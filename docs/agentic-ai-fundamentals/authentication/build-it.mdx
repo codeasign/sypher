@@ -1,0 +1,358 @@
+---
+title: Authentication
+sidebar_label: Build It
+---
+
+# Build It: Implementing Agent Authentication
+
+⏱️ 25 minutes
+
+## Breaking It Down
+
+### 1. Secure API Key Storage
+
+An API key is like a password. Never store it in source code, configuration files committed to version control, or environment variables printed at startup. Use a dedicated secrets manager.
+
+```python
+# secure_storage.py
+import os
+import json
+from cryptography.fernet import Fernet
+
+class SecretsManager:
+    """Encrypts API keys at rest using a master key from environment."""
+
+    def __init__(self):
+        master_key = os.environ.get("AGENT_MASTER_KEY")
+        if not master_key:
+            raise RuntimeError("AGENT_MASTER_KEY environment variable is required")
+        self.cipher = Fernet(master_key.encode())
+
+    def encrypt(self, key_id: str, api_key: str) -> bytes:
+        payload = json.dumps({"id": key_id, "key": api_key}).encode()
+        return self.cipher.encrypt(payload)
+
+    def decrypt(self, encrypted: bytes) -> dict:
+        payload = self.cipher.decrypt(encrypted)
+        return json.loads(payload.decode())
+
+    def store(self, key_id: str, api_key: str, storage_path: str):
+        encrypted = self.encrypt(key_id, api_key)
+        with open(storage_path, "wb") as f:
+            f.write(encrypted)
+        os.chmod(storage_path, 0o600)  # Owner read/write only
+
+    def retrieve(self, storage_path: str) -> dict:
+        with open(storage_path, "rb") as f:
+            encrypted = f.read()
+        return self.decrypt(encrypted)
+```
+
+In production, replace the file-based storage with a vault like HashiCorp Vault, AWS Secrets Manager, or GCP Secret Manager.
+
+### 2. OAuth 2.0 Token Refresh Flow
+
+The most critical pattern for agent authentication is automatic token refresh. An agent that cannot refresh its own tokens will fail on every long-running task.
+
+```python
+# oauth_client.py
+import time
+import httpx
+from datetime import datetime, timezone
+
+class OAuthClient:
+    """Manages OAuth 2.0 access tokens with automatic refresh."""
+
+    def __init__(self, client_id: str, client_secret: str, token_url: str, refresh_token: str):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.token_url = token_url
+        self._refresh_token = refresh_token
+        self._access_token: str | None = None
+        self._expires_at: float = 0.0
+
+    def _exchange_refresh_token(self) -> dict:
+        """Exchange the refresh token for a new access token."""
+        response = httpx.post(
+            self.token_url,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "refresh_token": self._refresh_token,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        self._access_token = data["access_token"]
+        expires_in = data.get("expires_in", 3600)
+        self._expires_at = time.time() + expires_in - 60  # Buffer 60 seconds
+        return data
+
+    @property
+    def access_token(self) -> str:
+        """Returns a valid access token, refreshing if needed."""
+        if not self._access_token or time.time() >= self._expires_at:
+            self._exchange_refresh_token()
+        return self._access_token
+
+    def is_expired(self) -> bool:
+        if not self._expires_at:
+            return True
+        return time.time() >= self._expires_at
+
+    def revoke(self):
+        """Revoke the refresh token (call when the agent session ends)."""
+        try:
+            httpx.post(
+                self.token_url.replace("/token", "/revoke"),
+                data={"token": self._refresh_token, "token_type_hint": "refresh_token"},
+            )
+        except Exception:
+            pass  # Best-effort revocation
+```
+
+### 3. Service Account Authentication
+
+For agents that operate as themselves (not as a user), service account authentication eliminates the need for user delegation entirely.
+
+```python
+# service_account.py
+import json
+import time
+import httpx
+
+class ServiceAccountAuth:
+    """Authenticates using a service account JSON key file."""
+
+    def __init__(self, key_file_path: str, scope: str):
+        with open(key_file_path) as f:
+            self._key_data = json.load(f)
+        self._scope = scope
+        self._access_token: str | None = None
+        self._expires_at: float = 0.0
+
+    def _generate_jwt_assertion(self) -> str:
+        """Create a signed JWT to exchange for an access token."""
+        header = {"alg": "RS256", "typ": "JWT"}
+        now = int(time.time())
+        claim = {
+            "iss": self._key_data["client_email"],
+            "scope": self._scope,
+            "aud": f"{self._key_data['token_uri']}",
+            "iat": now,
+            "exp": now + 3600,
+        }
+        # In production, use a JWT library like PyJWT to sign
+        # Here we show the conceptual structure
+        return f"signed_jwt_with_rsa_private_key"
+
+    def get_token(self) -> str:
+        if self._access_token and time.time() < self._expires_at:
+            return self._access_token
+        jwt_assertion = self._generate_jwt_assertion()
+        response = httpx.post(
+            self._key_data["token_uri"],
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": jwt_assertion,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        self._access_token = data["access_token"]
+        self._expires_at = time.time() + data.get("expires_in", 3600) - 60
+        return self._access_token
+```
+
+### 4. Token Injection into Tool Calls
+
+Once you have credentials, you need to inject them into every tool call that the agent makes. The cleanest approach is to wrap each tool with an auth layer.
+
+```python
+# auth_wrapper.py
+import functools
+from typing import Any
+
+def with_api_key(header_name: str, secret_manager: Any, key_id: str):
+    """Decorator that injects an API key into tool call headers."""
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Context object carries a reference to the current agent session
+            ctx = kwargs.get("ctx")
+            if ctx and hasattr(ctx, "secrets"):
+                key_entry = ctx.secrets.retrieve(f"secrets/{key_id}.enc")
+                api_key = key_entry["key"]
+                kwargs["headers"] = {header_name: api_key}
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def with_bearer_token(auth_client: OAuthClient):
+    """Decorator that injects an OAuth bearer token into tool call headers."""
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            token = auth_client.access_token
+            kwargs["headers"] = {"Authorization": f"Bearer {token}"}
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+```
+
+### 5. Credential Rotation
+
+Credentials should be rotated regularly to limit the damage of a leak. Automate the rotation so it does not depend on a human remembering to do it.
+
+```python
+# credential_rotator.py
+import os
+import httpx
+
+class CredentialRotator:
+    """Automates API key and token rotation."""
+
+    def __init__(self, secrets_manager, rotation_url: str):
+        self.secrets_manager = secrets_manager
+        self.rotation_url = rotation_url
+
+    async def rotate_api_key(self, key_id: str, storage_path: str):
+        """Generate a new API key via the management API and store it."""
+        response = httpx.post(f"{self.rotation_url}/keys/rotate", json={"key_id": key_id})
+        response.raise_for_status()
+        new_key = response.json()["api_key"]
+        self.secrets_manager.store(key_id, new_key, storage_path)
+        print(f"Rotated key {key_id} and stored securely")
+
+    async def rotate_all_keys(self, key_registry: list[dict]):
+        for entry in key_registry:
+            await self.rotate_api_key(entry["key_id"], entry["storage_path"])
+```
+
+## How It Works Internally
+
+Agent authentication follows the same token lifecycle as any OAuth 2.0 client, but with autonomous operation in mind.
+
+The lifecycle has four stages:
+
+1. **Issuance** — The agent obtains its first credential. For OAuth 2.0, this typically happens during a setup phase where a human authorizes the agent (authorization code flow) or the agent authenticates as a service account (JWT bearer grant). The result is an access token and a refresh token. The access token is short-lived (minutes to hours). The refresh token is long-lived (days to months).
+
+2. **Caching** — The agent caches the access token in memory, along with its expiration timestamp. Every API call checks the cache first. If the cached token is still valid, no network call is needed. This avoids the latency and rate-limit cost of refreshing on every request.
+
+3. **Refresh** — When the access token is within a safety buffer (typically 60 seconds) of expiring, the agent proactively exchanges the refresh token for a new access token. The refresh happens synchronously on the next API call, or asynchronously on a background timer. The refresh token itself may also expire or be revoked, in which case the agent needs a fallback (either re-authentication or a stored backup credential).
+
+4. **Revocation** — When the agent session ends or the credential is compromised, the refresh token should be revoked at the authorization server. This invalidates the entire credential chain. In agent systems, revocation should also trigger an alert and invalidate any cached tokens in memory.
+
+The critical difference from human-driven OAuth is that the agent must handle all four stages without user involvement. Stage 1 may still require human setup, but stages 2-4 must be fully automated.
+
+## Build Something Real
+
+Now let us combine these pieces into a working agent that authenticates to a REST API, manages token expiry, and handles refresh transparently.
+
+```python
+# sales_agent.py
+import asyncio
+import json
+import os
+from httpx import AsyncClient, HTTPStatusError
+
+class AuthenticatedSalesAgent:
+    """Agent that calls a REST API with OAuth 2.0 authentication."""
+
+    def __init__(self, client_id: str, client_secret: str, token_url: str, api_base: str, refresh_token: str):
+        self.api_base = api_base
+        self.oauth = OAuthClient(client_id, client_secret, token_url, refresh_token)
+        self.http = AsyncClient()
+
+    async def _api_call(self, method: str, path: str, **kwargs):
+        """Make an authenticated API call with automatic token refresh."""
+        url = f"{self.api_base}{path}"
+        headers = kwargs.pop("headers", {})
+        headers["Authorization"] = f"Bearer {self.oauth.access_token}"
+        try:
+            response = await self.http.request(method, url, headers=headers, **kwargs)
+            response.raise_for_status()
+            return response.json()
+        except HTTPStatusError as e:
+            if e.response.status_code == 401:
+                # Token expired — refresh and retry once
+                self.oauth._exchange_refresh_token()
+                headers["Authorization"] = f"Bearer {self.oauth.access_token}"
+                response = await self.http.request(method, url, headers=headers, **kwargs)
+                response.raise_for_status()
+                return response.json()
+            raise
+
+    async def get_customers(self) -> list[dict]:
+        """Fetch customer list from the CRM API."""
+        return await self._api_call("GET", "/customers")
+
+    async def get_orders(self, customer_id: str) -> list[dict]:
+        """Fetch orders for a specific customer."""
+        return await self._api_call("GET", f"/orders?customer_id={customer_id}")
+
+    async def create_report(self, title: str, data: dict) -> dict:
+        """Submit a report to the reporting API."""
+        return await self._api_call("POST", "/reports", json={"title": title, "data": data})
+
+    async def close(self):
+        await self.http.aclose()
+
+
+# ====== Usage in an agent loop ======
+async def main():
+    agent = AuthenticatedSalesAgent(
+        client_id=os.environ["API_CLIENT_ID"],
+        client_secret=os.environ["API_CLIENT_SECRET"],
+        token_url="https://auth.example.com/oauth/token",
+        api_base="https://api.example.com/v1",
+        refresh_token=os.environ["API_REFRESH_TOKEN"],
+    )
+
+    try:
+        # Agent step 1: fetch customers
+        customers = await agent.get_customers()
+        top_customer = customers[0]["id"]
+
+        # Agent step 2: fetch recent orders
+        orders = await agent.get_orders(top_customer)
+
+        # Agent step 3: generate and submit report
+        report = await agent.create_report(
+            title=f"Summary for customer {top_customer}",
+            data={"customer_id": top_customer, "orders": orders},
+        )
+        print(f"Report submitted: {report['id']}")
+
+    finally:
+        await agent.close()
+
+# asyncio.run(main())
+```
+
+This agent never handles token expiry directly. The `_api_call` method refreshes transparently on 401 responses, and the `OAuthClient` class refreshes proactively before expiry. The agent logic stays clean.
+
+## Security Considerations
+
+Agent authentication introduces security concerns beyond those of human-operated systems.
+
+**Token storage.** Store tokens in a dedicated secrets manager, not in environment variables that get printed during debugging or in configuration files committed to source control. Use encrypted storage at rest and limit access to the encryption key through a platform IAM system.
+
+**Least privilege.** Each credential should have the minimum scope needed for the agent's task. Do not give an agent that reads calendar events a scope that allows deleting events. If a credential is compromised, the blast radius is limited to the granted scope.
+
+**Audit logging.** Every token exchange should be logged: when a token was issued, which scope was granted, which tool called it, and when it was refreshed or revoked. Security audits will ask for these logs. Include a trace ID in every auth event so you can correlate authentication with specific agent sessions.
+
+**Credential rotation.** Rotate API keys and service account keys on a regular schedule (30-90 days). Automate the rotation so it does not depend on human memory. When a credential is rotated, the old credential should be deactivated immediately after the new one is verified to work.
+
+## Performance Considerations
+
+Token refresh costs latency. Every refresh adds a network round trip to the authorization server (typically 100-500 ms). Cache access tokens in memory and refresh them proactively before they expire to avoid blocking the agent's next tool call.
+
+Batch token refreshes if the agent holds multiple credentials for different services. If three tokens all expire within the same minute, refreshing them serially adds 300-1500 ms of overhead. A background refresh timer that refreshes all near-expiry tokens at once minimizes this cost.
+
+Avoid refreshing on every tool call. An agent that makes 50 tool calls in 10 seconds should refresh at most once during that window. The caching layer in `OAuthClient` handles this naturally by checking expiry before every token read.
+
+## What's Next
+
+Continue to [Avoid Mistakes](./avoid-mistakes) to learn about authentication anti-patterns like hardcoding credentials, ignoring token expiry, and over-provisioning permissions.

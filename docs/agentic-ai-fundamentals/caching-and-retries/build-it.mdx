@@ -1,0 +1,555 @@
+---
+title: Caching and Retries
+sidebar_label: Build It
+---
+
+# Build It: Implementing Caching and Retry Logic
+
+⏱️ 25 minutes
+
+## Breaking It Down
+
+### 1. LLM Response Cache with Redis
+
+A cache stores LLM responses so identical or similar requests do not need a new API call. Redis is the natural choice — it is fast, supports TTL expiration, and works across multiple agent instances.
+
+```python
+# cache.py
+import json
+import hashlib
+from typing import Optional
+import redis.asyncio as redis
+
+
+class LLMResponseCache:
+    """Redis-backed cache for LLM responses."""
+
+    def __init__(self, redis_url: str = "redis://localhost:6379/0",
+                 default_ttl_s: int = 3600):
+        self.client = redis.from_url(redis_url, decode_responses=True)
+        self.default_ttl = default_ttl_s
+
+    def _build_key(self, system_prompt: str, messages: list,
+                   tools: list, model: str, temperature: float) -> str:
+        """Generate a deterministic cache key from the request parameters."""
+        payload = {
+            "system": system_prompt,
+            "messages": messages,
+            "tools": tools,
+            "model": model,
+            "temperature": temperature,
+        }
+        serialized = json.dumps(payload, sort_keys=True, default=str)
+        return f"llm_cache:{hashlib.sha256(serialized.encode()).hexdigest()}"
+
+    async def get(self, system_prompt: str, messages: list,
+                  tools: list, model: str, temperature: float) -> Optional[str]:
+        """Return cached response if it exists, None otherwise."""
+        key = self._build_key(system_prompt, messages, tools, model, temperature)
+        cached = await self.client.get(key)
+        return cached
+
+    async def set(self, system_prompt: str, messages: list,
+                  tools: list, model: str, temperature: float,
+                  response: str, ttl_s: Optional[int] = None):
+        """Store an LLM response in the cache."""
+        key = self._build_key(system_prompt, messages, tools, model, temperature)
+        await self.client.setex(key, ttl_s or self.default_ttl, response)
+
+    async def invalidate_by_prefix(self, prefix: str = "llm_cache:"):
+        """Invalidate all cache entries matching a prefix."""
+        cursor = 0
+        while True:
+            cursor, keys = await self.client.scan(cursor, match=f"{prefix}*")
+            if keys:
+                await self.client.delete(*keys)
+            if cursor == 0:
+                break
+
+
+# Usage example
+async def example():
+    cache = LLMResponseCache()
+    system = "You are a helpful assistant."
+    messages = [{"role": "user", "content": "What is the refund policy?"}]
+    tools = []
+    model = "claude-sonnet-4-6"
+    temp = 0.0
+
+    cached = await cache.get(system, messages, tools, model, temp)
+    if cached:
+        print(f"Cache HIT: {cached}")
+    else:
+        print("Cache MISS — would call LLM API here")
+        # response = await client.messages.create(...)
+        await cache.set(system, messages, tools, model, temp, "Refund policy text")
+```
+
+### 2. Cache Key Generation (Exact + Semantic)
+
+Exact-match caching works when the input is byte-identical. For agents, the cache key must include system prompt, message history, tool definitions, model name, and temperature. Any difference in these parameters produces a different key.
+
+```python
+# cache_key.py
+import json
+import hashlib
+from typing import Any
+
+
+def build_exact_cache_key(
+    system_prompt: str,
+    messages: list[dict],
+    tools: list[dict],
+    model: str,
+    temperature: float,
+) -> str:
+    """
+    Build a deterministic cache key from exact request parameters.
+    Uses sorted JSON serialization so the same data always produces the same hash.
+    """
+    payload: dict[str, Any] = {
+        "system": system_prompt,
+        "messages": messages,
+        "tools": tools,
+        "model": model,
+        "temperature": temperature,
+    }
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return f"llm_exact:{digest}"
+
+
+def build_semantic_cache_key(
+    system_prompt: str,
+    normalized_message: str,
+    tools_summary: str,
+    model: str,
+) -> str:
+    """
+    Build a cache key from normalized (semantic) input.
+    The caller normalizes the user message — for example, lowercasing,
+    stripping punctuation, and replacing synonyms — so that semantically
+    similar queries map to the same key.
+    """
+    payload = {
+        "system": system_prompt,
+        "normalized_message": normalized_message,
+        "tools_summary": tools_summary,
+        "model": model,
+    }
+    serialized = json.dumps(payload, sort_keys=True, default=str)
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return f"llm_semantic:{digest}"
+
+
+# Semantic normalization example
+def normalize_query(message: str) -> str:
+    """Normalize a user message for semantic cache key generation."""
+    text = message.lower().strip()
+    # Replace common synonym groups
+    replacements = {
+        "return": "refund",
+        "give back": "refund",
+        "money back": "refund",
+        "how do i": "how to",
+        "what is the": "",
+        "tell me about": "",
+    }
+    for phrase, replacement in replacements.items():
+        text = text.replace(phrase, replacement)
+    # Collapse whitespace
+    return " ".join(text.split())
+
+
+# Test exact vs semantic keys
+msg1 = "What is the refund policy?"
+msg2 = "Tell me about the return policy"
+
+key_exact_1 = build_exact_cache_key("system", [{"role": "user", "content": msg1}], [], "claude-sonnet-4-6", 0.0)
+key_exact_2 = build_exact_cache_key("system", [{"role": "user", "content": msg2}], [], "claude-sonnet-4-6", 0.0)
+print(f"Exact keys differ: {key_exact_1 != key_exact_2}")  # True — different inputs
+
+key_sem_1 = build_semantic_cache_key("system", normalize_query(msg1), "", "claude-sonnet-4-6")
+key_sem_2 = build_semantic_cache_key("system", normalize_query(msg2), "", "claude-sonnet-4-6")
+print(f"Semantic keys match: {key_sem_1 == key_sem_2}")  # True — normalized to same thing
+```
+
+### 3. Retry Decorator with Exponential Backoff
+
+A retry decorator wraps any function — tool call, API call, database query — and retries on failure with exponential backoff and jitter.
+
+```python
+# retry.py
+import time
+import random
+import functools
+from typing import Callable, Optional
+
+
+def retry_with_backoff(
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+    max_delay: float = 60.0,
+    retryable_exceptions: Optional[tuple] = None,
+):
+    """
+    Decorator that retries a function with exponential backoff and jitter.
+    
+    Args:
+        max_retries: Maximum number of retry attempts (not counting the initial call).
+        base_delay: Initial delay in seconds.
+        backoff_factor: Multiplier applied to delay after each retry.
+        max_delay: Maximum delay cap in seconds.
+        retryable_exceptions: Tuple of exception types to retry on.
+            Defaults to ConnectionError, TimeoutError, IOError.
+    """
+    if retryable_exceptions is None:
+        retryable_exceptions = (ConnectionError, TimeoutError, IOError)
+
+    def decorator(func: Callable):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+
+            for attempt in range(max_retries + 1):
+                try:
+                    result = func(*args, **kwargs)
+                    if attempt > 0:
+                        print(f"  Retry {attempt} succeeded for {func.__name__}")
+                    return result
+                except retryable_exceptions as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        delay = min(base_delay * (backoff_factor ** attempt), max_delay)
+                        # Add jitter: randomize between 50% and 150% of the base delay
+                        jittered_delay = delay * (0.5 + random.random() * 0.5)
+                        print(
+                            f"  {func.__name__} failed (attempt {attempt + 1}/{max_retries + 1}): "
+                            f"{e}. Retrying in {jittered_delay:.1f}s..."
+                        )
+                        time.sleep(jittered_delay)
+                    else:
+                        print(f"  {func.__name__}: all {max_retries + 1} attempts exhausted.")
+
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+# Async version
+def retry_async_with_backoff(
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+    max_delay: float = 60.0,
+    retryable_exceptions: Optional[tuple] = None,
+):
+    if retryable_exceptions is None:
+        retryable_exceptions = (ConnectionError, TimeoutError, IOError)
+
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            import asyncio
+            last_exception = None
+
+            for attempt in range(max_retries + 1):
+                try:
+                    result = await func(*args, **kwargs)
+                    if attempt > 0:
+                        print(f"  Retry {attempt} succeeded for {func.__name__}")
+                    return result
+                except retryable_exceptions as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        delay = min(base_delay * (backoff_factor ** attempt), max_delay)
+                        jittered_delay = delay * (0.5 + random.random() * 0.5)
+                        print(
+                            f"  {func.__name__} failed (attempt {attempt + 1}): "
+                            f"{e}. Retrying in {jittered_delay:.1f}s..."
+                        )
+                        await asyncio.sleep(jittered_delay)
+
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+# Simulated flaky tool
+flaky_counter = 0
+
+def flaky_search(query: str) -> str:
+    global flaky_counter
+    flaky_counter += 1
+    if flaky_counter <= 2:  # Fail first 2 calls
+        raise ConnectionError("Database timeout")
+    return f"Results for '{query}': [data]"
+
+
+# Apply retry decorator
+@retry_with_backoff(max_retries=3, base_delay=0.5)
+def reliable_search(query: str) -> str:
+    return flaky_search(query)
+
+
+try:
+    result = reliable_search("refund policy")
+    print(f"Result: {result}")
+except Exception as e:
+    print(f"Failed: {e}")
+```
+
+### 4. Circuit Breaker for Failing Tools
+
+The circuit breaker prevents retries from overwhelming a failing downstream service. It tracks success and failure counts and opens the circuit when the error rate exceeds a threshold.
+
+```python
+# circuit_breaker.py
+import time
+import threading
+
+
+class CircuitBreaker:
+    """
+    Tracks tool call outcomes and opens the circuit when failures exceed the threshold.
+    
+    States:
+        CLOSED   — Normal operation. Calls pass through, failures are tracked.
+        OPEN     — Calls are blocked without attempting. Recovery timer runs.
+        HALF_OPEN — One test call is allowed. Success → CLOSED, failure → OPEN.
+    """
+
+    def __init__(self, failure_threshold: int = 5,
+                 recovery_timeout_s: float = 30.0,
+                 consecutive_only: bool = True):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout_s
+        self.consecutive_only = consecutive_only  # Count consecutive failures or any in a window
+
+        self.state = "CLOSED"
+        self.failure_count = 0
+        self.last_failure_time: float = 0.0
+        self._lock = threading.Lock()
+
+    def record_success(self):
+        """Record a successful call."""
+        with self._lock:
+            if self.state == "HALF_OPEN":
+                print("  Circuit breaker: HALF_OPEN call succeeded, returning to CLOSED")
+                self.state = "CLOSED"
+                self.failure_count = 0
+            elif self.state == "CLOSED":
+                self.failure_count = 0  # Reset consecutive failures on success
+
+    def record_failure(self):
+        """Record a failed call."""
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+
+            if self.state == "CLOSED" and self.failure_count >= self.failure_threshold:
+                print(
+                    f"  Circuit breaker: TRIPPED to OPEN "
+                    f"({self.failure_count} consecutive failures)"
+                )
+                self.state = "OPEN"
+
+            elif self.state == "HALF_OPEN":
+                print("  Circuit breaker: HALF_OPEN call failed, returning to OPEN")
+                self.state = "OPEN"
+
+    def allow_request(self) -> bool:
+        """Check if a new request is allowed."""
+        with self._lock:
+            if self.state == "CLOSED":
+                return True
+
+            if self.state == "OPEN":
+                elapsed = time.time() - self.last_failure_time
+                if elapsed >= self.recovery_timeout:
+                    print("  Circuit breaker: recovery timeout elapsed, HALF_OPEN")
+                    self.state = "HALF_OPEN"
+                    return True
+                remaining = self.recovery_timeout - elapsed
+                print(f"  Circuit breaker: OPEN, {remaining:.0f}s remaining")
+                return False
+
+            if self.state == "HALF_OPEN":
+                return True  # Allow one test request
+
+            return True
+
+    def reset(self):
+        """Manually reset the breaker to CLOSED."""
+        with self._lock:
+            self.state = "CLOSED"
+            self.failure_count = 0
+
+
+# Simulation
+def simulate_circuit_breaker():
+    cb = CircuitBreaker(failure_threshold=3, recovery_timeout_s=5.0)
+
+    for i in range(20):
+        if not cb.allow_request():
+            print(f"  Call {i + 1}: BLOCKED by circuit breaker")
+            time.sleep(0.5)
+            continue
+
+        # Simulate: first 8 calls succeed, then 5 fail, then succeed again
+        if 8 <= i < 13:
+            success = False
+        else:
+            success = True
+
+        if success:
+            cb.record_success()
+        else:
+            cb.record_failure()
+
+        status = "✓" if success else "✗"
+        print(f"Call {i + 1}: {status}  State: {cb.state}")
+        time.sleep(0.3)
+
+
+simulate_circuit_breaker()
+```
+
+### 5. Cache-Aware Agent Loop
+
+Combine caching and retries into a single agent execution loop. The cache intercepts LLM calls, and the retry wrapper protects tool calls.
+
+```python
+# cache_aware_agent.py
+import hashlib
+import json
+import time
+from typing import Optional
+
+
+class CacheAwareAgent:
+    """Agent that uses response caching for LLM calls and retry for tool calls."""
+
+    def __init__(self, cache: Optional[dict] = None):
+        # In-memory cache for simplicity; replace with Redis in production
+        self.cache: dict[str, str] = cache or {}
+        self.use_cache = True
+
+    def _cache_key(self, messages: list, tools: list, model: str) -> str:
+        """Generate a deterministic cache key."""
+        payload = {"messages": messages, "tools": tools, "model": model}
+        serialized = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha256(serialized.encode()).hexdigest()
+
+    def cached_llm_call(self, system_prompt: str, messages: list,
+                        tools: list, model: str, temperature: float = 0.0) -> str:
+        """Make an LLM call with cache-first behavior."""
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        key = self._cache_key(full_messages, tools, model)
+
+        if self.use_cache and key in self.cache:
+            cached = self.cache[key]
+            print(f"  Cache HIT ({len(cached)} chars)")
+            return cached
+
+        print("  Cache MISS — calling LLM API")
+        # Simulated LLM call
+        response = f"Simulated response for: {messages[-1]['content'][:50]}..."
+        time.sleep(0.1)  # Simulated latency
+
+        if self.use_cache:
+            self.cache[key] = response
+            print(f"  Cached response ({len(response)} chars)")
+
+        return response
+
+    def retrying_tool_call(self, tool_name: str, args: dict) -> str:
+        """Execute a tool call with retry logic."""
+        max_retries = 3
+        base_delay = 0.5
+
+        for attempt in range(max_retries + 1):
+            try:
+                result = self._execute_tool(tool_name, args)
+                if attempt > 0:
+                    print(f"  Tool retry {attempt} succeeded")
+                return result
+            except Exception as e:
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    import random
+                    delay *= 0.5 + random.random() * 0.5
+                    print(f"  Tool call failed (attempt {attempt + 1}): {e}. Retrying in {delay:.1f}s...")
+                    time.sleep(delay)
+                else:
+                    raise
+
+    def _execute_tool(self, name: str, args: dict) -> str:
+        """Simulated tool execution — replace with real tool logic."""
+        if name == "search" and args.get("query") == "fail":
+            raise ConnectionError("Simulated tool failure")
+        return f"Tool '{name}' result for args {args}"
+
+    def run(self, user_input: str, system_prompt: str = "You are helpful.") -> str:
+        """Run a simplified agent session with caching and retries."""
+        messages = [{"role": "user", "content": user_input}]
+        tools = [{
+            "name": "search",
+            "description": "Search the knowledge base",
+            "input_schema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            }
+        }]
+
+        # First LLM call — will miss cache on first run, hit on second
+        response = self.cached_llm_call(system_prompt, messages, tools, "claude-sonnet-4-6", 0.0)
+        print(f"Agent: {response[:60]}...")
+
+        # If the LLM returns a tool call, execute it with retry
+        if "search" in response.lower():
+            result = self.retrying_tool_call("search", {"query": user_input})
+            print(f"Tool result: {result}")
+
+        return response
+
+
+# Run the agent — first call misses cache, second call hits
+agent = CacheAwareAgent()
+
+print("=== First run (cache MISS) ===")
+result1 = agent.run("What is the refund policy?")
+
+print("\n=== Second run (cache HIT) ===")
+result2 = agent.run("What is the refund policy?")
+
+print(f"\nCache contains {len(agent.cache)} entries")
+```
+
+## How It Works Internally
+
+**Cache key hashing.** The cache key is a SHA-256 hash of a deterministic JSON serialization of the request parameters. Every parameter that affects the LLM response — system prompt, message history, tool definitions, model name, temperature, and any other inference parameters — must be included in the hash. If any parameter changes, the hash changes, and the cache produces a miss. This guarantees correctness: a cached response is always valid for exactly the same request that produced it.
+
+**Semantic similarity caching.** Semantic caching normalizes the input before hashing. Lowercasing, stripping punctuation, replacing synonyms (for example, "return" to "refund"), and removing stop words maps different phrasings of the same question to the same cache key. The normalization function must be deterministic — given the same input, it always produces the same output. The trade-off is that aggressive normalization can map genuinely different questions (for example, "how do I return a product?" vs "how do I return a file?") to the same key, producing incorrect cached answers. Production systems tune the normalization rules carefully and often combine exact-match and semantic caches with a fallback to the LLM on uncertainty.
+
+**Circuit breaker state machine.** The circuit breaker is a finite state machine with three states:
+
+- **CLOSED** — Normal operation. Every call passes through. The breaker tracks the failure count (either consecutive or within a sliding window). When the failure count exceeds the threshold, the breaker transitions to OPEN.
+- **OPEN** — Calls are rejected immediately without attempting the downstream call. A recovery timer starts. No calls reach the failing service, giving it time to recover. When the timer expires, the breaker transitions to HALF-OPEN.
+- **HALF_OPEN** — One test call is allowed through. If it succeeds, the breaker resets to CLOSED and normal operation resumes. If it fails, the breaker returns to OPEN and the recovery timer restarts.
+
+This state machine prevents the agent from wasting time and tokens on a system that is clearly failing, while automatically recovering once the system stabilizes.
+
+## Performance Considerations
+
+Cache hit rate is the single most important metric for cache efficiency. A 50 percent hit rate means you cut LLM costs by roughly half. Increasing the hit rate to 80 percent requires tuning the semantic normalization rules and extending the TTL. The trade-off is response freshness — longer TTLs increase hit rates but serve older data. For agent systems where tool results change frequently (stock prices, weather, database queries), short TTLs (30-300 seconds) balance freshness with efficiency.
+
+Cache serialization overhead matters in high-throughput systems. Each cache set and get operation serializes and deserializes the response. For large responses (10K+ tokens), serialization can add 5-20ms of latency. In most agent systems this is negligible compared to the 2-10 seconds saved by avoiding an LLM call, but in latency-critical systems, using a binary serialization format like MessagePack instead of JSON can reduce overhead.
+
+Circuit breaker tuning requires production data. A threshold that works in development (for example, 5 consecutive failures) may be too sensitive in production where transient blips are more common. Monitor the false-positive rate — how often does the breaker trip on a service that would have recovered on the next call? — and adjust the threshold and recovery timeout accordingly. A general guideline: start with a threshold of 5-10 failures, a recovery timeout of 30-60 seconds, and tighten based on observed failure patterns.
+
+## What's Next
+
+Continue to [Avoid Mistakes](./avoid-mistakes) to learn about common caching and retry pitfalls including caching without TTL, retrying without backoff, and cache poisoning with bad responses.

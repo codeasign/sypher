@@ -1,0 +1,445 @@
+---
+title: Scaling Agent Systems — Build It
+sidebar_label: Build It
+---
+
+# Build It: Scaling Your Agent System
+
+*Reading time: 25 minutes*
+
+## Breaking It Down
+
+### 1. Making Agents Stateless with External Session Storage
+
+The first step toward scaling is moving session state out of the agent process. Your agent memory, conversation history, and active tool results must live in a shared store that every instance can access.
+
+When a user sends a request, the agent looks up the session ID, loads the full conversation context from the store, and starts processing. After each turn, it saves the updated state back to the store. Any instance can handle any session.
+
+```python
+import json
+import redis
+from datetime import datetime
+
+# Connect to a shared Redis instance
+redis_client = redis.Redis(host="redis-cluster", port=6379, decode_responses=True)
+
+
+class SessionStore:
+    """External session storage for stateless agents."""
+
+    SESSION_TTL = 3600  # 1 hour
+
+    def save_session(self, session_id: str, state: dict) -> None:
+        """Save agent session state to Redis."""
+        key = f"session:{session_id}"
+        state["last_updated"] = datetime.utcnow().isoformat()
+        redis_client.setex(key, self.SESSION_TTL, json.dumps(state))
+
+    def load_session(self, session_id: str) -> dict | None:
+        """Load agent session state from Redis."""
+        key = f"session:{session_id}"
+        data = redis_client.get(key)
+        if data is None:
+            return None
+        return json.loads(data)
+
+    def delete_session(self, session_id: str) -> None:
+        """Remove session data when the conversation ends."""
+        key = f"session:{session_id}"
+        redis_client.delete(key)
+
+
+store = SessionStore()
+
+# Each agent instance can now pick up any session
+session = store.load_session("user-abc-123")
+if session is None:
+    session = {"messages": [], "memory": {}}
+
+# Process a turn...
+session["messages"].append({"role": "user", "content": "Hello"})
+store.save_session("user-abc-123", session)
+```
+
+### 2. Implementing a Load Balancer for Agent Instances
+
+With stateless agents, you can put multiple instances behind a load balancer. Nginx acts as the traffic cop, routing each incoming request to an available agent worker.
+
+```nginx
+# /etc/nginx/nginx.conf
+upstream agent_cluster {
+    # Least connections routing — sends to the least busy instance
+    least_conn;
+
+    server agent-instance-1:8000 max_fails=3 fail_timeout=30s;
+    server agent-instance-2:8000 max_fails=3 fail_timeout=30s;
+    server agent-instance-3:8000 max_fails=3 fail_timeout=30s;
+}
+
+server {
+    listen 80;
+
+    location /agent/ {
+        proxy_pass http://agent_cluster;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        # Timeout settings — agent calls can be long
+        proxy_read_timeout 120s;
+        proxy_connect_timeout 10s;
+
+        # Session affinity via cookie (optional optimization)
+        proxy_set_header Cookie $http_cookie;
+        proxy_pass_header Set-Cookie;
+    }
+
+    location /health {
+        return 200 "OK";
+    }
+}
+```
+
+The `least_conn` strategy sends new requests to the instance with the fewest active connections. This works well for agent workloads because each conversation holds a connection for an extended period. Round-robin would risk overwhelming instances that are still processing long-running tool calls.
+
+### 3. Rate Limiting with the Token Bucket Algorithm
+
+When you have multiple agent instances sharing a single API key, each instance must be rate-limited. The token bucket algorithm provides a simple, distributed rate limiter using Redis.
+
+```python
+import time
+import redis
+
+redis_client = redis.Redis(host="redis-cluster", port=6379, decode_responses=True)
+
+
+class TokenBucketRateLimiter:
+    """Distributed token bucket rate limiter backed by Redis."""
+
+    def __init__(self, key: str, max_tokens: int, refill_rate: float):
+        self.key = f"rate_limit:{key}"
+        self.max_tokens = max_tokens
+        self.refill_rate = refill_rate  # tokens per second
+
+    def acquire(self, tokens: int = 1) -> bool:
+        """Try to acquire tokens. Returns True if allowed."""
+        lua_script = """
+        local key = KEYS[1]
+        local now = tonumber(ARGV[1])
+        local max_tokens = tonumber(ARGV[2])
+        local refill_rate = tonumber(ARGV[3])
+        local requested = tonumber(ARGV[4])
+
+        local bucket = redis.call("hmget", key, "tokens", "last_refill")
+        local tokens = tonumber(bucket[1]) or max_tokens
+        local last_refill = tonumber(bucket[2]) or now
+
+        local elapsed = now - last_refill
+        tokens = math.min(max_tokens, tokens + elapsed * refill_rate)
+
+        if tokens >= requested then
+            tokens = tokens - requested
+            redis.call("hmset", key, "tokens", tokens, "last_refill", now)
+            redis.call("expire", key, 60)
+            return 1
+        else
+            return 0
+        end
+        """
+        now = time.time()
+        result = redis_client.eval(lua_script, 1, self.key, now,
+                                   self.max_tokens, self.refill_rate, tokens)
+        return bool(result)
+
+
+# Shared rate limiter for the Anthropic API (e.g., 100 requests per minute)
+rate_limiter = TokenBucketRateLimiter(
+    key="anthropic_api",
+    max_tokens=100,
+    refill_rate=100.0 / 60.0,  # 100 tokens per 60 seconds
+)
+
+if rate_limiter.acquire(1):
+    response = client.messages.create(...)
+else:
+    # Queue or retry with exponential backoff
+    raise Exception("Rate limit exceeded")
+```
+
+Each agent instance calls the same `acquire` method. The Lua script runs atomically in Redis, ensuring no race conditions between instances.
+
+### 4. Queuing with a Message Broker for Async Processing
+
+Not every agent request needs to block on a response. Background tasks — document processing, batch analysis, scheduled reports — can be queued for asynchronous consumption. Celery with Redis as the broker handles this pattern cleanly.
+
+```python
+# tasks.py
+from celery import Celery
+
+celery_app = Celery(
+    "agent_tasks",
+    broker="redis://redis-cluster:6379/1",
+    result_backend="redis://redis-cluster:6379/2",
+)
+
+
+@celery_app.task(bind=True, max_retries=3)
+def process_document_task(self, session_id: str, document_url: str):
+    """Process a document in the background and store results."""
+    try:
+        # Load session state
+        session = store.load_session(session_id)
+
+        # Run analysis (no user waiting)
+        result = run_extraction_pipeline(document_url)
+
+        # Store result for later retrieval
+        session["memory"]["document_result"] = result
+        store.save_session(session_id, result)
+
+        return {"status": "completed", "session_id": session_id}
+    except Exception as exc:
+        raise self.retry(exc=exc, countdown=2 ** self.request.retries)
+
+
+# Submit a task and return immediately
+task = process_document_task.delay("session-xyz-789", "https://...")
+print(f"Task submitted: {task.id}")
+
+# The user can poll for the result later
+status = process_document_task.AsyncResult(task.id).status
+```
+
+Queuing decouples request acceptance from request processing. The user gets an immediate acknowledgment, and the agent processes the work when capacity is available.
+
+### 5. Auto-Scaling Based on Queue Depth
+
+When the queue grows, you need more workers. When it shrinks, you can scale down. This is the core of elastic scaling. The following script can be run as a cron job or integrated with a container orchestrator.
+
+```python
+import requests
+
+# Configuration
+CELERY_QUEUE_URL = "http://rabbitmq:15672/api/queues/%2F/agent_tasks"
+SCALE_API = "http://orchestrator:8080/api/scale"
+MIN_INSTANCES = 2
+MAX_INSTANCES = 10
+QUEUE_DEPTH_PER_WORKER = 5
+
+
+def get_queue_depth() -> int:
+    """Get the number of pending tasks in the Celery queue."""
+    response = requests.get(CELERY_QUEUE_URL, auth=("guest", "guest"))
+    data = response.json()
+    return data.get("messages_ready", 0)
+
+
+def scale_workers(target_count: int) -> None:
+    """Scale agent instances to the target count."""
+    target = max(MIN_INSTANCES, min(MAX_INSTANCES, target_count))
+    requests.post(SCALE_API, json={"instances": target})
+
+
+def auto_scale() -> None:
+    """Scale workers based on current queue depth."""
+    depth = get_queue_depth()
+    desired_workers = max(MIN_INSTANCES, depth // QUEUE_DEPTH_PER_WORKER + 1)
+    scale_workers(desired_workers)
+    print(f"Queue depth: {depth}, scaling to {desired_workers} workers")
+
+
+auto_scale()
+```
+
+## How It Works Internally
+
+Session state externalization is the architectural heart of a scalable agent system. Here is how each piece of state is moved out of the agent process and into shared infrastructure.
+
+**Agent Memory.** The agent's working memory — facts it has learned about the user, preferences, recent observations — is stored as a serialized dictionary in Redis under a session-specific key. Each agent instance loads this memory at the start of a turn and writes it back after the turn ends. Because Redis supports atomic operations, concurrent writes from different instances touching different keys are safe. For data that must survive Redis restarts, a PostgreSQL or DynamoDB table serves as the durable backing store.
+
+**Conversation History.** The full message list (user messages, assistant responses, tool calls, and tool results) is stored as a JSON array, keyed by session ID. When instance A loads session `user-456`, it fetches the entire history, appends its own turn, and saves it back. The conversation history is the largest piece of state — it grows with each turn — so it is often split into two layers: a hot layer (recent N turns) in Redis for fast access, and a cold layer (all turns) in a document database for durability and audit.
+
+**Tool Results and Cache.** Tool outputs that are expensive to recompute (search results, database queries, file reads) are cached by content hash in a shared cache. When any instance runs a tool with the same arguments, it checks the cache first. This reduces latency and avoids redundant API calls. The cache has a TTL and is stored in Redis alongside session data or in a dedicated caching layer like Memcached.
+
+**The Handoff Protocol.** When a request arrives at the load balancer, the balancer checks for a session cookie. If one exists, it routes the request to the instance that last handled that session (session affinity). If that instance is unavailable, or if there is no cookie, the balancer routes to the least-loaded instance. That instance loads the session state from the shared store. There is no data loss — every instance reads from the same source of truth. The handoff is seamless because the session store, not the agent process, is the system of record.
+
+## Build Something Real
+
+The following example wires together all of the components into a complete scalable agent service. It exposes a FastAPI endpoint, stores session state in Redis, and uses Celery for background tasks.
+
+```python
+# agent_service.py — Scalable FastAPI agent with Redis session store
+import json
+import uuid
+import anthropic
+import redis
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from celery import Celery
+
+app = FastAPI(title="Scalable Agent Service")
+
+# Redis session store
+redis_client = redis.Redis(host="redis-cluster", port=6379, decode_responses=True)
+
+# Celery for background processing
+celery_app = Celery(
+    "agent_tasks",
+    broker="redis://redis-cluster:6379/1",
+    result_backend="redis://redis-cluster:6379/2",
+)
+
+# Anthropic client
+client = anthropic.Anthropic()
+
+SESSION_TTL = 3600
+
+
+class AgentRequest(BaseModel):
+    session_id: str | None = None
+    message: str
+
+
+class AgentResponse(BaseModel):
+    session_id: str
+    reply: str
+    task_id: str | None = None
+
+
+def load_session(session_id: str) -> list:
+    """Load conversation history from Redis."""
+    key = f"session:{session_id}"
+    data = redis_client.get(key)
+    return json.loads(data) if data else []
+
+
+def save_session(session_id: str, messages: list) -> None:
+    """Save conversation history to Redis."""
+    key = f"session:{session_id}"
+    redis_client.setex(key, SESSION_TTL, json.dumps(messages))
+
+
+def check_rate_limit() -> bool:
+    """Distributed rate limit check (simplified token bucket)."""
+    allowed = redis_client.eval(
+        """
+        local key = "rate_limit:anthropic"
+        local now = tonumber(ARGV[1])
+        local max_tokens = 100
+        local refill_rate = 1.67
+        local requested = 1
+        local bucket = redis.call("hmget", key, "tokens", "last_refill")
+        local tokens = tonumber(bucket[1]) or max_tokens
+        local last_refill = tonumber(bucket[2]) or now
+        local elapsed = now - last_refill
+        tokens = math.min(max_tokens, tokens + elapsed * refill_rate)
+        if tokens >= requested then
+            tokens = tokens - requested
+            redis.call("hmset", key, "tokens", tokens, "last_refill", now)
+            redis.call("expire", key, 60)
+            return 1
+        end
+        return 0
+        """,
+        1, "rate_limit:anthropic",
+        __import__("time").time(),
+    )
+    return bool(allowed)
+
+
+@app.post("/agent/chat", response_model=AgentResponse)
+async def agent_chat(request: AgentRequest):
+    """Handle a chat request — synchronous agent turn."""
+    session_id = request.session_id or str(uuid.uuid4())
+    messages = load_session(session_id)
+
+    # Append the user's new message
+    messages.append({"role": "user", "content": request.message})
+
+    if not check_rate_limit():
+        # Queue for background processing instead of failing
+        task = process_chat_task.delay(session_id, request.message)
+        return AgentResponse(
+            session_id=session_id,
+            reply="Your request has been queued. You will be notified when it is ready.",
+            task_id=task.id,
+        )
+
+    # Call the LLM
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1000,
+        temperature=0,
+        messages=messages,
+    )
+
+    reply = response.content[0].text
+    messages.append({"role": "assistant", "content": reply})
+    save_session(session_id, messages)
+
+    return AgentResponse(session_id=session_id, reply=reply)
+
+
+@celery_app.task(bind=True, max_retries=3)
+def process_chat_task(self, session_id: str, user_message: str):
+    """Background chat processing — used when rate limit is exceeded."""
+    import anthropic as _anthropic
+
+    cl = _anthropic.Anthropic()
+    messages = load_session(session_id)
+    messages.append({"role": "user", "content": user_message})
+
+    try:
+        response = cl.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            temperature=0,
+            messages=messages,
+        )
+        reply = response.content[0].text
+        messages.append({"role": "assistant", "content": reply})
+        save_session(session_id, messages)
+        return {"session_id": session_id, "reply": reply}
+    except Exception as exc:
+        raise self.retry(exc=exc, countdown=2 ** self.request.retries)
+
+
+@app.get("/agent/status/{task_id}")
+async def agent_status(task_id: str):
+    """Poll the status of a background task."""
+    task = process_chat_task.AsyncResult(task_id)
+    return {"status": task.status, "result": task.result if task.ready() else None}
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint for the load balancer."""
+    return {"status": "healthy"}
+```
+
+To run this deployment:
+
+```bash
+# Start Redis
+docker run -d --name redis-cluster -p 6379:6379 redis:7-alpine
+
+# Start Celery workers (scale with --concurrency as needed)
+celery -A agent_service.celery_app worker --loglevel=info --concurrency=4
+
+# Start FastAPI with multiple workers (behind nginx)
+uvicorn agent_service:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+## Performance Considerations
+
+Scaling an agent system introduces performance overhead that does not exist in a single-instance setup. Each turn now requires at least one network round trip to Redis to load and save session state. Under high concurrency, Redis itself can become a bottleneck. Use Redis Cluster or a managed Redis service (ElastiCache, Upstash) to shard data across multiple nodes.
+
+LLM API latency is the dominant factor in end-to-end response time. A single LLM call takes 2-5 seconds. Adding more agent instances does not make individual LLM calls faster — it increases throughput (requests per second). If your goal is to reduce response time per user, look at prompt optimization and smaller models rather than scaling.
+
+Serialization overhead matters at scale. Every session save and load converts Python objects to JSON and back. For sessions with thousands of turns, this serialization can add 100-200ms per operation. Store conversation history in a format that allows partial reads — recent N turns in Redis, older turns in a database — to keep the hot path fast.
+
+Database connection pooling is critical. Each agent instance that connects to Redis or PostgreSQL creates its own connection pool. If you launch 20 instances without limiting pool size, you can exhaust the database connection limit. Configure pool sizes to match your concurrent worker count, and use connection pooling middleware.
+
+## What's Next
+
+Continue to [Avoid Mistakes](./avoid-mistakes) to learn common scaling pitfalls — ignoring rate limits, assuming agents are stateless, and race conditions in shared state.

@@ -1,0 +1,663 @@
+---
+title: Versioning Prompts and Tools
+sidebar_label: Build It
+---
+
+# Build It: Implementing Prompt and Tool Versioning
+
+⏱️ 25 minutes
+
+## Breaking It Down
+
+### 1. Prompt Registry with Version Hashes
+
+A prompt registry stores every version of every prompt by its content hash. When you register a new prompt, the system computes a SHA-256 hash of the text, stores it under that hash, and optionally attaches a semantic version tag. The agent loads prompts by tag at startup and resolves them to the current hash on each request.
+
+```python
+# prompt_registry.py
+import hashlib
+import json
+import sqlite3
+from datetime import datetime
+from typing import Optional
+
+class PromptRegistry:
+    """Stores prompt versions by content hash with semantic tags."""
+
+    def __init__(self, db_path: str = "prompts.db"):
+        self.conn = sqlite3.connect(db_path)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS prompts (
+                hash TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata TEXT
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS tags (
+                tag TEXT PRIMARY KEY,
+                prompt_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (prompt_hash) REFERENCES prompts(hash)
+            )
+        """)
+
+    def _compute_hash(self, content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+    def register(self, content: str, tag: Optional[str] = None,
+                 metadata: Optional[dict] = None) -> str:
+        """Register a prompt version. Returns its content hash."""
+        hash_ = self._compute_hash(content)
+        now = datetime.now().isoformat()
+
+        self.conn.execute(
+            "INSERT OR IGNORE INTO prompts (hash, content, created_at, metadata) VALUES (?, ?, ?, ?)",
+            (hash_, content, now, json.dumps(metadata or {}))
+        )
+
+        if tag:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO tags (tag, prompt_hash, created_at) VALUES (?, ?, ?)",
+                (tag, hash_, now)
+            )
+
+        self.conn.commit()
+        return hash_
+
+    def resolve(self, tag: str) -> Optional[dict]:
+        """Resolve a tag to the full prompt record."""
+        row = self.conn.execute(
+            """SELECT p.hash, p.content, p.created_at, p.metadata
+               FROM prompts p
+               JOIN tags t ON p.hash = t.prompt_hash
+               WHERE t.tag = ?""",
+            (tag,)
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "hash": row[0],
+            "content": row[1],
+            "created_at": row[2],
+            "metadata": json.loads(row[3]),
+        }
+
+    def resolve_hash(self, hash_: str) -> Optional[dict]:
+        """Look up a prompt directly by its content hash."""
+        row = self.conn.execute(
+            "SELECT hash, content, created_at, metadata FROM prompts WHERE hash = ?",
+            (hash_,)
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "hash": row[0],
+            "content": row[1],
+            "created_at": row[2],
+            "metadata": json.loads(row[3]),
+        }
+
+    def move_tag(self, tag: str, new_hash: str) -> None:
+        """Point an existing tag to a different prompt version."""
+        existing = self.resolve_hash(new_hash)
+        if not existing:
+            raise ValueError(f"Hash {new_hash} not found in registry")
+        now = datetime.now().isoformat()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tags (tag, prompt_hash, created_at) VALUES (?, ?, ?)",
+            (tag, new_hash, now)
+        )
+        self.conn.commit()
+
+    def list_versions(self, tag: Optional[str] = None) -> list:
+        """List all tags, optionally filtered to versions of a specific tag."""
+        if tag:
+            rows = self.conn.execute(
+                "SELECT tag, prompt_hash, created_at FROM tags WHERE tag LIKE ? ORDER BY created_at DESC",
+                (f"{tag}%",)
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT tag, prompt_hash, created_at FROM tags ORDER BY created_at DESC"
+            ).fetchall()
+        return [{"tag": r[0], "hash": r[1], "created_at": r[2]} for r in rows]
+```
+
+### 2. Tool Definition Versioning with Schema Migration
+
+Each tool definition carries a semantic version. The agent records which version of each tool it used to craft a call. The MCP server advertises the minimum and maximum versions it supports. Schema migration follows the same principles as database migrations: additive changes are backward-compatible, renaming or removing parameters requires a major version bump.
+
+```python
+# tool_versioning.py
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+from enum import Enum
+import semver
+
+class BumpType(Enum):
+    MAJOR = "major"
+    MINOR = "minor"
+    PATCH = "patch"
+
+@dataclass
+class ToolParameter:
+    name: str
+    type: str
+    description: str
+    required: bool = False
+    deprecated: bool = False
+    default: Any = None
+
+@dataclass
+class ToolDefinition:
+    """A versioned tool schema."""
+    name: str
+    version: str  # semver string like "1.2.0"
+    description: str
+    parameters: list[ToolParameter] = field(default_factory=list)
+    handler: Optional[Callable] = None
+
+    def validate_call(self, arguments: dict, agent_version: str) -> list[str]:
+        """Validate tool arguments against this schema. Returns errors list."""
+        errors = []
+        param_map = {p.name: p for p in self.parameters}
+        for arg_name in arguments:
+            if arg_name not in param_map:
+                errors.append(f"Unknown parameter '{arg_name}' for tool '{self.name}'")
+            elif param_map[arg_name].deprecated:
+                errors.append(f"Parameter '{arg_name}' is deprecated in {self.name}@{self.version}")
+        for param in self.parameters:
+            if param.required and param.name not in arguments:
+                errors.append(f"Required parameter '{param.name}' missing for tool '{self.name}'")
+        return errors
+
+@dataclass
+class ToolVersionRange:
+    """The schema versions an MCP server supports."""
+    tool_name: str
+    min_version: str
+    max_version: str
+
+    def supports(self, version: str) -> bool:
+        try:
+            return (semver.Version.parse(self.min_version)
+                    <= semver.Version.parse(version)
+                    <= semver.Version.parse(self.max_version))
+        except ValueError:
+            return False
+
+@dataclass
+class ToolVersionedClient:
+    """An agent-side client that negotiates tool versions with a server."""
+    server_supported: dict[str, ToolVersionRange]
+    local_definitions: dict[str, ToolDefinition]
+
+    def negotiate(self, tool_name: str, required_version: str) -> Optional[ToolDefinition]:
+        """Find a compatible local definition for the given tool and version."""
+        if tool_name not in self.server_supported:
+            return None
+        if tool_name not in self.local_definitions:
+            return None
+        range_ = self.server_supported[tool_name]
+        if range_.supports(required_version):
+            return self.local_definitions[tool_name]
+        return None
+
+    def get_compatible_tools(self) -> dict[str, str]:
+        """Return map of tool names to the version the agent can use."""
+        result = {}
+        for name, range_ in self.server_supported.items():
+            if name in self.local_definitions:
+                local_version = self.local_definitions[name].version
+                if range_.supports(local_version):
+                    result[name] = local_version
+        return result
+```
+
+### 3. A/B Testing Prompts in Production
+
+With a registry in place, you can route a percentage of traffic to a different prompt version. The secret lies in consistent hashing — a given user always sees the same prompt version, so behavior is reproducible.
+
+```python
+# prompt_ab_test.py
+import hashlib
+
+class PromptABTest:
+    """Route traffic to different prompt versions by user hash."""
+
+    def __init__(self, registry):
+        self.registry = registry
+        self.experiments: dict[str, list[dict]] = {}  # name -> rollout configs
+
+    def define_experiment(self, name: str, variants: list[dict]) -> None:
+        """
+        Define an A/B test.
+
+        variants: list of {"tag": str, "weight": float} where weights sum to 1.0.
+        Example: [{"tag": "system-prompt/prod", "weight": 0.9},
+                   {"tag": "system-prompt/test-concise", "weight": 0.1}]
+        """
+        total = sum(v["weight"] for v in variants)
+        if abs(total - 1.0) > 0.001:
+            raise ValueError(f"Variant weights must sum to 1.0, got {total}")
+        self.experiments[name] = variants
+
+    def resolve_for_user(self, experiment_name: str, user_id: str) -> dict:
+        """Resolve the prompt version for a specific user."""
+        variants = self.experiments[experiment_name]
+        bucket = self._user_bucket(user_id, experiment_name)
+        cumulative = 0.0
+        for variant in variants:
+            cumulative += variant["weight"]
+            if bucket < cumulative:
+                return self.registry.resolve(variant["tag"])
+        return self.registry.resolve(variants[-1]["tag"])
+
+    def _user_bucket(self, user_id: str, experiment_name: str) -> float:
+        """Consistent hash from user_id + experiment_name to [0, 1)."""
+        key = f"{user_id}:{experiment_name}"
+        digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+        return int(digest[:8], 16) / 0xFFFFFFFF
+```
+
+### 4. Rollback Procedure
+
+A rollback restores a previous prompt or tool configuration. In a registry-based system this means moving a tag to an older hash. In a bundled system it means redeploying the previous artifact.
+
+```python
+# rollback.py
+from typing import Optional
+
+class RollbackManager:
+    """Manages safe rollbacks for prompt and tool configurations."""
+
+    def __init__(self, registry):
+        self.registry = registry
+        self.rollback_log: list[dict] = []
+
+    def rollback_prompt(self, tag: str, target_hash: str,
+                        reason: str) -> dict:
+        """
+        Roll back a prompt tag to a previous version.
+
+        Returns the previous state before the rollback.
+        """
+        current = self.registry.resolve(tag)
+        if not current:
+            raise ValueError(f"Tag '{tag}' not found")
+
+        target = self.registry.resolve_hash(target_hash)
+        if not target:
+            raise ValueError(f"Hash '{target_hash}' not found")
+
+        # Log before executing
+        entry = {
+            "action": "rollback_prompt",
+            "tag": tag,
+            "from_hash": current["hash"],
+            "to_hash": target_hash,
+            "reason": reason,
+            "timestamp": __import__("datetime").datetime.now().isoformat(),
+        }
+        self.rollback_log.append(entry)
+
+        self.registry.move_tag(tag, target_hash)
+        return entry
+
+    def dry_run_rollback(self, tag: str, target_hash: str) -> dict:
+        """Preview what a rollback would do without executing it."""
+        current = self.registry.resolve(tag)
+        if not current:
+            return {"error": f"Tag '{tag}' not found"}
+        target = self.registry.resolve_hash(target_hash)
+        if not target:
+            return {"error": f"Hash '{target_hash}' not found"}
+        return {
+            "tag": tag,
+            "current_hash": current["hash"],
+            "current_content_preview": current["content"][:200],
+            "target_hash": target_hash,
+            "target_content_preview": target["content"][:200],
+            "safe": True,
+        }
+
+    def get_rollback_history(self, tag: Optional[str] = None) -> list[dict]:
+        """Retrieve rollback history, optionally filtered by tag."""
+        if tag:
+            return [e for e in self.rollback_log if e["tag"] == tag]
+        return self.rollback_log
+```
+
+## How It Works Internally
+
+Version resolution at runtime follows a deterministic chain. When an agent session starts, the host resolves its configuration tag to a specific prompt hash and a set of tool versions. These become the session's immutable configuration. Even if the deployment tag moves to a newer hash mid-session, the running session continues with its originally resolved versions.
+
+The resolution chain works as follows:
+
+1. The agent startup script reads the deployment configuration, which specifies a configuration tag like `agent-config/v1.2.0`.
+2. The configuration tag resolves to a JSON document that contains a `prompt_tag` and a `tools` map with version constraints.
+3. The `prompt_tag` is resolved through the registry to a content hash, and the full prompt text is loaded into memory.
+4. Each tool version is validated against the server's supported version range. If a tool version is outside the range, the negotiation fails at startup — not mid-request.
+5. The session records its resolved configuration hash so it can be audited later.
+
+Tool definition validation against expected schemas happens at two points: registration and invocation. At registration, each tool version is checked against a schema migration policy. An additive change (adding an optional parameter) is allowed as a minor bump. A breaking change (removing a parameter, changing its type) requires a major bump. At invocation, the agent checks that every argument in the tool call matches the schema that was in use when the call was constructed. If a deprecated parameter is used, the system logs a warning but allows the call to proceed, giving consumers time to migrate.
+
+```python
+# version_resolution.py
+from dataclasses import dataclass
+from typing import Any
+
+@dataclass
+class ResolvedSessionConfig:
+    prompt_hash: str
+    prompt_content: str
+    tool_versions: dict[str, str]
+    resolved_at: str
+
+class ConfigurationResolver:
+    """Resolves tags to immutable session configurations."""
+
+    def __init__(self, registry, tool_client):
+        self.registry = registry
+        self.tool_client = tool_client
+        self.active_configs: dict[str, ResolvedSessionConfig] = {}
+
+    def resolve(self, config_tag: str) -> ResolvedSessionConfig:
+        """Resolve a config tag to an immutable session configuration."""
+        config_doc = self.registry.resolve(config_tag)
+        if not config_doc:
+            raise ValueError(f"Configuration tag '{config_tag}' not found")
+
+        config_payload = json.loads(config_doc["content"])
+
+        prompt = self.registry.resolve(config_payload["prompt_tag"])
+        if not prompt:
+            raise ValueError(f"Prompt tag '{config_payload['prompt_tag']}' not found")
+
+        tool_versions: dict[str, str] = {}
+        for tool_name, required_version in config_payload.get("tools", {}).items():
+            compatible = self.tool_client.negotiate(tool_name, required_version)
+            if compatible is None:
+                raise ValueError(
+                    f"Tool '{tool_name}' version {required_version} is not "
+                    f"compatible with this server"
+                )
+            tool_versions[tool_name] = compatible.version
+
+        resolved = ResolvedSessionConfig(
+            prompt_hash=prompt["hash"],
+            prompt_content=prompt["content"],
+            tool_versions=tool_versions,
+            resolved_at=__import__("datetime").datetime.now().isoformat(),
+        )
+
+        config_hash = hashlib.sha256(
+            json.dumps({
+                "prompt_hash": resolved.prompt_hash,
+                "tool_versions": resolved.tool_versions,
+            }, sort_keys=True).encode()
+        ).hexdigest()[:12]
+
+        self.active_configs[config_hash] = resolved
+        return resolved
+```
+
+## Build Something Real
+
+Now combine the registry, tool versioning, and rollback into a complete end-to-end system. This is the production pattern you would actually run.
+
+```python
+# agent_config_manager.py
+"""Production-ready agent configuration versioning system."""
+
+import json
+import hashlib
+from datetime import datetime
+from dataclasses import dataclass, field
+from typing import Optional
+import sqlite3
+
+# ----- Core Data Structures -----
+
+@dataclass
+class RegisteredPrompt:
+    hash: str
+    content: str
+    created_at: str
+    metadata: dict
+
+@dataclass
+class VersionedTool:
+    name: str
+    version: str
+    description: str
+    parameters: dict  # JSON schema
+
+@dataclass
+class AgentConfig:
+    """A complete agent configuration with pinned versions."""
+    version: str
+    prompt_tag: str
+    prompt_hash: str
+    tool_specs: dict[str, str]  # tool_name -> version
+    parameters: dict  # temperature, max_tokens, etc.
+    created_at: str
+
+# ----- Configuration Store -----
+
+class ConfigStore:
+    """Persistent store for agent configurations."""
+
+    def __init__(self, db_path: str = "agent_config.db"):
+        self.conn = sqlite3.connect(db_path)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS configs (
+                version TEXT PRIMARY KEY,
+                prompt_tag TEXT NOT NULL,
+                prompt_hash TEXT NOT NULL,
+                tool_specs TEXT NOT NULL,
+                parameters TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                superseded_by TEXT
+            )
+        """)
+
+    def save(self, config: AgentConfig) -> None:
+        self.conn.execute(
+            """INSERT INTO configs
+               (version, prompt_tag, prompt_hash, tool_specs, parameters, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (config.version, config.prompt_tag, config.prompt_hash,
+             json.dumps(config.tool_specs), json.dumps(config.parameters),
+             config.created_at)
+        )
+        self.conn.commit()
+
+    def mark_superseded(self, old_version: str, new_version: str) -> None:
+        self.conn.execute(
+            "UPDATE configs SET superseded_by = ? WHERE version = ?",
+            (new_version, old_version)
+        )
+        self.conn.commit()
+
+    def get(self, version: str) -> Optional[AgentConfig]:
+        row = self.conn.execute(
+            "SELECT * FROM configs WHERE version = ?", (version,)
+        ).fetchone()
+        if not row:
+            return None
+        return AgentConfig(
+            version=row[0], prompt_tag=row[1], prompt_hash=row[2],
+            tool_specs=json.loads(row[3]), parameters=json.loads(row[4]),
+            created_at=row[5],
+        )
+
+    def list_active(self) -> list[AgentConfig]:
+        rows = self.conn.execute(
+            "SELECT * FROM configs WHERE superseded_by IS NULL ORDER BY created_at DESC"
+        ).fetchall()
+        return [AgentConfig(
+            version=r[0], prompt_tag=r[1], prompt_hash=r[2],
+            tool_specs=json.loads(r[3]), parameters=json.loads(r[4]),
+            created_at=r[5],
+        ) for r in rows]
+
+# ----- Version Resolution -----
+
+class VersionResolver:
+    """Resolve a config version to a frozen, runnable agent configuration."""
+
+    def __init__(self, prompt_registry, tool_registry, config_store):
+        self.registry = prompt_registry
+        self.tools = tool_registry
+        self.configs = config_store
+        self.session_configs: dict[str, str] = {}  # session_id -> config_version
+
+    def create_config(self, version: str, prompt_tag: str,
+                      tool_specs: dict[str, str],
+                      parameters: dict) -> AgentConfig:
+        """Create a new configuration version from component versions."""
+        prompt = self.registry.resolve(prompt_tag)
+        if not prompt:
+            raise ValueError(f"Prompt tag '{prompt_tag}' not found")
+
+        for tool_name, tool_version in tool_specs.items():
+            if tool_name not in self.tools:
+                raise ValueError(f"Tool '{tool_name}' not registered")
+            if self.tools[tool_name].version != tool_version:
+                raise ValueError(
+                    f"Tool '{tool_name}' requested version {tool_version}, "
+                    f"registered version is {self.tools[tool_name].version}"
+                )
+
+        config = AgentConfig(
+            version=version,
+            prompt_tag=prompt_tag,
+            prompt_hash=prompt["hash"],
+            tool_specs=tool_specs,
+            parameters=parameters,
+            created_at=datetime.now().isoformat(),
+        )
+        self.configs.save(config)
+        return config
+
+    def pin_session(self, session_id: str, config_version: str) -> dict:
+        """Pin a session to a specific config version (immutable)."""
+        config = self.configs.get(config_version)
+        if not config:
+            raise ValueError(f"Config version '{config_version}' not found")
+        self.session_configs[session_id] = config_version
+        return {
+            "session_id": session_id,
+            "config_version": config.version,
+            "prompt_hash": config.prompt_hash,
+            "tool_versions": config.tool_specs,
+            "parameters": config.parameters,
+        }
+
+    def get_session_config(self, session_id: str) -> Optional[AgentConfig]:
+        """Get the immutable config for a running session."""
+        version = self.session_configs.get(session_id)
+        if not version:
+            return None
+        return self.configs.get(version)
+
+# ----- Usage Example -----
+
+def example_workflow():
+    """Demonstrate the full versioning lifecycle."""
+    from prompt_registry import PromptRegistry
+
+    registry = PromptRegistry()
+    resolver = VersionResolver(
+        prompt_registry=registry,
+        tool_registry={
+            "search_db": VersionedTool(
+                name="search_db", version="1.2.0",
+                description="Search the database",
+                parameters={"query": "string", "max_results": "integer"},
+            ),
+        },
+        config_store=ConfigStore(),
+    )
+
+    # Register prompt versions
+    v1_hash = registry.register(
+        "You are a database assistant. Answer questions using the database.",
+        tag="system-prompt/prod"
+    )
+    registry.register(
+        "You are a database assistant. Be concise. Answer using the database.",
+        tag="system-prompt/test-concise"
+    )
+
+    # Create configuration versions
+    config_v1 = resolver.create_config(
+        version="1.0.0",
+        prompt_tag="system-prompt/prod",
+        tool_specs={"search_db": "1.2.0"},
+        parameters={"temperature": 0.0, "max_tokens": 4096},
+    )
+
+    # Pin a session
+    session = resolver.pin_session("sess-001", "1.0.0")
+    print(f"Session running config {session['config_version']} "
+          f"with prompt {session['prompt_hash']}")
+
+    # Activate a new prompt version for next sessions
+    registry.move_tag("system-prompt/prod", v1_hash)  # no-op, same hash
+    v2_hash = registry.register(
+        "You are a database assistant. Answer questions using the database. "
+        "Always cite your sources from the database.",
+        tag="system-prompt/prod"  # overwrites the tag
+    )
+
+    config_v2 = resolver.create_config(
+        version="1.1.0",
+        prompt_tag="system-prompt/prod",
+        tool_specs={"search_db": "1.2.0"},
+        parameters={"temperature": 0.0, "max_tokens": 4096},
+    )
+
+    # Old session still uses the original prompt
+    old_session = resolver.get_session_config("sess-001")
+    assert old_session.prompt_hash != v2_hash  # pinned, not affected
+    print(f"Old session still uses prompt hash: {old_session.prompt_hash}")
+```
+
+## Performance Considerations
+
+Versioning adds storage and lookup overhead. Each prompt version stores the full content text, not a diff. For system prompts averaging 1-5 KB, storing 1,000 versions consumes roughly 1-5 MB of database space — negligible for most applications. Tool definitions are even smaller, typically a few hundred bytes per version.
+
+The performance-critical path is tag resolution at session startup. A registry-backed resolution involves two database lookups — one for the config tag, one for the prompt hash. With proper indexing, this completes in under 10 milliseconds. For high-throughput systems serving thousands of sessions per second, add an in-memory cache layer:
+
+```python
+# cache_layer.py
+from functools import lru_cache
+
+class CachedRegistry:
+    """Wraps PromptRegistry with an in-memory LRU cache."""
+
+    def __init__(self, registry, maxsize: int = 256):
+        self.registry = registry
+        self.maxsize = maxsize
+
+    def resolve_with_cache(self, tag: str) -> Optional[dict]:
+        """Resolve a tag, caching the result."""
+        return self._resolve_cached(tag)
+
+    @lru_cache(maxsize=256)
+    def _resolve_cached(self, tag: str) -> Optional[dict]:
+        return self.registry.resolve(tag)
+
+    def clear_cache(self):
+        self._resolve_cached.cache_clear()
+```
+
+The cache should be invalidated when a tag is moved to a new hash. An alternative strategy is to use short cache TTLs (for example, 30 seconds) so prompt updates propagate within a bounded window without explicit invalidation.
+
+## What's Next
+
+Continue to [Avoid Mistakes](./avoid-mistakes) to learn about versioning pitfalls like backward-compatible tool descriptions, orphaned prompt versions, and the risks of versioning without an audit trail.
