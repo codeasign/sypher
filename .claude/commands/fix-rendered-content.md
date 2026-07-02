@@ -12,6 +12,19 @@ $ARGUMENTS = a course slug (e.g. `system-design-basics`, `ai-engineering-hands-o
 
 ---
 
+## STEP 0 — ROOT CAUSE CHECK (run once, before cleaning symptoms)
+
+Mojibake is not random — it means a write path somewhere is not forcing UTF-8, so it re-corrupts on every new file generated. Cleaning the existing files without fixing this means the corruption returns on the next batch. Before cleaning, check the generation pipeline and any fix scripts:
+
+- **Python generation scripts:** every `open(path, "w")` that writes an `.mdx` file must pass `encoding="utf-8"` explicitly. On Windows, Python defaults to the system codepage (cp1252), which turns `─` into `â”€` — this is the single most common root cause. Search the pipeline for `open(` calls writing docs and confirm each has `encoding="utf-8"`.
+- **PowerShell fix/edit scripts:** every `Get-Content` and `Set-Content` touching `.mdx` must use `-Encoding UTF8`. A single script without it re-corrupts every file it touches.
+- **Node/JS scripts:** `fs.writeFileSync(path, data)` defaults to UTF-8 and is usually safe, but confirm no explicit `latin1`/`binary` encoding is set.
+- **The model/API response itself:** if the pipeline pipes model output through a shell or intermediate buffer with a non-UTF-8 codepage (Windows console default is often cp437/cp1252), the corruption can happen before the file is even written. Setting the console to UTF-8 (`chcp 65001`) or writing bytes directly from the API response rather than through a decoded string avoids this.
+
+Report which write path is the likely leak. If the leak isn't fixed, note in the final report that cleanup will need re-running after the next generation batch — cleaning symptoms without fixing the source is a treadmill.
+
+---
+
 ## STEP 1 — SCOPE AND SCAN
 
 Read every `.mdx` file under `docs/$ARGUMENTS/` (or all courses if `all`). For each file, scan for the four defect classes below. Process in batches of 15–20 files, reporting findings per batch — do not disappear into one silent giant pass.
@@ -106,6 +119,10 @@ After fixing each batch:
 Scope: <slug or all>
 Files scanned: <count>
 
+Root-cause check (Step 0):
+  Likely encoding leak: <which write path, or "not found / fixed">
+  Cleanup will recur on next batch until fixed: yes/no
+
 Defects found:
   A — mojibake (single-layer, reversed): <count>
   A — mojibake (multi-layer, regenerated): <count>
@@ -122,6 +139,7 @@ Build verified clean: yes/no
 
 ## HARD RULES
 
+- Run the Step 0 root-cause check first — cleaning mojibake without identifying the encoding leak means it returns on the next generation batch. Always report whether the source was found and whether cleanup will recur.
 - Report the full defect audit before fixing anything.
 - Never hand-retype multi-layer mojibake into "something that looks plausible" — if the original is unrecoverable, regenerate from the surrounding prose's description, don't guess at mangled bytes.
 - A regenerated diagram or code block must match what the surrounding text says it shows — technical validity isn't enough, it has to be the *right* content.

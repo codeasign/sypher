@@ -1,0 +1,662 @@
+---
+id: retries-deep-dive
+title: Retries — Deep Dive
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A production-grade retry system consists of four components working together: the retry executor, the backoff calculator, the jitter generator, and the retry budget tracker. Each component has a specific responsibility and communicates with the others through well-defined interfaces.
+
+<AsciiDiagram
+  id="retries/deep-dive-architecture"
+  title="Internal Architecture of a Retry System"
+  alt="Block diagram showing four internal components: Retry Executor, Backoff Calculator, Jitter Generator, and Retry Budget Tracker, with arrows showing data flow between them"
+  caption="The four internal components of a production retry system"
+  content={`
+┌─────────────────────────────────────────────────────────────┐
+│                    Retry Executor                           │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │  Attempt     │  │  Delay       │  │  Circuit Breaker │  │
+│  │  Counter     │  │  Queue       │  │  Check           │  │
+│  │  (atomic)    │  │  (sorted by  │  │  (fast-fail if   │  │
+│  │              │  │   wake time) │  │   open)          │  │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘  │
+│         │                 │                    │           │
+│         ▼                 ▼                    ▼           │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │           Backoff Calculator                        │   │
+│  │  delay = initialDelay * multiplier^(attempt-1)      │   │
+│  │  delay = min(delay, maxDelay)                      │   │
+│  └──────────────────────┬──────────────────────────────┘   │
+│                         │                                   │
+│                         ▼                                   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              Jitter Generator                       │   │
+│  │  Full jitter:  delay = rand(0, baseDelay * 2)      │   │
+│  │  Equal jitter: delay = baseDelay/2 + rand(0,        │   │
+│  │                               baseDelay/2)          │   │
+│  │  Decorrelated: delay = rand(baseDelay, baseDelay*3) │   │
+│  └──────────────────────┬──────────────────────────────┘   │
+│                         │                                   │
+│                         ▼                                   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │            Retry Budget Tracker                      │   │
+│  │  Tokens: current/max  Refill: rate/s                │   │
+│  │  Each retry costs 1 token                           │   │
+│  │  Empty budget = skip retry                          │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+`} />
+
+### Retry Executor
+
+The retry executor is the orchestrator. It manages the retry lifecycle: receiving a failed request, coordinating with the other components, dispatching retries, and reporting results. The executor maintains three data structures: the attempt counter, the delay queue, and the circuit breaker reference.
+
+The attempt counter is an atomic integer. It starts at 0 and increments before each retry. The executor checks the counter against maxRetries before each attempt. If the counter equals maxRetries, the executor returns the last failure.
+
+The delay queue holds scheduled retry tasks. Each task has a wake time computed by the backoff calculator and jitter generator. A dedicated worker thread or timer evaluates the queue, dispatching retries whose wake time has arrived.
+
+The circuit breaker check is a fast-path optimization. Before computing backoff or scheduling a delay, the executor checks the circuit breaker state. If the circuit is open, the executor returns immediately without scheduling a retry. This prevents wasted work when the downstream system is known to be unavailable.
+
+### Backoff Calculator
+
+The backoff calculator computes the delay for each retry attempt. It implements the exponential backoff formula: delay = min(initialDelay * multiplier^(attempt - 1), maxDelay).
+
+The calculator is a pure function. It takes three inputs (attempt number, initialDelay, multiplier) and returns a delay value. It does not maintain state. This makes it easy to test and reason about.
+
+The maxDelay cap is applied after the exponential calculation. If the computed delay exceeds maxDelay, the calculator returns maxDelay. Without this cap, the delay grows without bound. A typical maxDelay is 30 seconds.
+
+### Jitter Generator
+
+The jitter generator adds randomness to the base delay. Three common jitter strategies exist:
+
+**Full jitter:** delay = random(0, baseDelay). The delay is uniformly distributed between 0 and the base delay. This is the most aggressive jitter strategy. It completely eliminates the thundering herd problem because no two clients ever use the same delay. The downside is that some retries fire almost immediately, which may not give the server enough recovery time.
+
+**Equal jitter:** delay = baseDelay / 2 + random(0, baseDelay / 2). The delay is centered around baseDelay / 2 with variation of up to baseDelay / 2. This is a compromise between full jitter and deterministic backoff. The minimum delay is always at least baseDelay / 2, ensuring some recovery time.
+
+**Decorrelated jitter:** delay = min(maxDelay, random(baseDelay, baseDelay * 3)). Each delay is at least as large as the previous delay, on average. This strategy is useful when the server recovery time is unknown and may be long.
+
+### Retry Budget Tracker
+
+The retry budget tracker limits the rate of retries. It implements a token bucket algorithm. The bucket holds a maximum number of tokens. Tokens are added at a fixed rate. Each retry attempt consumes one token. When the bucket is empty, retries are suppressed.
+
+The retry budget is the last line of defense against retry storms. Even if every other component is misconfigured, the budget prevents unbounded retry amplification. The budget is configured per client instance, so it scales with the number of clients.
+
+## Data Structures
+
+### Delay Queue
+
+The delay queue is a priority queue ordered by wake time. Each entry contains the retry context: the request, the idempotency key, the attempt counter, and the wake timestamp. A timer thread pops entries whose wake time has passed and dispatches them.
+
+```python
+@dataclass
+class RetryEntry:
+    request: Request
+    idempotency_key: str
+    attempt: int
+    wake_time: float  # monotonic clock timestamp
+    deadline: float   # absolute deadline for the entire retry cycle
+
+class DelayQueue:
+    def __init__(self):
+        self._heap: list[RetryEntry] = []
+        self._lock = threading.Lock()
+
+    def push(self, entry: RetryEntry) -> None:
+        with self._lock:
+            heapq.heappush(self._heap, (entry.wake_time, entry))
+
+    def pop_due(self, now: float) -> list[RetryEntry]:
+        due = []
+        with self._lock:
+            while self._heap and self._heap[0][0] <= now:
+                _, entry = heapq.heappop(self._heap)
+                due.append(entry)
+        return due
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._heap)
+```
+
+### Retry Counter
+
+The retry counter tracks how many times a specific operation has been retried. It is keyed by a combination of request identity and idempotency key. The counter is stored in a concurrent hash map with automatic expiry to prevent memory leaks.
+
+```python
+class RetryCounter:
+    def __init__(self, ttl_seconds: float = 60.0):
+        self._counters: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self._ttl = ttl_seconds
+
+    def increment(self, key: str) -> int:
+        with self._lock:
+            count = self._counters.get(key, 0) + 1
+            self._counters[key] = count
+            return count
+
+    def should_retry(self, key: str, max_retries: int) -> bool:
+        return self.increment(key) <= max_retries
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._counters.pop(key, None)
+```
+
+### Backoff Curve
+
+The backoff curve is a precomputed lookup table of delay values for each attempt number. Precomputing the curve avoids floating-point arithmetic on each retry and guarantees consistent behavior across all clients.
+
+```python
+def compute_backoff_curve(
+    initial_delay: float,
+    multiplier: float,
+    max_delay: float,
+    max_retries: int,
+) -> list[float]:
+    curve = []
+    delay = initial_delay
+    for i in range(max_retries):
+        curve.append(min(delay, max_delay))
+        delay *= multiplier
+    return curve
+```
+
+The curve is computed once at startup and cached for the lifetime of the client. Each retry attempt indexes into the curve: backoffCurve[attempt - 1].
+
+<AsciiDiagram
+  id="retries/deep-dive-backoff-curve"
+  title="Backoff Curve — Precomputed Delay Values"
+  alt="Line chart showing exponential growth of delay values from 100ms to 1600ms across 5 attempts, capped at 30 seconds"
+  caption="Backoff curve: delay per attempt number, computed at startup"
+  content={`
+Delay (ms)
+ 3200 │                                        ┌────┐
+      │                                        │    │
+ 1600 │                                ┌────┐  │    │
+      │                                │    │  │    │
+  800 │                        ┌────┐  │    │  │    │
+      │                        │    │  │    │  │    │
+  400 │                ┌────┐  │    │  │    │  │    │
+      │                │    │  │    │  │    │  │    │
+  200 │        ┌────┐  │    │  │    │  │    │  │    │
+      │        │    │  │    │  │    │  │    │  │    │
+  100 │ ┌────┐ │    │  │    │  │    │  │    │  │    │
+      │ │    │ │    │  │    │  │    │  │    │  │    │
+    0 └─┴────┴─┴────┴──┴────┴──┴────┴──┴────┴──┴────┴──►
+       1      2      3       4       5       6   Attempt
+`} />
+
+## Retry Lifecycle
+
+The retry lifecycle consists of 12 distinct stages. Each stage has specific inputs, outputs, and failure modes.
+
+### Stage 1: Request Interception
+
+The retry system intercepts the outgoing request before it reaches the transport layer. The interceptor wraps the request with retry metadata: a unique retry ID, the attempt counter initialized to 0, and the idempotency key.
+
+### Stage 2: Circuit Breaker Check
+
+The interceptor checks the circuit breaker. If the circuit is open, the request is rejected immediately with a FastFailException. The caller receives the error without any delay.
+
+### Stage 3: Request Dispatch
+
+The interceptor sends the request through the transport layer. A timeout timer starts. The timeout value must account for the expected response time of the downstream service. A typical timeout is 500 milliseconds for an internal service.
+
+### Stage 4: Error Classification
+
+The response handler receives the result. If the response is a success (2xx), the retry lifecycle ends. If the response is an error, the handler classifies it: retryable (5xx, timeout) or non-retryable (4xx, authentication errors). Non-retryable errors are returned to the caller immediately.
+
+### Stage 5: Retry Budget Check
+
+The handler checks the retry budget. One token is consumed for each retry attempt. If the budget is exhausted, the error is returned to the caller immediately. The budget check happens before the delay queue to avoid unnecessary work.
+
+### Stage 6: Attempt Counter Check
+
+The handler checks the attempt counter. If the counter equals maxRetries, the error is returned to the caller. The latest error is returned, not the original error, because the latest error is more likely to reflect the current state of the downstream system.
+
+### Stage 7: Backoff Calculation
+
+The handler computes the delay for the next retry. It indexes into the precomputed backoff curve using the current attempt number. The base delay is the value from the curve.
+
+### Stage 8: Jitter Application
+
+The handler applies the jitter function to the base delay. With full jitter, the final delay is a random value between 0 and the base delay. The jitter function uses a per-client seed to avoid correlated randomness across clients.
+
+### Stage 9: Delay Queue Insertion
+
+The handler creates a RetryEntry with the wake time set to currentTime + jitteredDelay and inserts it into the delay queue. The queue is sorted by wake time. A dedicated worker thread monitors the queue.
+
+### Stage 10: Timer Wait
+
+The worker thread sleeps until the next entry in the queue is due. When the wake time arrives, the thread pops the entry from the queue.
+
+### Stage 11: Retry Dispatch
+
+The worker thread sends the retry request. The same idempotency key is used. The attempt counter is incremented. The timeout timer is restarted.
+
+### Stage 12: Result Handling
+
+The worker thread handles the retry result. Success ends the lifecycle. Failure returns to Stage 4. The cycle continues until success, exhaustion, or budget depletion.
+
+<AsciiDiagram
+  id="retries/deep-dive-lifecycle"
+  title="Complete Retry Lifecycle — 12 Stages"
+  alt="Flowchart showing the 12 stages of the retry lifecycle from interception through success or exhaustion"
+  caption="The complete retry lifecycle: from request interception to success or exhaustion"
+  content={`
+  ┌──────────────┐
+  │  1. Request  │
+  │ Interception │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐     Open
+  │  2. Circuit  │──────────────> Return error
+  │ Breaker Check│
+  └──────┬───────┘
+         │ Closed
+         ▼
+  ┌──────────────┐
+  │  3. Request  │
+  │   Dispatch   │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐  Success
+  │  4. Error    │──────────────> Return success
+  │ Classify     │
+  └──────┬───────┘
+         │ Retryable
+         ▼
+  ┌──────────────┐  Exhausted
+  │  5. Budget   │──────────────> Return error
+  │   Check      │
+  └──────┬───────┘
+         │ Available
+         ▼
+  ┌──────────────┐  Maxed out
+  │  6. Attempt  │──────────────> Return error
+  │   Counter    │
+  └──────┬───────┘
+         │ Below max
+         ▼
+  ┌──────────────┐
+  │  7. Backoff  │
+  │ Calculation  │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │  8. Jitter   │
+  │ Application  │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │  9. Delay    │
+  │ Queue Insert │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │ 10. Timer    │
+  │    Wait      │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │ 11. Retry    │
+  │   Dispatch   │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │ 12. Result   │──── Success ──> Return success
+  │   Handling   │
+  └──────┬───────┘
+         │ Failure
+         └──────────> Go to Stage 4
+`} />
+
+## Consistency and State
+
+Retries interact with consistency in three important ways.
+
+### Exactly-Once Semantics
+
+Retries threaten exactly-once semantics. A request is sent, the server processes it and commits the result, but the response is lost in transit. The client sees a timeout and retries. The server processes the same request again. The result is duplicate processing.
+
+Idempotency keys solve this. The client generates a unique key per operation. The server stores the key with the result. When a retry arrives with the same key, the server returns the stored result instead of reprocessing.
+
+### At-Least-Once Semantics
+
+Most retry systems provide at-least-once semantics. The client retries until it receives a success response or exhausts its attempts. If the server processed the request but the response was lost, the operation was performed at least once. The client believes it succeeded. The server also believes it succeeded. This is acceptable for idempotent operations.
+
+### State Consistency After Partial Failure
+
+A multi-step operation may fail after some steps succeeded but before others completed. Retrying from the beginning would re-execute the completed steps. The system must either be idempotent across all steps, or implement compensating transactions for the completed steps.
+
+Consider a two-phase commit: Phase 1 reserves inventory, Phase 2 charges the payment. If Phase 1 succeeds and Phase 2 fails, retrying from the beginning would reserve the inventory again. The fix is to make each step idempotent, or to implement a saga pattern with compensating actions.
+
+## Performance
+
+### Retry Overhead
+
+Each retry attempt consumes resources: CPU for serialization and deserialization, memory for buffering the request and response, network bandwidth for the additional round trip, and server-side processing capacity. The overhead is proportional to the number of retries.
+
+A common benchmark: a request that normally takes 10ms to process takes 70ms with 3 retries (10ms initial + 10ms * 3 retries = 40ms processing time, plus 30ms for backoff waits). The throughput of the client is reduced by approximately 40%.
+
+### Amplification Factor
+
+The amplification factor is the ratio of total requests (including retries) to original requests. If 10% of requests fail and each failure triggers 3 retries, the amplification factor is 1 + (0.1 * 3) = 1.3. The system sees 30% more traffic than the baseline.
+
+<AsciiDiagram
+  id="retries/deep-dive-amplification"
+  title="Request Amplification Factor by Retry Count and Failure Rate"
+  alt="Table showing how the amplification factor grows as failure rate and max retries increase"
+  caption="Amplification factor = total requests / original requests"
+  content={`
+Failure  │  Max Retries
+Rate     │  1     2     3     4     5
+─────────┼────────────────────────────────
+  1%     │ 1.01  1.02  1.03  1.04  1.05
+  5%     │ 1.05  1.10  1.16  1.22  1.28
+ 10%     │ 1.10  1.21  1.33  1.46  1.61
+ 20%     │ 1.20  1.44  1.73  2.07  2.49
+ 30%     │ 1.30  1.69  2.20  2.86  3.71
+ 50%     │ 1.50  2.25  3.38  5.06  7.59
+─────────┴────────────────────────────────
+  Amplification = 1 + (failureRate * sum(retries))
+`} />
+
+At a 50% failure rate with 5 retries, the system sees 7.59 times the baseline traffic. This is why retries must be bounded and combined with circuit breakers. At high failure rates, retries are counterproductive.
+
+### Tail Latency Impact
+
+Retries increase tail latency. A request that normally completes in 50ms (p50) may take 500ms (p99) with retries. The p99 latency with retries is approximately: p99 = p99Base + maxRetries * (backoffSum + p99Base). If p99Base is 100ms, maxRetries is 3, and backoffSum is 700ms, the p99 with retries is 100 + 3 * (700 + 100) = 2500ms.
+
+## Configuration
+
+The following parameters control the behavior of a retry system. Each parameter has a default value, a typical range, and a trade-off.
+
+### initialDelay
+
+The delay before the first retry, in milliseconds. Default: 100ms. Range: 10ms to 1000ms. A shorter delay catches short transients faster but increases load. A longer delay gives the server more recovery time but increases latency for the client.
+
+### multiplier
+
+The factor by which the delay increases after each retry. Default: 2. Range: 1.5 to 3. A higher multiplier spreads retries further apart, which is better for overloaded servers. A lower multiplier provides more retries in the same time window.
+
+### maxDelay
+
+The maximum delay between any two retries, in milliseconds. Default: 30000ms (30 seconds). Range: 5000ms to 120000ms. The cap prevents the exponential backoff from growing unbounded. The cap is reached after: log(maxDelay / initialDelay) / log(multiplier) attempts.
+
+### maxRetries
+
+The maximum number of retry attempts. Default: 3. Range: 0 to 10. Zero retries means no retries. Above 5 retries is uncommon because the total wait time becomes excessive. The optimal value depends on the failure characteristics of the downstream system.
+
+### jitterFactor
+
+The type of jitter to apply. Options: none, full, equal, decorrelated. Default: full. Full jitter is the safest default. No jitter should only be used when the client count is known to be very small (fewer than 5 clients).
+
+<AsciiDiagram
+  id="retries/deep-dive-configuration"
+  title="Configuration Parameters and Their Effects"
+  alt="Table showing initialDelay, multiplier, maxDelay, maxRetries, and jitterFactor with their defaults, ranges, and trade-offs"
+  caption="Retry configuration parameters: defaults, ranges, and trade-offs"
+  content={`
+┌────────────────┬──────────┬──────────────┬──────────────────────┐
+│ Parameter      │ Default  │ Range        │ Effect of increasing │
+├────────────────┼──────────┼──────────────┼──────────────────────┤
+│ initialDelay   │  100ms   │  10-1000ms   │ Higher latency,      │
+│                │          │              │ more recovery time   │
+├────────────────┼──────────┼──────────────┼──────────────────────┤
+│ multiplier     │   2.0    │  1.5-3.0     │ Faster delay growth, │
+│                │          │              │ fewer retries in     │
+│                │          │              │ same window          │
+├────────────────┼──────────┼──────────────┼──────────────────────┤
+│ maxDelay       │ 30000ms  │ 5000-120000  │ Longer max wait,     │
+│                │          │              │ more patience        │
+├────────────────┼──────────┼──────────────┼──────────────────────┤
+│ maxRetries     │    3     │   0-10       │ Higher amplification,│
+│                │          │              │ more chances         │
+├────────────────┼──────────┼──────────────┼──────────────────────┤
+│ jitterFactor   │  full    │ none/full/   │ More randomness,     │
+│                │          │ equal/dec    │ fewer retry waves    │
+└────────────────┴──────────┴──────────────┴──────────────────────┘
+`} />
+
+## Retry Budget Implementation
+
+The retry budget uses a token bucket algorithm. The bucket holds tokens that replenish at a fixed rate. Each retry consumes one token. If the bucket is empty, the retry is skipped.
+
+```python
+class TokenBucket:
+    def __init__(self, capacity: int, refill_rate: float):
+        self.capacity = capacity
+        self.tokens = capacity
+        self.refill_rate = refill_rate  # tokens per second
+        self.last_refill = time.monotonic()
+
+    def try_consume(self, tokens: int = 1) -> bool:
+        now = time.monotonic()
+        elapsed = now - self.last_refill
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+        self.last_refill = now
+        if self.tokens >= tokens:
+            self.tokens -= tokens
+            return True
+        return False
+```
+
+The budget capacity is the maximum burst of retries allowed in a short window. A typical capacity is 10 tokens. The refill rate is the sustained retry rate. A typical rate is 2 tokens per second.
+
+<AsciiDiagram
+  id="retries/deep-dive-token-bucket"
+  title="Token Bucket Retry Budget — Consumption and Refill"
+  alt="Diagram showing a token bucket with 10 tokens, arrows showing tokens consumed by retry attempts and tokens being added at a steady rate"
+  caption="Token bucket: retries consume tokens, time refills them"
+  content={`
+                        ┌─────────────────────┐
+                        │   Token Bucket       │
+                        │   Capacity: 10       │
+                        │   Refill: 2/s        │
+                        │                      │
+                        │  ┌──┬──┬──┬──┬──┐   │
+                        │  │T │T │T │T │T │   │
+                        │  │o │o │o │o │o │   │
+                        │  │k │k │k │k │k │   │
+                        │  ├──┼──┼──┼──┼──┤   │
+                        │  │T │T │T │T │T │   │
+                        │  │o │o │o │o │o │   │
+                        │  │k │k │k │k │k │   │
+                        │  └──┴──┴──┴──┴──┘   │
+                        │                      │
+                        └──────────┬───────────┘
+                                   │
+          ┌────────────────────────┼────────────────────────┐
+          │                        │                        │
+          ▼                        ▼                        ▼
+   ┌───────────┐          ┌───────────────┐        ┌──────────────┐
+   │  Retry 1  │          │   Retry 2     │        │   Refill     │
+   │ consumes  │          │   consumes    │        │   +2 tokens  │
+   │ 1 token   │          │   1 token     │        │   per second │
+   └───────────┘          └───────────────┘        └──────────────┘
+`} />
+
+## Full Retry Executor Implementation
+
+```python
+import random
+import threading
+import time
+import heapq
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional, Callable
+
+class RetryDecision(Enum):
+    SUCCESS = "success"
+    RETRYABLE_ERROR = "retryable"
+    NON_RETRYABLE_ERROR = "non_retryable"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    MAX_RETRIES_EXCEEDED = "max_retries_exceeded"
+    CIRCUIT_OPEN = "circuit_open"
+
+@dataclass
+class RetryConfig:
+    initial_delay_ms: float = 100.0
+    multiplier: float = 2.0
+    max_delay_ms: float = 30000.0
+    max_retries: int = 3
+    jitter_type: str = "full"  # none, full, equal, decorrelated
+    budget_capacity: int = 10
+    budget_refill_rate: float = 2.0  # tokens per second
+
+class RetryExecutor:
+    def __init__(self, config: RetryConfig):
+        self.config = config
+        self._attempt_counters: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self._budget_tokens = config.budget_capacity
+        self._last_refill = time.monotonic()
+        self._backoff_curve = self._compute_curve()
+
+    def _compute_curve(self) -> list[float]:
+        curve = []
+        delay = self.config.initial_delay_ms
+        for _ in range(self.config.max_retries):
+            curve.append(min(delay, self.config.max_delay_ms))
+            delay *= self.config.multiplier
+        return curve
+
+    def _apply_jitter(self, base_delay_ms: float) -> float:
+        jitter = self.config.jitter_type
+        if jitter == "none":
+            return base_delay_ms / 1000.0
+        elif jitter == "full":
+            return random.uniform(0, base_delay_ms) / 1000.0
+        elif jitter == "equal":
+            half = base_delay_ms / 2.0
+            return (half + random.uniform(0, half)) / 1000.0
+        elif jitter == "decorrelated":
+            return random.uniform(base_delay_ms, base_delay_ms * 3) / 1000.0
+        return base_delay_ms / 1000.0
+
+    def _check_budget(self) -> bool:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._budget_tokens = min(
+            self.config.budget_capacity,
+            self._budget_tokens + elapsed * self.config.budget_refill_rate
+        )
+        self._last_refill = now
+        if self._budget_tokens >= 1:
+            self._budget_tokens -= 1
+            return True
+        return False
+
+    def execute(
+        self,
+        request_id: str,
+        operation: Callable,
+        is_retryable: Callable,
+        circuit_open: Callable,
+    ) -> tuple[RetryDecision, Optional[Exception]]:
+        if circuit_open():
+            return (RetryDecision.CIRCUIT_OPEN, Exception("circuit is open"))
+
+        attempt = 0
+        last_error = None
+
+        while attempt <= self.config.max_retries:
+            if attempt > 0:
+                if not self._check_budget():
+                    return (RetryDecision.BUDGET_EXHAUSTED, last_error)
+
+                if attempt > self.config.max_retries:
+                    return (RetryDecision.MAX_RETRIES_EXCEEDED, last_error)
+
+                delay = self._apply_jitter(self._backoff_curve[attempt - 1])
+                time.sleep(delay)
+
+            try:
+                response = operation()
+                return (RetryDecision.SUCCESS, None)
+            except Exception as e:
+                last_error = e
+                if not is_retryable(e):
+                    return (RetryDecision.NON_RETRYABLE_ERROR, e)
+                attempt += 1
+
+        return (RetryDecision.MAX_RETRIES_EXCEEDED, last_error)
+```
+
+The executor provides a complete retry lifecycle in a single function. The caller provides the operation to execute, a function to classify errors as retryable or not, and a function to check circuit breaker state. The executor handles backoff, jitter, budget, and attempt counting.
+
+## Retry State Machine
+
+Each retry instance transitions through a well-defined set of states. The state machine has four states: INITIAL, WAITING, RETRYING, and DONE (terminal). The transitions between states are triggered by events: request failure, budget check, backoff completion, and success.
+
+<AsciiDiagram
+  id="retries/deep-dive-state-machine"
+  title="Retry State Machine — Four States and Their Transitions"
+  alt="State machine diagram with four states: INITIAL, WAITING, RETRYING, and DONE, showing transitions triggered by events like failure, budget check, backoff completion, and success"
+  caption="Retry state machine: each retry instance moves through four states"
+  content={`
+                    ┌──────────────────────────────────────────┐
+                    │                                          │
+                    │  ┌──────────┐                            │
+                    │  │ INITIAL  │  Request failed            │
+                    │  │          │  and is retryable          │
+                    │  └────┬─────┘                            │
+                    │       │                                  │
+                    │       │  Circuit closed                  │
+                    │       │  Budget available                │
+                    │       │  Attempt < maxRetries            │
+                    │       ▼                                  │
+                    │  ┌──────────┐                            │
+                    │  │ WAITING  │  Backoff delay expires     │
+                    │  │          │────────────────────────┐   │
+                    │  └──────────┘                        │   │
+                    │       │                              │   │
+                    │       │  Circuit opens or            │   │
+                    │       │  budget exhausted            │   │
+                    │       ▼                              │   │
+                    │  ┌──────────┐                        │   │
+                    │  │ RETRYING │  Request succeeds ─────┼───│────┐
+                    │  │          │                        │   │    │
+                    │  └────┬─────┘                        │   │    │
+                    │       │                              │   │    │
+                    │       │  Request fails               │   │    │
+                    │       │  and attempt < maxRetries    │   │    │
+                    │       └─────────────┐                │   │    │
+                    │                     │                │   │    │
+                    │                     ▼                │   │    │
+                    │  ┌──────────┐  Retry exhausted      │   │    │
+                    │  │   DONE   │<──────────────────────┘   │    │
+                    │  │          │  Success                  │    │
+                    │  │          │<──────────────────────────┼────┘
+                    │  │          │  Circuit open or budget   │
+                    │  │          │  exhausted                │
+                    │  │          │<──────────────────────────┘
+                    │  └──────────┘
+                    │
+                    │  INITIAL -> request classified as retryable
+                    │  WAITING -> computing and applying backoff
+                    │  RETRYING -> sending the retry request
+                    │  DONE -> terminal (success or exhausted)
+                    └──────────────────────────────────────────┘
+`} />
+
+The state machine is implemented by the retry executor. Each state corresponds to a phase in the execute method. INITIAL is the error classification phase. WAITING is the backoff sleep. RETRYING is the operation call. DONE is the return statement.
+
+The transitions are guarded by conditions. The transition from INITIAL to WAITING requires the circuit to be closed, the budget to have tokens, and the attempt counter to be below maxRetries. The transition from WAITING to RETRYING requires the backoff delay to expire. The transition from RETRYING to DONE requires success or exhaustion.
+
+The deep dive covered the internal architecture, data structures, lifecycle, consistency implications, performance characteristics, and configuration parameters of a production retry system. The next section shows how retries fit into a complete system architecture, including integration patterns and multi-region deployments.

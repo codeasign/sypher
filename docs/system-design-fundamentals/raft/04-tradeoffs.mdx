@@ -1,0 +1,236 @@
+---
+id: raft-tradeoffs
+title: Raft — Trade-offs and Failure Modes
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Core Tension: Safety vs. Availability During Leader Election
+
+The fundamental trade-off in Raft is between safety and availability during leader transitions. During an election (150-300ms by default), the cluster cannot commit new entries. The leader is unknown, and no node can accept client writes. The cluster is effectively unavailable for writes.
+
+This window can be extended dramatically under certain conditions:
+- **Split votes** can cause repeated elections, extending unavailability to seconds
+- **Network jitter** can trigger spurious elections even with a healthy leader
+- **GC pauses** on the leader can cause followers to timeout and start elections
+
+The trade-off is configurable through election timeout values:
+- Shorter timeouts (100-200ms): faster failover, more spurious elections
+- Longer timeouts (300-500ms): fewer spurious elections, longer failover
+
+For cross-region deployments, the timeout must be tuned to the maximum network latency between nodes. A 60ms RTT cross-region link needs a minimum timeout of approximately 200ms to avoid false positives.
+
+<AsciiDiagram
+  id="raft/tradeoffs-election-timing"
+  alt="Timeline showing two scenarios: fast failover with short timeout but risk of spurious elections, and slow failover with long timeout and stable leader"
+  caption="Safety-availability trade-off during leader election"
+  content={`
+Scenario A: Short timeout (150ms) — fast failover, spurious election risk
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  Leader ────────────────────────────────[pause 200ms]────    │
+│  Follower 1          │<-- timeout after 150ms                │
+│                     ╱╲  starts election                      │
+│  Follower 2          │<-- timeout after 130ms                │
+│                     ╱╲  starts election (concurrent!)        │
+│                                                              │
+│  Result: Split vote, both candidates, no leader for 300ms    │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+
+Scenario B: Longer timeout (300ms) — stable, slower failover
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  Leader ────────────────────────────────[pause 200ms]────    │
+│                                                              │
+│  Follower 1  (timer resets at 200ms — leader resumed)       │
+│  Follower 2  (timer resets at 200ms — leader resumed)       │
+│                                                              │
+│  No election! Leader recovered within the timeout window.    │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+`}
+/>
+
+## Decision Matrix
+
+Use this matrix to decide which Raft configuration fits your workload.
+
+| Scenario | Recommended Timeout | Cluster Size | Read Optimization | Rationale |
+|---|---|---|---|---|
+| Single-region, low latency | 150-300ms | 3 | Leader-only | Fast failover, low latency, simple operation |
+| Single-region, high throughput | 150-250ms | 5 | Read-index with followers | Spread read load, tolerate more failures |
+| Cross-region (US-EU) | 500-1000ms | 5 | Follower reads with locality | Avoid spurious elections from WAN latency |
+| Coordination service (Kubernetes etcd) | 200-400ms | 3 or 5 | Cache reads locally | Config reads dominate, writes are rare |
+| Financial transactions | 150-300ms | 5 | Leader-only with leasing | Strong consistency critical, no stale reads |
+| IoT / Edge with unreliable network | 1000-3000ms | 3 | None (reads only from leader) | Tolerate frequent disconnections |
+| Multi-region with witness nodes | 500ms (voting nodes) | 3 + witnesses | Follower reads | Minimize cross-region RTT for quorum |
+
+## Failure Modes
+
+### Split Vote Loops
+
+**What happens:** Multiple followers time out at nearly the same instant and all become candidates. Each sends RequestVote RPCs, and each other node has already voted for a different candidate. No candidate reaches majority. All candidates time out, increment their term, and try again. The loop continues until randomized timeouts happen to spread the retries.
+
+**Impact:** Write unavailability lasting 500ms to several seconds.
+
+**Mitigation:** Pre-vote (candidate checks if it can win before starting a real election). Also, ensure election timeout randomization has sufficient spread (range at least 150ms).
+
+### Stale Leader Serving Reads
+
+**What happens:** A network partition separates the leader from a majority of followers. The leader continues serving reads from its state machine, believing it is still the leader. Meanwhile, the majority side elects a new leader and commits new writes. The old leader is serving stale data.
+
+**Impact:** Clients read stale, potentially inconsistent data.
+
+**Mitigation:** Use leader leasing (the leader obtains a lease from followers that prevents other leaders from being elected for a fixed duration). Alternately, use read-index with verification against followers before serving reads.
+
+### Disk-Full Crash Loop
+
+**What happens:** The log grows until the disk is full. The Raft node cannot append new entries or create snapshots. It crashes. When the process restarts, it replays the log from disk and immediately encounters the full-disk error again. The node enters a crash loop.
+
+**Impact:** Permanent loss of a node from the cluster. If a majority of nodes experience this simultaneously, the entire cluster fails.
+
+**Mitigation:** (a) Proactive log compaction with headroom monitoring, (b) separate log storage from state machine storage to bound worst-case log growth, (c) disk usage alerts at 70% and 85% thresholds.
+
+<AsciiDiagram
+  id="raft/tradeoffs-disk-full-crash-loop"
+  alt="State diagram showing the crash loop: node running, log growing, disk full, crash, restart, replay log, disk full again"
+  caption="Disk-full crash loop — a dangerous positive feedback cycle"
+  content={`
+                 ┌──────────────────────────────────┐
+                 │                                  │
+                 ▼                                  │
+    ┌────────────────────┐                         │
+    │  Node Running       │  log grows to 100%     │
+    │  Log entries added  │  of disk               │
+    │  Disk at 85%        │                        │
+    └─────────┬──────────┘                         │
+              │                                    │
+              ▼                                    │
+    ┌────────────────────┐                         │
+    │  DISK FULL          │                         │
+    │  Cannot append      │                         │
+    │  Cannot snapshot    │                         │
+    └─────────┬──────────┘                         │
+              │                                    │
+              ▼                                    │
+    ┌────────────────────┐                         │
+    │  Process Crashes    │                         │
+    │  (OOM or fatal)     │                         │
+    └─────────┬──────────┘                         │
+              │                                    │
+              ▼                                    │
+    ┌────────────────────┐                         │
+    │  Process Restarts   │──── replays log ────────┘
+    │  Replays 1M log     │  disk still full
+    │  entries            │
+    │  Disk still full    │
+    └─────────┬──────────┘
+              │
+              ▼
+        Repeat forever
+`}
+/>
+
+### Network Partition with Latency Amplification
+
+**What happens:** Partial packet loss between the leader and some followers causes retransmissions that delay heartbeats. Followers experience election timeouts and start elections. The leader, still receiving some acknowledgments, does not step down. The cluster enters a state with frequent leader changes (leader flapping).
+
+**Impact:** Severely degraded throughput (each leader change discards pending proposals and requires log matching).
+
+**Mitigation:** Increase heartbeat frequency and election timeout relative to measured network jitter. Use dedicated network interfaces for Raft traffic.
+
+### Concurrent Compaction and Leader Election
+
+**What happens:** A follower is in the middle of installing a large snapshot when the leader fails. The follower cannot participate in the election because its log is inconsistent during snapshot installation. The remaining nodes may not have a majority.
+
+**Impact:** Prolonged unavailability until the snapshot completes.
+
+**Mitigation:** Implement snapshot installation in a background process that does not block the consensus module. The follower should retain enough log entries to still participate in elections during snapshot installation.
+
+## Anti-Patterns
+
+### Using Raft for High-Throughput Data Replication
+
+Raft is not designed for replicating large volumes of customer data (images, videos, database rows). It is designed for replicating the **metadata** that controls access to that data. Using Raft for all data replication limits throughput to the leader's fsync rate (10-30K ops/sec per group).
+
+**Better approach:** Use Raft for the configuration and coordination plane. Use asynchronous replication (Kafka, change data capture) for the data plane.
+
+### Over-Sized Clusters
+
+Raft clusters larger than 7 nodes degrade rapidly. Each additional node adds:
+- One more AppendEntries RPC per write (network overhead)
+- One more voter in each election (longer election time)
+- One more potential source of latency (slowest follower delays commit)
+
+For clusters that need more than 7 replicas, use hierarchical Raft (a top-level Raft cluster that coordinates sub-clusters) or multi-Raft (multiple independent groups).
+
+### Disabling fsync for Performance
+
+Disabling synchronous fsync improves throughput by 3-5x but destroys Raft's durability guarantee. If the leader crashes after acknowledging a write but before the data reaches disk, the write is lost. If multiple nodes crash simultaneously, committed entries may be permanently lost.
+
+**If you must disable fsync:** Deploy at least 5 nodes and accept that a simultaneous multi-node failure can cause data loss. This is acceptable for some caching and monitoring use cases but never for financial or coordination systems.
+
+### Asymmetric Cluster Sizes (Even Number of Nodes)
+
+A 2-node Raft cluster is dangerous: losing either node causes unavailability because the surviving node cannot form a majority. A 4-node cluster tolerates 1 failure (quorum = 3) but wastes resources compared to 3 nodes (same fault tolerance).
+
+**Rule:** Use odd-sized clusters (3, 5, 7). The cost of the extra node beyond 3 is justified by the ability to lose more nodes: 5-node tolerates 2 failures.
+
+### Not Handling Client Retries Correctly
+
+A client sends a write, the leader commits it, but the response is lost. The client retries. Without idempotency, the write is applied twice. Raft ensures at-least-once delivery by default.
+
+**Better approach:** Include a unique request ID in each client request. The Raft state machine deduplicates based on request IDs, providing exactly-once semantics.
+
+## When NOT to Use Raft
+
+**When eventual consistency suffices:** If your application can tolerate stale reads for seconds or minutes (CDN, search indexing, analytics), Raft's coordination cost is unnecessary overhead.
+
+**When throughput exceeds 100K writes/sec per group:** Even with batching and pipeline replication, a single Raft group caps at approximately 100K writes/sec. Beyond this, you must shard into multiple groups (multi-Raft).
+
+**When latency must be under 1ms:** Raft's minimum latency (one network RTT + two fsyncs) is typically 2-5ms in a single datacenter. For sub-millisecond latency, use leaderless replication (CRDTs, gossip) or single-node stores.
+
+**When you have fewer than 3 replicas:** Raft requires at least 3 nodes to function (2 is not a majority of 2, and a single-node system does not need consensus).
+
+**When most data is rarely read and has no strict ordering requirements:** The cost of maintaining a serializable log for cold data is not justified. Use a simpler replication mechanism.
+
+<AsciiDiagram
+  id="raft/tradeoffs-decision-tree"
+  alt="Decision tree for choosing Raft versus alternatives: eventual consistency, multi-Raft, CRDTs, or single-node"
+  caption="Decision tree: when to use Raft and when to use alternatives"
+  content={`
+Do you need strong consistency?
+  │
+  ├── No  ─────> Use eventual consistency (CRDTs, gossip)
+  │
+  └── Yes
+        │
+        Do you need < 1ms latency?
+        │
+        ├── Yes ──> Use single-node with synchronous replication
+        │
+        └── No
+              │
+              Do you need > 100K writes/sec?
+              │
+              ├── Yes ──> Use Multi-Raft (sharded Raft groups)
+              │
+              └── No
+                    │
+                    Do you have > 7 replicas?
+                    │
+                    ├── Yes ──> Use hierarchical Raft
+                    │
+                    └── No
+                          │
+                          Do you need exactly-once semantics?
+                          │
+                          ├── Yes ──> Use Raft with idempotency
+                          │
+                          └── No ──> Raft is still a good choice
+                                     (add client deduplication later)
+`}
+/>

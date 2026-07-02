@@ -1,0 +1,461 @@
+---
+id: circuit-breaker-architecture
+title: Circuit Breaker Architecture
+sidebar_label: Architecture
+position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Circuit Breaker Architecture
+
+## Naive Architecture: Timeout-Only
+
+The simplest approach to handling slow dependencies is a timeout. Every HTTP client has a connect timeout (typically 500ms), a read timeout (typically 2s), and a total timeout (typically 5s). When the dependency exceeds the timeout, the client throws an exception and the thread is released.
+
+### Why Timeouts Alone Fail
+
+A timeout prevents a single thread from blocking forever. It does not prevent cascading failure. Consider a service with 200 threads in its thread pool. Each thread makes a call with a 5-second timeout. If the payment service slows to 30 seconds per request, every thread hits the timeout after 5 seconds. But the thread still spent 5 seconds blocked. If you are receiving 100 requests per second and each request spends 5 seconds waiting, you need 500 threads to keep up. The thread pool has 200. Requests queue up. The queue grows. Memory grows. The service dies.
+
+```
+Time:  0s    5s    10s   15s   20s   25s   30s
+       │     │     │     │     │     │     │
+
+Thread 1:  [────request 1────]    [────request 6────]
+Thread 2:  [────request 2────]    [────request 7────]
+Thread 3:  [────request 3────]    [────request 8────]
+Thread 4:  [────request 4────]    [────request 9────]
+Thread 5:  [────request 5────]    [────request 10───]
+
+Queue:     r6 r7 r8 r9 r10 r11 r12 r13 r14 r15 ...
+
+Result: Thread pool exhausted at t=5s. Queue grows unbounded.
+        Memory exhausted at t=15s. Service crashes.
+```
+
+### The Timeout-Only Failure Cascade
+
+**Phase 1 (0-5 seconds):** Dependency slows from 200ms to 30s. Threads start blocking for the full 5-second timeout. After 5 seconds, 100 requests have arrived. Each thread blocks for 5 seconds. With a 200-thread pool, all 200 threads are blocked by second 5.
+
+**Phase 2 (5-15 seconds):** Thread pool is exhausted. New requests enter the queue. The queue depth grows by 100 entries per second. At 100 requests per second and 5-second queue wait, the queue holds 500 entries. At 2 KB per request, that is 1 MB of queued data.
+
+**Phase 3 (15-20 seconds):** The service runs out of memory. The OOM killer terminates the JVM or container. All 200 in-flight requests are lost. All 500 queued requests are lost.
+
+**Phase 4 (20-60 seconds):** Downstream services that depended on this service start timing out. Their thread pools fill up. The cascade continues through service A (ordering), service B (inventory), and service C (warehouse).
+
+<AsciiDiagram
+  id="circuit-breaker/architecture-naive"
+  title="Timeout-Only Failure Cascade"
+  alt="Timeline showing the four phases of failure cascade with timeout-only protection: phase 1 dependency slows, phase 2 thread pool exhausts, phase 3 memory exhaustion causes OOM crash, phase 4 cascading failure propagates to downstream services"
+  content={`
+    Phase 1 (0-5s)        Phase 2 (5-15s)       Phase 3 (15-20s)      Phase 4 (20-60s)
+    ┌─────────────────┐  ┌─────────────────┐   ┌────────────────┐   ┌────────────────┐
+    │ Dependency      │  │ Thread Pool     │   │ OOM Killer     │   │ Cascade        │
+    │ slows to 30s    │  │ exhausted       │   │ terminates     │   │ propagates     │
+    │                  │  │                  │   │                │   │                │
+    │ Payment DB      │  │ 200 threads      │   │ JVM heap:      │   │ Service A      │
+    │ checkpoint      │  │ all blocked      │   │ 512 MB used    │   │ (ordering)     │
+    │ lock contention │  │                  │   │ 768 MB limit   │   │ times out      │
+    │                  │  │ Queue:           │   │                │   │                │
+    │ All requests    │  │ 500 entries      │   │ Container      │   │ Service B      │
+    │ timeout at 5s   │  │ Memory: 1MB+    │   │ killed         │   │ (inventory)    │
+    │                  │  │ in queue data    │   │                │   │ fills pool     │
+    │ Latency:        │  │                  │   │ Restart: 45s   │   │                │
+    │ 200ms to 30s    │  │                  │   │                │   │ Service C      │
+    │                  │  │                  │   │                │   │ (warehouse)    │
+    └─────────────────┘  └─────────────────┘   └────────────────┘   └────────────────┘
+
+    Timeline:
+    0s ──5s── 10s── 15s── 20s── 25s── 30s── 35s── 40s── 45s── 50s── 55s── 60s
+    │          │          │          │          │          │          │
+    Dep slows  Pool full  OOM        A starts   B starts   C starts   All 4 down
+  `}
+  caption="Four-phase failure cascade with timeout-only protection. A single dependency slowing from 200ms to 30s causes thread pool exhaustion by 5 seconds, OOM crash by 15 seconds, and cascading failure to three downstream services by 60 seconds."
+/>
+
+## Production Architecture: Circuit Breaker + Bulkhead + Fallback
+
+A production-grade architecture combines three patterns:
+
+**Circuit Breaker:** Prevents calls to an unhealthy dependency. Responds immediately with error or fallback. Operates at the request level by checking state before each request and recording outcome after each request.
+
+**Bulkhead:** Limits concurrent calls to each dependency. A dedicated thread pool of 10 threads for the payment service prevents payment problems from affecting the inventory service.
+
+**Fallback:** Provides a degraded response when the circuit is open or the bulkhead is full. Fallbacks enable graceful degradation.
+
+### How They Work Together
+
+When a request arrives to call the payment service:
+1. The circuit breaker checks its state. If OPEN, the request is immediately redirected to the fallback. No thread is consumed.
+2. If CLOSED or HALF_OPEN, the request enters the payment bulkhead (a dedicated thread pool with 10 threads).
+3. If the bulkhead is full (all 10 threads are busy), the request waits in the bulkhead queue (up to 5 entries). If the queue is full, the request is rejected and the fallback is invoked.
+4. If a bulkhead thread becomes available, it makes the actual HTTP call to the payment service.
+5. If the call succeeds, the result is returned. The circuit breaker records a success.
+6. If the call fails, the exception is returned to the caller. The circuit breaker records a failure.
+
+### Layered Protection Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Checkout Service                         │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────┐        │
+│  │                 Request Handler                       │        │
+│  │   HTTP request → deserialize → business logic        │        │
+│  └────────────────────┬─────────────────────────────────┘        │
+│                       │                                         │
+│         ┌─────────────┼──────────────┐                          │
+│         ▼             ▼              ▼                          │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐                   │
+│  │ Payment    │ │ Inventory  │ │ Shipping   │                   │
+│  │ Client     │ │ Client     │ │ Client     │                   │
+│  └─────┬──────┘ └─────┬──────┘ └─────┬──────┘                   │
+│        │               │              │                          │
+│  ┌─────▼──────┐ ┌─────▼──────┐ ┌─────▼──────┐                   │
+│  │ Circuit    │ │ Circuit    │ │ Circuit    │                   │
+│  │ Breaker    │ │ Breaker    │ │ Breaker    │                   │
+│  │ Pay        │ │ Inv        │ │ Ship       │                   │
+│  └─────┬──────┘ └─────┬──────┘ └─────┬──────┘                   │
+│        │               │              │                          │
+│  ┌─────▼──────┐ ┌─────▼──────┐ ┌─────▼──────┐                   │
+│  │ Bulkhead   │ │ Bulkhead   │ │ Bulkhead   │                   │
+│  │ 10 threads │ │ 50 threads │ │ 10 threads │                   │
+│  │ q: 5       │ │ q: 25      │ │ q: 5       │                   │
+│  └─────┬──────┘ └─────┬──────┘ └─────┬──────┘                   │
+│        │               │              │                          │
+│  ┌─────▼──────┐ ┌─────▼──────┐ ┌─────▼──────┐                   │
+│  │ Fallback   │ │ Fallback   │ │ Fallback   │                   │
+│  │ cache      │ │ empty list │ │ 5 days     │                   │
+│  └────────────┘ └────────────┘ └────────────┘                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+<AsciiDiagram
+  id="circuit-breaker/architecture-layered"
+  title="Layered Resilience Architecture"
+  alt="Architecture diagram showing a checkout service with three dependency clients, each protected by a circuit breaker with per-dependency configuration, a bulkhead with per-dependency thread pool limits, and a fallback with per-dependency degraded response strategy"
+  content={`
+    ┌──────────────────────────────────────────────────────────────┐
+    │                    Checkout Service                          │
+    │                                                              │
+    │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+    │  │  Payment     │  │  Inventory   │  │  Shipping    │       │
+    │  │  Client      │  │  Client      │  │  Client      │       │
+    │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘       │
+    │         │                 │                 │              │
+    │  ┌──────▼───────┐  ┌──────▼───────┐  ┌──────▼───────┐       │
+    │  │ CB: PAY      │  │ CB: INV      │  │ CB: SHP      │       │
+    │  │ count=5      │  │ count=10     │  │ count=5      │       │
+    │  │ rate=50%     │  │ rate=60%     │  │ rate=50%     │       │
+    │  │ timeout=30s  │  │ timeout=60s  │  │ timeout=15s  │       │
+    │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘       │
+    │         │                 │                 │              │
+    │  ┌──────▼───────┐  ┌──────▼───────┐  ┌──────▼───────┐       │
+    │  │ BH: max=10   │  │ BH: max=50   │  │ BH: max=10   │       │
+    │  │ queue=5      │  │ queue=25     │  │ queue=5      │       │
+    │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘       │
+    │         │                 │                 │              │
+    │  ┌──────▼───────┐  ┌──────▼───────┐  ┌──────▼───────┐       │
+    │  │ FB: cached   │  │ FB: empty    │  │ FB: default  │       │
+    │  │     balance   │  │     list     │  │     5 days   │       │
+    │  └──────────────┘  └──────────────┘  └──────────────┘       │
+    │                                                              │
+    │  Legend: CB = Circuit Breaker | BH = Bulkhead | FB = Fallback │
+    └──────────────────────────────────────────────────────────────┘
+                                                              │
+                    ┌───────────┐  ┌───────────┐  ┌───────────┐
+                    │ Payment   │  │ Inventory │  │ Shipping  │
+                    │ Service   │  │ Service   │  │ Service   │
+                    └───────────┘  └───────────┘  └───────────┘
+  `}
+  caption="Layered resilience architecture for a checkout service with three dependencies. Each dependency client has its own independent circuit breaker, bulkhead thread pool, and fallback strategy. The payment dependency is most aggressively protected with failureCount=5 while inventory is more permissive with failureCount=10."
+/>
+
+## Integration Patterns
+
+### Pattern 1: Decorator Pattern
+
+Wrap the dependency client with a circuit breaker decorator. The decorator implements the same interface as the original client.
+
+```
+interface PaymentClient {
+    PaymentResponse charge(PaymentRequest request);
+}
+
+class CircuitBreakerDecorator implements PaymentClient {
+    private final PaymentClient delegate;
+    private final CircuitBreaker breaker;
+    private final FallbackProvider<PaymentRequest, PaymentResponse> fallback;
+
+    PaymentResponse charge(PaymentRequest request) {
+        if (!breaker.isRequestAllowed()) {
+            return fallback.apply(request);
+        }
+        try {
+            PaymentResponse response = delegate.charge(request);
+            breaker.recordSuccess();
+            return response;
+        } catch (Exception e) {
+            breaker.recordFailure();
+            return fallback.apply(request);
+        }
+    }
+}
+```
+
+### Pattern 2: Interceptor Pattern
+
+Use a framework interceptor (Spring AOP, Jakarta EE interceptor, gRPC interceptor) to apply the circuit breaker transparently via annotations.
+
+```
+@CircuitBreaker(name = "paymentService", fallbackMethod = "paymentFallback")
+public PaymentResponse charge(PaymentRequest request) {
+    return paymentClient.charge(request);
+}
+
+public PaymentResponse paymentFallback(PaymentRequest request, Throwable t) {
+    return PaymentResponse.cached(request.getUserId());
+}
+```
+
+### Pattern 3: Proxy Pattern (Service Mesh)
+
+Deploy a proxy layer (sidecar, service mesh) that implements circuit breaking. The application code is completely unaware of the circuit breaker. The proxy intercepts all outbound traffic and applies circuit breaking based on configuration.
+
+```
+Pod:
+  ┌────────────────┐
+  │ Application    │
+  │ (no CB code)   │──> localhost:8080
+  └────────────────┘
+         │
+         ▼
+  ┌────────────────┐
+  │ Envoy Sidecar  │──> payment.service:443
+  │ (circuit       │
+  │  breaker)      │
+  └────────────────┘
+```
+
+The proxy pattern provides the strongest isolation but adds latency through an additional network hop and operational complexity from managing sidecar lifecycles.
+
+<AsciiDiagram
+  id="circuit-breaker/architecture-proxy"
+  title="Proxy-Based Circuit Breaker (Envoy/Istio)"
+  alt="Architecture diagram showing a Kubernetes pod with an application container and an Envoy sidecar proxy. The application sends requests to localhost, the Envoy proxy intercepts them and applies circuit breaking via outlier detection before forwarding to the upstream payment service"
+  content={`
+    ┌──────────────────────────────────────────────────────────┐
+    │                    Kubernetes Node                        │
+    │                                                          │
+    │  ┌──────────────────────────────────────────────────┐    │
+    │  │                Pod: checkout-7f9b8c              │    │
+    │  │                                                  │    │
+    │  │  ┌────────────────────┐    ┌──────────────────┐  │    │
+    │  │  │  Application       │    │  Envoy Sidecar    │  │    │
+    │  │  │  (checkout.jar)    │    │  (envoy-proxy)    │  │    │
+    │  │  │                    │    │                   │  │    │
+    │  │  │  httpClient.get()  │───>│  CircuitBreaker   │  │    │
+    │  │  │  port 8080         │    │  OutlierDetection │  │    │
+    │  │  │                    │    │  ConnectionPool   │  │    │
+    │  │  └────────────────────┘    │  Port 15001       │  │    │
+    │  │                            └────────┬──────────┘  │    │
+    │  └─────────────────────────────────────┼─────────────┘    │
+    │                                        │                  │
+    │                            ┌───────────▼──────────┐       │
+    │                            │  payment:8080         │       │
+    │                            │  (payment-service)    │       │
+    │                            └──────────────────────┘       │
+    │                                                          │
+    │  Istio DestinationRule config:                           │
+    │  outlierDetection:                                       │
+    │    consecutive5xxErrors: 5                               │
+    │    interval: 10s                                         │
+    │    baseEjectionTime: 30s                                 │
+    │  connectionPool:                                         │
+    │    http: http2MaxRequests: 1000                         │
+    └──────────────────────────────────────────────────────────┘
+  `}
+  caption="Proxy-based circuit breaker using Envoy sidecar in a Kubernetes pod. The application sends requests to localhost, and the Envoy proxy intercepts traffic, applies circuit breaking via outlier detection and connection pool limits, and forwards to the upstream payment service."
+/>
+
+## Multi-Region Circuit Breaker
+
+In a multi-region deployment, each region has its own circuit breaker state:
+
+**Region-Specific Breakage:** The circuit breaker for the payment service in us-east-1 opens independently from the breaker in eu-west-1. This is correct: the payment service in us-east-1 might be unhealthy while the eu-west-1 instance is fine.
+
+**Cross-Region Calls:** If us-east-1 calls the payment service in eu-west-1 as a failover, the local circuit breaker in us-east-1 does not know about the health of the remote instance. You need dedicated cross-region circuit breakers with longer timeouts (30 seconds versus 10 seconds) to account for higher inter-region latency of 100-200ms.
+
+```
+us-east-1:
+  ┌─────────────────────────────────┐
+  │  Checkout Service               │
+  │  CB: payment-us-east → timeout=10s │──> payment.us-east-1
+  │  CB: payment-eu-west → timeout=30s │──> payment.eu-west-1
+  └─────────────────────────────────┘
+
+eu-west-1:
+  ┌─────────────────────────────────┐
+  │  Checkout Service               │
+  │  CB: payment-eu-west → timeout=10s │──> payment.eu-west-1
+  │  CB: payment-us-east → timeout=30s │──> payment.us-east-1
+  └─────────────────────────────────┘
+```
+
+<AsciiDiagram
+  id="circuit-breaker/architecture-multi-region"
+  title="Multi-Region Circuit Breaker Topology"
+  alt="Two-region deployment diagram showing us-east-1 and eu-west-1. Each region has a checkout service with two circuit breakers: one for the local payment service and one for the remote payment service. Cross-region calls have longer timeouts"
+  content={`
+    ┌───────────────── us-east-1 ─────────────────┐
+    │                                              │
+    │  ┌────────────────────────────────────┐      │
+    │  │  Checkout Service                  │      │
+    │  │  ┌──────────┐  ┌────────────┐     │      │
+    │  │  │ CB: local │  │ CB: remote │     │      │
+    │  │  │ to=10s    │  │ to=30s     │     │      │
+    │  │  │ cnt=5     │  │ cnt=3     │     │      │
+    │  │  └────┬─────┘  └─────┬──────┘     │      │
+    │  └───────┼──────────────┼────────────┘      │
+    │          │              │                    │
+    │          ▼              │                    │
+    │  ┌──────────────┐       │   cross-region     │
+    │  │ Payment      │       │   (30s timeout)   │
+    │  │ us-east-1    │       │                    │
+    │  └──────────────┘       │                    │
+    └─────────────────────────┼────────────────────┘
+                              │
+    ┌───────────────── eu-west-1 ────────────────┐
+    │                          │                  │
+    │  ┌────────────────────────────────────┐     │
+    │  │  Checkout Service                  │     │
+    │  │  ┌──────────┐  ┌────────────┐     │     │
+    │  │  │ CB: local │  │ CB: remote │     │     │
+    │  │  │ to=10s    │  │ to=30s     │     │     │
+    │  │  │ cnt=5     │  │ cnt=3     │     │     │
+    │  │  └────┬─────┘  └─────┬──────┘     │     │
+    │  └───────┼──────────────┼────────────┘     │
+    │          │              │                    │
+    │          ▼              │                    │
+    │  ┌──────────────┐       │                    │
+    │  │ Payment      │       │                    │
+    │  │ eu-west-1    │       │                    │
+    │  └──────────────┘       │                    │
+    └─────────────────────────┼────────────────────┘
+                              │
+                              ▼
+    Local CB:  timeout=10s, threshold=5 failures
+    Remote CB: timeout=30s, threshold=3 failures
+  `}
+  caption="Multi-region circuit breaker topology. Each region maintains local circuit breakers for intra-region calls (10-second timeout, 5-failure threshold) and remote circuit breakers for cross-region failover calls (30-second timeout, 3-failure threshold)."
+/>
+
+## Capacity Planning with Circuit Breakers
+
+### Thread Pool Calculation
+
+When using bulkheads, each dependency gets a dedicated thread pool. The pool size depends on the request rate, average latency, and target utilization.
+
+Pool size = R * L * (1 / U)
+
+Where R = request rate in req/s, L = average latency in seconds, U = target utilization.
+
+For the payment service with 50 req/s, 200ms latency, and 60 percent utilization:
+Pool size = 50 * 0.2 * (1 / 0.6) = 16.6, round up to 17 threads.
+
+When the circuit breaker is OPEN, the bulkhead sees zero traffic. The 17 threads remain idle.
+
+### Queue Sizing
+
+Even with circuit breakers, you need a bounded queue in front of each bulkhead. When the bulkhead is full and the circuit is CLOSED, requests wait in the queue. The queue should be bounded to prevent memory exhaustion.
+
+Queue depth = R * maxWait * (1 - U_avg)
+
+For 50 req/s, 5 seconds max wait, and 50 percent average utilization:
+Queue depth = 50 * 5 * (1 - 0.5) = 125 entries.
+
+When the circuit breaker opens, the queue drains rapidly because new requests are fast-failed.
+
+<AsciiDiagram
+  id="circuit-breaker/architecture-capacity"
+  title="Capacity Planning Parameters"
+  alt="Table showing the relationship between request rate, average latency, thread pool size, and queue depth for three dependencies in a checkout service. The table includes memory calculations and the impact of circuit breaker OPEN state on resource usage"
+  content={`
+    ┌─────────────────────────────────────────────────────────────────┐
+    │              Checkout Service Capacity Planning                 │
+    │                                                                 │
+    │  Dependency     Rate     Latency   Threads   Queue   Memory     │
+    │  ─────────────────────────────────────────────────────────────  │
+    │  Payment        50/s     200ms     17        125     4.4 MB    │
+    │  Inventory      200/s    150ms     85        625     22.0 MB   │
+    │  Shipping       25/s     300ms     17        125     4.4 MB    │
+    │  ─────────────────────────────────────────────────────────────  │
+    │  Total:                  119 threads    875 queue entries       │
+    │                                                                 │
+    │  Memory Breakdown:                                              │
+    │  Thread stacks: 119 x 256 KB = 30.5 MB                          │
+    │  Queue memory:  875 x 4 KB   = 3.5 MB                          │
+    │  Connection pools: 3 x 10 x 64 KB = 1.9 MB                     │
+    │  Circuit breaker state: 3 x 120 KB = 360 KB                    │
+    │  ────────────────────────────────────────────────────────      │
+    │  Total memory: ~36 MB                                          │
+    │                                                                 │
+    │  Worst-Case Scenario (Payment CB OPEN):                        │
+    │  Payment threads: 17 (idle, accepting fallback work)           │
+    │  Payment queue:   0 (instant fallback, no queuing)             │
+    │  Memory used:     4.4 MB (reduced by queue drain)              │
+    │  Inventory + Shipping: unaffected                              │
+    └─────────────────────────────────────────────────────────────────┘
+  `}
+  caption="Capacity planning for a checkout service with three dependencies. Total resource footprint is 119 threads and 36 MB. When the payment circuit breaker opens, payment thread usage drops to near zero and the queue drains completely."
+/>
+
+## Operations
+
+### Monitoring Circuit Breakers
+
+You must monitor three metrics for each circuit breaker:
+
+**State:** CLOSED (0), OPEN (1), or HALF_OPEN (2) as a gauge. Alert when the state is OPEN for more than 5 minutes. This indicates the dependency is chronically unhealthy.
+
+**Transition Count:** Number of state transitions per minute as a counter. A high rate of transitions (cycling between OPEN and HALF_OPEN) indicates an unstable dependency. Alert when transitions exceed 10 per minute.
+
+**Rejected Request Count:** Number of requests rejected because the breaker is OPEN as a counter. This measures the blast radius. Alert when rejected count exceeds 1,000 per minute.
+
+### Health Check Integration
+
+The circuit breaker's HALF_OPEN probes can use either the same request path or a dedicated health endpoint:
+- Same request path: more realistic but might overwhelm the dependency with complex processing.
+- Health endpoint: lighter weight but might succeed when the real endpoint fails.
+
+Best practice: use the health endpoint for the initial HALF_OPEN probe, then graduate to full request probes.
+
+### Deployment Considerations
+
+**New Version Deployment:** When you deploy a new service version, the circuit breaker state resets to CLOSED with an empty sliding window. The new instance has no history of failures. If the dependency is unhealthy, the breaker will open again after failureCount requests.
+
+**Rolling Deployment Risk:** During a rolling deployment, new instances start with CLOSED breakers while old instances might have OPEN breakers. The new instances send full traffic to the dependency, potentially overwhelming it. Mitigation: use a 30-second warm-up period where new instances probe the dependency before accepting full traffic.
+
+### Logging
+
+Every state transition should be logged. Every fallback invocation should be logged. Every probe outcome should be logged.
+
+```
+14:23:05.123 [CB] payment.service → OPEN   | failures:5 window:10s timeout:30s
+14:23:05.124 [CB] payment.service → closed  | fallback invoked | userId:99482
+14:23:35.123 [CB] payment.service → HALF_OPEN | timeout:30s expired
+14:23:35.124 [CB] payment.service → probe:1   | status:200 latency:150ms
+14:23:35.456 [CB] payment.service → CLOSED  | probes:3/3 succeeded
+```
+
+## Key Takeaways
+
+- Timeout-only architecture is insufficient because threads still block waiting for timeout expiration. A circuit breaker prevents thread blocking entirely.
+- Production architecture combines circuit breaker (request-level fail-fast), bulkhead (resource-level isolation with dedicated thread pools), and fallback (business-level degradation).
+- Each dependency gets its own dedicated thread pool with dependency-specific sizing and queue depth.
+- Integration patterns range from decorator (in-code wrapping, most flexible) to interceptor (annotation-based, cleanest) to proxy (service mesh, strongest isolation).
+- In multi-region deployments, each region has independent circuit breakers. Cross-region calls need separate breakers with longer timeouts and lower thresholds.
+- Capacity planning uses the formula pool size = R * L * (1/U) to size thread pools and bounded queues.
+- Monitor state, transition count, and rejected request count. Alert on prolonged OPEN state and rapid cycling.
+
+Up next, you will examine the tradeoffs involved in using circuit breakers: when they help, when they hurt, and how to make the right design decisions.

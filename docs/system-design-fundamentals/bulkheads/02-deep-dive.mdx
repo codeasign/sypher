@@ -1,0 +1,579 @@
+---
+id: bulkheads-deep-dive
+title: Bulkheads — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A bulkhead is not a monolithic component. It is a composition of several subsystems that work together to provide resource isolation. Understanding the internal architecture helps you configure, tune, and debug bulkhead implementations.
+
+The architecture consists of four layers. The entry point is the bulkhead facade, which intercepts calls to downstream services. Below the facade is the resource pool, which manages threads or semaphores. Below the pool is the queue, which buffers requests when the pool is full. At the bottom is the rejection handler, which determines what happens when both the pool and the queue are exhausted.
+
+<AsciiDiagram
+  id="bulkheads/deep-dive-internal-architecture"
+  title="Bulkhead Internal Architecture — Four Layers"
+  alt="Stacked architecture diagram showing four layers: bulkhead facade, resource pool, bounded queue, and rejection handler, with the call flow through each layer"
+  caption="The four-layer architecture of a bulkhead implementation. Each layer handles a specific aspect of resource isolation."
+ content={`
+     ┌──────────────────────────────────────────────────────┐
+     │     Layer 1: Bulkhead Facade                         │
+     │  ┌──────────────────────────────────────────────┐    │
+     │  │  interceptCall(dependency, request)           │    │
+     │  │  ── validates dependency is registered        │    │
+     │  │  ── checks circuit breaker state              │    │
+     │  │  ── selects partition for dependency          │    │
+     │  └──────────────────┬───────────────────────────┘    │
+     │                     │                                 │
+     ├─────────────────────┼─────────────────────────────────┤
+     │     Layer 2: Resource Pool                           │
+     │  ┌──────────────────v────────────────────────────┐    │
+     │  │  ThreadPoolExecutor or Semaphore               │    │
+     │  │  ── Acquires permit or assigns thread          │    │
+     │  │  ── Tracks active count                        │    │
+     │  │  ── Reports metrics (active, queued, max)      │    │
+     │  └──────────────────┬────────────────────────────┘    │
+     │                     │                                 │
+     ├─────────────────────┼─────────────────────────────────┤
+     │     Layer 3: Bounded Queue                            │
+     │  ┌──────────────────v────────────────────────────┐    │
+     │  │  BlockingQueue (ArrayBlockingQueue)            │    │
+     │  │  ── Holds pending requests                     │    │
+     │  │  ── Configurable capacity                      │    │
+     │  │  ── Timed offer: offer(task, timeout, unit)    │    │
+     │  └──────────────────┬────────────────────────────┘    │
+     │                     │                                 │
+     ├─────────────────────┼─────────────────────────────────┤
+     │     Layer 4: Rejection Handler                        │
+     │  ┌──────────────────v────────────────────────────┐    │
+     │  │  RejectedExecutionHandler                      │    │
+     │  │  ── Throws exception (default)                 │    │
+     │  │  ── Returns cached response (fallback)         │    │
+     │  │  ── Returns default value (degrade)            │    │
+     │  │  ── Enqueues for retry (async)                 │    │
+     │  └───────────────────────────────────────────────┘    │
+     └──────────────────────────────────────────────────────┘
+`} />
+
+### The Bulkhead Facade
+
+The facade is the public API of the bulkhead. It intercepts each call to a downstream service, determines which partition the call belongs to, and routes the call through the appropriate resource pool. The facade also integrates with the circuit breaker: if the circuit is open, the facade rejects the call without touching the resource pool.
+
+The facade performs these operations:
+
+1. Extract the dependency identifier from the call (service name, URL path, or tag).
+2. Look up the partition configuration for the dependency.
+3. Check the circuit breaker state for the dependency.
+4. Route the call to the partition's resource pool.
+5. Return the result from the pool or the rejection handler.
+
+### The Resource Pool
+
+The resource pool is the core of the bulkhead. It manages the threads or semaphores that execute downstream calls. The pool has a maximum size, a current active count, and a queue for pending work.
+
+In a thread pool implementation, the resource pool is a `ThreadPoolExecutor` with a fixed core pool size, a maximum pool size, and a keep-alive time for idle threads. The executor creates threads up to the core pool size. When the core pool is full, new tasks are queued. When the queue is full, the executor creates threads up to the maximum pool size. When the maximum pool size is reached and the queue is full, the rejection handler fires.
+
+In a semaphore implementation, the resource pool is a `Semaphore` with a fixed number of permits. The calling thread calls `tryAcquire()` with a timeout. If the permit is acquired, the thread proceeds. If not, the rejection handler fires.
+
+### The Bounded Queue
+
+The queue buffers requests when the pool is full. The queue is bounded to prevent unbounded memory growth. A bounded queue with capacity 100 holds at most 100 pending requests. When the queue is full, new requests are rejected.
+
+The queue has two parameters: capacity and offer timeout. The capacity sets the maximum number of pending requests. The offer timeout sets how long a request waits for a slot in the queue before timing out. A typical offer timeout is 10 milliseconds. If the queue cannot accept the request within 10 milliseconds, the rejection handler fires.
+
+### The Rejection Handler
+
+The rejection handler determines the behavior when the pool and queue are exhausted. The handler is a configurable strategy. The four common strategies are:
+
+1. **Abort.** Throw an exception immediately. The caller must handle the exception and decide what to do.
+2. **Fallback.** Return a cached response or a default value. This requires the caller to provide a fallback function.
+3. **Degrade.** Return a degraded response, such as "in stock" for an inventory check when the actual stock level is unavailable.
+4. **Enqueue.** Send the request to a separate retry queue for later processing. This is suitable for non-critical operations.
+
+## Data Structures
+
+### Bounded Queue
+
+The bounded queue is typically an `ArrayBlockingQueue` in Java or a fixed-size channel in Go. The data structure is a circular buffer with a fixed capacity. Elements are added at the tail and removed from the head. The queue is thread-safe: producers and consumers can operate concurrently.
+
+The queue maintains three counters: the current size, the number of elements added, and the number of elements removed. The current size is the number of pending requests. The add and remove counters are used for monitoring.
+
+```java
+// Simplified ArrayBlockingQueue structure
+public class ArrayBlockingQueue<E> {
+    private final E[] items;           // Circular buffer
+    private int takeIndex;             // Head index
+    private int putIndex;              // Tail index
+    private int count;                 // Current size
+    private final ReentrantLock lock;  // Synchronization
+    private final Condition notEmpty;  // Wait for non-empty
+    private final Condition notFull;   // Wait for non-full
+    
+    // Offer with timeout
+    public boolean offer(E e, long timeout, TimeUnit unit) {
+        lock.lock();
+        try {
+            if (count == items.length) {
+                return false; // Queue full, reject
+            }
+            enqueue(e);
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+```
+
+### Semaphore Counters
+
+A semaphore maintains an integer counter of available permits. The counter is decremented on `acquire()` and incremented on `release()`. The counter is protected by an atomic operation or a lock.
+
+```java
+// Simplified Semaphore structure
+public class Semaphore {
+    private final AtomicInteger permits;  // Available permits
+    private final int maxPermits;         // Maximum permits
+    
+    public boolean tryAcquire(long timeout, TimeUnit unit) {
+        long nanos = unit.toNanos(timeout);
+        long deadline = System.nanoTime() + nanos;
+        while (true) {
+            int available = permits.get();
+            if (available <= 0) {
+                // No permits available
+                if (nanos <= 0) return false;
+                // Spin or wait (simplified)
+                continue;
+            }
+            if (permits.compareAndSet(available, available - 1)) {
+                return true; // Permit acquired
+            }
+            // CAS failed, retry
+        }
+    }
+    
+    public void release() {
+        permits.incrementAndGet();
+    }
+}
+```
+
+### Thread Pool Metrics
+
+A thread pool maintains several metrics for monitoring and tuning. These metrics are exposed through management interfaces such as JMX in Java or Prometheus metrics in Go.
+
+<AsciiDiagram
+  id="bulkheads/deep-dive-pool-metrics"
+  title="Thread Pool Metrics — Monitoring Dashboard"
+  alt="Dashboard-style diagram showing eight metrics: active threads, pool size, queue depth, completed tasks, rejected tasks, max pool size, queue capacity, and thread utilization"
+  caption="Thread pool metrics provide visibility into bulkhead health. Each metric is a leading indicator of exhaustion."
+ content={`
+     ┌──────────────────────────────────────────────────────────────┐
+     │              Thread Pool Metrics Dashboard                    │
+     │                                                              │
+     │  ┌─────────────────────┐  ┌─────────────────────┐           │
+     │  │ Active Threads      │  │ Pool Size           │           │
+     │  │ ┌─────────────────┐ │  │ ┌─────────────────┐ │           │
+     │  │ │ ████████████    │ │  │ │ ████████████████│ │           │
+     │  │ │ 12 / 20         │ │  │ │ 20 / 20         │ │           │
+     │  └─────────────────────┘  └─────────────────────┘           │
+     │                                                              │
+     │  ┌─────────────────────┐  ┌─────────────────────┐           │
+     │  │ Queue Depth         │  │ Completed Tasks     │           │
+     │  │ ┌─────────────────┐ │  │ ┌─────────────────┐ │           │
+     │  │ │ ████████████████│ │  │ │ ████████████████│ │           │
+     │  │ │ 80 / 100        │ │  │ │ 45,231          │ │           │
+     │  └─────────────────────┘  └─────────────────────┘           │
+     │                                                              │
+     │  ┌─────────────────────┐  ┌─────────────────────┐           │
+     │  │ Rejected Tasks      │  │ Thread Utilization  │           │
+     │  │ ┌─────────────────┐ │  │ ┌─────────────────┐ │           │
+     │  │ │ 342             │ │  │ │ ████████████████│ │           │
+     │  │ │ Total: 45,573   │ │  │ │ 85%             │ │           │
+     │  └─────────────────────┘  └─────────────────────┘           │
+     │                                                              │
+     │  ┌─────────────────────┐  ┌─────────────────────┐           │
+     │  │ Max Pool Size       │  │ Queue Capacity      │           │
+     │  │ 20                  │  │ 100                 │           │
+     │  │ Configured: 20      │  │ Configured: 100      │           │
+     │  └─────────────────────┘  └─────────────────────┘           │
+     └──────────────────────────────────────────────────────────────┘
+`} />
+
+The key metrics for bulkhead monitoring are:
+
+- **Active Threads.** The number of threads currently executing downstream calls. When active threads approach the pool size, the queue starts filling.
+- **Pool Size.** The current number of threads in the pool. This is typically equal to the core pool size under steady load.
+- **Queue Depth.** The number of requests waiting in the queue. When the queue depth approaches the queue capacity, rejection is imminent.
+- **Completed Tasks.** The total number of tasks completed. This is used to calculate throughput.
+- **Rejected Tasks.** The number of tasks rejected by the bulkhead. A non-zero rejection rate indicates the bulkhead is active.
+- **Thread Utilization.** The ratio of active threads to pool size. Utilization above 80% indicates high load.
+
+## Lifecycle
+
+A request passes through 10 stages in the bulkhead lifecycle. Each stage has specific behavior and timing.
+
+### Stage 1: Call Interception
+
+The bulkhead facade intercepts the outgoing call. The facade identifies the downstream dependency and selects the appropriate partition. This stage takes under 1 microsecond.
+
+### Stage 2: Circuit Breaker Check
+
+The facade checks the circuit breaker state for the dependency. If the circuit is open, the call is rejected immediately with a fast-fail exception. This stage takes under 10 microseconds.
+
+### Stage 3: Attempt Acquire
+
+The facade attempts to acquire a resource from the partition. For a thread pool, this means submitting a task to the executor. For a semaphore, this means calling `tryAcquire()` with a timeout. This stage takes under 1 microsecond.
+
+### Stage 4: Queue Offer
+
+If the pool is full, the task is offered to the queue. The offer has a timeout, typically 10 milliseconds. If the queue accepts the task, the thread waits in the queue. If the queue is full, the offer fails.
+
+### Stage 5: Queue Wait
+
+The task waits in the queue for a thread to become available. The wait time depends on the queue depth and the thread completion rate. If the queue has 50 tasks ahead and each task takes 200 milliseconds, the wait time is 10 seconds.
+
+### Stage 6: Thread Assignment
+
+When a thread becomes available, the executor dequeues the next task. The thread starts executing the downstream call. This stage takes under 100 microseconds.
+
+### Stage 7: Downstream Call Execution
+
+The thread executes the downstream call. This is the actual HTTP request, database query, or RPC call. The duration depends on the downstream service. A healthy service responds in 10 to 100 milliseconds. A degraded service responds in 1 to 30 seconds.
+
+### Stage 8: Response Handling
+
+The thread receives the response from the downstream service. The facade processes the response: updates circuit breaker metrics, records latency, and returns the response to the caller. This stage takes under 1 millisecond.
+
+### Stage 9: Resource Release
+
+The thread is returned to the pool. The active count is decremented. If the queue has pending tasks, the next task is dequeued and assigned to the freed thread. This stage takes under 10 microseconds.
+
+### Stage 10: Metrics Update
+
+The bulkhead updates its metrics: active count, completed count, latency histogram, and rejection count. These metrics are exposed for monitoring and alerting. This stage takes under 100 microseconds.
+
+<AsciiDiagram
+  id="bulkheads/deep-dive-lifecycle"
+  title="Bulkhead Request Lifecycle — 10 Stages"
+  alt="Timeline diagram showing the 10 stages of a request through the bulkhead, from interception to metrics update, with typical timing for each stage"
+  caption="The 10-stage lifecycle of a request through the bulkhead. Each stage has specific timing and behavior."
+ content={`
+     ┌──────────────────────────────────────────────────────────────┐
+     │              Bulkhead Request Lifecycle — 10 Stages           │
+     │                                                              │
+     │  Stage 1:  Call Interception            < 1 us               │
+     │  ┌────────────────────────────────────────────────────────┐  │
+     │  │  Identify dependency, select partition                 │  │
+     │  └────────────────────────────────────────────────────────┘  │
+     │                         │                                    │
+     │  Stage 2:  Circuit Breaker Check      < 10 us               │
+     │  ┌────────────────────────────────────────────────────────┐  │
+     │  │  If circuit open, reject immediately                   │  │
+     │  └────────────────────────────────────────────────────────┘  │
+     │                         │                                    │
+     │  Stage 3:  Attempt Acquire              < 1 us               │
+     │  ┌────────────────────────────────────────────────────────┐  │
+     │  │  Submit task to pool or tryAcquire()                   │  │
+     │  └────────────────────────────────────────────────────────┘  │
+     │                         │                                    │
+     │  Stage 4:  Queue Offer                < 10 ms               │
+     │  ┌────────────────────────────────────────────────────────┐  │
+     │  │  If pool full, offer to queue with timeout             │  │
+     │  └────────────────────────────────────────────────────────┘  │
+     │                         │                                    │
+     │  Stage 5:  Queue Wait                10 ms — 30 s           │
+     │  ┌────────────────────────────────────────────────────────┐  │
+     │  │  Wait for thread to become available                   │  │
+     │  └────────────────────────────────────────────────────────┘  │
+     │                         │                                    │
+     │  Stage 6:  Thread Assignment           < 100 us              │
+     │  ┌────────────────────────────────────────────────────────┐  │
+     │  │  Dequeue task, assign to freed thread                  │  │
+     │  └────────────────────────────────────────────────────────┘  │
+     │                         │                                    │
+     │  Stage 7:  Downstream Call Execution  10 ms — 30 s          │
+     │  ┌────────────────────────────────────────────────────────┐  │
+     │  │  Execute HTTP call, DB query, or RPC                   │  │
+     │  └────────────────────────────────────────────────────────┘  │
+     │                         │                                    │
+     │  Stage 8:  Response Handling            < 1 ms              │
+     │  ┌────────────────────────────────────────────────────────┐  │
+     │  │  Update circuit breaker, record latency, return        │  │
+     │  └────────────────────────────────────────────────────────┘  │
+     │                         │                                    │
+     │  Stage 9:  Resource Release             < 10 us              │
+     │  ┌────────────────────────────────────────────────────────┐  │
+     │  │  Return thread to pool, dequeue next task              │  │
+     │  └────────────────────────────────────────────────────────┘  │
+     │                         │                                    │
+     │  Stage 10: Metrics Update              < 100 us             │
+     │  ┌────────────────────────────────────────────────────────┐  │
+     │  │  Update active count, completed, latency, rejected     │  │
+     │  └────────────────────────────────────────────────────────┘  │
+     └──────────────────────────────────────────────────────────────┘
+`} />
+
+## Consistency and State
+
+Bulkheads are a local resource management mechanism. They operate within a single process. They do not have the distributed consistency concerns of replicated data stores. However, there are state management considerations.
+
+### Thread Pool State
+
+The thread pool maintains mutable state: active threads, queue contents, and completion counts. This state is modified by multiple threads concurrently. The implementation uses locks or atomic operations to ensure thread safety.
+
+The `ThreadPoolExecutor` in Java uses a single `ReentrantLock` for all state modifications. The lock is held for the duration of task submission and dequeue operations. This means that thread pool operations are serialized, but the lock hold time is short (under 100 microseconds).
+
+### Metrics State
+
+Bulkhead metrics are updated on every request. The active count is updated on acquire and release. The completed count is updated on task completion. The rejected count is updated on rejection.
+
+These metrics are read by monitoring systems, which may see inconsistent intermediate states. An active count of 12 out of 20 with a queue depth of 80 out of 100 is a snapshot in time. The monitoring system may see active count 12 and queue depth 79 if the read happens between two updates. This is acceptable for monitoring purposes.
+
+### Shared State Across Partitions
+
+Partitions are independent. There is no shared state between them. Each partition has its own thread pool, its own queue, and its own metrics. This independence is the fundamental property of the bulkhead pattern: failure in one partition does not affect the state of another partition.
+
+## Performance
+
+### Pool Sizing Math
+
+The optimal pool size depends on the downstream service's latency and throughput. The formula for calculating the number of threads needed for a given throughput and latency is:
+
+```
+T = throughput in requests per second
+L = average latency in seconds
+Threads = T * L
+```
+
+For example, a service that handles 100 requests per second with an average latency of 200 milliseconds needs 100 * 0.2 = 20 threads.
+
+The Little's Law formula provides the theoretical foundation:
+
+```
+L = lambda * W
+```
+
+Where L is the number of threads in the system (concurrent requests), lambda is the arrival rate (throughput), and W is the average time a request spends in the system (latency).
+
+For a system with 50 requests per second and 500ms average latency:
+
+```
+L = 50 * 0.5 = 25 threads
+```
+
+This means 25 threads are needed to sustain 50 requests per second at 500ms latency. If the pool has fewer than 25 threads, the queue will grow and requests will be rejected.
+
+### CPU Context Switching Overhead
+
+Each thread consumes CPU time even when idle. The overhead comes from context switching: the operating system must save and restore the state of each thread when switching between them. For 20 threads, the context switching overhead is negligible (under 1% of CPU). For 200 threads, the overhead becomes significant (5% to 10% of CPU). For 2,000 threads, the system spends more time switching contexts than doing work.
+
+The relationship between thread count and context switching overhead is approximately linear:
+
+```
+Overhead = threadCount * contextSwitchCost * contextSwitchRate
+```
+
+Where `contextSwitchCost` is the time to save and restore thread state (typically 1 to 10 microseconds) and `contextSwitchRate` is the number of context switches per second per thread.
+
+For 50 threads at 100 context switches per second each, with a cost of 5 microseconds:
+
+```
+Overhead = 50 * 5us * 100 = 25,000 microseconds = 25ms per second
+```
+
+This is 2.5% overhead. For 500 threads, the overhead becomes 25%.
+
+### Semaphore Performance
+
+Semaphore-based bulkheads have lower overhead than thread pool bulkheads because they do not involve thread switching. The calling thread acquires a permit and proceeds directly.
+
+The overhead of a semaphore `tryAcquire()` is approximately 50 nanoseconds. The overhead of a thread pool `submit()` is approximately 10 microseconds. For a service with 10,000 requests per second:
+
+- Semaphore: 10,000 * 50ns = 500 microseconds = 0.5ms of CPU time per second
+- Thread pool: 10,000 * 10us = 100,000 microseconds = 100ms of CPU time per second
+
+The thread pool adds 200 times more overhead per request. However, the thread pool provides timeout isolation: a slow downstream call does not block the calling thread. The semaphore does not provide timeout isolation.
+
+<AsciiDiagram
+  id="bulkheads/deep-dive-performance-comparison"
+  title="Thread Pool vs Semaphore Performance Comparison"
+  alt="Two bar charts comparing thread pool and semaphore overhead across three metrics: latency per request, CPU overhead per 10K requests, and memory per partition"
+  caption="Thread pool isolation provides stronger guarantees but at higher CPU and memory cost than semaphore isolation."
+ content={`
+     ┌──────────────────────────────────────────────────────────────┐
+     │        Thread Pool vs Semaphore Performance                   │
+     │                                                              │
+     │  Metric          Thread Pool        Semaphore                │
+     │  ────────────────────────────────────────────────────        │
+     │  Per-request      10 us              50 ns                   │
+     │  overhead                                                   │
+     │  ┌────────────────┐  ┌────────────────┐                     │
+     │  │ █████████████  │  │ ██             │  (200x difference)  │
+     │  └────────────────┘  └────────────────┘                     │
+     │                                                              │
+     │  CPU / 10K req    100 ms             0.5 ms                  │
+     │  ┌────────────────┐  ┌────────────────┐                     │
+     │  │ █████████████  │  │ ██             │  (200x difference)  │
+     │  └────────────────┘  └────────────────┘                     │
+     │                                                              │
+     │  Memory / partition  1 MB              64 bytes              │
+     │  ┌────────────────┐  ┌────────────────┐                     │
+     │  │ █████████████  │  │ ██             │  (16,000x diff)     │
+     │  └────────────────┘  └────────────────┘                     │
+     │                                                              │
+     │  ────────────────────────────────────────────────────        │
+     │  Timeout isolation        Yes                No              │
+     │  Thread switching         Yes                No              │
+     │  Queue support            Yes                No              │
+     │  Best for          Slow services    Fast services            │
+     └──────────────────────────────────────────────────────────────┘
+`} />
+
+### Latency Impact
+
+The bulkhead adds latency to each request. The latency comes from three sources: queueing, thread switching, and rejection handling.
+
+**Queueing latency.** When a request is queued, it waits for a thread to become available. The queueing time depends on the queue depth and the average service time. A queue of 10 requests at 200ms each adds 2 seconds of latency.
+
+**Thread switching latency.** Dispatching work to a thread pool adds approximately 10 microseconds of overhead. This is negligible for most services.
+
+**Rejection handling latency.** When a request is rejected, the rejection handler executes. A fallback that returns a cached response takes under 1 millisecond. A fallback that calls another service takes 10 to 100 milliseconds.
+
+The total latency is:
+
+```
+Total = queueingTime + switchingTime + rejectTime
+```
+
+For a healthy service with available threads:
+```
+Total = 0 + 10us + 0 = 10 microseconds overhead
+```
+
+For a degraded service with full queue:
+```
+Total = 2000ms + 10us + 1ms = 2001 milliseconds
+```
+
+The bulkhead does not add significant overhead to healthy services. The overhead is meaningful only when the service is degraded, which is exactly when the bulkhead is needed.
+
+## Configuration Reference
+
+### corePoolSize
+
+The minimum number of threads in the pool. Threads are created up to this size when tasks are submitted. If the pool has fewer than `corePoolSize` threads, a new thread is created for each task, even if idle threads exist.
+
+**Default.** 10 threads per partition.
+
+**Tuning.** Set `corePoolSize` to the expected steady-state concurrency level. Use the formula: `corePoolSize = throughput * latency`. For 50 req/s at 200ms, set `corePoolSize = 10`.
+
+### maxPoolSize
+
+The maximum number of threads in the pool. Threads are created beyond `corePoolSize` only when the queue is full. New threads are created up to `maxPoolSize`. After `keepAliveTime` of idle time, excess threads are terminated.
+
+**Default.** 10 threads (same as corePoolSize, meaning no thread scaling).
+
+**Tuning.** Set `maxPoolSize` to handle traffic spikes. Set `maxPoolSize = corePoolSize * 2` for moderate spikes. Set `maxPoolSize = corePoolSize * 4` for extreme spikes.
+
+### queueCapacity
+
+The maximum number of pending requests in the queue. When the queue is full and the pool is at `maxPoolSize`, new requests are rejected.
+
+**Default.** 100 requests.
+
+**Tuning.** Set `queueCapacity` based on the acceptable wait time. For a maximum wait of 5 seconds at 50 req/s, set `queueCapacity = 5 * 50 = 250`. For a maximum wait of 1 second, set `queueCapacity = 1 * 50 = 50`.
+
+### semaphorePermits
+
+The maximum number of concurrent calls allowed through the semaphore. This is the equivalent of `maxPoolSize` for semaphore-based bulkheads.
+
+**Default.** 10 permits.
+
+**Tuning.** Same formula as pool sizing: `permits = throughput * latency`. For 100 req/s at 100ms, set `permits = 10`.
+
+### keepAliveTime
+
+The time that excess threads remain idle before being terminated. This only applies to thread pool bulkheads with `maxPoolSize > corePoolSize`.
+
+**Default.** 60 seconds.
+
+**Tuning.** Set `keepAliveTime` to the expected duration of traffic spikes. For short spikes (under 30 seconds), set `keepAliveTime = 30 seconds`. For long spikes, set `keepAliveTime = 120 seconds`.
+
+### maxWaitTime
+
+The maximum time a request waits in the queue before being rejected. This is the offer timeout on the queue.
+
+**Default.** 10 milliseconds.
+
+**Tuning.** Set `maxWaitTime` to the maximum acceptable queueing delay. For latency-sensitive services, set `maxWaitTime = 1ms`. For batch services, set `maxWaitTime = 100ms`.
+
+### rejectionStrategy
+
+The strategy for handling rejected requests. Options: `abort`, `fallback`, `degrade`, `enqueue`.
+
+**Default.** `abort` (throw exception).
+
+**Tuning.** Choose `fallback` for read operations where a cached response is acceptable. Choose `degrade` for non-critical operations where a default value is acceptable. Choose `enqueue` for writes that must eventually succeed.
+
+### maxConcurrentCalls
+
+The maximum number of concurrent calls to the downstream service. This is the primary capacity control for the bulkhead. For both thread pool and semaphore implementations, this is the effective limit on concurrent calls.
+
+**Default.** 10 concurrent calls.
+
+**Tuning.** Use the formula: `maxConcurrentCalls = maxExpectedThroughput * p99Latency`. For 200 req/s at 500ms p99, set `maxConcurrentCalls = 200 * 0.5 = 100`. This ensures the system can handle peak load without queueing.
+
+<AsciiDiagram
+  id="bulkheads/deep-dive-config-parameters"
+  title="Bulkhead Configuration Parameters"
+  alt="Diagram showing the three configuration parameters and how they interact: corePoolSize, maxPoolSize, and queueCapacity, with the regions where each parameter applies"
+  caption="The three pool configuration parameters define the operating regions of the bulkhead. Each parameter controls a specific behavior."
+ content={`
+     ┌──────────────────────────────────────────────────────────────┐
+     │              Bulkhead Configuration Regions                    │
+     │                                                              │
+     │  Threads                                                     │
+     │    ▲                                                         │
+     │    │  ┌──────────────────────────────────────────────────┐   │
+     │    │  │              Rejection Region                     │   │
+     │    │  │  Pool full + queue full → reject                 │   │
+     │    │  └──────────────────────────────────────────────────┘   │
+     │    │                         │                                │
+     │    │  maxPoolSize ───────────┼────────────────────────────    │
+     │    │                         │                                │
+     │    │  ┌──────────────────────v───────────────────────────┐   │
+     │    │  │              Queue Region                         │   │
+     │    │  │  Core pool full, queue accepts tasks             │   │
+     │    │  └──────────────────────────────────────────────────┘   │
+     │    │                         │                                │
+     │    │  corePoolSize ──────────┼────────────────────────────    │
+     │    │                         │                                │
+     │    │  ┌──────────────────────v───────────────────────────┐   │
+     │    │  │              Normal Region                        │   │
+     │    │  │  Threads available, no queueing                  │   │
+     │    │  └──────────────────────────────────────────────────┘   │
+     │    │                                                         │
+     │    └─────────────────────────────────────────────────────►   │
+     │                                                   Time       │
+     │                                                              │
+     │  Parameters:                                                 │
+     │  corePoolSize  = 10 threads (steady state)                   │
+     │  maxPoolSize   = 20 threads (burst)                          │
+     │  queueCapacity = 100 slots (buffer)                          │
+     └──────────────────────────────────────────────────────────────┘
+`} />
+
+## Bringing It Together
+
+The bulkhead internal architecture has four layers: facade, resource pool, bounded queue, and rejection handler. Each layer handles a specific responsibility. The data structures are straightforward: bounded queues for buffering, semaphores for permit counting, and atomics for metrics.
+
+The performance characteristics are well understood. Thread pool bulkheads add 10 microseconds of overhead per request but provide timeout isolation. Semaphore bulkheads add 50 nanoseconds of overhead but do not provide timeout isolation. The choice between them depends on the downstream service's latency profile.
+
+Configuration parameters are derived from Little's Law. The number of threads needed is throughput times latency. The queue capacity needed is maximum acceptable wait time times throughput. These formulas give you a starting point for configuration.
+
+In the next section, you will see how bulkheads fit into a production architecture, including integration patterns, multi-region deployment, and capacity planning.

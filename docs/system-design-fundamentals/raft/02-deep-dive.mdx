@@ -1,0 +1,429 @@
+---
+id: raft-deep-dive
+title: Raft — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A Raft node consists of four major subsystems that interact to provide consensus. Understanding these subsystems is essential for implementing, debugging, or operating Raft-based systems.
+
+**State Machine:** The application-level data structure that executes committed commands. In a key-value store, this is the key-value map. In a configuration service, this is the cluster membership table. The state machine is deterministic — given the same sequence of commands, it always produces the same state.
+
+**Log Storage:** An append-only sequence of log entries, each containing a term number and a command. The log is the authoritative record of all state changes. It is stored durably on disk (typically via write-ahead log, WAL). The term number tags each entry with the leadership era when it was created.
+
+**Consensus Module:** The heart of Raft. It implements leader election, log replication, safety checks, and membership changes. It communicates with peer consensus modules on other nodes via RequestVote and AppendEntries RPCs. It exposes a simple interface to the application: submit(command) returns result.
+
+**RPC Handlers:** Network-layer components that serialize and deserialize Raft RPCs. Each RPC carries the sender's term, and all handlers compare the arriving term against their current term — if the arriving term is higher, the receiver steps down to follower immediately.
+
+<AsciiDiagram
+  id="raft/deep-dive-node-architecture"
+  alt="Internal architecture of a single Raft node showing state machine, log storage, consensus module, and RPC handlers with arrows showing data flow"
+  caption="Internal architecture of a single Raft node"
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│                     Raft Node Instance                         │
+│                                                                │
+│  ┌──────────────────────────────────────────────┐              │
+│  │            Application Layer                  │              │
+│  │  ┌──────────────────────┐                     │              │
+│  │  │    State Machine     │  apply(entry) ─────>│              │
+│  │  │  (key-value store,   │                     │              │
+│  │  │   config table, etc) │<──── result ────────│              │
+│  │  └──────────────────────┘                     │              │
+│  └──────────────────────────────────────────────┘              │
+│                          ▲                                      │
+│                          │ apply(logEntry)                      │
+│                          │                                      │
+│  ┌──────────────────────────────────────────────┐              │
+│  │           Consensus Module                    │              │
+│  │                                              │              │
+│  │  ┌─────────┐  ┌──────────┐  ┌──────────┐   │              │
+│  │  │ Leader  │  │ Election │  │ Log      │   │              │
+│  │  │ Election│  │ Safety   │  │ Matching │   │              │
+│  │  │ Logic   │  │ Check    │  │ Engine   │   │              │
+│  │  └─────────┘  └──────────┘  └──────────┘   │              │
+│  │                                              │              │
+│  │  ┌──────────────────────┐  ┌──────────────┐ │              │
+│  │  │ Commit Index Tracker │  │ Term Counter │ │              │
+│  │  └──────────────────────┘  └──────────────┘ │              │
+│  └──────────────────────────────────────────────┘              │
+│         ▲              ▲              ▲                         │
+│         │              │              │                         │
+│  ┌──────┴──────┐ ┌─────┴──────┐ ┌────┴────────┐               │
+│  │AppendEntries│ │RequestVote │ │InstallSna-  │               │
+│  │   Handler   │ │  Handler   │ │pshot Handler│               │
+│  └─────────────┘ └────────────┘ └─────────────┘               │
+│         ▲              ▲              ▲                         │
+│         │              │              │                         │
+│  ┌──────┴──────────────┴──────────────┴─────────────────────┐  │
+│  │                Network Layer (RPC Transport)              │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                Log Storage (Persistent)                   │  │
+│  │  ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐     │  │
+│  │  │  1 │  2 │  3 │  4 │  5 │  6 │  7 │  8 │  9 │ 10 │     │  │
+│  │  │ T1 │ T1 │ T2 │ T2 │ T2 │ T3 │ T3 │ T4 │ T4 │ T4 │     │  │
+│  │  └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘     │  │
+│  │  ┌──────────────────────────────────────────────────┐     │  │
+│  │  │              Snapshot File                        │     │  │
+│  │  └──────────────────────────────────────────────────┘     │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+## Algorithm Detail
+
+### Leader Election
+
+Leader election is the mechanism by which the cluster selects a single node to coordinate. Every node maintains a **term counter** that increases monotonically. Terms act as a logical clock: a higher term always supersedes a lower one.
+
+**Timing and timeouts:** Each follower runs an election timer. The timer is reset whenever the follower receives a valid AppendEntries RPC from the current leader. The timeout duration is randomized within a range (typically 150-300ms). When the timer expires, the follower transitions to candidate, increments its term, and sends RequestVote RPCs to all peers.
+
+**RequestVote RPC:** The candidate sends its term, its last log index, and its last log term. Each recipient compares these with its own state:
+
+1. **Term check:** If the candidate's term is less than the recipient's term, the vote is denied.
+2. **Log freshness check:** If the candidate's last log term is less than the recipient's last log term, the vote is denied. If they are equal but the candidate's last log index is lower, the vote is denied. This ensures only a node with an up-to-date log can become leader.
+
+**Vote granting rules:** A node votes for at most one candidate per term. It persists its vote to disk before responding. If a node receives a RequestVote from a candidate with a higher term while it has already voted, it can change its vote — the higher term supersedes.
+
+**Election safety:** At most one leader wins per term. Proof: a leader requires votes from a majority of nodes. Each node votes for at most one candidate per term. Therefore, two candidates cannot both obtain a majority in the same term.
+
+<AsciiDiagram
+  id="raft/deep-dive-election-timeline"
+  alt="Timeline showing three nodes with randomized election timeouts, one timing out first, sending RequestVote, and winning before the others timeout"
+  caption="Election timeline with randomized timeouts preventing split vote"
+  content={`
+Node A ──────────────────────────────────────────────────────────────
+        │follower   │candidate   │leader                            │
+        │           │            │                                  │
+        │timer=187ms│            │ sends RequestVote to B and C     │
+        │           │────timeout>│           │                      │
+        │           │   term=4   │           │                      │
+        │           │  votes=1   │   votes=2 │  votes=3  MAJORITY!  │
+        │           │            │           │                      │
+Node B ──────────────────────────────────────────────────────────────
+        │timer=223ms│  timeout not yet │        │                   │
+        │           │<─── grants vote ──        │                   │
+        │           │            │           │                      │
+Node C ──────────────────────────────────────────────────────────────
+        │timer=298ms│  timeout not yet │        │                   │
+        │           │<─── grants vote ──        │                   │
+        │           │            │           │                      │
+        └───────────┴────────────┴───────────┴──────────────────────┘
+`}
+/>
+
+### Log Replication
+
+The leader manages log replication using two per-follower data structures: nextIndex and matchIndex.
+
+**nextIndex:** For each follower, the leader tracks the index of the next log entry to send. On leader election, nextIndex is initialized to the leader's last log index plus one.
+
+**matchIndex:** For each follower, the leader tracks the highest log index known to be replicated on that follower. On leader election, matchIndex is initialized to zero.
+
+**AppendEntries RPC:** The leader sends entries starting from nextIndex through its current last index. The RPC includes:
+
+- The leader's term and commit index
+- The index and term of the entry immediately preceding the new entries
+- The new log entries themselves
+
+**Follower processing:**
+
+1. The follower checks the arriving term — if lower than its current term, it rejects.
+2. The follower checks that its log has an entry at prevLogIndex with matching prevLogTerm. If not, it rejects (log mismatch).
+3. The follower deletes any entries starting at the first new entry's index and appends the new entries.
+4. The follower updates its commit index to min(leaderCommit, index of last new entry).
+
+<AsciiDiagram
+  id="raft/deep-dive-log-matching"
+  alt="Two logs showing leader and follower with divergent entries at index 5 and leader overwriting them starting from the matching point at index 4"
+  caption="Log matching and conflict resolution — leader overwrites divergent follower entries"
+  content={`
+Leader log:
+┌────┬────┬────┬────┬────┬────┬────┬────┐
+│  1 │  2 │  3 │  4 │  5 │  6 │  7 │  8 │
+│ T1 │ T2 │ T2 │ T2 │ T3 │ T3 │ T4 │ T4 │
+│ a=1│ b=2│ c=3│ d=4│ e=5│ f=6│ g=7│ h=8│
+└────┴────┴────┴────┴────┴────┴────┴────┘
+
+Follower log (before):
+┌────┬────┬────┬────┬────┬────┬────┐
+│  1 │  2 │  3 │  4 │  5 │  6 │  7 │
+│ T1 │ T2 │ T2 │ T2 │ T3 │ T3 │ T3 │
+│ a=1│ b=2│ c=3│ d=4│ x=9│ y=10│z=11│
+└────┴────┴────┴────┴────┴────┴────┘
+                     ^ mismatch at 5 (T3 vs T3, same term but different command)
+                     Leader sends: prevLogIndex=4, prevLogTerm=T2
+                     Follower matches at 4, overwrites 5-7 with 5-8 from leader
+
+Follower log (after):
+┌────┬────┬────┬────┬────┬────┬────┬────┐
+│  1 │  2 │  3 │  4 │  5 │  6 │  7 │  8 │
+│ T1 │ T2 │ T2 │ T2 │ T3 │ T3 │ T4 │ T4 │
+│ a=1│ b=2│ c=3│ d=4│ e=5│ f=6│ g=7│ h=8│
+└────┴────┴────┴────┴────┴────┴────┴────┘
+`}
+/>
+
+### Safety Properties
+
+**Election Safety:** At most one leader is elected per term. This is guaranteed by the vote-granting rule: each node votes for at most one candidate per term, and a leader requires a majority of votes. Two leaders cannot coexist in the same term.
+
+**Leader Completeness (Log Matching):** Once a log entry is committed, all future leaders will contain that entry. Proof: a committed entry is on a majority of nodes. A new leader must receive votes from a majority. By the intersection property, at least one voter has the committed entry. The voter only votes for a candidate whose log is at least as up-to-date, so the candidate must have the committed entry (or it would fail the log freshness check).
+
+**State Machine Safety:** If a node applies entry E at index I, no other node can apply a different entry at index I. This follows from the leader completeness property plus the log matching property: nodes apply committed entries in index order, and committed entries at each index are deterministic.
+
+**Commitment Rule:** A leader considers an entry committed only when the entry is stored on a majority of nodes. However, entries from previous terms cannot be committed solely by counting replicas — the leader must first commit an entry from its own term. This prevents a scenario where a leader replicates an old-term entry to a majority, crashes, and a new leader overwrites the entry before it is committed.
+
+<AsciiDiagram
+  id="raft/deep-dive-commitment-rule"
+  alt="Diagram showing why entries from previous terms need a current-term entry to be committed alongside them for correctness"
+  caption="Commitment rule: a current-term entry (entry 8) serves as indirect proof that prior entries are committed"
+  content={`
+Scenario: Leader (term 3) replicates entry 5 (term 2) to a majority, then crashes.
+New leader (term 4) may overwrite entry 5 if it does not have it.
+
+┌────┬────┬────┬────┬────┐
+│  1 │  2 │  3 │  4 │  5 │   entries
+│ T2 │ T2 │ T3 │ T3 │ T2 │   terms
+└────┴────┴────┴────┴────┘
+                     ^ entry from previous term
+                       cannot auto-commit
+
+Solution: Leader replicates entry 6 (its own term) after entry 5.
+Once entry 6 (T3) is committed, entry 5 (T2) is also implicitly committed.
+
+┌────┬────┬────┬────┬────┬────┐
+│  1 │  2 │  3 │  4 │  5 │  6 │
+│ T2 │ T2 │ T3 │ T3 │ T2 │ T3 │
+└────┴────┴────┴────┴────┴────┘
+                     ^    ^ entry committed
+                     |    (from current term)
+                     implicit commit through Leader Completeness
+`}
+/>
+
+## Request Lifecycle
+
+Follow a single client write request through the entire system.
+
+<AsciiDiagram
+  id="raft/deep-dive-full-write-lifecycle"
+  alt="Complete 12-step sequence diagram of a client write going through leader append, parallel replication to followers, majority acknowledgment, commit, state machine apply, and response to client"
+  caption="Complete write lifecycle from client request to response"
+  content={`
+Client          Leader          Follower A      Follower B     Follower C
+  │               │                │               │               │
+  │  ① PUT x=5   │                │               │               │
+  │──────────────>│                │               │               │
+  │               │  ② append to  │               │               │
+  │               │  leader log   │               │               │
+  │               │  (idx 9, T4)  │               │               │
+  │               │                │               │               │
+  │               │  ③ AppendEntries RPC (entries 9, prevLog=8,4) │
+  │               │───────────────>│               │               │
+  │               │───────────────│──────────────>│               │
+  │               │───────────────│───────────────│──────────────>│
+  │               │                │               │               │
+  │               │  ④ check:     │               │               │
+  │               │  log[8] matches (idx 8, term 4)               │
+  │               │  ⑤ append     │               │               │
+  │               │  entry 9      │               │               │
+  │               │                │               │               │
+  │               │  ⑥ AckOK     │               │               │
+  │               │<───────────────│               │               │
+  │               │<──────────────────────────────│               │
+  │               │                │               │               │
+  │               │  ⑦ Majority! (leader+A+B=3/5) │               │
+  │               │  ⑧ commitIndex=9              │               │
+  │               │  ⑨ apply entry 9 to state machine            │
+  │               │                │               │               │
+  │               │  ⑩ Response OK │               │               │
+  │<──────────────│                │               │               │
+  │               │                │               │               │
+  │               │  ⑪ heartbeat/next AppendEntries                │
+  │               │  with commitIndex=9                            │
+  │               │───────────────>│               │               │
+  │               │────────────────│──────────────>│               │
+  │               │────────────────│───────────────│──────────────>│
+  │               │                │               │               │
+  │               │  ⑫ followers   │               │               │
+  │               │  apply entry 9 │               │               │
+  │               │  to state machine               │               │
+└───────────────┴───────────────┴───────────────┴───────────────┴───┘
+`}
+/>
+
+**Step 1 — Client request arrives.** The client sends a PUT x=5 command. If the request reaches a follower, it is forwarded to the leader. The leader serializes the request into a new log entry.
+
+**Step 2 — Leader appends locally.** The leader appends the entry (index 9, term 4) to its own log with fsync to guarantee durability.
+
+**Step 3 — Parallel replication.** The leader issues concurrent AppendEntries RPCs to all followers. Each RPC includes the new entry, the previous entry's index (8) and term (4), and the leader's commit index.
+
+**Step 4 — Follower consistency check.** Each follower verifies that its log has entry 8 with term 4. This is the Log Matching Property check.
+
+**Step 5 — Follower appends.** The follower appends the new entry to its own log with fsync.
+
+**Step 6 — Acknowledgment.** Each follower sends an Ack response to the leader.
+
+**Step 7 — Majority detection.** The leader counts acknowledgments. It has its own copy (leader) plus replies from two followers. Leader + 2 followers = majority of 5.
+
+**Step 8 — Commit.** The leader advances commitIndex to 9. The entry is now committed — it will survive any subsequent leader failure.
+
+**Step 9 — Apply.** The leader applies the entry (PUT x=5) to its state machine. The state machine now reflects the new value.
+
+**Step 10 — Client response.** The leader responds to the client with success.
+
+**Step 11 — Commit propagation.** On the next heartbeat or AppendEntries, the leader sends commitIndex=9 to all followers.
+
+**Step 12 — Follower apply.** Followers advance their own commitIndex and apply entry 9 to their state machines.
+
+## Consistency and State
+
+Understanding what happens during failures is essential for building reliable systems on Raft.
+
+### Leader Crashes Mid-Replication
+
+The leader has appended entry 10 to its log but crashed before replicating to any follower. When a new leader is elected, entry 10 is not present in the new leader's log. The entry is effectively lost. The client that sent the original request will receive a timeout or connection error and must retry. No inconsistency occurs because the entry was never committed.
+
+### Follower Behind on Logs
+
+A follower was offline for 10 minutes. When it reconnects, the leader detects that the follower's nextIndex is far behind. The leader sends InstallSnapshot RPC (if the log has been compacted past the follower's last index) or sends the backlog of AppendEntries (if the entries still exist). The follower catches up within seconds to minutes depending on the volume of entries.
+
+### Network Partition
+
+A 5-node cluster splits into two groups: &#123;leader, follower A&#125; on one side, and &#123;followers B, C, D&#125; on the other. The leader's heartbeats cannot reach the majority side. After the election timeout expires, followers B, C, and D elect a new leader among themselves. Both leaders now exist in different terms — the original leader in term 4, the new leader in term 5. The original leader continues accepting writes, but cannot commit them (no majority). The new leader accepts writes and commits them (majority = 3 of 3 in its partition). When the partition heals, the original leader discovers term 5, steps down, and its uncommitted entries are discarded.
+
+<AsciiDiagram
+  id="raft/deep-dive-network-partition"
+  alt="Five-node cluster split into two partitions, left side with stale leader unable to commit, right side with new leader committing writes, showing what happens when partition heals"
+  caption="Network partition behavior — majority side continues, minority side blocks"
+  content={`
+Before Partition:
+┌───────────────────────────────────────────┐
+│   Leader(T4) ─ FollowerA ─ FollowerB      │
+│           ─ FollowerC ─ FollowerD         │
+│   All heartbeats flowing                   │
+└───────────────────────────────────────────┘
+
+During Partition:
+┌──────────────┐          ┌─────────────────┐
+│  Minor Side  │          │   Major Side     │
+│              │          │                  │
+│  Leader(T4)  │  Network │  FollowerB       │
+│  FollowerA   │──partition─ candidate(T5)   │
+│              │          │  FollowerC       │
+│              │          │  FollowerD       │
+│              │          │                  │
+│  Accepts but │          │  Elects new      │
+│  cannot      │          │  leader          │
+│  commit      │          │  Accepts and     │
+│              │          │  commits writes  │
+└──────────────┘          └─────────────────┘
+
+After Partition Heals:
+┌───────────────────────────────────────────┐
+│   Old leader sees T5 > T4                 │
+│   Steps down to follower                  │
+│   Uncommitted T4 entries discarded        │
+│   Follows new leader (T5), syncs log      │
+│   All nodes consistent                    │
+└───────────────────────────────────────────┘
+`}
+/>
+
+### Concurrent Elections (Split Vote)
+
+Three followers time out at nearly the same instant. Each increments the term to 6 and sends RequestVote. Each node receives requests from two candidates. Because each node votes for the first candidate it receives, no candidate reaches a majority. All three candidates time out, increment to term 7, and retry. This time, randomized timeouts spread the retries, and one candidate wins.
+
+### Old Leader Reconnects
+
+After a partition, the old leader (term 4) reconnects. It sees AppendEntries from the new leader with term 5. Since 5 is greater than 4, the old leader steps down to follower, sets its term to 5, discards any uncommitted entries, and accepts the new leader's log.
+
+## Performance
+
+Raft performance is dominated by disk I/O and network latency.
+
+### Throughput
+
+With synchronous fsync on every AppendEntries: 10,000 to 30,000 writes per second on modern SSDs. Each write requires at least one fsync on the leader and one on each follower in the critical path. Batching improves this: combining 50-100 entries per AppendEntries RPC can push throughput to 50,000-100,000 ops/sec.
+
+Without synchronous fsync (dangerous in production but used in benchmarks): throughput can exceed 100,000 ops/sec. This is achieved by acknowledging writes before persisting to disk, relying on the leader remaining alive to reconstruct the log. Losing the leader before fsync means losing all uncommitted writes.
+
+### Latency
+
+End-to-end write latency in a single-region deployment:
+
+- p50 latency: 1-5ms (one network round trip + two fsyncs)
+- p99 latency: 20-100ms (varies with disk contention, GC pauses, network jitter)
+- Read latency (leader-direct): 0.1-1ms (no disk writes, no network round trip to followers)
+- Read latency (with read-index verification): 2-8ms (one lightweight round trip for commit index)
+
+### Read Performance with Optimization
+
+The linearizable read optimization (leader leasing or read indices) improves throughput by avoiding log writes for reads. A system doing 10,000 writes/sec and 90,000 reads/sec can achieve ~100,000 total ops/sec with optimization, versus ~30,000 without (because the leader becomes bottlenecked by log fsync).
+
+## Configuration
+
+Critical configuration parameters for production Raft deployments:
+
+**Election timeout:** Range 150-300ms is the Raft default. Faster elections (100-200ms) detect failures sooner but risk spurious elections under network jitter. Slower elections (300-500ms) are more stable at the cost of longer failover times. For cross-region deployments, 500-1000ms may be necessary to avoid network jitter triggering elections.
+
+**Heartbeat interval:** Typically 50-100ms. Should be significantly shorter than the election timeout (by a factor of 5-10). A 100ms heartbeat with 150-300ms timeout provides a good balance.
+
+**Batch size:** Number of entries per AppendEntries RPC. 50-100 entries is typical. Larger batches improve throughput but increase latency for individual entries.
+
+**Pipeline replication:** The leader sends AppendEntries without waiting for each response. This improves throughput by keeping the network saturated. The leader maintains multiple in-flight RPCs per follower.
+
+**Snapshot threshold:** Log size that triggers compaction. For a key-value store, 10,000-100,000 entries or 64-256 MB of log data is typical. Smaller thresholds reduce recovery time but increase snapshot frequency.
+
+**Max inflight snapshots:** Limits simultaneous InstallSnapshot transfers. Default 1, to avoid saturating the network.
+
+<AsciiDiagram
+  id="raft/deep-dive-performance-vs-config"
+  alt="Graph showing throughput and latency curves as batch size increases, with optimal range marked"
+  caption="Performance trade-offs with batch size configuration"
+  content={`
+Throughput (ops/sec)
+  ^
+  │
+  │           ┌─────────────────── Optimal range (50-100)
+  │           │
+  │          ╱╲
+  │         ╱  ╲
+  │        ╱    ╲
+  │       ╱      ╲
+  │      ╱        ╲
+  │     ╱          ╲
+  │    ╱            ╲
+  │   ╱              ╲
+  │  ╱                ╲
+  │ ╱                  ╲
+  │╱                    ╲
+  └──────────────────────────────> Batch Size (entries/RPC)
+  0   25  50  75  100  125  150
+
+Latency (ms) per entry
+  ^
+  │  ╲
+  │   ╲
+  │    ╲
+  │     ╲
+  │      ╲
+  │       ──────────────
+  │                    ╱
+  │                   ╱
+  │                  ╱
+  │                 ╱ Latency increases at
+  │                ╱  high batch sizes due
+  │               ╱   to fsync cost per RPC
+  └──────────────────────────────> Batch Size (entries/RPC)
+  0   25  50  75  100  125  150
+`}
+/>

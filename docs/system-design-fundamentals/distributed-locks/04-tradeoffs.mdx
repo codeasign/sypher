@@ -1,0 +1,1308 @@
+﻿---
+id: distributed-locks-tradeoffs
+title: Distributed Locks — Trade-offs and Failure Modes
+position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Core Tension
+
+Every distributed lock system navigates a fundamental tension between two properties:
+
+- **Safety**: Never grant the same lock to two processes simultaneously. If two processes both believe they hold the lock, the protected resource may be corrupted.
+- **Liveness**: Always be able to acquire the lock when no one holds it. If the lock service is unavailable, all protected operations stop.
+
+Safety and liveness are inherently in conflict. Requiring more nodes to agree before granting a lock improves safety but reduces liveness (more nodes can fail, making the lock unavailable). Using shorter TTLs improves liveness (the lock is released quickly after a crash) but can lead to safety violations (a slow process loses the lock while still operating).
+
+<AsciiDiagram
+  id="distributed-locks/safety-vs-liveness"
+  title="Safety versus Liveness Trade-off"
+  alt="A quadrant chart showing the tension between safety and liveness, with different lock implementations positioned along the axes"
+  caption="The fundamental trade-off: stronger safety guarantees reduce liveness" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│              SAFETY vs LIVENESS TRADE-OFF                                │
+│                                                                         │
+│                 More Safe ──────────────────▶                          │
+│                   ▲                                                     │
+│                   │   Optimistic                                  │
+│                   │   Locking                         Consensus │
+│                   │                                           │
+│               20% │   Redis Single         ZooKeeper         │
+│                   │   Master               Ephemeral Seq     │
+│   Unsafe          │                         │               │
+│   Locks           │   Database                        │
+│                   │   SELECT FOR UPDATE            │
+│              Liveness │                         │                   │
+│               │       │                         │                   │
+│               │       etcd Leases               │                   │
+│               │       │                         │                   │
+│               │       Redlock                    │                   │
+│               │       │                         │                   │
+│               ▼       ── Less Liveness ────────▶│                   │
+│                                                                     │
+│               ◄── More Available ──  ── Less Available ──▶        │
+│                                                                     │
+│  Key insight:                                                        │
+│  ZooKeeper and etcd provide the best safety (linearizable, tokens).  │
+│  Redis single master provides the best liveness (always available).  │
+│  No system achieves both perfect safety and perfect liveness.        │
+│  The choice depends on the cost of lock failure vs unavailability.   │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Decision Matrix
+
+| Scenario | Recommended Approach | Rationale |
+|----------|---------------------|-----------|
+| Financial transactions | ZooKeeper with fencing tokens | Safety is paramount. A double-spend costs millions. Accept higher latency. |
+| Cache rebuilding | Redis SETNX | Cache corruption is recoverable. Speed matters more than perfect safety. |
+| Leader election | etcd leases with Raft | Strong consistency required. Failover time of 10 seconds acceptable. |
+| Job scheduling (non-critical) | Database SELECT FOR UPDATE | Existing infrastructure, low throughput, safety is useful but not critical. |
+| File processing pipeline | Redlock with fencing tokens | Medium safety requirement. Must handle process crashes cleanly. |
+| Distributed rate limiting | Redis with local counters | No lock needed. Counters are naturally concurrent. |
+| Configuration rollout | ZooKeeper sequential nodes | Not a lock pattern. Sequential rollout with version checks is safer. |
+
+## Failure Modes
+
+### Failure Mode 1: TTL Expiry While Holding Lock
+
+The lock holder is still alive and operating but the TTL has expired. Another process acquires the lock. Two processes now believe they hold the lock simultaneously.
+
+**Root cause**: The process took longer than the TTL to complete its critical section. This can happen due to a garbage collection pause (Java GC can pause for seconds), a disk I/O stall, a network retry, or CPU throttling in a cloud environment.
+
+**Impact**: The protected resource may be corrupted by concurrent writes. If the resource is a database, this can cause data corruption or duplicate records.
+
+**Mitigation**: Fencing tokens are the only complete solution. The protected resource tracks the highest token it has seen and rejects operations with lower tokens. The process must check the token before each write operation, not just at lock acquisition time.
+
+**Mitigation (partial)**: Hold the lock for a small multiple of the expected operation time. If the operation typically completes in 100ms, set the TTL to 1 second. This reduces the window of unsafety but does not eliminate it.
+
+### Failure Mode 2: Clock Drift
+
+The lock service's clock and the client's clock drift apart. The lock service thinks the TTL has expired, but the client disagrees. Or vice versa.
+
+**Root cause**: NTP synchronization is imperfect. Cloud instances can experience clock drift of up to 2ms per second under high load. Virtualized environments are particularly susceptible to clock skew during CPU steal time.
+
+**Impact**: Premature lock expiry (service side clock is fast) or delayed lock expiry (service side clock is slow). Premature expiry can lead to two processes holding the lock simultaneously. Delayed expiry can lead to prolonged lock unavailability after a crash.
+
+**Mitigation**: Use a monotonic clock for TTL tracking, not the wall clock. The service checks elapsed time since lock acquisition, not wall clock expiration. Include a clock drift tolerance buffer of 5% in the TTL.
+
+**Mitigation (ZooKeeper or etcd)**: Use a consensus-based lock service that does not rely on clock synchronization. ZooKeeper's ephemeral znodes are controlled by session timeouts, which use server-side clocks synchronized across the cluster.
+
+### Failure Mode 3: Deadlock
+
+Two processes each hold a lock and are waiting for the other's lock. Neither process can make progress. Both eventually timeout, release their locks, and retry, which may lead to the same deadlock.
+
+<AsciiDiagram
+  id="distributed-locks/deadlock-scenario"
+  title="Distributed Deadlock Scenario"
+  alt="Two processes each holding one lock and waiting for the other's lock, forming a circular wait condition"
+  caption="Circular wait in a distributed deadlock between two processes" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    DISTRIBUTED DEADLOCK                                  │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  Lock Service                                                    │   │
+│  │  ┌──────────────────────┐     ┌──────────────────────┐         │   │
+│  │  │ Resource_A: HELD     │     │ Resource_B: HELD     │         │   │
+│  │  │ Owner: Process 1     │     │ Owner: Process 2     │         │   │
+│  │  │ TTL: 30s             │     │ TTL: 30s             │         │   │
+│  │  └──────────────────────┘     └──────────────────────┘         │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  ┌──────────────┐                     ┌──────────────┐                │
+│  │ Process 1    │                     │ Process 2    │                │
+│  │              │                     │              │                │
+│  │ Holds: A     │                     │ Holds: B     │                │
+│  │ Needs: B     │────────────────────│ Needs: A     │                │
+│  │              │ Waiting for P2     │              │                │
+│  │              │ to release B       │              │                │
+│  └──────────────┘                     └──────────────┘                │
+│                                                                         │
+│  Timeline:                                                              │
+│  0s:  P1 acquires A        P2 acquires B                               │
+│  2s:  P1 tries B → waits   P2 tries A → waits                         │
+│  10s: P1 renews A lease    P2 renews B lease                           │
+│  20s: P1 renews A lease    P2 renews B lease                           │
+│  30s: Both TTLs expire → both locks released                          │
+│  30s: Both operations fail                                             │
+│                                                                         │
+│  Prevention: Always acquire locks in the same order across all         │
+│  processes (A then B). Or use a single lock for the whole operation.   │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+**Root cause**: Two processes acquire locks in different orders. Process 1 acquires lock A then tries B. Process 2 acquires lock B then tries A. Each holds a resource the other needs.
+
+**Prevention**: Establish a global lock ordering. All processes must acquire locks in the same order. For example, always acquire resource A before resource B. This eliminates circular wait, which is one of the four conditions required for deadlock.
+
+**Detection**: Distributed deadlock detection requires building a wait-for graph. Each process reports which locks it holds and which it is waiting for. The lock service checks for cycles in the graph. This is expensive and rarely done in practice.
+
+### Failure Mode 4: Lock Contention Storm
+
+A sudden spike in lock acquisition attempts overwhelms the lock service. Every process is trying to acquire locks simultaneously.
+
+**Root cause**: A lock holder holds a lock for longer than expected (slow query, external API call). Waiting processes accumulate. When the lock is released, all waiting processes try to acquire it simultaneously — a thundering herd. Each failed attempt triggers another retry cycle.
+
+<AsciiDiagram
+  id="distributed-locks/contention-storm"
+  title="Lock Contention Storm Pattern"
+  alt="A timeline showing lock acquisition requests spiking and the lock service being overwhelmed by retries as each process fails and retries"
+  caption="A thundering herd of lock acquisition attempts overwhelms the lock service" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│               LOCK CONTENTION STORM                                      │
+│                                                                         │
+│  Lock held by P1                                                       │
+│  ─────────────────────────────────────────────────────────────         │
+│                                                                         │
+│  50 processes waiting:                                                  │
+│                                                                         │
+│  0s    P1 holds lock                                                    │
+│                                                                         │
+│  5s    P2-P51 all try to acquire → all fail → all wait 100ms           │
+│                                                                         │
+│  5.1s  P2-P51 all retry → all fail → all wait 200ms                   │
+│                                                                         │
+│  5.3s  P2-P51 all retry → all fail → all wait 400ms                   │
+│                                                                         │
+│  5.7s  P2-P51 all retry → all fail → all wait 800ms                   │
+│                                                                         │
+│  6.5s  P1 releases lock                                                 │
+│                                                                         │
+│  6.5s  P2-P51 all retry (after backoff) → 1 succeeds, 49 fail          │
+│        Lock service processes 50 requests in 2ms                       │
+│        1 OK, 49 NIL responses                                          │
+│                                                                         │
+│  6.5s+ 49 processes retry with backoff → 1 succeeds, 48 fail          │
+│        Cascade continues until all 50 have acquired and released       │
+│                                                                         │
+│  Total time for 50 processes: ~30 seconds                              │
+│  Throughput during storm: 1.67 processes/second                       │
+│  Normal throughput: 50 processes in 1 second                          │
+│                                                                         │
+│  Without jitter: all 50 retry at exact same time → 50x spike          │
+│  With jitter: retries spread over 0-100ms window → smooth traffic     │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+**Mitigation**: Add jitter to retry intervals. Instead of retrying every N milliseconds, add a random offset: N + random(0, N/2). This spreads retries across a time window rather than bunching them at exact intervals.
+
+**Mitigation (queue-based)**: Use a lock queue instead of polling. ZooKeeper's sequential znode approach creates a natural queue — each process watches the preceding process, not the lock itself. When the lock is released, only the next process in the queue attempts to acquire it.
+
+### Failure Mode 5: Fencing Token Gap
+
+The fencing token generator skips numbers, creating a gap in the token sequence. Two different lock acquisitions receive tokens that are not consecutive, but the gap does not affect correctness — the only requirement is monotonic increase.
+
+**More serious**: The fencing token generator resets after a leader failover. The new leader starts at token 1. A late write from the previous epoch (token 1042) may be accepted because the resource has seen tokens from the new epoch (token 5) and 1042 is higher.
+
+**Mitigation**: The fencing token generator must be persistent. The current token value is stored in the write-ahead log and replicated. After failover, the new leader reads the last committed token and continues from there.
+
+**Mitigation (epoch-based)**: Combine the fencing token with an epoch number. The epoch is incremented on each leader change. The token is (epoch, counter). The resource rejects any token with an epoch lower than its last-seen epoch.
+
+## Anti-Patterns
+
+### Anti-Pattern 1: Using a Lock as a Mutex
+
+A distributed lock is not a replacement for a local mutex. Acquiring a distributed lock involves a network round trip of 1-100ms. Using it to protect a 1-microsecond critical section is catastrophically expensive.
+
+**Better approach**: Use a local mutex for local resource protection. Use a distributed lock only for cross-process resource coordination. The critical section protected by a distributed lock should take at least 10x the lock acquisition latency.
+
+### Anti-Pattern 2: Locking Everything
+
+Applying distributed locks to every operation "just in case." This creates unnecessary contention and latency. Not every operation needs mutual exclusion — many operations are safe to run concurrently.
+
+**Better approach**: Analyze the actual concurrency risks. Use optimistic concurrency control for low-contention scenarios. Use compare-and-swap operations when they suffice. Reserve distributed locks for operations that would cause data corruption if run concurrently.
+
+### Anti-Pattern 3: Infinite Lock Hold Time
+
+Setting the TTL to a very large value (hours or days) to avoid lock expiry during long operations. This makes the lock essentially non-releasable if the holder crashes.
+
+**Better approach**: Break long operations into smaller steps, each protected by a short-lived lock. Use a workflow engine or saga pattern instead of holding a lock for the entire operation.
+
+### Anti-Pattern 4: Using Lock Release as a Signal
+
+Inter-process communication through lock acquire and release. Process A acquires a lock, does some work, releases it. Process B, which was waiting for the lock, interprets the acquisition as "Process A finished step 1." This is fragile — if Process A crashes, Process B cannot distinguish between "step 1 is done" and "Process A crashed."
+
+**Better approach**: Use a dedicated signaling mechanism: a message queue, a shared log, or a condition variable with explicit state.
+
+### Anti-Pattern 5: Ignoring the Fencing Token
+
+Using a lock without checking the fencing token at the protected resource. This makes the lock a probabilistic mechanism — it works most of the time but fails under certain edge cases (GC pauses, network delays, clock drift).
+
+**Better approach**: Implement fencing token checking in the protected resource. The resource should reject any operation with a stale token. This adds complexity but is the only way to guarantee safety.
+
+### Anti-Pattern 6: Using a Single Redis Master for Critical Locks
+
+Relying on a single Redis instance or Redis with asynchronous replication for locks that protect critical data. A failover can cause the lock to be duplicated.
+
+**Better approach**: Use ZooKeeper, etcd, or Redlock for critical locks. Or use Redis Sentinel with wait semantics to ensure the lock is replicated before responding.
+
+### Anti-Pattern 7: Reading the Lock from a Read Replica
+
+Reading lock state from a read replica to avoid load on the master. The read replica may be behind the master. A FREE status on the replica does not mean the lock is actually free — the master may have granted it milliseconds ago.
+
+**Better approach**: Always read lock state from the leader or a node that provides linearizable reads.
+
+## When NOT to Use Distributed Locks
+
+**Idempotent operations**: If the operation produces the same result regardless of how many times it runs, a lock is unnecessary. Idempotent operations can safely run concurrently. Use idempotency keys instead.
+
+**Read-only operations**: If the operation only reads data, a lock provides no benefit. Multiple readers can read concurrently without conflict. Read locks add latency without any safety improvement.
+
+**Single-worker systems**: If the system runs on a single server with a single process, use a local mutex. A distributed lock adds unnecessary network overhead.
+
+**High-throughput operations**: If the operation requires more than 1,000 acquisitions per second, a distributed lock is too slow. Use optimistic concurrency control or lock-free data structures instead.
+
+**Operations that tolerate inconsistency**: If the system can tolerate brief periods of inconsistency (eventual consistency), a distributed lock may not be needed. Use conflict-free replicated data types (CRDTs) or last-writer-wins conflict resolution instead.
+
+**Cross-datacenter operations without consensus**: If the lock must work across datacenters, a distributed lock without consensus-based coordination will fail. The network latency and partition risk make single-master locks unsafe.
+
+## Cost Analysis: Compute Cost Per Lock Acquisition
+
+Understanding the true cost of each lock acquisition helps architects make the right technology choice for their scale and budget.
+
+### Infrastructure Cost Model
+
+The cost of a lock acquisition is not just the infrastructure cost of the lock service. It includes the application server cost for waiting and retrying, the network bandwidth cost, and the operational overhead cost.
+
+```python
+# Cost per lock acquisition calculation
+def cost_per_acquisition(
+    lock_service_monthly_cost,
+    monthly_acquisitions,
+    avg_operation_time_ms,
+    app_server_hourly_cost,
+    concurrency_per_server,
+    avg_retries_per_acquisition
+):
+    """Calculate the fully-loaded cost per lock acquisition."""
+    
+    # Infrastructure cost
+    infra_cost_per_op = lock_service_monthly_cost / monthly_acquisitions
+    
+    # Application server cost for waiting
+    total_wait_time_hours = (
+        monthly_acquisitions * avg_operation_time_ms / 1000 / 3600
+    )
+    app_wait_cost = (
+        total_wait_time_hours * app_server_hourly_cost / concurrency_per_server
+    )
+    
+    # Retry cost
+    retry_cost = app_wait_cost * avg_retries_per_acquisition
+    
+    # Total
+    total = infra_cost_per_op + app_wait_cost + retry_cost
+    
+    return {
+        "infrastructure_cost_per_op": infra_cost_per_op,
+        "application_wait_cost_per_op": app_wait_cost,
+        "retry_cost_per_op": retry_cost,
+        "total_cost_per_op": total,
+        "monthly_cost": lock_service_monthly_cost + app_wait_cost + retry_cost
+    }
+```
+
+### Cost Comparison Matrix
+
+Assume a medium-scale deployment: 3,000,000 lock acquisitions per day (approximately 35 per second on average, with peaks at 200 per second), running on AWS in us-east-1.
+
+| Cost Dimension | Redis (ElastiCache) | etcd (Self-Managed) | ZooKeeper (Self-Managed) | Database (RDS) |
+|----------------|---------------------|---------------------|-------------------------|----------------|
+| Base cluster size | 1 node | 3 nodes | 3 nodes | 1 primary + 2 read replicas |
+| Node spec | cache.r6g.large | c6i.xlarge | c6i.xlarge | db.r6g.large |
+| Monthly infra cost | $180 | $450 | $450 | $600 |
+| Support/vCPU hour | $0 | $400 (ops engineer time allocation) | $400 | $0 (managed) |
+| Ops overhead (hours/month) | 2 hours | 20 hours | 25 hours | 5 hours |
+| **Total monthly cost** | $180 + $200 = $380 | $450 + $2,400 = $2,850 | $450 + $2,900 = $3,350 | $600 + $500 = $1,100 |
+| Acquisitions/month | 90,000,000 | 90,000,000 | 90,000,000 | 90,000,000 |
+| **Cost per 1,000 acquisitions** | $0.004 | $0.032 | $0.037 | $0.012 |
+| Cost per acquisition | $0.000004 | $0.000032 | $0.000037 | $0.000012 |
+
+### Cost at Different Scales
+
+| Scale Level | Acquisitions/Month | Redis Cost/1K | etcd Cost/1K | ZooKeeper Cost/1K | Database Cost/1K |
+|-------------|-------------------|--------------|--------------|-------------------|-----------------|
+| Small (startup) | 1,000,000 | $0.38 | $2.85 | $3.35 | $1.10 |
+| Medium (growth) | 10,000,000 | $0.04 | $0.29 | $0.34 | $0.11 |
+| Large (enterprise) | 100,000,000 | $0.004 | $0.03 | $0.04 | $0.01 |
+| Very large (hyperscale) | 1,000,000,000 | $0.0004 | $0.003 | $0.004 | $0.001 |
+
+**Key insight**: At low scale, operational overhead dominates cost, making managed services (Redis, database) far cheaper. At high scale, the per-op cost converges, and reliability considerations outweigh raw cost.
+
+### Hidden Costs
+
+The cost matrix above omits several hidden costs that can dominate in practice:
+
+**Lock retention time cost**: How long does a lock remain in the system after it is released? Redis evicts immediately on DELETE. etcd retains the key in its revision history until compaction runs (default: every 5 minutes). ZooKeeper retains the znode until explicitly deleted. If locks are never cleaned up, ZooKeeper can accumulate hundreds of millions of znodes, each consuming memory and slowing session processing.
+
+**Client-side library cost**: Redis clients are thin and well-optimized. etcd client libraries (etcd3, etcdctl) are heavier, consuming more memory and CPU in the application process. ZooKeeper clients are thread-heavy, each consuming approximately 1MB of heap per connection. For 100 application servers, ZooKeeper client library overhead can add $500/month in additional server cost.
+
+**License and support cost**: Redis (BSD license) and etcd (Apache 2.0) require no license fees. ZooKeeper (Apache 2.0) also requires no fees. However, enterprise support for any of these systems (Redis Enterprise, Confluent's ZooKeeper support) can add $10,000-$50,000 annually.
+
+**Migration cost**: Switching from one lock service to another requires rewriting the client library integration, reconfiguring applications, and migrating the lock state. A migration project typically takes 2-4 weeks of engineering time, costing $10,000-$40,000 in salary costs.
+
+## More Anti-Patterns
+
+### Anti-Pattern 8: Using Locks for Caching
+
+Acquiring a distributed lock before checking or updating a cache entry. The reasoning is: "If two processes both try to update the cache simultaneously, one should win." But caches are inherently lossy — a stale cache entry is corrected on the next read, and a lost write is harmless.
+
+```python
+# ANTI-PATTERN: Lock before cache update
+def get_user_bad(user_id):
+    lock_key = f"user_cache_lock:{user_id}"
+    lock = lock_service.acquire(lock_key, ttl=5)
+    try:
+        # Check cache while holding lock
+        cached = cache.get(f"user:{user_id}")
+        if cached:
+            return cached
+        # Miss: fetch from database
+        user = database.fetch_user(user_id)
+        cache.set(f"user:{user_id}", user, ttl=300)
+        return user
+    finally:
+        lock.release()
+
+# BETTER: No lock, just update and accept temporary inconsistency
+def get_user_good(user_id):
+    cached = cache.get(f"user:{user_id}")
+    if cached:
+        return cached
+    
+    # Use compare-and-set or don't worry about it
+    user = database.fetch_user(user_id)
+    cache.set(f"user:{user_id}", user, ttl=300, nx=True)
+    return user
+```
+
+**Why this is wrong**: Cache misses are rare events — typically 1-5% of reads. The lock adds latency to every cache miss. The distributed lock network round trip (5-50ms) is often longer than the database query itself (1-10ms). The lock also creates contention: if 100 processes all experience a cache miss simultaneously (after cache invalidation), they all try to acquire the lock, and the lock service becomes a bottleneck for what should be a fast path.
+
+**Impact**: Locking for caching can increase cache miss latency by 5-10x and add unnecessary load to the lock service. The cache hit ratio improvement from lock protection is negligible because cache writes are idempotent.
+
+**Better alternatives**: Use cache stampede protection (early recompute before TTL expiry), probabilistic early expiration, or a request coalescing pattern (only one process fetches from the database and others wait on a future or channel).
+
+### Anti-Pattern 9: Using Locks for Logging
+
+Acquiring a distributed lock to ensure log entries appear in the correct order. The reasoning is: "Log entries from different processes are interleaved. A lock ensures sequential ordering."
+
+```python
+# ANTI-PATTERN: Lock before log write
+def log_with_lock(event):
+    lock = lock_service.acquire("log_lock", ttl=1)
+    try:
+        with open("app.log", "a") as f:
+            f.write(f"{time.isoformat()} {event}\n")
+    finally:
+        lock.release()
+```
+
+**Why this is wrong**: Logging is one of the highest-frequency operations in an application. A single application can produce thousands of log lines per second. Acquiring a distributed lock for each log line converts a 1-microsecond I/O operation into a 1-50ms network round trip. This reduces log throughput by 99.9% and makes the lock service the bottleneck for the entire application.
+
+**Impact**: The lock service is now processing lock acquisitions for every log line. If the application logs 10,000 lines per second, the lock service must process 10,000 acquisitions per second for log entries alone — potentially exceeding the lock service's throughput capacity and degrading all other lock-protected operations.
+
+**Better alternatives**: Use a structured logging framework that writes to a centralized log sink (CloudWatch, ELK, Loki) without any coordination. Log aggregation systems handle out-of-order entries natively. If ordering matters, use a distributed log (Kafka) with partition keys, not a lock.
+
+### Anti-Pattern 10: Lock Without Monitoring
+
+Deploying a distributed lock system without any metrics, dashboards, or alerts. The lock service is treated as a black box — if lock acquisitions succeed, everything is assumed to be fine.
+
+```python
+# ANTI-PATTERN: No monitoring on lock operations
+def process_batch(batch_id):
+    # Acquire lock — but no tracking of:
+    # - How long did the acquisition take?
+    # - How many retries were needed?
+    # - Is the lock service healthy?
+    # - Is this lock heavily contended?
+    lock = lock_client.acquire(f"batch:{batch_id}", ttl=30)
+    try:
+        do_work(batch_id)
+    finally:
+        lock.release()
+```
+
+**Impact**: Without monitoring, a contention storm develops silently. Lock acquisition latency increases from 5ms to 500ms. Application response times degrade. Users report slow operations. The operations team has no visibility into the root cause. It could be the lock service, the database, the network, or the application itself. Without lock metrics, the investigation starts from scratch.
+
+**Better approach**: Instrument every lock acquisition with metrics:
+
+```python
+# CORRECT: Monitor every lock operation
+import time
+import prometheus_client as prom
+
+lock_acquisition_duration = prom.Histogram(
+    'lock_acquisition_duration_seconds',
+    'Time to acquire a distributed lock',
+    ['resource_group'],
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0)
+)
+
+lock_acquisition_errors = prom.Counter(
+    'lock_acquisition_errors_total',
+    'Total lock acquisition errors',
+    ['resource_group', 'error_type']
+)
+
+lock_acquisitions_total = prom.Counter(
+    'lock_acquisitions_total',
+    'Total lock acquisitions',
+    ['resource_group', 'result']
+)
+
+lock_hold_duration = prom.Histogram(
+    'lock_hold_duration_seconds',
+    'How long locks are held',
+    ['resource_group'],
+    buckets=(0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0)
+)
+
+def monitored_acquire(lock_client, resource_id, ttl=30):
+    resource_group = resource_id.split(":")[0]
+    start = time.monotonic()
+    try:
+        lock = lock_client.acquire(resource_id, ttl=ttl)
+        duration = time.monotonic() - start
+        lock_acquisition_duration.labels(resource_group).observe(duration)
+        lock_acquisitions_total.labels(resource_group, "success").inc()
+        return MonitoredLock(lock, resource_group)
+    except LockTimeoutError as e:
+        lock_acquisition_errors.labels(resource_group, "timeout").inc()
+        lock_acquisitions_total.labels(resource_group, "timeout").inc()
+        raise
+    except ConnectionError as e:
+        lock_acquisition_errors.labels(resource_group, "connection").inc()
+        lock_acquisitions_total.labels(resource_group, "error").inc()
+        raise
+
+class MonitoredLock:
+    def __init__(self, lock, resource_group):
+        self._lock = lock
+        self._resource_group = resource_group
+        self._acquired_at = time.monotonic()
+    
+    def release(self):
+        hold_duration = time.monotonic() - self._acquired_at
+        lock_hold_duration.labels(self._resource_group).observe(hold_duration)
+        self._lock.release()
+```
+
+### Anti-Pattern 11: Using Locks as a Semaphore
+
+A distributed lock is a mutual exclusion primitive: exactly one process can hold it. A semaphore allows N processes to proceed concurrently. Attempting to use locks as semaphores by acquiring multiple locks and checking their count leads to race conditions and deadlocks.
+
+**Why this is wrong**: If the goal is to allow up to 5 concurrent workers, creating 5 lock keys and checking how many are acquired creates a read-modify-write race — two processes can simultaneously read "3 locks held" and both decide to acquire the fourth. Additionally, holding multiple locks creates deadlock risk and increases management overhead.
+
+**Better approach**: Use a dedicated semaphore implementation. ZooKeeper supports sequential ephemeral znodes, which can implement a semaphore: each process creates a znode, and the N lowest-numbered znodes are the active workers. Redis supports counting semaphores through `INCR` and `DECR` with TTL. For more complex scenarios, use a rate limiter library (token bucket or leaky bucket).
+
+### Anti-Pattern 12: Nested Distributed Locks
+
+Acquiring a distributed lock while already holding another distributed lock, without a defined ordering. This creates deadlock risk and increases complexity.
+
+```python
+# ANTI-PATTERN: Nested distributed locks with inconsistent ordering
+def transfer_funds(from_account, to_account, amount):
+    # Deadlock risk: process A locks from=acct1, to=acct2
+    # Process B locks from=acct2, to=acct1
+    lock_from = lock_service.acquire(f"account:{from_account}", ttl=10)
+    lock_to = lock_service.acquire(f"account:{to_account}", ttl=10)
+    try:
+        from_bal = database.get_balance(from_account)
+        to_bal = database.get_balance(to_account)
+        database.set_balance(from_account, from_bal - amount)
+        database.set_balance(to_account, to_bal + amount)
+    finally:
+        lock_to.release()
+        lock_from.release()
+```
+
+**Better approach**: Use a consistent ordering for all lock acquisitions. Acquire locks in a deterministic order (always the lower account ID first). Or use a single lock for the transaction scope. Or use optimistic concurrency control with version numbers instead of locks for financial transactions.
+
+## Complex Trade-Off Analysis Matrix
+
+A systematic evaluation of distributed lock implementations across multiple dimensions helps architects make informed decisions.
+
+<AsciiDiagram
+  id="distributed-locks/tradeoff-matrix-visual"
+  title="Lock Implementation Trade-Off Analysis"
+  alt="Radar chart comparing Redis, etcd, ZooKeeper, and Database-based locks across 8 dimensions"
+  caption="Multi-dimensional comparison of lock implementation approaches" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│              LOCK IMPLEMENTATION TRADE-OFF MATRIX                         │
+│                                                                         │
+│  Dimension                 Redis    etcd    ZooKeeper   Database        │
+│  ───────────────────────────────────────────────────────────────────    │
+│                                                                         │
+│  Safety (linearizability)    2/5     5/5      5/5         3/5          │
+│  Liveness (availability)     5/5     4/5      4/5         3/5          │
+│  Throughput (ops/sec)        5/5     3/5      3/5         2/5          │
+│  Latency (p50)               5/5     4/5      3/5         3/5          │
+│  Operational simplicity      5/5     3/5      2/5         4/5          │
+│  Client library quality      4/5     4/5      4/5         5/5          │
+│  Failure tolerance           2/5     4/5      4/5         3/5          │
+│  Fencing token support       1/5     5/5      5/5         2/5          │
+│  Cost efficiency             5/5     3/5      3/5         4/5          │
+│  Monitoring maturity         4/5     4/5      3/5         5/5          │
+│  Cross-region support        2/5     3/5      2/5         4/5          │
+│  Ecosystem integration       5/5     3/5      2/5         5/5          │
+│                                                                         │
+│  Composite score (max 60):                                              │
+│  Redis:      44/60                                                      │
+│  etcd:       45/60                                                      │
+│  ZooKeeper:  40/60                                                      │
+│  Database:   42/60                                                      │
+│                                                                         │
+│  Note: Composite scores are highly context-dependent. A score of       │
+│  45/60 for etcd and 44/60 for Redis does not mean etcd is "better"     │
+│  than Redis — it means etcd is more suitable for use cases where       │
+│  safety and failure tolerance dominate, while Redis excels when        │
+│  throughput and latency are the primary concerns.                      │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Detailed Dimension Analysis
+
+**Safety (Linearizability)**:
+- Redis single master: Not linearizable. Asynchronous replication means a failover can lose the most recent write. Redis Sentinel does not guarantee that the promoted replica has the latest state.
+- Redis Redlock: Probabilistically safe. Under normal conditions, linearizable. Under network partitions or clock drift, safety is compromised. Martin Kleppmann's analysis showed that Redlock is not a true consensus system.
+- etcd: Linearizable for all operations. Raft provides strong consistency. Every read and write reflects the latest committed state.
+- ZooKeeper: Linearizable for write operations. Reads can be stale by default (unless using `sync()` before read). Sequential consistency for read operations.
+- Database (PostgreSQL SELECT FOR UPDATE): Linearizable within a transaction isolation level. Serializable isolation provides strong guarantees, but at a high cost. Read Committed allows phantom reads after unlock.
+
+**Liveness (Availability)**:
+- Redis single master: No built-in failover. If the master goes down, the lock is unavailable until Sentinel promotes a replica (10-30 seconds). During the failover, all locks are lost.
+- Redis Sentinel: Failover can take 10-30 seconds. During this time, no locks can be acquired. Existing locks may be lost as the replica may not have the latest state.
+- etcd: Leader election completes in 150-300ms. During election (100-300ms), no writes are possible. Reads from followers may still serve stale data. Total outage window: less than 1 second.
+- ZooKeeper: Leader election completes in 1-10 seconds (ZAB protocol, configurable tick time). During election, no operations are available. Total outage window: 1-10 seconds.
+- Database: Database availability depends on the database HA setup. RDS Multi-AZ failover takes 60-120 seconds. During failover, the lock table is unavailable.
+
+**Throughput**:
+- Redis: Up to 50,000 ops/sec on a single node. Limited by single-threaded event loop and network. Redis 6+ with I/O threads can push to 100,000 ops/sec.
+- etcd: 3,000-10,000 ops/sec depending on network latency and disk speed. Limited by Raft consensus: each write requires a majority commit. Disk fsync is the bottleneck.
+- ZooKeeper: 3,000-10,000 ops/sec. Similar to etcd. Limited by Zab protocol and disk sync. ZooKeeper syncs to disk on every write.
+- Database: 500-5,000 ops/sec depending on database hardware and lock table design. Transaction overhead (BEGIN, COMMIT, row locking) adds latency. Indexed access to the lock table is critical.
+
+**Latency (p50)**:
+- Redis single master: 0.5-2ms (in-region). Sub-millisecond for local connections. No consensus overhead.
+- Redis Sentinel: Same as single master (0.5-2ms) when the master is healthy. No additional latency for normal operations.
+- etcd: 2-10ms. Raft consensus adds 1-2ms for leader coordination. Disk fsync adds 0.5-5ms depending on disk hardware.
+- ZooKeeper: 5-30ms. ZAB protocol overhead. Disk sync on every write is the dominant factor.
+- Database: 2-15ms. BEGIN, row lock, UPDATE, COMMIT overhead. Database contention adds variability.
+
+**Operational Simplicity**:
+- Redis: Simple to set up. Single binary, no dependencies. Sentinel adds complexity but is well-documented. Redis Cluster requires careful planning.
+- etcd: Moderate complexity. Requires cluster configuration, TLS setup, regular maintenance of WAL compaction and defragmentation.
+- ZooKeeper: High complexity. Requires careful JVM tuning, heap configuration, disk layout planning, and regular maintenance of snapshots and transaction logs.
+- Database: Very simple if the database is already in use. A single table with proper indexing. No new infrastructure to manage.
+
+**Fencing Token Support**:
+
+| System | Fencing Token | Persistence | Epoch Safety |
+|--------|--------------|-------------|-------------|
+| Redis single master | Manual (INCR counter) | Not persisted | Not safe |
+| Redis Redlock | Manual (client generates) | No standard mechanism | Not safe |
+| etcd | Built-in (revision number) | Persisted in Raft log | Safe across failovers |
+| ZooKeeper | Built-in (zxid + sequential counter) | Persisted in transaction log | Safe across failovers |
+| PostgreSQL | Advisory lock ID or serial | Persisted in transaction log | Safe with serializable isolation |
+
+**Client Library Quality**:
+- Redis: `redis-py`, `ioredis`, `go-redis`. Battle-tested, well-documented, active maintenance. Lock patterns are well-known and widely used.
+- etcd: `etcd3` (Python), `etcd-client` (Java), `go.etcd.io/etcd`. Well-maintained by the etcd team. Good documentation.
+- ZooKeeper: ZooKeeper client (Java), `kazoo` (Python), `go-zookeeper`. Java client is mature but heavy. Python and Go clients are well-maintained.
+- Database: Native SQL drivers for any language. Lock patterns are built on standard SQL constructs. No additional library dependencies.
+
+**Cross-Region Support**:
+- Redis: Active-Active with CRDTs (Redis Enterprise). Standard Redis: cross-region replication is async and can lose state. No cross-region consensus.
+- etcd: Can be deployed cross-region with manual failover. Raft across regions suffers from 100-200ms commit latency. Not recommended for cross-regine writes.
+- ZooKeeper: Primarily single-region. Cross-region ZooKeeper is unreliable due to ZAB protocol sensitivity to latency. Manual cross-region DR with async replication.
+- Database: Cross-region support depends on the database engine. PostgreSQL logical replication, MySQL Group Replication, RDS cross-region replicas. All are async by default.
+
+### Scoring by Use Case
+
+| Use Case | Best Choice | Second Best | Rationale |
+|----------|-------------|-------------|-----------|
+| Financial transactions | ZooKeeper | etcd | Maximum safety with fencing tokens |
+| Cache coherence (read-heavy) | Redis | Database | Highest throughput, eventual consistency is fine |
+| Leader election | etcd | ZooKeeper | Fast failover (300ms vs 10s) |
+| Job scheduling (critical) | etcd | ZooKeeper | Strong consistency with good throughput |
+| Job scheduling (non-critical) | Database | Redis | Use existing infrastructure |
+| Rate limiting | Redis | Database | No lock needed, use counters |
+| Configuration management | etcd | ZooKeeper | Built-in watch and versioning |
+| Service discovery | ZooKeeper | etcd | Ephemeral znodes are a natural fit |
+| Distributed counters | Redis | Database | Atomic INCR/DECR operations |
+| Multi-step transactions | Database (2PC/Saga) | etcd | ACID transactions handle this natively |
+
+## More Failure Modes
+
+### Failure Mode 6: Leader Election Causing Lock Thrashing
+
+A leader election in the lock service cluster causes all locks to be re-evaluated. During the election window, no locks can be acquired or released. After the election, all leases that were held by the previous leader are invalidated.
+
+**Root cause**: In ZooKeeper, leader election resets all session timeouts. All ephemeral znodes (locks) created by the previous leader's clients are orphans — no one is refreshing them. The new leader must re-establish sessions with all clients, and during this process, some leases may expire prematurely.
+
+In etcd, the lease manager is tied to the Raft state machine. A leader change does not invalidate leases — the lease state is replicated across all nodes. However, during the election window (100-300ms), no lease renewals are processed. For leases with short TTLs (1-5 seconds), this can cause premature expiry.
+
+<AsciiDiagram
+  id="distributed-locks/leader-failover-thrashing"
+  title="Leader Failover Lock Thrashing"
+  alt="Timeline showing lock thrashing during a ZooKeeper leader election, with leases expiring and processes re-acquiring locks"
+  caption="Lock thrashing during a leader election event" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│               LEADER ELECTION LOCK THRASHING                              │
+│                                                                         │
+│  ZooKeeper 3-node cluster                                                │
+│                                                                         │
+│  Time  Event                                                             │
+│  ────  ─────                                                             │
+│  0s    Leader (node 1) is healthy, 500 active locks                     │
+│                                                                         │
+│  2s    Node 1 loses network connectivity (NIC failure)                  │
+│        500 clients still believe they hold locks                        │
+│        Node 2 and 3 detect leader loss (3 * tickTime = 6s timeout)      │
+│                                                                         │
+│  8s    Node 2 initiates leader election                                 │
+│        Node 3 votes for Node 2                                          │
+│        Election duration: 2-4 seconds                                   │
+│                                                                         │
+│  10s   Node 2 becomes leader                                            │
+│        All 500 sessions with old leader are expired                     │
+│        All 500 ephemeral lock znodes are deleted                        │
+│        Total: 500 locks lost simultaneously                             │
+│                                                                         │
+│  10.5s Clients detect session expiry, reconnect to new leader           │
+│        500 processes re-acquire their locks                             │
+│        Lock service processes 500 acquisitions in 200ms                 │
+│                                                                         │
+│  10.7s Some operations were in flight when locks were lost              │
+│        Those operations may have corrupted the protected resource       │
+│                                                                         │
+│  11s   Protected resources detect stale operations via fencing tokens   │
+│        12 operations rejected as stale                                   │
+│        3 operations completed before lock loss → no protection          │
+│                                                                         │
+│  Total thrashing window: 8-11 seconds                                    │
+│  Locks lost: 500                                                         │
+│  Potentially unsafe operations: up to 15 (3% of in-flight operations)   │
+│                                                                         │
+│  Mitigation: Use fencing tokens to reject the 3 unsafe operations.      │
+│  Prevention: Use a system with longer session timeout or faster         │
+│  failure detection (etcd with 1-second heartbeat interval).             │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+**Recovery pattern**:
+1. All clients detect session loss through the ZooKeeper event system. Each client receives a `SessionExpiredException`.
+2. Clients reconnect to the new leader. The lock client library should automatically attempt reconnection with exponential backoff.
+3. Each client identifies which locks it was holding by querying a local state table. The client maintained a list of (resource, token, operation_status) for each lock it held.
+4. Clients attempt to re-acquire each former lock. For operations that were in flight during the session loss, the client must check the operation status at the protected resource before continuing.
+5. For operations that completed: no action needed. The fencing token from the previous session is already recorded at the resource.
+6. For operations that were in flight: abort and restart. The operation did not complete, so no harm was done, but it must be retried with a new fencing token.
+7. For operations that were pending (not yet started): simply re-acquire the lock and proceed.
+
+```python
+def recover_from_session_loss(local_lock_registry, resource_checker):
+    """
+    Recover held locks after a ZooKeeper session loss.
+    """
+    for lock_record in local_lock_registry.get_all():
+        resource = lock_record["resource"]
+        token = lock_record["token"]
+        operation_status = lock_record["status"]
+        
+        if operation_status == "completed":
+            # Verify the operation completed at the resource
+            # If the token is recorded, no further action needed
+            continue
+        
+        elif operation_status == "in_flight":
+            # The operation was interrupted. Check at the resource.
+            resource_state = resource_checker.get_state(resource)
+            # Did our operation succeed before session loss?
+            if resource_state.last_token >= token:
+                # Operation completed, just record success
+                lock_record["status"] = "completed"
+            else:
+                # Operation did not complete. Must restart.
+                abort_and_retry_operation(resource)
+        
+        elif operation_status == "pending":
+            # Operation never started. Re-acquire the lock.
+            new_lock = lock_service.acquire(resource, ttl=30)
+            if new_lock:
+                lock_record["token"] = new_lock.token
+                lock_record["status"] = "pending"
+```
+
+### Failure Mode 7: Snapshot Recovery Overwriting Lock State
+
+When a consensus system (etcd, ZooKeeper) performs a snapshot of its state and then restores from that snapshot, the restored state may be missing lock operations that occurred after the snapshot was taken. Worse, if the snapshot is from a stale backup, locks that have since been released may appear as still held.
+
+**Root cause**: In etcd, snapshotting is periodic (default: every 10,000 WAL entries). If the cluster crashes after the snapshot but before the WAL entries following the snapshot have been applied to a new node, the restored node will have a clean but outdated view of lock state.
+
+In ZooKeeper, snapshots are taken by the leader. Follower nodes that restore from a leader's snapshot may be missing the latest transaction log entries. If the snapshot is from 30 seconds ago and the TTL on all active locks is 60 seconds, a restored follower might show active locks that have expired from the perspective of the actual lock holders.
+
+<AsciiDiagram
+  id="distributed-locks/snapshot-stale-state"
+  title="Stale Snapshot Restoring Lock State"
+  alt="Timeline showing a stale snapshot restoring locks that had already been released, causing confusion in the monitoring system"
+  caption="Stale snapshot causing phantom lock entries after recovery" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│             STALE SNAPSHOT RESTORING LOCK STATE                           │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  etcd WAL timeline                                                │   │
+│  │                                                                   │   │
+│  │  t=0     Snapshot taken (contains lock_A, lock_B, lock_C)        │   │
+│  │                                                                   │   │
+│  │  t=10s   lock_A released                                          │   │
+│  │  t=15s   lock_B released                                          │   │
+│  │  t=20s   lock_C released                                          │   │
+│  │  t=25s   lock_D acquired                                          │   │
+│  │  t=30s   lock_E acquired                                          │   │
+│  │  t=35s   lock_F acquired                                          │   │
+│  │                                                                   │   │
+│  │  t=40s   Cluster crash — all 3 nodes go down                     │   │
+│  │  t=42s   WAL entries t=10 to t=35 are replayed from WAL          │   │
+│  │           All operations recovered: lock_D, lock_E, lock_F held  │   │
+│  │           lock_A, lock_B, lock_C released                        │   │
+│  │                                                                   │   │
+│  │  ─── If WAL entries t=10 to t=35 are LOST (corrupt disk): ──    │   │
+│  │  t=42s   Restored from snapshot only                              │   │
+│  │           lock_A, lock_B, lock_C are still in the state           │   │
+│  │           but they were released 22 seconds ago                   │   │
+│  │           They are phantom entries: not actually held              │   │
+│  │                                                                   │   │
+│  │  Impact: Prometheus scrapes lock state and reports               │   │
+│  │  3 phantom held locks. Monitoring dashboard shows                 │   │
+│  │  active locks that don't actually exist.                          │   │
+│  │  If the monitoring system alerts on lock count, false alarm.     │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  Worse case:                                                            │
+│  If lock_A, lock_B, lock_C were acquired with a 30-second TTL,         │
+│  and no renewal was happening, those locks expired at t=30.            │
+│  A restore at t=42 shows them as held — but they are expired.         │
+│  The lock service would correctly refuse to release them (they are    │
+│  not actually in the state machine), but the monitoring shows          │
+│  phantom entries.                                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+**Recovery pattern**:
+1. After restoring from snapshot, the lock service should reconcile its lock state with the reality of the world. Any lock whose TTL has expired (based on the restored snapshot's timestamp) should be immediately released.
+2. The system should send a `SessionExpired` notification to all connected clients, forcing them to re-acquire any locks they believe they hold. This re-establishes the true lock state.
+3. The monitoring system should be aware that the lock service was restored from snapshot and should treat the lock count as potentially inaccurate for the first few minutes after restoration.
+4. Automated pruning: Run a reconciliation job that scans all lock entries, checks if the current time exceeds the lock's created_at + TTL, and deletes expired entries.
+
+```python
+def reconcile_after_snapshot_restore(lock_service, current_time):
+    """
+    After restoring from a stale snapshot, reconcile lock state by
+    removing any lock whose TTL has expired.
+    """
+    all_lock_keys = lock_service.get_all_keys()
+    expired_count = 0
+    for key in all_lock_keys:
+        lock_entry = lock_service.get(key)
+        if lock_entry is None:
+            continue
+        
+        created_at = lock_entry["created_at"]
+        ttl = lock_entry["ttl"]
+        expiry = created_at + ttl
+        
+        if current_time > expiry:
+            # Lock has expired. Remove it.
+            lock_service.delete(key)
+            expired_count += 1
+            log_warning(f"Removed expired lock {key} after snapshot restore. "
+                       f"Created at {created_at}, TTL {ttl}s, "
+                       f"expired {current_time - expiry}s ago")
+    
+    return expired_count
+```
+
+### Failure Mode 8: Out-of-Order Message Delivery in Async Replication
+
+When a lock service uses asynchronous replication (Redis master-replica, MySQL binary log replication), messages between the master and replica can arrive out of order. A lock release message may arrive at the replica before the corresponding lock acquisition message.
+
+**Root cause**: Async replication uses a stream of log entries. If the network connection between master and replica has variable latency, or if the master queues entries and then sends them in bursts, the replica may apply updates in a different order than they occurred on the master. Worse, entries can be lost entirely if the master crashes before the replica has received all entries.
+
+**Scenario**:
+1. Client A acquires lock_X on the master at t=0. Lock state: held by A.
+2. Client A releases lock_X on the master at t=10ms. Lock state: free.
+3. Client B acquires lock_X on the master at t=12ms. Lock state: held by B.
+4. Master crashes at t=15ms before replicating the release (t=10ms) and the second acquisition (t=12ms).
+5. Replica is promoted to master. It has the lock state from t=0: held by A.
+6. Lock state on promoted replica shows lock_X held by A. Client A has already released it. Client B was holding it but the replica doesn't know.
+7. Client A has moved on to other work. Client B believes it holds the lock and is operating on the protected resource.
+8. Client C tries to acquire lock_X. The replica (now master) says lock_X is held by A. Client C cannot acquire it.
+9. Meanwhile, Client B is modifying the resource without a valid lock from the current master.
+
+**Impact**: Two wrong things happen simultaneously: a legitimate holder (Client B) loses its lock, and a non-holder (Client A) appears to still hold the lock. This is worse than both Client A and Client B holding the lock — it creates a situation where nobody can acquire the lock, and the actual lock holder is unaware it has been disowned.
+
+**Recovery pattern**:
+1. After the replica is promoted, all clients must re-establish their lock state. The promotion event should trigger a lease expiry for all existing lock entries.
+2. Clients that were holding locks must re-acquire them. The re-acquisition should use a fencing token that is higher than any previously used token.
+3. The protected resource must reject operations from the old epoch. When the lock service restarts after a failover, it should increment its epoch number. All fencing tokens from the previous epoch are invalid.
+4. Client B, which was operating on the protected resource during the failover, will have its operations rejected by the resource if the resource checks the fencing token epoch. This prevents corruption.
+
+```python
+class EpochBasedFencingToken:
+    """
+    A fencing token that includes an epoch number.
+    The epoch is incremented on each leader change or failover.
+    """
+    def __init__(self, current_epoch=None, counter=0):
+        self.epoch = current_epoch or 1
+        self.counter = counter
+    
+    def __str__(self):
+        return f"{self.epoch}:{self.counter}"
+    
+    def __lt__(self, other):
+        if self.epoch != other.epoch:
+            return self.epoch < other.epoch
+        return self.counter < other.counter
+    
+    def __le__(self, other):
+        if self.epoch != other.epoch:
+            return self.epoch < other.epoch
+        return self.counter <= other.counter
+
+class FencingTokenGenerator:
+    """Generates monotonically increasing fencing tokens with epoch support."""
+    
+    def __init__(self, lock_service):
+        self.lock_service = lock_service
+        self.epoch = self._get_current_epoch()
+        self.counter = 0
+    
+    def _get_current_epoch(self):
+        """Read the current epoch from the lock service."""
+        epoch_value = self.lock_service.get("__fencing_epoch__")
+        if epoch_value is None:
+            return 1
+        return int(epoch_value)
+    
+    def generate(self):
+        """Generate a new fencing token with the current epoch."""
+        self.counter += 1
+        return EpochBasedFencingToken(epoch=self.epoch, counter=self.counter)
+    
+    def handle_failover(self):
+        """Called when a leader change is detected. Increments the epoch."""
+        self.epoch += 1
+        self.counter = 0
+        self.lock_service.set("__fencing_epoch__", str(self.epoch))
+```
+
+## Recovery Patterns After Failure Modes
+
+Each failure mode has a corresponding recovery pattern. Some recovery patterns are generic; others are specific to the failure mode.
+
+### Generic Recovery: Retry with Backoff
+
+Most lock acquisition failures can be resolved by retrying. The exponential backoff pattern ensures that the lock service is not overwhelmed by retries.
+
+| Failure Type | Retry Strategy | Max Retries | Backoff Formula |
+|-------------|---------------|-------------|-----------------|
+| Timeout (single operation) | Exponential backoff with jitter | 5 | `100ms * 2^attempt + random(0, 100ms)` |
+| Connection refused | Fast retry on another node | 3 | No backoff, immediate redirect |
+| Quorum lost | Backoff and wait for election | 10 | `500ms * 2^attempt + random(0, 1s)` |
+| Session expired (ZooKeeper) | Full state reset and re-acquisition | Infinity (until success) | `1s * 2^attempt` up to 30s |
+
+### Recovery Pattern: Stale Lock Detection
+
+When a lock is found to be stale (the holder has crashed but the lock was not released), the recovery must be transactional to avoid two processes acquiring the same lock.
+
+```python
+def recover_stale_lock(lock_service, resource, suspected_owner, max_ttl):
+    """
+    Attempt to recover a lock that may have a crashed holder.
+    Uses a compare-and-swap operation to ensure safety.
+    """
+    current_lock = lock_service.get(resource)
+    
+    # Check if the lock is actually stale
+    if current_lock is None:
+        # Lock is already free, nothing to recover
+        return None
+    
+    if current_lock["owner"] != suspected_owner:
+        # Another process has acquired the lock
+        return None
+    
+    lock_age = time.monotonic() - current_lock["acquired_at"]
+    if lock_age < max_ttl * 0.5:
+        # Lock is not old enough to assume crash
+        # Wait longer
+        return None
+    
+    # Attempt atomic lock recovery using etcd transaction
+    # This ensures that between the GET and the recovery PUT, no other
+    # process has acquired the lock
+    with lock_service.transaction() as tx:
+        check = tx.compare_value(resource, "==", current_lock["owner"])
+        # Only set the lock to recovery if the owner hasn't changed
+        recovery_key = f"{resource}:recovering"
+        tx.if_(check).then(
+            tx.put(recovery_key, "recovering", ttl=10),
+        ).else_(
+            tx.put(recovery_key, "failed", ttl=5),
+        )
+    
+    recovery_status = lock_service.get(f"{resource}:recovering")
+    if recovery_status and recovery_status["value"] == "recovering":
+        # This process is now responsible for recovery
+        # Release the old lock and notify waiting processes
+        lock_service.delete(resource)
+        return {"status": "recovered", "resource": resource}
+    
+    return None
+```
+
+### Recovery Pattern: After a Network Partition
+
+Network partitions in lock service clusters require specific recovery actions:
+
+1. **Detect the partition end**: The lock service (etcd or ZooKeeper) automatically detects when a partitioned node can rejoin the cluster. The node catches up on missed WAL entries and re-enters the quorum.
+
+2. **Reconcile diverged state**: During the partition, the majority side of the partition continued processing lock operations. The partitioned node missed these operations. When it rejoins, it receives the latest snapshot and replays the WAL entries it missed. No data reconciliation is needed because the majority side has the authoritative state.
+
+3. **Client reconnection**: Clients that were connected to the partitioned node must reconnect to the current leader. The lock client library should automatically detect the new leader and redirect connections.
+
+4. **Handle the minority partition's lock operations**: If the minority side of the partition continued serving lock operations (in a misconfigured cluster), those operations must be invalidated. The minority side's fencing tokens were issued by a leader that lost quorum — those tokens are invalid. The protected resource must reject any operation with a fencing token whose epoch is lower than the current leader's epoch.
+
+```python
+def handle_post_partition(minority_operations, current_epoch):
+    """
+    After a partition is healed, handle operations from the minority side.
+    """
+    rejected = 0
+    accepted = 0
+    
+    for operation in minority_operations:
+        # Check if the operation was committed during the partition
+        # by examining the fencing token epoch
+        if operation["token"].epoch < current_epoch:
+            # This operation was issued by a leader that lost quorum
+            # It may be unsafe. Reject it.
+            log_error(f"Rejecting operation from minority partition: "
+                     f"{operation['id']}, token epoch {operation['token'].epoch}")
+            rollback_operation(operation)
+            rejected += 1
+        else:
+            # The operation has a valid epoch, accept it
+            accepted += 1
+    
+    return {"rejected": rejected, "accepted": accepted}
+```
+
+### Recovery Pattern: After a Full Cluster Restart
+
+A full cluster restart (all nodes go down simultaneously) requires a specific recovery sequence:
+
+1. **Start the nodes**: All nodes should be started within a short window (minutes). The cluster must elect a leader.
+2. **Verify the WAL**: Each node replays its WAL. If a node has a corrupted WAL, it must restore from the latest snapshot.
+3. **Elect a leader**: The node with the most complete WAL (highest term and index) is elected leader. The new leader reconciles the state from all nodes.
+4. **Re-establish connections**: All clients must reconnect. Any locks that were held before the restart are now expired (their TTL has passed during the downtime).
+5. **Reconcile lock state**: The lock state after the restart should be empty — no locks are held. Any application that needs a lock must re-acquire it.
+6. **Post-restart verification**: Run a verification that the cluster can process lock operations correctly. Check that the fencing token counter continues from where it left off (or starts fresh with a new epoch).
+
+```yaml
+# Full cluster restart procedure
+steps:
+  - step: 1
+    action: verify_backup
+    command: "Check WAL and snapshot from each node. Fresh clone if needed."
+    duration: 5m
+    
+  - step: 2
+    action: start_cluster
+    command: "Start all nodes simultaneously or within 1 minute window."
+    verification: "Check: etcdctl endpoint health --cluster"
+    duration: 1m
+    
+  - step: 3
+    action: elect_leader
+    command: "Automatic. Monitor leader election via /health endpoint."
+    verification: "Check: etcdctl endpoint status shows one node as 'is_leader=true'"
+    duration: 30s
+    
+  - step: 4
+    action: accept_client_connections
+    command: "Enable client-facing port (2379). Clients should reconnect automatically."
+    verification: "Check connection count rising to expected levels."
+    duration: 2m
+    
+  - step: 5
+    action: verify_lock_state
+    command: "Query all lock keys. Should be empty (or close to empty)."
+    verification: "Compare with pre-shutdown lock count expectation."
+    duration: 1m
+    
+  - step: 6
+    action: start_lock_acquisitions
+    command: "Applications begin re-acquiring locks as needed."
+    monitoring: "Watch lock_acquisition_rate, lock_failure_rate, lock_latency."
+    duration: 5m observation
+    
+  rollback:
+    - Restore from backup (WAL + snapshot)
+    - Repeat steps 2-6
+    - Expected RTO: 30 minutes
+    - Expected RPO: 0 (no data loss if WAL is intact)
+```
+
+## Comparison of Lock Granularity
+
+The granularity of a lock — how much resource it protects — is a critical design decision. Fine-grained locks protect small units of data and allow high concurrency but add overhead and complexity. Coarse-grained locks protect large units of data and are simple but limit concurrency.
+
+### Granularity Spectrum
+
+<AsciiDiagram
+  id="distributed-locks/granularity-spectrum"
+  title="Lock Granularity Spectrum"
+  alt="Spectrum from fine-grained to coarse-grained locks with examples: row-level, document-level, collection-level, table-level, and cluster-level"
+  caption="The granularity spectrum for distributed locks, from fine to coarse" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  LOCK GRANULARITY SPECTRUM                                │
+│                                                                         │
+│  Fine-grained ───────────────────────────────────── Coarse-grained     │
+│  (high concurrency, high overhead)    (low concurrency, low overhead)  │
+│                                                                         │
+│                    │                                                      │
+│  ┌───────┐  ┌───────┐  ┌──────────┐  ┌───────┐  ┌────────────────┐   │
+│  │Row-   │  │Docu-  │  │Collection │  │Table- │  │Database/       │   │
+│  │Level  │  │ment   │  │-Level    │  │Level  │  │Cluster Level   │   │
+│  └───────┘  └───────┘  └──────────┘  └───────┘  └────────────────┘   │
+│                                                                         │
+│  Example    │         │            │          │                        │
+│  ─────────────────────────────────────────────────────────────          │
+│  row:       │         │            │          │                        │
+│  user_123   │         │            │          │                        │
+│  doc:       │  report │            │          │                        │
+│             │  .pdf   │            │          │                        │
+│  collection:│         │  users_col │          │                        │
+│             │         │  lection   │          │                        │
+│  table:     │         │            │  users   │                        │
+│             │         │            │  _table  │                        │
+│  database:  │         │            │          │  entire_db             │
+│                                                                         │
+│  Concurrency  Max   High   Medium    Low    Minimal                    │
+│  Overhead     High  High   Medium    Low    Low                        │
+│  Complexity   High  High   Medium    Low    Low                        │
+│  Deadlock     High  High   Medium    Low    None                       │
+│  risk                                                                            │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Fine-Grained Locking (Row-Level or Document-Level)
+
+Each individual data item (database row, cache entry, file) has its own lock. This allows maximum concurrency: different rows can be modified concurrently by different processes.
+
+**Use case**: An e-commerce order processing system where each order is independent. Lock per order_id.
+
+**Example**: Processing 10,000 orders per hour. Each order is a separate lock.
+
+```
+Lock key pattern: order:{order_id}
+Total locks per hour: 10,000
+Concurrent locks: ~50 (orders in flight simultaneously)
+Throughput: 10,000 operations per hour = 2.8 operations per second
+Lock service load: trivial
+```
+
+**Complexity**: The application must manage lock keys dynamically. The lock key is constructed at runtime based on the data being processed. The lock must be acquired before processing each row and released afterward. The lock must be unique for each row — no accidental collisions (e.g., using the same lock prefix for different data types).
+
+```python
+def process_order_fine_grained(order_id, payment_data):
+    """Fine-grained lock per order."""
+    lock_key = f"order:{order_id}"
+    lock = lock_service.acquire(lock_key, ttl=30)
+    try:
+        # Process this one order
+        order = db.get_order(order_id)
+        order.status = "processing"
+        order.payment = payment_data
+        db.save_order(order)
+        return True
+    finally:
+        lock.release()
+```
+
+**When to use fine-grained locking**:
+- Data items are independent and can be processed concurrently
+- High throughput is required (>100 operations per second per resource type)
+- Operations are short (milliseconds to seconds)
+- The lock service can handle high key cardinality (thousands to millions of distinct keys)
+
+### Coarse-Grained Locking (Table-Level or Collection-Level)
+
+A single lock protects an entire table, collection, or data category. All operations on that data category must acquire the same lock.
+
+**Use case**: A batch processing pipeline that processes all pending orders in a single run. The lock protects the entire "pending orders queue."
+
+**Example**: Processing a batch of orders every hour.
+
+```
+Lock key pattern: batch:pending_orders
+Total locks per hour: 1 (acquired once per batch run)
+Concurrent locks: 1 (only one batch processor active at a time)
+Throughput: 1 operation per hour
+Lock service load: negligible
+```
+
+```python
+def process_batch_coarse_grained():
+    """Coarse-grained lock for entire batch processing pipeline."""
+    lock_key = "batch:pending_orders"
+    # TTL must cover the entire batch operation
+    # If batch takes 45 minutes, TTL must be at least 45 minutes
+    lock = lock_service.acquire(lock_key, ttl=3600)  # 1 hour TTL
+    try:
+        orders = db.get_pending_orders()
+        for order in orders:
+            # Process each order inside the same lock
+            order.status = "processing"
+            db.save_order(order)
+        return len(orders)
+    finally:
+        lock.release()
+```
+
+**When to use coarse-grained locking**:
+- Data items are not independent (processing one affects processing of others)
+- The operation is long-running (minutes to hours)
+- Throughput is low (under 1 operation per second)
+- Simplicity is more important than concurrency
+- The operation must be atomic across all items in the collection
+
+### Trade-Off Analysis: Fine vs Coarse
+
+| Dimension | Fine-Grained | Coarse-Grained |
+|-----------|-------------|----------------|
+| Concurrency | High (many items processed simultaneously) | Low (serial processing) |
+| Throughput | High (limited by lock service capacity) | Low (limited by single-threaded processing) |
+| Lock overhead | High (many lock operations) | Low (one lock operation) |
+| Complexity | High (dynamic keys, key management) | Low (static key) |
+| Deadlock risk | High (multiple locks per operation) | Low (single lock per operation) |
+| Impact of lock failure | Low (one item affected) | High (entire batch affected) |
+| TTL management | Short TTL (seconds) | Long TTL (minutes to hours) |
+| Lock service memory | High (many keys) | Low (few keys) |
+| Recovery on crash | Quick (only affected items need redo) | Slow (entire batch must restart) |
+| Monitoring granularity | Per-item granularity | Per-batch granularity |
+
+### Specific Examples of Granularity Decisions
+
+**Example 1: Shopping Cart System**
+
+A shopping cart system must prevent two processes from modifying the same cart simultaneously.
+
+**Fine-grained approach**: Lock per cart_id. Each cart can be modified concurrently. If a promotion affects 100,000 carts, each cart is processed independently with its own lock.
+
+```python
+# Fine-grained: lock per cart
+def update_cart_fine(cart_id, item):
+    lock = lock_service.acquire(f"cart:{cart_id}", ttl=10)
+    # Fast: 100,000 carts processed in parallel
+    # Each lock held for ~100ms
+    # Total throughput: 10 carts/sec per server
+```
+
+**Coarse-grained approach**: Lock for the entire cart system during maintenance. All cart modifications are blocked until the maintenance completes.
+
+```python
+# Coarse-grained: lock for entire cart system
+def cart_maintenance_coarse():
+    lock = lock_service.acquire("cart:system_maintenance", ttl=3600)
+    # All 100,000 carts processed sequentially
+    # Each cart takes 100ms → 10,000 seconds = 2.7 hours
+    # But no concurrent modifications allowed
+```
+
+**Recommended approach**: Fine-grained locking for normal operations. Use a separate coarse-grained lock for system maintenance that checks if any per-cart locks are held before proceeding.
+
+**Example 2: File Processing Pipeline**
+
+A pipeline processes incoming files. Each file must be processed by exactly one worker.
+
+**Fine-grained approach**: Lock per filename. Workers compete for each file independently. A worker acquires the lock for file_A, processes it, releases the lock, and moves to the next available file.
+
+```python
+# Fine-grained: lock per file
+def process_file(file_name):
+    lock = lock_service.acquire(f"file:processing:{file_name}", ttl=300)
+    try:
+        data = read_file(file_name)
+        result = transform(data)
+        write_output(file_name, result)
+        move_to_processed(file_name)
+    finally:
+        lock.release()
+```
+
+**Coarse-grained approach**: Lock for the entire pipeline. One worker processes all files in sequence, while other workers wait.
+
+**Recommended approach**: Fine-grained. File processing is the canonical use case for fine-grained locking — each file is independent and can be processed in any order. A coarse-grained lock here would serialize processing unnecessarily.
+
+**Example 3: Financial Account Balance Transfer**
+
+Transferring money between two accounts. Both accounts must be locked atomically to prevent race conditions.
+
+**Fine-grained approach**: Two locks — one per account. The order of acquisition must be consistent to avoid deadlock.
+
+```python
+# Fine-grained: lock per account with consistent ordering
+def transfer(account_a, account_b, amount):
+    # Always acquire locks in sorted order to prevent deadlock
+    locks = sorted([account_a, account_b])
+    lock_a = lock_service.acquire(f"account:{locks[0]}", ttl=10)
+    lock_b = lock_service.acquire(f"account:{locks[1]}", ttl=10)
+    try:
+        bal_a = db.get_balance(account_a)
+        bal_b = db.get_balance(account_b)
+        db.set_balance(account_a, bal_a - amount)
+        db.set_balance(account_b, bal_b + amount)
+    finally:
+        lock_b.release()
+        lock_a.release()
+```
+
+**Coarse-grained approach**: Lock for the entire transfer system. All transfers are serialized. This is simple and safe but limits throughput to one transfer at a time.
+
+**Recommended approach**: Fine-grained with consistent ordering. The serialized approach does not scale. The fine-grained approach must carefully handle the multi-lock acquisition pattern with deadlock prevention.
+
+### Combining Granularities: Hierarchical Locking
+
+For complex systems, a hierarchical locking strategy combines multiple granularity levels. A single operation acquires a coarse-grained lock first, then fine-grained locks within its scope.
+
+```python
+class HierarchicalLock:
+    """
+    Hierarchical locking: acquire a coarse-grained lock on a partition,
+    then fine-grained locks on individual items within that partition.
+    """
+    def __init__(self, partition, item):
+        self.partition_lock_key = f"partition:{partition}"
+        self.item_lock_key = f"partition:{partition}:item:{item}"
+    
+    def acquire(self):
+        # Acquire the partition lock first (coarse)
+        self.partition_lock = lock_service.acquire(
+            self.partition_lock_key, ttl=60
+        )
+        # Then acquire the item lock (fine)
+        self.item_lock = lock_service.acquire(
+            self.item_lock_key, ttl=30
+        )
+    
+    def release(self):
+        # Release in reverse order: fine first, then coarse
+        self.item_lock.release()
+        self.partition_lock.release()
+```
+
+**Use case**: A marketplace order processing system. Lock per marketplace (coarse) and then per order (fine). This allows one marketplace's orders to be processed without waiting for another marketplace's orders, while still serializing within the same marketplace for consistency.

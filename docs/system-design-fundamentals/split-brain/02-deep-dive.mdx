@@ -1,0 +1,755 @@
+﻿---
+id: split-brain-deep-dive
+title: Split Brain — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A split-brain prevention system comprises five major components that work together to detect partitions, enforce safety, and manage recovery.
+
+<AsciiDiagram
+  id="split-brain/deep-dive-architecture"
+  title="Split Brain Prevention — Internal Architecture"
+  alt="Block diagram showing the five components of split brain prevention: Quorum Calculation Engine, Fencing Mechanism, Partition Detector, Rejoin Coordinator, and Conflict Resolver, with data flows between them"
+  caption="Five-component architecture for split brain prevention and recovery"
+ content={`
+   ┌─────────────────────────────────────────────────────────────┐
+   │              Split Brain Prevention System                  │
+   ├─────────────────────────────────────────────────────────────┤
+   │                                                             │
+   │  ┌────────────────────┐        ┌────────────────────────┐  │
+   │  │ Partition Detector │───────>│ Quorum Calculation     │  │
+   │  │ Monitors heartbeats│        │ Engine                 │  │
+   │  │ Detects node loss  │        │ Calculates majority    │  │
+   │  │ Tracks partitions  │        │ Tracks group membership│  │
+   │  └────────────────────┘        └───────────┬────────────┘  │
+   │                                            │                │
+   │                                            ▼                │
+   │                                   ┌────────────────────┐  │
+   │                                   │ Fencing Mechanism  │  │
+   │                                   │ STONITH / IPMI     │  │
+   │                                   │ Fencing Tokens     │  │
+   │                                   │ Network Isolation  │  │
+   │                                   └───────────┬────────┘  │
+   │                                               │            │
+   │                                               ▼            │
+   │                                   ┌────────────────────┐  │
+   │                                   │ Rejoin Coordinator │  │
+   │                                   │ Sync from leader   │  │
+   │                                   │ Discard stale data │  │
+   │                                   └───────────┬────────┘  │
+   │                                               │            │
+   │                                               ▼            │
+   │                                   ┌────────────────────┐  │
+   │                                   │ Conflict Resolver  │  │
+   │                                   │ LWW / CRDT / Manual│  │
+   │                                   │ Merge strategies   │  │
+   │                                   └────────────────────┘  │
+   │                                                             │
+   ├─────────────────────────────────────────────────────────────┤
+   │ Data Flows: Heartbeat ▶ Detection ▶ Quorum ▶ Fencing       │
+   │             Rejoin ▶ Conflict Resolution ▶ Recovery         │
+   └─────────────────────────────────────────────────────────────┘
+`} />
+
+**Partition Detector.** Runs on every node. Each node sends heartbeats to every other node at a configured interval, typically 500 milliseconds to 1 second. The detector tracks response times and missed heartbeats. A node is suspected dead after N consecutive missed heartbeats, configurable from 3 to 10. The detector also tracks asymmetric partitions where Node A can reach Node B but Node B cannot reach Node A.
+
+**Quorum Calculation Engine.** Receives partition information from the detector and calculates which nodes are reachable. Determines if the current group has a majority. In a 5-node cluster, the engine checks: current group size >= 3. If yes, the group is quorate and can continue. If no, the group must step down.
+
+**Fencing Mechanism.** Activated when a new leader is elected or when a node is determined to be unreachable. The fencing mechanism ensures that the old leader cannot serve requests. The mechanism can use physical STONITH (IPMI power-off), network fencing (disable switch port), or logical fencing (lease-based fencing tokens).
+
+**Rejoin Coordinator.** Manages the process when a partitioned node reconnects. The coordinator determines the rejoining node's last known state, identifies any writes the node accepted during the partition, synchronizes from the current leader, and discards the stale writes.
+
+**Conflict Resolver.** Handles data conflicts that arise from writes accepted on both sides. Resolution strategies include last-writer-wins (LWW) using timestamps, CRDT-based merge where possible, application-level merge hooks, and manual reconciliation queues.
+
+## Algorithms
+
+### Majority Quorum Algorithm
+
+The most fundamental split brain prevention algorithm. A cluster of N nodes requires at least N/2 + 1 nodes to agree on any decision.
+
+```
+Quorum size = floor(N / 2) + 1
+
+N = 3:  quorum = 2  (tolerates 1 failure)
+N = 5:  quorum = 3  (tolerates 2 failures)
+N = 7:  quorum = 4  (tolerates 3 failures)
+```
+
+The quorum size determines both fault tolerance and availability. Larger quorums provide more safety but reduce availability because more nodes must be online.
+
+<AsciiDiagram
+  id="split-brain/deep-dive-quorum-matrix"
+  title="Quorum Matrix — Cluster Size vs. Fault Tolerance"
+  alt="Table-like diagram showing cluster sizes from 1 to 7, their quorum sizes, and the number of simultaneous failures each can tolerate"
+  caption="Quorum matrix: larger clusters tolerate more failures but require more nodes for decisions"
+ content={`
+   Cluster    Quorum    Failures       Max Quorum
+   Size       Size      Tolerated      Loss Survival
+   ───────    ──────    ────────       ──────────────
+     1         1          0             No loss possible
+     2         2          0             Any loss stops cluster
+     3         2          1             Can lose 1 of 3
+     4         3          1             Can lose 1 of 4
+     5         3          2             Can lose 2 of 5
+     6         4          2             Can lose 2 of 6
+     7         4          3             Can lose 3 of 7
+
+   Key insight:
+   Odd node counts are more efficient.
+   3 nodes tolerate 1 failure (33% loss)
+   4 nodes tolerate 1 failure (25% loss)
+   5 nodes tolerate 2 failures (40% loss)
+   6 nodes tolerate 2 failures (33% loss)
+
+   Odd clusters provide better fault tolerance per node.
+`} />
+
+The algorithm works in three phases. Phase 1: each node maintains a view of cluster membership. Phase 2: when a node suspects another node is dead, it initiates a quorum check by broadcasting to all nodes. Phase 3: nodes respond with their current view. If the initiating node collects responses from a majority, it can proceed with leadership changes. If not, it must wait.
+
+### Fencing Tokens
+
+Fencing tokens are monotonically increasing numbers that accompany every write operation. Each leader election generates a new, higher token. Nodes reject any write that carries a token lower than the highest token they have seen.
+
+<AsciiDiagram
+  id="split-brain/deep-dive-fencing-tokens"
+  title="Fencing Token Sequence — Preventing Stale Writes"
+  alt="Number line showing fencing tokens incrementing with each leader election, with a stale write carrying an old token being rejected by the current leader"
+  caption="Fencing tokens increase with each election; stale writes with low tokens are rejected"
+ content={`
+   Token Sequence
+   ──────────────
+
+   Token: 1         Token: 2         Token: 3
+   ┌────────┐      ┌────────┐      ┌────────┐
+   │Election│      │Election│      │Election│
+   │Node A  │      │Node B  │      │Node C  │
+   │wins    │      │wins    │      │wins    │
+   └────────┘      └────────┘      └────────┘
+
+   Event Log:
+   ───────────────────────────────────────────────────────
+   Token 1: Node A elected. Writes accepted with token=1.
+   Token 2: Node A partitioned. Node B elected.
+            All writes from token=1 now invalid.
+            Network fencing: "Node A, token=1 is expired."
+   Token 3: Node B partitioned. Node C elected.
+            All writes from token=2 now invalid.
+
+   Write Validation:
+   ───────────────────────────────────────────────────────
+   Write comes with token=1  → Current token=3 → REJECT
+   Write comes with token=2  → Current token=3 → REJECT
+   Write comes with token=3  → Current token=3 → ACCEPT
+   Write comes with token=4  → Current token=3 → ACCEPT
+                                                      (pre-grant)
+
+   A stale leader with token=1 cannot write to a node
+   that has seen token=2 or higher.
+`} />
+
+Fencing tokens provide lightweight split brain prevention without hardware manipulation. The algorithm requires a consensus service like ZooKeeper or etcd to generate monotonic tokens. Each node stores the highest token it has seen in a hardened fenced register.
+
+### STONITH via Power Switch / IPMI
+
+STONITH is the most aggressive fencing mechanism. The cluster management software connects to the node's baseboard management controller (BMC) via IPMI and issues a power-off command.
+
+```
+STONITH Sequence:
+1. Cluster detects Node A is unresponsive
+2. Cluster elects Node B as new leader
+3. Node B connects to Node A's IPMI interface
+   (credentials stored in cluster configuration)
+4. Node B issues: ipmitool -H mgmt-A -U admin -P pass power off
+5. IPMI confirms: "Chassis Power is off"
+6. Node B waits 2 seconds for confirmation
+7. Node B verifies Node A is no longer reachable
+8. Node B starts accepting writes
+```
+
+The sequence takes 200 to 800 milliseconds depending on IPMI response time and network latency. Failures in STONITH — such as incorrect IPMI credentials or unreachable management network — must abort the failover entirely.
+
+### Lease-Based Leadership
+
+Leases provide time-bound leadership authority without requiring consensus for every heartbeat.
+
+```
+Lease Algorithm:
+- Leader obtains a lease with epoch number E and expiry time T
+- Leader must renew lease before T by contacting quorum
+- Renew increments T by lease_duration
+- If lease expires without renewal, leader must step down
+- A node cannot accept writes from lease E if it has seen lease E+1
+
+Configuration parameters:
+- lease_duration: 10 seconds (default)
+- lease_renewal_interval: 2 seconds
+- lease_grace_period: 2 seconds (after expiry before forced step-down)
+- clock_skew_tolerance: 200 milliseconds
+```
+
+Clock skew is the primary threat to lease correctness. If Node A's clock is 5 seconds behind Node B's clock, a lease that expires at T=100 on Node B expires at T=95 on Node A. Node A might think its lease is still valid when it has already expired. Clock synchronization via NTP with tight bounds is essential.
+
+## Request Lifecycle During Split Brain
+
+A complete request lifecycle during a split brain scenario involves 10 distinct phases.
+
+### Phase 1: Normal Operation (Pre-Partition)
+
+<AsciiDiagram
+  id="split-brain/deep-dive-lifecycle-1"
+  title="Lifecycle Phase 1 — Healthy Cluster"
+  alt="Client sending writes to the leader node, which replicates to two followers, all nodes connected"
+  caption="Phase 1: all nodes connected, writes flow normally from client to leader to followers"
+ content={`
+   Client ──Write(x=42)──▶ Leader A ──Replicate──▶ Follower B
+                                     ──Replicate──▶ Follower C
+
+   State After Phase 1:
+   ├── A: x=42
+   ├── B: x=42
+   └── C: x=42
+`} />
+
+### Phase 2: Network Partition Occurs
+
+The network link between Node A and Nodes B/C is cut. Node A detects missed heartbeats from B and C. Nodes B and C detect missed heartbeats from A.
+
+<AsciiDiagram
+  id="split-brain/deep-dive-lifecycle-2"
+  title="Lifecycle Phase 2 — Network Partition"
+  alt="Cluster showing a dashed red line cutting the connection between leader A and followers B and C, with heartbeat failures"
+  caption="Phase 2: the network partition cuts communication between nodes"
+ content={`
+                  ┌──────────────────┐
+                  │   Heartbeat FAIL │
+                  │   A→B, A→C       │
+                  └──────────────────┘
+
+   ┌──────────────┐              ┌──────────────┐
+   │  Node A       │   XXXXXXXX   │  Node B      │
+   │  Last seen B: │   XXXXXXXX   │  Last seen A:│
+   │  T=10.000s    │   XXXXXXXX   │  T=10.000s   │
+   └──────────────┘   XXXXXXXX   └──────────────┘
+                       XXXXXXXX    ┌──────────────┐
+                       XXXXXXXX   │  Node C      │
+                       XXXXXXXX   │  Last seen A:│
+                                  │  T=10.000s   │
+                                  └──────────────┘
+`} />
+
+### Phase 3: Leader Loss Detection
+
+Both sides detect leader loss. Node A detects that B and C are unreachable (3 consecutive missed heartbeats). Nodes B and C detect that A is unreachable. Both sides enter the election state.
+
+### Phase 4: First Leader Election
+
+Node A, already leader, continues as leader. Nodes B and C hold an election. Node B votes for itself. Node C votes for Node B. Node B becomes the new leader with fencing token 2.
+
+<AsciiDiagram
+  id="split-brain/deep-dive-lifecycle-4"
+  title="Lifecycle Phase 4 — Dual Leadership"
+  alt="Both sides have elected leaders: Node A continues as leader on one side, Node B is elected leader on the other side with Node C as follower"
+  caption="Phase 4: both sides have elected leaders with different fencing tokens"
+ content={`
+   Side 1 (Quorate):           Side 2 (Quorate):
+   ┌──────────────────┐       ┌──────────────────┐
+   │  Leader: Node A   │       │  Leader: Node B   │
+   │  Token: 1         │       │  Token: 2         │
+   │  Followers: none  │       │  Followers: C     │
+   └──────────────────┘       └──────────────────┘
+   Node A believes:            Node B believes:
+   "B and C are dead"          "A is dead"
+   "I am still leader"         "I am the new leader"
+   Both leaders are correct within their own view.
+   Both views are wrong globally.
+`} />
+
+### Phase 5: Writes Accepted on Both Sides
+
+Node A accepts a write: set x = 5. Node B accepts a write: set x = 10. The data diverges.
+
+### Phase 6: Partition Heals
+
+The network link is restored. Nodes discover each other. Heartbeats succeed again.
+
+<AsciiDiagram
+  id="split-brain/deep-dive-lifecycle-6"
+  title="Lifecycle Phase 6 — Partition Healed"
+  alt="The network link is restored, nodes can communicate again, but the data states are now divergent"
+  caption="Phase 6: the network is restored, nodes reconnect to discover conflicting states"
+ content={`
+   ┌──────────────┐     Link Restored     ┌──────────────┐
+   │  Node A      │◄─────────────────────►│  Node B      │
+   │  x = 5       │                       │  x = 10      │
+   │  y = 100     │                       │  y = 0       │
+   │  Token: 1    │                       │  Token: 2    │
+   └──────────────┘                       └──────────────┘
+          │                                      │
+          │                                      │
+          ▼                                      ▼
+   ┌──────────────────────────────────────────────────┐
+   │  Conflict: Node A (Token 1) vs Node B (Token 2)  │
+   │  Token 2 is higher → Node B is authoritative     │
+   │  Node A's writes (x=5, y=100) may be lost        │
+   └──────────────────────────────────────────────────┘
+`} />
+
+### Phase 7: Conflict Detection
+
+The cluster detects that Node A operated with a stale fencing token. The cluster compares tokens and determines that Node B's token (2) is higher than Node A's token (1). Node A is the stale leader.
+
+### Phase 8: Fencing of Stale Leader
+
+<AsciiDiagram
+  id="split-brain/deep-dive-lifecycle-8"
+  title="Lifecycle Phase 8 — Fencing the Stale Leader"
+  alt="The authoritative cluster (Node B) issues a fencing command against the stale leader (Node A), using fencing tokens and network isolation"
+  caption="Phase 8: the stale leader (Node A) is fenced using a fencing token check"
+ content={`
+   ┌──────────────────────┐
+   │  Authoritative Side  │
+   │  (Token 2)           │
+   │  Node B sends:       │
+   │  "Fence Node A.      │
+   │   Current token is 2.│
+   │   Your token 1       │
+   │   is invalid."       │
+   └──────────┬───────────┘
+              │
+              ▼
+   ┌──────────────────────┐
+   │  Execution           │
+   │  Option 1: IPMI      │
+   │  Power off Node A    │
+   │  Option 2: Network   │
+   │  Disable switch port │
+   │  Option 3: Token     │
+   │  Node A rejects own  │
+   │  writes (token stale)│
+   └──────────────────────┘
+              │
+              ▼
+   ┌──────────────────────┐
+   │  Result:             │
+   │  Node A is fenced.   │
+   │  Node A's writes     │
+   │  (x=5, y=100) are   │
+   │  marked as stale.   │
+   └──────────────────────┘
+`} />
+
+### Phase 9: Data Recovery
+
+The cluster initiates conflict resolution. The authoritative leader (Node B) has x = 10. Node A had x = 5. Since fencing token 2 is higher than token 1, Node B's version wins. If Node A accepted writes not seen by Node B, those writes are discarded.
+
+### Phase 10: Node Rejoin
+
+Node A (now fenced or rebooted) reconnects to the cluster. Node A synchronizes from Node B, discarding its local state. The cluster returns to a consistent state.
+
+<AsciiDiagram
+  id="split-brain/deep-dive-lifecycle-10"
+  title="Lifecycle Phase 10 — Node Rejoin Complete"
+  alt="Node A has rejoined the cluster, synchronized from the leader, and all three nodes now agree on the state"
+  caption="Phase 10: Node A rejoins and synchronizes from the leader, restoring consistency"
+ content={`
+   ┌──────────────┐              ┌──────────────┐
+   │  Node A      │◄─Sync───────│  Node B      │
+   │  x = 10      │              │  x = 10      │
+   │  y = 0       │              │  y = 0       │
+   │  Token: 2    │              │  Token: 2    │
+   │  (Follower)  │              │  (Leader)    │
+   └──────────────┘              └──────┬───────┘
+                                        │
+                                        ▼
+                                 ┌──────────────┐
+                                 │  Node C      │
+                                 │  x = 10      │
+                                 │  y = 0       │
+                                 │  Token: 2    │
+                                 │  (Follower)  │
+                                 └──────────────┘
+   All nodes consistent. x = 10 everywhere.
+   Split brain resolved. Node A's stale write (x=5) lost.
+`} />
+
+## Consistency and State
+
+### Stale Leader Returning
+
+When a stale leader reconnects claiming authority, the cluster must reject that claim. The fencing token mechanism handles this. The stale node's token is lower than the current cluster token. The stale node's claim is rejected.
+
+Potential issue: if the stale leader has uncommitted writes that contain critical data, those writes are lost. Applications must be designed to tolerate this. Logged but not committed writes are the most common casualty.
+
+### Minority-Side Commits
+
+Writes committed only on the minority side of a partition present a special problem. From the minority side's perspective, these writes were committed durably. From the cluster's perspective, they never happened.
+
+```
+Example scenario:
+- Node A (leader) commits write W1, acknowledges to client
+- Partition occurs before W1 replicates to B and C
+- Nodes B and C elect new leader with token 2
+- Node A continues with token 1, commits W2 and W3
+- Partition heals, Node A fenced
+- W1, W2, W3 are all discarded
+
+Impact: Client received acknowledgement for W1
+        but W1 is lost. Application must retry.
+```
+
+The application must implement retry logic with idempotency keys. The cluster provides no guarantee that acknowledged writes survive a split brain.
+
+### Clock Drift and Overlapping Leases
+
+Clock drift can cause overlapping leases, creating a window where two nodes legitimately believe they hold the lease. This is the most subtle split brain vulnerability.
+
+<AsciiDiagram
+  id="split-brain/deep-dive-clock-drift"
+  title="Clock Drift — Overlapping Lease Hazard"
+  alt="Timeline showing two clocks drifting apart, causing lease expiry times to misalign and creating a window where two nodes both believe they hold the lease"
+  caption="Clock drift creates overlapping lease windows, a subtle split brain vulnerability"
+ content={`
+   Correct Clock:
+   ────────────────────────────────────────────────────────►
+   Lease A: │██████████████████████████████████│
+            T=0                               T=10
+   Drifted Clock (+3s):
+   ────────┬───────────────────────────────────────────────►
+   Lease A: │███████████████████████████████████████████████│
+            T=0                                     T=13 (T=10+3)
+   Problem: Node A (fast clock) thinks lease expires at T=13.
+            Node B (correct clock) sees lease expire at T=10.
+            At T=11 on the real clock:
+              Node A: "My lease is valid until T=13"
+              Node B: "Node A's lease expired at T=10. I can take over."
+   ┌── Overlap Window: T=10 to T=13 ──┐
+   │ Both nodes believe they are leader │
+   └─────────────────────────────────────┘
+   Mitigation: NTP with tight bounds, lease_grace_period,
+               clock_skew_tolerance in election logic.
+`} />
+
+The overlap window equals the clock skew. If clocks are synchronized to within 200 milliseconds, the overlap window is 200 milliseconds. If clocks drift by 5 seconds, the overlap window is 5 seconds. NTP configuration is a critical safety parameter for any lease-based system.
+
+### Fencing Token Gaps
+
+If fencing tokens are generated incorrectly, a stale leader might hold a token that the current cluster has not yet seen. This can happen when the token generation service itself is partitioned.
+
+```
+Token Gap Scenario:
+- Token 1: Node A elected leader
+- Token 2: Node A partitioned, Node B elected
+- Token 3: Node B partitioned, Node C elected
+- Token 4: Token generation service (etcd) partitioned
+           Node A's group generates Token 4 (different sequence)
+           Node C's group generates Token 5 (different sequence)
+- Both Token 4 and Token 5 claim to be current
+- Nodes cannot determine which is authoritative
+
+Solution: Monotonic token generation from a single source.
+          Use Raft-based consensus for token generation.
+          Reject tokens from non-quorate groups.
+```
+
+## Performance
+
+### Quorum Size Impact
+
+The quorum size directly affects cluster performance and availability.
+
+**3-node cluster:** Quorum = 2. Tolerates 1 failure. Write latency includes 2 acknowledgments (leader + 1 follower). 99.9% availability with 99.0% uptime per node. The smallest practical cluster for fault tolerance.
+
+**5-node cluster:** Quorum = 3. Tolerates 2 failures. Write latency includes 3 acknowledgments. 99.999% availability with 99.0% uptime per node. The standard configuration for production deployments.
+
+**7-node cluster:** Quorum = 4. Tolerates 3 failures. Write latency includes 4 acknowledgments. Used for geo-distributed deployments spanning 3 regions.
+
+### Latency Added by Fencing
+
+Fencing adds measurable latency to the failover process. The table below shows typical latencies for each fencing method.
+
+```
+Fencing Method        Typical Latency     Worst Case     Notes
+─────────────────     ───────────────     ──────────     ─────
+Fencing Token          2-5 ms             50 ms         Software only, no hardware
+Network (switch)      50-200 ms           2 s            SSH to switch, disable port
+IPMI STONITH         200-800 ms           5 s            Power-off via BMC
+PDU STONITH          500-3000 ms         10 s           Power Distribution Unit
+```
+
+The total failover time is the sum of partition detection time (3-10 heartbeats at 500ms each = 1.5-5s), election time (200-500ms), fencing time, and leader initialization time (200ms-1s). Total: 2 to 12 seconds.
+
+## Configuration
+
+### Cluster Size Configuration
+
+```
+cluster:
+  size: 5                          # Number of nodes
+  minimum_quorate: 3               # Minimum for quorum (N/2 + 1)
+  preferred_leader_selection: true # Prefer keeping existing leader
+```
+
+### Quorum Type
+
+```
+quorum:
+  type: majority                   # majority or hierarchical
+  hierarchical_levels:             # Only for hierarchical quorum
+    - level: 1
+      nodes: [node1, node2, node3]
+      votes: 2
+    - level: 2
+      nodes: [node4, node5]
+      votes: 1
+  majority:
+    require_quorum_for_writes: true
+    require_quorum_for_reads: false  # Allow stale reads for performance
+```
+
+### Fencing Mechanism
+
+```
+fencing:
+  primary: stonith
+  stonith:
+    method: ipmi
+    timeout: 5s
+    retries: 2
+    ipmi_credentials: managed_secrets  # Reference to secrets manager
+  secondary: network
+  network:
+    method: disable_switch_port
+    switch_vendor: cisco
+    ssh_timeout: 3s
+  fallback: token_only
+```
+
+### Lease Duration
+
+```
+lease:
+  duration: 10s                    # How long a leader's lease lasts
+  renewal_interval: 2s             # How often leader renews
+  grace_period: 2s                 # Extra time before forced step-down
+  clock_skew_tolerance: 200ms      # Maximum allowed clock difference
+  max_renewal_failures: 5          # Renewal failures before stepping down
+```
+
+## Leader Election Protocols
+
+Different leader election protocols provide different guarantees for split brain safety. The three most common protocols each have distinct properties.
+
+### Raft
+
+Raft divides time into terms. Each term has at most one leader. A leader is elected when it receives votes from a majority of the cluster. Raft guarantees that only one leader can exist in a given term.
+
+```
+Raft Term Safety:
+- Each term has a monotonically increasing term number
+- A candidate must receive votes from a majority to become leader
+- A leader commits entries by replicating to a majority
+- A follower that misses a term transition cannot accept old-term entries
+- Formal guarantee: at most one leader per term
+
+Split brain prevention:
+- A partitioned candidate cannot get majority votes → cannot become leader
+- A leader that loses majority connection → steps down
+- Fencing token = term number
+- No term can have two leaders
+```
+
+Raft's safety comes from the requirement that a candidate must receive its own vote plus N/2 additional votes. In a 5-node cluster, a candidate needs 3 votes. A partitioned node can only gather at most 2 votes (itself plus potentially one other). It cannot form a majority and cannot become leader.
+
+### Paxos
+
+Paxos uses numbered proposals with a similar safety property. Proposers must prepare with a quorum before proposing a value.
+
+```
+Paxos Safety:
+- Each proposal has a unique, increasing proposal number
+- A proposer must receive promise from a majority before proposing
+- An acceptor promises not to accept any lower-numbered proposal
+- Formal guarantee: at most one value can be chosen per round
+
+Split brain prevention:
+- Two proposers on opposite sides of a partition
+- Each sends prepare(N) to their accessible nodes
+- Only the proposer that reaches a majority first gets promises
+- The other proposer's prepare is rejected — it has seen higher number
+- Only one proposer can proceed with the accept phase
+```
+
+Paxos is more complex than Raft but provides the same fundamental safety guarantee. The practical difference is that Paxos is harder to implement correctly, which is why Raft is more commonly used in modern systems.
+
+### Zab (ZooKeeper Atomic Broadcast)
+
+Zab is the protocol used by ZooKeeper. It is similar to Raft but with different epoch management.
+
+```
+Zab Safety:
+- Uses epoch numbers (similar to Raft terms)
+- Leader synchronization phase ensures all new leader's data is authoritative
+- Follower synchronization guarantees no divergence
+
+Zab's unique property:
+- A newly elected leader must synchronize with a quorum before accepting writes
+- This eliminates the "stale leader" window that exists in some Raft implementations
+- Slightly slower failover but stronger safety guarantees
+```
+
+## Clock Synchronization and Lease Safety
+
+Lease-based systems depend on accurate clocks. The relationship between clock skew and lease safety is mathematical.
+
+### Clock Skew Bound
+
+```
+Let:
+  L = lease duration in seconds
+  S = maximum clock skew between any two nodes (seconds)
+  R = maximum network round-trip time (seconds)
+  P = processing time for lease renewal (seconds)
+
+Safe lease duration:
+  L > S + R + P + margin
+
+For a typical deployment with NTP synchronization:
+  S = 200ms (NTP with local time server, tight bound)
+  R = 50ms (p99 intra-datacenter latency)
+  P = 10ms (lease renewal processing)
+
+  L > 200 + 50 + 10 = 260ms
+  With 50% margin: L > 390ms
+
+  Practical minimum: L = 1 second (includes margin and operational tolerance)
+  Recommended production: L = 5-10 seconds
+
+If NTP is unavailable (air-gapped deployment):
+  S = 5,000ms (5 seconds drift possible without NTP)
+  R = 50ms
+  P = 10ms
+
+  L > 5,000 + 50 + 10 = 5,060ms
+  With 50% margin: L > 7,590ms
+  Practical minimum: L = 10 seconds
+```
+
+### Google TrueTime
+
+Google's TrueTime API, used in Spanner, eliminates the clock skew problem by explicitly reporting the clock uncertainty interval.
+
+```
+TrueTime:
+- Uses GPS and atomic clocks in each datacenter
+- Returns an interval [earliest, latest] for the current time
+- The actual time is guaranteed to be within this interval
+- Interval width: typically 1-7ms
+
+Lease safety with TrueTime:
+- Leader holds lease until absolute time T
+- New leader cannot be elected until time T + interval_width
+- Guarantees no overlap between leases
+- Eliminates clock skew as a failure mode
+
+TrueTime is not available outside Google. Alternatives include
+AWS Time Sync Service and Azure Precision Time Protocol, which
+provide similar but weaker guarantees.
+```
+
+## Advanced: Fencing Token Algorithms
+
+### Counter-Based Fencing
+
+The simplest fencing token algorithm. A monotonically increasing counter is stored in a consensus service. Each election increments the counter.
+
+```
+Algorithm:
+  Counter: integer, starts at 1
+
+  On leader election:
+    new_token = CAS(counter, current_value, current_value + 1)
+    // CAS = compare-and-swap, guaranteed atomic by consensus service
+    leader.fencing_token = new_token
+
+  On write:
+    if write.token < node.highest_seen_token:
+      reject("stale token")
+    else:
+      accept_write()
+      node.highest_seen_token = write.token
+
+  On rejoin:
+    node.highest_seen_token = cluster.current_token
+    discard all data written with lower tokens
+```
+
+### Hybrid Logical Clocks (HLC)
+
+HLC combines physical clocks with a logical counter to provide fencing-like guarantees without a consensus service.
+
+```
+HLC Properties:
+- Each event gets a timestamp (physical_time, logical_counter)
+- Physical time is the node's clock, bounded by NTP
+- Logical counter increments when physical time doesn't advance
+- HLC timestamps are partially ordered
+- Two events can be concurrent (happened-before relationship unknown)
+
+HLC for split brain prevention:
+- Every write gets an HLC timestamp
+- On rejoin, nodes compare HLC timestamps
+- Writes with timestamps that are not causally related require conflict resolution
+- HLC cannot guarantee total ordering, so split brain resolution is possible
+
+HLC is used in CockroachDB for distributed transaction ordering.
+It provides causal consistency without a centralized token service.
+```
+
+## Performance: Detailed Benchmarks
+
+### Write Latency by Cluster Size
+
+```
+3-node cluster (quorum=2):
+  Leader local write:   1ms
+  Replication to 1 node: 2ms (network round trip)
+  Total write latency:  3ms
+  Throughput:           15,000 writes/sec
+
+5-node cluster (quorum=3):
+  Leader local write:   1ms
+  Replication to 2 nodes: 2ms (parallel, same as 1)
+  Total write latency:  3ms
+  Throughput:           12,000 writes/sec (more replication overhead)
+
+7-node cluster (quorum=4):
+  Leader local write:   1ms
+  Replication to 3 nodes: 2ms
+  Total write latency:  3ms
+  Throughput:           10,000 writes/sec
+```
+
+### Recovery Strategy
+
+```
+recovery:
+  split_brain_strategy: last_token_wins  # Or: last_writer_wins, manual
+  conflict_resolution:
+    default: discard_minority_side
+    application_hooks:
+      - table: accounts
+        strategy: merge_additive     # Add balances together
+      - table: user_profiles
+        strategy: last_writer_wins   # Use latest timestamp
+      - table: inventory
+        strategy: manual_review      # Queue for human inspection
+  rejoin:
+    full_sync: true                  # Full resync on rejoin, not incremental
+    verify_checksums: true           # Verify all data after sync
+    timeout: 600s                    # Max time for rejoin
+```

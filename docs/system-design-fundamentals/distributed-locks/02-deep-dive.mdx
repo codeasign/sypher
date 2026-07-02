@@ -1,0 +1,1284 @@
+﻿---
+id: distributed-locks-deep-dive
+title: Distributed Locks — Under the Hood
+position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A distributed lock service is composed of several subsystems that work together to provide safe, fault-tolerant mutual exclusion. Understanding the internal architecture reveals where failure modes originate and how correctness is maintained.
+
+<AsciiDiagram
+  id="distributed-locks/internal-architecture"
+  title="Distributed Lock Service Internal Architecture"
+  alt="Layered architecture of a distributed lock service showing the API layer, lock registry, lease manager, fencing token generator, replication layer, and storage backend"
+  caption="Internal subsystems of a production-grade distributed lock service" content={`
+┌────────────────────────────────────────────────────────────────────────────┐
+│                     DISTRIBUTED LOCK SERVICE                                 │
+│                                                                             │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │                    API Layer (gRPC / HTTP)                          │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌────────────┐  ┌────────────────┐  │    │
+│  │  │ Acquire  │  │ Release  │  │ Renew      │  │ Query Status   │  │    │
+│  │  │ Endpoint │  │ Endpoint │  │ Endpoint   │  │ Endpoint       │  │    │
+│  │  └────┬─────┘  └────┬─────┘  └─────┬──────┘  └───────┬────────┘  │    │
+│  └───────┼─────────────┼──────────────┼──────────────────┼───────────┘    │
+│          │             │              │                  │                 │
+│  ┌───────▼─────────────▼──────────────▼──────────────────▼───────────┐    │
+│  │                    Lock Registry                                    │    │
+│  │  ┌──────────────────────────────────────────────────────────────┐ │    │
+│  │  │  In-Memory Lock Table                                        │ │    │
+│  │  │  ┌──────────┬──────────┬────────┬────────┬────────┬───────┐ │ │    │
+│  │  │  │Resource  │ Owner ID │ Token  │ TTL    │Expires │Status │ │ │    │
+│  │  │  ├──────────┼──────────┼────────┼────────┼────────┼───────┤ │ │    │
+│  │  │  │res_A     │svr_7     │ 1042   │ 30000  │12:00:30│HELD   │ │ │    │
+│  │  │  │res_B     │—         │ —      │ —      │ —      │FREE   │ │ │    │
+│  │  │  │res_C     │svr_12    │ 1039   │ 15000  │12:00:15│HELD   │ │ │    │
+│  │  │  └──────────┴──────────┴────────┴────────┴────────┴───────┘ │ │    │
+│  │  └──────────────────────────────────────────────────────────────┘ │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                     │                                       │
+│  ┌──────────────────────────────────┼──────────────────────────────────┐    │
+│  │          Lease Manager          │                                  │    │
+│  │  ┌──────────────────────────────▼──────────────────────────────┐   │    │
+│  │  │  Heartbeat Monitor                                           │   │    │
+│  │  │  ┌──────────┬──────────┬─────────────┬────────────────┐     │   │    │
+│  │  │  │Resource  │ Owner    │ Last Heart  │ Next Check     │     │   │    │
+│  │  │  ├──────────┼──────────┼─────────────┼────────────────┤     │   │    │
+│  │  │  │res_A     │svr_7     │ 12:00:05    │ 12:00:10       │     │   │    │
+│  │  │  │res_C     │svr_12    │ 12:00:03    │ 12:00:08       │     │   │    │
+│  │  │  └──────────┴──────────┴─────────────┴────────────────┘     │   │    │
+│  │  └─────────────────────────────────────────────────────────────┘   │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                             │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │              Fencing Token Generator                               │    │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │    │
+│  │  │  current_token: 1043   (64-bit monotonically increasing)      │  │    │
+│  │  │  Increments on each lock grant. Persisted to Raft log.        │  │    │
+│  │  └──────────────────────────────────────────────────────────────┘  │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                             │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │              Replication Layer (Raft / Zab)                         │    │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │    │
+│  │  │  Node 1      │  │  Node 2      │  │  Node 3      │           │    │
+│  │  │  (Leader)    │  │  (Follower)  │  │  (Follower)  │           │    │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘           │    │
+│  │         │                 │                 │                    │    │
+│  │         └─────────────────┼─────────────────┘                    │    │
+│  │                     Raft Log Replication                         │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                             │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │              Storage Backend                                        │    │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │    │
+│  │  │  Write-Ahead Log (WAL)  │  In-Memory State  │  Snapshot     │  │    │
+│  │  └──────────────────────────────────────────────────────────────┘  │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Lock Registry
+
+The lock registry is the core data structure. It holds the canonical state of every lock in the system. Each entry contains the resource identifier, the current owner's identity, the fencing token, the TTL in milliseconds, the expiration timestamp, and the lock status (FREE, HELD, PENDING_RELEASE, or EXPIRED).
+
+The registry supports atomic compare-and-swap operations. A lock acquisition is a conditional write: "if resource is FREE, set owner to X, token to Y, TTL to Z." A lock release is a conditional delete: "if owner matches X, delete the entry." These operations must be linearizable — every process must agree on the order of operations.
+
+In an in-memory implementation, the registry is a concurrent hash map protected by a single mutex (since lock operations are fast, a single-threaded event loop can process thousands per second without contention). In a disk-backed implementation, the registry is backed by a write-ahead log for durability.
+
+### Lease Manager
+
+The lease manager tracks active lock leases and enforces TTL expiry. It maintains a priority queue of expiration timestamps. A background goroutine or timer tick (typically every 100ms) checks the queue for expired leases. When a lease expires, the lease manager signals the lock registry to release the lock.
+
+The lease manager also handles heartbeat requests. When a holder sends a heartbeat, the lease manager extends the expiration by the original TTL. If a heartbeat is missed (the holder crashed or the network failed), the lease eventually expires and the lock is released.
+
+The heartbeat interval must be carefully tuned. A short interval reduces the window of lock unavailability after a crash but increases network load. A long interval reduces network load but increases the window of unavailability. The standard configuration uses a heartbeat interval equal to one-third of the TTL.
+
+### Fencing Token Generator
+
+The fencing token generator produces monotonically increasing integers. Each lock grant receives a unique token that is strictly greater than all previous tokens. The generator must be fault-tolerant — if the leader fails and a new leader is elected, the token sequence must continue without gaps or duplicates.
+
+The simplest implementation stores the current token value in the Raft log. Each lock grant appends a log entry that increments the token. This ensures that even after leader failover, the token remains monotonic. The token generator typically starts at 1 and increments by 1 for each lock grant.
+
+### Replication Layer
+
+The replication layer ensures that lock state survives node failures. ZooKeeper uses the Zab protocol. etcd uses Raft. Redis uses asynchronous replication (with the risk described in the concepts section). The replication layer must provide linearizable reads — reading the lock state must return the latest committed state.
+
+Raft-based replication has a significant cost: each lock operation requires a consensus round trip to a majority of nodes. For a 3-node cluster, this means the leader writes to itself and one follower before responding. For a 5-node cluster, the leader writes to itself and two followers. The commit latency depends on the slowest node in the majority.
+
+## Algorithms
+
+### Redlock Algorithm
+
+The Redlock algorithm was proposed by Salvatore Sanfilippo (Antirez), the creator of Redis, to provide a distributed lock implementation with safety guarantees stronger than single-master Redis. The algorithm uses N independent Redis nodes (typically 5) to reach agreement on lock ownership.
+
+<AsciiDiagram
+  id="distributed-locks/redlock-algorithm"
+  title="Redlock Algorithm Flow"
+  alt="A client acquiring a lock from 5 independent Redis nodes, requiring a majority of 3 nodes to agree"
+  caption="Redlock acquires from N=5 Redis nodes, requires majority of 3" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   Redlock Algorithm (N=5 Redis Nodes)                    │
+│                                                                         │
+│  ┌──────────┐                                                          │
+│  │  Client  │                                                          │
+│  │  T = NOW │                                                          │
+│  │  ID = X  │                                                          │
+│  └────┬─────┘                                                          │
+│       │                                                                  │
+│       │  1. Compute request timeout < TTL/N                              │
+│       │  2. Send SET resource ID NX PX TTL to all N nodes               │
+│       │     with per-node timeout of 5ms                                 │
+│       │                                                                  │
+│       ├─────────────┬─────────────┬─────────────┬──────────┬──────────┐ │
+│       │             │             │             │          │          │ │
+│       ▼             ▼             ▼             ▼          ▼          │ │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐   │ │
+│  │ Redis 1 │  │ Redis 2 │  │ Redis 3 │  │ Redis 4 │  │ Redis 5 │   │ │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘   │ │
+│       │             │             │             │          │          │ │
+│       │ OK          │ OK          │ OK          │ NIL       │ OK       │ │
+│       ├─────────────┼─────────────┼─────────────┼──────────┼──────────┘ │
+│       │             │             │             │          │            │
+│       │             │             │             │          │            │
+│       ◄─────────────┴─────────────┴─────────────┴──────────┘            │
+│       │  3. Count OK responses: 4                                       │
+│       │  4. Majority (3/5)? YES                                         │
+│       │  5. Elapsed = NOW - T = 4ms                                     │
+│       │  6. TTL remaining > 0? 30,000 - 4 = 29,996 > 0 → YES           │
+│       │  7. Lock acquired!                                              │
+│       │                                                                  │
+│       │  Release: send DEL to all nodes (including failures)            │
+│       │                                                                  │
+│       │  Failure scenario:                                              │
+│       │  - Only 2 nodes respond OK (not majority)                       │
+│       │  - TTL remaining <= 0 (operation took too long)                 │
+│       │  → Lock not acquired, send DEL to all nodes                     │
+│       │                                                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+**Redlock algorithm steps**:
+
+1. Get the current time in milliseconds (T1).
+2. Send SET resource random_value NX PX TTL to all N Redis nodes sequentially. Use a per-node timeout much smaller than the TTL (e.g., 5-10ms per node for a 30-second TTL).
+3. Compute the elapsed time: elapsed = NOW - T1.
+4. If the client received OK from at least (N/2 + 1) nodes AND elapsed < TTL, the lock is acquired. The effective TTL is TTL - elapsed.
+5. If the lock is acquired, the effective lock duration is TTL - elapsed.
+6. If the lock is not acquired, send DEL to all nodes (to unlock any partial acquisitions).
+
+**Complexity analysis**: Redlock requires O(N) network round trips for acquisition (one per Redis node) plus O(N) for release. With N=5, this is 5 sequential round trips for acquisition plus 5 parallel DEL commands for release. Average acquisition latency is N * (network RTT + Redis command time), typically 5-15ms for a well-connected cluster. Throughput is limited by the sequential nature of the algorithm — a single client can perform at most 1/(N * RTT) acquisitions per second.
+
+**Safety analysis**: Redlock assumes that all Redis nodes are independent (no coordination between them) and that clock drift is bounded. These assumptions have been criticized by Martin Kleppmann and others. The core concern is that Redlock does not provide fencing tokens (the random value is not a monotonically increasing token). Without fencing tokens, a delayed client cannot be prevented from writing to the protected resource.
+
+### ZooKeeper Lock Recipe
+
+The ZooKeeper lock recipe uses ephemeral sequential znodes with a watch chain. The algorithm is simpler than Redlock because ZooKeeper provides linearizable consistency through the Zab protocol.
+
+<AsciiDiagram
+  id="distributed-locks/zookeeper-recipe"
+  title="ZooKeeper Lock Recipe Detailed"
+  alt="Detailed ZooKeeper lock algorithm showing the sequence of operations: create znode, get children, check lowest, set watch, wait for notification"
+  caption="ZooKeeper lock recipe with sequential znode ordering and watch chain" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                ZooKeeper Lock Recipe — Detailed Flow                     │
+│                                                                         │
+│  Client Process 7 connecting to ZooKeeper ensemble (3 nodes)            │
+│                                                                         │
+│  Step 1: Create ephemeral sequential znode                              │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ create /locks/res_A/lock-  (ephemeral, sequential)             │   │
+│  │ Result: /locks/res_A/lock-0000001042                           │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  Step 2: Get all children                                              │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ ls /locks/res_A                                                  │   │
+│  │ Result: [lock-0000001041, lock-0000001042, lock-0000001043]     │   │
+│  │ (Process 5's znode from earlier acquisition)                     │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  Step 3: Check if lowest                                                │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ My znode: lock-0000001042                                       │   │
+│  │ Lowest: lock-0000001041                                         │   │
+│  │ My znode is NOT the lowest → I must wait                         │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  Step 4: Watch preceding znode                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ exists /locks/res_A/lock-0000001041 (watch=true)                │   │
+│  │ Block until the watch fires (znode deleted)                     │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  Step 5: Watch fires (znode 1041 deleted by Process 5 release)        │
+│                                                                         │
+│  Step 6: Retry from Step 2                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │ ls /locks/res_A                                                  │   │
+│  │ Result: [lock-0000001042, lock-0000001043]                     │   │
+│  │ My znode: lock-0000001042                                       │   │
+│  │ Lowest: lock-0000001042                                         │   │
+│  │ My znode IS the lowest → LOCK ACQUIRED                           │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  Release: close session or delete /locks/res_A/lock-0000001042        │
+│  Ephemeral znode auto-deletes on session expire                        │
+│  Next waiter (lock-0000001043) gets watch notification                 │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+**Complexity analysis**: ZooKeeper lock acquisition requires 2-3 round trips (create, ls, exists/watch). In the best case (no contention), the client creates the znode, lists children, finds itself as the lowest, and acquires the lock in 2 round trips. In the worst case (high contention with many waiters), each acquisition requires waiting for the preceding znode to be deleted, which takes an unbounded time. ZooKeeper handles approximately 10,000 write operations per second on a well-tuned cluster. Each lock acquisition is one write (create) and one read (ls), plus potential watch notifications.
+
+### Fencing Token Algorithm
+
+Fencing tokens are the mechanism that guarantees safety even when the lock itself fails. The algorithm requires cooperation between the lock service and the protected resource.
+
+1. **Lock service side**: Each lock grant includes a fencing token. The token is a monotonically increasing integer stored in a persistent, replicated counter. The lock service guarantees that no two concurrent grants receive the same token and that tokens are strictly increasing over time.
+
+2. **Protected resource side**: The resource maintains a record of the highest token it has seen. When a request arrives, the resource checks the token. If the request's token is higher than the last-seen token, the resource accepts the request and updates the last-seen token. If the request's token is lower or equal, the resource rejects the request.
+
+3. **Safety guarantee**: If process A holds the lock with token T, and process B acquires the lock after A's lock expires, B receives token T+1 or higher. If A's operation arrives at the resource after B's operation, A's token T is rejected because the resource's last-seen token is T+1.
+
+### Lease-Based Lock Algorithm
+
+The lease-based lock algorithm, used by Google Chubby and etcd, separates lock acquisition from lease management.
+
+1. The client creates a lease with a TTL. The lease is a contract with the lock service: "I will send heartbeats every interval. If you do not hear from me within TTL, revoke my lease."
+
+2. The client uses the lease to create a lock key. The lock key is bound to the lease — if the lease is revoked, the lock key is automatically deleted.
+
+3. The client periodically refreshes the lease by sending heartbeat requests. A successful heartbeat resets the TTL timer.
+
+4. If the client crashes, heartbeats stop. After the TTL, the lease expires, the lock key is deleted, and another client can acquire the lock.
+
+5. If the network partitions, the client cannot send heartbeats. The lease eventually expires. The client detects the partition when heartbeat requests fail and can abort its operation.
+
+**Complexity analysis**: Lease-based lock acquisition requires 2 round trips (create lease, create key with lease). Each heartbeat adds 1 round trip. The amortized cost per second is (1 / heartbeat_interval) round trips. With a 10-second TTL and 3-second heartbeat interval, this is 0.33 round trips per second per lock.
+
+## Request Lifecycle
+
+A lock request passes through 10 stages from initiation to completion. Each stage has specific failure modes and recovery mechanisms.
+
+<AsciiDiagram
+  id="distributed-locks/request-lifecycle"
+  title="Lock Request Lifecycle Stages"
+  alt="A detailed 10-stage lifecycle diagram from lock acquisition request through quorum voting, token generation, lock grant, periodic renewal, to final release"
+  caption="The full 10-stage lifecycle of a distributed lock request in a Raft-based lock service" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    LOCK REQUEST LIFECYCLE (Raft-based)                       │
+│                                                                             │
+│  STAGE 1: RECEIVE                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Client sends Acquire(resource="res_A", owner="svr_7", ttl=30000)   │   │
+│  │ API layer validates request format and authentication               │   │
+│  │ Lock registry checks: resource name valid? owner ID valid? ttl in   │   │
+│  │ range?                                                              │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ▼                                        │
+│  STAGE 2: PREPARE                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Lock registry creates proposed entry:                                │   │
+│  │ resource=res_A, owner=svr_7, status=PENDING, ttl=30000              │   │
+│  │ Prepares Raft log entry with the proposed state change               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ▼                                        │
+│  STAGE 3: QUORUM VOTE                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Leader appends entry to its Raft log                                 │   │
+│  │ Sends AppendEntries RPC to followers                                 │   │
+│  │ Waits for majority (2/3 or 3/5) to acknowledge                      │   │
+│  │ If majority acknowledges → entry is committed                        │   │
+│  │ If quorum not reached within timeout → FAILURE                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ▼                                        │
+│  STAGE 4: TOKEN GENERATION                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Fencing token generator atomically increments counter               │   │
+│  │ new_token = atomic_increment(current_token)                        │   │
+│  │ Token value appended to Raft log entry                              │   │
+│  │ Token is durable once log entry is committed                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ▼                                        │
+│  STAGE 5: APPLY TO REGISTRY                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Lock registry applies the committed log entry:                      │   │
+│  │ Insert: resource=res_A, owner=svr_7, token=1042,                   │   │
+│  │         ttl=30000, expires=NOW+30000, status=HELD                   │   │
+│  │ Verify: resource was FREE (reject if already HELD)                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ▼                                        │
+│  STAGE 6: LEASE START                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Lease manager creates entry for new lock:                            │   │
+│  │ resource=res_A, owner=svr_7, expires=NOW+30000                     │   │
+│  │ Adds to expiry priority queue                                       │   │
+│  │ Next check scheduled in 100ms                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ▼                                        │
+│  STAGE 7: RESPONSE TO CLIENT                                                │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ API layer sends response to client:                                 │   │
+│  │ status=GRANTED, token=1042, effective_ttl=30000                    │   │
+│  │ Client receives response and begins critical section                │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ▼                                        │
+│  STAGE 8: PERIODIC RENEWAL                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Every 10 seconds (ttl/3):                                           │   │
+│  │ Client sends Renew(resource="res_A", owner="svr_7")                │   │
+│  │ Lease manager extends expiry: expires = NOW + 30000                │   │
+│  │ If renew fails (network error, timeout):                            │   │
+│  │   Client retries 3 times with 500ms backoff                        │   │
+│  │   If all retries fail: client must assume lock lost                 │   │
+│  │   Client aborts critical section and stops accessing resource       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ▼                                        │
+│  STAGE 9: RELEASE                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Client sends Release(resource="res_A", owner="svr_7", token=1042)  │   │
+│  │ API layer validates owner and token match registry entry            │   │
+│  │ Raft log entry appended: DELETE resource=res_A, owner=svr_7        │   │
+│  │ Once committed: lock registry removes entry                         │   │
+│  │ Lease manager removes expiry entry                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ▼                                        │
+│  STAGE 10: WAITER NOTIFICATION                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Lock registry checks waiter queue for resource                      │   │
+│  │ If waiters exist: notify next waiter (via watch / callback)        │   │
+│  │ Waiter receives notification and starts acquisition from Stage 1    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Stage 1: Receive
+
+The client sends an `Acquire` request to the lock service API. The request is a protobuf or JSON message containing the resource identifier, the client's owner identifier, and the desired TTL. The API layer validates the request: the resource identifier must match a known pattern, the owner identifier must be unique and properly formatted, and the TTL must be within the configured bounds (minimum 100ms, maximum 120 seconds).
+
+### Stage 2: Prepare
+
+The lock registry checks its current state. If the resource is already held, the request is rejected immediately with a LOCK_HELD response. If the resource is free, the registry creates a proposed state entry in the Raft log. The proposal includes the resource, owner, TTL, and a PENDING status.
+
+### Stage 3: Quorum Vote
+
+The Raft leader appends the proposal to its write-ahead log and sends `AppendEntries` RPCs to followers. The leader waits for acknowledgement from a majority of nodes. In a 3-node cluster, this means the leader must hear from 1 follower. In a 5-node cluster, 2 followers. If a majority acknowledges within the election timeout, the entry is committed. If the leader cannot reach quorum (network partition, multiple followers down), the operation fails.
+
+### Stage 4: Token Generation
+
+The fencing token generator atomically increments the current token value and appends the increment to the Raft log. The token value is the new current value (e.g., if the counter was at 1041, the new token is 1042). The token is durable once the Raft log entry is committed to a majority of nodes.
+
+### Stage 5: Apply to Registry
+
+The lock registry applies the committed log entry to its in-memory state. The registry inserts a new entry with the resource, owner, token, TTL, expiration time, and status set to HELD. The apply step is deterministic — every node in the Raft cluster applies the same entries in the same order, maintaining identical state.
+
+### Stage 6: Lease Start
+
+The lease manager creates a lease entry for the new lock. The entry tracks the expiration time. The lease manager runs a background timer that ticks every 100ms. Each tick checks the expiry priority queue for entries with expiration times in the past. Any expired entries trigger lock release.
+
+### Stage 7: Response to Client
+
+The API layer sends a success response to the client. The response includes the fencing token and the effective TTL. The client records these values and begins the critical section.
+
+### Stage 8: Periodic Renewal
+
+The client maintains a renewal timer. Every 10 seconds (for a 30-second TTL), the client sends a `Renew` request to the lock service. The lease manager extends the expiration time by the original TTL. If the renewal fails (connection timeout, service unavailable), the client retries with exponential backoff. After exhausting retries, the client must assume the lock is lost and abort the critical section.
+
+### Stage 9: Release
+
+The client sends a `Release` request when it completes the critical section. The API layer validates that the owner identifier and token match the registry entry. If validated, the release is appended to the Raft log. Once committed, the lock registry removes the entry.
+
+### Stage 10: Waiter Notification
+
+The lock service checks whether any processes are waiting for the released lock. In ZooKeeper, this is the watch mechanism — the waiter has set a watch on the preceding znode. In etcd, this is the watch API on the lock key prefix. The waiters are notified and the next waiter in line can begin acquisition.
+
+## Consistency and State
+
+### Lock Holder Crashes Mid-Operation
+
+<AsciiDiagram
+  id="distributed-locks/crash-scenario"
+  title="Lock Holder Crash Recovery"
+  alt="Timeline showing a lock holder crashing mid-operation, the lease expiring after TTL, a new holder acquiring the lock, and the fencing token preventing the original holder's late operations"
+  caption="Crash recovery timeline with fencing token protection" content={`
+Timeline:   0ms          500ms         30,000ms      35,000ms      60,000ms
+            │              │              │              │             │
+  Holder A  ──acquire──▶──crash───▶      X              │             │
+            token=42      (process dies) │              │             │
+                                          │              │             │
+  Lock TTL  │              │              │              │             │
+  (30s)     │              │              │              │             │
+            │              │         TTL expires        │             │
+            │              │         Lock released      │             │
+            │              │              │              │             │
+  Holder B  │              │              │──acquire──▶──process────▶│
+            │              │              │  token=43    │  done      │
+                                          │              │             │
+  Resource  │              │              │              │             │
+  State     │              │              │  last_token: │  last_token │
+            │              │              │  null        │  = 43       │
+                                          │              │             │
+  Late Write │             │              │              │             │
+  from A     │             │              │              │             │
+  (token 42) │             │              │              │  REJECTED   │
+            │              │              │              │  (token 42  │
+            │              │              │              │   < 43)     │
+└────────────────────────────────────────────────────────────────────────┘
+`} />
+
+When the lock holder crashes mid-operation, the lease mechanism provides automatic recovery. After the TTL expires, the lock is released and another process can acquire it. However, the crashing process may have written partial data. The fencing token mechanism protects against this — any late writes from the crashed process carry a stale token and are rejected by the protected resource.
+
+### TTL Expires While Still Holding Lock
+
+This is the most dangerous failure mode. The lock holder has not crashed but is running slowly (GC pause, CPU throttling, disk I/O stall). The TTL expires and another process acquires the lock. The original process resumes, unaware that it no longer holds the lock, and continues writing to the protected resource.
+
+The fencing token is the only defense. The original process holds token 42. The new process holds token 43. When the original process's operation arrives at the resource, the resource checks the token and rejects it because token 42 is less than the last-seen token 43.
+
+Without fencing tokens, the system has a window of unsafety equal to the TTL. If the TTL is 30 seconds, the original process can continue writing for up to 30 seconds after losing the lock before detecting the failure.
+
+### Network Partition Splits Lock Participants
+
+A network partition can split the system into two or more groups. If the lock service is on one side of the partition and the lock holder is on the other, the holder cannot renew the lease. The lease expires, and the lock service grants the lock to a process on its side of the partition.
+
+Meanwhile, the original holder believes it still holds the lock (it received no error from its renewal requests — they simply timed out). Both sides may now access the protected resource.
+
+This scenario is unavoidable. Any distributed system can experience a partition. The fencing token is the defense — only the side of the partition with the lock service can issue new tokens, and the protected resource rejects stale tokens.
+
+### Clock Drift Causing Premature Expiry
+
+Clock drift is a subtle threat to TTL-based locks. If the lock service's clock runs fast relative to the holder's clock, the TTL may expire earlier than expected. If the holder's clock runs slow, the holder may believe the TTL is still valid when it has already expired.
+
+The standard mitigation is to use a clock synchronization service like NTP and to include a clock drift tolerance (typically 5-10%) in the TTL calculation. For a 30-second TTL with 10% tolerance, the effective minimum TTL is 27 seconds. The client should also track the actual elapsed time and abandon the lock if it has held it for more than the TTL.
+
+## Performance
+
+### Lock Acquisition Latency
+
+The latency of acquiring a distributed lock depends on the coordination service and the algorithm used.
+
+**Redis (single master)**: 1-3ms. A single round trip to a single node. The SETNX command is O(1) in Redis. Redis processes commands on a single thread, so concurrent requests are queued. At 50,000 requests per second, the queueing delay adds 0.02ms per request.
+
+**Redis (Redlock, 5 nodes)**: 5-15ms. Five sequential round trips, each 1-3ms. The client must poll all 5 nodes sequentially (parallel requests would not help because the Elapsed time calculation requires knowing when each request started and ended).
+
+**ZooKeeper (no contention)**: 5-15ms. Two round trips: one write (create znode) and one read (get children). Each round trip involves a leader write for the create, plus a follower read for the list. ZooKeeper's Zab protocol adds one Raft round trip per write.
+
+**ZooKeeper (with contention)**: 5-15ms plus waiting time. The client must wait for the preceding znode to be deleted. The waiting time depends on how long the preceding holder keeps the lock. With 30-second TTLs, the average wait is 15 seconds.
+
+**etcd (no contention)**: 3-8ms. Two round trips: one lease create (Raft write) and one key create with lease (Raft write). Each Raft write requires a quorum commit. With a 3-node cluster and typical network latency of 1ms, the commit takes approximately 2-3ms.
+
+**Database (SELECT FOR UPDATE)**: 10-100ms. The row lock acquisition time depends on the database engine. InnoDB (MySQL) acquires row locks through its internal lock system, which can queue concurrent requests. Under contention, the queueing delay adds significant latency. Connection pool waits add more latency if all connections are in use.
+
+### Throughput
+
+<AsciiDiagram
+  id="distributed-locks/throughput-comparison"
+  title="Lock Service Throughput Comparison"
+  alt="Bar chart comparing throughput in operations per second for Redis, ZooKeeper, etcd, and MySQL lock implementations"
+  caption="Relative throughput of different distributed lock implementations" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│               LOCK THROUGHPUT (operations per second, log scale)             │
+│                                                                             │
+│  Redis (single master)    ┌──────────────────────────────────────┐         │
+│                           │ ████████████████████████████████████ │ 50,000 │
+│                           └──────────────────────────────────────┘         │
+│                                                                             │
+│  Redis (Redlock 5 nodes) ┌────────────────────┐                           │
+│                          │ ██████████████████  │ 10,000                    │
+│                          └────────────────────┘                           │
+│                                                                             │
+│  etcd (3 nodes)          ┌──────────────┐                                  │
+│                          │ ████████████  │ 5,000                           │
+│                          └──────────────┘                                  │
+│                                                                             │
+│  ZooKeeper (3 nodes)     ┌──────────────┐                                  │
+│                          │ ████████████  │ 5,000                           │
+│                          └──────────────┘                                  │
+│                                                                             │
+│  ZooKeeper (5 nodes)     ┌───────────┐                                     │
+│                          │ █████████  │ 3,000                              │
+│                          └───────────┘                                     │
+│                                                                             │
+│  MySQL (single master)   ┌─────┐                                           │
+│                          │ ███  │ 500                                      │
+│                          └─────┘                                           │
+│                                                                             │
+│  0    10K     20K     30K     40K     50K     60K                         │
+│                                                                             │
+│  Assumptions:                                                              │
+│  - 3-node clusters (unless specified)                                      │
+│  - Same region, single availability zone                                   │
+│  - No concurrent contention (single client)                                │
+│  - Wire latency 1ms                                                        │
+│  - Lock TTL 30 seconds                                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Lock Queue Implementation
+
+Under high contention, the lock service maintains a queue of processes waiting for each resource. The queue implementation is a critical performance and fairness concern.
+
+<AsciiDiagram
+  id="distributed-locks/lock-queue-internal"
+  title="Internal Lock Queue Data Structure"
+  alt="In-memory lock queue showing a doubly-linked list of waiters per resource, with the head of the queue holding the active lock and subsequent entries in FIFO order"
+  caption="Internal lock queue with doubly-linked list for O(1) enqueue, dequeue, and cancellation" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  LOCK QUEUE INTERNAL DATA STRUCTURE                           │
+│                                                                             │
+│  Lock Registry (concurrent hash map)                                        │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  Key: "res_A" ──────────▶ Lock Entry                               │    │
+│  │                            ├─ owner: "svr_7"                       │    │
+│  │                            ├─ token: 1042                          │    │
+│  │                            ├─ status: HELD                          │    │
+│  │                            └─ waiter_queue ───────────┐            │    │
+│  │                                                       │            │    │
+│  │  Key: "res_B" ──────────▶ Lock Entry ──── waiter_queue: (empty)    │    │
+│  │  (FREE, no waiters)                                              │    │
+│  │                                                                     │    │
+│  │  Key: "res_C" ──────────▶ Lock Entry                               │    │
+│  │                            ├─ owner: "svr_12"                      │    │
+│  │                            ├─ token: 1039                          │    │
+│  │                            ├─ status: HELD                          │    │
+│  │                            └─ waiter_queue ───────────┐            │    │
+│  └────────────────────────────────────────────────────────┼───────────┘    │
+│                                                           │                 │
+│  ┌────────────────────────────────────────────────────────┼───────────┐    │
+│  │  Doubly-Linked Waiter Queue for res_A                  │           │    │
+│  │                                                       ▼           │    │
+│  │  ┌──────────┐     ┌──────────┐     ┌──────────┐                   │    │
+│  │  │ HEAD     │     │ NODE 1   │     │ NODE 2   │                   │    │
+│  │  │ (active) │────▶│ svr_9    │────▶│ svr_12   │                   │    │
+│  │  │ svr_7    │     │ wait_since│     │ wait_since│                   │    │
+│  │  │          │◀────│ 12:00:01 │◀────│ 12:00:03 │                   │    │
+│  │  └──────────┘     └──────────┘     └──────────┘                   │    │
+│  │       │                                                           │    │
+│  │       │  Operations:                                              │    │
+│  │       │  • Enqueue: O(1) append to tail                          │    │
+│  │       │  • Dequeue (head): O(1) remove head                      │    │
+│  │       │  • Cancel: O(1) unlink node (needs pointer to node)      │    │
+│  │       │  • Peek head: O(1)                                       │    │
+│  │       │  • Count: O(1) cached                                    │    │
+│  │       │  • Iterate: O(N) for timeout checks                      │    │
+│  └───────────────────────────────────────────────────────────────────┘    │
+│                                                                             │
+│  Fairness guarantee: strict FIFO order.                                    │
+│  No waiter can starve as long as preceding waiters eventually acquire and  │
+│  release.                                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Queue Implementation in ZooKeeper
+
+ZooKeeper implements the lock queue through the filesystem namespace itself. The queue is implicit in the sequential znode names, not a separate data structure.
+
+```python
+# Python-like pseudocode for ZooKeeper lock queue operations
+import time
+import uuid
+
+class ZooKeeperLock:
+    def __init__(self, zk_client, lock_path):
+        self.zk = zk_client
+        self.lock_path = lock_path
+        self.znode_path = None
+        self.ensure_lock_path_exists()
+
+    def ensure_lock_path_exists(self):
+        # Ensure /locks/resource_name exists
+        if not self.zk.exists(self.lock_path):
+            self.zk.create(self.lock_path, makepath=True)
+
+    def acquire(self, timeout_ms=30000):
+        # Create ephemeral sequential znode
+        self.znode_path = self.zk.create(
+            f"{self.lock_path}/lock-",
+            value=str(uuid.uuid4()).encode(),
+            ephemeral=True,
+            sequential=True
+        )
+        start_time = time.monotonic()
+        while True:
+            # Get all children sorted by sequence number
+            children = self.zk.get_children(self.lock_path)
+            children.sort()
+            # Extract my sequence number from znode name
+            my_seq = self.znode_path.split("-")[-1]
+            if children[0].endswith(my_seq):
+                # Lowest sequence number: lock acquired
+                return True
+            # Watch the preceding znode
+            my_index = children.index(next(c for c in children if my_seq in c))
+            preceding = f"{self.lock_path}/{children[my_index - 1]}"
+            self.zk.exists(preceding, watch=True)
+            # Wait for watch notification (blocking)
+            if not self.wait_for_watch(timeout_ms - elapsed()):
+                # Timeout exceeded: clean up and return failure
+                self.zk.delete(self.znode_path)
+                return False
+
+    def release(self):
+        if self.znode_path and self.zk.exists(self.znode_path):
+            self.zk.delete(self.znode_path)
+            self.znode_path = None
+
+    def wait_for_watch(self, timeout_ms):
+        # Block until the watch fires or timeout
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            if self.watch_event_occurred:
+                return True
+            time.sleep(0.001)  # 1ms polling of event flag
+        return False
+```
+
+### Queue Implementation in etcd
+
+etcd implements the lock queue through revision ordering. Each lock attempt creates a key under a prefix. The key's revision (a monotonically increasing integer assigned by etcd) determines the queue order.
+
+```go
+// Go pseudocode for etcd lock queue using revision ordering
+func acquireLock(ctx context.Context, cli *clientv3.Client, prefix string, ttl int64) (string, error) {
+    lease, err := cli.Grant(ctx, ttl)
+    if err != nil {
+        return "", err
+    }
+    // Create a key under the lock prefix with the lease attached
+    myKey := fmt.Sprintf("%s/%s", prefix, uuid.New().String())
+    txn := cli.Txn(ctx).
+        If(clientv3.Compare(clientv3.CreateRevision(myKey), "=", 0)).
+        Then(clientv3.OpPut(myKey, "", clientv3.WithLease(lease.ID)))
+    txnResp, err := txn.Commit()
+    if err != nil || !txnResp.Succeeded {
+        return "", err
+    }
+    // Get all keys under the prefix sorted by revision
+    resp, err := cli.Get(ctx, prefix,
+        clientv3.WithPrefix(),
+        clientv3.WithSort(clientv3.SortByCreateRevision, clientv3.SortAscending))
+    if err != nil {
+        return "", err
+    }
+    myRev := txnResp.Header.Revision
+    if len(resp.Kvs) > 0 && resp.Kvs[0].CreateRevision == myRev {
+        // My key has the lowest revision: lock acquired
+        return myKey, nil
+    }
+    // Watch the key with the revision immediately before mine
+    prevRev := findPrecedingRevision(resp.Kvs, myRev)
+    watchCh := cli.Watch(ctx, prefix,
+        clientv3.WithPrefix(),
+        clientv3.WithRev(prevRev))
+    for watchResp := range watchCh {
+        for _, ev := range watchResp.Events {
+            if ev.Type == clientv3.EventTypeDelete &&
+                ev.Kv.CreateRevision == prevRev {
+                // Preceding lock released: retry acquisition
+                return acquireLock(ctx, cli, prefix, ttl)
+            }
+        }
+    }
+    return "", ctx.Err()
+}
+```
+
+## Background Cleanup Processes
+
+A production-grade lock service runs several background processes to maintain correctness and reclaim resources.
+
+### Expired Lease Scanner
+
+The lease scanner runs on a periodic timer (default: every 100ms) and checks the expiry priority queue for leases that have expired. When an expired lease is found, the scanner triggers the following sequence:
+
+1. **Mark as expired**: The lock registry updates the lock entry status to EXPIRED.
+2. **Remove lock entry**: The registry deletes the lock entry, making the resource available.
+3. **Notify waiters**: If any processes are waiting for this resource, the scanner triggers the waiter notification mechanism.
+4. **Log alert**: The scanner logs a warning with the resource name, previous owner, and the gap between expiration and detection.
+
+The scanner must handle the case where a lease expires while a release is being processed. A compare-and-swap operation ensures that the scanner does not release a lock that has already been released by its holder.
+
+### Orphaned Lock Reaper
+
+The orphaned lock reaper handles locks whose holder sessions have terminated abnormally. This is distinct from lease expiry — the session termination may be detected before the lease expires, or the lease may be extended by a now-dead process.
+
+```python
+# Pseudocode for orphaned lock reaper
+class OrphanedLockReaper:
+    def __init__(self, lock_registry, session_manager, reap_interval_ms=5000):
+        self.registry = lock_registry
+        self.sessions = session_manager
+        self.interval = reap_interval_ms / 1000.0
+        self.running = False
+
+    def start(self):
+        self.running = True
+        asyncio.create_task(self._reap_loop())
+
+    async def _reap_loop(self):
+        while self.running:
+            orphaned = self.registry.find_locks_with_dead_sessions()
+            for lock_entry in orphaned:
+                self._reap_lock(lock_entry)
+            await asyncio.sleep(self.interval)
+
+    def _reap_lock(self, entry):
+        # Atomically check and release
+        success = self.registry.compare_and_release(
+            resource=entry.resource,
+            expected_owner=entry.owner,
+            new_status="FREE"
+        )
+        if success:
+            logger.warning(
+                "Reaped orphaned lock",
+                extra={
+                    "resource": entry.resource,
+                    "owner": entry.owner,
+                    "held_for_ms": time.monotonic() - entry.acquired_at
+                }
+            )
+            self._notify_waiters(entry.resource)
+```
+
+### Stale Waiter Cleaner
+
+Processes that are waiting for a lock may crash or timeout while still registered in the waiter queue. The stale waiter cleaner removes these entries to prevent memory leaks and incorrect queue ordering.
+
+```python
+class StaleWaiterCleaner:
+    def __init__(self, waiter_queue, ttl=60000):
+        self.queue = waiter_queue
+        # Waiters that have been in the queue longer than ttl are removed
+        self.waiter_ttl_ms = ttl
+
+    def clean_stale_waiters(self):
+        now = time.monotonic()
+        stale = []
+        for node in self.queue.iterate():
+            wait_duration = now - node.wait_since
+            if wait_duration > self.waiter_ttl_ms:
+                stale.append(node)
+        for node in stale:
+            self.queue.remove(node)
+            self._notify_waiter_timeout(node.owner_id)
+        return len(stale)
+```
+
+### Heartbeat Timeout Detector
+
+The heartbeat timeout detector monitors active leases for missed heartbeats. It works alongside the expired lease scanner but uses a separate, more frequent check to detect missed heartbeat intervals rather than full TTL expiry.
+
+```python
+class HeartbeatTimeoutDetector:
+    def __init__(self, lease_manager, missing_threshold=2):
+        self.lease_manager = lease_manager
+        # Number of consecutive missed heartbeats before marking suspect
+        self.missing_threshold = missing_threshold
+        self.heartbeat_counts = {}  # resource -> (last_heartbeat_seq, missed_count)
+
+    def check_heartbeats(self):
+        for resource, lease in self.lease_manager.active_leases():
+            expected_seq = lease.heartbeat_count
+            last_seq = self.heartbeat_counts.get(resource, (0, 0))[0]
+            if expected_seq == last_seq:
+                # No new heartbeat since last check
+                missed = self.heartbeat_counts[resource][1] + 1
+                self.heartbeat_counts[resource] = (expected_seq, missed)
+                if missed >= self.missing_threshold:
+                    self._flag_suspect_lease(resource, lease)
+            else:
+                # Heartbeat received; reset missed count
+                self.heartbeat_counts[resource] = (expected_seq, 0)
+```
+
+## Additional Failure Scenarios
+
+### Split-Brain After Leader Election
+
+A split-brain scenario occurs when a network partition causes the lock service cluster to split into two groups, each electing its own leader. Both leaders accept lock requests, leading to duplicate lock grants.
+
+<AsciiDiagram
+  id="distributed-locks/split-brain"
+  title="Split-Brain After Leader Election"
+  alt="A 5-node Raft cluster splitting into two partitions, each electing a leader, showing how both sides independently grant lock tokens"
+  caption="Split-brain scenario where both partitions of a 5-node cluster independently grant lock tokens" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   SPLIT-BRAIN SCENARIO (5-node Raft cluster)                  │
+│                                                                             │
+│  Normal operation:                                                          │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │  Leader          Followers                       │                   │  │
+│  │  ┌───┐          ┌───┐  ┌───┐  ┌───┐  ┌───┐      │  Token counter:  │  │
+│  │  │ N1│◀────────▶│ N2│  │ N3│  │ N4│  │ N5│      │  1042            │  │
+│  │  └───┘          └───┘  └───┘  └───┘  └───┘      │                   │  │
+│  │  (majority: 3 of 5)                               │                   │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  Network partition occurs:                                                  │
+│  ┌────────────────────────────────┐  ┌────────────────────────────────┐    │
+│  │  Partition A (majority: 3)     │  │  Partition B (minority: 2)    │    │
+│  │  ┌───┐   ┌───┐   ┌───┐        │  │  ┌───┐   ┌───┐               │    │
+│  │  │ N1│   │ N2│   │ N3│        │  │  │ N4│   │ N5│               │    │
+│  │  └───┘   └───┘   └───┘        │  │  └───┘   └───┘               │    │
+│  │      │         │              │  │      │         │               │    │
+│  │      └─────────┘              │  │      └─────────┘               │    │
+│  │    N1 remains leader          │  │    N4 cannot reach majority    │    │
+│  │    Accepts requests           │  │    No leader elected           │    │
+│  │    Token: 1043                │  │    Rejects requests            │    │
+│  └────────────────────────────────┘  └────────────────────────────────┘    │
+│                                                                             │
+│  Worse scenario — quorum split (2-2-1):                                    │
+│  ┌────────────────┐  ┌────────────────┐  ┌────┐                           │
+│  │ Partition A    │  │ Partition B    │  │ N5 │                           │
+│  │ N1, N2         │  │ N3, N4         │  │    │                           │
+│  │ Elect N1 leader │  │ Elect N3 leader│  │    │                           │
+│  └───────┬────────┘  └───────┬────────┘  └────┘                           │
+│          │                   │                                             │
+│   Token: 1043         Token: 1043          Neither has majority           │
+│   Client A gets       Client B gets        Both believe they              │
+│   lock with token     lock with token      are leader —                   │
+│   1043                1043 (duplicate!)    TWO CLIENTS HOLD LOCK          │
+│                                                                             │
+│  Prevention:                                                               │
+│  1. Raft requires strict majority (3 of 5) for any commit                 │
+│  2. 2-2-1 split means neither side has majority → no commits              │
+│  3. Only odd-numbered clusters prevent tie splits                         │
+│  4. Leader leases (epoch-based) prevent stale leader serving requests     │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+The split-brain scenario with a 2-2-1 partition is the most dangerous. Nodes N1 and N2 elect N1 as leader. Nodes N3 and N4 elect N3 as leader. Neither side has a strict majority (3 out of 5), but both sides believe they are the leader. Under Raft's safety properties, neither side can commit new log entries because both lack a majority. However, if the network partition is asymmetric (N1 and N2 can still reach N3 but N3 cannot reach N4), the behavior becomes unpredictable.
+
+The mitigation for split-brain in consensus-based lock services is:
+
+1. **Odd number of nodes**: Always use an odd number of nodes (3, 5, or 7) to prevent tie splits.
+2. **Leader lease**: Each leader has a lease duration. If the leader cannot extend its lease with a majority, it steps down. This prevents stale leaders from accepting requests.
+3. **Epoch-based fencing tokens**: Each leader election increments an epoch number. Lock tokens include the epoch. After a new leader is elected, tokens from the previous epoch are invalid. The protected resource rejects operations with stale epoch tokens.
+4. **Read-only mode**: A leader that loses its majority stops accepting write requests (including lock acquisitions) and reverts to read-only mode.
+
+### Slow Disk on Consensus Commit
+
+A slow disk on a Raft follower can create a subtle failure mode that affects lock acquisition latency without triggering any failure detectors.
+
+```yaml
+# Scenario: 3-node etcd cluster, Node 2 has a failing SSD
+Cluster topology:
+  Node 1 (leader):   healthy, write latency 1ms
+  Node 2 (follower): failing SSD, write latency 800ms
+  Node 3 (follower): healthy, write latency 1ms
+
+Impact on lock acquisition:
+  Step 1: Leader receives lock acquisition request
+  Step 2: Leader appends to local WAL (1ms)
+  Step 3: Leader sends AppendEntries to Node 2 and Node 3
+  Step 4: Node 3 acknowledges in 2ms (1ms network + 1ms write)
+  Step 5: Node 2 acknowledges in 801ms (1ms network + 800ms write)
+  Step 6: Leader has majority (Node 3 acked) → commits at 3ms
+  Step 7: Lock granted to client at 4ms total
+
+  Problem: The leader sends the next AppendEntries only after
+  receiving Node 2's ack (or timing out). If the leader waits
+  for all followers, throughput drops to 1.2 ops/second.
+
+  Solution: Pipelined replication — leader sends next entry
+  immediately after receiving majority ack, without waiting
+  for slow followers. The slow follower catches up via
+  background replication.
+```
+
+The slow disk scenario does not increase latency for individual lock operations because the majority can be reached with fast nodes. However, it does reduce throughput in implementations where the leader stalls log replication when followers fall behind. The Raft protocol specification describes the `nextIndex` mechanism that allows slow followers to catch up without blocking the leader:
+
+```python
+# Pseudocode: Raft log replication with slow follower handling
+class RaftLeader:
+    def __init__(self, cluster, max_pipeline_depth=10):
+        self.cluster = cluster
+        self.next_index = {n: 0 for n in cluster.nodes}
+        self.match_index = {n: 0 for n in cluster.nodes}
+        self.max_pipeline = max_pipeline_depth
+
+    def replicate_entry(self, entry):
+        """Replicate a log entry to all followers. Does not block on slow nodes."""
+        self.log.append(entry)
+        for follower in self.cluster.followers:
+            if self.outstanding_pipeline_count(follower) < self.max_pipeline:
+                self.send_append_entries(follower)
+            else:
+                # Pipeline full for this follower; will retry on next ack
+                self.queue_pending(follower, entry)
+
+    def handle_append_response(self, follower, success, last_index):
+        if success:
+            self.match_index[follower] = last_index
+            self.next_index[follower] = last_index + 1
+            # Send next queued entry immediately
+            if self.has_pending(follower):
+                self.send_append_entries(follower)
+        else:
+            # Follower is behind; decrement next_index and retry
+            self.next_index[follower] -= 1
+            self.send_append_entries(follower)
+```
+
+### Network Latency Spike on Lock Client
+
+A network latency spike between the lock client and the lock service can cause cascading failures that are difficult to diagnose.
+
+<AsciiDiagram
+  id="distributed-locks/network-spike-cascade"
+  title="Network Latency Spike Cascade"
+  alt="Timeline showing a network latency spike triggering missed heartbeat, lease expiry, lock acquisition by a second process, and the original process failing to detect the lost lock"
+  caption="Cascading failure caused by a network latency spike between lock client and lock service" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│               NETWORK LATENCY SPIKE: CASCADE OF FAILURES                     │
+│                                                                             │
+│  t=0    Client A acquires lock resource_X (TTL=10s, token=42)              │
+│  t=1    Client A starts critical section                                    │
+│  t=2    Network latency spikes: 1ms → 5000ms                              │
+│  t=5    Client A sends heartbeat (Renew)                                   │
+│         ─────────────────────────────────────>                              │
+│         Packet in flight (5s RTT)                                            │
+│  t=8    Lock service: no heartbeat seen in 3s                              │
+│         Heartbeat timeout detector: miss #1                                 │
+│  t=10   Lock TTL expires                                                    │
+│         Lease scanner: lock released                                        │
+│         Next waiter notified                                                │
+│  t=11   Client B acquires lock resource_X (token=43)                       │
+│  t=12   Both clients believe they hold the lock                            │
+│         Client A: still processing (no error from lock service)            │
+│         Client B: just started processing                                  │
+│  t=14   Client A's heartbeat finally arrives at lock service               │
+│         Lock service: resource_X is held by B, not A                       │
+│         Heartbeat response: "LOCK_NOT_HELD"                                │
+│         (response delayed by 5s RTT)                                       │
+│  t=19   Client A receives LOCK_NOT_HELD response                          │
+│         Client A has been operating without lock for 9 seconds             │
+│         (t=10 to t=19)                                                     │
+│                                                                             │
+│  Prevention:                                                                │
+│  • Client-side lock timeout: abort if no heartbeat response within 2s      │
+│  • Client-side elapsed time tracking: abandon if held > TTL + margin       │
+│  • Fencing tokens on the resource side reject stale writes                 │
+│  • Heartbeat acknowledgment timeout shorter than TTL - safety margin       │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+The critical insight from this scenario: a network latency spike creates a window where the client operates without a lock. The client cannot distinguish between "the network is slow" and "the lock service is down." Both produce the same symptom — delayed or missing responses.
+
+The mitigation strategy is a combination of client-side timeout management and resource-side fencing:
+
+```python
+class LockClient:
+    def __init__(self, lock_service, resource_id, ttl_ms=30000):
+        self.service = lock_service
+        self.resource = resource_id
+        self.ttl = ttl_ms
+        self.token = None
+        self.acquired_at = None
+        self.heartbeat_interval = ttl_ms // 3
+
+    def critical_section(self):
+        with self.lock_context():
+            # Client-side safety: track elapsed time
+            elapsed = 0
+            while self.operation_is_running():
+                elapsed = time.monotonic() - self.acquired_at
+                if elapsed > self.ttl * 0.9:
+                    # Abort: we have held the lock too long
+                    # Even if the lock service still thinks we hold it,
+                    # the elapsed time exceeds the safe threshold
+                    self.abort_operation("lock TTL safety margin exceeded")
+                    return
+                self.check_renewal()
+                self.perform_work_step()
+
+    def check_renewal(self):
+        elapsed = time.monotonic() - self.last_renewal_at
+        if elapsed >= self.heartbeat_interval:
+            try:
+                response = self.service.renew(
+                    self.resource, self.token,
+                    timeout=2000  # 2s timeout on heartbeat
+                )
+                if response.status == "LOCK_NOT_HELD":
+                    self.abort_operation("lock no longer held")
+                self.last_renewal_at = time.monotonic()
+            except TimeoutError:
+                # Heartbeat timed out. Do NOT continue.
+                # The lock may still be valid, but we cannot confirm it.
+                self.abort_operation("heartbeat timeout")
+```
+
+## Performance Tuning Parameters
+
+### TTL Selection
+
+The TTL is the most critical configuration parameter. It represents a trade-off between safety and availability.
+
+| Critical Section Duration | Recommended TTL | Renewal Interval | Renewal Timeout |
+|---|---|---|---|
+| < 10ms | 500ms | 150ms | 100ms |
+| 10-100ms | 1 second | 300ms | 200ms |
+| 100ms - 1 second | 5 seconds | 1.5 seconds | 1 second |
+| 1-5 seconds | 15 seconds | 5 seconds | 3 seconds |
+| 5-30 seconds | 60 seconds | 20 seconds | 10 seconds |
+| 30-120 seconds | 300 seconds | 100 seconds | 30 seconds |
+
+The TTL should be calculated as:
+
+```
+TTL = (maximum_expected_critical_section_duration) * 2 + network_latency_margin
+```
+
+The renewal interval should be:
+
+```
+renewal_interval = TTL / 3
+```
+
+This ensures that the client has at least two renewal attempts before the TTL expires. If one renewal attempt fails due to network issues, the second attempt still succeeds before the TTL expires.
+
+### Heartbeat Concurrency
+
+For systems with many concurrent locks, the heartbeat mechanism can become a bottleneck. Each heartbeat is a network round trip. With 1000 concurrent locks and a 5-second heartbeat interval, the system generates 200 heartbeats per second.
+
+| Concurrent Locks | Heartbeat Interval | Heartbeats per Second | Bandwidth (per heartbeat ~200 bytes) |
+|---|---|---|---|
+| 100 | 10s | 10 | 2 KB/s |
+| 500 | 5s | 100 | 20 KB/s |
+| 1000 | 3s | 333 | 67 KB/s |
+| 5000 | 1s | 5000 | 1 MB/s |
+| 10000 | 1s | 10000 | 2 MB/s |
+
+The heartbeat overhead becomes significant beyond 5000 concurrent locks. Mitigations include:
+
+1. **Lease batching**: Send a single heartbeat for multiple leases in one request.
+2. **Heartbeat aggregation**: Combine heartbeat requests into a single network packet.
+3. **Lease hierarchy**: Use a single long-lived lease and attach multiple locks to it. Instead of 1000 independent heartbeats, send one heartbeat for the lease and let the lease cover all 1000 locks.
+4. **Local lease proxy**: Deploy a local proxy on each machine that aggregates heartbeats from all processes on that machine into a single stream to the lock service.
+
+### Cluster Size Selection
+
+The cluster size affects both fault tolerance and performance.
+
+| Cluster Size | Fault Tolerance | Write Latency (p99) | Read Latency (p99) | Throughput |
+|---|---|---|---|---|
+| 1 | None | 1ms | 1ms | 50,000 ops/s |
+| 3 | 1 node failure | 3ms | 1ms | 10,000 ops/s |
+| 5 | 2 node failures | 5ms | 1ms | 8,000 ops/s |
+| 7 | 3 node failures | 7ms | 1ms | 6,000 ops/s |
+
+The write latency increases with cluster size because the leader must wait for a majority (ceil(N/2) nodes) to acknowledge each write. The throughput decreases because each write requires replication to more nodes.
+
+For most production systems, a 3-node cluster is optimal. It tolerates one node failure, which covers the common failure scenarios (single machine crash, single availability zone outage). A 5-node cluster is appropriate for cross-region deployments where the cluster must tolerate one full region failure.
+
+### Connection Pool Configuration
+
+Each lock service client maintains a connection pool. The pool size determines how many concurrent lock requests can be in flight.
+
+```go
+// Recommended connection pool configuration for etcd client
+config := clientv3.Config{
+    Endpoints:        []string{"node1:2379", "node2:2379", "node3:2379"},
+    DialTimeout:      5 * time.Second,
+    DialKeepAliveTime:    30 * time.Second,
+    DialKeepAliveTimeout: 10 * time.Second,
+    // Connection pool
+    MaxCallSendMsgSize:    10 * 1024 * 1024,
+    MaxCallRecvMsgSize:    10 * 1024 * 1024,
+    // gRPC connection pool
+    autoClose:       false,
+    // Per-connection settings
+    Username:        "lock-client",
+    Password:        os.Getenv("ETCD_PASSWORD"),
+}
+```
+
+The pool size should be calculated based on the expected concurrency:
+
+```
+pool_size = max_concurrent_locks * 1.2  // 20% headroom
+```
+
+For 100 concurrent locks, a pool of 120 connections is appropriate. Each connection can handle multiple concurrent streams over HTTP/2, so the actual number of connections may be lower with gRPC multiplexing.
+
+## Redlock vs ZooKeeper: Detailed Scalability Analysis
+
+### Redlock Scalability Limits
+
+Redlock's scalability is bounded by two factors: the sequential polling of N Redis nodes and the clock drift assumptions.
+
+**Sequential polling bottleneck**: Redlock requires the client to poll all N Redis nodes sequentially. The client must measure the elapsed time between the first and last node response. Parallel polling would make the elapsed time measurement ambiguous — the client would not know which responses arrived before the clock measurement and which arrived after.
+
+The maximum acquisition throughput for a single client is:
+
+```
+max_acquisitions_per_second = 1 / (N * RTT_avg)
+```
+
+With N=5 and RTT=2ms:
+```
+max_acquisitions_per_second = 1 / (5 * 0.002) = 100
+```
+
+This is a hard limit for a single client. Multiple clients can acquire in parallel, but each individual acquisition is sequential.
+
+**Clock drift assumption**: Redlock assumes bounded clock drift between Redis nodes. The algorithm states that clock drift should be less than the TTL margin. If clocks drift by more than the tolerance, the safety guarantee breaks. In practice, modern NTP synchronization keeps clock drift under 2ms per minute (approximately 0.003% drift), which is negligible for typical TTLs of 1-30 seconds. However, a clock resynchronization event (e.g., NTP adjusting the clock by 100ms after a network disruption) can violate the assumption.
+
+**Memory overhead**: Each Redlock acquisition creates a key on all N nodes. With 100,000 concurrent locks, each Redis node stores 100,000 keys. At approximately 200 bytes per key (resource name + value + TTL metadata), this consumes 20 MB per node, which is acceptable. However, the cleanup of expired keys adds CPU overhead. Redis handles expired key cleanup with a periodic scan that checks 20 random keys every 100ms. With 100,000 keys expiring simultaneously, the cleanup rate may fall behind, causing memory pressure.
+
+### ZooKeeper Scalability Limits
+
+ZooKeeper's scalability is bounded by the Zab protocol's write throughput and the watch mechanism's notification overhead.
+
+**Leader write throughput**: All write operations (including lock acquisitions) must go through the ZooKeeper leader. The leader processes approximately 10,000 write operations per second on a well-tuned cluster. Each lock acquisition creates at least one write (the ephemeral sequential znode). With 10,000 lock acquisitions per second, the leader reaches its maximum throughput. Beyond this, requests queue and latency spikes.
+
+**Watch notification overhead**: Each lock waiter watches the preceding znode. When a lock is released, the watcher is notified. The notification triggers a read (get children) to determine if the watcher is now the lowest sequence number. In a high-contention scenario with 1000 waiters, a single lock release triggers one watch notification. That watcher then performs a read. If all 1000 waiters are watching the same preceding znode (which should not happen in a properly implemented chain), a single release would trigger 1000 notifications, overwhelming the ZooKeeper cluster.
+
+The watch chain design prevents this: each waiter watches only the immediately preceding znode, so a single release triggers exactly one watch notification. This is the key scalability feature of the ZooKeeper lock recipe.
+
+**Session management overhead**: Each ZooKeeper client maintains a session with heartbeats. A ZooKeeper cluster with 10,000 clients generates 10,000 session heartbeats every tick_time (default: 2 seconds). This is 5,000 heartbeat checks per second on the leader. Each heartbeat requires a touch of the session in memory, which is fast but adds CPU load. At 100,000 clients, the session management overhead becomes a significant portion of CPU time.
+
+### Direct Comparison
+
+| Metric | Redlock (5 nodes) | ZooKeeper (3 nodes) |
+|---|---|---|
+| Single-client acquisition throughput | ~100 ops/s | ~5,000 ops/s |
+| Multi-client acquisition throughput | ~10,000 ops/s (limited by Redis CPU) | ~10,000 ops/s (limited by leader) |
+| Contention support (10,000 waiters) | Poor (polling-based, no queue) | Excellent (watch chain, O(1) notification) |
+| Memory per 10,000 locks | ~2 MB per Redis node | ~5 MB per ZooKeeper node |
+| Network cost per acquisition | 5 round trips | 2-3 round trips |
+| Clock dependency | High (elapsed time measurement) | Low (session-based, no clock needed) |
+| Fencing tokens | Not available | Available (sequential znode ID) |
+| Cross-datacenter latency | 5x RTT penalty | 2-3x RTT penalty |
+| Client complexity | Simple (SETNX + DEL) | Moderate (watch chain logic) |
+
+### When Each Excels
+
+**Choose Redlock when**:
+- The lock operation is non-critical (cache rebuilds, log rotation, non-critical job scheduling)
+- The acquisition rate is below 100 ops/s per client
+- Redis is already in the infrastructure
+- Clock synchronization is reliable (NTP within 1ms)
+
+**Choose ZooKeeper when**:
+- Lock safety is critical (financial transactions, resource allocation, leader election)
+- High contention is expected (many processes waiting for the same resource)
+- The lock rate exceeds 100 ops/s per client
+- Fencing tokens are required for safety
+- The lock service must be accessible across datacenters
+
+## Lock Renewal Strategy for Long-Running Operations
+
+Operations that hold locks for extended periods require a robust renewal strategy. The following pseudocode implements a renewal loop with exponential backoff and graceful degradation.
+
+```python
+class LockRenewalManager:
+    def __init__(self, lock_service, resource_id, owner_id, ttl_ms):
+        self.service = lock_service
+        self.resource = resource_id
+        self.owner = owner_id
+        self.ttl = ttl_ms
+        self.interval = ttl_ms // 3
+        self.max_retries = 5
+        self.base_backoff_ms = 200
+        self.token = None
+        self._cancel = threading.Event()
+
+    def start_renewal_loop(self, token):
+        """Start the background renewal loop. Runs until stop() or failure."""
+        self.token = token
+        self._cancel.clear()
+        thread = threading.Thread(target=self._renewal_loop, daemon=True)
+        thread.start()
+        return thread
+
+    def stop(self):
+        self._cancel.set()
+
+    def _renewal_loop(self):
+        consecutive_failures = 0
+        while not self._cancel.is_set():
+            self._cancel.wait(self.interval)
+            if self._cancel.is_set():
+                break
+            success = self._attempt_renewal(consecutive_failures)
+            if success:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= self.max_retries:
+                    self._on_lock_lost()
+                    break
+
+    def _attempt_renewal(self, failed_count):
+        for attempt in range(3):  # 3 retries per renewal cycle
+            try:
+                response = self.service.renew(self.resource, self.token, timeout=2000)
+                if response.status == "OK":
+                    return True
+                elif response.status == "LOCK_NOT_HELD":
+                    self._on_lock_lost()
+                    return False
+            except (ConnectionError, TimeoutError) as e:
+                if attempt < 2:
+                    backoff = self.base_backoff_ms * (2 ** failed_count)
+                    time.sleep(backoff / 1000.0)
+                continue
+        return False
+
+    def _on_lock_lost(self):
+        logging.critical(
+            "Lock lost after %d failed renewal attempts (resource=%s, token=%d)",
+            self.max_retries, self.resource, self.token
+        )
+        self._cancel.set()
+        # Signal the main operation thread to abort
+        self.lost_callback(self.resource, self.token)
+```
+
+## Memory and Storage Analysis
+
+### In-Memory Lock Table Scaling
+
+The lock registry maintains an in-memory table of all active locks. The memory consumption depends on the number of concurrent locks and the size of each entry.
+
+```python
+# Memory calculation for in-memory lock table
+class LockEntry:
+    def __init__(self, resource_id, owner_id, token, ttl_ms):
+        self.resource_id = resource_id   # 8 bytes (int) or ~50 bytes (string)
+        self.owner_id = owner_id         # ~36 bytes (UUID string)
+        self.token = token               # 8 bytes (int)
+        self.ttl_ms = ttl_ms             # 4 bytes (int)
+        self.acquired_at = 0.0           # 8 bytes (float timestamp)
+        self.expires_at = 0.0            # 8 bytes (float timestamp)
+        self.status = "HELD"             # ~5 bytes (string)
+        # Object overhead (Python): ~56 bytes
+        # HashMap entry overhead: ~72 bytes
+        # Total per entry: ~245 bytes
+
+# Scaling estimates:
+# 1,000 concurrent locks: 245 KB
+# 10,000 concurrent locks: 2.45 MB
+# 100,000 concurrent locks: 24.5 MB
+# 1,000,000 concurrent locks: 245 MB
+```
+
+For most use cases, the memory overhead is negligible. A lock service handling 100,000 concurrent locks consumes approximately 25 MB of memory for the lock table. The lease manager's priority queue adds another 10-15 MB. Total memory consumption is well within the resources of a standard server.
+
+### Write-Ahead Log Growth
+
+The Raft write-ahead log (WAL) stores every lock operation. The WAL growth rate depends on the operation rate and the log compaction strategy.
+
+| Operation Rate | Log Entry Size | WAL Growth per Hour | Log Compaction Interval |
+|---|---|---|---|
+| 100 ops/s | ~200 bytes | 72 MB | Every 24 hours |
+| 1,000 ops/s | ~200 bytes | 720 MB | Every 6 hours |
+| 10,000 ops/s | ~200 bytes | 7.2 GB | Every 1 hour |
+
+Without log compaction, the WAL grows unboundedly and consumes disk space. Raft implementations use snapshotting to compact the log. A snapshot captures the full lock registry state at a point in time and truncates all log entries before the snapshot. The snapshot size is approximately equal to the in-memory lock table size (a few MB to a few hundred MB, depending on the number of locks).

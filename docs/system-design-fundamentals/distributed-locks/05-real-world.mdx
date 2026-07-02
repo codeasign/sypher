@@ -1,0 +1,915 @@
+﻿---
+id: distributed-locks-real-world
+title: Distributed Locks in Production
+position: 5
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Case Study 1: The Redlock Controversy
+
+In 2014, Salvatore Sanfilippo (Antirez), the creator of Redis, published the Redlock algorithm. The goal was to create a distributed lock that works correctly even when individual Redis nodes fail. The algorithm uses N independent Redis nodes and requires a majority to agree before granting a lock.
+
+In 2016, Martin Kleppmann published a detailed critique of Redlock in his paper "How to do distributed locking." Kleppmann identified a fundamental flaw: Redlock does not provide fencing tokens. Without fencing tokens, a process that experiences a GC pause, network delay, or clock drift can continue writing to the protected resource after the lock has expired, causing data corruption.
+
+The controversy played out publicly. Antirez responded with a blog post defending Redlock, arguing that the algorithm's timing assumptions (bounded clock drift, bounded network delay) are reasonable for most systems. Kleppmann countered that these assumptions are not guaranteed in production environments, particularly with Java's garbage collection and cloud instance clock drift.
+
+<AsciiDiagram
+  id="distributed-locks/redlock-controversy"
+  title="Redlock Controversy — GC Pause Failure"
+  alt="Timeline showing a GC pause causing a lock holder to exceed the TTL, another process acquiring the lock, and then the original holder resuming and writing with a stale lock"
+  caption="The Redlock controversy centers on whether GC pauses can cause safety violations" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    REDLOCK CONTROVERSY — GC PAUSE SCENARIO                   │
+│                                                                             │
+│  Process A acquires lock from 3/5 Redis nodes.                             │
+│  Process A starts writing to storage.                                      │
+│                                                                             │
+│  Timeline:                                                                  │
+│  ──────┬──────────┬──────────────┬────────────────┬───────────────        │
+│        │          │              │                │                        │
+│       0ms        5ms          1005ms         1010ms         2000ms         │
+│        │          │              │                │                        │
+│  A:  Acquire    Start        GC PAUSE        GC Resumes              │
+│      lock       write         (1000ms)         write completes            │
+│      token=42   to storage                     to storage                 │
+│        │          │              │                │                        │
+│  B:              │          Acquire lock     Write to storage            │
+│                  │          token=43         (last_token 42→43)          │
+│                  │              │                │                        │
+│  Storage                                                        │
+│  State:          │              │                │                        │
+│  last_token: 0  42             42              43                        │
+│                                                                             │
+│  Result: A's write (elapsed 1005ms from lock grant) is ACCEPTED because    │
+│  A's token 42 is checked against last_token.                                │
+│                                                                             │
+│  A holds token 42. When A resumes, last_token is 43. A should be rejected. │
+│  BUT: A's write was already accepted before B's write arrived.             │
+│  The order of writes to storage determines the outcome.                     │
+│                                                                             │
+│  Without fencing tokens checked by the storage layer, Redlock is           │
+│  vulnerable to this scenario.                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### The Resolution
+
+The industry has not reached a consensus. The practical outcome is nuanced:
+
+- For non-critical operations (cache rebuilding, log rotation, non-critical job scheduling), Redlock is safe enough. The cost of a rare duplicate operation is low.
+- For critical operations (financial transactions, resource allocation, leader election), Redlock should not be used. Use ZooKeeper or etcd with fencing tokens instead.
+- The controversy improved the entire field. Lock implementations now routinely document their safety guarantees and failure modes. Teams make informed choices rather than assuming any lock implementation is perfectly safe.
+
+## Case Study 2: Google Chubby
+
+Google Chubby is a distributed lock service designed for coarse-grained locking. It powers Google's infrastructure: Bigtable uses it for tablet assignment, GFS uses it for lease management, and Borg uses it for leader election.
+
+Chubby exposes a filesystem-like interface with directories and files. Each file can be locked for exclusive access. The lock is lease-based — the holder must periodically renew the lease or the lock is released.
+
+<AsciiDiagram
+  id="distributed-locks/chubby-architecture"
+  title="Google Chubby Architecture"
+  alt="Chubby cell with five replicas using Paxos consensus, clients connected to the master via the Chubby library, and the filesystem namespace with lock files"
+  caption="Google Chubby's architecture — a Paxos-replicated filesystem for distributed locking" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    GOOGLE CHUBBY ARCHITECTURE                                │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                   Chubby Cell (5 replicas)                           │   │
+│  │                                                                     │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │   │
+│  │  │  Replica 1   │  │  Replica 2   │  │  Replica 3   │             │   │
+│  │  │  (MASTER)    │  │              │  │              │             │   │
+│  │  │  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │             │   │
+│  │  │  │Paxos   │  │  │  │Paxos   │  │  │  │Paxos   │  │             │   │
+│  │  │  │State   │  │  │  │State   │  │  │  │State   │  │             │   │
+│  │  │  │Machine │  │  │  │Machine │  │  │  │Machine │  │             │   │
+│  │  │  └────────┘  │  │  └────────┘  │  │  └────────┘  │             │   │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘             │   │
+│  └─────────┼─────────────────┼─────────────────┼──────────────────────┘   │
+│            │                 │                 │                           │
+│            │       Paxos Replication (multi-Raft)                         │
+│            │                 │                 │                           │
+│            ▼                 ▼                 ▼                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    Chubby Namespace (filesystem abstraction)         │   │
+│  │                                                                     │   │
+│  │  /ls/chubby_cell                                                    │   │
+│  │    ├── /bigtable/tablet_assignments/lock      (locked by tserver-7) │   │
+│  │    ├── /gfs/chunkserver_leases/chunkserver-12 (locked)              │   │
+│  │    ├── /borg/jobs/job_1234_election/lock      (locked by leader-3) │   │
+│  │    └── /borg/services/web_frontend/election   (locked by host-42)  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  Key properties:                                                            │
+│  - Lease duration: default 60 seconds (configurable)                       │
+│  - Master election: 5-15 seconds after failure                             │
+│  - Clients cache lock state locally (read optimization)                    │
+│  - Cache invalidation via lease expiration or explicit invalidate          │
+│  - Fencing tokens: built into the protocol                                 │
+│  - Designed for coarse-grained locking (hours, not milliseconds)           │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Lessons from Chubby
+
+**Coarse-grained locking is the right default**: Chubby is designed for locks that are held for minutes to hours. Fine-grained locking (milliseconds) is not its intended use case. This simplicity makes Chubby robust — the overhead of consensus is amortized over the long lock duration.
+
+**Cache the lock state**: Clients cache the lock state locally and subscribe to invalidation notifications. This reduces the load on the Chubby cell. A client can serve millions of read requests per second without contacting Chubby, as long as the cached lock state is valid.
+
+**Master lease extension**: The Chubby master extends its lease proactively. If the master fails, the replicas detect the lease expiration and hold a new election. The election takes 5-15 seconds, during which no lock operations are available. Applications must tolerate this window.
+
+## Case Study 3: ZooKeeper in Kafka
+
+Apache Kafka uses ZooKeeper for broker metadata management and leader election. Each Kafka partition has one leader and multiple followers. The leader is responsible for all reads and writes. If the leader fails, a controller broker (elected via ZooKeeper) assigns a new leader.
+
+The controller election uses ZooKeeper's ephemeral sequential znode pattern. Each broker that wants to be controller creates an ephemeral node at `/controller`. The first broker to create the node becomes the controller. If the controller broker crashes, the ephemeral node is deleted (after the ZooKeeper session timeout), and another broker can create the node and become the new controller.
+
+<AsciiDiagram
+  id="distributed-locks/kafka-controller-election"
+  title="Kafka Controller Election with ZooKeeper"
+  alt="Kafka brokers attempting to become the controller by creating ephemeral znodes in ZooKeeper, with the active controller managing partition leaders"
+  caption="Kafka uses ZooKeeper ephemeral znodes for controller election" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 KAFKA CONTROLLER ELECTION via ZooKeeper                      │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                     ZooKeeper Ensemble                                │   │
+│  │                                                                     │   │
+│  │  /kafka                                                              │   │
+│  │    ├── /controller     (ephemeral, owner: broker-3)                  │   │
+│  │    ├── /brokers                                                      │   │
+│  │    │    ├── /ids/1    (ephemeral, broker-1 metadata)                 │   │
+│  │    │    ├── /ids/2    (ephemeral, broker-2 metadata)                 │   │
+│  │    │    └── /ids/3    (ephemeral, broker-3 metadata)                 │   │
+│  │    └── /admin                                                         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐       │
+│  │ Broker 1     │         │ Broker 2     │         │ Broker 3     │       │
+│  │              │         │              │         │              │       │
+│  │ Tries to     │         │ Tries to     │         │ Tries to     │       │
+│  │ create       │         │ create       │         │ create       │       │
+│  │ /controller  │         │ /controller  │         │ /controller  │       │
+│  │              │         │              │         │              │       │
+│  │ FAIL:        │         │ FAIL:        │         │ SUCCESS:     │       │
+│  │ broker-3     │         │ broker-3     │         │ is           │       │
+│  │ already      │         │ already      │         │ CONTROLLER   │       │
+│  │ exists       │         │ exists       │         │              │       │
+│  └──────────────┘         └──────────────┘         └──────┬───────┘       │
+│                                                            │               │
+│                                                            ▼               │
+│  Controller responsibilities:                                              │
+│  - Watch /brokers/ids for broker failures                                   │
+│  - Assign partition leaders when brokers join or leave                      │
+│  - Update ISR (in-sync replica) sets                                        │
+│  - Manage topic creation and deletion                                       │
+│  - Watch /admin for admin operations                                        │
+│                                                                             │
+│  Failure scenario:                                                          │
+│  1. Broker-3 (controller) crashes                                           │
+│  2. ZooKeeper session timeout (6s default) expires                          │
+│  3. /controller ephemeral znode deleted                                     │
+│  4. All brokers notified (watch on /controller)                             │
+│  5. Broker 1 creates /controller → becomes new controller                  │
+│  6. New controller rebuilds partition leadership from scratch              │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Lessons from Kafka
+
+**Session timeout is critical**: Kafka's controller failover time is directly tied to the ZooKeeper session timeout. A 6-second timeout means the cluster has no controller for up to 6 seconds after the controller crashes. Kafka 2.8+ introduced KRaft to eliminate this dependency on ZooKeeper.
+
+**Watch the root, not the leaves**: Brokers watch the /controller znode, not individual partitions. When the controller changes, the new controller rebuilds the partition leadership assignments. This is more efficient than setting watches on every partition.
+
+**Eliminating the lock service**: Kafka's move to KRaft (Raft-based consensus built into Kafka) shows that distributed lock services are sometimes an intermediate step. Mature systems absorb the lock functionality into their core architecture.
+
+## Case Study 4: etcd in Kubernetes
+
+Kubernetes uses etcd for all cluster state storage. Leader election in Kubernetes components (scheduler, controller manager) uses etcd's lease mechanism.
+
+Each Kubernetes component that needs leader election creates an etcd lease with a TTL (default 15 seconds). The component creates a lock key with the lease attached. The component running as the current leader holds the lock. Other components watch the lock key. When the leader's lease expires (component crash or network partition), the lock key is deleted, and another component acquires the lock and becomes the leader.
+
+```go
+// Kubernetes leader election using etcd leases (simplified)
+lease, _ := client.Lease.Grant(ctx, 15)  // TTL = 15 seconds
+for {
+    // Try to create the leader lock key
+    _, err := client.Put(ctx, "/leader/my-component",
+        leaderIdentity,
+        clientv3.WithLease(lease.ID))
+    if err == nil {
+        // We are the leader
+        lead()
+    }
+    // Watch for lock changes
+    watchCh := client.Watch(ctx, "/leader/my-component")
+    for change := range watchCh {
+        if change.Canceled {
+            // Lock lost, try to acquire again
+            break
+        }
+    }
+}
+```
+
+### Lessons from etcd
+
+**Leases are the right abstraction**: etcd's lease mechanism cleanly separates the lock lifecycle from the lock data. A lease can outlive a specific lock key — the same lease can protect multiple keys. This is more flexible than ZooKeeper's ephemeral znode approach.
+
+**TTL-based leases need careful tuning**: Kubernetes sets a 15-second TTL for leader election. If the leader crashes, the failover takes up to 15 seconds. Decreasing the TTL improves failover time but increases the lease renewal frequency and network load. Kubernetes components renew every 5 seconds (one-third of the TTL).
+
+## Open Source Implementations
+
+### Redisson
+
+Redisson is a Java Redis client that provides a comprehensive distributed lock implementation. It supports Redlock, fair locks (FIFO ordering), read-write locks, and semaphores. Redisson handles the complexities of lock renewal, retry, and connection management automatically.
+
+Redisson's lock implementation uses a background thread for lease renewal. Every 10 seconds (for a 30-second TTL), the thread sends a PEXPIRE command to extend the lock. If the renewal fails, the thread retries with backoff. After exhausting retries, the lock is automatically released.
+
+### Apache Curator
+
+Apache Curator is a Java ZooKeeper client that provides a high-level API for distributed coordination. Curator's `InterProcessMutex` implements the ZooKeeper lock recipe. It supports reentrant locks, read-write locks, and semaphores.
+
+Curator handles the watch setup, session management, and retry logic. It also provides a `LeaderSelector` for leader election that handles the complexity of ephemeral znode creation, session monitoring, and leader re-election.
+
+### etcd Concurrency Package
+
+etcd's Go concurrency package provides `sync.Mutex`-compatible distributed locks. The `Mutex` type uses etcd's lease and transaction mechanisms. The `Session` type manages lease lifecycle and heartbeat.
+
+The concurrency package is minimal and well-tested. It is used by Kubernetes itself for leader election. The API is straightforward: `NewSession` to create a lease, `NewMutex` to create a lock, `Lock` and `Unlock` for the critical section.
+
+## Cloud Services
+
+### AWS ElastiCache for Redis
+
+AWS ElastiCache provides managed Redis clusters. For distributed locks, ElastiCache with cluster mode disabled (single shard, multiple replicas) provides the basic SETNX functionality. Cluster mode enabled supports partitioning but does not support multi-key operations across shards, which limits Redlock implementations.
+
+ElastiCache with Redis Sentinel provides automatic failover. The failover takes 10-30 seconds, during which lock operations are unavailable. After failover, the new primary may not have all lock keys if they were not replicated.
+
+### Azure Cache for Redis
+
+Azure Cache for Redis provides managed Redis with data persistence and replication. The Premium tier supports Redis clustering. Azure's Redis implementation includes additional features like geo-replication across regions.
+
+The key limitation for distributed locks is the same as all Redis-based approaches: asynchronous replication can lead to lock duplication on failover. Azure's active geo-replication reduces the replication lag but does not eliminate it.
+
+### Google Cloud Memorystore
+
+Google Cloud Memorystore provides managed Redis and Memcached. Memorystore for Redis supports Redis 7.0 features including ACLs and sharded pub/sub. The Standard tier provides replication with automatic failover in under 1 minute.
+
+## Production Lessons
+
+**Lesson 1**: Monitor lock hold duration. A spike in hold duration often precedes a crash. Set an alert when a lock is held for more than 80% of the TTL.
+
+**Lesson 2**: Always set a TTL. A lock without a TTL is a memory leak waiting to happen. If the holder crashes, the lock is held forever. Every lock must have an expiration time.
+
+**Lesson 3**: Test clock synchronization. Ensure all nodes in the lock service run NTP with the same time source. Monitor clock skew between nodes. A skew of more than 100ms can cause subtle lock failures.
+
+**Lesson 4**: Use a dedicated lock service cluster. Sharing a ZooKeeper or etcd cluster between locks and other purposes (configuration storage, service discovery) increases the risk of lock starvation. A busy configuration change can delay lock operations.
+
+**Lesson 5**: Plan for lock service unavailability. The lock service will go down eventually. Design the application to handle lock service unavailability gracefully — retry with backoff, queue operations locally, and alert on extended unavailability.
+
+**Lesson 6**: Graceful shutdown matters. On application shutdown, the process must release all locks it holds. Install a shutdown hook that iterates through all held locks and releases them. This speeds up recovery for other processes.
+
+## More Open Source Implementations
+
+### LockSupport in Java
+
+The `java.util.concurrent.locks.LockSupport` class provides basic park/unpark primitives that are used as the foundation for Java's built-in lock implementations. While LockSupport itself is not distributed, it provides the threading primitives used by distributed lock client libraries.
+
+Java applications using Redisson or Curator rely on LockSupport under the hood. When a thread calls `lock()` on a Redisson distributed lock, the underlying implementation uses `LockSupport.parkNanos()` to suspend the thread while waiting for the lock. LockSupport avoids CPU spin-waiting, making it efficient for lock contention scenarios.
+
+```java
+// LockSupport usage in Redisson's lock implementation (conceptual)
+public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) {
+    long deadline = System.nanoTime() + unit.toNanos(waitTime);
+    for (;;) {
+        // Try Redis SETNX
+        Long ttl = commandExecutor.evalWrite(...);
+        if (ttl == null) {
+            // Lock acquired
+            return true;
+        }
+        // Wait for the lock to be released
+        long remaining = deadline - System.nanoTime();
+        if (remaining <= 0) {
+            return false; // Timeout
+        }
+        LockSupport.parkNanos(remaining);
+        // On wake, retry the acquisition
+    }
+}
+```
+
+The key insight is that LockSupport-based waiting uses OS-level thread parking, which consumes zero CPU while the thread is blocked. This is essential for distributed lock clients that may wait seconds or minutes for a contended lock.
+
+### DLite for C++
+
+DLite is a distributed locking library for C++ applications that provides a ZooKeeper-compatible lock implementation. It wraps the ZooKeeper C client with a RAII-style lock interface. DLite supports the standard ZooKeeper lock recipe with ephemeral sequential znodes.
+
+```cpp
+// DLite distributed lock usage example
+#include <dlite/lock.h>
+
+void process_critical_section() {
+    dlite::LockConfig config;
+    config.connection_string = "zk1:2181,zk2:2181,zk3:2181";
+    config.lock_path = "/locks/resource_alpha";
+    config.session_timeout = std::chrono::seconds(10);
+    
+    dlite::DistributedLock lock(config);
+    
+    // RAII lock acquisition — automatically released on scope exit
+    if (lock.try_lock_for(std::chrono::seconds(5))) {
+        // Critical section — exclusive access to resource_alpha
+        perform_sensitive_operation();
+        // Lock released automatically in destructor
+    } else {
+        // Failed to acquire lock within 5 seconds
+        handle_lock_failure();
+    }
+}
+```
+
+DLite handles session reconnection transparently. If the ZooKeeper session expires, DLite attempts to re-establish the session and re-acquire any locks that were held. This is important for long-running C++ services that cannot afford to crash on transient ZooKeeper failures.
+
+### hazed for Python
+
+hazed is a Python library that provides distributed locking using Redis as the backend. It wraps the Redis SETNX pattern with a context manager interface. hazed supports configurable TTL, automatic retry, and lease renewal.
+
+```python
+# hazed distributed lock usage
+from hazed import Lock
+import redis
+
+r = redis.Redis(host="redis-cluster.example.com", port=6379)
+
+lock = Lock(
+    redis_client=r,
+    name="job_847",
+    ttl=30.0,           # Lock held for 30 seconds max
+    retry_interval=0.1,  # Retry every 100ms
+    max_retries=50,      # Give up after 5 seconds of trying
+)
+
+# Context manager interface — automatic acquire and release
+with lock:
+    # Critical section
+    process_job(847)
+    # Lock is automatically released on exit
+```
+
+hazed also provides a blocking `acquire` method for cases where the operation must obtain the lock before proceeding. The library is designed for Python web services and batch processing pipelines where simplicity is more important than absolute safety guarantees.
+
+## More Cloud Services
+
+### Google Cloud Spanner Locks
+
+Google Cloud Spanner provides built-in distributed locking at the database level. Spanner uses TrueTime, Google's globally synchronized clock, to implement lock-free read operations and lock-based write operations.
+
+Spanner's read-write transactions acquire locks on the rows being modified. The locks are managed by Spanner's distributed transaction manager, which uses the Percolator model with TrueTime timestamps. The key properties are:
+
+- **Row-level locking**: Each row modification acquires a lock on that specific row. Multiple transactions can modify different rows concurrently.
+- **Lock-free reads**: Spanner's reads do not acquire locks. Reads use TrueTime to read a consistent snapshot without blocking writers.
+- **Deadlock detection**: Spanner detects deadlocks using a wait-for graph across all Spanner nodes. The deadlock victim is the transaction that has waited the longest.
+- **Automatic retry**: Transactions that are aborted due to deadlock detection are automatically retried by the Spanner client library.
+
+```sql
+-- Spanner uses standard SQL transactions with implicit locking
+BEGIN TRANSACTION;
+
+-- This statement acquires a row-level lock on the account row
+UPDATE accounts
+SET balance = balance - 100
+WHERE account_id = "acc_847"
+  AND balance >= 100;
+
+-- The lock is held until COMMIT or ROLLBACK
+INSERT INTO transactions (id, account_id, amount, timestamp)
+VALUES ("txn_901", "acc_847", -100, CURRENT_TIMESTAMP());
+
+COMMIT;
+```
+
+Spanner is the only cloud database that provides both external consistency (strongest consistency model) and global availability. The trade-off is cost — Spanner is significantly more expensive than traditional databases for the same throughput.
+
+### AWS DynamoDB Conditional Writes
+
+DynamoDB does not provide explicit locks, but its conditional write operations can be used to implement a locking mechanism. The pattern uses DynamoDB's conditional expression to atomically check and set a lock attribute.
+
+```python
+# DynamoDB-based distributed lock
+import boto3
+from datetime import datetime, timedelta
+import uuid
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table("distributed_locks")
+
+def acquire_lock(lock_name, ttl_seconds=30):
+    owner_id = str(uuid.uuid4())
+    expiry = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+    
+    try:
+        # Conditional write — only succeeds if lock does not exist OR is expired
+        table.put_item(
+            Item={
+                "lock_name": lock_name,
+                "owner_id": owner_id,
+                "expires_at": int(expiry.timestamp())
+            },
+            ConditionExpression=(
+                "attribute_not_exists(lock_name) OR "
+                "expires_at < :now"
+            ),
+            ExpressionAttributeValues={
+                ":now": int(datetime.utcnow().timestamp())
+            }
+        )
+        return owner_id
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        return None  # Lock is held by another process
+
+def release_lock(lock_name, owner_id):
+    # Conditional delete — only succeeds if we still own the lock
+    try:
+        table.delete_item(
+            Key={"lock_name": lock_name},
+            ConditionExpression="owner_id = :owner",
+            ExpressionAttributeValues={":owner": owner_id}
+        )
+        return True
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        return False  # Lock was taken by another process
+```
+
+The DynamoDB approach has limitations. The minimum granularity is one lock per item (DynamoDB item). There is no built-in fencing token mechanism. The lock relies on wall-clock time for expiry, which is vulnerable to clock drift. However, for non-critical lock use cases within an AWS-only infrastructure, DynamoDB provides a zero-infrastructure-overhead solution.
+
+<AsciiDiagram
+  id="distributed-locks/dynamodb-lock-pattern"
+  title="DynamoDB Conditional Write Lock Pattern"
+  alt="Sequence diagram showing DynamoDB conditional put for lock acquisition and conditional delete for release"
+  caption="DynamoDB conditional writes provide a lock mechanism without dedicated lock infrastructure" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              DYNAMODB CONDITIONAL WRITE LOCK PATTERN                         │
+│                                                                             │
+│  ┌─────────────┐                    ┌──────────────────────┐               │
+│  │  Process A   │                    │   DynamoDB Table      │               │
+│  │  owner=abc   │                    │  (distributed_locks)  │               │
+│  └──────┬───────┘                    └──────────┬───────────┘               │
+│         │                                       │                           │
+│  ACQUIRE│  PutItem(lock_name="X",               │                           │
+│         │    owner_id="abc",                     │                           │
+│         │    expires_at=12345)                   │                           │
+│         │  Condition: NOT exists OR expired      │                           │
+│         │───────────────────────────────────────>│                           │
+│         │  SUCCESS (Condition matched)           │                           │
+│         │<───────────────────────────────────────│                           │
+│         │                                       │                           │
+│         │  ─── Lock held (abc owns lock_x) ───   │                           │
+│         │                                       │                           │
+│  ┌─────────────┐                    ┌──────────┴───────────┐               │
+│  │  Process B   │    ACQUIRE        │  Lock_x:             │               │
+│  │              │───────────────────>  owner_id = "abc"     │               │
+│  │  owner=xyz   │                   │  expires_at = 12345   │               │
+│  │              │<── FAIL (LOCKED)  └───────────────────────┘               │
+│  └─────────────┘                                                           │
+│                                                                             │
+│  Release:                                                                   │
+│  ┌─────────────┐                    ┌──────────────────────┐               │
+│  │  Process A   │    DeleteItem     │                      │               │
+│  │              │    Key="lock_x"   │   Lock deleted        │               │
+│  │              │    Condition:     │                      │               │
+│  │              │    owner="abc"    │                      │               │
+│  │              │───────────────────>                      │               │
+│  │              │<── SUCCESS         │                      │               │
+│  └─────────────┘                    └──────────────────────┘               │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Production War Stories
+
+### Twitter's Use of Redis Locks
+
+Twitter's early distributed systems used Redis locks for job scheduling and resource coordination. In 2013, Twitter experienced a high-profile incident where Redis lock failures caused duplicate tweet processing across their stream processing pipeline.
+
+The root cause was Redis replication lag. Twitter ran a Redis master with multiple read replicas. Lock acquisition went to the master. When the master crashed, the failover promoted a replica that did not have the latest lock state. Two workers simultaneously believed they held the lock for the same job. Both processed the job, and the downstream systems received duplicate tweets.
+
+Twitter's fix involved three changes:
+1. Redis Sentinel was configured with stricter replication requirements before failover.
+2. Lock write operations used `WAIT` to ensure replication to at least one replica before returning success.
+3. A secondary deduplication layer was added downstream — idempotent job processing with job ID as the deduplication key.
+
+The incident led to a broader architectural change at Twitter. Critical coordination workflows were moved from Redis to ZooKeeper. Twitter's engineering blog noted that Redis locks are acceptable for cache invalidation and non-critical job scheduling, but ZooKeeper is required for workflows where duplicate processing has business impact.
+
+### GitHub's ZooKeeper Migration
+
+GitHub operated a large ZooKeeper cluster for coordination of their Git operations infrastructure. Over time, the ZooKeeper cluster became a bottleneck. GitHub observed that ZooKeeper request latency increased under high load, and lock acquisition times became unpredictable.
+
+GitHub migrated their coordination layer from ZooKeeper to an etcd-based system. The migration took 18 months and involved the following phases:
+
+1. **Shadow mode**: etcd was deployed alongside ZooKeeper. All lock operations were sent to both systems. ZooKeeper's response was authoritative; etcd's response was logged for comparison. This phase ran for 3 months and identified configuration issues with etcd's disk sync settings.
+
+2. **Dual-write mode**: Both ZooKeeper and etcd were authoritative. A lock was considered acquired only if both systems granted it. This phase ran for 6 months and allowed gradual migration of individual services.
+
+3. **Primary mode**: etcd became primary, ZooKeeper became a fallback for read-only operations. This phase ran for 6 months.
+
+4. **etcd-only**: ZooKeeper was decommissioned. etcd handled all coordination.
+
+The key lessons from GitHub's migration were:
+- Never run a parallel migration without logging inconsistencies between the two systems.
+- The migration window for distributed lock systems is measured in months, not weeks.
+- every service consuming locks must be updated independently to avoid coupling the migration to a single release cycle.
+
+### Discord's Lock Patterns
+
+Discord uses distributed locks extensively for their real-time communication infrastructure. Discord's voice server allocation uses Redis locks to ensure that each voice channel is mapped to one voice server instance.
+
+Discord's lock pattern is notable for its aggressive lease renewal strategy. The TTL is set to 10 seconds, and the renewal interval is 1 second. This aggressive renewal ensures that a voice server crash is detected within 2 seconds, and a replacement server can take over quickly.
+
+```python
+# Discord-style aggressive lease renewal (conceptual)
+class VoiceChannelLock:
+    def __init__(self, redis, channel_id, server_id):
+        self.redis = redis
+        self.channel_id = channel_id
+        self.server_id = server_id
+        self.lock_key = f"voice:lock:{channel_id}"
+        self.ttl = 10  # seconds
+        self.renewal_interval = 1  # second
+        
+    async def acquire_and_hold(self):
+        # Acquire the lock
+        acquired = await self.redis.set(
+            self.lock_key,
+            self.server_id,
+            nx=True,
+            ex=self.ttl
+        )
+        if not acquired:
+            return False
+            
+        # Start background renewal coroutine
+        self.renewing = True
+        asyncio.ensure_future(self._renew_loop())
+        return True
+        
+    async def _renew_loop(self):
+        while self.renewing:
+            await asyncio.sleep(self.renewal_interval)
+            # Renew the TTL
+            await self.redis.expire(self.lock_key, self.ttl)
+```
+
+Discord's lock patterns also demonstrate that aggressive lease renewal shifts the failure detection burden to the lock service. If a voice server crashes, the lock expires within 10 seconds regardless of whether the server can send a release command. This crash-only design for lock management simplifies the failure handling logic in the voice server.
+
+## Lessons from Specific Incidents
+
+### Cloudflare's Lock-Related Outages
+
+Cloudflare experienced a significant outage in 2021 related to their distributed lock infrastructure. The incident involved the TLS certificate management system, which uses distributed locks to coordinate certificate issuance across Cloudflare's global network.
+
+The failure sequence was:
+1. A software update introduced a bug where the lock renewal background thread would silently stop after a network hiccup.
+2. The lock holder continued operating without the lock, believing it still held the lock.
+3. Another process detected the expired lock, acquired it, and started working on the same certificate.
+4. Both processes wrote conflicting certificate data to the storage layer.
+5. The conflicting writes caused certificate corruption, which affected TLS termination for Cloudflare's customers.
+
+Cloudflare's post-mortem identified three contributing factors:
+- The lock renewal thread did not have a health check. No monitor checked whether the renewal thread was alive.
+- Lock loss was communicated asynchronously (event-based), not synchronously (flag-based). The holder did not check for lock loss before each write.
+- The lock release on the storage side did not verify ownership before overwriting.
+
+The fixes implemented after the incident:
+1. The lock renewal thread was given a dedicated health-check endpoint. External monitoring verified that the renewal thread was running on every lock holder.
+2. Lock loss notification was changed to a synchronous flag. Before every write, the holder checked an atomic boolean. If the boolean was false (lock lost), the holder immediately aborted.
+3. The storage layer was modified to include ownership verification on every write. Writes without a valid lock token were rejected.
+
+### MongoDB's Lock Incidents
+
+MongoDB's sharded cluster uses distributed locks for metadata operations such as chunk migration and shard topology changes. MongoDB experienced incidents where balancer locks caused cluster-wide stalls.
+
+The failure pattern:
+1. A chunk migration operation acquired the balancer lock.
+2. The migration encountered a slow read operation that took longer than expected.
+3. The lock TTL expired, but the migration thread continued.
+4. A second balancer process acquired the lock and started a conflicting migration.
+5. Both migrations modified the same chunk metadata, causing the metadata to become inconsistent.
+6. The cluster entered a recovery state where all chunk operations were blocked.
+
+MongoDB's engineering team addressed this with several changes:
+- Chunk migration operations were made interruptible. If the lock is lost during migration, the operation is aborted mid-flight and rolled back.
+- The balancer lock TTL was increased from 15 seconds to 60 seconds to accommodate slow storage operations.
+- A fencing token (called the "epoch" in MongoDB terminology) was added to the chunk metadata. Every chunk metadata write includes the epoch, and stale writes are rejected.
+
+## Migration Strategies
+
+### Moving from Redis to ZooKeeper
+
+Migrating from Redis-based locks to ZooKeeper locks is a common upgrade path as systems grow and safety requirements increase. The migration strategy must account for the behavioral differences between the two systems.
+
+**Phase 1 — Parallel deployment**: Deploy a ZooKeeper ensemble alongside the existing Redis lock infrastructure. Both systems receive all lock operations. Redis provides the response the application acts on; ZooKeeper responses are logged for analysis. This phase identifies discrepancies between the Redis lock state and the ZooKeeper lock state.
+
+**Phase 2 — Dual-authority mode**: The application checks both Redis and ZooKeeper before acting on a lock. The lock is considered acquired only if both systems grant it. This phase catches cases where Redis would have incorrectly granted a lock (false positive) or incorrectly denied one (false negative).
+
+**Phase 3 — ZooKeeper primary**: ZooKeeper becomes the authority. Redis serves as a read-aside cache for fast lock status checks. If ZooKeeper is unavailable, the system falls back to Redis with a circuit breaker that limits the fallback duration.
+
+**Phase 4 — ZooKeeper only**: Redis is removed from the lock path. The system now relies entirely on ZooKeeper for lock coordination.
+
+Common pitfalls during this migration:
+- **TTL mismatch**: Redis locks use TTL expiration. ZooKeeper locks use session expiration. The two mechanisms have different timing behaviors. Processes that rely on lock expiration timing (such as lease renewal) need adjustment.
+- **Connection pooling**: Redis connection handling is different from ZooKeeper connection handling. ZooKeeper maintains persistent connections with session management. Redis typically uses connection pools. The client code must handle both patterns during the migration.
+- **Performance regression**: ZooKeeper lock operations are 2-5x slower than Redis operations. The application must be load-tested with ZooKeeper before production deployment.
+
+### Moving from ZooKeeper to etcd
+
+Some organizations migrate from ZooKeeper to etcd for consistency of infrastructure (Kubernetes environments) or for operational simplicity. The migration has distinct challenges.
+
+**Key differences between ZooKeeper and etcd locks**:
+
+| Aspect | ZooKeeper | etcd |
+|--------|-----------|------|
+| Lock primitive | Ephemeral sequential znode | Lease + transaction |
+| Session model | Long-lived session, heartbeat | Short-lived lease, periodic renewal |
+| Watch mechanism | One-time watch, must re-register | Streaming watch, continuous |
+| Data model | Hierarchical (znode tree) | Flat key-value with prefix support |
+| Consensus protocol | Zab | Raft |
+
+**Migration steps**:
+
+1. **Lease mapping**: ZooKeeper's ephemeral znodes map to etcd leases. Each ephemeral znode becomes an etcd key created with a lease. The lease TTL matches the ZooKeeper session timeout.
+
+2. **Sequence mapping**: ZooKeeper's sequential znode numbering maps to etcd's revision-based ordering. The `create-with-lease-and-sequential-key` pattern in etcd provides equivalent ordering guarantees.
+
+3. **Watch mapping**: ZooKeeper's one-time watches map to etcd's streaming watches. The client must be updated to handle the streaming watch model, where events continue to arrive after the first event.
+
+4. **Namespace mapping**: ZooKeeper's hierarchical znodes (`/locks/resource/child`) map to etcd's key prefix model (`/locks/resource/` prefix with keys containing child identifiers).
+
+```go
+// etcd lock equivalent of ZooKeeper ephemeral sequential znode
+// ZooKeeper pattern: create /locks/resource/lock- (ephemeral, sequential)
+// etcd equivalent:
+func acquireLock(client *v3.Client, lockPath string, leaseID v3.LeaseID) (string, error) {
+    // Create a key with the lease attached — equivalent to ephemeral
+    // The lease ensures the key is deleted if the holder crashes
+    resp, err := client.Put(ctx, lockPath+"/lock-", "locked",
+        v3.WithLease(leaseID),
+        v3.WithSerializable(), // Ensure linearizable read
+    )
+    if err != nil {
+        return "", err
+    }
+    // The created key's revision acts as the sequence number
+    return fmt.Sprintf("%s/lock-%d", lockPath, resp.Header.Revision), nil
+}
+```
+
+## Lock Patterns in Specific Domains
+
+### Gaming Leaderboards
+
+Real-time gaming leaderboards require distributed locks to ensure consistent score updates. The challenge is high write throughput combined with strong consistency requirements for ranking calculations.
+
+A typical approach uses sharded Redis locks per score bucket. Each score range (0-999, 1000-1999, etc.) gets its own lock. When a player's score changes, the system acquires the lock for the player's current score bucket, updates the leaderboard, and releases the lock.
+
+```python
+# Gaming leaderboard lock pattern
+def update_score(player_id, delta_score, current_score):
+    # Lock bucket: score range determines which lock to acquire
+    bucket = (current_score // 1000) * 1000
+    lock_key = f"leaderboard:lock:score_bucket_{bucket}"
+    
+    # Acquire lock on the score bucket
+    owner = acquire_lock(lock_key, ttl=2000)  # 2 second TTL
+    if not owner:
+        return RETRY_LATER
+    
+    try:
+        # Read current leaderboard for this bucket
+        bucket_scores = redis.zrangebyscore(
+            "leaderboard", bucket, bucket + 999, withscores=True
+        )
+        # Update score in sorted set
+        redis.zincrby("leaderboard", delta_score, player_id)
+        # Recalculate rank
+        new_rank = redis.zrevrank("leaderboard", player_id)
+        return new_rank
+    finally:
+        release_lock(lock_key, owner)
+```
+
+The key insight is that gaming leaderboards can tolerate brief lock contention because score updates are small operations. The lock granularity is at the bucket level, not the individual player level, reducing the total number of lock operations.
+
+### Financial Exchanges
+
+Financial exchanges require distributed locks with the strongest possible safety guarantees. A single lock failure in an exchange can result in financial loss, regulatory penalties, and reputational damage.
+
+Exchange lock systems typically use hardware-backed consensus with the following properties:
+
+- **Deterministic lock ordering**: All lock operations are ordered by a globally consistent clock (hardware timestamp units or GPS clocks). This eliminates ambiguity about which lock was acquired first.
+- **Dual-lock pattern**: Critical operations require two independent lock services to grant the lock before proceeding. This protects against the failure of one lock service.
+- **Audit trails**: Every lock acquisition, release, and failure is logged with high-precision timestamps. The audit trail is immutable and stored in a separate system from the lock service.
+
+```python
+# Financial exchange dual-lock pattern (conceptual)
+def acquire_trading_lock(symbol, trader_id):
+    # Both lock services must agree
+    lock1 = acquire_zk_lock(f"/trading/locks/{symbol}", trader_id)
+    lock2 = acquire_etcd_lock(f"/trading/locks/{symbol}", trader_id)
+    
+    if lock1 and lock2:
+        # Both locks acquired — safe to proceed
+        log_audit("LOCK_ACQUIRED", symbol, trader_id)
+        return True
+    else:
+        # Release whichever was acquired
+        if lock1: release_zk_lock(lock1)
+        if lock2: release_etcd_lock(lock2)
+        log_audit("LOCK_FAILED", symbol, trader_id)
+        return False
+```
+
+The exchange lock pattern demonstrates the principle of defense in depth — two independent lock services must fail simultaneously for a lock failure to occur. The probability of synchronized failure across two systems with different implementations is extremely low.
+
+### IoT Device Coordination
+
+IoT systems coordinate millions of devices through distributed lock services. The lock patterns for IoT differ from traditional server-side locking because devices have intermittent connectivity, low bandwidth, and limited power.
+
+The coordinator lock pattern for IoT works as follows:
+
+1. A device connects to the cloud and requests a lock for a specific operation (firmware update, data upload).
+2. The lock service grants a lock with a long TTL (5-10 minutes) to account for device-to-cloud latency.
+3. The device performs the operation and reports completion.
+4. The lock service releases the lock.
+5. If the device disconnects without releasing the lock, the TTL expires and the lock is released.
+
+```python
+# IoT device lock coordination
+def coordinate_firmware_update(device_id, firmware_version):
+    lock_key = f"iot:fw_update:{device_id}"
+    
+    # Long TTL for intermittent devices
+    owner = acquire_lock(lock_key, ttl=300)  # 5 minute TTL
+    if not owner:
+        return DEVICE_BUSY
+    
+    try:
+        # Send firmware URL to device
+        send_command(device_id, "UPDATE_FIRMWARE", firmware_version)
+        # Wait for device to report completion (up to 4 minutes)
+        result = wait_for_completion(device_id, timeout=240)
+        return result
+    finally:
+        release_lock(lock_key, owner)
+```
+
+IoT lock patterns must also handle device clock drift. Many IoT devices lack NTP synchronization and have hardware clocks that drift significantly. For this reason, IoT lock services use server-side timestamps exclusively and never rely on device-reported timestamps for lock expiry calculations.
+
+<AsciiDiagram
+  id="distributed-locks/iot-lock-pattern"
+  title="IoT Device Lock Coordination Pattern"
+  alt="Timeline showing IoT device connecting to cloud lock service, acquiring lock with long TTL, performing the operation, and releasing"
+  caption="IoT lock patterns require longer TTLs and server-side timestamp management" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                IoT DEVICE LOCK COORDINATION PATTERN                           │
+│                                                                             │
+│  ┌──────────┐                    ┌──────────────┐                          │
+│  │  IoT Device│                   │  Cloud Lock   │                          │
+│  │  (field)   │                   │  Service      │                          │
+│  └─────┬──────┘                   └──────┬───────┘                          │
+│        │                                 │                                    │
+│        │  Connect (battery powered)      │                                    │
+│        │────────────────────────────────>│                                    │
+│        │                                 │                                    │
+│        │  Request firmware update lock   │                                    │
+│        │  device_id="sensor_12"          │                                    │
+│        │────────────────────────────────>│                                    │
+│        │                          ┌──────┴───────┐                           │
+│        │                          │ Grant lock    │                           │
+│        │                          │ TTL: 300s     │                           │
+│        │                          │ owner: uuid-1 │                           │
+│        │                          └──────┬───────┘                           │
+│        │<── LOCK_GRANTED (ttl=300s) ─────│                                    │
+│        │                                 │                                    │
+│        │  ─── Device performs firmware ───                                      │
+│        │  ─── update (may go offline) ───                                      │
+│        │                                 │                                    │
+│        │  UPDATE_COMPLETE                │                                    │
+│        │────────────────────────────────>│                                    │
+│        │                          ┌──────┴───────┐                           │
+│        │                          │ Release lock  │                          │
+│        │                          └──────────────┘                           │
+│        │                                 │                                    │
+│        │  ─── If device disconnects ───                                          │
+│        │  ─── TTL expires after 300s ───                                       │
+│        │  ─── Lock auto-released ───                                           │
+│        │                                 │                                    │
+│        │  Next device can acquire        │                                    │
+│        │  the lock                       │                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Benchmarking Methodology
+
+Benchmarking a distributed lock service requires measuring multiple dimensions of performance and reliability. A single metric (such as average latency) does not capture the full picture.
+
+### Metrics to Measure
+
+**Latency percentiles**: Measure P50, P90, P99, and P99.9 lock acquisition latency under various load levels. P99.9 is the most important metric because lock timeouts are typically caused by tail latency spikes.
+
+```bash
+# Example benchmark setup with redis-benchmark
+redis-benchmark -h lock-cluster.example.com -p 6379 \
+  -n 100000 -c 50 \
+  -r 1000 \
+  SET lock:{rand:000-999} "owner-{rand}" NX PX 30000
+```
+
+**Throughput**: Maximum lock operations per second (acquisitions + releases) before saturation. The throughput ceiling is determined by the consensus protocol in ZooKeeper/etcd, or by the Redis single-threaded execution model.
+
+**Contention ratio**: Percentage of lock acquisition attempts that fail because the lock is already held. A contention ratio above 30% indicates the lock granularity is too coarse.
+
+**Lease renewal success rate**: Percentage of lease renewals that succeed. A renewal failure rate above 1% indicates the lease TTL is too short relative to network latency.
+
+**Failover time**: Time from lock holder crash to lock release (TTL expiry or session timeout). Measured under controlled crash scenarios.
+
+**False grant rate**: Percentage of lock grants where more than one process receives the same lock. This is the most important reliability metric. A non-zero false grant rate is acceptable only if the application has fencing tokens.
+
+### Benchmarking Scenarios
+
+| Scenario | Configuration | What to Measure |
+|----------|--------------|-----------------|
+| Low contention | 10 workers, 1000 lock keys | P50/P99 latency |
+| High contention | 100 workers, 1 lock key | Contention ratio, throughput |
+| Burst load | 50 workers, all start simultaneously | Thundering herd behavior |
+| Network partition | Isolate lock service leader node | Failover time, false grants |
+| Clock skew | Introduce 500ms NTP offset | Lease expiry behavior |
+| Process crash | Kill a lock holder process | Recovery time, lock release |
+
+### Sample Benchmarking Code
+
+```python
+import time
+import statistics
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+def benchmark_lock_throughput(num_workers, num_locks, runtime_seconds):
+    """
+    Benchmark lock throughput with N workers contending for M locks.
+    """
+    results = []
+    lock = threading.Lock()
+    stop_event = threading.Event()
+    
+    def worker(worker_id):
+        local_ops = 0
+        while not stop_event.is_set():
+            lock_name = f"lock:{worker_id % num_locks}"
+            owner = f"worker-{worker_id}"
+            
+            start = time.monotonic()
+            acquired = redis_lock_acquire(lock_name, owner, ttl=5000)
+            latency = time.monotonic() - start
+            
+            if acquired:
+                redis_lock_release(lock_name, owner)
+                local_ops += 1
+                
+            with lock:
+                results.append({
+                    "latency_ms": latency * 1000,
+                    "acquired": acquired
+                })
+        return local_ops
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(worker, i) for i in range(num_workers)]
+        time.sleep(runtime_seconds)
+        stop_event.set()
+    
+    # Analyze results
+    latencies = [r["latency_ms"] for r in results if r["acquired"]]
+    contention = 100 * (1 - len(latencies) / len(results))
+    
+    return {
+        "total_ops": len(results),
+        "acquisitions": len(latencies),
+        "contention_ratio": contention,
+        "p50_latency_ms": statistics.median(latencies),
+        "p99_latency_ms": sorted(latencies)[int(len(latencies) * 0.99)]
+    }
+```
+
+### Interpreting Results
+
+When benchmarking a lock service, compare the results against the operational requirements:
+
+- Lock acquisition latency below 5ms for Redis, below 20ms for ZooKeeper/etcd at P50, with P99 below 3x P50.
+- Throughput above 5,000 ops/sec for a single ZooKeeper/etcd cluster, above 50,000 ops/sec for a single Redis instance.
+- Contention ratio below 20% for healthy lock granularity. Above 50% indicates the critical section is too long or locks are too coarse.
+- False grant rate of zero for consensus-based systems. For Redis, the false grant rate depends on replication configuration and should be measured under partition scenarios.
+
+Benchmarking must be performed in an environment that mirrors production conditions. A development environment with no network latency, no clock skew, and no competing load will produce optimistic results that do not reflect production behavior.

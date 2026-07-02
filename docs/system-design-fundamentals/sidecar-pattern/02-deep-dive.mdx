@@ -1,0 +1,487 @@
+---
+id: sidecar-pattern-deep-dive
+title: Deep Dive — Sidecar Pattern Internals
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+The sidecar pattern depends on three fundamental mechanisms that enable two independent processes to function as a single unit: the shared process model, the shared filesystem, and inter-process communication. These mechanisms vary across deployment environments but serve the same functional purpose in all cases.
+
+### Sidecar Process Model
+
+The sidecar runs as a separate operating system process in its own container or process space. It has its own PID namespace, its own memory space, and its own filesystem layer. The separation provides strong isolation: the sidecar can crash, consume memory, or be updated without directly affecting the primary process.
+
+In Kubernetes, the sidecar resides in a separate container within the same pod. Each container has its own container image, its own resource limits (CPU and memory), and its own restart policy. The containers share the pod's network namespace, meaning they can communicate over localhost, and they can share volumes mounted into the pod.
+
+The isolation is not absolute. Both containers share the pod's cgroup hierarchy. A memory leak in the sidecar container that exceeds its memory limit triggers an OOM kill of the sidecar container only, not the primary container. But if the pod-level memory limit is reached, both containers may be evicted together.
+
+<AsciiDiagram
+  id="sidecar-pattern/deep-dive-process-model"
+  title="Sidecar Process Model — Container Architecture"
+  alt="Diagram showing two containers in a pod sharing network namespace and volumes, with their own PID namespaces, filesystem layers, and resource limits"
+  caption="Each container in a pod has its own process space but shares network and storage resources"
+ content={`
+┌─────────────────────────────────────────────────────────┐
+│                     Kubernetes Pod                       │
+│                                                         │
+│  ┌─── Network Namespace (shared) ────────────────────┐  │
+│  │  localhost:8080  │  localhost:15001               │  │
+│  │  localhost:9090  │  localhost:15002               │  │
+│  └──────────────────────────────────────────────────┘  │
+│                                                         │
+│  ┌── Container 1 (Primary) ───┐  ┌── Container 2 ──┐ │
+│  │  PID Namespace             │  │  PID Namespace  │ │
+│  │  ─ PID 1: java -jar app    │  │  ─ PID 1: envoy │ │
+│  │  Filesystem Layer          │  │  Filesystem     │ │
+│  │  ─ /app/ (RO)              │  │  ─ /etc/envoy/  │ │
+│  │  ─ /var/log/ (RW shared)   │  │  ─ /var/log/    │ │
+│  │  ─ /etc/config/ (RW shared)│  │  ─ /etc/config/ │ │
+│  │  Resource Limits           │  │  Resource       │ │
+│  │  ─ CPU: 2000m              │  │  ─ CPU: 500m   │ │
+│  │  ─ Memory: 2Gi             │  │  ─ Memory: 1Gi │ │
+│  │  ─ Restart: Always         │  │  ─ Restart:    │ │
+│  │  ─ Image: payments:v3.2    │  │  Always         │ │
+│  └────────────────────────────┘  └─────────────────┘ │
+│                                                         │
+│  ┌────────── Pod Managed Resources ─────────────────┐  │
+│  │  Pod IP: 10.0.1.42                                │  │
+│  │  Service Account: payments-sa                     │  │
+│  │  QoS Class: Burstable                             │  │
+│  │  Pod CPU limit: 3000m                             │  │
+│  │  Pod Memory limit: 4Gi                            │  │
+│  └─────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+`} />
+
+### Shared Filesystem Mechanism
+
+The shared filesystem is the primary communication channel for data-heavy sidecar functions such as log forwarding and config synchronization. The orchestrator mounts a volume into both containers at the same path. Both processes see the same files.
+
+Kubernetes supports several volume types suitable for sidecar communication. An emptyDir volume is created when the pod starts and is deleted when the pod terminates. It provides a scratch space for log files and temporary data. A hostPath volume mounts a directory from the node's filesystem into both containers. A CSI-backed volume (such as EBS or EFS) provides persistent storage shared across restarts.
+
+The primary process writes data to the shared volume. The sidecar reads from that volume. This is a producer-consumer pattern with no locking or synchronization protocol defined by the platform. The two processes must coordinate access to avoid partial reads and write conflicts. Common approaches include atomic file renames (write to a temp file, then rename), append-only log files (the sidecar tracks its read position), and Unix domain sockets.
+
+<AsciiDiagram
+  id="sidecar-pattern/deep-dive-shared-filesystem"
+  title="Shared Filesystem — Volume Mount Architecture"
+  alt="Diagram showing shared emptyDir and ConfigMap volumes mounted into both primary and sidecar containers in the same pod"
+  caption="Shared volumes enable data exchange between the primary process and the sidecar"
+ content={`
+┌────────────────────────────────────────────┐
+│              Pod Volumes                    │
+│                                            │
+│  ┌─────────── emptyDir ──────────────────┐ │
+│  │  Mount Path: /var/log/app/            │ │
+│  │                                        │ │
+│  │  ┌─────────────────────────────────┐  │ │
+│  │  │ /var/log/app/access.log         │  │ │
+│  │  │ /var/log/app/error.log          │  │ │
+│  │  │ /var/log/app/audit.log          │  │ │
+│  │  └─────────────────────────────────┘  │ │
+│  │                                        │ │
+│  │  ┌─────────────────────────────────┐  │ │
+│  │  │ /var/log/app/access.log.offset │  │ │
+│  │  │ (sidecar tracking file)        │  │ │
+│  │  └─────────────────────────────────┘  │ │
+│  └────────────────────────────────────────┘ │
+│                                            │
+│  ┌─────────── ConfigMap ─────────────────┐ │
+│  │  Mount Path: /etc/config/              │ │
+│  │                                        │ │
+│  │  ┌─────────────────────────────────┐  │ │
+│  │  │ /etc/config/app.yaml            │  │ │
+│  │  │ /etc/config/routes.yaml         │  │ │
+│  │  └─────────────────────────────────┘  │ │
+│  └────────────────────────────────────────┘ │
+│                                            │
+│  Access Pattern:                            │
+│  Primary writes  ───►  emptyDir  ◄───  Sidecar reads   │
+│  ConfigMap writes ◄───  (kubelet)  ───►  Both read      │
+└────────────────────────────────────────────┘
+`} />
+
+### Inter-Process Communication (IPC)
+
+The primary process and sidecar communicate through several IPC mechanisms, each suited to different data exchange patterns.
+
+**Localhost TCP/UDP.** Both containers share the pod's network namespace. The primary process listens on a port. The sidecar connects to that port over 127.0.0.1. This is the simplest IPC mechanism and requires no shared volumes. The ambassador pattern uses localhost TCP exclusively: the primary connects to the proxy sidecar on localhost for all outbound traffic.
+
+**Unix Domain Sockets.** A Unix domain socket is a file-based socket that provides lower latency and higher throughput than TCP loopback. The socket file is placed on a shared volume. Both processes open connections to the socket file. Unix domain sockets are commonly used for metrics collection and health checking where performance matters.
+
+**Shared Files.** The primary writes data to a shared file. The sidecar reads from that file. This is the least efficient IPC mechanism (disk I/O is slower than network or socket I/O) but the simplest to implement and debug. Log forwarding uses shared files almost exclusively because logs must persist across process restarts.
+
+**Signals.** The sidecar can send POSIX signals to the primary process if they share a PID namespace. A config sync sidecar may send SIGHUP to trigger a configuration reload. A health sidecar may send SIGTERM to force a restart of an unhealthy primary process. Signal-based IPC is limited: only a small set of signals have defined semantics, and the primary process must register signal handlers.
+
+## Data Structures
+
+Sidecar implementations use several standard data structures to manage state, buffering, and configuration.
+
+### Log Buffer
+
+The log buffer is a circular buffer that stores log entries before forwarding them to the external logging system. The buffer prevents log loss during network interruptions and enables batching for efficient transport.
+
+A typical log buffer has three parameters. Buffer capacity is the maximum number of entries stored in memory, typically 10,000 to 100,000 entries for a standard logging sidecar. Flush interval is the maximum time between batch sends, typically 1 to 5 seconds. Batch size is the maximum number of entries in a single send operation, typically 100 to 1,000 entries.
+
+The combined effect of these parameters determines memory usage and delivery latency. A buffer with 100,000 entries, each averaging 512 bytes, consumes approximately 50 MB of memory. The flush interval of 5 seconds means the last log entry may be delayed up to 5 seconds before reaching the logging system.
+
+### Connection Pool
+
+The proxy sidecar maintains a connection pool for each upstream service. The connection pool caches TCP connections, HTTP connections, or gRPC streams to reduce connection establishment overhead for the primary service.
+
+A connection pool has these parameters. Maximum connections per upstream defines the high-water mark for connections to a single backend, typically 100 to 10,000. Maximum pending requests defines the queue depth when all connections are in use, typically 1,000 to 10,000. Connection timeout defines how long the pool waits for a new connection to be established, typically 1 to 30 seconds. Idle timeout defines how long an unused connection stays open, typically 1 to 60 minutes.
+
+Connection pooling has a direct effect on latency. For a service handling 5,000 requests per second to a single upstream with a connection establishment cost of 10 milliseconds, pooling reduces the per-request establishment cost from 10 milliseconds to near zero after the pool is warm.
+
+### Config Cache
+
+The config cache stores the last known good configuration for the primary process. The cache enables the sidecar to continue functioning when the remote config store is unreachable.
+
+A config cache stores the configuration data as raw bytes, a checksum of the configuration for detecting changes, version metadata for tracking updates, a timestamp of the last successful sync for staleness checking, and a rollback pointer to the previous valid version. The cache is typically stored on a shared volume so it persists across container restarts.
+
+The cache hit ratio for a config sync sidecar depends on the polling interval and the rate of configuration changes. For a system with 10 configuration changes per day and a 30-second polling interval, the cache returns stale data for 999 out of 1,000 reads. This is acceptable for configuration data because staleness of up to 30 seconds is typically tolerable.
+
+## Lifecycle
+
+The sidecar lifecycle involves over 10 distinct stages from startup to shutdown. Each stage must handle failure modes and edge cases.
+
+**Stage 1: Image Pull.** The container runtime pulls the sidecar's container image from the registry. If the image is large (Envoy is approximately 200 MB compressed), the pull time adds 5 to 30 seconds to the pod startup time. Image pull latency is a primary contributor to pod startup delays in sidecar-heavy deployments.
+
+**Stage 2: Init Container Network Rules.** An init container configures iptables rules on the pod's network namespace. The rules redirect inbound traffic from the pod's primary port to the sidecar's inbound listener port. Outbound traffic from the primary container is redirected through the sidecar's outbound listener port. This redirection is transparent to the primary service.
+
+<AsciiDiagram
+  id="sidecar-pattern/deep-dive-iptables"
+  title="Traffic Redirection — iptables Rules for Sidecar Proxy"
+  alt="Diagram showing how iptables PREROUTING and OUTPUT chains redirect inbound and outbound traffic through the Envoy sidecar ports"
+  caption="Iptables rules installed by an init container transparently redirect traffic through the sidecar proxy"
+ content={`
+                           Inbound Traffic
+                               │
+                               ▼
+                     ┌─────────────────┐
+                     │ iptables        │
+                     │ PREROUTING      │
+                     │ Chain           │
+                     │                 │
+                     │ Port 8080 ─────►│  redirect to
+                     │                 │  127.0.0.1:15001
+                     │  (inbound)      │  (Envoy inbound)
+                     └────────┬────────┘
+                              │
+                              ▼
+                    ┌──────────────────┐
+                    │  Envoy Proxy     │
+                    │  Inbound Listener │
+                    │  :15001          │
+                    │                  │
+                    │  Apply filters:  │
+                    │  ─ Auth check     │
+                    │  ─ Rate limit     │
+                    │  ─ Route to app   │
+                    └────────┬─────────┘
+                             │ 127.0.0.1:8080
+                             ▼
+                    ┌──────────────────┐
+                    │  Primary Service │
+                    │  :8080           │
+                    └────────┬─────────┘
+                             │
+                    Outbound traffic
+                             │
+                             ▼
+                     ┌─────────────────┐
+                     │ iptables        │
+                     │ OUTPUT Chain    │
+                     │                 │
+                     │ Port != 15001   │
+                     │ redirect to     │
+                     │ 127.0.0.1:15002 │
+                     └────────┬────────┘
+                              │
+                              ▼
+                    ┌──────────────────┐
+                    │  Envoy Proxy     │
+                    │  Outbound Listener│
+                    │  :15002          │
+                    │                  │
+                    │  Apply rules:    │
+                    │  ─ Service disc   │
+                    │  ─ Load balance   │
+                    │  ─ TLS origination│
+                    │  ─ Circuit break  │
+                    └──────────────────┘
+`} />
+
+**Stage 3: Sidecar Startup.** The sidecar process starts. It reads its bootstrap configuration from a local file or environment variables. The sidecar opens its listeners. For Envoy, this includes the inbound listener on port 15001 and the outbound listener on port 15002. The sidecar connects to the control plane to receive dynamic configuration.
+
+**Stage 4: Bootstrap Configuration Load.** The sidecar loads its static bootstrap configuration. This configuration tells the sidecar how to connect to the control plane, where to find TLS certificates, and what default listeners to open. The bootstrap configuration is typically small (under 50 lines of YAML) and embedded in the sidecar container image or mounted from a ConfigMap.
+
+**Stage 5: Control Plane Handshake (for mesh proxies).** The sidecar establishes a connection to the control plane. In Istio, the Envoy proxy connects to Istiod over XDS (the Envoy discovery service protocol) using gRPC on port 15012. The control plane authenticates the sidecar using its service account token. The initial handshake takes 100 to 500 milliseconds.
+
+**Stage 6: Dynamic Configuration Receipt.** The control plane pushes the initial set of dynamic configurations to the sidecar. This includes listener configurations, cluster definitions, route rules, and endpoint discovery information. For a mesh with 50 services, the initial configuration set is approximately 5,000 to 10,000 lines of protobuf configuration.
+
+**Stage 7: Primary Service Startup.** The primary service starts after the sidecar is ready. The primary opens its listener on its configured port. If the sidecar proxy is present, inbound traffic is now flowing: external requests arrive at the pod's IP, are redirected by iptables to the sidecar's inbound listener, and the sidecar forwards them to the primary service over localhost.
+
+**Stage 8: Readiness Gate.** The pod's readiness probe checks both containers. In a service mesh, Kubernetes uses a readiness gate that defers readiness until the sidecar proxy confirms it is ready to handle traffic. The readiness gate prevents traffic from reaching the pod before the sidecar is fully initialized.
+
+**Stage 9: Steady-State Health Checks.** During operation, the container runtime executes liveness and readiness probes for both containers every 10 to 30 seconds. The sidecar may perform its own health checks against the primary process. Some sidecar implementations expose a health endpoint that aggregates the status of both processes.
+
+**Stage 10: Configuration Refresh (ongoing).** Throughout its lifetime, the sidecar receives configuration updates from the control plane. When routes change (a service's backend is moved), the sidecar updates its routing table within 1 to 5 seconds. When a new version of a service is deployed, the sidecar receives the updated endpoint list. This continuous configuration refresh is a defining feature of the sidecar proxy pattern.
+
+**Stage 11: Graceful Shutdown Initiation.** When the pod is marked for termination, the orchestrator sends SIGTERM to the primary process and the sidecar process simultaneously. The sidecar should drain its existing connections rather than abruptly closing them.
+
+**Stage 12: Connection Draining.** The sidecar stops accepting new connections and begins draining existing connections. For HTTP connections, the drain phase involves sending Go-Away frames (HTTP/2) or Connection: close headers (HTTP/1.1). The drain period is typically 5 to 60 seconds, configurable via the sidecar configuration.
+
+**Stage 13: Buffer Flush.** The sidecar flushes any in-memory buffers. The log forwarding sidecar sends its remaining log batches. The metrics sidecar pushes its final metrics snapshot. This stage ensures no data is lost during shutdown.
+
+**Stage 14: Process Termination.** After the drain and flush stages complete, the sidecar process exits. If the process does not exit within the pod's termination grace period (default 30 seconds), the runtime sends SIGKILL to force termination. Any data in unflushed buffers at this point is lost.
+
+## Consistency and State
+
+The sidecar pattern introduces consistency challenges because two independent processes manage shared state.
+
+**Log Consistency.** The primary process writes log entries to a shared volume. The sidecar reads those entries. If the primary writes a log entry and crashes before the sidecar reads it, the entry is present on disk but may be partially written. The sidecar must handle partial writes by reading at record boundaries or using checksum validation.
+
+**Configuration Consistency.** The config sync sidecar writes configuration files to a shared volume. The primary process reads those files. If the sidecar updates a configuration file while the primary process is reading it, the primary may read a torn write (a mix of old and new content). Atomic file rename (write to .tmp, then rename to target) prevents this but requires the primary to open the file by name, not by file descriptor.
+
+**Traffic Consistency.** In the proxy sidecar pattern, the primary connects to the sidecar over localhost. If the sidecar restarts, the primary's existing connections to the sidecar break. The primary must handle connection errors and re-establish connections after the sidecar comes back up. This is similar to handling any network interruption, but the sidecar restart introduces a brief window where traffic cannot flow.
+
+**Stateful Sidecar Data.** Some sidecars maintain state that must survive restarts. A log forwarding sidecar tracks its read position in a log file. If it restarts, it must resume from the last read position rather than re-reading the entire file. The sidecar stores this position on a shared volume as a small offset file.
+
+## Performance
+
+Sidecar proxies introduce measurable performance overhead. Each network request passes through an additional hop (the sidecar) on both inbound and outbound paths.
+
+**Latency Overhead.** The proxy sidecar adds 1 to 5 milliseconds of latency per request in the common case. This includes connection lookup, TLS decryption, header processing, route matching, and forwarding. For a request that normally takes 50 milliseconds, a 3-millisecond sidecar overhead represents a 6% increase.
+
+**CPU Overhead.** The sidecar proxy consumes CPU for every request it processes. For Envoy, each request requires approximately 0.1 to 0.5 milliseconds of CPU time for proxy processing, depending on the complexity of the filter chain. A service handling 10,000 requests per second requires approximately 1 to 5 CPU cores for the sidecar proxy alone.
+
+**Memory Overhead.** Each sidecar proxy consumes memory for its connection tracking tables, route tables, and filter state. Envoy uses approximately 50 to 200 MB of memory per sidecar in a typical production deployment. For a cluster with 1,000 pods, sidecars consume 50 to 200 GB of cluster memory.
+
+<AsciiDiagram
+  id="sidecar-pattern/deep-dive-performance"
+  title="Performance Overhead — Sidecar Proxy Latency Breakdown"
+  alt="Bar chart showing the latency contribution of each sidecar proxy processing stage: iptables, TLS, route match, filter chain, and forwarding"
+  caption="Sidecar proxy overhead adds 1-5 milliseconds per request across inbound and outbound paths"
+ content={`
+Request Path Through Sidecar Proxy
+(typical latency per stage in microseconds)
+
+Client ──► Sidecar Inbound
+  │
+  ├── iptables lookup: 20-50 us
+  ├── TLS handshake: 500-2000 us (first request)
+  ├── TLS decrypt: 50-200 us (subsequent)
+  ├── Route match: 10-50 us
+  ├── Filter chain: 100-500 us
+  │   ├── RBAC check
+  │   ├── Rate limit
+  │   └── Access log
+  │
+  └── Forward to app: 10-30 us (localhost)
+
+Primary Service
+  │
+  ├── Process request: 10,000-50,000 us
+  │
+  └── Response ──► Sidecar Outbound
+
+Sidecar Outbound
+  │
+  ├── Route lookup: 10-50 us
+  ├── Load balance pick: 5-10 us
+  ├── Connection pool: 10-100 us
+  ├── TLS originate: 50-200 us
+  └── Forward to upstream: 500-5000 us
+
+Total sidecar overhead: 1,000-5,000 us (1-5 ms)
+Primary processing: 10,000-50,000 us (10-50 ms)
+Sidecar overhead ratio: 5-20%
+`} />
+
+## Configuration
+
+Sidecar configuration is typically divided into three layers: bootstrap configuration, dynamic configuration from a control plane, and runtime overrides.
+
+**Bootstrap Configuration.** The bootstrap configuration defines the sidecar's identity, control plane connection details, and default listeners. This configuration is static and embedded in the container image or provided as a mounted ConfigMap. Bootstrap configuration rarely changes between deployments.
+
+```yaml
+# Bootstrap configuration for an Envoy sidecar proxy
+admin:
+  access_log_path: /tmp/admin_access.log
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+    - envoy_grpc:
+        cluster_name: xds_cluster
+  cds_config:
+    ads: {}
+  lds_config:
+    ads: {}
+static_resources:
+  clusters:
+  - name: xds_cluster
+    connect_timeout: 1s
+    type: STRICT_DNS
+    load_assignment:
+      cluster_name: xds_cluster
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: istiod.istio-system.svc
+                port_value: 15012
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        common_tls_context:
+          tls_certificates:
+          - certificate_chain:
+              filename: /etc/certs/cert-chain.pem
+            private_key:
+              filename: /etc/certs/key.pem
+          validation_context:
+            trusted_ca:
+              filename: /etc/certs/root-cert.pem
+```
+
+**Dynamic Configuration.** The control plane pushes dynamic configuration updates via the XDS protocol. The configuration includes listeners (ports and filters), clusters (upstream backends and load balancing), routes (traffic splitting and matching rules), endpoints (individual service instances), and secrets (TLS certificates).
+
+**Runtime Overrides.** Some sidecar implementations support runtime configuration overrides that take effect without a control plane update. These overrides are typically used for emergency rate limiting, log level changes, and debug flag toggles. In Envoy, runtime overrides are read from a local filesystem directory.
+
+The configuration system must handle partial updates gracefully. If the control plane pushes a malformed configuration, the sidecar should reject the update and continue operating with the last valid configuration. Envoy implements this behavior through its rejection system: invalid configurations are rejected with a detailed error message, and the proxy continues with the previous configuration.
+
+<AsciiDiagram
+  id="sidecar-pattern/deep-dive-ipc"
+  title="IPC Mechanisms — Primary Process to Sidecar Communication Channels"
+  alt="Diagram showing four IPC channels between the primary process and sidecar: localhost TCP for proxy traffic, Unix domain sockets for metrics, shared files for logging, and POSIX signals for lifecycle coordination"
+  caption="Four IPC mechanisms serve different communication needs between the primary process and the sidecar"
+ content={`
+┌───────────────────────────────────────────────────────────┐
+│           Primary Process to Sidecar IPC                  │
+│                                                           │
+│  ┌──────────────────┐            ┌──────────────────┐    │
+│  │                  │ 1. TCP     │                  │    │
+│  │   Primary        │◄──────────►│   Sidecar        │    │
+│  │   Service        │  localhost │   Proxy          │    │
+│  │                  │   :15001   │   (Envoy)        │    │
+│  │                  │────────────►                  │    │
+│  │                  │  outbound   │                  │    │
+│  └────────┬─────────┘            └──────────────────┘    │
+│           │                                               │
+│           │ 2. Unix Domain Socket                         │
+│           ├────────────────────────────────► /tmp/proxy.sock
+│           │                                               │
+│           │ 3. Shared File                                │
+│           ├──── writes/var/log/app.log────► Sidecar reads │
+│           │                                               │
+│           │ 4. POSIX Signal                               │
+│           │◄──── SIGHUP (config reload) ───── Sidecar     │
+│           │◄──── SIGTERM (forced restart)── Sidecar       │
+│           │                                               │
+│  ┌────────┴──────────────────────────────────────────┐   │
+│  │  IPC Selection Guide                               │   │
+│  │  ┌──────────┬──────────────┬──────────────────┐   │   │
+│  │  │ Channel  │ Use Case     │ Latency           │   │   │
+│  │  ├──────────┼──────────────┼──────────────────┤   │   │
+│  │  │ TCP      │ Proxy        │ 50-200 us        │   │   │
+│  │  │ UDS      │ Metrics      │ 10-50 us         │   │   │
+│  │  │ File     │ Logs         │ 1-10 ms (disk)   │   │   │
+│  │  │ Signal   │ Lifecycle    │ 1-5 us           │   │   │
+│  │  └──────────┴──────────────┴──────────────────┘   │   │
+│  └────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────┘
+`} />
+
+<AsciiDiagram
+  id="sidecar-pattern/deep-dive-log-buffer"
+  title="Log Buffer Architecture — Circular Buffer with Spillover"
+  alt="Diagram showing the log buffer data structure with circular buffer entries, flush interval, batch size, and spillover file for backpressure handling"
+  caption="The log buffer stores entries in a circular buffer, flushes in batches, and spills to disk when the backend is unreachable"
+ content={`
+┌────────────────────────────────────────────────────────────┐
+│              Logging Sidecar Buffer Architecture            │
+│                                                             │
+│  Circular Buffer (In-Memory)                                │
+│  ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐      │
+│  │ L1 │ L2 │ L3 │ L4 │ L5 │ L6 │ L7 │ L8 │ .. │ Ln │      │
+│  └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘      │
+│    read_pos ▲                              write_pos        │
+│                                                             │
+│  Parameters:                                                │
+│  ─ Capacity: 200,000 entries (~100 MB at 512 B each)       │
+│  ─ Flush interval: 5 seconds                                │
+│  ─ Batch size: 500 entries                                  │
+│  ─ Current usage: 12,000 entries (6%)                       │
+│                                                             │
+│  Flush Pipeline:                                            │
+│  Buffer ──► Batch (500 entries) ──► Compress (gzip)         │
+│       ──► Send (HTTP bulk) ──► Elasticsearch                │
+│                                                             │
+│  Backpressure Handling:                                     │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │ If Elasticsearch unreachable for > 30 seconds:     │    │
+│  │ 1. Buffer fills to capacity (200K entries)         │    │
+│  │ 2. New entries written to spillover file on disk   │    │
+│  │ 3. Spillover file grows until ES recovers          │    │
+│  │ 4. On recovery: spillover sent FIRST, then buffer  │    │
+│  └────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────────────────┘
+`} />
+
+<AsciiDiagram
+  id="sidecar-pattern/deep-dive-connection-pool"
+  title="Connection Pool — Sidecar Proxy Connection Management"
+  alt="Diagram showing connection pool architecture with upstream clusters, per-cluster connection pools, pending request queues, and pool lifecycle"
+  caption="The sidecar proxy maintains a connection pool for each upstream service to reduce connection establishment overhead"
+ content={`
+┌────────────────────────────────────────────────────────────┐
+│          Envoy Sidecar Connection Pool                     │
+│                                                             │
+│  Upstream Clusters:                                         │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ Cluster: payment-service.svc.cluster.local:8080       │  │
+│  │                                                       │  │
+│  │  Connection Pool:                                     │  │
+│  │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐      │  │
+│  │  │Conn 1│ │Conn 2│ │Conn 3│ │Conn 4│ │Conn 5│      │  │
+│  │  │active│ │active│ │active│ │idle  │ │idle  │      │  │
+│  │  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘      │  │
+│  │                                                       │  │
+│  │  Pending Queue: [req1] [req2] [req3]                  │  │
+│  │                                                       │  │
+│  │  Max connections: 100                                 │  │
+│  │  Max pending: 1000                                    │  │
+│  │  Connect timeout: 5s                                  │  │
+│  │  Idle timeout: 60m                                    │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                             │
+│  Pool Metrics:                                              │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │ Active: 3 / Idle: 2 / Pending: 3 / Total: 5       │    │
+│  │ Connections established: 1,245                     │    │
+│  │ Connections recycled: 1,240 (99.6% hit rate)      │    │
+│  │ Avg connection lifetime: 12.3 minutes              │    │
+│  └────────────────────────────────────────────────────┘    │
+│                                                             │
+│  Pool Lifecycle:                                            │
+│  Request ──► Pool lookup ──► Idle available?               │
+│    ├── Yes ──► Reuse connection ──► Send request           │
+│    └── No ───► Max reached?                                │
+│         ├── No ──► New connection ──► Send request         │
+│         └── Yes ──► Queue pending ──► Wait for free conn   │
+└────────────────────────────────────────────────────────────┘
+`} />
+
+Understanding the internal architecture, data structures, lifecycle, and performance characteristics of the sidecar pattern is essential for designing systems that use it effectively. The architecture section continues this exploration by examining how the sidecar pattern fits into larger system architectures.

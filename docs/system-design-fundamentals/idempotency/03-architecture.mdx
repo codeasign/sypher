@@ -1,0 +1,444 @@
+---
+id: idempotency-architecture
+title: System Architecture
+position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# System Architecture
+
+This section presents the system architecture for idempotency at scale. You will learn about naive approaches that fail, production-grade distributed architectures, integration patterns, multi-region deployment, and capacity planning.
+
+---
+
+## Naive Approach: Client-Side Deduplication Only
+
+The simplest approach to idempotency is to rely on the client to never send duplicate requests. The client generates a unique ID for each request, stores it locally, and only sends the request once.
+
+<AsciiDiagram
+  id="idempotency/architecture-naive"
+  title="Naive Client-Side Deduplication"
+  alt="Architecture diagram showing the client generating a unique ID and storing it locally, with no server-side deduplication support"
+  caption="Naive Client-Side Deduplication"
+  content={`┌─────────────────────────────────────────────────────────┐
+│              Client-Side Deduplication Only                  │
+│                                                             │
+│  ┌──────────────────────┐                                   │
+│  │      Client          │                                   │
+│  │                      │                                   │
+│  │  ┌────────────────┐  │                                   │
+│  │  │ Sent Requests  │  │                                   │
+│  │  │ Store          │  │                                   │
+│  │  │                │  │                                   │
+│  │  │ req-abc-123    │  │                                   │
+│  │  │ req-def-456    │  │                                   │
+│  │  │ req-ghi-789    │  │                                   │
+│  │  └────────────────┘  │                                   │
+│  │                      │                                   │
+│  └──────────┬───────────┘                                   │
+│             │                                                │
+│             │  POST /orders (Idempotency-Key: req-abc-123)  │
+│             ▼                                                │
+│  ┌──────────────────────┐                                   │
+│  │      Server          │  No deduplication logic           │
+│  │                      │  Processes every request          │
+│  │  ┌────────────────┐  │                                   │
+│  │  │ Order Creation  │  │                                   │
+│  │  └────────────────┘  │                                   │
+│  └──────────────────────┘                                   │
+│                                                             │
+│  What goes wrong:                                           │
+│  1. Client crashes → lost sent-requests store              │
+│  2. Multiple clients → no shared state                     │
+│  3. Network retry → client retransmits                     │
+│  4. Server-side retry → server retries                     │
+│  5. Load balancer → routes duplicate to different server   │
+└─────────────────────────────────────────────────────────┘`} />
+
+Client-side deduplication fails in five ways:
+
+1. **Client crash**: The client stores the sent-requests list in memory. A crash wipes the list. After restart, the client retries all pending requests as new requests. The server processes them again.
+
+2. **Multiple clients**: A user accesses the service from their phone and their laptop. Each device has its own sent-requests store. If the phone sends a request and retries from the laptop, the laptop does not know the request was already sent.
+
+3. **Network retry**: The client sends a request and the network stack retransmits the TCP packet. The server receives the same HTTP request twice. The client cannot control TCP retransmissions.
+
+4. **Server-side retry**: The server receives the request, starts processing, and experiences an internal timeout. The server itself may retry the processing logic. The client cannot prevent server-side retries.
+
+5. **Load balancer**: A request arrives at server A. The response is lost. The client retries. The load balancer routes the retry to server B. Server B has no knowledge of the original request.
+
+Client-side deduplication is better than nothing but insufficient for production systems.
+
+---
+
+## Production Architecture: Distributed Idempotency Store
+
+A production idempotency architecture uses a distributed store that all servers share. Every server checks this shared store before processing any request.
+
+<AsciiDiagram
+  id="idempotency/architecture-production"
+  title="Production Distributed Idempotency Architecture"
+  alt="Architecture diagram showing multiple application servers sharing a distributed idempotency store with Redis cluster, with consistent hashing for key distribution"
+  caption="Production Distributed Idempotency Architecture"
+  content={`┌─────────────────────────────────────────────────────────┐
+│         Production Idempotency Architecture                  │
+│                                                             │
+│                     ┌──────────────┐                        │
+│                 ┌───┤   Client     ├───┐                    │
+│                 │   └──────────────┘   │                    │
+│                 ▼                      ▼                    │
+│         ┌──────────────┐      ┌──────────────┐             │
+│         │  App Server  │      │  App Server  │             │
+│         │      1       │      │      2       │             │
+│         └──────┬───────┘      └──────┬───────┘             │
+│                │                     │                      │
+│                └──────────┬──────────┘                      │
+│                           ▼                                 │
+│                ┌────────────────────┐                       │
+│                │   Redis Cluster    │                       │
+│                │  (Idempotency      │                       │
+│                │   Store)           │                       │
+│                │                    │                       │
+│                │  ┌────┐ ┌────┐    │                       │
+│                │  │R1  │ │R2  │    │                       │
+│                │  └────┘ └────┘    │                       │
+│                │  ┌────┐ ┌────┐    │                       │
+│                │  │R3  │ │R4  │    │                       │
+│                │  └────┘ └────┘    │                       │
+│                └────────────────────┘                       │
+│                                                             │
+│  Key distribution: consistent hashing                       │
+│  Replication: master-replica per shard                      │
+│  Durability: AOF persistence + replication                  │
+│  Consistency: strong for reads/writes of same key           │
+└─────────────────────────────────────────────────────────┘`} />
+
+The production architecture has these key characteristics:
+
+- **Shared store**: All application servers use the same idempotency store, typically Redis or a distributed database.
+- **Consistent hashing**: Keys are distributed across Redis shards using consistent hashing. This ensures minimal reshuffling when nodes are added or removed.
+- **Replication**: Each shard has a master and one or more replicas. Writes go to the master. Reads can go to replicas if the system can tolerate eventual consistency for duplicate detection.
+- **Atomic operations**: The store supports atomic check-and-set operations. This prevents race conditions without external locks.
+
+The check-and-set operation is the core of the production architecture:
+
+```python
+def process_with_idempotency(request):
+    key = request.headers["Idempotency-Key"]
+
+    # Atomic check-and-set
+    # SET NX = set only if the key does not exist
+    stored = redis.set(
+        f"idemp:{key}",
+        json.dumps({"status": "processing"}),
+        ex=IDEMPOTENCY_TTL,
+        nx=True  # Only set if key does not exist
+    )
+
+    if not stored:
+        # Key already exists → return cached response
+        cached = redis.get(f"idemp:{key}")
+        return json.loads(cached)
+
+    # Key was set (first request) → process
+    result = process_business_logic(request)
+
+    # Store the result
+    redis.set(
+        f"idemp:{key}",
+        json.dumps({"status": "completed", "result": result}),
+        ex=IDEMPOTENCY_TTL
+    )
+
+    return result
+```
+
+The SET NX command is atomic. If two requests arrive at the same time, only one succeeds in setting the key. The other sees the key exists and returns the cached response.
+
+---
+
+## Integration Patterns
+
+Idempotency can be integrated into a system at different layers. Each layer has advantages and disadvantages.
+
+### API Gateway Pattern
+
+The API gateway handles idempotency for all downstream services. The gateway checks the idempotency store before routing the request to the appropriate backend service.
+
+<AsciiDiagram
+  id="idempotency/architecture-gateway"
+  title="API Gateway Integration Pattern"
+  alt="Architecture diagram showing an API gateway that checks the idempotency store before routing requests to downstream services like orders, payments, and notifications"
+  caption="API Gateway Integration Pattern"
+  content={`┌─────────────────────────────────────────────────────────┐
+│              API Gateway Integration Pattern                 │
+│                                                             │
+│  Client                                                     │
+│    │                                                        │
+│    ▼                                                        │
+│  ┌──────────────────────┐                                   │
+│  │    API Gateway        │  Handles idempotency for         │
+│  │                       │  all downstream services         │
+│  │  ┌─────────────────┐  │                                  │
+│  │  │ Idempotency      │  │  Validates key                  │
+│  │  │ Middleware       │  │  Checks store                   │
+│  │  └─────────────────┘  │  │  Caches response              │
+│  │                       │                                  │
+│  └──────────┬────────────┘                                  │
+│             │                                                │
+│     ┌───────┴───────┐                                      │
+│     ▼               ▼                                       │
+│  ┌────────┐    ┌────────┐  ┌────────┐                      │
+│  │ Orders  │    │Payment │  │ Notif  │                      │
+│  │ Service │    │Service │  │ Service│                      │
+│  └────────┘    └────────┘  └────────┘                      │
+│                                                             │
+│  Pros: Idempotency is transparent to services               │
+│  Cons: Gateway becomes a bottleneck                         │
+│  Cons: Gateway must store responses for all services        │
+└─────────────────────────────────────────────────────────┘`} />
+
+The API gateway pattern is simple: if a duplicate request is detected, the gateway returns the cached response without forwarding the request to the backend service. This reduces load on backend services and provides centralized idempotency management.
+
+The drawback is that the gateway must understand the response format for every downstream service. If the response format changes in a service, the gateway must be updated.
+
+### Service-Level Pattern
+
+Each service manages its own idempotency store. The service validates the key, checks its store, processes the request, and stores the result.
+
+<AsciiDiagram
+  id="idempotency/architecture-service"
+  title="Service-Level Integration Pattern"
+  alt="Architecture diagram showing each service with its own idempotency store and the choreography between services for idempotent request processing"
+  caption="Service-Level Integration Pattern"
+  content={`┌─────────────────────────────────────────────────────────┐
+│            Service-Level Integration Pattern                 │
+│                                                             │
+│  ┌──────────────────────────────────────┐                   │
+│  │         Order Service                │                   │
+│  │                                      │                   │
+│  │  ┌────────────┐  ┌──────────────┐   │                   │
+│  │  │ Business   │  │ Idempotency  │   │                   │
+│  │  │ Logic      │  │ Store        │   │                   │
+│  │  └────────────┘  └──────────────┘   │                   │
+│  └──────────────────────────────────────┘                   │
+│             │                                                │
+│             │  POST /payments (Idempotency-Key: X)          │
+│             ▼                                                │
+│  ┌──────────────────────────────────────┐                   │
+│  │         Payment Service              │                   │
+│  │                                      │                   │
+│  │  ┌────────────┐  ┌──────────────┐   │                   │
+│  │  │ Business   │  │ Idempotency  │   │                   │
+│  │  │ Logic      │  │ Store        │   │                   │
+│  │  └────────────┘  └──────────────┘   │                   │
+│  └──────────────────────────────────────┘                   │
+│                                                             │
+│  Pros: Services are independent                             │
+│  Pros: Each service can choose its own TTL and backend      │
+│  Cons: Duplicate keys across services are not coordinated   │
+│  Cons: Each service requires infrastructure for store       │
+└─────────────────────────────────────────────────────────┘`} />
+
+The service-level pattern gives each service autonomy. The order service might use a 24-hour TTL with Redis, while the notification service might use a 1-hour TTL with a simpler in-memory store. Services can be deployed independently and fail independently.
+
+The challenge is coordination across services. If the order service processes a request and calls the payment service with the same idempotency key, both services must coordinate to ensure exactly-once processing across the entire request chain.
+
+### Database-Level Pattern
+
+The database itself provides idempotency through unique constraints, conditional inserts, and transactional guarantees.
+
+```sql
+-- Create an idempotency table
+CREATE TABLE idempotency_keys (
+    key_hash VARCHAR(64) PRIMARY KEY,
+    response_status INTEGER NOT NULL,
+    response_body TEXT NOT NULL,
+    response_headers JSONB,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMP NOT NULL
+);
+
+-- Create an index on expires_at for efficient cleanup
+CREATE INDEX idx_idempotency_expires ON idempotency_keys(expires_at);
+
+-- Conditional insert (PostgreSQL)
+INSERT INTO idempotency_keys (key_hash, response_status, response_body, expires_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (key_hash) DO NOTHING
+RETURNING *;
+```
+
+If the INSERT returns a row, the key was new and the request should be processed. If the INSERT returns no row, the key already exists and the cached response should be returned.
+
+The database-level pattern is the most robust because it inherits the database's consistency guarantees. However, it adds load to the primary database and may require schema changes.
+
+---
+
+## Multi-Region Architecture
+
+When your system spans multiple geographic regions, the idempotency store must be globally consistent or use conflict-free replicated data types (CRDTs) to handle concurrent writes across regions.
+
+<AsciiDiagram
+  id="idempotency/architecture-multi-region"
+  title="Multi-Region Idempotency Architecture"
+  alt="Architecture diagram showing three regions (US, EU, ASIA) each with their own idempotency store, synchronized via CRDT-based replication with an arbiter for conflict resolution"
+  caption="Multi-Region Idempotency Architecture"
+  content={`┌─────────────────────────────────────────────────────────┐
+│            Multi-Region Idempotency Architecture            │
+│                                                             │
+│  ┌────────────────────┐  ┌────────────────────┐            │
+│  │     US Region      │  │     EU Region      │            │
+│  │                    │  │                    │            │
+│  │  ┌──────────────┐  │  │  ┌──────────────┐  │            │
+│  │  │ App Servers  │  │  │  │ App Servers  │  │            │
+│  │  └──────┬───────┘  │  │  └──────┬───────┘  │            │
+│  │         │          │  │         │          │            │
+│  │  ┌──────▼───────┐  │  │  ┌──────▼───────┐  │            │
+│  │  │ Idempotency  │  │  │  │ Idempotency  │  │            │
+│  │  │ Store (US)   │  │  │  │ Store (EU)   │  │            │
+│  │  └──────┬───────┘  │  │  └──────┬───────┘  │            │
+│  └─────────┼──────────┘  └─────────┼──────────┘            │
+│            │                       │                        │
+│            └───────────┬───────────┘                        │
+│                        ▼                                    │
+│             ┌──────────────────────┐                        │
+│             │   CRDT Replication   │                        │
+│             │                      │                        │
+│             │  ┌────────────────┐  │                        │
+│             │  │ Arbiter (AU)   │  │                        │
+│             │  │ Conflict Res.  │  │                        │
+│             │  └────────────────┘  │                        │
+│             └──────────────────────┘                        │
+│                                                             │
+│  Strategy: Write to local store, replicate async to others  │
+│  Conflict resolution: Last-writer-wins with timestamp       │
+│  Or: Use region-prefixed keys to avoid conflicts            │
+│  Consistency: Eventual across regions, strong within region  │
+└─────────────────────────────────────────────────────────┘`} />
+
+Multi-region idempotency has three main strategies:
+
+### Strategy 1: Global Store with Latency Cost
+
+A single idempotency store is deployed in one region. All regions route their idempotency checks to this store. This provides strong consistency but adds cross-region latency of 50-200 milliseconds per check.
+
+This strategy works when idempotency operations are a small fraction of total traffic. The cross-region latency is acceptable if the business operation itself takes hundreds of milliseconds.
+
+### Strategy 2: Regional Store with Cross-Region Coordination
+
+Each region has its own idempotency store. The stores replicate asynchronously. When a duplicate request arrives in a different region than the original, the local store does not have the key, and the request is processed again.
+
+This strategy is acceptable when the window for duplicates across regions is short. For example, if a user typically retries within 5 seconds, and cross-region replication takes 2 seconds, only a small number of duplicates escape.
+
+### Strategy 3: CRDT-Based Idempotency Store
+
+Each region has an independent idempotency store that uses CRDTs to merge state without conflict. An idempotency key in a CRDT store is set-once: once a key is written, it cannot be overwritten. Merges across regions preserve this invariant.
+
+The CRDT approach provides the best availability: each region can process requests without waiting for cross-region coordination. The trade-off is complexity: implementing CRDTs correctly is difficult.
+
+---
+
+## Capacity Planning
+
+Capacity planning for an idempotency system requires estimating storage, throughput, and network requirements.
+
+### Storage Calculation
+
+The storage required for idempotency keys depends on four variables:
+
+1. R = Requests per day (for example, 10,000,000)
+2. S = Average record size in bytes (for example, 512)
+3. T = Idempotency window TTL in seconds (for example, 86,400 = 24 hours)
+4. D = Number of days of TTL (for example, 1)
+
+Steady-state storage = R x S x D
+
+```python
+def calculate_storage(rps, record_size_bytes, ttl_hours):
+    requests_per_day = rps * 60 * 60 * 24
+    storage_gb = requests_per_day * record_size_bytes / (1024**3)
+    storage_gb *= ttl_hours / 24
+    return storage_gb
+
+# For 10M requests/day, 512 byte records, 24h TTL
+print(calculate_storage(115, 512, 24))  # ~5.12 GB
+
+# For 100M requests/day, 512 byte records, 24h TTL
+print(calculate_storage(1157, 512, 24))  # ~51.2 GB
+
+# For 100M requests/day, 512 byte records, 7 day TTL
+print(calculate_storage(1157, 512, 24 * 7))  # ~358.4 GB
+```
+
+### Throughput Calculation
+
+The throughput required for the idempotency store is approximately 2x the request rate (one read + one write per request, plus reads for duplicates).
+
+```python
+def calculate_throughput(rps, retry_rate=0.01):
+    # Each new request: 1 read + 1 write
+    new_requests = rps * (1 - retry_rate)
+    # Each duplicate: 1 read
+    duplicates = rps * retry_rate
+    # Total operations
+    total_ops = new_requests * 2 + duplicates
+    return total_ops
+
+# For 115 rps (10M/day) with 1% retry rate
+print(calculate_throughput(115))  # ~228.85 ops/second
+
+# For 1157 rps (100M/day) with 1% retry rate
+print(calculate_throughput(1157))  # ~2302.43 ops/second
+```
+
+These throughput requirements are modest. A single Redis instance can handle 100,000 operations per second. Three Redis instances provide 300,000 operations per second, enough for 150M requests per day.
+
+### Network Bandwidth
+
+Network bandwidth depends on the record size and throughput. For 1157 requests per second with 512-byte records:
+
+- Write bandwidth: 1157 x 512 = 592 KB/s
+- Read bandwidth: 2302 x 512 = 1.18 MB/s
+- Total: ~1.77 MB/s
+
+Network bandwidth is rarely a bottleneck for idempotency systems.
+
+---
+
+## Operations
+
+Operating an idempotency system requires monitoring, alerting, and troubleshooting procedures.
+
+### Monitoring
+
+Monitor these metrics for the idempotency store:
+
+- **Duplicate rate**: Percentage of requests identified as duplicates. A sudden drop in duplicate rate might indicate that the idempotency store is losing keys.
+- **Store latency**: P50, P99, and P999 latency for get and set operations.
+- **Store size**: Current number of keys and total storage used.
+- **Eviction rate**: Rate at which keys are evicted due to memory pressure.
+- **Lock contention**: Number of lock acquisition failures per second.
+
+Connect these metrics to alerts. A P99 latency spike above 50 milliseconds should trigger an investigation. A duplicate rate drop of more than 50% within 5 minutes should trigger a page.
+
+### Troubleshooting
+
+Common issues and their resolutions:
+
+1. **Duplicate requests are being processed twice**: Check if the idempotency store is accessible. Check if the SET NX command returns the expected result. Check for network partitions between the application server and the store.
+
+2. **Idempotency store is out of memory**: Increase the memory allocation, reduce the TTL, or reduce the stored response size. Implement a memory-eviction policy like allkeys-lru.
+
+3. **Latency spikes on the store**: Check for hot keys (keys that are accessed frequently). Check for slow queries or commands. Check the network latency between application servers and the store.
+
+4. **Cross-region duplicates**: Check the replication lag between regions. Check if the idempotency window is aligned with the replication lag. Consider reducing the TTL or implementing a regional prefix.
+
+---
+
+## Summary
+
+The naive approach to idempotency (client-side deduplication) fails at scale due to client crashes, multiple clients, network retries, server-side retries, and load balancer routing. A production architecture uses a distributed idempotency store with atomic check-and-set operations. Integration patterns include API gateway, service-level, and database-level approaches. Multi-region architectures require global stores, regional coordination, or CRDT-based conflict resolution. Capacity planning for storage, throughput, and network bandwidth shows that idempotency systems have modest resource requirements.
+
+In the next section, you will analyze the trade-offs in idempotency system design, including the core tension between consistency and availability in distributed idempotency stores.

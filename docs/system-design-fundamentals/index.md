@@ -75,5 +75,7 @@ Each topic is structured as a guided learning path:
 | [Consistent Hashing](consistent-hashing) | The hashing technique that makes Dynamo, Cassandra, and Discord scale |
 | [Distributed Counters](distributed-counters) | Counting anything accurately across thousands of machines |
 | [Distributed IDs](distributed-ids) | Generating unique identifiers at scale — UUIDs, Snowflake, and beyond |
+| [Vector Clocks](vector-clocks) | Tracking causal relationships between events without synchronized clocks |
+| [PACELC](pacelc) | Extending CAP Theorem — trade-offs during both partitions and normal operation |
 
 Let's begin.

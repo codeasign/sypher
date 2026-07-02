@@ -1,0 +1,318 @@
+---
+id: raft-architecture
+title: Raft at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## From Naive Implementation to Production System
+
+A textbook Raft implementation works correctly on a single machine with simulated network delays. The production architecture requires significant engineering beyond the core algorithm.
+
+### The Naive Approach
+
+A minimal Raft implementation places every component on a single process per node: the state machine (key-value store), the Raft consensus module, the log storage, the RPC handlers, and the application API server. This approach works for small clusters (3-5 nodes) with low throughput (under 1,000 ops/sec). It fails at scale because:
+
+- The API server competes with Raft RPCs for CPU and network bandwidth
+- A single fsync thread blocks both log writes and snapshot operations
+- The leader's network stack becomes a bottleneck under high throughput
+- No isolation between the Raft-critical path and application-level processing
+
+### Production Architecture (etcd / ZooKeeper Style)
+
+Production Raft systems like etcd use a layered architecture that separates concerns and enables scaling.
+
+<AsciiDiagram
+  id="raft/architecture-production-layers"
+  alt="Layered architecture of a production Raft node showing transport layer, Raft consensus module, MVCC backend, state machine, and client API"
+  caption="Production Raft node architecture with layered components"
+  content={`
+┌────────────────────────────────────────────────────────────────┐
+│                   Production Raft Node                           │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │           Client API Layer (gRPC/HTTP)                │       │
+│  │   Range   │   Put   │   Delete   │   Watch   │   Txn  │       │
+│  └───────────┴─────────┴────────────┴──────────┴────────┘       │
+│                          │                                       │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │           Application Logic / Validation              │       │
+│  │   Auth   │   Quota   │   Request Serialization        │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                          │                                       │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │           Raft Consensus Module                       │       │
+│  │  ┌────────────┐  ┌──────────┐  ┌─────────────────┐  │       │
+│  │  │  Leader    │  │  Voter   │  │  Log Replicator │  │       │
+│  │  │  Election  │  │  Logic   │  │  (batcher)      │  │       │
+│  │  └────────────┘  └──────────┘  └─────────────────┘  │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                          │                                       │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │           MVCC / Backend Layer                        │       │
+│  │  ┌────────────────────┐  ┌────────────────────────┐   │       │
+│  │  │  B-tree Index      │  │  Write-Ahead Log (WAL) │   │       │
+│  │  └────────────────────┘  └────────────────────────┘   │       │
+│  │  ┌────────────────────┐  ┌────────────────────────┐   │       │
+│  │  │  Memory Table      │  │  SSTable / Snapshot    │   │       │
+│  │  └────────────────────┘  └────────────────────────┘   │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                          │                                       │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │           Transport Layer (Raft RPCs)                  │       │
+│  │   gRPC Streaming   │   TLS Termination   │   Mux     │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                          │                                       │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │           Disk / Storage Layer                        │       │
+│  │   SSD (NVMe)   │   WAL Pre-Allocation   │   O_DIRECT │       │
+│  └──────────────────────────────────────────────────────┘       │
+└────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+**Transport layer:** Production Raft systems use gRPC streaming for Raft RPCs. This enables pipelining and reduces connection overhead. TLS termination is handled at this layer. Request multiplexing combines Raft RPCs and client API calls over the same connection.
+
+**Consensus module:** Implements leader election, log replication, and safety checks. The log replicator uses a batcher that groups entries into configurable-sized batches. The voter logic handles RequestVote and pre-vote requests.
+
+**MVCC backend:** Instead of a simple state machine, production systems use multi-version concurrency control (MVCC). Each read sees a consistent snapshot of the state machine. This enables reads to proceed without blocking writes.
+
+**Client API layer:** Handles client connections, authentication, and request routing. The API layer forwards writes to the Raft leader and can serve reads locally using read-index optimization.
+
+## Multi-Raft Sharding
+
+A single Raft group cannot scale beyond approximately 10,000-30,000 writes per second because all writes go through a single leader node. Multi-Raft sharding solves this by partitioning the key space into multiple ranges, each managed by its own Raft group.
+
+CockroachDB popularized this architecture. The key space is divided into contiguous ranges (default 64 MB each). Each range operates as an independent Raft group with its own leader and follower replicas. Ranges are automatically rebalanced across nodes to distribute load evenly.
+
+<AsciiDiagram
+  id="raft/architecture-multi-raft-sharding"
+  alt="Multi-Raft architecture showing key space divided into ranges, each range replicated across three nodes as its own Raft group"
+  caption="Multi-Raft sharding — each data range is its own Raft group"
+  content={`
+                    Key Space
+┌──────┬──────┬──────┬──────┬──────┬──────┐
+│  0-  │ 16-  │ 32-  │ 48-  │ 64-  │ 80-  │
+│  15  │ 31   │ 47   │ 63   │ 79   │ 95   │
+└──┬───┴──┬───┴──┬───┴──┬───┴──┬───┴──┬───┘
+   │      │      │      │      │      │
+   ▼      ▼      ▼      ▼      ▼      ▼
+┌────────────────────────────────────────────────────┐
+│              Raft Group for Range 0-15              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐          │
+│  │  Leader  │  │ Follower │  │ Follower │          │
+│  │  Node 1  │  │  Node 2  │  │  Node 3  │          │
+│  └──────────┘  └──────────┘  └──────────┘          │
+└────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│              Raft Group for Range 16-31             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐          │
+│  │  Node 2  │  │  Node 3  │  │  Node 4  │          │
+│  │ (Leader) │  │(Follower)│  │(Follower)│          │
+│  └──────────┘  └──────────┘  └──────────┘          │
+└────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│              Raft Group for Range 32-47             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐          │
+│  │  Node 3  │  │  Node 4  │  │  Node 5  │          │
+│  │ (Leader) │  │(Follower)│  │(Follower)│          │
+│  └──────────┘  └──────────┘  └──────────┘          │
+└────────────────────────────────────────────────────┘
+
+Node 1 hosts: Range 0-15 (Leader)
+Node 2 hosts: Range 0-15 (Follower), Range 16-31 (Leader)
+Node 3 hosts: Range 0-15 (Follower), Range 16-31 (Follower), Range 32-47 (Leader)
+Node 4 hosts: Range 16-31 (Follower), Range 32-47 (Follower)
+Node 5 hosts: Range 32-47 (Follower)
+`}
+/>
+
+### Raft Store per Node
+
+In a multi-Raft system, each node hosts a Raft store that manages all Raft groups on that node. The store provides:
+
+- A shared log storage pool (write-ahead log file that interleaves entries for all groups)
+- A shared snapshot scheduler
+- Per-group state tracking (commit index, last applied, current term)
+- A shared transport for Raft RPCs
+
+The store uses a **shared-nothing** approach for CPU: each Raft group runs on its own goroutine or thread, but the storage layer serializes writes to batch fsyncs across groups. This reduces the per-group fsync cost significantly.
+
+## Integration with Databases and Caches
+
+Raft is most commonly embedded in databases and coordination services.
+
+### Embedded Raft in Databases
+
+**etcd:** A key-value store that uses Raft for both consensus and replication. It serves as Kubernetes' primary datastore. etcd's Raft implementation logs every operation through the consensus layer. Writes achieve linearizability, and reads can be served with linearizable semantics using the read-index optimization.
+
+**TiDB:** A distributed SQL database that uses Raft for consensus within each region (a shard of data). TiDB's Raft implementation includes a significant optimization: the Raft log is the same as the database's write-ahead log, eliminating redundant writes. This reduces write amplification from 2x to nearly 1x.
+
+**CockroachDB:** Uses multi-Raft with per-range Raft groups. The Raft log is stored in a separate RocksDB instance per node. CockroachDB implements a "parallel commits" optimization that reduces write latency from two Raft rounds to one for non-conflicting transactions.
+
+<AsciiDiagram
+  id="raft/architecture-db-integration"
+  alt="How Raft integrates into a distributed SQL database showing the write path through Raft consensus into the storage engine"
+  caption="Raft integration in a distributed SQL database (TiDB/CockroachDB pattern)"
+  content={`
+Client Request (SQL INSERT)
+         │
+         ▼
+┌─────────────────┐
+│  SQL Layer       │  ── Parse, plan, optimize
+│  (Query Engine)  │
+└────────┬────────┘
+         │  row mutation
+         ▼
+┌─────────────────┐
+│  Transaction     │  ── Begin, commit coordinator
+│  Coordinator     │
+└────────┬────────┘
+         │  key-value pair
+         ▼
+┌──────────────────────────────────────┐
+│  Raft Consensus Module                │
+│                                      │
+│  ┌────┐  ┌────┐  ┌────┐  ┌────┐    │
+│  │ T1 │  │ T2 │  │ T3 │  │ T4 │    │  Raft log entries
+│  └────┘  └────┘  └────┘  └────┘    │       │
+│                                      │       │
+│  Raft log == WAL (write-ahead log)   │<──────┘
+│  Disk: sequential append to WAL      │
+└──────────────────────────────────────┘
+         │  apply committed entry
+         ▼
+┌─────────────────┐
+│  Storage Engine  │  ── RocksDB / Pebble / InnoDB
+│  (LSM-Tree or    │
+│   B-Tree)        │
+└─────────────────┘
+         │
+         ▼
+     Disk: SSTable files / B-Tree pages
+`}
+/>
+
+### Integration with Caches
+
+Raft is used in distributed caching systems to maintain a consistent configuration store. For example, Redis Sentinel uses a Raft-like protocol for leader election, and some Redis Cluster deployments embed Raft for configuration consensus.
+
+The key insight is that Raft is not used for cache data replication (which uses more efficient async replication) but for metadata consensus: who is the primary, what nodes are in the cluster, what is the shard layout.
+
+## Multi-Region Raft
+
+Operating Raft across multiple geographic regions introduces significant latency and failure mode challenges.
+
+**Latency challenge:** A write in a US-East to US-West deployment requires one RTT for replication. At 60-80ms round trip, a single write takes 60-80ms minimum. This is acceptable for configuration data but not for high-throughput transactional workloads.
+
+**Failure isolation:** A region-wide outage must not bring down the entire cluster. The typical deployment is 5 nodes spread across 3 regions: 2 in region A, 2 in region B, 1 in region C. Any single region can fail and the cluster continues (quorum remains in the other regions).
+
+**Witness nodes:** To reduce cross-region replication cost, witness nodes (non-voting) can be placed in regions that need read locality but do not need to participate in quorum. These nodes receive the replicated log asynchronously.
+
+<AsciiDiagram
+  id="raft/architecture-multi-region"
+  alt="Five-node Raft cluster spread across three regions with 2 nodes in us-east, 2 in us-west, and 1 in eu-west, showing quorum crossing regions"
+  caption="Multi-region Raft deployment — quorum spans regions for fault tolerance"
+  content={`
+                  us-east (primary)         us-west          eu-west
+                  ┌──────────────┐    ┌──────────────┐    ┌────────┐
+                  │  Node 1      │    │  Node 3      │    │ Node 5 │
+                  │  Raft Leader │    │  Follower    │    │Witness│
+                  │              │    │              │    │(async) │
+                  │  Node 2      │    │  Node 4      │    │        │
+                  │  Follower    │    │  Follower    │    └────────┘
+                  └──────────────┘    └──────────────┘
+
+Latency: us-east to us-west = 60ms RTT
+         us-east to eu-west = 90ms RTT
+         us-west to eu-west = 150ms RTT
+
+Write path:
+1. Client in us-east sends write to Leader (Node 1)    0ms
+2. Leader appends to local log + fsync                  2ms
+3. Leader sends AppendEntries to Nodes 2,3,4           62ms (us-west)
+4. Nodes 2 (local) and 3 (us-west) ack                 62ms
+5. Majority reached (Leader + Node 2 + Node 3)         62ms
+6. Commit + respond to client                          62ms
+
+Read path (optimized):
+1. Client sends read to Leader                        0ms
+2. Leader confirms leadership (no partition)           0ms
+3. Leader reads from state machine                     1ms
+4. Response to client                                  1ms
+`}
+/>
+
+## Capacity Planning
+
+Estimating resources for a Raft-based system requires modeling the write path carefully.
+
+**Write cost model:** Each write requires one fsync on the leader and one fsync on a majority of followers. For a 3-node cluster with 10,000 writes/sec:
+- Each node performs approximately 6,700 fsyncs/sec (leader: 10,000, each follower contributes to majority roughly 3,350)
+- Total write bandwidth: 10,000 entries * average entry size (e.g., 200 bytes) = 2 MB/sec per node
+
+**Memory per node:** Each node maintains the full log in memory until compaction. For 100,000 entries at 200 bytes each: 20 MB for entries plus metadata overhead (term, index checksums) adds approximately 10-20% more.
+
+**Snapshot cost:** Creating a snapshot of a 10 GB state machine takes 1-30 seconds depending on implementation (copy-on-write snapshots are faster but use more memory). During snapshot, the write throughput is typically reduced by 20-50%.
+
+**Network bandwidth:** Each write generates N-1 AppendEntries RPCs (one per follower). With 3 nodes and 10,000 writes/sec: 20,000 outbound RPCs/sec from the leader, each containing the batch of entries plus metadata.
+
+## Operations
+
+Operating production Raft systems requires specific monitoring and maintenance practices.
+
+**Monitoring:** Critical metrics include:
+- Election rate (should be near zero after initial stabilization)
+- Term changes (unexpected term increments indicate leader instability)
+- Log lag per follower (divergence indicates a slow or failing follower)
+- Snapshot duration (long snapshots block log compaction)
+- Commit latency (p50 and p99)
+- RPC failure rate (network issues)
+
+**Member changes:** Adding or removing nodes requires joint consensus or a configuration change entry. The procedure is:
+1. Propose the new configuration to the Raft cluster as a log entry
+2. Once committed, the new configuration takes effect
+3. Data transfer (for replaced nodes) proceeds through normal log replication
+
+**Disaster recovery:** If a majority of nodes is lost permanently (e.g., entire data center destroyed), the cluster is unavailable. Recovery requires:
+1. Identify the surviving node with the most up-to-date log
+2. Force that node to become leader (skip election safety checks)
+3. Add replacement nodes through the membership change mechanism
+4. Accept the loss of any entries committed on the lost majority nodes
+
+<AsciiDiagram
+  id="raft/architecture-membership-change"
+  alt="Sequence of membership change showing old configuration, joint consensus phase, and new configuration"
+  caption="Safe membership change procedure in Raft"
+  content={`
+Step 1: Propose new config (add Node 6)
+┌──────────────────────────────────────────────┐
+│  Old config: [1,2,3,4,5]                     │
+│  Leader proposes: C_old_new = [1,2,3,4,5,6]  │
+│  Joint consensus: quorum = majority(5) AND   │
+│                    majority(6)                │
+└──────────────────────────────────────────────┘
+
+Step 2: Commit joint consensus
+┌──────────────────────────────────────────────┐
+│  Leader replicates C_old_new to C_old quorum  │
+│  AND C_new quorum (needs 3/5 AND 4/6)        │
+│  Once committed, both configs are active     │
+└──────────────────────────────────────────────┘
+
+Step 3: Propose new config only
+┌──────────────────────────────────────────────┐
+│  Leader proposes: C_new = [1,2,3,4,5,6]      │
+│  Quorum = 4/6                                │
+│  Once committed, old config is discarded     │
+└──────────────────────────────────────────────┘
+
+Step 4: Normal operation with 6 nodes
+┌──────────────────────────────────────────────┐
+│  All operations use C_new                    │
+│  Node 6 receives full log replication        │
+└──────────────────────────────────────────────┘
+`}
+/>

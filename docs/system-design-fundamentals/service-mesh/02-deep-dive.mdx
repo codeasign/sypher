@@ -1,0 +1,1030 @@
+---
+id: service-mesh-deep-dive
+title: Deep Dive
+position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+The service mesh relies on two interacting planes: the data plane (sidecar proxies) that processes every request, and the control plane (management components) that configures the data plane. This section examines the internal architecture of both planes, the data structures they maintain, the request lifecycle in detail, consistency and state management, performance characteristics, and configuration mechanisms.
+
+---
+
+## Sidecar Proxy Internals
+
+A sidecar proxy like Envoy is built from several internal subsystems that work together to handle every request.
+
+<AsciiDiagram
+  id="service-mesh/deep-dive-sidecar-internals"
+  title="Sidecar Proxy Internal Architecture"
+  alt="Internal subsystems of a sidecar proxy showing listeners, filters, router, clusters, and health checking components"
+  caption="Envoy's internal architecture showing the major subsystems that process each request"
+>
+{`
+┌──────────────────────────────────────────────────────┐
+│              Sidecar Proxy (Envoy)                    │
+│                                                       │
+│  ┌────────────────────────────────────────────────┐ │
+│  │              Listener Manager                   │ │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────────┐ │ │
+│  │  │L1 :8080  │  │L2 :8443  │  │L3 :15001     │ │ │
+│  │  │HTTP      │  │HTTPS     │  │DNS/TCP       │ │ │
+│  │  └────┬─────┘  └────┬─────┘  └──────┬───────┘ │ │
+│  └───────┼─────────────┼───────────────┼───────────┘ │
+│          ▼             ▼               ▼              │
+│  ┌────────────────────────────────────────────────┐ │
+│  │            Filter Chain                         │ │
+│  │  ┌──────────┐ ┌──────────┐ ┌────────────────┐ │ │
+│  │  │HTTP      │ │CORS/RBAC│ │Fault Injection │ │ │
+│  │  │Decoder   │ │Filter    │ │Filter          │ │ │
+│  │  └────┬─────┘ └────┬─────┘ └───────┬────────┘ │ │
+│  │       ▼             ▼               ▼           │ │
+│  │  ┌──────────────────────────────────────────┐ │ │
+│  │  │           Router (RDS)                    │ │ │
+│  │  │  Matches request to virtual host + route │ │ │
+│  │  └────────────────────┬─────────────────────┘ │ │
+│  └───────────────────────┼─────────────────────────┘ │
+│                          ▼                           │
+│  ┌────────────────────────────────────────────────┐ │
+│  │              Cluster Manager                    │ │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────────┐ │ │
+│  │  │ CB: svcA │  │ CB: svcB │  │CB: svcC      │ │ │
+│  │  │ LB: RR   │  │ LB: LRQ  │  │LB: CHash    │ │ │
+│  │  │ pool: 12 │  │ pool: 8  │  │pool: 5       │ │ │
+│  │  └────┬─────┘  └────┬─────┘  └──────┬───────┘ │ │
+│  └───────┼─────────────┼───────────────┼───────────┘ │
+│          ▼             ▼               ▼              │
+│  ┌────────────────────────────────────────────────┐ │
+│  │              Connection Pool                    │ │
+│  │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐         │ │
+│  │  │HTTP/2│ │HTTP/2│ │gRPC  │ │gRPC  │         │ │
+│  │  │to A1 │ │to A2 │ │to B1 │ │to B2 │         │ │
+│  │  └──────┘ └──────┘ └──────┘ └──────┘         │ │
+│  └────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Listener Manager
+
+The listener manager owns all network listeners. Each listener binds to a specific IP address and port. The main listeners are:
+
+- **Outbound listener** (port 15001): intercepts all outbound traffic from the application container. It applies iptables REDIRECT rules that route traffic destined for other services through the proxy.
+- **Inbound listener** (port 15006): handles inbound traffic arriving from other sidecar proxies. It applies inbound policy checks before forwarding to the local application.
+- **Admin listener** (port 15000): exposes administrative endpoints for health checking, configuration dumps, and statistics.
+
+Each listener has a set of filter chains that process incoming connections based on the protocol and destination port. The listener manager supports dynamic addition and removal of listeners via the Listener Discovery Service (LDS), which means you can add new listeners without restarting the proxy.
+
+Listener configuration includes:
+
+- **Bind address**: IP and port to listen on (0.0.0.0:15001 for outbound)
+- **Protocol**: HTTP/1.1, HTTP/2, gRPC, TCP, or TLS
+- **Connection buffer limits**: per-connection buffer sizes
+- **Socket options**: TCP keepalive, reuse port
+- **Filter chains**: ordered list of filter chain matchers
+
+### Filter Chain
+
+Filters process requests and responses. They are ordered in a chain, and each filter can modify, observe, or reject the request. Envoy supports two types of filters:
+
+**Read filters** (downstream to upstream):
+- HTTP decoder: parses HTTP/1.1, HTTP/2, or gRPC frames into a request object including headers, body, and trailers
+- CORS filter: validates cross-origin requests against allowed origins
+- RBAC filter: checks the source identity against Role-Based Access Control rules
+- Fault injection filter: deliberately introduces errors or latency for resiliency testing
+- Rate limit filter: enforces rate limits using global or local counters
+- Router filter: the terminal filter that performs route matching and forwarding
+
+**Write filters** (upstream to downstream):
+- Health check filter: intercepts health check requests and responds locally
+- Header manipulation filter: adds or removes headers on the response path
+
+Each filter has access to the connection state, request metadata, and dynamic metadata that can be shared between filters. Filters are configured in a chain, and the order determines the processing sequence.
+
+### Connection Pool
+
+Each upstream cluster maintains a connection pool. The pool manages TCP and HTTP/2 connections to backend instances. Key parameters:
+
+- **Max connections**: maximum number of TCP connections to each endpoint (default 1024)
+- **Max pending requests**: queue size when all connections reach max concurrent streams (default 1024)
+- **Max requests per connection**: maximum requests on a single HTTP/2 connection (default unlimited)
+- **Idle timeout**: how long an idle connection remains open before closing (default 1 hour)
+- **Connect timeout**: maximum time to establish a TCP connection (default 10s)
+- **Max lifetime**: maximum lifetime of a connection regardless of activity (default 24 hours)
+
+The connection pool implementation differs by protocol:
+
+- **HTTP/2 pool**: uses multiplexed streams over a single TCP connection. Multiple requests share the same connection. New connections are opened only when all existing connections reach their max concurrent stream limit.
+- **HTTP/1.1 pool**: opens separate TCP connections for each request (or uses connection keepalive). Each connection handles one request at a time.
+- **gRPC pool**: uses HTTP/2 semantics with long-lived streaming connections.
+
+---
+
+## Control Plane Components
+
+The control plane consists of several components that work together to configure the data plane.
+
+<AsciiDiagram
+  id="service-mesh/deep-dive-control-plane"
+  title="Control Plane Components and Data Flows"
+  alt="Control plane components showing Pilot, Citadel, Galley and their data flows to sidecar proxies"
+  caption="Istio control plane components and the xDS APIs they expose to sidecar proxies"
+>
+{`
+┌─────────────────────────────────────────────────────────┐
+│                    Control Plane                          │
+│                                                          │
+│  ┌──────────────────┐    ┌─────────────────────────┐    │
+│  │     Pilot         │    │        Citadel           │    │
+│  │  ┌──────────────┐│    │  ┌─────────────────────┐ │    │
+│  │  │Service       ││    │  │ Certificate Authority│ │    │
+│  │  │Discovery     ││    │  │ SPIFFE ID issuance   │ │    │
+│  │  │(K8s API/EDS) ││    │  │ mTLS cert generation │ │    │
+│  │  └──────────────┘│    │  │ Secret distribution   │ │    │
+│  │  ┌──────────────┐│    │  │ Auto-rotation (24h)  │ │    │
+│  │  │Traffic       ││    │  └───────────┬──────────┘ │    │
+│  │  │Management    ││    │              │ SDS         │    │
+│  │  │(RDS/virtual  ││    │              ▼             │    │
+│  │  │ services)    ││    │  ┌──────────────────────┐ │    │
+│  │  └──────────────┘│    │  │ Galley               │ │    │
+│  │  ┌──────────────┐│    │  │ Config ingestion     │ │    │
+│  │  │Config        ││    │  │ Validation webhook   │ │    │
+│  │  │Distribution  ││    │  │ Status reporting     │ │    │
+│  │  │(xDS to proxy)││    │  └──────────────────────┘ │    │
+│  │  └──────────────┘│    └────────────────────────────┘    │
+│  └────────┬─────────┘                                       │
+│           │                                                  │
+│           ▼                                                  │
+│  ┌──────────────────────────────────────────────────┐       │
+│  │  xDS API Aggregation                              │       │
+│  │  LDS │ RDS │ CDS │ EDS │ SDS │                    │       │
+│  └──────────────────────┬───────────────────────────┘       │
+└─────────────────────────┼───────────────────────────────────┘
+                          │
+                          ▼
+           Sidecar Proxies receive config via xDS
+`}
+</AsciiDiagram>
+
+### Pilot
+
+Pilot is the traffic management component. It performs three core functions:
+
+**Service Discovery Integration**: Pilot watches Kubernetes services and endpoints, Consul services, or static file configuration. It maintains an internal service registry that maps service names to endpoint IPs and ports. When a new pod is created or deleted, Pilot detects the change and updates the endpoint information.
+
+**Traffic Rule Translation**: Pilot converts high-level traffic management rules (VirtualService, DestinationRule in Istio) into Envoy-specific configuration. A VirtualService with weight-based routing becomes an Envoy route configuration with weighted clusters. A DestinationRule with connection pool settings becomes Envoy cluster configuration.
+
+**xDS API Serving**: Pilot exposes the xDS APIs that sidecar proxies poll to get their configuration. Each proxy connects to Pilot via gRPC streaming. The proxy sends an initial discovery request and receives incremental updates as configuration changes.
+
+Pilot's internal state machine:
+
+```
+Initial State -> Watch K8s API -> Build Registry -> Serve xDS
+                                                    |
+                    Watch CRDs -> Translate Rules ---+
+                                                    |
+                    Config Change -> Push Update ----+
+```
+
+### Citadel
+
+Citadel is the security component. It manages the service mesh identity and encryption infrastructure:
+
+**Certificate Authority**: Citadel acts as a CA that issues X.509 certificates to sidecar proxies. Each certificate includes a SPIFFE ID in the format `spiffe://cluster.local/ns/{namespace}/sa/{serviceaccount}`. This embeds the service identity directly into the certificate.
+
+**Certificate Rotation**: Citadel rotates certificates automatically. The default rotation period is 24 hours. Proxies request new certificates via the Secret Discovery Service (SDS) before the current certificate expires. The rotation happens without any application downtime.
+
+**Identity Management**: Citadel maps Kubernetes service accounts to SPIFFE identities. This allows fine-grained authorization policies based on service identity rather than network attributes like IP addresses.
+
+### Galley
+
+Galley is the configuration management component that acts as a validation and ingestion gateway:
+
+**Configuration Validation**: Galley validates all Istio CRDs before they are applied to the cluster. It performs schema validation, semantic validation (checking for conflicts between rules), and policy validation. It rejects invalid configurations with detailed error messages.
+
+**Configuration Transformation**: Galley converts between configuration formats. It can ingest configuration from multiple sources (files, CRDs, mesh config) and standardizes them for internal consumption.
+
+In modern Istio deployments (version 1.5+), Pilot, Citadel, and Galley are merged into a single binary called `istiod`. This simplifies deployment, reduces the number of components to manage, and improves reliability by eliminating inter-component communication.
+
+---
+
+## Data Structures
+
+### Routing Table
+
+The routing table maps request attributes to destination clusters. It is the primary data structure for traffic management in the sidecar proxy.
+
+<AsciiDiagram
+  id="service-mesh/deep-dive-routing-table"
+  title="Routing Table Data Structure"
+  alt="Routing table showing hierarchical structure from listeners to virtual hosts to routes to clusters to endpoints"
+  caption="The routing table is a hierarchical structure that maps listeners through virtual hosts and routes to endpoint clusters"
+>
+{`
+┌────────────────────────────────────────────────────────┐
+│              Routing Table Structure                     │
+│                                                         │
+│  Listener: 0.0.0.0:15001                                │
+│  └── VirtualHost: service-b.default.svc.cluster.local   │
+│      ├── Domains: ["service-b", "service-b:8080",       │
+│      │             "service-b.default.svc.cluster.local"]│
+│      └── Routes:                                        │
+│          ├── Route 1: match: prefix=/api/v1             │
+│          │   └── Cluster: service-b-v1 (weight: 90)     │
+│          │       ├── Endpoint: 10.0.1.5:8080 (healthy)  │
+│          │       ├── Endpoint: 10.0.1.6:8080 (healthy)  │
+│          │       └── Endpoint: 10.0.1.7:8080 (ejected)  │
+│          └── Route 2: match: prefix=/api/v2             │
+│              └── Cluster: service-b-v2 (weight: 10)     │
+│                  ├── Endpoint: 10.0.2.5:8080 (healthy)  │
+│                  └── Endpoint: 10.0.2.6:8080 (healthy)  │
+└────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+The routing table is stored in memory and updated dynamically via the Route Discovery Service (RDS). The hierarchical structure is:
+
+```
+Listener -> []VirtualHost -> []Route -> []WeightedCluster -> []Endpoint
+```
+
+Each level contains specific configuration:
+
+**Listener**:
+- Listen address and port
+- Protocol and transport socket configuration
+- Filter chain definitions
+- Connection buffer limits
+
+**VirtualHost**:
+- Domain names for matching (Host header)
+- Require TLS flag
+- Route configuration
+- Response headers to add or remove
+
+**Route**:
+- Match criteria (prefix, exact path, regex, headers, query params)
+- Timeout duration
+- Retry policy (retry count, retry-on conditions, retry budget)
+- Traffic mirroring configuration
+- Request mirroring percentage
+
+**Cluster**:
+- Endpoint list
+- Load balancing policy (round robin, least request, random, consistent hash)
+- Circuit breaker thresholds
+- Outlier detection configuration
+- Connection pool settings
+- Transport socket (TLS configuration)
+
+**Endpoint**:
+- IP address and port
+- Health status (healthy, unhealthy, draining, ejected)
+- Zone and region metadata
+- Weight for load balancing
+- Priority level
+
+### Connection Pool
+
+Each upstream cluster maintains a connection pool. The pool is keyed by endpoint (IP:port) and organized by protocol.
+
+The connection pool data structure:
+
+```
+Cluster: "service-b" {
+  connectionPoolConfig: {
+    maxConnections: 1024
+    maxPendingRequests: 1024
+    maxRequestsPerConnection: null
+    idleTimeout: 3600s
+    connectTimeout: 10s
+  }
+  
+  endpointPools: {
+    "10.0.1.5:8080": {
+      http2Connections: [conn1, conn2, conn3]
+      activeRequests: 12
+      pendingRequests: 0
+      maxConcurrentStreams: 100
+      totalStreamsCreated: 45
+      lastActivityTimestamp: 1719876543
+      currentConnectAttempts: 0
+      isConnecting: false
+      connectFailureCount: 0
+    }
+    "10.0.1.6:8080": {
+      http2Connections: [conn1, conn2]
+      activeRequests: 8
+      pendingRequests: 2
+      maxConcurrentStreams: 100
+      totalStreamsCreated: 30
+      lastActivityTimestamp: 1719876545
+      currentConnectAttempts: 1
+      isConnecting: true
+      connectFailureCount: 0
+    }
+  }
+}
+```
+
+The connection pool tracks:
+
+- **Active connections**: number of established TCP connections
+- **Active requests**: number of in-flight requests across all connections
+- **Pending requests**: requests waiting for an available stream
+- **Connecting state**: whether a connection attempt is in progress
+- **Connection failures**: count of failed connection attempts
+- **Bytes sent and received**: cumulative traffic metrics per endpoint
+
+### Circuit Breaker State
+
+The circuit breaker tracks failures per endpoint and per cluster. It prevents cascading failures by stopping traffic to unhealthy endpoints.
+
+```
+CircuitBreaker: {
+  cluster: "service-b"
+  config: {
+    consecutive5xxThreshold: 5
+    consecutiveGatewayFailureThreshold: 10
+    interval: 10s
+    baseEjectionTime: 30s
+    maxEjectionPercent: 50
+    enforcingConsecutive5xx: 100
+    enforcingConsecutiveGatewayFailure: 100
+    enforcingSuccessRate: 100
+    successRateMinimumHosts: 5
+    successRateRequestVolume: 100
+    successRateStdevFactor: 1.5
+  }
+  
+  globalState: {
+    isTripped: false
+    consecutiveErrors: 0
+    lastErrorTimestamp: 0
+    lastTransitionTimestamp: 0
+    currentState: "closed"
+  }
+  
+  endpointStates: {
+    "10.0.1.5:8080": {
+      consecutive5xx: 0
+      consecutiveGatewayFailures: 0
+      successRate: 99.5
+      isEjected: false
+      ejectionTimeRemaining: 0
+      lastEjectionTimestamp: null
+    }
+    "10.0.1.7:8080": {
+      consecutive5xx: 8
+      consecutiveGatewayFailures: 2
+      successRate: 85.0
+      isEjected: true
+      ejectionTimeRemaining: 18000
+      lastEjectionTimestamp: 1719876400
+    }
+  }
+}
+```
+
+The circuit breaker has three states:
+
+**Closed (normal operation)**:
+- All requests flow to the backend
+- Consecutive errors are counted with a sliding window
+- When the threshold is reached, the circuit transitions to open
+- The sliding window uses a configurable interval (default 10s)
+
+**Open (failure detected)**:
+- All requests fail fast without reaching the backend
+- The proxy returns a 503 response immediately
+- A timer starts for the cooldown period (baseEjectionTime)
+- The cooldown doubles for each subsequent ejection: 30s, 60s, 120s, up to 300s max
+- After the cooldown, the circuit transitions to half-open
+
+**Half-Open (probing for recovery)**:
+- A single test request is allowed through
+- If it succeeds, the circuit transitions to closed (full recovery)
+- If it fails, the circuit transitions back to open (extended cooldown)
+- The half-open state prevents thundering herd when recovering services
+
+The following diagram visualizes the circuit breaker as a finite state machine with three states and the transitions between them. Each state determines how the proxy handles incoming requests to the affected endpoint.
+
+<AsciiDiagram
+  id="service-mesh/deep-dive-circuit-breaker"
+  title="Circuit Breaker State Machine"
+  alt="State machine diagram showing the three circuit breaker states (Closed, Open, Half-Open) and the transitions between them based on error thresholds, cooldown timers, and probe results"
+  caption="The circuit breaker is a finite state machine that controls traffic flow to upstream endpoints"
+>
+{`
+┌─────────────────────────────────────────────────────────┐
+│              Circuit Breaker State Machine                │
+│                                                          │
+│                    ┌──────────────────┐                   │
+│                    │     CLOSED       │                   │
+│                    │  (normal flow)   │                   │
+│                    └────────┬─────────┘                   │
+│                             │                             │
+│                N errors in  │                             │
+│                sliding      │                             │
+│                window       │                             │
+│                             ▼                             │
+│                    ┌──────────────────┐                   │
+│                    │      OPEN        │                   │
+│                    │   (fail fast)    │                   │
+│                    └────────┬─────────┘                   │
+│                             │                             │
+│                    cooldown │                             │
+│                    timer    │                             │
+│                    expires  │                             │
+│                             ▼                             │
+│                    ┌──────────────────┐                   │
+│                    │   HALF-OPEN      │                   │
+│                    │  (probing)       │                   │
+│                    └────┬──────┬──────┘                   │
+│                         │      │                          │
+│                   probe │      │ probe                    │
+│                   succ. │      │ fails                    │
+│                         ▼      ▼                          │
+│                    ┌────────┐ ┌────────┐                  │
+│                    │ CLOSED │ │  OPEN  │                  │
+│                    │(recovered)│(re-trip)│                │
+│                    └────────┘ └────────┘                  │
+└─────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+---
+
+## Request Lifecycle (12+ Steps)
+
+<AsciiDiagram
+  id="service-mesh/deep-dive-request-lifecycle"
+  title="Complete Request Lifecycle Through the Mesh"
+  alt="Sequence of 12+ steps showing a request flowing from service A, through source sidecar, through destination sidecar, to service B and back"
+  caption="The full lifecycle of a single request through the service mesh"
+>
+{`
+┌──────┐     ┌──────────┐     ┌──────────┐     ┌──────┐
+│svc A │     │proxy A   │     │proxy B   │     │svc B │
+│      │     │(source)  │     │(dest)    │     │      │
+└──┬───┘     └────┬─────┘     └────┬─────┘     └──┬───┘
+   │              │                │               │
+   │ 1. connect() │                │               │
+   │─────────────>│                │               │
+   │              │ 2. iptables    │               │
+   │              │    redirect    │               │
+   │              │ 3. listener    │               │
+   │              │    match       │               │
+   │              │ 4. filter      │               │
+   │              │    chain       │               │
+   │              │ 5. route       │               │
+   │              │    lookup      │               │
+   │              │ 6. cluster     │               │
+   │              │    pick + LB   │               │
+   │              │ 7. CB check    │               │
+   │              │ 8. pool check  │               │
+   │              │ 9. DNS resolve │               │
+   │              │ 10. connect    │               │
+   │              │────────────────>               │
+   │              │                │               │
+   │              │                │ 11. mTLS      │
+   │              │                │    handshake  │
+   │              │                │<──────────────│
+   │              │ 12. send req   │               │
+   │              │────────────────>               │
+   │              │                │ 13. inbound   │
+   │              │                │    filter     │
+   │              │                │ 14. auth check│
+   │              │                │ 15. fwd to svc│
+   │              │                │──────────────>│
+   │              │                │               │
+   │              │                │<──────────────│
+   │              │<───────────────│ 16. response  │
+   │              │                │     back      │
+   │<─────────────│                │               │
+   │              │ 17. telemetry  │               │
+   │              │ 18. tracing    │               │
+   │              │ 19. access log │               │
+   │              │                │               │
+`}
+</AsciiDiagram>
+
+The detailed sequence of events for a single request through the mesh:
+
+### Step 1: Application Initiates Connection
+
+Service A opens a TCP connection to `service-b:8080`. The application uses standard DNS resolution. Kubernetes DNS resolves `service-b` to a cluster IP such as 10.96.0.10. The application code is unaware that a sidecar proxy exists.
+
+### Step 2: iptables Traffic Interception
+
+The sidecar's init container configured iptables rules in the pod's network namespace during pod startup. Outbound TCP traffic destined for non-local IPs on ports 80, 8080, 443, 8443, and 15000-15100 is redirected to the sidecar's outbound listener port (15001). Inbound traffic destined for the application port is redirected to the inbound listener port (15006).
+
+The iptables rules use the REDIRECT target for TCP:
+
+```
+iptables -t nat -A OUTPUT -p tcp --dport 8080 -j REDIRECT --to-port 15001
+iptables -t nat -A PREROUTING -p tcp --dport 8080 -j REDIRECT --to-port 15006
+```
+
+The rules exclude traffic from the sidecar itself to avoid infinite loops:
+
+```
+iptables -t nat -A OUTPUT -m owner --uid-owner 1337 -j RETURN
+```
+
+### Step 3: Listener Match
+
+The outbound listener on port 15001 accepts the redirected connection. The listener manager determines the protocol by inspecting the first bytes of the connection. For HTTP traffic, it reads the `Host` header to determine the virtual destination.
+
+The listener match process:
+
+1. Accept TCP connection
+2. Read initial bytes (ALPN for TLS, HTTP method for plaintext)
+3. Determine HTTP version (1.1 vs 2.0 via upgrade or prior knowledge)
+4. Parse initial headers to extract Host, path, and method
+5. Select the matching filter chain based on protocol and destination
+
+### Step 4: Filter Chain Processing (Outbound)
+
+The connection passes through the outbound filter chain. Each filter receives the request in order:
+
+**HTTP Decoder Filter**: Parses the raw HTTP bytes into a structured request object with headers, body (if available), and trailers. It validates HTTP protocol compliance.
+
+**CORS Filter**: If the request includes an Origin header, the CORS filter checks against the configured allowed origins. It adds the appropriate Access-Control-Allow-Origin headers.
+
+**RBAC Filter**: Checks if the source service identity is authorized to access the destination. The RBAC filter receives the source identity from the mTLS session (if established) or from peer metadata.
+
+**Fault Injection Filter**: If configured, this filter can introduce artificial delays or errors. For example, it may add 500ms of delay to 10% of requests or return a 500 error for 5% of requests. This is used exclusively for resiliency testing.
+
+**Rate Limit Filter**: Checks global or local rate limit counters. If the rate limit is exceeded, the filter returns a 429 Too Many Requests response.
+
+**Router Filter**: The terminal filter that performs the actual route matching and forwarding. It holds a reference to the routing table and load balancer.
+
+### Step 5: Route Lookup
+
+The router filter matches the request against the routing table. It iterates through virtual hosts and their routes in order and selects the first matching route.
+
+The matching logic:
+
+```
+for each virtualHost in listener.virtualHosts:
+    if request.host in virtualHost.domains:
+        for each route in virtualHost.routes:
+            if request matches route.match:
+                return route.cluster
+return default_route or 404
+```
+
+Route match criteria (evaluated in order within a route):
+
+- **Prefix**: `/api/v1/orders` matches `prefix: /api/v1/`
+- **Exact path**: `/health` matches `exact: /health`
+- **Regex**: `/users/[0-9]+/profile` matches regex pattern
+- **Headers**: match when `x-canary: true` header is present
+- **Query parameters**: match when `?version=v2` query string
+- **Methods**: match when HTTP method is GET, POST, etc.
+- **Authority**: match on the authority (Host header)
+
+### Step 6: Cluster Selection with Load Balancing
+
+The matched route specifies one or more weighted clusters. If multiple clusters are specified (for canary or blue-green), the proxy generates a random number to select the cluster based on weights.
+
+```
+Pseudo-random selection:
+  randInt = random(1..100)
+  cumulative = 0
+  for each cluster in route.clusters:
+    cumulative += cluster.weight
+    if randInt <= cumulative:
+      selectedCluster = cluster
+      break
+```
+
+After selecting a cluster, the proxy applies the load balancing algorithm:
+
+**Round Robin**: Selects the next healthy endpoint in sequence. Uses a simple counter modulo the number of healthy endpoints.
+
+**Least Request**: Selects the endpoint with the fewest active requests. This is the default algorithm in Envoy and provides better load distribution for variable-length requests.
+
+**Consistent Hash**: Selects an endpoint by hashing a request attribute (source IP, header value, cookie). This ensures requests from the same client always reach the same backend.
+
+**Random**: Selects a random healthy endpoint. Simple but can produce uneven load distributions.
+
+### Step 7: Circuit Breaker Check
+
+Before forwarding, the proxy checks the circuit breaker state:
+
+1. Is the circuit for this cluster open?
+   - Yes: Increment circuit breaker rejected counter, return 503 immediately
+   - No: Continue to Step 8
+2. Is this specific endpoint ejected?
+   - Yes: Try the next endpoint in the load balancing rotation
+   - No: Continue
+3. Have we reached max ejection percentage?
+   - Yes: Do not eject additional endpoints, but use them with hesitation
+
+The circuit breaker maintains a sliding window of consecutive errors. If the window contains more errors than the threshold within the configured interval, the circuit trips.
+
+### Step 8: Connection Pool Check
+
+The proxy checks the connection pool for the selected endpoint:
+
+1. Is there an idle HTTP/2 connection with available stream capacity?
+   - Yes: Reuse the existing connection
+   - No: Continue to check pool limits
+2. Are we at max connections?
+   - No: Open a new connection
+   - Yes: Can we queue (pending requests not at max)?
+     - Yes: Add request to pending queue
+     - No: Return 503 Service Unavailable
+
+HTTP/2 connections have a maximum concurrent stream limit (default 100). The proxy tracks active streams per connection and opens new connections when all existing connections reach their limit.
+
+### Step 9: DNS Resolution
+
+If the endpoint IP is not already cached, the proxy performs DNS resolution. Envoy uses c-ares for asynchronous DNS resolution:
+
+- **DNS cache TTL**: 5 seconds by default (configurable)
+- **Respect DNS TTL**: Can respect the DNS record's TTL or use a fixed refresh interval
+- **Multiple IPs**: Handles A records with multiple IPs, load balancing across them
+- **DNS resolution type**: Strict DNS (resolve each time) or logical DNS (resolve once)
+
+### Step 10: TCP Connection to Destination Sidecar
+
+The source proxy opens a TCP connection to the destination proxy's inbound listener. The destination address is the endpoint IP and port from the cluster.
+
+The connection establishment involves:
+
+1. Socket creation with configured socket options (TCP keepalive, buffer sizes)
+2. TCP three-way handshake to the destination IP:port
+3. TLS handshake (if mTLS is configured)
+4. HTTP/2 connection preface exchange
+5. Connection registered in the connection pool
+
+### Step 11: mTLS Handshake
+
+If mTLS is enabled (STRICT mode), the source proxy initiates a TLS handshake with the destination proxy:
+
+1. Source proxy presents its client certificate (issued by Citadel)
+2. Destination proxy verifies the certificate against the trusted CA bundle
+3. Destination proxy extracts the source SPIFFE ID from the certificate
+4. Destination proxy presents its server certificate
+5. Source proxy verifies the destination certificate
+6. Both sides negotiate TLS 1.3 cipher suites
+7. Encrypted tunnel established for the HTTP/2 connection
+
+The certificate includes the SPIFFE ID: `spiffe://cluster.local/ns/default/sa/service-a`. This identifies the service, namespace, and service account of the calling service.
+
+### Step 12: HTTP Request Transmission
+
+The source proxy sends the HTTP request over the mTLS-secured HTTP/2 connection. The request includes additional headers:
+
+- **x-request-id**: unique request identifier for tracing
+- **x-b3-traceid**: trace context for distributed tracing
+- **x-b3-spanid**: span identifier for this hop
+- **x-b3-parentspanid**: parent span for causal ordering
+- **x-envoy-decorator-operation**: operation name for the service graph
+
+### Step 13: Destination Sidecar Inbound Processing
+
+The destination proxy receives the request on its inbound listener (port 15006). It processes the request through the inbound filter chain:
+
+1. TLS termination (decrypt the mTLS connection)
+2. Extract source identity from the client certificate
+3. Parse HTTP request headers
+4. Apply inbound RBAC policies
+5. Check inbound rate limits
+6. Verify authorization rules (allowed paths, methods, headers)
+
+### Step 14: Authorization Check
+
+The destination proxy evaluates authorization policies:
+
+1. Is the source identity in the allowed list?
+2. Is the HTTP method allowed?
+3. Is the request path allowed?
+4. Are required headers present?
+5. Does the request match any deny policies?
+
+If any check fails, the proxy returns 403 Forbidden.
+
+### Step 15: Forward to Local Application
+
+The destination proxy strips the mTLS layer and forwards the HTTP request to the local application on `localhost:8080`. The connection is plain HTTP (the mTLS was terminated at the inbound listener).
+
+The forwarded request includes headers that provide transparency:
+- **x-envoy-peer-metadata**: JSON metadata about the source proxy
+- **x-envoy-peer-metadata-id**: identity of the source proxy
+
+### Step 16: Application Response
+
+Service B processes the request and returns an HTTP response. The response flows back through the destination proxy to the source proxy:
+
+1. Destination proxy receives the response from localhost
+2. Destination proxy re-encrypts the response (if mTLS requires it)
+3. Response travels over the mTLS connection back to the source proxy
+4. Source proxy decrypts the response
+5. Source proxy forwards the response to Service A
+
+### Step 17: Telemetry Collection
+
+The source proxy records metrics after the response is sent:
+
+- **Request duration**: measured from first byte sent to last byte received
+- **Response code**: categorized into 2xx, 3xx, 4xx, 5xx buckets
+- **Request size**: bytes sent in the request body
+- **Response size**: bytes received in the response body
+- **TCP RTT**: round-trip time of the TCP connection
+- **Active requests**: count of in-flight requests during this request
+
+These metrics are aggregated using histograms with configurable buckets (1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1000ms, 2500ms, 5000ms, 10000ms).
+
+### Step 18: Distributed Tracing Span Recording
+
+The source proxy records a distributed tracing span:
+
+```
+Span: {
+  traceId: "0af7651916cd43dd8448eb211c80319c"
+  spanId: "b7ad6b7169203331"
+  parentSpanId: "1032769f0f3c3a8c"
+  operationName: "service-a:service-b"
+  startTime: 1719876543123
+  duration: 45ms
+  tags: {
+    "http.method": "POST"
+    "http.url": "/api/v1/orders"
+    "http.status_code": "200"
+    "peer.service": "service-b"
+    "upstream_cluster": "service-b.default"
+  }
+}
+```
+
+### Step 19: Access Log Recording
+
+The proxy writes an access log entry:
+
+```
+[2026-07-02T10:45:12.345Z] "POST /api/v1/orders HTTP/1.1" 200
+  - "-" 0 450 45ms "-" "curl/7.68.0" "abcdef12-3456-7890-abcd-ef1234567890"
+  "service-a" "service-b" "10.0.1.5:8080"
+```
+
+The access log includes: timestamp, method, path, protocol, status code, response flags, body bytes sent, body bytes received, duration, user agent, request ID, source service, destination service, and upstream host.
+
+---
+
+## Consistency and State Management
+
+The service mesh is a distributed system where the control plane must maintain consistency across potentially thousands of proxies.
+
+<AsciiDiagram
+  id="service-mesh/deep-dive-consistency"
+  title="Consistency Model and State Propagation"
+  alt="Timeline showing control plane updates propagating to multiple sidecar proxies with eventual consistency"
+  caption="The service mesh uses an eventually consistent model where proxy state can temporarily diverge"
+>
+{`
+┌──────────────────────────────────────────────────────────────┐
+│  Time  │  Control Plane        │ Proxy A      │ Proxy B      │
+│────────┼───────────────────────┼──────────────┼─────────────│
+│  T0    │  Current config       │ Config v5    │ Config v5    │
+│  T1    │  User applies new     │              │              │
+│        │  VirtualService       │              │              │
+│  T2    │  Galley validates     │              │              │
+│        │  and stores config    │              │              │
+│  T3    │  Pilot detects change │              │              │
+│  T4    │  Pilot builds v6      │              │              │
+│        │  Envoy config         │              │              │
+│  T5    │  Pilot pushes to      │              │              │
+│        │  Proxy A (xDS push)   │              │              │
+│  T6    │                       │ Receives v6  │              │
+│  T7    │                       │ Applies:     │              │
+│        │                       │ new routes   │              │
+│  T8    │  Pilot pushes to      │              │              │
+│        │  Proxy B (xDS push)   │              │              │
+│  T9    │                       │ Routes v6    │ Receives v6 │
+│  T10   │                       │ active       │ Applies:    │
+│        │                       │              │ new routes  │
+│  T11   │                       │              │ Routes v6   │
+│        │                       │              │ active      │
+│                                                             │
+│  Window T1-T11: eventual consistency window                  │
+│  During this window, Proxy A follows old routes to          │
+│  Proxy B, which has already applied new routes.             │
+└──────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Consistency Model
+
+The service mesh uses an **eventual consistency model**:
+
+- **Strong consistency is not required**: Routing rules do not need to be applied simultaneously across all proxies. A brief period where proxies have different configurations is acceptable.
+
+- **Per-proxy state**: Each proxy maintains its own copy of configuration. The control plane pushes updates independently to each proxy.
+
+- **No distributed transactions**: The control plane does not use two-phase commit or distributed consensus for configuration updates.
+
+- **Stale configuration**: During an update window, some proxies may use old configuration while others use new configuration. This can cause transient routing mismatches.
+
+### State Management
+
+The control plane manages state through:
+
+**Push-based updates**: When configuration changes, the control plane pushes updates to all proxies via gRPC streaming. The push is asynchronous and non-blocking.
+
+**Pull-based fallback**: Proxies periodically poll the control plane (default 15s) as a fallback mechanism. This ensures proxies eventually receive updates even if push notifications are lost.
+
+**Incremental updates**: Only changed configuration is sent, not full snapshots. This reduces network bandwidth and proxy processing time.
+
+**Warming**: New proxies receive a full initial configuration snapshot before accepting traffic. This prevents them from making routing decisions with incomplete data.
+
+### Consistency Challenges
+
+**Race conditions between proxies**: Proxy A may start routing to a new cluster before Proxy B has configured that cluster's endpoints. This can cause initial request failures until Proxy B receives its update.
+
+**Stale endpoint information**: If a pod is deleted, some proxies may still have the old endpoint in their routing table. Requests to the deleted pod fail until the endpoint is removed from all proxies.
+
+**Configuration drift**: A proxy that is disconnected from the control plane (network partition) continues to use its last known configuration. When reconnected, it must catch up on all missed updates.
+
+---
+
+## Performance Characteristics
+
+### Latency Overhead
+
+Each proxy adds 1-2ms of latency per hop. For a request traversing 5 services (10 hops including response), the total overhead is 10-20ms.
+
+Latency breakdown per hop:
+
+| Component | Typical | P99 |
+|-----------|---------|-----|
+| TCP connection establishment | 0.5ms | 5ms |
+| TLS handshake (first request) | 1ms | 10ms |
+| Route lookup (cached) | 0.01ms | 0.1ms |
+| Load balancing | 0.001ms | 0.01ms |
+| Filter chain processing | 0.05ms | 0.5ms |
+| Connection pool lookup | 0.005ms | 0.05ms |
+| Metrics recording | 0.02ms | 0.2ms |
+| Total per hop (no mTLS) | 0.5-1ms | 5-10ms |
+| Total per hop (with mTLS) | 1-2ms | 10-20ms |
+
+### Resource Consumption
+
+Each sidecar proxy consumes CPU and memory proportional to the request rate and configuration size.
+
+**Memory**:
+- Base memory: 50-100 MB per proxy
+- Per 1000 routes: +10 MB
+- Per 1000 endpoints: +5 MB
+- Per-request memory: 4 KB per active request
+- Connection pool: 2 KB per pooled connection
+
+**CPU**:
+- Base CPU: 0.1 core per proxy
+- Per 1000 requests/second: +0.3 core
+- TLS operations: +20% CPU per request
+- gRPC streaming: +15% CPU per active stream
+
+### Optimization Techniques
+
+**Connection reuse**: HTTP/2 multiplexing reduces the number of TCP connections. 100 requests per second to the same service can share 2-3 connections instead of opening 100 separate connections.
+
+**TLS session resumption**: TLS session IDs and session tickets allow resuming TLS sessions without a full handshake. This reduces TLS overhead from 1ms to 0.1ms for subsequent requests.
+
+**Configuration caching**: The proxy caches computed configuration (routing decisions, load balancing state) to avoid recomputing for every request.
+
+**Batched metrics**: Metrics are aggregated in memory and flushed on a timer (default 60s) rather than emitted per request.
+
+---
+
+## Configuration Mechanisms
+
+<AsciiDiagram
+  id="service-mesh/deep-dive-config-mechanisms"
+  title="Configuration Flow from User to Proxy"
+  alt="Flow diagram showing configuration flowing from user CRDs through Galley, Pilot, xDS API to sidecar proxies"
+  caption="Configuration flows through multiple stages from user input to proxy execution"
+>
+{`
+┌───────────────────────────────────────────────────────┐
+│  Configuration Flow                                    │
+│                                                        │
+│  ┌──────────────┐                                      │
+│  │ User applies │  VirtualService, DestinationRule,    │
+│  │ CRD manifest │  ServiceEntry, Sidecar, PeerAuth     │
+│  └──────┬───────┘                                      │
+│         │ kubectl apply -f virt-svc.yaml               │
+│         ▼                                              │
+│  ┌──────────────────┐                                  │
+│  │ Galley validates │  Schema check, semantic check,   │
+│  │ and ingests      │  conflict detection              │
+│  └──────┬───────────┘                                  │
+│         │ accepted                                     │
+│         ▼                                              │
+│  ┌──────────────────┐                                  │
+│  │ Pilot translates │  CRD -> Envoy xDS config         │
+│  │ to xDS resources │  High-level -> low-level         │
+│  └──────┬───────────┘                                  │
+│         │ LDS, RDS, CDS, EDS, SDS                      │
+│         ▼                                              │
+│  ┌──────────────────┐                                  │
+│  │ xDS gRPC stream  │  Push or pull to proxies        │
+│  │ to sidecar       │  Incremental updates             │
+│  └──────┬───────────┘                                  │
+│         │                                              │
+│         ▼                                              │
+│  ┌──────────────────┐                                  │
+│  │ Envoy rebuilds   │  Hot reload without restart      │
+│  │ internal state   │  New listeners, routes, clusters │
+│  └──────────────────┘                                  │
+└───────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Configuration APIs
+
+The xDS (Discovery Service) APIs are the standard configuration protocol between the control plane and sidecar proxies:
+
+**LDS (Listener Discovery Service)**: Provides listener configuration. Each listener specifies the port, protocol, filter chains, and TLS settings. When a new listener is added, the proxy opens a new port and starts accepting connections.
+
+**RDS (Route Discovery Service)**: Provides route configuration for HTTP listeners. Routes map request attributes to destination clusters. Route changes are applied atomically per virtual host.
+
+**CDS (Cluster Discovery Service)**: Provides cluster definitions. Each cluster specifies the endpoints, load balancing policy, circuit breaker settings, and TLS configuration.
+
+**EDS (Endpoint Discovery Service)**: Provides the list of healthy endpoints for each cluster. Endpoints are updated as pods are created, deleted, or become unhealthy.
+
+**SDS (Secret Discovery Service)**: Provides TLS certificates and private keys. The proxy requests certificates from SDS and receives them with automatic rotation.
+
+### Configuration Formats
+
+**Kubernetest CRDs**: High-level configuration in YAML format:
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: service-b-routing
+spec:
+  hosts:
+  - service-b
+  http:
+  - match:
+    - headers:
+        x-canary:
+          exact: "true"
+    route:
+    - destination:
+        host: service-b
+        subset: v2
+      weight: 100
+  - route:
+    - destination:
+        host: service-b
+        subset: v1
+      weight: 100
+```
+
+**Envoy xDS JSON**: Low-level configuration in JSON format, generated by Pilot:
+
+```json
+{
+  "name": "service-b.default.svc.cluster.local:8080",
+  "domains": ["service-b", "service-b:8080", "service-b.default.svc.cluster.local:8080"],
+  "routes": [{
+    "match": {"prefix": "/"},
+    "route": {
+      "cluster": "outbound|8080||service-b.default.svc.cluster.local",
+      "timeout": "3s",
+      "retryPolicy": {
+        "retryOn": "5xx,gateway-error,connect-failure",
+        "numRetries": 3,
+        "perTryTimeout": "1s"
+      }
+    }
+  }]
+}
+```
+
+### Dynamic Reloading
+
+All configuration changes are applied dynamically without proxy restart:
+
+1. Pilot detects a configuration change
+2. Pilot builds new xDS resources
+3. Pilot pushes the changes via the existing gRPC stream
+4. Envoy validates the new configuration
+5. Envoy applies the changes atomically
+6. Old configuration is retained until the new configuration is fully active
+
+This dynamic reloading enables canary deployments, traffic shifting, and policy changes without any application downtime.
+
+---
+
+## Summary
+
+A sidecar proxy consists of a listener manager, filter chain, router, cluster manager, and connection pool. These subsystems process every request through 19 distinct steps from application connect to response delivery and telemetry recording. The control plane (Pilot, Citadel, Galley/istiod) manages the data plane via the xDS APIs (LDS, RDS, CDS, EDS, SDS). The system uses eventual consistency, with configuration propagating asynchronously to all proxies. Performance overhead is 1-2ms per hop, and all configuration changes are applied dynamically without proxy restarts.
+
+Next, you will explore the architecture patterns for deploying and operating a service mesh in production.

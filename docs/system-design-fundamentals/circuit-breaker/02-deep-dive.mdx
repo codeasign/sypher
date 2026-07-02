@@ -1,0 +1,703 @@
+---
+id: circuit-breaker-deep-dive
+title: Circuit Breaker Deep Dive
+sidebar_label: Deep Dive
+position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Circuit Breaker Deep Dive
+
+## Internal Architecture
+
+A circuit breaker is a state machine with three components that work together: the state machine itself, the metrics collector, and the threshold evaluator. Each component has a specific responsibility and communicates with the others through well-defined interfaces.
+
+### State Machine
+
+The state machine maintains the current state of the breaker: CLOSED, OPEN, or HALF_OPEN. It exposes two operations: `recordSuccess()` and `recordFailure()`. Each operation may trigger a state transition. The state machine is thread-safe. Writes go through a lock-free compare-and-swap (CAS) operation on an atomic integer.
+
+The state machine also exposes `isRequestAllowed()`, which checks the current state and applies the probe-limiting logic for HALF_OPEN state.
+
+```
+recordSuccess() effects by state:
+  CLOSED:    reset failure count to 0, no transition
+  OPEN:      do nothing (requests are rejected in OPEN state,
+             so successes are not expected; this is a no-op)
+  HALF_OPEN: increment success count;
+             if successCount >= halfOpenSuccessThreshold,
+             transition to CLOSED and reset metrics
+
+recordFailure() effects by state:
+  CLOSED:    increment failure count in sliding window;
+             if failure count >= failureThreshold (count-based)
+             or failure rate >= failureRate (rate-based),
+             transition to OPEN and start reset timer
+  OPEN:      do nothing (requests are not sent in OPEN state,
+             so failures are not expected; this is a no-op)
+  HALF_OPEN: transition to OPEN immediately on first probe failure;
+             this is strict: a single failed probe means the
+             dependency is not ready, and we protect it again
+
+isRequestAllowed():
+  CLOSED:    return true (all requests pass through)
+  OPEN:     check if reset timeout has expired;
+            if expired, transition to HALF_OPEN, reset probe counter,
+            return true for this request (it becomes the first probe);
+            if not expired, return false (request rejected)
+  HALF_OPEN: if probeCount < halfOpenMax, increment probeCount
+             atomically and return true;
+             if probeCount >= halfOpenMax, return false
+```
+
+### Metrics Collector
+
+The metrics collector tracks successes and failures over time. Each recorded event is timestamped and classified as success or failure. The collector supports two query types: `countInWindow(type, duration)` returns the count of events of a given type within the past `duration` seconds, and `rateInWindow(type, duration)` returns the rate (count per second) of events of a given type within the past `duration` seconds.
+
+The collector implementation uses either bucketed sliding windows (efficient but imprecise) or exact ring buffers (precise but more memory-intensive).
+
+### Threshold Evaluator
+
+The threshold evaluator reads current metrics from the collector and determines whether the threshold has been exceeded. It runs on every `recordFailure()` call and on a periodic timer (every 1 second) to handle the rate-based evaluation that depends on total request volume.
+
+For count-based breakers, the evaluator checks: `metrics.countInWindow(FAILURE, windowSize) >= failureCount ? OPEN : CLOSED`.
+
+For rate-based breakers, the evaluator checks: `totalRequests = metrics.countInWindow(ALL, windowSize); if (totalRequests >= minRequests) { rate = metrics.countInWindow(FAILURE, windowSize) / totalRequests; rate >= failureRate ? OPEN : CLOSED }`.
+
+For adaptive breakers, the evaluator checks: `currentLatency > baselineMean + 2 * baselineStdDev ? OPEN : CLOSED`.
+
+<AsciiDiagram
+  id="circuit-breaker/deep-dive-internal-architecture"
+  title="Circuit Breaker Internal Architecture"
+  alt="Block diagram of circuit breaker internals showing the state machine connected to the metrics collector and threshold evaluator, with the caller interface on the left and the dependency on the right. Arrows show data flow between components"
+  content={`
+    ┌──────────────────────────────────────────────────────────────┐
+    │                    Circuit Breaker                           │
+    │                                                              │
+    │  ┌─────────────┐    ┌──────────────┐    ┌──────────────┐    │
+    │  │   Metrics    │    │   Threshold  │    │    State     │    │
+    │  │   Collector  │───>│   Evaluator  │───>│   Machine    │    │
+    │  │              │    │              │    │              │    │
+    │  │  ring buffer │    │  failure >=  │    │  CLOSED      │    │
+    │  │  counters    │    │  threshold?  │    │  OPEN        │    │
+    │  │  timestamps  │    │  rate >= X%? │    │  HALF_OPEN   │    │
+    │  │  latency EWMA│    │  timeout?    │    │              │    │
+    │  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘    │
+    │         │                   │                   │           │
+    │         │                   │                   │           │
+    │         ▼                   ▼                   ▼           │
+    │  ┌─────────────────────────────────────────────────────┐    │
+    │  │              Caller Interface                        │    │
+    │  │  isRequestAllowed() | recordSuccess() | recordFailure│    │
+    │  └─────────────────────────────────────────────────────┘    │
+    └──────────────────────────────────────────────────────────────┘
+                           │
+                           │  HTTP/gRPC call
+                           ▼
+                 ┌──────────────────┐
+                 │   Dependency     │
+                 │   (protected)    │
+                 └──────────────────┘
+
+    Data Flow:
+      request → isRequestAllowed() → [CLOSED] → forward to dependency
+      response → recordSuccess/Failure → metrics collector → threshold evaluator
+      threshold exceeded → state machine transition → reset timer starts
+      timer expires → state machine transition to HALF_OPEN
+  `}
+  caption="Internal architecture of a circuit breaker. The metrics collector feeds data to the threshold evaluator, which drives the state machine. The caller interface exposes three methods: isRequestAllowed, recordSuccess, and recordFailure. Data flows from the caller interface through the metrics collector, then to the threshold evaluator, and finally to the state machine."
+/>
+
+## Data Structures
+
+### Sliding Window Counters
+
+The sliding window counters track failures in the most recent N seconds. Two common implementations exist, each with different tradeoffs in precision, memory, and CPU usage.
+
+**Implementation A: Bucketed Sliding Window**
+
+Divide the window into fixed-size buckets. Each bucket covers, for example, 1 second of a 10-second window. When an event arrives, increment the counter in the current bucket. To query the total, sum the last N buckets. Old buckets are recycled in a circular fashion.
+
+```
+class BucketedSlidingWindow {
+    buckets: [int]   // array of size = windowSize / bucketSize
+    currentBucketIndex: int
+    currentBucketStart: timestamp
+    total: AtomicInteger  // running sum for fast queries
+    bucketSize: duration  // typically 1 second
+
+    onEvent():
+        now = currentTime()
+        if now - currentBucketStart >= bucketSize:
+            advanceBucket(now)
+        buckets[currentBucketIndex]++
+        total.increment()
+
+    advanceBucket(now):
+        nextIndex = (currentBucketIndex + 1) % len(buckets)
+        total.addAndGet(-buckets[nextIndex])  // subtract expiring bucket
+        buckets[nextIndex] = 0
+        currentBucketIndex = nextIndex
+        currentBucketStart = now
+
+    countInWindow():
+        // Runs on every query. If periodic maintenance ensures buckets
+        // are advanced on a timer, this is just: return total.get()
+        now = currentTime()
+        while currentBucketStart + bucketSize <= now:
+            advanceBucket(now)
+        return total.get()
+}
+```
+
+The bucketed approach trades off precision for lower memory overhead. A 10-second window with 1-second buckets uses an array of 10 integers: 40 bytes. The tradeoff is that events arriving at second 10.9 might be grouped with events at second 11.0 rather than second 10.0, introducing up to 1 bucket-width (1 second) of timing error.
+
+**Implementation B: Exact Sliding Window (Ring Buffer)**
+
+Store each event with its timestamp. Query by filtering events where the timestamp falls within the window. Prune old events during maintenance.
+
+```
+class ExactSlidingWindow {
+    events: [Event]  // ring buffer, overwrites oldest when full
+    head: int        // write position
+    count: int       // total events in buffer
+    capacity: int    // max events
+
+    record(type):
+        events[head] = Event(type=type, timestamp=now())
+        head = (head + 1) % capacity
+        if count < capacity:
+            count++
+
+    countInWindow(type, windowDuration):
+        cutoff = now() - windowDuration
+        total = 0
+        for i in range(head, head + count):
+            idx = i % capacity
+            if events[idx].type == type and events[idx].timestamp >= cutoff:
+                total++
+        return total
+}
+```
+
+The exact approach provides precise counting at the cost of O(N) query time. For a ring buffer of 10,000 events, a query iterates over all 10,000 entries. This is acceptable when queries run once per request (a few microseconds per query). The ring buffer uses more memory: each event stores an 8-byte timestamp and a 1-byte type field, plus object overhead.
+
+**Comparison:**
+
+| Property | Bucketed | Exact (Ring Buffer) |
+|---|---|---|
+| Memory (10s window) | ~40 bytes | ~90 KB (10K events) |
+| Record latency | ~50 ns (increment) | ~20 ns (array write) |
+| Query latency | ~100 ns (read total) | ~2,000 ns (iterate) |
+| Precision | Bucket-width error (1s) | Exact timestamps |
+| Bounded memory | Yes (fixed array) | Yes (fixed array) |
+| Thread safety | CAS on total | CAS on head |
+
+<AsciiDiagram
+  id="circuit-breaker/deep-dive-sliding-window"
+  title="Sliding Window Data Structure (Bucketed)"
+  alt="Diagram of a bucketed sliding window showing 10 buckets each covering 1 second. Buckets 0 through 9 cycle in a circular buffer. The current time bucket is highlighted and expired buckets are shown as faded. Each bucket contains a failure and success count"
+  content={`
+    Time:  0s    1s    2s    3s    4s    5s    6s    7s    8s    9s    10s
+          ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐
+          │  0   │  1   │  2   │  3   │  4   │  5   │  6   │  7   │  8   │  9   │
+          │      │      │      │      │      │      │      │      │      │      │
+          │  F:2 │  F:3 │  F:1 │  F:0 │  F:5 │  F:2 │  F:0 │  F:1 │  F:0 │  F:0 │
+          │  S:8 │  S:7 │  S:9 │  S:10│  S:6 │  S:8 │  S:10│  S:9 │  S:0 │  S:0 │
+          └──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┘
+                    ▲                                   ▲
+                    │                                   │
+                    └──────── Current time: 2.5s ───────┘
+
+    Current window sum: F = 3+1+0+5+2+0+1+0+0 = 12 failures
+                         S = 7+9+10+6+8+10+9+0+0 = 59 successes
+    Total requests: 71
+    Failure rate: 12 / 71 = 16.9%  (below threshold)
+
+    Index detail:
+    Index 0 (0s-1s): F=2, S=8    -- partially in window
+    Index 1 (1s-2s): F=3, S=7    -- fully in window
+    Index 2 (2s-3s): F=1, S=9    -- current bucket
+    Index 3 (3s-4s): F=0, S=10   -- fully in window
+    Index 4 (4s-5s): F=5, S=6    -- fully in window
+    Index 5 (5s-6s): F=2, S=8    -- fully in window
+    Index 6 (6s-7s): F=0, S=10   -- fully in window
+    Index 7 (7s-8s): F=1, S=9    -- fully in window
+    Index 8 (8s-9s): F=0, S=0    -- expired
+    Index 9 (9s-10s): F=0, S=0   -- expired
+  `}
+  caption="Bucketed sliding window with 1-second buckets over a 10-second window. At time 2.5 seconds, the active window spans buckets 3 through 2 (circularly). Buckets 8 and 9 have expired and their counts are zero. The window sums to 12 failures and 59 successes."
+/>
+
+### State Enum
+
+The state is typically represented as an enum or integer for lock-free transitions.
+
+```
+enum State {
+    CLOSED = 0,
+    OPEN = 1,
+    HALF_OPEN = 2
+}
+```
+
+Using an atomic integer allows lock-free state transitions:
+
+```
+AtomicInteger state = new AtomicInteger(CLOSED);
+
+boolean tryOpen() {
+    // CLOSED → OPEN only if currently CLOSED
+    return state.compareAndSet(CLOSED, OPEN);
+}
+
+boolean tryClose() {
+    // HALF_OPEN → CLOSED only if currently HALF_OPEN
+    return state.compareAndSet(HALF_OPEN, CLOSED);
+}
+
+boolean tryHalfOpen() {
+    // OPEN → HALF_OPEN only if currently OPEN
+    return state.compareAndSet(OPEN, HALF_OPEN);
+}
+```
+
+The compare-and-swap (CAS) operation is a single CPU instruction (CMPXCHG on x86). It has no lock contention and completes in approximately 10-20 nanoseconds on modern hardware. The CAS ensures that only one thread can transition the state at a time. If two threads both try to open the breaker simultaneously, only one CAS succeeds. The other thread's CAS returns false, and it retries or returns.
+
+### Configuration Structure
+
+```
+CircuitBreakerConfig {
+    // Identity
+    String name = "default"            # human-readable name for metrics
+
+    // Count-based settings
+    int failureCount = 5               # failures to trigger OPEN
+    int windowSizeSeconds = 10         # sliding window duration
+
+    // Rate-based settings (used if failureRate > 0)
+    float failureRate = 0.0            # 0.0 means count-based only
+    int minRequests = 10               # minimum requests before rate eval
+
+    // Timeout settings
+    int resetTimeoutSeconds = 30       # time in OPEN before HALF_OPEN
+    int maxResetTimeoutSeconds = 300   # cap for exponential backoff
+    boolean useExponentialBackoff = false
+
+    // Half-open settings
+    int halfOpenMax = 3                # max probe requests
+    int halfOpenSuccessThreshold = 3   # consecutive successes to close
+
+    // Manual override
+    boolean forceOpen = false          # force OPEN (maintenance)
+    boolean forceClosed = false        # force CLOSED (testing)
+
+    // Notifications
+    String onOpenCallback = ""         # webhook or function name
+    String onCloseCallback = ""
+    String onHalfOpenCallback = ""
+
+    // Metrics
+    boolean emitMetrics = true         # enable metrics export
+    String metricsPrefix = "cb"        # prefix for metric names
+}
+```
+
+<AsciiDiagram
+  id="circuit-breaker/deep-dive-ring-buffer"
+  title="Ring Buffer Memory Layout"
+  alt="Circular ring buffer diagram showing 12 slots with a head pointer at position 7. Each slot contains an event type (F or S) and a timestamp. The buffer wraps around from the last slot back to the first"
+  content={`
+    ┌──────────── Ring Buffer (capacity = 12) ─────────────────┐
+    │                                                          │
+    │   ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬───  │
+    │   │  0  │  1  │  2  │  3  │  4  │  5  │  6  │  7  │... │
+    │   │ F:t0│ F:t1│ S:t2│ F:t3│ S:t4│ S:t5│ F:t6│ F:t7│    │
+    │   └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴───  │
+    │                                    ▲                     │
+    │                                    │                     │
+    │                                  head=7                  │
+    │                                                          │
+    │   ┌─────┬─────┬─────┬─────┐                              │
+    │   │  8  │  9  │  10 │  11 │                              │
+    │   │ S:t8│ F:t9│ S:t10│F:t11│                              │
+    │   └─────┴─────┴─────┴─────┘                              │
+    │                                                          │
+    │   Legend:  F = Failure    S = Success                    │
+    │            tN = timestamp of event N                     │
+    │                                                          │
+    │   head = 7 means the next write goes to slot 7           │
+    │   Slots 0-6 contain events 0-6 (oldest → newest)        │
+    │   Query walks from head backwards through count entries  │
+    └──────────────────────────────────────────────────────────┘
+
+    Example query: count failures in last 5 seconds
+    Walk from (head-1) through (head+count-1) modulo capacity
+    For each entry: type == FAILURE AND timestamp >= now - 5s
+    Result: F:t1, F:t3, F:t6  →  3 failures
+  `}
+  caption="Ring buffer with 12 slots storing individual events with their timestamps. The head pointer marks the next write position. A query walks the buffer in chronological order, checking each entry against the type and timestamp filter. The ring buffer wraps from the last slot back to the first."
+/>
+
+## Lifecycle: 12 Detailed Steps
+
+The lifecycle of a circuit breaker from normal operation through failure detection, circuit opening, recovery, and return to normal operation involves 12 distinct steps. Each step involves different components and data structures.
+
+**Step 1. Request Arrives at Normal Traffic.** A caller invokes the circuit-breaker-wrapped dependency. The caller thread is a web request handler in the checkout service. Typical request volume is 50 requests per second to this dependency. The existing sliding window shows 498 successes and 2 failures in the last 10 seconds. The failure rate is 0.4 percent.
+
+**Step 2. isRequestAllowed() Check.** The breaker calls isRequestAllowed(). It reads the state variable via a volatile read (a single CPU memory load). The state is CLOSED. The method returns true. This check takes under 1 microsecond.
+
+**Step 3. Dependency Call Fails.** The breaker forwards the request to the dependency. The dependency's database is under load from a concurrent checkpoint operation. The dependency takes 5 seconds to respond with a 503 Service Unavailable. The caller's timeout is 2 seconds, so the call fails with a timeout exception.
+
+**Step 4. recordFailure() Called.** The breaker's catch block calls recordFailure() on the state machine. The state machine calls metrics.recordFailure(). The metrics collector increments the failure counter in the current sliding window bucket: bucket index 3 goes from F:0 to F:1.
+
+**Step 5. Metrics Update and Threshold Check.** The running total for the window is now 5 failures and 498 successes. The threshold evaluator reads the failure count: 5. It compares against the configured failureCount: 5. The threshold is met exactly. The evaluator signals the state machine to transition to OPEN.
+
+**Step 6. State Transition: CLOSED to OPEN.** The state machine calls tryOpen() which performs a CAS from CLOSED (0) to OPEN (1). The CAS succeeds. The state is now OPEN. The timestamp of the transition is recorded for the reset timeout calculation. A system timer is scheduled to fire after 30 seconds.
+
+**Step 7. Error Returned to Caller.** The breaker returns the timeout exception to the caller. The caller's error handler logs the failure: "payment service unavailable (circuit breaker opened)". The caller returns an HTTP 500 to the end user. Total elapsed time for the failed call: 2,010 milliseconds (2 second timeout + 10ms overhead).
+
+**Step 8. New Request Arrives -- Breaker Open.** A second request arrives 200 milliseconds later. The breaker calls isRequestAllowed(). The state is OPEN. It checks the reset timeout: current time minus transition time equals 200 milliseconds, which is less than 30 seconds. The request is rejected.
+
+**Step 9. Fallback Response Returned.** The breaker's fallback handler returns a cached response. The caller receives the cached payment method list without any network call. Elapsed time: 0.5 milliseconds. No thread blocking occurred. The thread pool has 199 available threads instead of 0.
+
+**Steps 8-9 repeat for all subsequent requests during the open window.** Twenty-five requests per second arrive, all fast-failed with fallbacks. The thread pool stays healthy. Other dependencies continue to function.
+
+**Step 10. Reset Timer Fires.** After 30 seconds, the reset timer fires. The state machine atomically transitions from OPEN to HALF_OPEN. The probe counter is reset to 0. The system is now ready to test the dependency's health.
+
+**Step 11. Probe Request Succeeds.** The next incoming request is the first probe. The breaker calls isRequestAllowed(). State is HALF_OPEN. Probe count is 0, which is less than halfOpenMax (3). The probe count is atomically incremented to 1. The request is allowed through. It reaches the dependency, which has recovered (database checkpoint completed). The dependency responds in 150 milliseconds. The breaker calls recordSuccess().
+
+**Step 12. Probe Success Threshold Reached.** The first probe succeeded. Two more probes arrive in quick succession. Both succeed. The probe count reaches 3. The halfOpenSuccessThreshold of 3 is met. The state machine transitions from HALF_OPEN to CLOSED. The metrics collector resets its sliding window. Full traffic resumes.
+
+<AsciiDiagram
+  id="circuit-breaker/deep-dive-lifecycle"
+  title="Circuit Breaker Lifecycle Sequence"
+  alt="Sequence diagram showing the 12-step lifecycle of a circuit breaker: a request arrives, the breaker is CLOSED and allows the request, the dependency fails, failure count increments, threshold is checked, threshold exceeded, transition to OPEN, subsequent requests are blocked, reset timeout fires, transition to HALF_OPEN, probe request sent, probe succeeds, transition back to CLOSED"
+  content={`
+    ┌─────────┐    ┌──────────────────┐    ┌──────────────┐
+    │ Caller   │    │ Circuit Breaker  │    │  Dependency  │
+    │          │    │                  │    │              │
+    └────┬─────┘    └────────┬─────────┘    └──────┬───────┘
+         │                  │                    │
+         │  1. request()    │                    │
+         │─────────────────>│                    │
+         │                  │  2. isRequestAllowed() → CLOSED → true
+         │                  │────────────────────>│
+         │                  │  3. response(503)    │
+         │                  │<────────────────────│
+         │                  │  4. recordFailure()
+         │                  │  5. metrics.failures++ (now = 5)
+         │                  │  6. threshold exceeded? → yes
+         │                  │  7. state = OPEN (CAS)
+         │  8. error        │
+         │<─────────────────│
+         │                  │
+         │  9. request()    │
+         │─────────────────>│
+         │                  │  isRequestAllowed() → OPEN → false
+         │ 10. fallback     │
+         │<─────────────────│
+         │                  │
+         │                  │  11. resetTimeout fires (30s)
+         │                  │  state = HALF_OPEN (CAS)
+         │                  │  probeCount = 0
+         │                  │
+         │ 12. probe()      │
+         │─────────────────>│
+         │                  │────────────────────>│
+         │                  │  13. response(200)
+         │                  │<────────────────────│
+         │                  │  recordSuccess()
+         │                  │  probeCount = 1 → 2 → 3
+         │                  │  probeCount >= halfOpenMax → yes
+         │                  │  state = CLOSED (CAS)
+         │  response(200)   │
+         │<─────────────────│
+
+    Total timeline:
+    0s     → request sent
+    0-2s   → request pending (timeout at 2s)
+    2s     → failure recorded, threshold check, transition
+    2-32s  → OPEN state, all requests fast-failed with fallbacks
+    32s    → reset timer fires, HALF_OPEN transition
+    32.1s  → probe request sent
+    32.25s → probe succeeds, CLOSED transition
+    32.25s → full traffic resumes
+  `}
+  caption="Circuit breaker lifecycle sequence showing 13 events from the initial request through failure detection, circuit opening, 30-second rejection period, half-open probing, and recovery back to closed state. The total timeline spans approximately 32 seconds from first failure to full recovery."
+/>
+
+## Consistency and State
+
+### Single-Process Consistency
+
+In a single process, the circuit breaker state is in-memory. Writes go through an atomic CAS or a mutex. Under contention, CAS retries in a spin loop:
+
+```
+while (true) {
+    int current = state.get();
+    int newState = transition(current);
+    if (state.compareAndSet(current, newState)) {
+        break;
+    }
+    // CAS failed — another thread changed state. Retry.
+}
+```
+
+This spin loop executes 1-3 iterations under normal contention. It never blocks the OS scheduler. Worst-case latency per CAS is under 100 nanoseconds. The spin loop uses `Thread.onSpinWait()` (Java) or `_mm_pause()` (C++) to hint to the CPU that the thread is spinning, which improves power efficiency.
+
+### Distributed Consistency
+
+In a distributed system, each service instance maintains its own circuit breaker state. This means:
+
+- Instance A has seen 5 failures and is OPEN.
+- Instance B has seen 3 failures and is CLOSED.
+- Instance C has seen 4 failures and is CLOSED.
+
+The inconsistency means some traffic still reaches the failing dependency through instances B and C. This is intentional: distributed circuit breakers do not require consensus. Each instance independently decides when to open based on its own observed traffic. The inconsistency is a feature, not a bug -- it limits the blast radius to the instances that have observed failures.
+
+For coordination, you can use a shared store like Redis or ZooKeeper, but this adds latency to every request path. A 5-millisecond Redis round trip on every request adds overhead that is 25x larger than the circuit breaker's own overhead. The simpler approach -- local state with eventual consistency through shared traffic patterns -- is preferred for most deployments.
+
+### Race Conditions
+
+**Double-Open Race.** Thread A and Thread B both call recordFailure() simultaneously. Both see that the threshold has been met. Both call tryOpen(). Thread A's CAS succeeds: state changes from CLOSED to OPEN. Thread B's CAS fails because the state is no longer CLOSED. Thread B retries, sees state=OPEN, and returns without action. No harm done.
+
+**Probe Race.** Thread A and Thread B both call isRequestAllowed() in HALF_OPEN state before either has incremented the probe count. Both see probeCount < halfOpenMax. Both pass. The probe count ends up at 2, but halfOpenMax was 1. The fix: increment the probe count atomically inside isRequestAllowed():
+
+```
+boolean isRequestAllowed() {
+    if (state == HALF_OPEN) {
+        int currentProbeCount = probeCount.get();
+        while (currentProbeCount < halfOpenMax) {
+            if (probeCount.compareAndSet(currentProbeCount, currentProbeCount + 1)) {
+                return true;
+            }
+            currentProbeCount = probeCount.get();
+        }
+        return false;
+    }
+    ...
+}
+```
+
+**Timer Race.** The reset timer fires and calls tryHalfOpen() just as a probe request arrives and calls isRequestAllowed(). The timer sets state to HALF_OPEN. The probe request sees HALF_OPEN and passes. No race -- both operations are atomic and consistent.
+
+**Transition During Probe.** A probe request is in-flight. The probe has not yet returned. Meanwhile, the reset timer fires again (should not happen because the timer is single-shot, not periodic). This is prevented by design: the reset timer is a one-shot timer that fires exactly once after the configured delay.
+
+## Performance
+
+### Latency Overhead
+
+The circuit breaker adds overhead on every request. The overhead comes from three sources:
+
+1. **State check:** Reading the state enum and branch comparison to determine if the request is allowed. Cost: 5-10 nanoseconds.
+2. **Metrics recording:** Updating the sliding window counter or appending to the ring buffer. Cost: 100-500 nanoseconds.
+3. **Threshold evaluation:** Summing the sliding window and comparing to threshold. Cost: 100-1,000 nanoseconds.
+
+**Total overhead per request:** approximately 200-1,500 nanoseconds (0.2-1.5 microseconds).
+
+In the normal (CLOSED) state, the overhead is minimal: a state check and a counter increment. In the OPEN state, the overhead is even lower: a state check and return. The overhead is negligible compared to a network call (1-100 milliseconds).
+
+### Throughput Impact
+
+Benchmark measurements with a Java implementation (Resilience4j) on a single 3.5 GHz core:
+
+| Operation | Throughput (ops/sec) | Avg Latency | Memory Allocation |
+|---|---|---|---|
+| No circuit breaker | 12,500,000 | 80 ns | 0 bytes |
+| CLOSED state check | 11,200,000 | 89 ns | 0 bytes |
+| CLOSED + record success | 8,400,000 | 119 ns | 48 bytes |
+| CLOSED + record failure | 8,100,000 | 123 ns | 48 bytes |
+| OPEN state check | 11,200,000 | 89 ns | 0 bytes |
+| HALF_OPEN probe check | 9,800,000 | 102 ns | 0 bytes |
+
+The circuit breaker reduces maximum throughput by roughly 10-30 percent at the microbenchmark level. In a real application where the majority of time is spent in I/O and business logic (milliseconds versus nanoseconds), the circuit breaker overhead is below 0.1 percent of total request latency.
+
+### P50, P99, P999 Latency
+
+At the application level, the circuit breaker affects tail latency primarily through indirect effects:
+
+- **P50 latency:** No measurable change. The state check completes in nanoseconds. The dependency call dominates the latency profile.
+- **P99 latency:** Reduces tail latency during failures because fast-failed requests do not wait for timeouts. Without a breaker, a failing dependency pushes p99 from 200ms to 30,000ms (the timeout value). With a breaker, p99 stays under 200ms.
+- **P999 latency:** The largest improvement. Without a breaker, cascading failures can push p999 to 60,000ms or higher. With a breaker that opens within 5 seconds of the first failure, p999 stays at normal levels.
+
+### Memory Overhead
+
+The bucketed sliding window with 10 buckets of 4 bytes each: 40 bytes. The ring buffer with 10,000 events at 12 bytes each: 120,000 bytes. For a service with 20 dependencies each with their own circuit breaker, the bucketed approach uses 800 bytes and the ring buffer approach uses 2.4 MB.
+
+In a JVM with a 512 MB heap, 2.4 MB represents 0.5 percent of available memory. In a Go process with 100 MB heap, 2.4 MB represents 2.4 percent. In a Rust process with 10 MB heap (embedded systems), 2.4 MB represents 24 percent. Choose your data structure based on your memory constraints.
+
+<AsciiDiagram
+  id="circuit-breaker/deep-dive-performance"
+  title="Circuit Breaker Latency Impact"
+  alt="Two latency distribution histograms side by side. The left histogram shows latency without a circuit breaker, with a long tail from 200ms to 30s. The right histogram shows latency with a circuit breaker, with the tail truncated at 200ms. P99 values are highlighted"
+  content={`
+    Without Circuit Breaker:
+
+    Count
+      │  ████████████
+      │  ████████████
+      │  ████████████
+      │  ████████████  ████
+      │  ████████████  ████  ████                    ████
+      │  ████████████  ████  ████  ████  ████  ████  ████  ████
+      └──────────────────────────────────────────────────────────
+       200ms   1s     5s     10s    15s    20s    25s    30s
+
+    P50:  180ms   (main request latency)
+    P99:  12s     (one timeout in 100 requests)
+    P999: 28s     (queuing delay from thread pool exhaustion)
+
+    With Circuit Breaker:
+
+    Count
+      │  ████████████████████
+      │  ████████████████████
+      │  ████████████████████
+      │  ████████████████████  ████
+      │  ████████████████████  ████  ████
+      │  ████████████████████  ████  ████  ████  ████  ████  ████
+      └──────────────────────────────────────────────────────────
+       200us  1ms    10ms   50ms   100ms  150ms  200ms  250ms
+
+    P50:  180ms   (no change -- main request unaffected)
+    P99:  195ms   (fast-failed requests return in under 1ms)
+    P999: 220ms   (no queuing delay -- breaker prevents queueing)
+
+    Improvement:
+      P50:   180ms  →  180ms  (no change)
+      P99:   12s    →  195ms  (98.4% reduction)
+      P999:  28s    →  220ms  (99.2% reduction)
+  `}
+  caption="Latency distribution comparison with and without a circuit breaker. Without the breaker, a failing dependency pushes tail latency to 30 seconds (the timeout) and queuing adds 28 seconds of additional delay. With the breaker, P99 drops from 12 seconds to 195 milliseconds and P999 drops from 28 seconds to 220 milliseconds."
+/>
+
+## Configuration Deep Dive
+
+### failureCount
+
+Controls how many failures must occur in the sliding window before the breaker opens. Lower values detect problems faster but increase false positives. Higher values reduce false positives but delay protection.
+
+- **Typical range:** 3-50
+- **Low-traffic service (1 req/s):** failureCount=3 with a 30-second window. At 1 req/s, 3 failures take 3 seconds. The window of 30 seconds provides enough data for the threshold to be meaningful.
+- **High-traffic service (1000 req/s):** failureCount=50 with a 10-second window (0.5% failure rate). At 1000 req/s, 50 failures arrive in 50 milliseconds. The breaker opens within 50ms of the first failure.
+- **Recommended starting point:** failureCount=5, windowSize=10s. This detects a 50% failure rate at 1 req/s and a 0.05% failure rate at 1000 req/s.
+
+### failureRate
+
+Controls the failure percentage that triggers the breaker. Used in rate-based mode.
+
+- **Typical range:** 0.3 (30%) to 0.8 (80%).
+- **Critical dependency:** 30%. Open early at the first sign of trouble. False positives are acceptable for critical paths where a degraded fallback is better than a cascading failure.
+- **Non-critical dependency:** 80%. Tolerate more failures before opening. The fallback for a non-critical dependency (recommendations, personalization) provides minimal value, so you only want to open when the dependency is truly broken.
+- **Recommended starting point:** 50%.
+
+### minRequests
+
+The minimum number of requests required before the rate-based breaker evaluates the failure rate. Prevents the breaker from opening on a single request that happens to fail.
+
+- **Typical range:** 5-100.
+- **Recommended starting point:** 10.
+- **Rationale:** With minRequests=10 and failureRate=50%, the breaker needs at least 5 failures out of 10 requests to open. This prevents a single 503 from taking down the dependency for all users.
+
+### resetTimeout
+
+The duration the breaker stays OPEN before transitioning to HALF_OPEN. Must be long enough for the dependency to recover.
+
+- **Typical range:** 5-300 seconds.
+- **Fast-recovering dependency (connection pool exhaustion):** 5-10 seconds. Connection pool exhaustion resolves as soon as in-flight requests complete, typically within a few seconds.
+- **Slow-recovering dependency (database restart):** 60-300 seconds. A database restart involves process restart, WAL recovery, buffer pool warmup, and connection re-establishment. This takes 30-120 seconds depending on data volume.
+- **Recommended starting point:** 30 seconds. This covers most failure scenarios: transient overload (5-15s), connection pool drain (5-10s), and minor database issues (15-30s).
+
+### halfOpenMax
+
+The maximum number of probe requests allowed while in HALF_OPEN state. Lower values reduce stress on the recovering dependency. Higher values provide more confidence in recovery.
+
+- **Typical range:** 1-10.
+- **Recommended starting point:** 3.
+- **Rationale:** With halfOpenMax=3, three probe requests provide enough data to confirm recovery without overwhelming a barely-recovered dependency. A single probe might be a false positive (a lucky success during an otherwise broken period). Three probes reduce false positive probability from potentially 50 percent to under 12.5 percent.
+
+### halfOpenSuccessThreshold
+
+The number of consecutive successful probe requests required to transition back to CLOSED.
+
+- **Typical range:** 1-10.
+- **Recommended starting point:** equal to halfOpenMax.
+- **Rationale:** If halfOpenMax=3 and halfOpenSuccessThreshold=3, all three probes must succeed. This provides the highest confidence. Setting halfOpenSuccessThreshold lower than halfOpenMax (for example, 1) means the breaker closes after one successful probe even if two more probes would have failed.
+
+<AsciiDiagram
+  id="circuit-breaker/deep-dive-configuration-impact"
+  title="Configuration Parameter Impact Analysis"
+  alt="A table showing the impact of low and high values for each configuration parameter. Each row shows a parameter with its low value on the left, a gradient bar in the middle, and its high value on the right. Text annotations explain the tradeoffs"
+  content={`
+    Parameter          Low Value                    High Value
+    ─────────────────  ───────────────────────────  ─────────────────────────
+    failureCount=3     │██ Active protection        │   failureCount=50
+                       │   Fewer failures needed    │      Higher confidence
+                       │   More false positives     │      Slower to respond
+                       │   Opens in ~3 seconds      │      Opens after ~5s
+                       ▼                            ▼
+    ─────────────────  ───────────────────────────  ─────────────────────────
+    resetTimeout=5s    │██ Fast recovery            │   resetTimeout=300s
+                       │   Quick to probe           │      Generous recovery
+                       │   May probe too early      │      Wastes uptime
+                       │   Cycles rapidly           │      Slow to recover
+                       ▼                            ▼
+    ─────────────────  ───────────────────────────  ─────────────────────────
+    halfOpenMax=1      │██ Conservative probing     │   halfOpenMax=10
+                       │   Minimal stress           │      Better confidence
+                       │   Slow to confirm health   │      May overwhelm dep.
+                       │   Single data point        │      More probes = safer
+                       ▼                            ▼
+    ─────────────────  ───────────────────────────  ─────────────────────────
+    windowSize=5s      │██ Quick reaction           │   windowSize=60s
+                       │   Responds in seconds      │      More data points
+                       │   Noisy signal             │      Delayed response
+                       │   Spiky traffic victims    │      Smooths spikes
+                       ▼                            ▼
+    ─────────────────  ───────────────────────────  ─────────────────────────
+    failureRate=30%    │██ Early detection          │   failureRate=80%
+                       │   Opens on minor issues    │      High tolerance
+                       │   More fallbacks           │      Fewer false opens
+                       │   Critical path safety     │      Non-critical paths
+                       ▼                            ▼
+  `}
+  caption="Configuration parameter impact analysis. Lower failureCount, failureRate, and windowSize values provide faster detection at the cost of more false positives. Higher resetTimeout and halfOpenMax values give dependencies more recovery time but delay full traffic restoration."
+/>
+
+## Edge Cases and Error Handling
+
+### Manual Override
+
+A circuit breaker must support manual override for two scenarios:
+
+**forceOpen:** Used during planned maintenance of the dependency. The breaker stays OPEN regardless of metrics. This prevents new traffic from reaching a dependency that is being restarted or upgraded. When forceOpen is true, isRequestAllowed() always returns false. recordSuccess() and recordFailure() are no-ops.
+
+**forceClosed:** Used during testing or when the circuit breaker itself has a bug. The breaker stays CLOSED regardless of failures. This is dangerous in production because it disables all cascading failure protection. When forceClosed is true, isRequestAllowed() always returns true. Metrics are still recorded but never evaluated.
+
+### Startup Behavior
+
+A freshly started circuit breaker has an empty sliding window. The first N requests all count toward the threshold. If the dependency is unhealthy at startup, the breaker will open normally after failureCount failures. If the dependency is healthy, the window fills with successes and provides a baseline.
+
+The startup window is a vulnerability window. During startup, the breaker cannot detect issues until it has collected failureCount failures. Mitigation: implement a startup delay where the breaker starts in a "probing" mode that is effectively OPEN for the first 5 seconds. During this time, the breaker sends probe requests to verify the dependency is healthy before allowing full traffic.
+
+### Clock Skew
+
+On a single machine, clock skew is not an issue. The system clock and the monotonic clock both progress at the same rate. In a distributed configuration with a shared store, clock skew between machines can cause sliding windows to appear to shift. Use monotonic clocks for measuring durations: `System.nanoTime()` in Java, `clock_gettime(CLOCK_MONOTONIC)` in C, `time.monotonic()` in Go. Monotonic clocks are not affected by system time adjustments from NTP.
+
+### Concurrency at Threshold Boundary
+
+When the failure count is at threshold-1 and 10 concurrent requests all fail simultaneously, all 10 threads see the threshold exceeded. Only one CAS succeeds in transitioning to OPEN. The other nine CAS operations fail and return. Those nine callers still get errors -- the state is already OPEN -- but they do not double-transition. The retry loop in tryOpen() handles this correctly.
+
+## Key Takeaways
+
+- The circuit breaker internal architecture has three components: state machine (via CAS on atomic integer), metrics collector (bucketed or exact sliding window), and threshold evaluator (compares metrics to configuration).
+- Two main data structure choices exist: bucketed sliding windows (40 bytes for 10 buckets, bucket-width precision error) and ring buffers (120 KB for 10K events, exact timestamps, O(N) queries).
+- CAS-based state transitions are lock-free and complete in 10-20 nanoseconds. Spin retry loops handle contention with 1-3 iterations.
+- The circuit breaker adds under 1.5 microseconds of overhead per request in normal operation, representing less than 0.1 percent of total request latency in typical applications.
+- Tail latency improves dramatically during failures: P99 drops from 30-second timeouts to under 200 milliseconds, and P999 drops from 60 seconds to under 250 milliseconds.
+- Configuration parameters require tuning to the specific dependency's traffic pattern and recovery profile. Start conservative and adjust based on observed behavior.
+- Race conditions at state boundaries are handled by CAS retry loops, atomic probe counting, and one-shot timers. Each race condition has a specific mitigation strategy.
+- Edge cases include manual overrides, startup behavior, clock skew in distributed configurations, and concurrent threshold boundary conditions.
+
+Up next, you will examine how circuit breakers integrate into a complete production architecture alongside bulkheads, retries, timeouts, and fallbacks to form a comprehensive resilience strategy.

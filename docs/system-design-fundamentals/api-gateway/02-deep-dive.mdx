@@ -1,0 +1,772 @@
+---
+id: api-gateway-deep-dive
+title: API Gateway — Under the Hood
+position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+An API gateway is not magic. It is a purpose-built HTTP server with a pipeline of plugins, filters, and handlers. Every gateway — whether open-source Kong, cloud-managed AWS API Gateway, or a custom-built solution — shares the same internal architecture.
+
+The gateway core is an event loop that processes incoming requests through a chain of middleware. Each middleware step performs one function: authenticate, rate-limit, transform, route, call backend, transform response, and respond. The middleware chain is configurable per route.
+
+### Core Components
+
+**Listener**
+The listener binds to a port (443 for HTTPS, 80 for HTTP) and accepts incoming TCP connections. It manages the TLS handshake and hands off the decrypted connection to the connection pool. Most production gateways use multiple listeners for different protocols: HTTPS, HTTP/2, gRPC, and WebSocket.
+
+**Connection Pool**
+A pool of pre-established connections to backend services. Opening a new TCP connection to a backend service takes time (the TCP handshake alone is one round trip). The connection pool keeps connections alive and reuses them across requests, reducing latency by 30 percent to 60 percent for high-throughput workloads.
+
+**Middleware Chain**
+An ordered list of plugins that process the request. Each plugin has a chance to inspect, modify, or reject the request before passing it to the next plugin. Common plugins include rate limiter, authenticator, cors, request-transformer, and route-matcher.
+
+**Router**
+The component that matches the incoming request to a configured route. It uses a routing data structure (typically a trie or a radix tree) to find the best match. The route specifies which backend service to call, which plugins to apply, and how to transform the request.
+
+**Load Balancer**
+Once the router selects a service, the load balancer picks a specific instance from the pool of healthy instances. Standard algorithms include round-robin, least-connections, and consistent hashing. The load balancer also monitors instance health and removes unhealthy instances from the rotation.
+
+**Circuit Breaker**
+Wraps each backend call. If the call fails (timeout, 5xx error, connection refused), the circuit breaker increments a failure counter. When the failure rate exceeds a threshold, the circuit opens and subsequent calls return fallback responses without touching the backend.
+
+**Response Processor**
+Takes the backend response, applies output transformations (remove internal headers, compress body, add CORS headers, format the response), and sends it back to the client.
+
+<AsciiDiagram
+  id="api-gateway/internal-architecture"
+  title="Internal Architecture of an API Gateway"
+  alt="Diagram showing the internal pipeline of components inside an API gateway"
+  caption="Request flow through the gateway's internal architecture"
+  content={`
+                         REQUEST FLOW
+                    ┌──────────────────┐
+                    │                  │
+                    ▼                  │
+┌──────────────────────────────────────────────┐
+│               LISTENER                         │
+│  (TLS termination, connection accept)         │
+└──────────────────┬───────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────┐
+│         CONNECTION POOL                        │
+│  (Keep-alive, multiplexing)                   │
+└──────────────────┬───────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────┐
+│         MIDDLEWARE CHAIN                       │
+│  ┌──────────┐ ┌──────────┐ ┌──────────────┐  │
+│  │ Rate     │ │  Auth    │ │  Request     │  │
+│  │ Limiter  │─▶│ Checker  │─▶│ Transformer │  │
+│  └──────────┘ └──────────┘ └──────┬───────┘  │
+│  ┌──────────┐ ┌──────────┐        │          │
+│  │ Logging  │ │  CORS    │        │          │
+│  │ Plugin   │◀─│ Plugin   │◀───────┘          │
+│  └──────────┘ └──────────┘                    │
+└──────────────────┬───────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────┐
+│              ROUTER                            │
+│  Matches path → selects service               │
+│  (/users → user-service)                      │
+└──────────────────┬───────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────┐
+│          LOAD BALANCER                         │
+│  Round-robin / least-connections               │
+│  Picks: user-service-03                        │
+└──────────────────┬───────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────┐
+│         CIRCUIT BREAKER                        │
+│  Checks failure rate ... OK                    │
+└──────────────────┬───────────────────────────┘
+                   ▼
+         ┌──────────────────────┐
+         │  Backend Service     │
+         │  (user-service-03)   │
+         └──────────┬───────────┘
+                    ▼
+┌──────────────────────────────────────────────┐
+│         RESPONSE PROCESSOR                     │
+│  Compress, add headers, format                 │
+└──────────────────┬───────────────────────────┘
+                   ▼
+              CLIENT RESPONSE
+`} />
+
+## Data Structures
+
+The gateway's performance depends heavily on the data structures it uses. Three data structures are central to every production gateway.
+
+### Routing Trie
+
+The routing table maps URL patterns to backend services. A naive implementation uses a list of regex patterns, tested sequentially. For a gateway with 500 routes, that means up to 500 regex matches per request. A routing trie reduces this to O(k) where k is the URL depth.
+
+A trie stores URL segments as nodes. The root node represents "/". Each child node represents a path segment. When a request arrives with the path "/v2/users/123/profile", the gateway walks the trie: root → "v2" → "users" → ":id" (parameterized node) → "profile". The walk stops when the path is consumed or no matching node is found.
+
+Path parameters like ":id" and wildcards like "*" are special nodes that match any segment. The trie always prefers exact matches over parameterized matches. This means "/users/create" matches a literal node "create" before it matches a parameterized node ":id".
+
+<AsciiDiagram
+  id="api-gateway/routing-trie"
+  title="Routing Trie Data Structure"
+  alt="Diagram showing a trie structure for routing URL paths to backend services"
+  caption="The routing trie enables O(k) path matching where k is the URL depth"
+  content={`
+  ROOT (/)
+    │
+    ├── users (GET /users → user-service:list)
+    │     │
+    │     ├── create (POST /users/create → user-service:create)
+    │     │
+    │     └── :id (GET /users/:id → user-service:get)
+    │           │
+    │           └── orders (GET /users/:id/orders → order-service:list)
+    │
+    ├── products (GET /products → product-service:list)
+    │     │
+    │     └── :id (GET /products/:id → product-service:get)
+    │           │
+    │           └── reviews (GET /products/:id/reviews → review-service:list)
+    │
+    └── search (POST /search → search-service:search)
+          │
+          └── :query ... (GET /search/:query → search-service:get)
+
+  Match priority: EXACT > PARAMETERIZED > WILDCARD
+  Example: /users/search → matches "search" (exact), not ":id" (param)
+`} />
+
+```
+Route definitions:
+  GET /users                    → user-service:list
+  GET /users/:id                → user-service:get
+  POST /users                   → user-service:create
+  GET /users/:id/orders         → order-service:list
+  GET /products                 → product-service:list
+  GET /products/:id             → product-service:get
+
+Trie structure:
+  "/"
+   ├── "users" (GET → user-service:list)
+   │    ├── ":id" (GET → user-service:get)
+   │    │    └── "orders" (GET → order-service:list)
+   │    └── (POST → user-service:create)
+   └── "products" (GET → product-service:list)
+        └── ":id" (GET → product-service:get)
+```
+
+### Token Bucket for Rate Limiting
+
+The token bucket algorithm is the most common rate-limiting data structure. It is simple, memory-efficient, and handles bursts gracefully.
+
+The bucket has two parameters: capacity (maximum burst size) and refill rate (tokens added per second). Each request consumes one token. If the bucket is empty, the request is rejected.
+
+```
+Bucket for client "mobile-app":
+  capacity = 100 tokens
+  refill rate = 10 tokens/second
+
+  At t=0:  bucket = 100 (full)
+  Request 1 at t=0:  bucket = 99
+  ...
+  Request 50 at t=0: bucket = 50
+  At t=1:  refill adds 10 tokens → bucket = 60
+  ...
+```
+
+In a distributed gateway deployment, the token bucket state must be shared across gateway instances. Redis is the standard choice. Each client's bucket state is stored as a Redis hash with fields for token count and last refill timestamp. The gateway uses a Lua script or a Redis transaction to atomically check and consume tokens.
+
+```
+Redis key: ratelimit:{client_id}:{route_id}
+Fields:
+  tokens: 45           (remaining tokens)
+  last_refill: 1719876543  (unix timestamp)
+
+Lua script (pseudocode):
+  1. Read tokens and last_refill
+  2. Calculate elapsed time since last_refill
+  3. Add (elapsed * refill_rate) tokens, capped at capacity
+  4. If tokens >= 1: decrement, allow request
+  5. Else: reject request
+```
+
+### Connection Pool
+
+A connection pool stores established TCP connections to backend services. Instead of opening a new connection for each request (which adds the TCP handshake latency), the gateway reuses connections from the pool.
+
+The pool is a hash map keyed by (backend_host, backend_port). Each entry is a list of open connections. When the gateway needs to send a request to a backend, it checks the pool for an idle connection. If one exists, it uses it. If not, it opens a new connection, possibly evicting an old one.
+
+```
+Connection pool structure:
+{
+  "user-service:8080": [
+    {conn: TCP_socket_1, idle_since: 1719876543},
+    {conn: TCP_socket_2, idle_since: 1719876540},
+    {conn: TCP_socket_3, idle_since: 1719876535}
+  ],
+  "order-service:8080": [
+    {conn: TCP_socket_4, idle_since: 1719876542}
+  ]
+}
+```
+
+A well-configured connection pool has parameters for max connections per backend, idle timeout (how long an idle connection stays open), and connection TTL (max lifetime of a connection to prevent stale connections).
+
+## Request Lifecycle: Twelve Steps
+
+The full request lifecycle expands the ten-step model with two additional steps that matter in production.
+
+### Step 1: DNS Resolution
+
+Before the client even reaches the gateway, DNS resolves the gateway's hostname to an IP address. A global load balancer (like AWS Route53 or Cloudflare) can return different IPs based on the client's geographic region. This is the gateway's first line of geographic distribution.
+
+### Step 2: Global Load Balancing
+
+The client connects to a global load balancer (GLB). The GLB routes the connection to the nearest gateway cluster based on latency, health, and capacity. If the entire us-east-1 gateway cluster is down, the GLB routes us-east-1 clients to us-west-2.
+
+### Step 3: TLS Termination
+
+The gateway instance selected by the GLB performs the TLS handshake. It presents a certificate for the domain, negotiates the cipher suite, and establishes an encrypted session. The client's request is now decrypted and ready for processing.
+
+### Step 4: Connection Acceptance and Multiplexing
+
+The gateway's listener accepts the connection and registers it with the event loop. For HTTP/2 connections, the gateway handles multiplexing — multiple concurrent streams over the same TCP connection. Each stream carries one request.
+
+### Step 5: Request Parsing and Validation
+
+The gateway parses the HTTP request. It validates mandatory headers, content-length, and content-type. If the request body is JSON, it may do a quick structural check. Malformed requests are rejected early with a 400 response.
+
+### Step 6: Pre-Routing Middleware
+
+The request enters the middleware chain. The order matters:
+1. IP allowlisting/denylisting — reject known bad actors
+2. Rate limiting — check and consume token
+3. Authentication — validate JWT or API key
+4. Authorization — check permissions
+5. Request logging — record the raw request for audit
+6. Request transformation — add/remove/modify headers and body
+
+Any middleware can short-circuit the chain by returning a response directly (for example, rate limiter returns 429).
+
+### Step 7: Route Matching
+
+The router walks the routing trie to find the best matching route. It extracts path parameters (for example, :id = "12345") and query parameters. If no route matches, the gateway returns 404.
+
+The matched route provides:
+- Target service name
+- Required plugins (per-route middleware)
+- Timeout and retry configuration
+- Circuit breaker thresholds
+
+### Step 8: Service Discovery
+
+The gateway resolves the target service name to a set of available instances. In Kubernetes, this means a DNS lookup against the cluster's DNS (CoreDNS). In a service mesh, the gateway queries the control plane's service registry (Consul, etcd, or Eureka). The result is a list of healthy IP:port pairs.
+
+### Step 9: Load Balancing
+
+The load balancer selects one instance from the healthy list. The algorithm depends on configuration:
+- Round-robin: simple, no state required
+- Least-connections: route to the instance with fewest active connections
+- Consistent hashing: route based on a hash of the client ID (ensures a client always hits the same instance, useful for caching)
+
+### Step 10: Connection from Pool
+
+The gateway checks the connection pool for an idle connection to the selected instance. If found, it reuses it. If not, it opens a new connection and adds it to the pool.
+
+### Step 11: Backend Call with Circuit Breaker
+
+The gateway sends the request to the backend instance. It monitors the response time and status code. If the call fails (timeout or 5xx), the circuit breaker records a failure. If the failure rate exceeds the threshold, the circuit opens.
+
+When the circuit is open:
+- No requests are sent to the backend
+- The gateway immediately returns a fallback response (cached data or a 503 with explanation)
+- After a cooldown period (typically 30 seconds), the circuit transitions to half-open
+- In half-open, the gateway probes the backend with a single request
+- If the probe succeeds, the circuit closes (traffic resumes)
+- If the probe fails, the circuit reopens for another cooldown
+
+### Step 12: Response Transformation and Return
+
+The gateway processes the backend response:
+1. Remove internal headers (X-Internal-Call, X-Backend-Version)
+2. Add response headers (X-Request-Id, X-RateLimit-Remaining)
+3. Compress the body (gzip if the client accepts it)
+4. Add CORS headers if applicable
+5. Log the response (status, latency, size)
+6. Write the response to the client over the TLS connection
+7. Return the connection to the connection pool (if keep-alive) or close it
+
+<AsciiDiagram
+  id="api-gateway/lifecycle-steps"
+  title="Complete Request Lifecycle Through the Gateway"
+  alt="Flow diagram showing all twelve steps from DNS to response"
+  caption="The twelve steps of a request through the API gateway"
+  content={`
+┌────────────┐
+│ 1. DNS     │  Client resolves gateway hostname
+│ Resolution │  → Global LB IP
+└─────┬──────┘
+      ▼
+┌────────────┐
+│ 2. Global  │  GLB routes to nearest gateway
+│ Load Bal.  │  → us-east-1a cluster
+└─────┬──────┘
+      ▼
+┌────────────┐
+│ 3. TLS     │  Gateway presents certificate
+│ Terminate  │  → Decrypted request
+└─────┬──────┘
+      ▼
+┌────────────┐
+│ 4. Accept  │  Event loop registers connection
+│ & Mux      │  → Stream assigned
+└─────┬──────┘
+      ▼
+┌────────────┐
+│ 5. Parse   │  Validate headers, body, method
+│ & Validate │  → Structured request object
+└─────┬──────┘
+      ▼
+┌────────────┐
+│ 6. Pre-    │  IP filter → Rate limit → Auth →
+│ Route MW   │  Authz → Log → Transform
+└─────┬──────┘
+      ▼
+┌────────────┐
+│ 7. Route   │  Trie walk: /v2/users/123 → user-svc
+│ Match      │  → Route config object
+└─────┬──────┘
+      ▼
+┌────────────┐
+│ 8. Service │  DNS / Consul → [ip1:port, ip2:port]
+│ Discovery  │  → Healthy instance list
+└─────┬──────┘
+      ▼
+┌────────────┐
+│ 9. Load    │  Select instance-02 via round-robin
+│ Balancing  │  → target = 10.0.1.5:8080
+└─────┬──────┘
+      ▼
+┌────────────┐
+│ 10. Pool   │  Reuse existing TCP connection
+│ Checkout   │  → conn from pool
+└─────┬──────┘
+      ▼
+┌────────────┐
+│ 11. Call   │  Forward request → monitor status
+│ + Circuit  │  → Response or fallback
+└─────┬──────┘
+      ▼
+┌────────────┐
+│ 12. Resp.  │  Transform → Compress → Log →
+│ Process    │  Send to client
+└────────────┘
+`} />
+
+## Consistency and State
+
+An API gateway sits in a fascinating position regarding consistency. It is stateless for request processing but stateful for configuration and rate limiting.
+
+### Stateless Request Path
+
+The actual request forwarding — parsing, routing, transforming, and responding — requires no local state. Any gateway instance can handle any request. This is what makes horizontal scaling trivial. You can add instances behind the load balancer without any data migration.
+
+### Stateful Configuration
+
+The gateway's configuration (routes, plugins, rate limits, upstreams) must be consistent across all instances. A route added to one instance must be visible to all instances. This requires a configuration store.
+
+The two approaches are:
+
+**Embedded database (Kong):** The gateway process reads configuration from a database (PostgreSQL or Cassandra). Configuration changes are written to the database and propagated to all gateway instances via change tracking or periodic polling.
+
+**File-based with hot reload (Envoy):** The gateway reads configuration from a file or a management server. When the configuration changes, the management server pushes the new config to all instances via xDS protocols. No database is involved.
+
+### Distributed Rate Limiter State
+
+Rate limiter state (token counts, timestamps) is shared across gateway instances via Redis. The consistency model is eventual consistency with small windows of inaccuracy. If two gateway instances process the same client's requests simultaneously, both may read the same token count and allow both requests, briefly exceeding the limit by a small margin.
+
+This is acceptable for rate limiting. An occasional 5 percent overage is better than the latency cost of strong consistency (which would require a distributed lock on every request).
+
+<AsciiDiagram
+  id="api-gateway/state-model"
+  title="State Model of an API Gateway"
+  alt="Diagram showing stateless request path alongside stateful configuration and rate limiter stores"
+  caption="The gateway combines a stateless request path with stateful configuration and rate limiting"
+  content={`
+┌────────────────────────────────────────────────────┐
+│              API GATEWAY INSTANCE                    │
+│                                                      │
+│  ┌──────────────────────────────────────────────┐   │
+│  │        STATELESS REQUEST PATH                  │   │
+│  │  Parse → Auth → RateCheck → Route → Call     │   │
+│  │  (no local state needed — any instance)       │   │
+│  └──────────────────────────────────────────────┘   │
+│                                                      │
+│  ┌──────────────┐  ┌──────────────────────────┐    │
+│  │ Local Cache  │  │ Local Rate Limiter      │    │
+│  │ (routes,     │  │ (hot paths only)         │    │
+│  │  plugins)    │  │                          │    │
+│  └──────┬───────┘  └──────────┬───────────────┘    │
+└─────────┼────────────────────┼─────────────────────┘
+          │                    │
+          │ sync               │ sync
+          ▼                    ▼    (Lua scripts)
+┌──────────────────┐   ┌────────────────────┐
+│  Config Store    │   │  Redis Cluster     │
+│  (PostgreSQL /   │   │  (Rate limit       │
+│   Consul / xDS)  │   │   counters)        │
+│  Strong          │   │  Eventually        │
+│  consistency     │   │  consistent        │
+└──────────────────┘   └────────────────────┘
+                          ▲
+                          │
+                      ┌───┴──────────┐
+                      │  Gateway B   │
+                      │  (same Redis) │
+                      └──────────────┘
+`} />
+
+## Performance Characteristics
+
+An API gateway adds latency to each request. The question is how much. A well-tuned gateway adds under 5 milliseconds of overhead for a typical request with no aggregation. An aggregation request that calls five services in parallel adds the gateway's overhead plus the slowest service's response time.
+
+### Latency Budget
+
+```
+Request flow                    Latency contribution
+──────────────────────────────────────────────────
+TLS handshake (per connection)  30-150 ms (one-time)
+Request parsing                 0.1-0.5 ms
+Rate limiter check              0.5-2 ms (Redis call)
+Authentication                  0.5-3 ms (JWT decode)
+Route matching                  0.01-0.05 ms (trie walk)
+Connection pool checkout        0.01-0.02 ms
+Backend call (network)          1-5 ms (same region)
+Response processing             0.1-0.3 ms
+──────────────────────────────────────────────────
+Total (backend excluded)        1.2-6 ms per request
+```
+
+The gateway overhead is small compared to the backend service's processing time. If your backend service takes 100 ms, the gateway adds roughly 2 percent to the total latency. The trade-off is favorable: you pay 2 percent latency for centralized auth, rate limiting, routing, and monitoring across all services.
+
+### Throughput
+
+A single gateway instance on modest hardware (4 CPU cores, 8 GB RAM) handles 10,000 to 50,000 requests per second. The bottleneck is almost never the gateway itself — it is the backend services or the network.
+
+The key throughput numbers:
+- TLS handshake: 5,000-15,000 per second per core (depends on cipher suite)
+- HTTP request parsing: 100,000+ per second per core
+- Route matching: 500,000+ per second per core
+- JSON body transformation: 20,000-50,000 per second per core
+
+### Memory Profile
+
+A gateway instance's memory usage depends on connection count:
+- Per idle connection: 2-5 KB
+- Per active connection: 10-50 KB (buffer for request/response body)
+- Per route: 0.5-2 KB (trie node)
+- Per rate limiter bucket: negligible (only when accessed)
+
+For 10,000 concurrent connections and 500 routes:
+```
+Connections:  10,000 × 5 KB   = 50 MB
+Routes:       500 × 2 KB      = 1 MB
+Buffers:      1,000 × 50 KB   = 50 MB (active requests)
+Runtime:                      = 50 MB (heap, code)
+Total:                        ≈ 150 MB
+```
+
+A gateway instance with 256 MB of memory handles 10,000 concurrent connections comfortably.
+
+## Configuration Anatomy
+
+A production gateway has hundreds of configuration parameters. Understanding the key configuration groups helps you reason about gateway behavior.
+
+### Listener Configuration
+
+```yaml
+listeners:
+  - protocol: HTTPS
+    port: 443
+    tls_certificate: /etc/certs/gateway.pem
+    tls_key: /etc/certs/gateway.key
+    http2: true
+  - protocol: HTTP
+    port: 8080
+    # internal health checks only
+```
+
+The listener tells the gateway which ports to bind to and which protocols to accept. Most production gateways bind port 443 for client traffic and port 8080 for internal health checks (no TLS overhead needed).
+
+### Route Configuration
+
+```yaml
+routes:
+  - id: get-user
+    methods: [GET]
+    paths: ["/users/:id"]
+    plugins:
+      - name: rate-limiter
+        config:
+          capacity: 100
+          refill_rate: 10
+      - name: jwt-auth
+        config:
+          required: true
+    upstream:
+      service: user-service
+      port: 8080
+      timeout_ms: 5000
+      retries: 2
+```
+
+Each route specifies the matching criteria, the plugins to apply, and the upstream service to call. Routes can also specify per-route timeouts, retry policies, and circuit breaker thresholds.
+
+### Upstream Configuration
+
+```yaml
+upstreams:
+  - name: user-service
+    algorithm: round-robin
+    health_checks:
+      active:
+        path: /health
+        interval_ms: 5000
+        timeout_ms: 2000
+      passive:
+        failures: 5
+        cooldown_ms: 30000
+    instances:
+      - host: 10.0.1.5
+        port: 8080
+        weight: 100
+      - host: 10.0.1.6
+        port: 8080
+        weight: 100
+```
+
+The upstream configuration defines the backend service instances and how the gateway should manage connections to them. Active health checks ping the /health endpoint every 5 seconds. Passive health checks track failures during normal request processing.
+
+### Global Plugin Configuration
+
+```yaml
+plugins:
+  - name: cors
+    config:
+      allowed_origins: ["https://app.example.com"]
+      allowed_methods: ["GET", "POST", "PUT", "DELETE"]
+  - name: logging
+    config:
+      format: json
+      fields: [request_id, method, path, status, latency]
+  - name: ip-restriction
+    config:
+      deny: ["10.0.0.0/8"]  # block internal IPs from external
+```
+
+Global plugins apply to every request. Route-level plugins override or extend global plugins for specific routes.
+
+## Connection Handling and Backpressure
+
+A gateway that cannot handle backpressure will crash under load. Backpressure is the mechanism by which a system communicates its capacity to its clients.
+
+### Request Queuing
+
+When all gateway worker threads are busy, incoming requests are queued in the kernel's TCP backlog. The size of this backlog is configurable. If the queue fills up, the kernel starts dropping new connections.
+
+A well-configured gateway has a generous backlog (1024 or more) and monitors the queue depth. If the queue depth exceeds a threshold, the gateway starts returning 503 Service Unavailable for new requests, signaling the client to back off.
+
+### Connection Draining
+
+When a gateway instance needs to shut down (deployment, scaling down), it enters draining mode. The gateway stops accepting new connections but continues processing existing ones. This prevents in-flight requests from being dropped.
+
+The draining timeout is typically 30-60 seconds. After the timeout, remaining connections are forcibly closed. The client is responsible for retrying.
+
+<AsciiDiagram
+  id="api-gateway/backpressure"
+  title="Backpressure and Connection Draining"
+  alt="Diagram showing request queuing and connection draining during gateway shutdown"
+  caption="How the gateway manages backpressure and graceful shutdown"
+  content={`
+NORMAL OPERATION:
+┌────────────┐   ┌────────────┐   ┌──────────────────────┐
+│ Requests   │──▶│ TCP        │──▶│ Worker Threads       │
+│ (300/sec)  │   │ Backlog    │   │ (4 threads, 250 each)│
+│            │   │ (queue=0)  │   │ Processing...         │
+└────────────┘   └────────────┘   └──────────────────────┘
+
+UNDER LOAD (queue building):
+┌────────────┐   ┌────────────┐   ┌──────────────────────┐
+│ Requests   │──▶│ TCP        │──▶│ Worker Threads       │
+│ (2000/sec)  │   │ Backlog    │   │ (4 threads, 200% util)│
+│            │   │ (queue=40) │   │ ▲ ▲ ▲ ▲               │
+└────────────┘   └────────────┘   └──────────────────────┘
+                         │
+                         ╚══▶ 503 responses when queue > threshold
+
+DRAINING (graceful shutdown):
+┌────────────┐   ┌────────────┐   ┌──────────────────────┐
+│ No new     │   │ Drain chan │   │ Finish in-flight     │
+│ requests   │──▶│ (no accept)│──▶│  → drain timeout 30s │
+│            │   │            │   │  → force close        │
+└────────────┘   └────────────┘   └──────────────────────┘
+`} />
+
+## Plugin Architecture
+
+Most production gateways support a plugin system. Plugins are self-contained modules that hook into the request lifecycle.
+
+### Plugin Lifecycle Hooks
+
+```
+Plugins can hook at multiple points:
+  ┌─ cert      ─┐
+  │─ rewrite   ─┤  Rewrite URL before route matching
+  │─ access    ─┤  Authenticate, rate limit, transform
+  │─ response  ─┤  Transform response body
+  │─ log       ─┤  Log request after response sent
+  │─ timer     ─┘  Periodic cleanup tasks
+```
+
+Each hook fires at the corresponding lifecycle stage. A plugin implementing the access hook runs after route matching but before the backend call. A plugin implementing the log hook runs after the response is sent.
+
+### Plugin Isolation
+
+In a multi-tenant gateway (one gateway serving multiple teams or products), plugins must be isolated. A buggy plugin for team A's routes must not crash the gateway for team B's routes.
+
+Isolation strategies:
+- Process-level isolation: Each tenant gets its own gateway process or container
+- Plugin sandboxing: The gateway runs plugins in a sandboxed environment (Lua sandbox in Kong, WASM in Envoy)
+- Fault boundaries: A plugin crash should only affect the current request, not the entire process
+
+### Common Plugin Examples
+
+<AsciiDiagram
+  id="api-gateway/plugin-chain"
+  title="Plugin Middleware Chain in the Gateway"
+  alt="Diagram showing plugins running in order during the access and response phases of the request lifecycle"
+  caption="Plugins hook into the request lifecycle at access, response, and log phases"
+  content={`
+  REQUEST FLOW:
+
+  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │   IP     │  │  Rate    │  │   JWT    │  │ Request  │  │  Route   │
+  │  Filter  │─▶│ Limiter  │─▶│   Auth   │─▶│Transform │─▶│  Match   │
+  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘
+       │             │             │             │
+       │ (denied)    │ (429)       │ (401)       │
+       ▼             ▼             ▼             │
+     Return        Return        Return         │
+      403            429           401           │
+                                                 ▼
+                                        ┌────────────────┐
+                                        │  Backend Call  │
+                                        └────────────────┘
+                                                 │
+  RESPONSE FLOW:                                 ▼
+  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │ Response │  │ Compress │  │   CORS   │
+  │Transform │◀─│   Body   │◀─│  Headers │◀─ Response
+  └──────────┘  └──────────┘  └──────────┘
+
+  LOG FLOW (after response sent):
+  ┌──────────┐  ┌──────────┐
+  │  Access  │  │  Audit   │
+  │   Log    │──│   Log    │
+  └──────────┘  └──────────┘
+`} />
+
+**Rate Limiter Plugin:**
+```
+access hook:
+  1. Read client_id from header
+  2. Increment Redis counter for this client+route
+  3. If counter > limit → return 429
+  4. Add X-RateLimit-* headers to upstream request
+```
+
+**JWT Auth Plugin:**
+```
+access hook:
+  1. Extract token from Authorization header
+  2. Decode token, verify signature with JWKS
+  3. If invalid/expired → return 401
+  4. Set X-User-Id header from token claims
+```
+
+**Request Transformer Plugin:**
+```
+access hook:
+  1. Add X-Request-Id header (UUID)
+  2. Remove X-Forwarded-For header
+  3. Add X-Real-Ip header from connection
+
+response hook:
+  1. Remove X-Internal headers
+  2. Add Content-Security-Policy header
+  3. Compress body if Accept-Encoding: gzip
+```
+
+## Hot Path and Cold Path
+
+A gateway has two execution paths with vastly different performance characteristics.
+
+### Hot Path
+
+The hot path is the critical path for every request. It includes the minimum operations required to forward a request: parsing headers, route matching, connection pool checkout, and writing the response.
+
+<AsciiDiagram
+  id="api-gateway/hot-cold-path"
+  title="Hot Path vs Cold Path Operations"
+  alt="Diagram comparing hot path operations that run on every request versus cold path operations that run infrequently"
+  caption="The hot path handles every request. The cold path handles configuration and maintenance tasks."
+  content={`
+  ┌────────────────────────────────────────────────────────────────┐
+  │                    HOT PATH (per request)                       │
+  │                                                                │
+  │  Parse ──▶ Route Match ──▶ Pool Checkout ──▶ Call ──▶ Respond │
+  │  Headers     O(k) trie     O(1) lookup       Backend  O(1)    │
+  │  O(1)                                                         │
+  │                                                                │
+  │  Requirements:                                                 │
+  │  • O(1) or O(log n) operations only                           │
+  │  • No dynamic memory allocation                                │
+  │  • No lock contention                                          │
+  │  • Pre-allocated buffers                                       │
+  │  • Under 5 ms total                                            │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────────┐
+  │                    COLD PATH (infrequent)                       │
+  │                                                                │
+  │  Config Reload ──▶ Trie Rebuild ──▶ Plugin Init ──▶ Health    │
+  │  Every 30s         O(routes)        O(plugins)     Check      │
+  │                                                      │        │
+  │  Requirements:                                         │        │
+  │  • Can be slower (100ms+ is fine)                     ▼        │
+  │  • Can allocate memory                         Stats         │
+  │  • Must not block hot path                    Aggregation    │
+  │  • Runs on separate thread                                  │
+  └────────────────────────────────────────────────────────────────┘
+`} />
+
+All operations on the hot path must be O(1) or O(log n). The gateway avoids dynamic memory allocation on the hot path. Buffers are pre-allocated and reused. Lock contention is minimized.
+
+### Cold Path
+
+The cold path includes operations that happen infrequently: configuration reload, plugin initialization, health check probes, and statistics aggregation.
+
+Cold path operations can be slower and more resource-intensive because they do not affect request latency. Configuration reload might rebuild the entire routing trie (O(routes)), but this happens only when configuration changes, not on every request.
+
+The separation between hot and cold paths is the key design principle that lets gateways handle high throughput while supporting rich features.
+
+## Summary
+
+An API gateway's internal architecture consists of a listener, connection pool, middleware chain, router, load balancer, circuit breaker, and response processor. Each component plays a specific role in the request lifecycle. The core data structures — routing trie, token bucket, and connection pool — determine the gateway's performance characteristics.
+
+The gateway is stateless on the request path (making horizontal scaling trivial) but stateful for configuration and rate limiting. Configuration uses strong consistency stores like PostgreSQL or xDS. Rate limiting uses eventual consistency with Redis, tolerating small overages for lower latency.
+
+A well-tuned gateway adds under 5 milliseconds of overhead per request while handling 10,000 to 50,000 requests per second on modest hardware. The latency cost is small compared to the benefits of centralized cross-cutting concerns.

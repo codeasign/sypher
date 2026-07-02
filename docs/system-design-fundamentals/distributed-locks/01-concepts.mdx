@@ -1,0 +1,989 @@
+﻿---
+id: distributed-locks-concepts
+title: Understanding Distributed Locks
+position: 1
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Problem Story
+
+A payment processing company runs a job scheduler across 12 servers. Every 30 seconds, each server polls a shared database for pending payment batches. The job scheduler uses a table called `scheduled_jobs` with a `status` column of `pending`, `running`, or `completed`. When a server finds a pending job, it updates the status to `running` and starts processing.
+
+One Tuesday at 2:47 PM, two servers — Server 7 and Server 9 — both poll the database within 3 milliseconds of each other. Both see the same job with status `pending`. Both update the status to `running`. Both start processing the same batch of 847 payments.
+
+The payments are idempotent on the payment gateway side, but the accounting system is not. The company's general ledger shows 847 duplicate entries. The finance team spends 3 days reconciling. The cost: 847 duplicate payment gateway fees at $0.29 each, plus 72 hours of accountant time, plus a compliance audit triggered by the discrepancy.
+
+This is the problem that distributed locks solve. Without a lock, any system with multiple workers and shared state will eventually process the same work twice — or worse, corrupt shared data through concurrent writes.
+
+The same problem appears in many forms. A cache rebuilding job that runs on every node simultaneously, flooding the database with identical queries. A leader election mechanism where two nodes both believe they are the leader, sending conflicting commands. A file processing pipeline where two workers fetch the same file from S3 and write duplicate results to the output bucket.
+
+A single-server mutex with `synchronized` or `Lock` cannot help here. The servers do not share a heap, a process tree, or a JVM. They run on different physical machines, potentially in different availability zones. The lock must live outside any single server, accessible to all participants over the network.
+
+## The Insight
+
+**A distributed lock is a mechanism that prevents multiple distributed processes from accessing the same resource simultaneously.**
+
+Think of a bathroom key at a gas station. There is one key, attached to a large wooden block. To use the restroom, you take the key from the counter. While you hold the key, no one else can use the restroom. When you return the key, the next person can take it. If you walk away with the key (crash), the attendant has a spare (TTL / lease) to unblock the situation.
+
+The key represents the lock. The restroom represents the protected resource. The wooden block ensures you do not walk away with the key (it is too bulky to fit in a pocket). The spare key in the drawer represents the timeout mechanism that prevents indefinite blocking.
+
+In distributed systems, the lock service replaces the attendant. The lock key is a record in Redis, ZooKeeper, etcd, or a database. The TTL replaces the spare key. The protected resource could be a database row, a file, a queue, a critical section of code, or a leadership role.
+
+A distributed lock must satisfy three properties:
+
+- **Safety**: No two processes hold the lock simultaneously. This is the non-negotiable property. If the lock ever allows two processes to believe they hold it simultaneously, the system is broken.
+- **Liveness**: The lock must eventually become available if the holder crashes. A lock that can never be released is worse than no lock.
+- **Fault tolerance**: The lock service must survive individual node failures. If the lock service goes down, all protected operations must stop.
+
+## Core Vocabulary
+
+**Distributed lock**: A synchronization primitive that enforces exclusive access to a shared resource across multiple machines connected by a network. Each process must acquire the lock before accessing the resource and release it afterward. The lock lives in a shared service that all participants can reach.
+
+**Mutex**: A mutual exclusion object that prevents multiple threads or processes from entering a critical section simultaneously. A distributed mutex is the same concept extended across network boundaries. The term comes from operating systems, where mutexes protect shared memory. In distributed systems, the mutex protects shared resources rather than shared memory.
+
+**Lock acquisition**: The operation a process performs to obtain the lock. Acquisition must be atomic — two processes cannot both receive the lock. In Redis, this is `SET resource random_value NX PX 30000`. In ZooKeeper, it is creating an ephemeral sequential znode. In MySQL, it is `SELECT ... FOR UPDATE`. The key constraint is atomicity: the lock service must decide which process gets the lock without ambiguity.
+
+**Lock release**: The operation a process performs to give up the lock. The holder sends a release request to the lock service, which removes the lock record so another process can acquire it. Release must be safe — only the holder should be able to release. If process A can release process B's lock, the lock is useless. This is why lock values include a unique identifier that the release operation must match.
+
+**Lock expiry / TTL**: A time-to-live duration attached to every lock. If the holder does not renew the lock before the TTL expires, the lock service automatically releases it. This prevents infinite blocking if the holder crashes. The TTL must be long enough for the critical operation to complete, but short enough that a crashed holder does not block the system for long. Typical TTLs range from 500ms to 30 seconds depending on the operation.
+
+**Lease**: A time-bound lock that must be periodically renewed. The holder sends heartbeat requests to extend the lease. If the heartbeat stops, the lease expires and the lock is released. Leases are stronger than simple TTLs because the holder can detect lease expiry proactively (by checking the heartbeat response) and abort the operation. Leases are the foundation of the Chubby lock service and etcd concurrency primitives.
+
+**Fencing token**: A monotonically increasing number that the lock service assigns to each lock acquisition. The fencing token is sent to the resource being protected (e.g., the database or file system). The resource checks that only the latest token is allowed to write. This prevents the delayed-writer problem where a process that held the lock, then paused (GC pause), then resumed after the lock expired, writes to the resource with a stale token. Fencing tokens are the only way to guarantee safety in the presence of clock drift and process pauses.
+
+**Reentrant lock**: A lock that can be acquired multiple times by the same process without blocking. The lock service tracks how many times the holder has acquired the lock. Each acquisition increments a counter; each release decrements it. The lock is truly released only when the counter reaches zero. Reentrant locks prevent deadlocks when a function calls another function that acquires the same lock. Most distributed lock implementations are not reentrant, because the overhead of tracking per-process acquisition counts is significant.
+
+**Deadlock**: A state where two or more processes each hold a lock and wait for the other to release, causing all to block indefinitely. Deadlock in distributed systems is harder to detect than in single-process systems because the lock service cannot inspect the processes' state. Prevention strategies include lock ordering (always acquire locks in the same order), TTLs (so locks auto-release), and timeout-based retry with backoff.
+
+**Livelock**: A state where processes repeatedly acquire and release locks without making progress. Each process detects that another process holds the desired lock, releases its own locks, and retries. The retry timing causes them to collide again. Livelock differs from deadlock in that the processes are active — they just cannot make forward progress. Random backoff and jitter in retry intervals prevent livelock.
+
+**Lock contention**: A measure of how many processes are waiting for a lock at any given time. High contention means many processes are blocked, reducing throughput. Contention is measured by the number of failed acquisition attempts per second and the average wait time. High contention suggests the lock granularity is too coarse (locking the entire table instead of a row) or the critical section is too slow.
+
+**Spin lock**: A lock where the process repeatedly polls the lock service until the lock is acquired, rather than going to sleep or switching to other work. Spin locks waste CPU cycles on polling and generate load on the lock service. They are acceptable only when the expected wait time is very short (microseconds). In distributed systems, spin locks are rarely appropriate because the network round trip for each poll is 1-10ms, making the CPU waste enormous.
+
+**Optimistic lock**: A strategy where the process reads the current state, performs the operation locally, and then attempts to commit with a version check. If the version changed, the operation fails and retries. Optimistic locking does not hold a lock during the operation. It works well for low-contention scenarios. Distributed locks are pessimistic — they hold the lock during the operation.
+
+## Big Picture
+
+<AsciiDiagram
+  id="distributed-locks/big-picture"
+  title="Distributed Lock System Architecture"
+  alt="Multiple application servers attempting to acquire a lock from a central lock service, with one server succeeding and accessing the protected resource"
+  caption="One server acquires the lock; all others wait" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        DISTRIBUTED LOCK SYSTEM                               │
+│                                                                             │
+│                     ┌─────────────────────────────────┐                     │
+│                     │         Lock Service             │                     │
+│                     │  ┌───────────────────────────┐  │                     │
+│                     │  │    Lock Registry           │  │                     │
+│                     │  │  ┌──────────────┐         │  │                     │
+│                     │  │  │ resource_A   │         │  │                     │
+│                     │  │  │ owner: svr_7 │         │  │                     │
+│                     │  │  │ ttl: 30s     │         │  │                     │
+│                     │  │  │ token: 1042  │         │  │                     │
+│                     │  │  └──────────────┘         │  │                     │
+│                     │  └───────────────────────────┘  │                     │
+│                     │  ┌───────────────────────────┐  │                     │
+│                     │  │    Lease Manager          │  │                     │
+│                     │  │  ┌──────────────────┐     │  │                     │
+│                     │  │  │ svr_7: heartbeat │     │  │                     │
+│                     │  │  │ next check in 5s │     │  │                     │
+│                     │  │  └──────────────────┘     │  │                     │
+│                     │  └───────────────────────────┘  │                     │
+│                     │  ┌───────────────────────────┐  │                     │
+│                     │  │    Token Generator         │  │                     │
+│                     │  │    next_token: 1043        │  │                     │
+│                     │  └───────────────────────────┘  │                     │
+│                     └─────────────────────────────────┘                     │
+│                              │                                                │
+│    ┌─────────────────────────┼─────────────────────────┐                    │
+│    │                         │                         │                    │
+│    ▼                         ▼                         ▼                    │
+│ ┌──────────┐           ┌──────────┐             ┌──────────┐               │
+│ │ App Svr 7│           │ App Svr 9│             │App Svr 12│               │
+│ │ LOCK:    │           │ LOCK:    │             │ LOCK:    │               │
+│ │ HELD  ✓  │           │ WAITING  │             │ WAITING  │               │
+│ │          │           │          │             │          │               │
+│ │ token:   │           │ retry:   │             │ retry:   │               │
+│ │ 1042     │           │ 500ms    │             │ 1200ms   │               │
+│ └─────┬────┘           └──────────┘             └──────────┘               │
+│       │                                                                     │
+│       ▼                                                                     │
+│ ┌──────────────────────────────────────────────────────┐                   │
+│ │              Protected Resource                       │                   │
+│ │  ┌────────────────────────────────────────────────┐  │                   │
+│ │  │  Database: payments table                       │  │                   │
+│ │  │  Batch #847: processing by svr_7, token 1042   │  │                   │
+│ │  └────────────────────────────────────────────────┘  │                   │
+│ └──────────────────────────────────────────────────────┘                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## How It Works
+
+The distributed lock lifecycle follows a precise sequence of operations. Each step must be atomic and safe against concurrent access.
+
+### Step 1: Lock Request
+
+The application process sends a lock acquisition request to the lock service. The request includes the resource identifier (what to lock), a unique owner identifier (who is requesting), and the desired TTL. The lock service validates the request — the resource identifier must exist in the lock registry, and the owner identifier must be unique.
+
+### Step 2: Atomic Check-and-Set
+
+The lock service checks whether the resource is already locked. If it is not locked, the service creates a lock record with the owner identifier and TTL. If it is locked by another owner, the service returns a failure response. The check-and-set must be atomic — no other request can interleave between the check and the set. In Redis, this is achieved with `SET resource value NX PX TTL`. In ZooKeeper, it is the atomic creation of an ephemeral znode.
+
+### Step 3: Token Assignment
+
+The lock service assigns a fencing token — a monotonically increasing 64-bit integer. Token 1042 is assigned to the current lock acquisition. The next acquisition gets token 1043, regardless of which resource is being locked. The token is returned to the holder along with the lock grant.
+
+### Step 4: Lock Grant
+
+The lock service returns a success response to the holder. The response includes the fencing token and the TTL duration. The holder now holds the lock and can proceed to access the protected resource.
+
+### Step 5: TTL Timer Starts
+
+The lock service starts a timer for the TTL duration. If the TTL expires without a renewal, the lock service will automatically release the lock. The TTL is a safety mechanism — if the holder crashes, the lock is released after the TTL, allowing another process to acquire it.
+
+### Step 6: Access Protected Resource
+
+The holder accesses the protected resource. It sends the fencing token along with the access request. The resource checks the fencing token — if the token is the latest seen, the request is processed. If the token is stale (an older token than the latest), the resource rejects the request.
+
+### Step 7: Periodic Lease Renewal
+
+The holder sends periodic heartbeat or renewal requests to the lock service. Each renewal extends the TTL by the original duration. The renewal interval is typically one-third of the TTL — for a 30-second TTL, the holder renews every 10 seconds. This gives the holder time to retry if a renewal request fails.
+
+### Step 8: Lock Release
+
+When the holder completes the operation, it sends a release request to the lock service. The release request includes the resource identifier, owner identifier, and fencing token. The lock service verifies that the requesting process is the current holder. If verified, the lock service removes the lock record.
+
+### Step 9: Wait Queue Notification
+
+The lock service notifies waiting processes that the lock is available. In ZooKeeper, this is a watch event on the lock znode. In Redis, waiting processes poll the lock key. The notification triggers the next waiting process to attempt acquisition.
+
+### Step 10: Next Process Acquires
+
+The next waiting process sends a lock acquisition request. The process repeats from Step 1. The new process receives a new fencing token, higher than the previous token.
+
+<AsciiDiagram
+  id="distributed-locks/lifecycle-sequence"
+  title="Distributed Lock Lifecycle Sequence"
+  alt="A sequence diagram showing the full lifecycle of a distributed lock: request, grant, resource access, renewal, and release"
+  caption="The complete lifecycle of a distributed lock from acquisition through release" content={`
+    ┌──────────┐         ┌──────────────┐         ┌──────────────────┐
+    │  Holder  │         │ Lock Service │         │ Protected Resource│
+    │ Process  │         │              │         │                  │
+    └────┬─────┘         └──────┬───────┘         └────────┬─────────┘
+         │                      │                          │
+         │ 1. Acquire Lock     │                          │
+         │ ──────────────────> │                          │
+         │                     │                          │
+         │ 2. Check registry   │                          │
+         │                     │                          │
+         │ 3. Assign token     │                          │
+         │                     │                          │
+         │ 4. Lock granted     │                          │
+         │ <────────────────── │                          │
+         │  token=1042, ttl=30 │                          │
+         │                     │                          │
+         │ 5. Access resource  │                          │
+         │ ──────────────────────────────────────────────>│
+         │  token=1042         │                          │
+         │                     │                          │
+         │ 6. Validate token   │                          │
+         │                     │                          │
+         │ 7. Operation done   │                          │
+         │ <──────────────────────────────────────────────│
+         │                     │                          │
+         │ 8. Renew lock       │                          │
+         │ ──────────────────> │                          │
+         │  ttl extended       │                          │
+         │ <────────────────── │                          │
+         │                     │                          │
+         │ 9. Complete work    │                          │
+         │                     │                          │
+         │ 10. Release lock    │                          │
+         │ ──────────────────> │                          │
+         │                     │                          │
+         │ 11. Lock removed    │                          │
+         │                     │                          │
+         │ 12. Notify waiters  │                          │
+         │                     │                          │
+         │ 13. Next acquires   │                          │
+         │                     │                          │
+`} />
+
+### Lock State Transitions
+
+A lock can be in one of three states: FREE, HELD, or EXPIRED.
+
+<AsciiDiagram
+  id="distributed-locks/state-transitions"
+  title="Distributed Lock State Transitions"
+  alt="A state machine diagram showing transitions between FREE, HELD, and EXPIRED states with the events that trigger each transition"
+  caption="Lock state machine with transition events" content={`
+                  ┌──────────────┐
+        ┌────────>│              │
+        │         │    FREE      │
+        │         │              │<──────────┐
+        │         └──────┬───────┘           │
+        │                │                   │
+        │           acquire()           release() OR
+        │                │              ttl_expire()
+        │                ▼                   │
+        │         ┌──────────────┐           │
+        │         │              │───────────┘
+        └─────────│    HELD      │
+          renew() │              │
+                  └──────┬───────┘
+                         │
+                    ttl_expire()
+                         │
+                         ▼
+                  ┌──────────────┐
+                  │              │
+                  │   EXPIRED    │
+                  │              │
+                  └──────────────┘
+                       │    │
+                       │    └──────────────┐
+                       ▼                   ▼
+                  ┌──────────────┐  ┌──────────────┐
+                  │  Auto-      │  │  Detected by │
+                  │  released   │  │  next waiter │
+                  └──────────────┘  └──────────────┘
+`} />
+
+### Lock Acquisition with Contention
+
+When multiple processes contend for the same lock, the lock service must decide the order. The most common strategy is first-come, first-served using a queue.
+
+<AsciiDiagram
+  id="distributed-locks/contention-queue"
+  title="Lock Contention Queue"
+  alt="Three processes queued for a lock with the first process holding the lock and the next two in FIFO order"
+  caption="FIFO queue for lock contention resolution" content={`
+┌──────────────────────────────────────────────────────────────┐
+│                    Lock Queue for resource_A                   │
+│                                                               │
+│  ┌──────────┐     ┌──────────┐     ┌──────────┐             │
+│  │ Process 7│     │ Process 9│     │Process 12│             │
+│  │ ACTIVE   │     │ WAITING  │     │ WAITING  │             │
+│  │ token:   │     │ enqueued │     │ enqueued │             │
+│  │ 1042     │     │ 12:00:01 │     │ 12:00:03 │             │
+│  └────┬─────┘     └────┬─────┘     └────┬─────┘             │
+│       │                │                │                    │
+│       ▼                ▼                ▼                    │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  Lock Service                                         │   │
+│  │  resource_A → owner: process_7, ttl: 30s, token: 1042│   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                               │
+│  When process_7 releases:                                     │
+│  1. Lock removed from registry                                │
+│  2. Process 9 notified                                        │
+│  3. Process 9 acquires lock → token: 1043                     │
+│  4. Process 12 moves to front of queue                        │
+└──────────────────────────────────────────────────────────────┘
+`} />
+
+## Variants
+
+Different coordination services implement distributed locks with different trade-offs in consistency, performance, and complexity.
+
+### Redis-Based Locks (SETNX + TTL)
+
+Redis offers the simplest distributed lock implementation. A single command atomically sets a key only if it does not exist, with a TTL.
+
+```
+SET resource_key unique_owner_id NX PX 30000
+```
+
+The `NX` flag means "set only if the key does not exist." The `PX 30000` sets a 30-second TTL. If the command returns OK, the lock is acquired. If it returns nil, the lock is held by another process.
+
+Release uses a Lua script that checks the owner ID before deleting:
+
+```lua
+if redis.call("get",KEYS[1]) == ARGV[1] then
+    return redis.call("del",KEYS[1])
+else
+    return 0
+end
+```
+
+<AsciiDiagram
+  id="distributed-locks/redis-lock-flow"
+  title="Redis-Based Lock Acquisition"
+  alt="Sequence diagram showing Redis SETNX command for lock acquisition with TTL, and Lua script for safe release"
+  caption="Redis lock acquisition and release flow" content={`
+┌──────────┐                  ┌───────────┐
+│  Client  │                  │   Redis   │
+└────┬─────┘                  └─────┬─────┘
+     │                              │
+     │ SET resource KEY NX PX 30000 │
+     │ ────────────────────────────>│
+     │                              │
+     │ Key does not exist?          │
+     │ Check: YES                   │
+     │                              │
+     │ OK                           │
+     │ <────────────────────────────│
+     │                              │
+     │ ──── Lock held ────         │
+     │                              │
+     │ EVAL (release script)        │
+     │ ────────────────────────────>│
+     │                              │
+     │ GET resource → owner matches │
+     │ DEL resource                 │
+     │                              │
+     │ 1 (success)                  │
+     │ <────────────────────────────│
+     │                              │
+     │ ──── Lock released ────      │
+     │                              │
+`} />
+
+**When to use**: Redis locks are ideal for high-throughput scenarios where a brief window of lock overlap is acceptable. The simple SETNX approach is vulnerable to clock drift and GC pauses, but for non-critical operations (cache rebuilds, log rotation, non-critical job scheduling), it is fast and reliable.
+
+**When not to use**: Redis locks should not be used for operations that require strict mutual exclusion, such as financial transactions, resource allocation, or any scenario where two concurrent operations could cause data corruption. The single-master Redis approach has a window where the master fails after writing the key but before replicating it — the replica promotes and has no knowledge of the lock, allowing duplicate acquisitions.
+
+### ZooKeeper-Based Locks (Ephemeral Sequential Znodes)
+
+ZooKeeper implements distributed locks using ephemeral sequential znodes. The algorithm is more robust than Redis SETNX because ZooKeeper provides linearizable consistency through the Zab consensus protocol.
+
+The process creates an ephemeral sequential znode under a lock path, e.g., `/locks/resource_A/lock-0000001042`. The ephemeral flag means the znode is automatically deleted if the creating session disconnects. The sequential flag ensures unique, monotonically increasing names.
+
+The process then lists all children of the lock path. If its znode has the lowest sequence number, it holds the lock. Otherwise, it watches the preceding znode and waits for it to be deleted.
+
+<AsciiDiagram
+  id="distributed-locks/zookeeper-lock-flow"
+  title="ZooKeeper Lock Recipe"
+  alt="ZooKeeper znodes tree showing the lock path, ephemeral sequential znodes, and the watch mechanism between preceding and following waiters"
+  caption="ZooKeeper ephemeral sequential znode lock recipe" content={`
+┌──────────────────────────────────────────────────────┐
+│               ZooKeeper Namespace                     │
+│                                                       │
+│  /locks                                               │
+│    └── /resource_A                                   │
+│         ├── lock-0000001042  (Process 7 — HELD)     │
+│         ├── lock-0000001043  (Process 9 — WATCHING) │
+│         │                           │                │
+│         │                           │ watch          │
+│         │                           ▼                │
+│         │                      [delete event]        │
+│         └── lock-0000001044  (Process 12 — WATCHING) │
+│                                    │                  │
+│                                    │ watch            │
+│                                    ▼                  │
+│                               [delete event]          │
+│                                                       │
+│  Algorithm:                                           │
+│  1. Create /locks/resource_A/lock- ephemeral seq     │
+│  2. Get children of /locks/resource_A                │
+│  3. If my znode is lowest seq → lock acquired        │
+│  4. Else watch preceding znode, wait for delete      │
+│  5. On delete notification, retry step 2             │
+│                                                       │
+│  Session disconnect → ephemeral auto-deleted         │
+│  No clock drift needed                               │
+│  Linearizable consistency via Zab                    │
+└──────────────────────────────────────────────────────┘
+`} />
+
+**When to use**: ZooKeeper locks are appropriate for coarse-grained locking where consistency is paramount and lock acquisition latency of 10-50ms is acceptable. Use ZooKeeper for leader election, configuration management, and coordination of critical resources.
+
+**When not to use**: ZooKeeper locks are too slow for high-throughput scenarios (more than 100 lock acquisitions per second per path). The sequential znode creation and watch setup add latency. ZooKeeper also requires a minimum of three nodes for quorum, adding operational complexity.
+
+### etcd-Based Locks (Leases with TTL)
+
+etcd provides distributed locks through its concurrency package using leases and the Raft consensus protocol. The approach is similar to ZooKeeper but uses etcd's lease mechanism instead of ephemeral znodes.
+
+A client creates a lease with a TTL. The lease is a time-to-live contract — if the client does not refresh the lease before it expires, etcd automatically revokes it. The client then creates a key under the lock prefix with the lease attached. The key's auto-deletion on lease expiry provides the same safety as ZooKeeper's ephemeral nodes.
+
+```go
+// Go example using etcd concurrency package
+cli, _ := clientv3.New(clientv3.Config{Endpoints: []string{"localhost:2379"}})
+session, _ := concurrency.NewSession(cli, concurrency.WithTTL(10))
+mutex := concurrency.NewMutex(session, "/my-lock")
+mutex.Lock(context.TODO())
+// critical section
+mutex.Unlock(context.TODO())
+```
+
+<AsciiDiagram
+  id="distributed-locks/etcd-lock-flow"
+  title="etcd Lock with Leases"
+  alt="Sequence diagram showing etcd lease creation, lock key creation with lease attachment, periodic lease refresh, and release"
+  caption="etcd distributed lock using leases and Raft consensus" content={`
+┌──────────┐                  ┌───────────┐
+│  Client  │                  │   etcd    │
+└────┬─────┘                  └─────┬─────┘
+     │                              │
+     │ 1. Create lease (TTL 10s)   │
+     │ ────────────────────────────>│
+     │                              │
+     │ Lease ID: 0xdeadbeef        │
+     │ <────────────────────────────│
+     │                              │
+     │ 2. Create key with lease     │
+     │ PUT /locks/resource_A        │
+     │ value: client_7              │
+     │ lease: 0xdeadbeef            │
+     │ ────────────────────────────>│
+     │                              │
+     │ Created (via Raft consensus) │
+     │ <────────────────────────────│
+     │                              │
+     │ 3. Periodic lease refresh    │
+     │ ────────────────────────────>│
+     │ (every 3s, ttl=10s)         │
+     │ <────────────────────────────│
+     │                              │
+     │ 4. Release lock              │
+     │ DELETE /locks/resource_A     │
+     │ Revoke lease 0xdeadbeef     │
+     │ ────────────────────────────>│
+     │                              │
+     │ Released                     │
+     │ <────────────────────────────│
+     │                              │
+     │ On crash:                    │
+     │ lease expires after 10s     │
+     │ key auto-deleted by etcd    │
+     │ next waiter can acquire     │
+     │                              │
+`} />
+
+**When to use**: etcd locks are suitable for Kubernetes-native applications, service discovery, and leader election. The Raft consensus provides strong consistency. The lease mechanism is efficient and well-integrated with the etcd watch API.
+
+**When not to use**: etcd has similar limitations to ZooKeeper — higher latency than Redis (typically 5-10ms per operation) and lower throughput. The concurrency package is Go-specific; other languages require custom implementations.
+
+### Database-Based Locks (SELECT FOR UPDATE)
+
+Relational databases can implement distributed locks using row-level locking with `SELECT ... FOR UPDATE`. The lock record is a row in a database table. Acquiring the lock is a transaction that selects the row with `FOR UPDATE`, which blocks other transactions from selecting the same row.
+
+```sql
+BEGIN;
+SELECT * FROM locks WHERE resource_id = 'resource_A' FOR UPDATE;
+-- If we got here, we hold the lock
+UPDATE locks SET owner = 'process_7', acquired_at = NOW()
+WHERE resource_id = 'resource_A';
+COMMIT;
+```
+
+<AsciiDiagram
+  id="distributed-locks/db-lock-flow"
+  title="Database-Based Lock with SELECT FOR UPDATE"
+  alt="Two transactions attempting to SELECT FOR UPDATE on the same row, with the second transaction blocked until the first commits"
+  caption="Database row-level locking for distributed mutual exclusion" content={`
+┌──────────┐         ┌──────────────┐         ┌──────────┐
+│ Process 7│         │   Database   │         │ Process 9│
+└────┬─────┘         └──────┬───────┘         └────┬─────┘
+     │                      │                      │
+     │ BEGIN                │                      │
+     │ ────────────────────>│                      │
+     │                      │                      │
+     │ SELECT FOR UPDATE    │                      │
+     │ (resource_A)         │                      │
+     │ ────────────────────>│                      │
+     │                      │                      │
+     │ Row locked           │    BEGIN              │
+     │ ────────────────────>│    ──────────────────>│
+     │                      │                      │
+     │ UPDATE owner         │    SELECT FOR UPDATE  │
+     │ ────────────────────>│    (resource_A)       │
+     │                      │    ──────────────────>│
+     │                      │                      │
+     │ COMMIT               │    BLOCKED            │
+     │ ────────────────────>│    (waiting for lock) │
+     │                      │                      │
+     │ Row unlocked         │                      │
+     │                      │                      │
+     │                      │    SELECT FOR UPDATE │
+     │                      │    (now succeeds)    │
+     │                      │    ──────────────────>│
+     │                      │                      │
+     │                      │    Row locked         │
+     │                      │    ──────────────────>│
+     │                      │                      │
+     │                      │    UPDATE owner       │
+     │                      │    ──────────────────>│
+     │                      │                      │
+     │                      │    COMMIT             │
+     │                      │    ──────────────────>│
+     │                      │                      │
+`} />
+
+**When to use**: Database locks are appropriate when the application already uses a relational database and the lock rate is low (fewer than 10 acquisitions per second). No additional infrastructure is required. The lock is automatically released if the database session disconnects.
+
+**When not to use**: Database locks have poor performance under high contention. The row lock consumes a database connection, which is a limited resource. Connection pool exhaustion becomes a risk. The lock scope is limited to a single database — cross-database locking requires distributed transactions. Clock drift between application servers can cause issues with TTL-based lock cleanup.
+
+## Mental Model Check
+
+**Question 1**: Two servers both try to acquire a distributed lock for the same resource. Server A sends the request first, but Server B's request is processed first by the lock service due to network latency. Which server gets the lock?
+
+**Answer**: Server B gets the lock. The lock service decides based on the order it processes requests, not the order the requests were sent. Network latency means the order of sending is not the order of receiving. The lock service must be authoritative. This is why distributed locks require a centralized (or consensus-based) decision point.
+
+**Question 2**: Server A acquires a lock, starts processing, and then experiences a 10-second garbage collection pause. The lock TTL is 30 seconds. The GC pause starts at second 25 of the TTL. Does the lock expire before Server A resumes?
+
+**Answer**: Yes. The TTL of 30 seconds means the lock expires 30 seconds after acquisition. Server A was at second 25 when the GC pause started. The GC pause lasts 10 seconds, so Server A resumes at second 35 — 5 seconds after the lock expired. When Server A resumes, it no longer holds the lock. Another server may have acquired it. Server A must check the lock status before continuing to access the protected resource, or use a fencing token to detect the stale lock.
+
+**Question 3**: A Redis-based lock service has a single master node. The master goes down after writing a lock key but before replicating it to replicas. A replica is promoted to master. What happens?
+
+**Answer**: The new master does not have the lock key because it was not replicated. The client that acquired the lock still believes it holds the lock. Another client can acquire the lock from the new master because the key does not exist. Two clients now believe they hold the lock simultaneously. This is the fundamental safety violation of single-master Redis locks. The Redlock algorithm was designed to address this by requiring agreement from multiple Redis nodes, but even Redlock has limitations under certain failure scenarios.
+
+**Question 4**: A ZooKeeper lock uses ephemeral sequential znodes. The lock holder's ZooKeeper session experiences a temporary network partition. The session timeout is 20 seconds. What happens to the lock?
+
+**Answer**: The ephemeral znode is not deleted immediately. ZooKeeper waits for the session timeout (20 seconds) to expire before declaring the session dead. If the network partition heals before the timeout, the session is restored and the lock remains valid. If the partition lasts longer than the timeout, the session is expired, the ephemeral znode is deleted, and the lock is released. The holder may still be active but cannot communicate with ZooKeeper. This creates a window where both the original holder (still processing) and a new holder (who acquired the lock after the znode was deleted) could operate concurrently.
+
+**Question 5**: A fencing token is a monotonically increasing integer. Server A receives token 42. Server B receives token 43. The protected resource tracks the last-seen token. Server A's operation arrives at the resource after Server B's operation, even though Server A held the lock first. What does the resource do?
+
+**Answer**: The resource rejects Server A's operation because its token (42) is lower than the last-seen token (43). The fencing token guarantees that even if operations arrive out of order, the resource can detect and reject stale operations. This is the only mechanism that protects against the delayed-writer problem (GC pauses, network delays, clock drift). Without fencing tokens, distributed locks provide probabilistic safety at best.
+
+**Question 6**: A distributed lock service uses a 10-second TTL. The lock holder's critical section takes 8 seconds on average but can spike to 15 seconds under load. Three processes are contending for the same lock. What is the impact on the system when the critical section spikes to 15 seconds?
+
+**Answer**: The lock expires at 10 seconds. A second process acquires the lock at 10 seconds. The original process is still running and continues writing to the protected resource until it finishes at 15 seconds. For 5 seconds (10s to 15s), two processes operate concurrently on the same resource — the original process with stale token 42 and the new process with token 43. If the resource honors fencing tokens, the original process's writes from second 10 onward are rejected. If the resource does not use fencing tokens, data corruption occurs. The TTL must be set to the maximum expected critical section duration plus a safety margin, not the average. A better approach is to set the TTL to 20 seconds and use a heartbeat renewal interval of 6 seconds. If the process stalls beyond 20 seconds, the TTL provides a safety net.
+
+**Question 7**: A lock implementation uses a single MySQL database table for distributed locks. The lock table has 1000 rows, each representing a distinct resource. Ten application servers each hold 50 locks simultaneously. A network blip causes all 10 servers to lose their database connections simultaneously. What happens when the connections are re-established?
+
+**Answer**: When the database connections were lost, the database automatically released all row locks held by those sessions (MySQL releases all locks held by a disconnected session). The 500 locks (50 per server x 10 servers) are now available. When the servers reconnect, they do not know their locks were released. They continue operating as if they still hold the locks. Another process can acquire any of these 500 locks, leading to concurrent access to the protected resources. This is a catastrophic failure of the database-based lock approach. The mitigation is to use a versioning or fencing token scheme: each lock acquisition includes a monotonically increasing version number stored in the database. The protected resource checks the version number on each write. If the version changed (another process acquired the lock), the write is rejected. Without this mechanism, database-based locks are unsafe under any scenario that causes connection loss — including connection pool refreshes, database failover, and network interruptions.
+
+**Question 8**: A lock service uses a 5-node Raft cluster for consensus. Node 3 (a follower) experiences a slow disk that causes disk write latency to spike from 2ms to 500ms. How does this affect lock acquisition latency?
+
+**Answer**: The Raft leader (Node 1) sends AppendEntries RPCs to all followers. Nodes 2, 4, and 5 respond within 2-3ms. Node 3 responds after 500ms. The leader needs a majority (3 out of 5) to commit. Nodes 1, 2, and 4 constitute a majority, so the entry is committed after approximately 3ms — the slow node does not delay the commit. However, the leader still sends entries to Node 3 and waits for its response. If the leader's log replication backpressure mechanism limits the rate of new entries when any follower falls behind, the effective throughput may drop. The 5-node cluster tolerates the slow node because the majority is still fast. If Node 3 were part of a 3-node cluster, the same scenario would cause the commit latency to rise to 500ms because the leader plus one fast follower (2 of 3) would need the slow node's acknowledgement only if the leader itself crashed, but during normal operation the leader and one fast follower still constitute a majority. In a 3-node cluster with one slow node, the leader must wait for the faster of the two followers to acknowledge, which remains fast.
+
+## Additional Vocabulary
+
+**Lease holder**: The process that currently holds a lease-based lock. The lease holder is distinct from the lock owner because the lease is a separate contract from the lock. A process may hold a lease (periodically sending heartbeats) but not hold any locks, or may hold multiple locks under the same lease. The lease holder is responsible for maintaining the lease's TTL through heartbeats. If the lease holder fails to send heartbeats, the lease expires and all locks attached to that lease are automatically released. This indirection allows a single lease to cover multiple locks, reducing the heartbeat overhead.
+
+**Lock granularity**: The scope of the resource being locked. Coarse-grained locking locks a large resource (an entire database table, a file system partition). Fine-grained locking locks a small resource (a single database row, a single file). The granularity determines the level of concurrency. Coarse-grained locks are simpler but reduce throughput because unrelated operations must wait for the same lock. Fine-grained locks increase throughput but increase complexity and the risk of deadlock. The trade-off is captured in the lock escalation problem: acquiring many fine-grained locks can be slower than acquiring one coarse-grained lock. The optimal granularity depends on the access pattern. Resources that are always accessed together should use coarse-grained locking. Resources that are accessed independently should use fine-grained locking.
+
+**Lock escalation**: The process of converting many fine-grained locks into a single coarse-grained lock when the number of locks exceeds a threshold. Lock escalation is common in database systems. For example, a transaction that acquires 1000 row locks on the same table may escalate to a table-level lock. The database automatically performs the escalation to reduce lock management overhead. In distributed lock systems, lock escalation is typically application-level — the application code decides when to use a coarse-grained lock instead of many fine-grained locks. The escalation threshold must be chosen carefully. Too low, and the system serializes operations unnecessarily. Too high, and the lock manager memory is consumed by tracking thousands of fine-grained locks.
+
+**Lock starvation**: A condition where a process never acquires a lock because other processes continuously acquire and release the lock ahead of it. Starvation occurs when the lock service does not enforce fairness. A simple Redis SETNX lock without a queue can starve a process — if two other processes continuously acquire and release the lock, the third process may never acquire it because it always finds the key set. Fairness mechanisms like FIFO queues (ZooKeeper's sequential znode order) prevent starvation. The lock service must guarantee that every waiting process eventually acquires the lock, assuming the lock is released within a bounded time.
+
+**Lock splitting**: The technique of dividing a single lock into multiple locks to reduce contention. For example, instead of a single "database lock," splitting into "read lock" and "write lock" (readers-writer lock) allows multiple readers to proceed concurrently. Further splitting into per-shard or per-tenant locks distributes contention across multiple lock resources. Lock splitting is a common optimization for high-throughput systems. The extreme form is per-key locking, where each resource identifier (e.g., each customer ID, each order ID) has its own lock. Per-key locking provides maximum concurrency but requires careful management of the lock namespace.
+
+**Lock coalescing**: The opposite of lock splitting. Coalescing combines multiple related locks into a single lock to reduce the overhead of acquiring and releasing many locks. For example, an operation that modifies 10 database rows in the same table may acquire a single table-level lock instead of 10 row-level locks. Coalescing trades concurrency for lower overhead. The decision to coalesce depends on the ratio of lock management overhead to critical section execution time.
+
+## Implementation Comparison Table
+
+The following table provides a side-by-side comparison of the four major distributed lock implementations across key dimensions.
+
+| Dimension | Redis (SETNX) | ZooKeeper (Ephemeral Sequential) | etcd (Lease + Key) | Database (SELECT FOR UPDATE) |
+|---|---|---|---|---|
+| **Consistency model** | Eventual (async replication) | Linearizable (Zab) | Linearizable (Raft) | Serializable (if using SSI) |
+| **Safety guarantee** | Probabilistic | Strong (with fencing tokens) | Strong (with fencing tokens) | Strong (within same DB) |
+| **Fencing tokens** | Not supported natively | Manual (sequential znode ID) | Manual (revision number) | Manual (version column) |
+| **Acquisition latency** | 1-3ms | 5-15ms | 3-8ms | 10-100ms |
+| **Throughput (ops/sec)** | 50,000 | 5,000-10,000 | 5,000-10,000 | 500-2,000 |
+| **Scalability limit** | Single master CPU | Zab leader write throughput | Raft leader write throughput | Connection pool size |
+| **Auto-release on crash** | TTL expiry | Session expiry (ephemeral) | Lease expiry | Session disconnect |
+| **Fairness (FIFO)** | Not by default | Yes (sequence number) | Yes (revision order) | Not by default |
+| **Reentrant** | Not by default | Not by default | Not by default | Not by default |
+| **Deadlock detection** | TTL only | Session timeout | Lease timeout | Lock wait timeout |
+| **Network partition tolerance** | Partition can lose locks | Partition can lose locks | Partition can lose locks | Partition splits database |
+| **Clock drift sensitivity** | High (TTL on server clock) | Low (session-based) | Low (lease-based) | Medium (TTL cleanup) |
+| **Operational complexity** | Low | Medium | Medium | Low (if DB already exists) |
+| **Minimum nodes** | 1 (3 for HA) | 3 | 3 | 1 (2 for HA) |
+| **Storage overhead** | Memory (key-value) | Memory + disk (WAL) | Memory + disk (WAL + boltdb) | Disk (B-tree) |
+| **Language support** | All languages | All languages | Go (native), others via client | All languages (SQL) |
+| **Best use case** | Cache rebuilds, non-critical scheduling | Leader election, configuration | Kubernetes-native, service discovery | Low-rate locks, existing DB |
+
+### Interpretation Guide
+
+The table reveals several important trade-offs:
+
+**Consistency vs. performance**: Redis offers the highest throughput (50,000 ops/sec) but the weakest safety guarantees. The asynchronous replication gap means lock state can be lost on master failure. ZooKeeper and etcd offer strong consistency but at 10-20% of Redis throughput. The choice depends on whether data corruption from a rare lock violation is acceptable. For a cache rebuild, Redis is fine. For a payment batch, it is not.
+
+**Fencing token availability**: Only ZooKeeper and etcd provide natural fencing token mechanisms (sequential znode IDs and revision numbers, respectively). Redis SETNX uses a random value for the lock key, which is not monotonically increasing. Without fencing tokens, the lock provides only probabilistic safety — even with perfect clock synchronization, a GC pause can cause safety violations.
+
+**Operational cost**: Database locks have the lowest operational cost if the database already exists. However, the lock rate is limited by the connection pool. Each held lock consumes a database connection. For 100 concurrent locks, the application needs at least 100 database connections, which may exceed the connection pool limit. Redis is the easiest to operate but requires careful monitoring of memory usage (each lock key consumes memory).
+
+## Lock Granularity Decision Framework
+
+Choosing the right lock granularity requires analyzing the access pattern.
+
+<AsciiDiagram
+  id="distributed-locks/granularity-decision"
+  title="Lock Granularity Decision Tree"
+  alt="Decision tree for choosing between coarse-grained and fine-grained locks based on access pattern characteristics"
+  caption="Decision framework for lock granularity selection" content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                  LOCK GRANULARITY DECISION TREE                       │
+│                                                                       │
+│  Start: What resources are being protected?                          │
+│                                                                       │
+│  Are all resources always accessed together?                         │
+│       │                                                              │
+│       ├── YES ───▶ Coarse-grained lock (single resource)            │
+│       │            Benefits: simplest, lowest overhead               │
+│       │                                                              │
+│       └── NO ────▶ Are resources accessed independently?             │
+│                      │                                               │
+│                      ├── YES ───▶ Fine-grained locks                 │
+│                      │             Benefits: max concurrency         │
+│                      │                                              │
+│                      └── NO ───▶ Hybrid approach                     │
+│                                   Group related resources            │
+│                                   under shared locks                 │
+│                                                                       │
+│  Additional considerations:                                          │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  Access pattern: 95% reads, 5% writes → readers-writer lock │   │
+│  │  Access pattern: all writes to same key → single lock       │   │
+│  │  Access pattern: writes to random keys → per-key lock       │   │
+│  │  Contention level: > 10% contention → coarser locks         │   │
+│  │  Critical section: < 1ms → fine-grained overhead acceptable │   │
+│  │  Critical section: > 100ms → coarser locks reduce overhead  │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Lock Strategy Selection Guide
+
+The choice of lock strategy depends on the trade-off between consistency requirements and performance needs.
+
+| Scenario | Recommended Strategy | Reasoning |
+|---|---|---|
+| Cache rebuild every 5 minutes | Redis SETNX | Brief overlap acceptable, speed matters |
+| Payment batch processing | ZooKeeper or etcd with fencing tokens | Safety is non-negotiable |
+| Leader election for a single leader | ZooKeeper or etcd | Natural fit, ephemeral/session semantics |
+| Kubernetes pod scheduling | etcd | Native integration with Kubernetes API |
+| File processing pipeline | Database SELECT FOR UPDATE | Already using the database, low rate |
+| Configuration update coordination | ZooKeeper or etcd | Watch mechanism for change notification |
+| Distributed rate limiting | Redis | High throughput, approximate accuracy |
+| Multi-database transaction coordination | External lock service (ZooKeeper/etcd) | Cross-database locking needed |
+| Critical section under 5ms | Redis SETNX | Fast acquisition, short hold time |
+| Critical section over 5 seconds | ZooKeeper or etcd with leases | Long hold requires lease management |
+
+## Lock Behavior Under Load
+
+Understanding how each lock variant behaves under increasing load is essential for capacity planning. The following analysis covers three dimensions: acquisition latency as a function of contention, throughput degradation under overload, and recovery behavior after load spikes.
+
+### Acquisition Latency vs Contention Level
+
+<AsciiDiagram
+  id="distributed-locks/latency-vs-contention"
+  title="Acquisition Latency vs Contention Level"
+  alt="Graph showing how lock acquisition latency increases for Redis, ZooKeeper, etcd, and MySQL as the number of concurrent contending processes increases from 1 to 1000"
+  caption="Acquisition latency scaling with contention for each lock variant" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│           ACQUISITION LATENCY vs CONTENTION (1 to 1000 concurrent)           │
+│                                                                             │
+│  Latency (ms, log scale)                                                    │
+│  1000 ┤                                                          ── MySQL  │
+│       │                                                       ──           │
+│   100 ┤                                          ── MySQL ──               │
+│       │                            ── ZooKeeper                             │
+│    10 ┤              ── ZooKeeper ──         ── etcd                       │
+│       │    ── etcd ──                         ── Redis                      │
+│     1 ┤ ── Redis ──                                                       │
+│       │                                                                    │
+│       └───┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬──      │
+│           1      3     10     30    100    300   1000                      │
+│                    Concurrent processes                                     │
+│                                                                             │
+│  Redis: flat at 1-2ms until ~1000 concurrent, then sublinear increase      │
+│  etcd: flat at 3-5ms until ~300 concurrent, then linear increase           │
+│  ZooKeeper: flat at 5-10ms until ~200 concurrent, then linear increase     │
+│  MySQL: flat at 10-30ms until ~50 concurrent, then exponential increase    │
+│         beyond connection pool limits                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Throughput Degradation Under Overload
+
+When the lock service exceeds its capacity, throughput degrades differently for each implementation:
+
+- **Redis**: Throughput degrades gracefully. Redis uses a single-threaded event loop. When requests exceed CPU capacity, they queue in the event loop. The queueing delay increases latency linearly with queue depth. Redis continues to process requests at maximum capacity (50,000 ops/s). No requests are dropped — they are simply delayed.
+
+- **ZooKeeper**: Throughput degrades with a sharp knee. ZooKeeper's Zab protocol has a fixed write throughput capacity (approximately 10,000 writes/s). Beyond this, the leader's request queue grows. The watch mechanism adds complexity — if watch notifications cannot be delivered quickly, the follower's notification backlog grows, consuming memory. At extreme overload, ZooKeeper entries the "watch overflow" condition where watches are expired to prevent memory exhaustion.
+
+- **etcd**: Throughput degrades similarly to ZooKeeper but with better isolation due to Raft's pipelining. The etcd leader can pipeline multiple entries to followers, amortizing the per-entry latency. Under overload, the Raft log grows in memory until the snapshot mechanism compacts it. etcd's boltdb backend limits the maximum database size (default: 2GB), and hitting this limit causes write failures.
+
+- **MySQL**: Throughput degrades catastrophically at connection pool exhaustion. When all connections are in use (each held by a `SELECT ... FOR UPDATE`), new requests block at the connection pool level. The blocking threads consume application server resources. If connection wait timeouts are not configured, the application server can experience thread pool exhaustion, cascading to unrelated services. This is the most dangerous failure mode — database-based locks can take down the entire application.
+
+### Recovery Behavior After Load Spike
+
+After a load spike subsides, each variant recovers differently:
+
+- **Redis**: Immediate recovery. The event loop processes queued requests, and within one event loop cycle (sub-millisecond) the system returns to normal latency.
+
+- **ZooKeeper**: Gradual recovery (seconds to minutes). The watch notification backlog must drain. The leader must catch up with any lagging followers. Session reconnections from timed-out clients add load during recovery.
+
+- **etcd**: Gradual recovery (seconds). The Raft log compaction must run if the log grew during the spike. boltdb freelist operations after deletions add latency during recovery.
+
+- **MySQL**: Slow recovery (minutes). Connection pool re-establishment is slow. Each new connection requires a TCP handshake, SSL negotiation, and authentication. The database's buffer pool may have been flushed during the overload, causing cold-cache performance after recovery.
+
+## Lock Service High Availability Patterns
+
+### Active-Passive with Failover
+
+The simplest HA pattern for lock services uses an active-passive configuration. One node handles all lock operations. A standby node monitors the active node's health. If the active node fails, the standby takes over.
+
+The challenge is the failover gap: lock state in memory on the active node is lost on failover unless it is persisted to shared storage. Redis Sentinel addresses this with a combination of primary-replica replication and Sentinel monitoring. When the primary fails, Sentinel promotes a replica. However, the asynchronous replication gap means some lock keys may be lost.
+
+### Active-Active with Consensus
+
+Active-active configurations replicate lock state across all nodes using a consensus protocol. ZooKeeper, etcd, and Consul all use this approach. Every node can handle read requests, but writes must go through the leader. The consensus protocol ensures that lock state is consistent across all nodes.
+
+The cost is write latency: each write requires a consensus round trip. The benefit is zero lock state loss on failover — the consensus log preserves all committed operations.
+
+### Multi-Region Deployments
+
+For global systems, the lock service must span multiple geographic regions. The options are:
+
+1. **Single region, global access**: All clients connect to a single region's lock service. Cross-region latency (50-300ms) adds to every lock acquisition. This approach works for low-rate locks but fails for high-throughput systems.
+
+```yaml
+Latency breakdown for US-East clients accessing a lock service in US-West:
+  Network round trip: 60ms
+  Lock acquisition:   5ms
+  Total:              65ms
+
+Latency breakdown for EU-West clients accessing same service:
+  Network round trip: 140ms
+  Lock acquisition:   5ms
+  Total:              145ms
+```
+
+2. **Per-region lock services**: Each region has its own lock service instance. Resources are partitioned by region. A resource in US-East is locked using the US-East lock service. This avoids cross-region latency but requires careful partitioning — a global resource (e.g., "last-processed-order-id") cannot be locked independently.
+
+3. **Consensus across regions**: The lock service cluster spans all regions. A 5-node cluster with nodes in US-East (2), US-West (2), and EU-West (1) provides regional fault tolerance. Write latency is determined by the slowest majority link. For a client in US-East, the majority includes the two US-East nodes and one US-West node (2 + 1 = 3 of 5). The US-West link adds ~60ms to each write. This is too slow for most use cases.
+
+4. **Hierarchical lock services**: A local lock service in each region handles high-throughput local locks. A global lock service handles cross-region coordination. The local lock service acquires a global lock only when the operation affects resources in multiple regions. This is the most scalable approach but adds complexity.
+
+## The CAP Theorem and Distributed Locks
+
+Distributed locks are fundamentally limited by the CAP theorem. A lock service must choose between consistency and availability during a partition.
+
+| Lock Service | CAP Choice | Behavior During Partition |
+|---|---|---|
+| Redis (single master) | CP during normal operation, AP during failover | Master failure: locks lost, new master may allow duplicate acquisitions |
+| Redis (Redlock) | AP (majority vote tolerates minority failures) | Minority partition: lock not acquired; Majority partition: locks available |
+| ZooKeeper | CP (blocks if quorum lost) | No writes if quorum lost; reads return stale data without sync |
+| etcd | CP (blocks if quorum lost) | No writes if quorum lost; linearizable reads require quorum |
+| Database (single) | CP (blocks if database unavailable) | Locks unavailable if database unreachable |
+| Database (multi-master) | AP (eventual consistency) | Both masters accept writes, duplicate locks possible |
+
+The critical insight: a CP lock service (ZooKeeper, etcd) becomes unavailable during a partition that breaks quorum. An AP lock service (Redis with failover) remains available during a partition but may violate mutual exclusion. There is no distributed lock service that provides both "always available" and "always safe" — this is a direct consequence of the CAP theorem.
+
+Trade-off guidance: for systems that must always be available (e.g., serving user traffic), use an AP lock service and accept the small risk of duplicate operations. For systems that must never corrupt data (e.g., financial systems), use a CP lock service and accept brief unavailability during partitions.
+
+## Lock Session Lifecycle
+
+Every distributed lock client maintains a session with the lock service. The session lifecycle has distinct phases, each with its own failure modes.
+
+<AsciiDiagram
+  id="distributed-locks/session-lifecycle"
+  title="Lock Client Session Lifecycle"
+  alt="State machine showing the session lifecycle: DISCONNECTED, CONNECTING, CONNECTED with HELD or WAITING sub-states, RECONNECTING, TERMINATED"
+  caption="The complete lifecycle of a lock client session" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     LOCK CLIENT SESSION LIFECYCLE                            │
+│                                                                             │
+│                  ┌──────────────────────┐                                   │
+│                  │    DISCONNECTED       │                                   │
+│                  │  (initial state)      │                                   │
+│                  └──────────┬───────────┘                                   │
+│                             │                                                │
+│                     connect()                                                │
+│                             │                                                │
+│                             ▼                                                │
+│                  ┌──────────────────────┐                                   │
+│                  │    CONNECTING         │                                   │
+│                  │  (TCP handshake,      │                                   │
+│                  │   auth, session init) │                                   │
+│                  └──────────┬───────────┘                                   │
+│                   ┌────────┼────────┐                                       │
+│                   │        │        │                                       │
+│                   ▼        │        ▼                                       │
+│            ┌──────────┐    │  ┌──────────────┐                              │
+│            │ CONNECT  │    │  │  CONNECT     │                              │
+│            │ TIMEOUT  │    │  │  REFUSED     │                              │
+│            │ (retry)  │    │  │  (retry)     │                              │
+│            └──────────┘    │  └──────────────┘                              │
+│                            │                                                │
+│                            ▼                                                │
+│                  ┌──────────────────────┐                                   │
+│                  │     CONNECTED         │                                   │
+│                  │  (session established)│                                   │
+│                  └──────────┬───────────┘                                   │
+│                             │                                                │
+│                     acquire()                                               │
+│                             │                                                │
+│                             ▼                                                │
+│                  ┌──────────────────────┐    ┌──────────────────────┐       │
+│                  │   SUB-STATE: HELD    │    │  SUB-STATE: WAITING │       │
+│                  │  (holds lock,        │    │  (in queue, waiting │       │
+│                  │   renewing lease)    │    │   for lock)         │       │
+│                  └──────────┬───────────┘    └──────────┬───────────┘       │
+│                             │                          │                    │
+│                    ┌────────┼────────┐          ┌──────┴──────┐             │
+│                    │        │        │          │             │             │
+│                    ▼        ▼        ▼          ▼             ▼             │
+│             ┌──────────┐ ┌────┐ ┌────────┐ ┌────────┐ ┌──────────┐        │
+│             │ RELEASE  │ │ TTL│ │ NETWORK│ │ LOCK   │ │ WAIT     │        │
+│             │ (success)│ │EXP │ │ LOST   │ │GRANTED │ │ TIMEOUT  │        │
+│             └──────────┘ └────┘ └────────┘ └────────┘ └──────────┘        │
+│                 │          │        │          │            │               │
+│                 └──────────┴────────┴──────────┴────────────┴────┐          │
+│                                                          │                  │
+│                                                          ▼                  │
+│                                               ┌──────────────────────┐      │
+│                                               │    RECONNECTING      │      │
+│                                               │  (attempting to     │      │
+│                                               │   restore session)  │      │
+│                                               └──────────┬───────────┘      │
+│                                                   ┌──────┴──────┐           │
+│                                                   │             │           │
+│                                                   ▼             ▼           │
+│                                            ┌──────────┐  ┌──────────┐      │
+│                                            │ SESSION  │  │ SESSION  │      │
+│                                            │ RESTORED │  │ EXPIRED  │      │
+│                                            │ (attempt │  │ (clean   │      │
+│                                            │  retry)  │  │  exit)   │      │
+│                                            └──────────┘  └──────────┘      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+Each state transition has a corresponding handler that manages the lock state on the client side:
+
+| Transition | Client Action |
+|---|---|
+| HELD → TTL EXPIRED | Abort critical section, log error, trigger alert |
+| HELD → NETWORK LOST | Enter safe mode: stop writes, attempt reconnect |
+| WAITING → LOCK GRANTED | Enter critical section, start renewal timer |
+| WAITING → WAIT TIMEOUT | Report failure to caller, remove from waiter queue |
+| RECONNECTING → SESSION EXPIRED | Assume all locks lost, abort all critical sections |
+| RECONNECTING → SESSION RESTORED | Verify each lock still valid, resume or re-acquire |
+
+## Distributed Lock Testing Methodology
+
+Testing a distributed lock implementation requires verifying both safety properties (no two processes hold the lock simultaneously) and liveness properties (the lock is eventually released).
+
+### Safety Testing
+
+A safety test creates N concurrent processes that all attempt to acquire the same lock. Each process increments a shared counter while holding the lock. After all processes complete, the counter value must equal the number of processes (each process increments exactly once).
+
+```python
+# Safety test for distributed locks
+import concurrent.futures
+import threading
+
+def safety_test(lock_service, lock_name, num_processes=100):
+    """
+    Safety test: N processes each increment a shared counter
+    exactly once while holding the lock.
+    If two processes hold the lock simultaneously, the counter
+    will be incremented more than N times or increments will overlap.
+    """
+    shared_counter = 0
+    counter_lock = threading.Lock()  # Local lock for counter access
+    errors = []
+
+    def worker(worker_id):
+        nonlocal shared_counter
+        lock = lock_service.acquire(lock_name, owner=f"worker_{worker_id}")
+        if not lock:
+            errors.append(f"Worker {worker_id} could not acquire lock")
+            return
+        try:
+            # Critical section: increment shared counter
+            with counter_lock:
+                current = shared_counter
+                # Simulate work delay
+                import time
+                time.sleep(0.001)
+                shared_counter = current + 1
+        finally:
+            lock_service.release(lock)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_processes) as ex:
+        futures = [ex.submit(worker, i) for i in range(num_processes)]
+        concurrent.futures.wait(futures)
+
+    assert shared_counter == num_processes, \
+        f"Safety violation: counter={shared_counter}, expected={num_processes}"
+    assert len(errors) == 0, f"Lock acquisition errors: {errors}"
+    print(f"Safety test passed. Counter={shared_counter}, expected={num_processes}")
+```
+
+### Liveness Testing
+
+A liveness test verifies that a lock is eventually released when the holder crashes. The test acquires a lock, kills the holder process (or simulates a crash), and measures how long another process takes to acquire the lock.
+
+```python
+# Liveness test for distributed locks
+import time
+
+def liveness_test(lock_service, lock_name, ttl_ms=5000):
+    """
+    Liveness test: acquire lock, simulate crash, measure time
+    until another process can acquire the lock.
+    Expected maximum: ttl_ms + grace period
+    """
+    # Phase 1: Process A acquires the lock
+    lock_a = lock_service.acquire(lock_name, owner="worker_a")
+    assert lock_a is not None, "Process A could not acquire lock"
+    lock_token_a = lock_a.token
+
+    # Phase 2: Simulate crash — do NOT release the lock
+    # The lock should auto-release after TTL + safety margin
+    start = time.monotonic()
+
+    # Phase 3: Process B attempts to acquire the lock
+    lock_b = None
+    while lock_b is None:
+        lock_b = lock_service.acquire(lock_name, owner="worker_b",
+                                      timeout_ms=ttl_ms + 2000)
+        if lock_b is None:
+            elapsed = (time.monotonic() - start) * 1000
+            if elapsed > ttl_ms + 5000:
+                break
+
+    elapsed_ms = (time.monotonic() - start) * 1000
+    assert lock_b is not None, \
+        f"Liveness violation: lock not acquired within {ttl_ms + 5000}ms"
+    assert elapsed_ms <= ttl_ms + 2000, \
+        f"Liveness violation: took {elapsed_ms:.0f}ms, max expected {ttl_ms + 2000}ms"
+
+    print(f"Liveness test passed. Lock acquired in {elapsed_ms:.0f}ms, "
+          f"TTL={ttl_ms}ms")
+```
+
+### Fault Injection Testing
+
+Realistic testing requires fault injection: network partitions, process crashes, clock skew, and resource exhaustion.
+
+```bash
+# Fault injection scenarios for lock testing
+
+# Scenario 1: Network partition between client and lock service
+# Block all traffic from client to lock service for 15 seconds
+iptables -A INPUT -s <lock-service-ip> -j DROP
+sleep 15
+iptables -D INPUT -s <lock-service-ip> -j DROP
+
+# Scenario 2: Clock skew on the lock service
+# Advance clock by 5 seconds (simulates NTP adjustment)
+date -s "+5 seconds"
+sleep 10
+date -s "-5 seconds"
+
+# Scenario 3: Lock service leader crash
+# Kill the Raft leader process
+LEADER=$(etcdctl endpoint status --cluster | grep "true" | awk '{print $1}')
+kill -9 $LEADER_PID
+
+# Scenario 4: Resource exhaustion on lock service (memory pressure)
+stress --vm 2 --vm-bytes 512M --timeout 30s
+
+# Scenario 5: Slow file system on consensus commit
+# Introduce 100ms write delay on the lock service's data directory
+# (requires a filesystem-level tool like `fault` on Linux)
+fault --delay=100 --device=/dev/sda1 --operation=write
+```

@@ -1,0 +1,1647 @@
+﻿---
+id: distributed-locks-architecture
+title: Distributed Locks at Scale
+position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest distributed lock implementation uses a single Redis instance with the SETNX command. One server, one Redis process, one lock key. This is where most teams start.
+
+<AsciiDiagram
+  id="distributed-locks/naive-implementation"
+  title="Naive Single-Node Lock Deployment"
+  alt="A single Redis instance serving lock requests from multiple application servers with no replication or failover"
+  caption="The naive approach — one Redis instance, no replication" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    NAIVE LOCK DEPLOYMENT (Single Node)                    │
+│                                                                         │
+│                     ┌─────────────────────────────┐                     │
+│                     │       Application Tier       │                    │
+│                     │  ┌────────┐ ┌────────┐ ┌────────┐              │ │
+│                     │  │ Web    │ │ Worker │ │ Worker │              │ │
+│                     │  │ Server │ │ 1      │ │ 2      │              │ │
+│                     │  │ (3x)   │ │        │ │        │              │ │
+│                     │  └───┬────┘ └───┬────┘ └───┬────┘              │ │
+│                     │      │          │          │                     │ │
+│                     │      └──────────┼──────────┘                    │ │
+│                     │                 │                                │ │
+│                     └─────────────────┼────────────────────────────────┘ │
+│                                       │                                  │
+│                              SET resource_A                              │
+│                              random NX PX 30000                         │
+│                                       │                                  │
+│                                       ▼                                  │
+│                     ┌──────────────────────────────────┐                │
+│                     │        Redis (Single Node)        │               │
+│                     │  ┌────────────────────────────┐  │                │
+│                     │  │  Lock Registry (in memory)  │  │               │
+│                     │  │  ┌──────────────────────┐  │  │               │
+│                     │  │  │ resource_A: HELD     │  │  │               │
+│                     │  │  │ resource_B: FREE     │  │  │               │
+│                     │  │  │ resource_C: HELD     │  │  │               │
+│                     │  │  └──────────────────────┘  │  │               │
+│                     │  └────────────────────────────┘  │               │
+│                     │  Memory: 8 GB                     │              │
+│                     │  No persistence                   │              │
+│                     │  No replication                   │              │
+│                     │  Single point of failure          │              │
+│                     └──────────────────────────────────┘               │
+│                                                                         │
+│  Failure modes:                                                         │
+│  1. Redis crashes → all locks lost → all operations stop               │
+│  2. Redis master fails without replication → lock state gone           │
+│  3. Asynchronous replication → lock duplication on failover            │
+│  4. Clock drift → premature or delayed lock expiry                     │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Where This Breaks
+
+**At 500 lock acquisitions per second (single Redis node)**: Redis handles this easily. The single node can process 50,000 operations per second. The bottleneck is not Redis but the application servers' network connections.
+
+**At 1,000 lock acquisitions per second**: Still fine. Redis is barely breaking a sweat. The single node has plenty of headroom.
+
+**At 5,000 lock acquisitions per second**: Redis is using approximately 10% CPU. The network interface is handling 5,000 small packets per second. No visible degradation.
+
+**At first Redis node failure**: The entire lock service goes down. Every application server that was holding a lock loses it. Every server waiting for a lock cannot acquire one. The job scheduler falls back to a polling strategy that causes duplicate processing. The cache rebuild system runs on every node simultaneously. The leader election times out and all nodes believe they are followers.
+
+**At first network partition between application and Redis**: The application servers cannot reach Redis. They cannot acquire locks or release them. The lock holders cannot renew their leases. The leases expire. Other servers on the same side of the partition as Redis can acquire the locks. The original holders, now partitioned, continue operating without lock protection.
+
+## Production Architecture
+
+A production distributed lock system addresses the single-node failure modes through a combination of replication, consensus, and client-side resilience.
+
+<AsciiDiagram
+  id="distributed-locks/production-architecture"
+  title="Production Distributed Lock Architecture"
+  alt="Multi-node lock service cluster with Raft consensus, client-side retry with backoff, and health monitoring"
+  caption="Production-grade distributed lock architecture with consensus-based replication" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  PRODUCTION LOCK ARCHITECTURE                                │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    APPLICATION SERVERS                                 │   │
+│  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐        │   │
+│  │  │  App Server 1  │  │  App Server 2  │  │  App Server 3  │        │   │
+│  │  │                 │  │                 │  │                 │        │   │
+│  │  │  Lock Client    │  │  Lock Client    │  │  Lock Client    │        │   │
+│  │  │  ┌───────────┐ │  │  ┌───────────┐ │  │  ┌───────────┐ │        │   │
+│  │  │  │ Retry     │ │  │  │ Retry     │ │  │  │ Retry     │ │        │   │
+│  │  │  │ Logic     │ │  │  │ Logic     │ │  │  │ Logic     │ │        │   │
+│  │  │  │ Backoff   │ │  │  │ Backoff   │ │  │  │ Backoff   │ │        │   │
+│  │  │  │ Jitter    │ │  │  │ Jitter    │ │  │  │ Jitter    │ │        │   │
+│  │  │  │ Timeout   │ │  │  │ Timeout   │ │  │  │ Timeout   │ │        │   │
+│  │  │  └───────────┘ │  │  └───────────┘ │  │  └───────────┘ │        │   │
+│  │  │  Endpoints:     │  │  Endpoints:     │  │  Endpoints:     │        │   │
+│  │  │  svr1:2379      │  │  svr1:2379      │  │  svr1:2379      │        │   │
+│  │  │  svr2:2379      │  │  svr2:2379      │  │  svr2:2379      │        │   │
+│  │  │  svr3:2379      │  │  svr3:2379      │  │  svr3:2379      │        │   │
+│  │  └────────────────┘  └────────────────┘  └────────────────┘        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                     │                                        │
+│                                     │ gRPC / HTTP                           │
+│                                     ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    LOCK SERVICE CLUSTER (etcd, 3 nodes)              │   │
+│  │                                                                     │   │
+│  │  ┌────────────────────────┐  ┌────────────────────────┐  ┌────────┐ │   │
+│  │  │      Node 1 (Leader)   │  │     Node 2 (Follower)  │  │  Node 3│ │   │
+│  │  │  ┌──────────────────┐  │  │  ┌──────────────────┐  │  │(Follower│ │   │
+│  │  │  │ Lock Registry    │  │  │  │ Lock Registry    │  │  │        │ │   │
+│  │  │  │ Lease Manager    │  │  │  │ Lease Manager    │  │  │ State  │ │   │
+│  │  │  │ Token Generator  │  │  │  │ Token Generator  │  │  │Replica │ │   │
+│  │  │  │ Raft State       │  │  │  │ Raft State       │  │  │        │ │   │
+│  │  │  │ WAL              │  │  │  │ WAL              │  │  │ WAL   │ │   │
+│  │  │  │ SSDs (RAID 1)    │  │  │  │ SSDs (RAID 1)    │  │  │ SSD   │ │   │
+│  │  │  └──────────────────┘  │  │  └──────────────────┘  │  │        │ │   │
+│  │  └────────────────────────┘  └────────────────────────┘  └────────┘ │   │
+│  │                                                                     │   │
+│  │  Cross-node: Raft consensus (port 2380)                             │   │
+│  │  Client-facing: gRPC API (port 2379)                                │   │
+│  │  Cluster health: port 2381 (metrics, debug)                         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                     │                                        │
+│                                     │                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    OBSERVABILITY STACK                               │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │   │
+│  │  │  Prometheus  │  │  Grafana     │  │  Alertmanager│             │   │
+│  │  │  Metrics:    │  │  Dashboards: │  │  Alerts:     │             │   │
+│  │  │  lock_grants │  │  Lock        │  │  quorum lost │             │   │
+│  │  │  lock_waits  │  │  contention  │  │  high wait   │             │   │
+│  │  │  lease_expiry│  │  per resource│  │  lease expiry│             │   │
+│  │  │  raft_commit │  │  cluster     │  │  rate spike  │             │   │
+│  │  │  quorum_size │  │  health      │  │              │             │   │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Lock Service Cluster
+
+The production lock service runs as a cluster of 3-5 nodes using a consensus protocol (Raft or Zab). A 3-node cluster tolerates 1 node failure. A 5-node cluster tolerates 2 node failures. The cluster provides:
+
+- **Linearizable consistency**: Every lock operation returns the latest committed state. If the lock is held, no client can receive a stale FREE response.
+- **Automatic failover**: If the leader fails, the cluster elects a new leader within 150-300ms. During the election, lock operations are not available. The fencing token ensures no safety violations during the election window.
+- **Durable state**: Lock state is persisted to the write-ahead log on each node. A full cluster restart recovers the lock state from the WAL.
+
+### Client-Side Resilience
+
+The lock client library implements several resilience patterns:
+
+- **Endpoint discovery**: The client connects to all cluster endpoints. If the leader changes, the client redirects to the new leader automatically.
+- **Retry with exponential backoff**: Failed lock acquisitions are retried with backoff. The first retry at 100ms, then 200ms, 400ms, 800ms, up to a maximum of 5 seconds, with jitter added to prevent thundering herd.
+- **Request timeout**: Each request has a timeout shorter than the TTL. If the timeout expires, the client retries on a different node.
+- **Lease renewal awareness**: The client tracks the time remaining on the lease. If the lease is within 25% of expiry, the client sends a renewal preemptively, even if the scheduled renewal is not due.
+
+### Integration Patterns
+
+**Database integration**: The lock protects database operations. The fencing token is passed as a session variable or a comment in the SQL query. The database trigger checks the token and rejects stale operations.
+
+```sql
+-- Safe database operation with fencing token
+SET @fencing_token = 1042;
+UPDATE payments SET status = 'processed'
+WHERE batch_id = 847
+  AND @fencing_token > (
+    SELECT MAX(last_token) FROM lock_tokens
+    WHERE resource = 'batch_847'
+  );
+```
+
+**Job scheduler integration**: The job scheduler acquires a lock before processing each job. The lock key is the job ID. The job metadata includes the fencing token. If the job is retried, the scheduler checks the token and skips processing if the job was already completed by a previous holder.
+
+**Resource manager integration**: The resource manager (file system, S3 bucket, message queue) checks the fencing token on each write operation. The token is embedded in the write request metadata. The resource manager maintains a monotonic counter of the last-seen token.
+
+## Multi-Region Architecture
+
+Cross-region lock coordination is the hardest problem in distributed locking. The speed of light limits cross-region latency to 50-150ms. Consensus protocols perform poorly at these latencies.
+
+<AsciiDiagram
+  id="distributed-locks/multi-region-architecture"
+  title="Multi-Region Lock Architecture"
+  alt="Three regions each with a local lock service cluster, with a global leader region and read replicas in other regions"
+  caption="Multi-region lock architecture with global leader and local replicas" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    MULTI-REGION LOCK ARCHITECTURE                            │
+│                                                                             │
+│  ┌─────────────────────┐     ┌─────────────────────┐     ┌────────────────┐ │
+│  │    us-east-1        │     │    eu-west-1         │     │  ap-southeast-1│ │
+│  │                     │     │                     │     │                │ │
+│  │  ┌───────────────┐  │     │  ┌───────────────┐  │     │ ┌────────────┐ │ │
+│  │  │  Lock Service  │  │     │  │  Lock Service  │  │     │ │ Lock       │ │ │
+│  │  │  (LEADER)      │  │     │  │  (FOLLOWER)    │  │     │ │ Service   │ │ │
+│  │  │  Raft: 3 nodes │  │     │  │  Raft: 3 nodes │  │     │ │(FOLLOWER) │ │ │
+│  │  │  Accepts       │  │     │  │  Read-only     │  │     │ │Read-only  │ │ │
+│  │  │  writes        │  │     │  │  proxies to    │  │     │ │proxies to │ │ │
+│  │  │                │  │     │  │  leader        │  │     │ │leader     │ │ │
+│  │  └───────┬───────┘  │     │  └───────┬───────┘  │     │ └─────┬────┘ │ │
+│  │          │           │     │          │           │     │       │      │ │
+│  │    ┌─────▼──────┐   │     │    ┌─────▼──────┐   │     │ ┌─────▼────┐ │ │
+│  │    │ App Servers │   │     │    │ App Servers │   │     │ │App       │ │ │
+│  │    │ (100 nodes) │   │     │    │ (50 nodes)  │   │     │ │Servers   │ │ │
+│  │    └────────────┘   │     │    └────────────┘   │     │ │(30 nodes)│ │ │
+│  └─────────────────────┘     └─────────────────────┘     │ └──────────┘ │ │
+│                            │                             └──────────────┘ │
+│                            │                                               │
+│                            │ Cross-region latency: 80ms                   │
+│                            ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  Cross-Region Replication (Async)                                    │  │
+│  │  Leader region (us-east-1) asynchronously replicates lock state     │  │
+│  │  to follower regions. Follower regions serve read-only queries.     │  │
+│  │  All lock acquisitions must go through the leader region.            │  │
+│  │                                                                     │  │
+│  │  Lock acquisition latency from eu-west-1: 80ms + 5ms = 85ms        │  │
+│  │  Lock acquisition latency from ap-southeast-1: 150ms + 5ms = 155ms │  │
+│  │  Lease renewal latency from eu-west-1: 80ms + 5ms = 85ms           │  │
+│  │                                                                     │  │
+│  │  Failure mode:                                                       │  │
+│  │  If us-east-1 becomes unavailable:                                   │  │
+│  │  1. All lock operations stop                                         │  │
+│  │  2. Manual failover to eu-west-1 (promote to leader)                │  │
+│  │  3. RTO: 5-15 minutes (manual intervention)                         │  │
+│  │  4. Some lock state may be lost (async replication gap)             │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Cross-Region Strategies
+
+**Single leader region**: All lock operations go through one region. Other regions proxy to the leader. This is simple but has high latency for remote regions and a single point of failure at the region level.
+
+**Partitioned locks**: Each resource is assigned to a specific region. Resources starting with A-M go to us-east-1, N-Z go to eu-west-1. This distributes the load but creates operational complexity when the partition boundaries need to change.
+
+**Last-writer-wins with CRDTs**: For locks that protect non-critical resources, a last-writer-wins approach using conflict-free replicated data types can avoid cross-region coordination. This is not mutual exclusion — it is conflict resolution. Both processes can proceed, but one will be rolled back.
+
+**Global consensus with Geo-Raft**: Raft can be extended to operate across regions, but the commit latency is bounded by the slowest region. A 3-region Geo-Raft cluster with nodes in us-east-1, eu-west-1, and ap-southeast-1 has a commit latency of 150ms (the slowest inter-region link). This is acceptable for coarse-grained locking but not for high-throughput operations.
+
+## Capacity Planning
+
+### Lock Count Estimation
+
+Each lock entry in the registry consumes approximately 200 bytes of memory (resource identifier, owner identifier, fencing token, TTL, expiration, status, metadata). For 10,000 concurrent locks, the memory requirement is 2MB — negligible for a production server.
+
+The real constraint is the lease manager's heartbeat tracking. Each active lease requires a timer entry. With 10,000 active leases and a 100ms tick interval, the lease manager checks 10,000 entries per tick. Each check is a simple expiration comparison, so the CPU cost is approximately 0.1ms per 1,000 entries.
+
+### Throughput Estimation
+
+Lock acquisition throughput depends on the number of cluster nodes and the consensus protocol overhead.
+
+- **Redis single master**: 50,000 ops/sec. Limited by Redis single-threaded event loop and network throughput.
+- **etcd 3-node cluster**: 5,000 ops/sec. Limited by Raft commit latency. Each write requires a majority commit. With 3 nodes, the leader writes to itself and 1 follower. Network latency adds 1-2ms per write.
+- **etcd 5-node cluster**: 3,000 ops/sec. The leader must write to itself and 2 followers. The slower follower determines the commit latency.
+- **ZooKeeper 3-node cluster**: 5,000 ops/sec. Limited by Zab protocol and disk sync interval. ZooKeeper syncs to disk on every write, limiting throughput to disk write speed.
+
+### Scaling Strategy
+
+**Vertical scaling**: Increase the CPU and memory of the lock service nodes. More CPU reduces the time spent on consensus message processing. More memory allows larger lock registries and more concurrent leases. Vertical scaling is effective up to 16 vCPU and 64 GB RAM for etcd and ZooKeeper.
+
+**Horizontal scaling with sharding**: Partition the lock namespace across multiple lock service clusters. Resource keys A-M go to cluster 1, N-Z to cluster 2. Each cluster handles its own consensus. This doubles the throughput but requires the client to know which cluster handles each resource. Consistent hashing can distribute the load evenly.
+
+**Caching with TTL**: Frequently accessed locks can be cached at the client side for a short duration (100ms). The client avoids a network round trip if it can determine that the lock is highly likely to be free. This is a probabilistic optimization — it does not guarantee correctness.
+
+## Operations
+
+### Monitoring
+
+Every lock service should expose the following metrics:
+
+- **lock_grants_total**: Total number of lock grants. Track by resource, success/failure, and latency.
+- **lock_contention_ratio**: Number of failed acquisition attempts per successful acquisition. A ratio above 5 indicates high contention.
+- **lease_expiry_rate**: Number of leases expiring per second. A spike indicates holder crashes or network partitions.
+- **raft_commit_latency**: Time to commit a Raft log entry. Sustained high latency indicates disk I/O issues or network congestion.
+- **quorum_size**: Number of nodes in the Raft quorum. A drop below majority indicates a cluster failure.
+- **lock_hold_duration**: Distribution of how long locks are held. Outliers indicate processes that are stuck or running slowly.
+
+### Alerting
+
+Alert on the following conditions:
+
+- **Quorum lost**: The cluster cannot reach consensus. No lock operations will succeed. Pager-level alert.
+- **High contention ratio**: More than 10 failed acquisitions per success. Indicates a resource that is locked too long or a misconfigured TTL.
+- **Lease expiry spike**: More than 10 expirations per second above baseline. Indicates multiple holder crashes.
+- **Lock acquisition latency p99 above 100ms**: The lock service is slow. Investigate disk I/O, network, or CPU.
+- **Raft leader changes**: More than 1 leader change per hour. Indicates node instability or network issues.
+
+### Backup and Recovery
+
+The lock service is a coordination system, not a data store. Backups are primarily for disaster recovery, not for routine restore.
+
+- **Snapshot the Raft log**: etcd and ZooKeeper support periodic snapshots. Take a snapshot every hour. Retention of 7 days.
+- **Backup the WAL**: The write-ahead log is the source of truth. Back up the WAL to object storage (S3, GCS) every 5 minutes.
+- **Disaster recovery**: Restore from the latest snapshot and WAL replay. Expected recovery time: 5 minutes for a 1GB snapshot.
+- **No recovery from stale snapshots**: Lock state is ephemeral. A snapshot from 1 hour ago shows locks that were held at that time, but all those locks have since expired. Recovery is only useful for reconstructing the last known state before a catastrophic failure.
+
+## Detailed Deployment Topologies
+
+The choice between a 3-node and a 5-node cluster is not merely about failure tolerance. Each topology has distinct implications for latency, throughput, operational complexity, and cost.
+
+### 3-Node Cluster Topology
+
+The 3-node cluster is the minimum viable deployment for consensus-based locking. It tolerates one node failure. This topology is suitable for most production workloads at moderate scale.
+
+**Failure tolerance**: The cluster continues to operate as long as two nodes are healthy. If one node fails, the remaining two maintain quorum. If a second node fails before the first is replaced, the cluster stops serving lock operations.
+
+**Quorum behavior**: All writes require confirmation from 2 of 3 nodes. The commit latency is the sum of the leader's local write time and the fastest follower's network round trip. If the followers have latency of 1ms and 10ms, the commit latency is determined by the 1ms follower — the 10ms follower can lag behind during transient congestion.
+
+<AsciiDiagram
+  id="distributed-locks/three-node-quorum"
+  title="3-Node Cluster Quorum Behavior"
+  alt="Three-node etcd cluster showing leader handling writes with confirmation from one follower, with the third follower acknowledging asynchronously"
+  caption="Write path through a 3-node consensus cluster" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    3-NODE CLUSTER WRITE PATH                              │
+│                                                                         │
+│  ┌──────────────┐     Propose     ┌──────────────┐                    │
+│  │   Client     │────────────────▶│  Leader       │                    │
+│  │   App Server │                 │  (Node 1)     │                    │
+│  │              │◀─── response ───│  Append to    │                    │
+│  └──────────────┘                 │  local WAL    │                    │
+│                                   └──────┬───────┘                    │
+│                                          │                              │
+│                              ┌───────────┼───────────┐                │
+│                              │           │           │                  │
+│               Append entry   │           │           │ Append entry     │
+│                              ▼           │           ▼                  │
+│                    ┌──────────────┐      │    ┌──────────────┐        │
+│                    │  Node 2     │      │    │  Node 3      │        │
+│                    │  (Follower) │      │    │  (Follower)  │        │
+│                    │  WAL append │      │    │  WAL append  │        │
+│                    │  latency:   │      │    │  latency:    │        │
+│                    │  0.5ms      │      │    │  10ms        │        │
+│                    └──────┬──────┘      │    └──────────────┘        │
+│                           │              │                             │
+│                           │ Ack (fast)   │  Ack (slow, async)        │
+│                           └──────┬───────┘                             │
+│                                  │                                     │
+│                                 ▼                                     │
+│                     ┌─────────────────────┐                          │
+│                     │  Commit Latency ≈   │                          │
+│                     │  0.5ms + leader     │                          │
+│                     │  disk write time    │                          │
+│                     └─────────────────────┘                          │
+│                                                                         │
+│  Key property: The slowest follower does NOT determine commit          │
+│  latency. Only the fastest follower matters. The slow follower         │
+│  catches up during idle periods or via snapshot transfer.              │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+**Read path**: Linearizable reads in a 3-node cluster can be served by the leader. The leader ensures it is still the leader by sending a heartbeat to the followers. If the leader has lost quorum, reads are blocked until a new leader is elected. This prevents stale reads during a partition.
+
+**Election time**: Leader election in a 3-node cluster takes 150-300ms under normal conditions. If the cluster is under load, election time can extend to 1-2 seconds as the Raft candidates process pending log entries. During the election window, no lock operations are available.
+
+**Resource utilization**: Each node in a 3-node cluster handles approximately 1/3 of the client connections. If there are 300 application servers, each node handles approximately 100 connections. CPU utilization is typically 10-30% under normal load. Network throughput is 100-500 Kbps per node.
+
+### 5-Node Cluster Topology
+
+The 5-node cluster tolerates two node failures. This topology is used for critical lock services where availability is paramount. It is also used when the lock service must survive rolling updates or maintenance windows without degrading the quorum.
+
+**Failure tolerance**: The cluster continues to operate with any three healthy nodes. Two simultaneous failures do not affect availability. During rolling updates (one node updated at a time), the remaining four nodes maintain quorum, so lock operations continue uninterrupted.
+
+**Quorum behavior**: Writes require confirmation from 3 of 5 nodes. The commit latency is the latency of the median follower, not the fastest or slowest. If the four followers have latencies of 0.5ms, 1ms, 3ms, and 50ms, the commit latency is determined by the 3ms follower (the median of the three fastest followers counting the leader). The 50ms follower can be slow without affecting performance.
+
+**Election time**: Leader election in a 5-node cluster is similar to 3-node — approximately 150-300ms. However, the cluster is more resilient to election failures. If a candidate fails to gather votes from a majority, a second election round still has a high probability of success because 3 of 5 nodes are likely to be alive.
+
+**When to use 5 nodes instead of 3**:
+- The lock service protects critical financial transactions
+- The service must remain available during rolling deployments
+- Maintenance windows are frequent (patch Tuesday, kernel updates)
+- The expected failure rate exceeds 1 node per quarter due to hardware issues
+- Cross-AZ deployment requires surviving an entire AZ failure
+
+**When 3 nodes are sufficient**:
+- The lock service is non-critical and brief outages are acceptable
+- The cluster runs in a single AZ with reliable hardware
+- Maintenance can be scheduled during low-traffic periods
+- The total throughput requirement is under 5,000 ops/sec
+
+### Witness Node Topology
+
+A witness node is a lightweight participant in the consensus protocol that participates in elections but does not hold the full lock registry. Witness nodes are useful for maintaining quorum without the cost of a full data node.
+
+<AsciiDiagram
+  id="distributed-locks/witness-node-topology"
+  title="Witness Node Topology"
+  alt="Two full lock service nodes with a lightweight witness node that participates in elections but does not replicate lock state"
+  caption="A 2+1 witness topology reduces cost while maintaining quorum" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                 2+1 WITNESS NODE TOPOLOGY                                 │
+│                                                                         │
+│  ┌─────────────────────────────┐   ┌─────────────────────────────┐    │
+│  │      Full Node 1            │   │      Full Node 2            │     │
+│  │  ┌───────────────────────┐  │   │  ┌───────────────────────┐  │    │
+│  │  │ Lock Registry         │  │   │  │ Lock Registry         │  │    │
+│  │  │ WAL (100 GB SSD)      │  │   │  │ WAL (100 GB SSD)      │  │    │
+│  │  │ Raft State Machine    │  │   │  │ Raft State Machine    │  │    │
+│  │  │ Replicated Store      │  │   │  │ Replicated Store      │  │    │
+│  │  └───────────────────────┘  │   │  └───────────────────────┘  │    │
+│  │  vCPU: 4, RAM: 16 GB       │   │  vCPU: 4, RAM: 16 GB       │    │
+│  └─────────────────────────────┘   └─────────────────────────────┘    │
+│                                  │                                     │
+│                                  │  Raft voting                        │
+│                                  ▼                                     │
+│  ┌─────────────────────────────┐                                       │
+│  │      Witness Node 3         │                                       │
+│  │  ┌───────────────────────┐  │                                       │
+│  │  │ Raft Voting Only      │  │                                       │
+│  │  │ No Lock Registry      │  │                                       │
+│  │  │ No WAL                │  │                                       │
+│  │  │ Election Participant  │  │                                       │
+│  │  └───────────────────────┘  │                                       │
+│  │  vCPU: 1, RAM: 2 GB        │                                       │
+│  │  Cost: 20% of full node    │                                       │
+│  └─────────────────────────────┘                                       │
+│                                                                         │
+│  Scenario: 2 full nodes + 1 witness                                    │
+│  - Tolerates 1 node failure (witness + 1 full node must survive)      │
+│  - If a full node fails, the witness provides the third vote          │
+│  - If the witness fails, the 2 full nodes continue with 2/2 quorum    │
+│  - Full failure: both full nodes fail → lock service down              │
+│  - Cost: 60% of a 3-node cluster (2 full + 1 light)                  │
+│                                                                         │
+│  Use case: Cost-sensitive deployments where 3 full nodes is too       │
+│  expensive but 2 nodes is too risky. Common in staging, DR, or         │
+│  low-throughput production environments.                               │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+**Witness node characteristics**: A witness node consumes approximately 20% of the resources of a full node. It does not store the lock registry or the WAL. It participates only in the Raft voting process. If the witness node fails, the cluster degrades to 2 full nodes operating with 2/2 quorum — still functional but unable to tolerate another failure.
+
+**Validation topology**: In multi-region setups, witness nodes can be placed in a third region that does not host a full cluster. This provides a tie-breaking vote without the latency cost of a full node. For example, a 2-node cluster in us-east-1 plus a witness in us-west-2 provides quorum without replicating the full lock state across the continent.
+
+## Connection Pool Management
+
+Each application server that holds locks must maintain connections to the lock service cluster. The number of connections and how they are managed directly affects lock acquisition latency, resource utilization, and failure recovery.
+
+### Connection Count Estimation
+
+The lock service (etcd, ZooKeeper) limits the number of concurrent connections. etcd has a default limit of 10,000 client connections per cluster. ZooKeeper has a default limit of 60 connections per client IP by default.
+
+Each application server should maintain a connection pool to the lock service. The pool size depends on the number of concurrent lock operations the server needs to perform.
+
+```
+Pool size formula:
+  max_active_connections = concurrent_lock_operations * (1.2 buffer)
+  
+  For a server that acquires 50 concurrent locks:
+  max_active_connections = 50 * 1.2 = 60 connections
+
+  For a cluster of 300 servers:
+  total_connections = 300 * 60 = 18,000 connections
+```
+
+If the lock service has a 10,000 connection limit, 300 servers at 60 connections each would exceed the limit. The solution is either to increase the limit (etcd: `--max-request-bytes` and OS-level `ulimit` tuning) or to reduce the connection pool per server.
+
+### Pooling Strategies
+
+**Fixed pool with blocking**: A pool of N connections is maintained. A thread requesting a lock borrows a connection from the pool. If no connection is available, the thread blocks until one is released. This is the simplest strategy and works well when the number of concurrent lock operations is bounded.
+
+```python
+import etcd3
+from queue import Queue, Empty, Full
+import threading
+import time
+
+class LockConnectionPool:
+    def __init__(self, endpoints, pool_size=10, max_retries=3):
+        self.endpoints = endpoints
+        self.pool_size = pool_size
+        self.max_retries = max_retries
+        self._pool = Queue(maxsize=pool_size)
+        self._lock = threading.Lock()
+        self._initialize_pool()
+    
+    def _initialize_pool(self):
+        """Pre-create all connections to avoid latency on first use."""
+        for i in range(self.pool_size):
+            client = etcd3.client(
+                host=self.endpoints[i % len(self.endpoints)],
+                port=2379,
+                timeout=5,
+            )
+            self._pool.put(client, timeout=10)
+    
+    def acquire_client(self, timeout=5):
+        """Get a client from the pool with timeout."""
+        client = self._pool.get(timeout=timeout)
+        # Ping to verify connection is healthy
+        try:
+            client.status()
+            return client
+        except Exception:
+            # Connection is dead, create a replacement
+            idx = hash(time.time()) % len(self.endpoints)
+            new_client = etcd3.client(
+                host=self.endpoints[idx],
+                port=2379,
+                timeout=5,
+            )
+            return new_client
+    
+    def release_client(self, client):
+        """Return a client to the pool or close it if pool is full."""
+        try:
+            self._pool.put(client, timeout=1, block=False)
+        except Full:
+            client.close()
+```
+
+**Dynamic pool with watermark**: The pool grows and shrinks based on demand. A minimum pool size is maintained for baseline traffic. A maximum pool size limits resource usage. The pool grows when the number of waiting threads exceeds a threshold and shrinks when connections are idle for a configurable duration.
+
+```yaml
+# Pool configuration (YAML-based)
+connection_pool:
+  strategy: dynamic_watermark
+  min_size: 5
+  max_size: 50
+  watermark_low: 0.3    # Shrink when less than 30% of connections in use
+  watermark_high: 0.7   # Grow when more than 70% of connections in use
+  idle_timeout_ms: 30000 # Close connections idle for 30 seconds
+  reap_interval_ms: 10000 # Check for idle connections every 10 seconds
+  acquisition_timeout_ms: 5000 # Fail fast if no connection available
+  endpoint_selection: least_loaded
+```
+
+**Connection per thread**: Each thread maintains its own connection. This eliminates pool contention but increases the total number of connections. This strategy is appropriate when the lock service supports a high connection count and the number of lock-using threads is bounded.
+
+**Implementation consideration**: Connections should use TCP keepalive to detect broken connections. The kernel-level keepalive interval should be set to 15 seconds with 3 probes. This detects dead connections within 45 seconds. Shorter keepalive intervals (5 seconds) can be used if the lock service must detect failures quickly, but this increases network overhead.
+
+### Pool Health Checking
+
+Connections in the pool must be periodically health-checked. A dead connection returned to a caller causes a lock acquisition failure that could have been avoided.
+
+```python
+def health_check_worker(pool, interval_seconds=30):
+    """Background worker that periodically checks pool connection health."""
+    while not pool.shutdown_flag:
+        time.sleep(interval_seconds)
+        for i in range(pool._pool.qsize()):
+            try:
+                client = pool._pool.get(block=False)
+                try:
+                    client.status()
+                    pool._pool.put(client, block=False)
+                except Exception:
+                    # Replace dead connection
+                    idx = hash(time.time()) % len(pool.endpoints)
+                    new_client = etcd3.client(
+                        host=pool.endpoints[idx],
+                        port=2379,
+                        timeout=5,
+                    )
+                    pool._pool.put(new_client, block=False)
+            except Empty:
+                break
+```
+
+### Endpoint Selection
+
+The client should distribute connections across all lock service endpoints. Round-robin is the simplest strategy but does not account for node capacity. Least-loaded endpoint selection tracks the response time of each node and prefers faster nodes.
+
+```python
+class LeastLoadedSelector:
+    def __init__(self, endpoints):
+        self.endpoints = endpoints
+        self.latency_stats = {ep: [] for ep in endpoints}
+    
+    def select_endpoint(self):
+        """Select endpoint with lowest average latency."""
+        avg_latencies = {
+            ep: sum(stats[-10:]) / max(len(stats[-10:]), 1)
+            for ep, stats in self.latency_stats.items()
+        }
+        return min(avg_latencies, key=avg_latencies.get)
+    
+    def record_latency(self, endpoint, latency_ms):
+        self.latency_stats[endpoint].append(latency_ms)
+        if len(self.latency_stats[endpoint]) > 100:
+            self.latency_stats[endpoint].pop(0)
+```
+
+## Circuit Breaker Patterns
+
+A lock service failure can cascade through the entire application. If the lock service is slow or unavailable, every operation that requires a lock will hang or fail. A circuit breaker prevents this cascade by failing fast when the lock service is degraded.
+
+### Circuit Breaker States
+
+<AsciiDiagram
+  id="distributed-locks/circuit-breaker-states"
+  title="Circuit Breaker State Machine for Lock Service"
+  alt="State machine diagram showing the CLOSED, OPEN, and HALF_OPEN states of a circuit breaker with transition conditions"
+  caption="Circuit breaker state machine for lock service interactions" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    CIRCUIT BREAKER STATE MACHINE                          │
+│                                                                         │
+│                          failure_count                                   │
+│                          exceeds threshold                               │
+│                    ┌──────────────────────────────┐                     │
+│                    │                              ▼                     │
+│        ┌───────────────────┐          ┌───────────────────┐           │
+│        │                   │          │                   │            │
+│        │     CLOSED        │──────────│     OPEN          │            │
+│        │                   │  N ≥ 5   │                   │            │
+│        │ Normal operation  │          │ Fast-fail all     │            │
+│        │ Requests pass     │          │ requests with     │            │
+│        │ through           │          │ CircuitOpenError  │            │
+│        └───────────────────┘          └───────────────────┘            │
+│                    │                              │                     │
+│                    │ success resets               │ timeout (30s)      │
+│                    │ failure_count                │                   │
+│                    │                              ▼                     │
+│                    │                    ┌───────────────────┐          │
+│                    │                    │                   │          │
+│                    │                    │    HALF_OPEN      │          │
+│                    │                    │                   │          │
+│                    │  success ◄─────────│ Probe: 1 request  │          │
+│                    │                    │ passes through    │          │
+│                    │                    └───────────────────┘          │
+│                    │                              │                     │
+│                    │                              │ failure            │
+│                    └──────────────────────────────┘                     │
+│                                                                         │
+│  State transition rules:                                                │
+│  CLOSED → OPEN  : 5 consecutive failures                              │
+│  OPEN → HALF_OPEN: 30 second timeout expires                           │
+│  HALF_OPEN → CLOSED: probe request succeeds                            │
+│  HALF_OPEN → OPEN: probe request fails                                 │
+│                                                                         │
+│  Consecutive failures tracked per lock resource or aggregate.          │
+│  Aggressive mode: 3 failures → OPEN (for critical lock paths).        │
+│  Relaxed mode: 10 failures → OPEN (for non-critical lock paths).      │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Circuit Breaker Implementation
+
+```python
+import time
+import threading
+from enum import Enum
+
+class CircuitState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+class LockCircuitBreaker:
+    def __init__(self, failure_threshold=5, recovery_timeout=30, half_open_max=1):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_max = half_open_max
+        self.state = CircuitState.CLOSED
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.half_open_attempts = 0
+        self._lock = threading.Lock()
+    
+    def call(self, lock_func, *args, **kwargs):
+        """Execute a lock operation through the circuit breaker."""
+        with self._lock:
+            if self.state == CircuitState.OPEN:
+                if time.monotonic() - self.last_failure_time >= self.recovery_timeout:
+                    self.state = CircuitState.HALF_OPEN
+                    self.half_open_attempts = 0
+                else:
+                    raise CircuitOpenError("Lock service circuit is open")
+        
+        try:
+            result = lock_func(*args, **kwargs)
+            self._on_success()
+            return result
+        except (ConnectionError, TimeoutError) as e:
+            self._on_failure()
+            raise LockServiceDegradedError(str(e)) from e
+    
+    def _on_success(self):
+        with self._lock:
+            if self.state == CircuitState.HALF_OPEN:
+                self.half_open_attempts += 1
+                if self.half_open_attempts >= self.half_open_max:
+                    self.state = CircuitState.CLOSED
+                    self.failure_count = 0
+            else:
+                # Reset failure count on success in CLOSED state
+                self.failure_count = 0
+    
+    def _on_failure(self):
+        with self._lock:
+            self.last_failure_time = time.monotonic()
+            if self.state == CircuitState.HALF_OPEN:
+                self.state = CircuitState.OPEN
+            elif self.state == CircuitState.CLOSED:
+                self.failure_count += 1
+                if self.failure_count >= self.failure_threshold:
+                    self.state = CircuitState.OPEN
+
+class CircuitOpenError(Exception):
+    """Raised when the circuit breaker is open and all requests are blocked."""
+
+class LockServiceDegradedError(Exception):
+    """Raised when the lock service is responding with errors."""
+```
+
+### Circuit Breaker Placement
+
+The circuit breaker should be placed at two levels:
+
+**Per-resource circuit breaker**: If a specific lock resource is contended or the lock service is slow for that key, the circuit breaker opens for that key only. Other keys continue to work normally. This prevents one hot key from affecting the entire lock service.
+
+**Cluster-level circuit breaker**: If all lock acquisition attempts fail, the circuit breaker opens for all resources. This prevents the application from hammering a dead lock service. The cluster-level breaker should have a higher failure threshold (10-15 failures) than the per-resource breaker (3-5 failures).
+
+### Integration with Degradation Behavior
+
+When the circuit breaker is open, the application must decide how to proceed:
+
+- **Fail fast**: Raise an exception to the caller. The calling code knows the lock is unavailable and can handle it (retry later, use a fallback, or abort).
+- **Skip the lock**: Proceed without the lock. This is acceptable for non-critical operations where a brief period of unsafety is acceptable.
+- **Use a degraded lock**: Fall back to a local in-memory lock. This provides best-effort mutual exclusion within a single process but does not prevent cross-process race conditions.
+- **Use a backup lock service**: Switch to a secondary lock service in another region. This requires the backup service to be kept in sync, which is complex.
+
+## Graceful Degradation Strategies
+
+When the lock service is degraded (high latency, intermittent failures, or reduced quorum), the application must adjust its behavior to avoid making the situation worse while still providing useful functionality.
+
+### Degradation Levels
+
+Define four degradation levels based on lock service health:
+
+| Level | Condition | Behavior |
+|-------|-----------|----------|
+| Green | Latency p99 < 10ms, no errors | Normal operation |
+| Yellow | Latency p99 10-50ms, error rate < 1% | Add jitter, increase retry intervals |
+| Orange | Latency p99 50-200ms, error rate 1-5% | Extend lease TTL, reduce concurrency |
+| Red | Latency p99 > 200ms, error rate > 5% | Circuit breaker open, use fallback |
+
+### Degradation Behavior by Component
+
+**Lock acquisition**: In Yellow and Orange levels, increase the retry backoff factor from 2x to 3x. This reduces the retry load on the lock service. In Red level, do not attempt new lock acquisitions. Wait for the circuit breaker to transition to HALF_OPEN.
+
+**Lease renewal**: In Yellow level, renew leases 30% earlier than normal (when 40% of TTL remains instead of 25%). In Orange level, renew at 50% of TTL. This gives more time for slow operations to complete. In Red level, extend the local lease tolerance window — allow operations to proceed for up to 2 TTL periods without a renewal confirmation.
+
+**Operation timeout**: In Green level, the operation timeout equals 80% of the lock TTL. In Yellow, reduce to 60%. In Orange, reduce to 40%. This ensures the operation completes (or fails) before the lock expires, even under degraded conditions.
+
+**Connection management**: In Yellow level, reduce the connection pool size by 20%. In Orange, reduce by 50%. In Red, close all idle connections. This reduces the load on the degraded lock service while preserving the most essential connections.
+
+### Implementation Pattern
+
+```python
+class DegradationManager:
+    def __init__(self, baseline_ttl=30, baseline_pool_size=50):
+        self.level = "green"
+        self.baseline_ttl = baseline_ttl
+        self.baseline_pool_size = baseline_pool_size
+    
+    def get_effective_ttl(self):
+        multipliers = {
+            "green": 1.0,
+            "yellow": 1.2,   # Extend TTL by 20%
+            "orange": 1.5,   # Extend TTL by 50%
+            "red": 2.0,      # Extend TTL by 100%
+        }
+        return self.baseline_ttl * multipliers[self.level]
+    
+    def get_effective_pool_size(self):
+        multipliers = {
+            "green": 1.0,
+            "yellow": 0.8,   # Reduce pool by 20%
+            "orange": 0.5,   # Reduce pool by 50%
+            "red": 0.2,      # Reduce pool by 80%
+        }
+        return int(self.baseline_pool_size * multipliers[self.level])
+    
+    def should_attempt_acquisition(self):
+        if self.level == "red":
+            # Only allow periodic probes at half-open intervals
+            return time.monotonic() % 30 < 1
+        return True
+    
+    def assess_health(self, latency_p99, error_rate):
+        if latency_p99 < 10 and error_rate < 0.01:
+            self.level = "green"
+        elif latency_p99 < 50 and error_rate < 0.05:
+            self.level = "yellow"
+        elif latency_p99 < 200 and error_rate < 0.10:
+            self.level = "orange"
+        else:
+            self.level = "red"
+```
+
+## Detailed Capacity Planning Math
+
+### Memory Per Lock
+
+Each lock entry in the registry has multiple components that consume memory. Understanding the exact memory footprint is essential for capacity planning.
+
+```python
+# Memory breakdown per lock entry (etcd v3)
+# Key-value storage
+lock_key = "/locks/resource_abc"  # ~20 bytes
+lock_value = json.dumps({
+    "owner": "server-42-pid-1234",    # ~25 bytes
+    "token": 1042,                     # ~4 bytes as int
+    "created_at": 1719876543.456,      # ~16 bytes as float64
+    "ttl": 30000,                      # ~4 bytes as int
+    "metadata": {                      # variable
+        "request_id": "req_98765",     # ~16 bytes
+        "operation": "batch_process"   # ~18 bytes
+    }
+})  # ~100 bytes total for serialized JSON
+
+# etcd storage overhead
+# Key index entry: ~40 bytes
+# Revision history: ~40 bytes per revision
+# Backend transaction buffer: ~20 bytes
+# BoltDB bucket overhead: ~30 bytes
+
+# Total per lock entry:
+# Lock data:          ~120 bytes
+# etcd overhead:      ~130 bytes
+# ----------------------------
+# Total:              ~250 bytes per active lock
+```
+
+For 100,000 concurrent locks, the memory requirement is 25 MB for the lock data plus approximately 50 MB for the etcd in-memory index. This is still modest — a 64 GB server has over 1,000 times the required memory.
+
+**The real memory cost is the WAL**: Each lock acquisition and release generates one or more WAL entries. With 100,000 lock acquisitions per second and an average entry size of 200 bytes, the WAL grows at 20 MB/second or 72 GB/hour. WAL compaction and snapshotting must keep pace with this growth to prevent disk exhaustion.
+
+### CPU Per Operation
+
+Lock operations consume CPU on both the lock service and the client. Understanding the CPU profile helps right-size the cluster.
+
+**Server-side CPU per operation**:
+
+| Operation | CPU Time (3-node etcd) | CPU Time (5-node etcd) |
+|-----------|----------------------|----------------------|
+| Lock acquire (PUT) | 0.02ms | 0.03ms |
+| Lock release (DELETE) | 0.02ms | 0.03ms |
+| Lock check (GET) | 0.005ms | 0.005ms |
+| Lease renew (KeepAlive) | 0.01ms | 0.01ms |
+| Raft consensus message | 0.005ms | 0.008ms |
+| WAL append and sync | 0.01ms | 0.01ms |
+
+**Total CPU for 10,000 operations/second**:
+- 10,000 acquires x 0.02ms = 200ms CPU per second (20% of one core)
+- 10,000 releases x 0.02ms = 200ms CPU per second (20% of one core)
+- 10,000 lease renewals x 0.01ms = 100ms CPU per second (10% of one core)
+- Total: 0.5 cores per second
+
+For a 4-core server, this represents 12.5% CPU utilization. For 50,000 operations/second, the CPU utilization rises to 62.5%. At 80,000 operations/second, the server is CPU-bound.
+
+**Client-side CPU per operation**:
+
+| Component | CPU Time |
+|-----------|----------|
+| Serialize request | 0.001ms |
+| Deserialize response | 0.001ms |
+| Token generation (client-side) | 0.0001ms |
+| Lock manager state update | 0.0005ms |
+| Connection pool management | 0.0005ms |
+| Total | 0.003ms per operation |
+
+Client-side CPU is negligible. The bottleneck is always the lock service or the network.
+
+### Network Bandwidth Calculation
+
+Each lock operation generates a small network packet. The key metric is packets per second (PPS), not bytes per second. Network devices and operating systems are limited by PPS, especially on cloud instances with virtualized networking.
+
+```python
+# Packet size breakdown per lock operation
+#
+# HTTP/2 or gRPC request:
+#   TCP header:           20 bytes
+#   IP header:            20 bytes
+#   Ethernet frame:       14 bytes
+#   HTTP/2 frame header:  9 bytes
+#   gRPC wrapper:         5 bytes
+#   Protobuf payload:     150 bytes (key + value)
+#   -----------------------------
+#   Total per request:    ~218 bytes
+#
+# Response:
+#   Headers:              ~80 bytes
+#   Protobuf payload:    ~30 bytes (OK/nil + token)
+#   ----------------------------
+#   Total per response:   ~110 bytes
+#
+# Full lock acquisition round trip:
+#   Request:  218 bytes
+#   Response: 110 bytes
+#   -----------------
+#   Total:    328 bytes
+
+# Bandwidth for 10,000 ops/sec:
+#   10,000 x 328 bytes = 3.28 MB/s = 26.2 Mbps
+
+# Bandwidth for 50,000 ops/sec:
+#   50,000 x 328 bytes = 16.4 MB/s = 131 Mbps
+
+# Bandwidth for 100,000 ops/sec:
+#   100,000 x 328 bytes = 32.8 MB/s = 262 Mbps
+
+# Packet rate for each throughput level:
+#   10,000 ops/sec  → 10,000 PPS (trivial)
+#   50,000 ops/sec  → 50,000 PPS (typical limit: 100,000 PPS)
+#   100,000 ops/sec → 100,000 PPS (some cloud instances capped here)
+#   500,000 ops/sec → 500,000 PPS (requires enhanced networking)
+```
+
+### Per-Node Capacity Table
+
+| Resource | 3-Node etcd | 5-Node etcd | 3-Node ZooKeeper |
+|----------|-------------|-------------|-------------------|
+| vCPU | 4-8 | 8-16 | 4-8 |
+| Memory | 16-32 GB | 32-64 GB | 16-32 GB |
+| Disk (SSD) | 100 GB | 200 GB | 100 GB |
+| Network | 1 Gbps | 10 Gbps | 1 Gbps |
+| Max ops/sec | 5,000 | 3,000 | 5,000 |
+| Max connections | 10,000 | 10,000 | 60/client IP |
+| Max active locks | 1,000,000 | 1,000,000 | 100,000 (znode limit) |
+| WAL growth/hour | 3.6 GB (5K ops/sec) | 2.2 GB (3K ops/sec) | 7.2 GB (5K ops/sec, verbose) |
+
+## Auto-Scaling Strategies
+
+Lock service clusters are stateful and consensus-based, which makes auto-scaling fundamentally different from stateless web servers. Adding or removing nodes requires careful coordination to maintain quorum.
+
+### Scaling Up (Adding Nodes)
+
+Adding a node to a consensus cluster is a deliberate operation, not an automatic one. The new node must receive a snapshot of the current state and catch up on the WAL before it can participate in the quorum.
+
+```yaml
+# Scaling procedure for a 3-node etcd cluster (add 2 nodes → 5-node cluster)
+stages:
+  - stage: 1
+    action: "add_node_4"
+    command: "etcdctl member add node-4 --peer-urls=https://node-4:2380"
+    verification: "Wait for node-4 to catch up. Check: etcdctl endpoint status"
+    duration: "30-60 seconds for snapshot transfer"
+    
+  - stage: 2
+    action: "add_node_5"
+    command: "etcdctl member add node-5 --peer-urls=https://node-5:2380"
+    verification: "Wait for node-5 to catch up"
+    duration: "30-60 seconds"
+    
+  - stage: 3
+    action: "rebalance_in_flight"
+    command: "Monitor client connections. New nodes automatically accept connections"
+    verification: "Check connection distribution: all 5 nodes should have ~20% each"
+    duration: "5-15 minutes for natural rebalancing"
+```
+
+**Auto-scaling triggers for adding nodes**:
+- CPU utilization exceeds 70% on all nodes for 5 minutes
+- Lock acquisition latency p99 exceeds 100ms for 5 minutes
+- Connection count exceeds 80% of the node limit
+- WAL write latency exceeds 50ms (disk is throttling)
+
+### Scaling Down (Removing Nodes)
+
+Removing a node from a consensus cluster is more dangerous than adding one. Never remove more than one node at a time. Removing a node reduces the quorum size, which reduces failure tolerance.
+
+```python
+def scale_down_cluster(cluster_nodes, node_to_remove):
+    """
+    Safely remove a node from the cluster.
+    Must not reduce quorum below majority.
+    """
+    # Validate quorum after removal
+    current_count = len(cluster_nodes)
+    if current_count - 1 < 3:
+        raise ValueError("Cannot reduce cluster below 3 nodes")
+    
+    # Check if removal would reduce failure tolerance
+    new_quorum = (current_count - 1) // 2 + 1
+    remaining = current_count - 1
+    new_tolerance = remaining - new_quorum
+    
+    print(f"After removal: {remaining} nodes, quorum={new_quorum}, "
+          f"failure_tolerance={new_tolerance} nodes")
+    
+    if new_tolerance < 1:
+        print("Warning: Cluster will have zero failure tolerance after removal")
+    
+    # Drain connections from the node before removal
+    # This prevents client connection errors
+    print(f"Draining connections from {node_to_remove}...")
+    time.sleep(30)  # Allow clients to discover the draining
+    
+    # Remove the member
+    # etcdctl member remove {node_to_remove.member_id}
+    
+    # Verify removal
+    # etcdctl endpoint health --cluster
+    
+    print("Verifying cluster health after removal...")
+    time.sleep(5)
+```
+
+**Auto-scaling triggers for removing nodes**:
+- CPU utilization below 20% on all nodes for 15 minutes (outside maintenance windows)
+- Consistent under-utilization observed over a 24-hour period with workload patterns analyzed
+- Node is marked as unhealthy and cannot recover (replace rather than scale down in this case)
+
+### The Auto-Scaling Architecture
+
+<AsciiDiagram
+  id="distributed-locks/auto-scaling-architecture"
+  title="Auto-Scaling Architecture for Lock Service"
+  alt="Architecture diagram showing the auto-scaler monitoring lock service metrics and making scaling decisions"
+  caption="Auto-scaling pipeline for a stateful lock service cluster" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   AUTO-SCALING ARCHITECTURE                               │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    METRICS PIPELINE                               │   │
+│  │                                                                   │   │
+│  │  ┌──────────────────┐    ┌──────────────┐    ┌──────────────┐   │   │
+│  │  │ Node Exporter    │───▶│  Prometheus   │───▶│  Recording   │   │   │
+│  │  │ (per node)       │    │  (scrape)     │    │  Rules       │   │   │
+│  │  └──────────────────┘    └──────────────┘    │  node_cpu    │   │   │
+│  │  ┌──────────────────┐                        │  node_mem    │   │   │
+│  │  │ etcd Metrics     │                       │  ops_latency │   │   │
+│  │  │ (per node)       │                       │  conn_count  │   │   │
+│  │  └──────────────────┘                       └──────┬───────┘   │   │
+│  └─────────────────────────────────────────────────────┼─────────┘   │
+│                                                         │              │
+│                                                         ▼              │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    SCALING DECISION ENGINE                        │   │
+│  │                                                                   │   │
+│  │  ┌────────────────────┐     ┌────────────────────┐              │   │
+│  │  │ Scale-Up Rules     │     │ Scale-Down Rules   │              │   │
+│  │  │                    │     │                    │              │   │
+│  │  │ cpu > 70% for 5m  │     │ cpu < 20% for 15m  │              │   │
+│  │  │ latency > 100ms   │     │ conn < 30% for 30m │              │   │
+│  │  │ conn > 80% limit  │     │                    │              │   │
+│  │  └────────────────────┘     └────────────────────┘              │   │
+│  │                                                                   │   │
+│  │  Cooldown: 10 minutes between scaling actions                   │   │
+│  │  Max scale-up: +1 node per 10 minutes                           │   │
+│  │  Max scale-down: -1 node per 30 minutes                         │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                         │              │
+│                                                         ▼              │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    EXECUTION ENGINE                               │   │
+│  │                                                                   │   │
+│  │  1. Check cooldown: last scaling action > 10 min ago            │   │
+│  │  2. Validate: quorum will be maintained after change             │   │
+│  │  3. Execute: etcdctl member add/remove                          │   │
+│  │  4. Verify: endpoint health check after change                   │   │
+│  │  5. Update load balancer or DNS if needed                       │   │
+│  │  6 Notify, update deployment record                              │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Scaling Limitations in Practice.
+Consensus-based systems имеют some inherent limitations on scaling that cannot be overcome by adding nodes alone:
+-每個集群節點的數量上限，etcd建議上限為7個節，超過此節的數量可能會導致 Raft heartbeat overhead Dominates the可用 CPU, which degrades commit latency even at idle throughput level increases with quadratic growth rate！）
+- 每個 WAL 追加者必須等待至少超半數 commit, thus every additional node directly increases the commit delay without being able to add more throughput
+- 因此應考思想者應該是垂直放大（大型機器）加上多集群user sharding, 而不是追求集群內節數量最大
+
+以上考量内容已按需求撰写內容：
+
+## Blue-Green Deployment of Lock Services
+
+Blue-green deployment for a lock service cluster where cipher key data is subsequently updated is non-trivial, since all state must be migrated from the old cluster to the new one.  Unlike stateless servers that can switch traffic instantly, lock state is ephemeral and must be handled in steps.
+
+### Blue-Green Deployment Procedure
+
+**Phase 1: Warm the green cluster**.
+
+Start the new cluster in parallel with the existing blue cluster. The green cluster must receive no traffic yet. Verify its health by running a synthetic workload. Ensure the green cluster uses the same configuration as the blue cluster (TTL, lease duration, compaction interval).
+
+**Phase 2: Drain active locks from blue**.
+
+No lock should be migrated while it is held. Wait for all existing locks to expire. New lock acquisitions during this phase should still go to the blue cluster. Set a maximum drain timeout of 15 minutes. If locks persist beyond this timeout, force-release them (after verifying that the holders are healthy and can reacquire).
+
+**Phase 3: Switch clients to green**.
+
+Update the client configuration to point to the green cluster endpoints. If the client uses service discovery, update the DNS or load balancer target. The switch should be gradual: 10% of clients first, then 25%, 50%, 100%. Monitor lock acquisition success rate during each step.
+
+**Phase 4: Verify and retire blue**.
+
+All clients are on green. Run a verification workload to confirm that locks are acquired and released correctly on green. Monitor for any errors or warnings. If no issues arise after 30 minutes, decommission the blue cluster.
+
+```yaml
+# blue-green deployment plan
+deployment:
+  strategy: blue_green
+  phases:
+    - phase: warm_green
+      duration: 15m
+      actions:
+        - start_cluster("green", nodes=3, config=blue_config)
+        - run_health_checks("green")
+        - run_synthetic_workload("green")
+        - verify_consistency("green", "blue")
+    
+    - phase: drain_blue
+      duration: 15m
+      actions:
+        - set_blue_cluster_readonly()
+        - wait_for_existing_locks_to_expire(max=15m)
+        - force_release_stale_locks()
+        - verify_no_active_locks("blue")
+    
+    - phase: switch_traffic
+      duration: 10m
+      actions:
+        - update_dns("lock.blue.internal", "lock.green.internal")
+        - update_load_balancer_target_group("green")
+        - gradual_client_switch(step_percent=[10, 25, 50, 100])
+        - monitor_lock_success_rate()
+    
+    - phase: verify_and_retire
+      duration: 30m
+      actions:
+        - run_verification_workload()
+        - check_metrics("lock_grants", "errors")
+        - if_all_good: decommission_blue_cluster()
+        - if_issues: rollback_to_blue()
+  
+  rollback:
+    - route_traffic_back_to_blue()
+    - resume_locks_from_blue()
+    - decommission_green()
+    - expected_rollback_time: 5m
+```
+
+### Hot Standby Pattern (Alternative to Blue-Green)
+
+For lock services that cannot tolerate the drain phase, a hot standby pattern can be used. The secondary cluster is kept in sync via async replication (leader in the primary cluster replicates to a follower in the secondary cluster). This is lossy — a failover may lose the last few lock operations — but it eliminates the drain time.
+
+## Monitoring Dashboards
+
+A comprehensive monitoring setup for lock services provides visibility into every aspect of the system. The dashboards below assume Grafana as the visualization layer with Prometheus as the metrics backend.
+
+### Dashboard 1: Lock Service Overview
+
+This is the first dashboard an operator checks. It shows the overall health of the lock service.
+
+**Panel 1: Cluster Health (Stat panels in a row)**:
+- Number of nodes: expected vs actual (3/3, 4/5, etc.)
+- Current leader: node name and uptime
+- Quorum status: healthy or degraded
+- Cluster version: all nodes running the same version?
+
+**Panel 2: Lock Acquisition Rate (Time series)**:
+- `rate(lock_grants_total[1m])` — lock acquisitions per second, colored by resource group
+- Overlay the lock release rate for comparison
+- Add a second axis for cumulative active locks
+
+**Panel 3: Lock Contention (Time series)**:
+- `rate(lock_failures_total[1m]) / rate(lock_grants_total[1m])` — contention ratio. Add a threshold line at 5.0
+- Top 10 most contended resources (table with resource, contention ratio, average wait time)
+- P50/P95/P99 lock acquisition wait time
+
+**Panel 4: Error Rate (Time series)**:
+- `rate(lock_errors_total[1m])` — colored by error type: timeout, connection refused, quorum lost, etc.
+- Error rate by node — to detect a single node that is causing more errors than others
+
+### Dashboard 2: Lock Service Cluster Internals
+
+This dashboard shows the cluster-level metrics for operators who need to diagnose performance issues.
+
+**Panel 1: Raft Consensus Metrics**:
+
+| Metric | PromQL | Purpose |
+|--------|--------|---------|
+| Proposal rate | `rate(etcd_server_proposals_failed_total[1m])` | Failed Raft proposals (write failures) |
+| Commit latency | `etcd_server_commit_proposal_duration_seconds_bucket` | Histogram of commit latency |
+| Applied index | `etcd_server_leader_applied_index` | How current the state machine is |
+| Term changes | `changes(etcd_server_term[1m])` | Leader changes (alerts on > 1/hour) |
+
+**Panel 2: Disk I/O**:
+- WAL fsync latency: `etcd_wal_fsync_duration_seconds_bucket`. Shows p50, p95, p99 over time. High fsync latency indicates disk contention.
+- DB fsync latency: `etcd_db_fsync_duration_seconds_bucket`. Should be lower than WAL fsync.
+- Disk throughput: `rate(etcd_wal_write_bytes_total[1m])`. Should correlate with lock acquisition rate.
+- Disk space utilization: percentage of WAL and snapshot disk space used. Alert at 70%, 85%, 95%.
+
+**Panel 3: Network**:
+- Client traffic: `rate(etcd_network_client_grpc_sent_bytes_total[1m])` and received. Break down by node.
+- Peer traffic: `rate(etcd_network_peer_sent_bytes_total[1m])`. Raft consensus traffic.
+- Connection count: `etcd_cluster_client_connections`. Total and per-node.
+- gRPC call latency: `grpc_server_handling_seconds_bucket`. Break down by method: Put, Range, DeleteRange.
+
+**Panel 4: Memory and CPU**:
+- etcd process memory: `process_resident_memory_bytes`. Should be stable; growth indicates a memory leak or WAL not compacting.
+- etcd process CPU: `rate(process_cpu_seconds_total[1m])`. Compare across nodes.
+- Goroutine count: `go_goroutines`. A growing goroutine count indicates connection leaks or operations stuck in flight.
+
+### Dashboard 3: Application-Level Lock Metrics
+
+This dashboard shows the lock usage patterns from the perspective of the application servers.
+
+**Panel 1: Lock Hold Time Distribution (Heatmap)**:
+- A heatmap with lock hold duration on the x-axis and count on the y-axis. Color intensity shows the number of lock operations.
+- Overlay the TTL value as a vertical line. Lock operations to the right of this line are approaching expiry.
+- Multiple resources shown as separate series to identify resources with abnormally long hold times.
+
+**Panel 2: Lock Acquisition Latency by Resource**:
+- A table showing each lock resource and its p50/p95/p99 acquisition latency.
+- Sort by p99 descending to identify the slowest resources.
+- Include a column for the number of acquisitions to distinguish between hot keys and cold keys.
+
+**Panel 3: Client-Side Circuit Breaker Status**:
+- For each circuit breaker (per resource and cluster-level), show the current state (CLOSED, OPEN, HALF_OPEN).
+- Show the failure count for OPEN breakers.
+- Show the time since last transition — a breaker that has been OPEN for more than 5 minutes indicates a persistent problem.
+
+**Panel 4: Lease Renewal Metrics**:
+- `lease_renewal_success_rate`: percentage of lease renewals that succeeded.
+- `lease_renewal_latency`: distribution of renewal round-trip times.
+- `lease_expiry_count`: number of leases that expired before renewal. High expiry count indicates that lock holders are too slow to renew or the network is too slow.
+
+### Alert Rules for Grafana/Alertmanager
+
+```yaml
+# alerting rules for lock service
+groups:
+  - name: lock_service_critical
+    interval: 30s
+    rules:
+      - alert: LockServiceQuorumLost
+        expr: |
+          count(etcd_server_has_leader == 1) < (count(etcd_server_id) / 2 + 1)
+        for: 10s
+        labels:
+          severity: critical
+          pager: true
+        annotations:
+          summary: "Lock service has lost quorum. No lock operations available."
+          description: "Only {{ $value }} of {{ $labels.cluster }} nodes see a leader."
+      
+      - alert: LockAcquisitionHighLatency
+        expr: |
+          histogram_quantile(0.99, rate(grpc_server_handling_seconds_bucket{
+            grpc_method="Put"
+          }[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lock acquisition p99 latency exceeds 100ms"
+          description: "Current p99: {{ $value }}s on {{ $labels.instance }}"
+      
+      - alert: LockContentionHigh
+        expr: |
+          rate(lock_failures_total[5m]) / rate(lock_grants_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High lock contention ratio"
+          description: "Contention ratio: {{ $value }} failures per success"
+      
+      - alert: LockLeaseExpirySpike
+        expr: |
+          rate(etcd_lease_expired_total[1m]) > 
+          (rate(etcd_lease_expired_total[30m] offset 30m) * 3)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lease expiry rate has spiked"
+          description: "Current: {{ $value }} expirations/sec"
+      
+      - alert: LockServiceDiskFull
+        expr: |
+          (etcd_mvcc_db_total_size_in_bytes / etcd_server_quota_backend_bytes) > 0.85
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Lock service disk usage exceeds 85%"
+          description: "Node {{ $labels.instance }} at {{ $value | humanizePercentage }}"
+      
+      - alert: LockRaftLeaderChanges
+        expr: |
+          changes(etcd_server_leader_changes_seen_total[1h]) > 2
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Frequent Raft leader changes"
+          description: "{{ $value }} leader changes in the last hour on {{ $labels.instance }}"
+```
+
+## Chaos Engineering for Lock Services
+
+Chaos engineering validates that the lock service survives real-world failures. The goal is to find weaknesses before a production incident exploits them.
+
+### What to Test
+
+**Network failures**:
+- Partition a single lock service node from the rest of the cluster
+- Partition the lock service cluster from a subset of application servers (readers or writers lose connectivity)
+- Introduce packet loss (1%, 5%, 10%) on the lock service network link
+- Introduce latency (add 50ms, 100ms, 200ms) to lock service traffic
+- Throttle bandwidth on the lock service interface to simulate congestion
+
+**Node failures**:
+- Kill the leader node (hard kill: SIGKILL, no graceful shutdown)
+- Kill a follower node (cold start test: does the cluster handle the rejoin gracefully?)
+- Kill two nodes simultaneously in a 5-node cluster (does the cluster keep quorum?)
+- Kill all nodes and restart them (disaster recovery test)
+- Kill the etcd process but leave the OS running (does the health check and auto-restart work?)
+
+**Disk failures**:
+- Fill the WAL disk to 100% (does the cluster fail gracefully?)
+- Slow the WAL disk to simulate a failing drive (inject 50ms latency to all writes)
+- Corrupt the WAL or snapshot file (can the cluster recover from a backup?)
+- Detach the data disk and reattach it (does the node recover?)
+
+**Client failures**:
+- Kill an application server that is holding multiple locks (does the lease expiry handle this?)
+- Kill all application servers simultaneously (does the lock service recover when they come back?)
+- Induce GC pauses in application servers holding locks (10 second pause — does the fencing token protect the resource?)
+- Throttle client CPU to simulate a noisy neighbor (do lock renewal timers fire on time?)
+
+**Clock failures**:
+- Induce clock skew on lock service nodes (add 100ms skew, 1 second skew, 10 seconds skew)
+- Induce clock skew on client nodes (add 1 second skew)
+- Pause NTP on a lock service node (does the clock drift become dangerous over 24 hours?)
+
+### How to Simulate Failures
+
+```bash
+# Network partition: block traffic from one node to the rest
+# On the target node (etcd node 3):
+iptables -A INPUT -s 10.0.0.1 -j DROP  # Block traffic from node 1
+iptables -A INPUT -s 10.0.0.2 -j DROP  # Block traffic from node 2
+
+# Observe: cluster should detect the partition, node 3 drops out,
+# leader election on nodes 1 and 2, quorum maintained with 2 nodes.
+# After the test:
+iptables -F
+
+# Packet loss injection on the lock service port:
+tc qdisc add dev eth0 root netem loss 5% 25%
+# 5% packet loss, 25% correlation (bursty loss)
+# This simulates a congested or failing network link
+
+# After test:
+tc qdisc del dev eth0 root netem
+
+# Disk latency injection:
+# Slow all writes to the etcd data directory
+# Using device mapper or cgroups to throttle I/O
+# On Linux, use blkio cgroups:
+echo "8:0 50000" > /sys/fs/cgroup/blkio/system.slice/etcd.service/\
+blkio.throttle.write_bps_device
+# Limits write throughput to ~50 KB/s for the etcd disk device
+
+# Clock skew injection (requires root and careful testing):
+# On the lock service node:
+# Stop NTP: service ntp stop
+# Set time forward by 10 seconds: date -s "+10 seconds"
+# Monitor what happens to lease expiry
+# After test: restart NTP: service ntp start
+```
+
+### Chaos Experiment: Leader Failure During Lock Acquisition
+
+This is the most important chaos experiment. It validates system behavior during the leader election window.
+
+```python
+# Chaos experiment: kill leader while locks are being acquired
+import subprocess
+import time
+import random
+
+def chaos_leader_failure_test():
+    """Kill the etcd leader and verify lock operations recover."""
+    print("Phase 1: Establish baseline lock acquisition rate")
+    start_acquisition_workload()
+    time.sleep(10)
+    baseline_rate = measure_lock_rate()
+    print(f"Baseline: {baseline_rate} ops/sec")
+    
+    print("Phase 2: Identify the leader node")
+    leader = find_etcd_leader()  # etcdctl endpoint status
+    print(f"Leader: {leader}")
+    
+    print("Phase 3: Kill the leader")
+    subprocess.run(["ssh", leader, "killall", "-9", "etcd"])
+    # -9 ensures a hard kill, no graceful shutdown
+    
+    print("Phase 4: Observe behavior during election")
+    start = time.monotonic()
+    election_done = False
+    errors_during_election = 0
+    while not election_done:
+        try:
+            status = subprocess.run(
+                ["etcdctl", "endpoint", "health", "--cluster"],
+                capture_output=True, timeout=5
+            )
+            if status.returncode == 0:
+                election_done = True
+        except subprocess.TimeoutExpired:
+            errors_during_election += 1
+    
+    election_duration = time.monotonic() - start
+    print(f"Election completed in {election_duration:.2f}s")
+    print(f"Requests that timed out during election: {errors_during_election}")
+    
+    print("Phase 5: Measure recovery rate")
+    time.sleep(2)
+    recovery_rate = measure_lock_rate()
+    print(f"Recovery rate: {recovery_rate} ops/sec")
+    print(f"Recovery efficiency: {recovery_rate/baseline_rate*100:.0f}%")
+    
+    print("Phase 6: Verify no duplicate lock grants")
+    stalled_operations = check_for_duplicate_operations()
+    if stalled_operations > 0:
+        print(f"WARNING: {stalled_operations} duplicate operations detected!")
+    else:
+        print("No duplicate lock grants detected — fencing tokens working correctly")
+```
+
+### Chaos Experiment Schedule
+
+| Frequency | Experiment | Expected Outcome |
+|-----------|-----------|-----------------|
+| Daily (prod-like) | Kill leader node | Election under 300ms, no lock duplication |
+| Daily | Network partition of one node | Quorum maintained, lock service degraded but available |
+| Weekly | Disk I/O throttling | Latency increases but no crashes |
+| Weekly | Application server crash with locks held | Lease expiry cleans up within 1.5x TTL |
+| Monthly | Two-node simultaneous failure (5-node cluster) | Quorum maintained with 3 remaining nodes |
+| Monthly | Full cluster restart | State recovered from WAL within 5 minutes |
+| Quarterly | Cross-region network partition | Lock operations degraded but no unsafe grants |
+| Quarterly | Clock skew of 10 seconds | Lease timers tolerate the skew within safety budget |
+
+### Success Criteria for Chaos Experiments
+
+Each chaos experiment must validate both liveness and safety:
+
+**Liveness criteria**:
+- Lock operations resume within 2 seconds of a single node failure
+- Cluster recovers to full throughput within 30 seconds after node restart
+- No lock operation takes longer than 5 seconds to complete (including retries)
+
+**Safety criteria**:
+- No fencing token is reused across leader epochs
+- No lock is granted while a previous holder with a valid token still operates
+- The fencing token check at the resource rejects any operation with a lower or equal token
+- No lock is released prematurely due to clock skew on the service side
+
+## SLOs and SLIs for Lock Services
+
+Defining service level objectives for a lock service requires careful consideration of what matters to the applications that depend on it.
+
+### Service Level Indicators
+
+**SLI 1: Lock Acquisition Availability**.
+
+The fraction of lock acquisition requests that succeed within the expected latency budget.
+
+```
+SLI = successful_acquisitions / total_acquisition_attempts
+
+Successful acquisition: The lock is granted or the client correctly learns
+that the lock is held by another process (not an error).
+
+Excluded from SLI: Requests that are rejected by the circuit breaker
+(the circuit breaker is a client-side decision, not a service failure).
+
+Measurement: Prometheus counter lock_grants_total / lock_attempts_total
+Evaluated over: 1-minute rolling window
+```
+
+**SLI 2: Lock Acquisition Latency**.
+
+The time to complete a lock acquisition request, measured from the moment the client sends the request to the moment it receives the response.
+
+```
+SLI p99: 99% of lock acquisition requests complete within L milliseconds
+SLI p50: 50% of lock acquisition requests complete within L milliseconds
+
+Measurement: Histogram from client-side instrumentation
+Buckets: 1ms, 2ms, 5ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms, 1000ms
+```
+
+**SLI 3: Lock Service Availability**.
+
+The fraction of time the lock service is capable of processing lock operations.
+
+```
+SLI = uptime_seconds / total_seconds
+
+A lock service is available when:
+- A majority of nodes are healthy
+- The leader is elected and accepting requests
+- No quorum loss condition exists
+
+Measurement: Prometheus up metric or custom health check probe
+```
+
+**SLI 4: Lease Renewal Success Rate**.
+
+The fraction of lease renewal attempts that succeed before the lease expires.
+
+```
+SLI = successful_renewals / total_renewals
+
+A lease renewal is successful if the lock service confirms the extension
+before the original lease expires.
+
+Measurement: Client-side lease renewal counter
+```
+
+### Service Level Objectives
+
+| SLO Tier | Availability | Latency p99 | Measurement Window | Burn Rate |
+|----------|-------------|-------------|-------------------|-----------|
+| Platinum | 99.99% | 50ms | 30 days | 10% / week |
+| Gold | 99.95% | 100ms | 30 days | 15% / week |
+| Silver | 99.9% | 200ms | 30 days | 20% / week |
+| Bronze | 99.5% | 500ms | 30 days | 25% / week |
+
+**Error budget calculation for Gold SLO**:
+
+```
+Monthly error budget (30 days):
+30 days x 24 hours x 3600 seconds = 2,592,000 seconds
+Allowed downtime (100% - 99.95%): 0.05%
+Error budget: 2,592,000 x 0.0005 = 1,296 seconds = 21.6 minutes
+
+Quarterly error budget (90 days):
+90 x 24 x 3600 x 0.0005 = 3,888 seconds = 64.8 minutes
+
+Burn rate alert: If the error budget is consumed at 10x the budgeted rate,
+the SLO will be breached in 72 hours (quarterly budget) or 2.88 days (monthly).
+```
+
+### Burn Rate Alerting
+
+```yaml
+# SLO burn rate alerts for lock service
+groups:
+  - name: lock_service_slo
+    interval: 1m
+    rules:
+      # Fast burn: error budget consumed at 10x rate over 1 hour
+      - alert: LockServiceFastBurnRate
+        expr: |
+          (1 - (sum(rate(lock_grants_total[1h]))
+               / sum(rate(lock_attempts_total[1h]))))
+          > (1 - 0.9995) * 10
+        for: 1m
+        labels:
+            severity: critical
+        annotations:
+            summary: "Lock service error budget burning at 10x rate (1h window)"
+            description: "Availability over last hour: {{ $value | humanizePercentage }}"
+      
+      # Slow burn: error budget consumed at 2x rate over 6 hours
+      - alert: LockServiceSlowBurnRate
+        expr: |
+          (1 - (sum(rate(lock_grants_total[6h]))
+               / sum(rate(lock_attempts_total[6h]))))
+          > (1 - 0.9995) * 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+            summary: "Lock service error budget burning at 2x rate (6h window)"
+            description: "Availability over last 6 hours: {{ $value | humanizePercentage }}"
+```
+
+### Multi-Window, Multi-Burn-Rate Alerting
+
+A single burn rate window can produce false positives from short traffic bursts. Use multiple windows to confirm a sustained violation.
+
+```python
+def evaluate_burn_rate_alerts(short_window_1m, long_window_1h):
+    """
+    Multi-window burn rate evaluation.
+    Alert fires only when both windows exceed the threshold.
+    """
+    short_availability = short_window_1m["success"] / max(short_window_1m["total"], 1)
+    long_availability = long_window_1h["success"] / max(long_window_1h["total"], 1)
+    
+    short_burn = (1 - short_availability) / (1 - 0.9995)  # normalized to SLO
+    long_burn = (1 - long_availability) / (1 - 0.9995)
+    
+    if short_burn > 10 and long_burn > 2:
+        return "CRITICAL: Sustained high burn rate"
+    elif short_burn > 10 and long_burn <= 2:
+        return "WARNING: Short burst of errors, may be transient"
+    elif short_burn <= 10 and long_burn > 2:
+        return "WARNING: Slow degradation over long window"
+    elif long_burn > 1:
+        return "INFO: Error budget being consumed at normal rate"
+    else:
+        return "OK: Error budget well within SLO"
+```
+
+### SLO Violation Response Procedure
+
+When an SLO is breached or about to be breached, the following procedure guides the response:
+
+1. **Acknowledge the alert**: Confirm that a human is investigating. This should happen within 5 minutes of a critical alert.
+2. **Assess the scope**: Is the issue global (all resources affected) or per-resource? Is it a lock service failure or a client-side issue? Use the dashboards to narrow the scope.
+3. **Protect the SLO**: If the remaining error budget is at risk, take aggressive action to reduce failures. This may mean reducing the lock acquisition rate (ask applications to hold locks longer and acquire fewer) or diverting traffic to a secondary cluster.
+4. **Remediate**: Fix the root cause. Common fixes include restarting a stuck node, increasing the WAL snapshot interval to reduce disk pressure, or adjusting the lease TTL to reduce contention.
+5. **Debrief**: After the incident, compute the consumed error budget. Determine if the SLO needs adjustment. Add a postmortem with action items to prevent recurrence.
+
+### Capacity Planning for SLOs
+
+The error budget informs capacity planning. When a cluster consistently consumes error budget at a high rate (above 50% of the monthly budget in the first week), the cluster is under-provisioned for the current workload.
+
+```python
+# Capacity planning from SLO data
+def recommend_cluster_size(monthly_requests, current_nodes, current_error_budget_consumption):
+    """
+    Recommend cluster scaling based on error budget consumption.
+    """
+    budget_consumption_rate = current_error_budget_consumption / (30 * 24 * 60 * 60)
+    # If the first week consumed 60% of the budget, the rate is high
+    
+    projected_monthly_consumption = budget_consumption_rate * 30 * 24 * 3600
+    
+    if projected_monthly_consumption > 0.9:  # Will breach SLO this month
+        recommended_additional_nodes = 1
+        if projected_monthly_consumption > 1.5:
+            recommended_additional_nodes = 2
+    elif projected_monthly_consumption > 0.7:
+        recommended_additional_nodes = 1  # Proactive scaling
+    else:
+        recommended_additional_nodes = 0
+    
+    return {
+        "current_nodes": current_nodes,
+        "recommended_nodes": current_nodes + recommended_additional_nodes,
+        "projected_budget_consumption": f"{projected_monthly_consumption:.0%}",
+        "monthly_budget_seconds": 0.0005 * 30 * 24 * 3600,
+        "action": "scale_up" if recommended_additional_nodes > 0 else "no_action"
+    }
+```
