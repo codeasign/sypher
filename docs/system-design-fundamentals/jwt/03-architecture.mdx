@@ -1,0 +1,970 @@
+---
+id: jwt-architecture
+title: JWT at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# JWT at Scale
+
+You have likely used JWTs in smaller applications where a single server issues tokens, verifies them inline, and life is simple. At FAANG scale, that approach collapses under its own weight. This page walks you through the architectural evolution from a naive single-server setup to a multi-region, horizontally scaled JWT infrastructure that handles millions of token verifications per second.
+
+By the end, you will understand the production patterns, integration points, multi-region challenges, and capacity considerations that every senior engineer must internalize before designing an authentication system at scale.
+
+---
+
+## The Naive Approach: Hand-Rolled JWT on a Single Server
+
+When you first build a system with JWT authentication, the architecture is straightforward. A single monolith issues tokens and also verifies them. The signing key lives in a configuration file on disk. You validate tokens in middleware that runs in the same process. This works for a few hundred users, but it does not scale.
+
+<AsciiDiagram
+  id="system-design-fundamentals/jwt/naive-architecture"
+  content={`
+                        ╔═══════════════════════╗
+                        ║   Single Monolith     ║
+                        ║   (Your App Server)   ║
+                        ╠═══════════════════════╣
+                        ║  ┌─────────────────┐  ║
+                        ║  │  Login Endpoint  │  ║
+                        ║  │  POST /auth      │  ║
+                        ║  └────────┬────────┘  ║
+                        ║           │           ║
+                        ║           ▼           ║
+                        ║  ┌─────────────────┐  ║
+                        ║  │  JWT Sign()     │  ║
+                        ║  │  (secret.key)   │  ║
+                        ║  └────────┬────────┘  ║
+                        ║           │           ║
+                        ║  ╔════════╧════════╗  ║
+                        ║  ║   secret.key    ║  ║
+                        ║  ║  (local file)   ║  ║
+                        ║  ╚═════════════════╝  ║
+                        ║           │           ║
+                        ║  ┌────────▼────────┐  ║
+                        ║  │  Middleware      │  ║
+                        ║  │  JWT Verify()   │  ║
+                        ║  │  (same key)     │  ║
+                        ║  └─────────────────┘  ║
+                        ╚═══════════════════════╝
+                                    │
+                      ┌─────────────┼─────────────┐
+                      ▼             ▼             ▼
+                   Client A      Client B      Client C
+  `}
+  alt="Naive single-server JWT architecture where the monolith both signs and verifies tokens using a local secret key file."
+  caption="Naive architecture: same process signs and verifies, single key on disk."
+/>
+
+### Problems That Emerge at Scale
+
+**Horizontal scaling is impossible.** All instances must share the same secret key. If you deploy the key to every server, the blast radius of a key compromise is total. If you try to use different keys per instance, tokens issued by one instance are rejected by another.
+
+**Key rotation requires a coordinated deploy.** You cannot rotate the signing key without restarting every server or using a shared file system. During a rotation window, tokens signed with the old key are rejected, causing a full logout storm.
+
+**Verification cost competes with business logic.** Every request invokes a full JWT decode, signature verification, and expiration check inside your application process. At thousands of requests per second, that CPU overhead directly reduces the capacity available for your actual features.
+
+**No revocation mechanism.** JWTs are stateless by design. A naive implementation cannot revoke a token before its expiration. If a user changes their password or is removed from a system, their existing tokens remain valid until they expire.
+
+**Single point of failure.** If the monolith goes down, no one can authenticate. There is no separation between the authentication authority and the services that consume tokens.
+
+### A Concrete Example: The 10x Traffic Spike
+
+Imagine your single-server application is handling 500 requests per second. Each request requires JWT verification in middleware. The verification takes roughly 25 microseconds with HS256 on a single core. That means 500 multiplied by 25 microseconds equals 12.5 milliseconds of CPU time per second for verification. Negligible.
+
+Then your product goes viral. Traffic jumps to 50,000 requests per second. Now verification consumes 1,250 milliseconds of CPU per second. You need 1.25 cores just for token verification. But you also need cores for routing, business logic, database queries, and response serialization. Your single server saturates at 4,000 requests per second before latency spikes beyond acceptable thresholds.
+
+You add more servers behind a load balancer. Now every server needs the secret key. You deploy the key via environment variables in your container orchestration system. An intern commits a debug endpoint that logs environment variables to stdout, and the secret key ends up in the log aggregation service. A developer with read access to logs now has the key to forge tokens for any user. The blast radius is total.
+
+This is the moment you realize the naive approach is not just a performance problem. It is a security architecture problem. You need separation of concerns, asymmetric keys, and a proper key distribution mechanism.
+
+---
+
+## Production Architecture: Dedicated Auth Service with JWKS
+
+At scale, you separate concerns. A dedicated authentication service handles token issuance. Downstream services verify tokens locally using public keys distributed through a JWKS (JSON Web Key Set) endpoint. This is the standard pattern used by major identity providers including Auth0, Okta, and AWS Cognito.
+
+<AsciiDiagram
+  id="system-design-fundamentals/jwt/production-architecture"
+  content={`
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │                        JWT Production Architecture                   │
+    ├──────────────────────────────────────────────────────────────────────┤
+    │                                                                      │
+    │  ┌─────────────────┐       ┌──────────────────────────────────┐      │
+    │  │   Auth Service   │       │       Downstream Services        │      │
+    │  │  (Token Issuer)  │       │                                  │      │
+    │  │                  │       │  ┌──────────────────────────┐   │      │
+    │  │  ┌──────────┐   │       │  │  Service A (Node.js)     │   │      │
+    │  │  │ Private  │   │       │  │  ┌────────────────────┐  │   │      │
+    │  │  │ Key      │───┼───────┼──┼──│ verify(token,     │  │   │      │
+    │  │  │ (RS256)  │   │       │  │  │  JWKS.public_key) │  │   │      │
+    │  │  └──────────┘   │       │  │  └────────────────────┘  │   │      │
+    │  │       │         │       │  └──────────────────────────┘   │      │
+    │  │       ▼         │       │                                  │      │
+    │  │  ┌──────────┐   │       │  ┌──────────────────────────┐   │      │
+    │  │  │ JWKS     │   │       │  │  Service B (Go)         │   │      │
+    │  │  │ Endpoint │───┼───────┼──┼──│ verify(token,     │  │   │      │
+    │  │  │ /jwks    │   │       │  │  │  JWKS.public_key) │  │   │      │
+    │  │  └──────────┘   │       │  │  └────────────────────┘  │   │      │
+    │  └─────────────────┘       │  └──────────────────────────┘   │      │
+    │            │               │                                  │      │
+    │            │               │  ┌──────────────────────────┐   │      │
+    │  ┌─────────▼──────────┐    │  │  Service C (Python)     │   │      │
+    │  │  Token Endpoints   │    │  │  ┌────────────────────┐  │   │      │
+    │  │  POST /token       │    │  │  │ verify(token,     │  │   │      │
+    │  │  POST /refresh     │    │  │  │  JWKS.public_key) │  │   │      │
+    │  │  POST /revoke      │    │  │  └────────────────────┘  │   │      │
+    │  └────────────────────┘    │  └──────────────────────────┘   │      │
+    │                            └──────────────────────────────────┘      │
+    └──────────────────────────────────────────────────────────────────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    ▼                       ▼
+            ┌──────────────┐       ┌──────────────┐
+            │  Public Key   │       │  Public Key   │
+            │  Cache (TTL)  │       │  Cache (TTL)  │
+            │  max-age=3600 │       │  max-age=3600 │
+            └──────────────┘       └──────────────┘
+  `}
+  alt="Production JWT architecture with a dedicated auth service that signs tokens with a private key and exposes a JWKS endpoint, while downstream services fetch public keys for local verification."
+  caption="Production pattern: auth service owns the private key, services verify with public keys from JWKS."
+/>
+
+### Key Design Decisions
+
+**Asymmetric signing (RS256 or ES256).** You use a private key to sign tokens and distribute only public keys. This means the private key lives in exactly one place: the auth service. Even if an attacker compromises a downstream service, they cannot forge tokens because they only have access to the public key.
+
+**JWKS endpoint as the contract.** The `/.well-known/jwks.json` endpoint returns a JSON object containing one or more public keys. Each key has a `kid` (key ID) that matches the `kid` header in the JWT. This allows services to select the correct key even during rotation windows.
+
+```json
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "key-2026-q2",
+      "use": "sig",
+      "alg": "RS256",
+      "n": "0vx7ago...",
+      "e": "AQAB"
+    }
+  ]
+}
+```
+
+**Local verification with cached keys.** Each service fetches the JWKS on startup and caches the keys. Subsequent verifications hit the cache. You set the `Cache-Control` header on the JWKS response to control how long services cache keys without re-fetching. A typical TTL is one hour.
+
+**Separation of concerns.** The auth service owns identity. Services own business logic. You can scale each independently. The auth service can be a small, well-audited codebase with minimal attack surface.
+
+### Auth Service Internal Architecture
+
+A production auth service is not a single endpoint. It is a small suite of internal components, each with a specific responsibility:
+
+**Token signing module.** This component holds the private key in memory, loaded from a secure key management service such as AWS KMS or HashiCorp Vault. The key is never written to disk. On startup, the module calls KMS to decrypt the private key, holds it in a guarded memory region, and signs tokens on request. Some implementations use KMS for every signing operation, but this adds 5-15 milliseconds of latency per token. The better approach is to decrypt the key once and cache it in memory with a periodic re-read.
+
+**JWKS generation module.** This component assembles the JWKS response from the current set of active public keys. It reads key metadata from a configuration store or database, constructs the JWK objects, and serves them at the `/.well-known/jwks.json` endpoint. The response should be pre-rendered and cached in memory, re-generated only when keys change, to avoid serialization overhead on every request.
+
+**Token endpoint handlers.** These are the HTTP handlers for `/token`, `/refresh`, `/revoke`, and `/introspect`. Each handler validates input, calls the appropriate business logic, and returns a response. The `/introspect` endpoint is particularly important for services that cannot or will not verify tokens locally. It accepts a token and returns its claims if valid, performing the verification server-side. This is a fallback, not a primary pattern, because it introduces a network round-trip on every verification.
+
+**Rate limiting and abuse detection.** The auth service is a high-value target. Every endpoint must be rate-limited per client IP and per user. Additionally, the service should detect patterns such as rapid-fire token refresh attempts, which indicate a brute-force attack on refresh tokens.
+
+```python
+# Auth service rate limiting configuration example
+RATE_LIMITS = {
+    "/token":     {"per_ip": 10, "per_user": 5, "window": 60},   # 5 logins per minute per user
+    "/refresh":   {"per_ip": 30, "per_user": 15, "window": 60},  # 15 refreshes per minute per user
+    "/revoke":    {"per_ip": 20, "per_user": 10, "window": 60},  # 10 revocations per minute per user
+    "/jwks":      {"per_ip": 100, "per_user": None, "window": 60} # 100 JWKS fetches per minute per IP
+}
+```
+
+**Audit logging pipeline.** Every authentication event must be logged: login success, login failure, token refresh, token revocation, and failed verification attempts. These logs feed into your security information and event management (SIEM) system for anomaly detection and compliance auditing.
+
+---
+
+## JWKS Key Rotation
+
+Key rotation is the most critical operational procedure in a JWT infrastructure. You must rotate keys periodically to limit the impact of a potential key compromise. The standard pattern is to introduce a new key while keeping the old key available for verification.
+
+<AsciiDiagram
+  id="system-design-fundamentals/jwt/key-rotation"
+  content={`
+    Timeline: Key Rotation Lifecycle
+    ──────────────────────────────────────────────────────────────────────────
+
+    Phase 1:  [── Active Key: key-2026-q1 ──]
+              JWKS returns: [key-2026-q1]
+              Signing with:  key-2026-q1
+
+                  ▼
+    Phase 2:  [── Active Key: key-2026-q1 ──] [── New: key-2026-q2 ──]
+              JWKS returns: [key-2026-q1, key-2026-q2]
+              Signing with:  key-2026-q2
+              Old tokens:    verified by key-2026-q1 (still in JWKS)
+
+                  ▼
+    Phase 3:  [── Grace period ──] [── Active Key: key-2026-q2 ──] [retired]
+              JWKS returns: [key-2026-q1, key-2026-q2]
+              Signing with:  key-2026-q2
+              Old tokens:    verified by key-2026-q1 until they expire
+
+                  ▼
+    Phase 4:  [── Active Key: key-2026-q2 ──]
+              JWKS returns: [key-2026-q2]
+              key-2026-q1 removed from JWKS
+              All remaining key-2026-q1 tokens will fail verification
+
+    ┌──────────────────────────────────────────────────────────────────┐
+    │                    JWKS Response Evolution                        │
+    ├──────────────────────────────────────────────────────────────────┤
+    │  Phase 1:  {"keys": [key-2026-q1]}                                │
+    │  Phase 2:  {"keys": [key-2026-q1, key-2026-q2]}                   │
+    │  Phase 3:  {"keys": [key-2026-q1, key-2026-q2]}                   │
+    │  Phase 4:  {"keys": [key-2026-q2]}                                │
+    └──────────────────────────────────────────────────────────────────┘
+  `}
+  alt="JWT key rotation lifecycle showing four phases: single active key, introduction of new key, grace period with both keys, and retirement of old key."
+  caption="Key rotation lifecycle: introduce, overlap, retire to avoid mass token invalidation."
+/>
+
+### Rotation Best Practices
+
+**Pre-issue before you activate.** Generate the new key pair at least 24 hours before you start signing with it. Add the public key to the JWKS endpoint immediately. This gives service caches time to pick up the new key before any token signed with it arrives.
+
+**Grace period equals token lifetime.** Keep the old key in the JWKS for at least as long as your maximum token TTL. If your access tokens live for 15 minutes but refresh tokens live for 30 days, you must keep the old key for 30 days during rotation.
+
+**Automate the rotation schedule.** Manual key rotation is unreliable at scale. Use a cron job or a scheduled lambda that generates new keys, updates the JWKS, and switches the signing key. Run this on a fixed cadence: every 90 days is typical for production systems.
+
+**Monitor key usage.** Track which `kid` values appear in verification requests. A sudden drop in requests for the current key might indicate that JWKS caches are stale or that services are failing to verify tokens. Alert if the old key stops being used before the grace period expires.
+
+---
+
+## Integration Patterns
+
+JWTs at scale require careful integration with every part of your infrastructure. Each client type and service boundary presents unique challenges.
+
+### Integration with API Gateway
+
+In a microservices architecture, the API gateway is the natural place to validate tokens. The gateway verifies the JWT, extracts claims, and forwards a signed request context to downstream services. This removes token verification from each individual service.
+
+<AsciiDiagram
+  id="system-design-fundamentals/jwt/api-gateway-integration"
+  content={`
+    ┌──────────┐     ┌─────────────────────────────────────────────────────┐
+    │  Client   │     │                  API Gateway                        │
+    │  (Mobile) │     │                                                    │
+    │  Browser  │────▶│  ┌─────────────────────────────────────────────┐   │
+    │  Service  │     │  │  JWT Verification Middleware                │   │
+    └──────────┘     │  │                                              │   │
+                     │  │  1. Extract JWT from Authorization header    │   │
+                     │  │  2. Verify signature against JWKS cache      │   │
+                     │  │  3. Check expiration (exp claim)             │   │
+                     │  │  4. Validate issuer (iss claim)              │   │
+                     │  │  5. Validate audience (aud claim)            │   │
+                     │  │  6. Extract user_id and roles from claims    │   │
+                     │  │  7. Attach X-User-Id and X-Role headers      │   │
+                     │  └──────────┬──────────────────────────────────┘   │
+                     └─────────────┼──────────────────────────────────────┘
+                                   │
+                   ┌───────────────┼───────────────┐
+                   ▼               ▼               ▼
+             ┌──────────┐   ┌──────────┐   ┌──────────┐
+             │ Service  │   │ Service  │   │ Service  │
+             │   A      │   │   B      │   │   C      │
+             │          │   │          │   │          │
+             │ (trusts  │   │ (trusts  │   │ (trusts  │
+             │ headers) │   │ headers) │   │ headers) │
+             └──────────┘   └──────────┘   └──────────┘
+
+    ├────────────────────────────────────────────────────────────────────┤
+    │  Gateway-stripped headers:                                         │
+    │  X-User-Id:  a1b2c3d4                                             │
+    │  X-Role:     admin                                                 │
+    │  X-Org-Id:   org-42                                               │
+    │  X-Request-Id:  req-abc-123                                       │
+    └────────────────────────────────────────────────────────────────────┘
+  `}
+  alt="API gateway integration showing JWT verification at the gateway level with downstream service headers."
+  caption="API gateway validates tokens once and passes verified claims as headers to internal services."
+/>
+
+**Gateway validation is a performance optimization.** Because the gateway verifies the token once and passes internal headers, downstream services avoid the CPU cost of signature verification. However, this introduces a trust boundary: services behind the gateway must trust that internal headers are authentic. You must strip any external `X-User-Id` headers at the gateway to prevent header injection attacks.
+
+#### Gateway Configuration for JWT
+
+When you configure an API gateway for JWT validation, you must decide which claims to validate at the gateway layer and which to delegate to services:
+
+| Claim | Gateway Validation | Rationale |
+|-------|-------------------|-----------|
+| `exp` | Required | Reject expired tokens immediately, no downstream processing |
+| `iss` | Required | Only accept tokens from your trusted issuer |
+| `aud` | Required | Ensure the token was intended for this API |
+| `sub` | Extract and forward | Identity of the user |
+| `roles` | Extract and forward | Authorization decisions are service-specific |
+| `permissions` | Forward only | Too granular for gateway-level enforcement |
+| Custom tenant claims | Forward only | Tenant isolation is per-service logic |
+
+Most production API gateways including Kong, AWS API Gateway, and Envoy support native JWT validation. Envoy, for example, can be configured with a JWT filter that fetches the JWKS endpoint automatically and validates tokens before routing requests:
+
+```yaml
+# Envoy JWT filter configuration
+http_filters:
+- name: envoy.filters.http.jwt_authn
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+    providers:
+      auth_provider:
+        issuer: https://auth.example.com
+        audiences:
+        - https://api.example.com
+        from_headers:
+        - name: Authorization
+          value_prefix: "Bearer "
+        remote_jwks:
+          http_uri:
+            uri: https://auth.example.com/.well-known/jwks.json
+            cluster: auth_cluster
+            timeout: 5s
+          cache_size: 100
+    rules:
+    - match:
+        prefix: /api/v1
+      requires:
+        provider_name: auth_provider
+```
+
+**Gateway caching is critical.** Each gateway instance should cache the JWKS response and the most recently verified tokens. Token caching allows you to skip verification for repeated requests from the same client within the cache window. Set the token cache to 60 seconds for access tokens with a 15-minute TTL. This reduces verification load by up to 90 percent for high-traffic endpoints.
+
+### Integration with Microservices
+
+When an API gateway is not present, or when services communicate directly via event queues or gRPC, each service must verify tokens independently. This is common in service-mesh architectures.
+
+```python
+# Example: JWT verification middleware in a Python microservice
+import jwt
+from jwt import PyJWKClient
+
+jwks_client = PyJWKClient("https://auth.example.com/.well-known/jwks.json")
+
+def verify_token(token: str) -> dict:
+    signing_key = jwks_client.get_signing_key_from_jwt(token)
+    claims = jwt.decode(
+        token,
+        signing_key.key,
+        algorithms=["RS256"],
+        audience="https://api.example.com",
+        issuer="https://auth.example.com",
+        options={"verify_exp": True}
+    )
+    return claims
+```
+
+Each service caches the JWKS response internally. The cache TTL should align with your key rotation cadence. Most JWT libraries provide built-in caching for JWKS clients.
+
+#### Service-to-Service Authentication
+
+When microservices call each other, you need a mechanism for one service to authenticate to another. The standard approach is to issue a service account JWT that the calling service uses as its credential. This JWT is distinct from user tokens and carries different claims:
+
+```json
+{
+  "sub": "service:billing-processor",
+  "iss": "https://auth.example.com",
+  "aud": "https://api.example.com/services",
+  "iat": 1760000000,
+  "exp": 1760000900,
+  "service_role": "worker",
+  "permissions": ["read:orders", "write:invoices"]
+}
+```
+
+Service account tokens have their own key rotation, revocation, and monitoring. They are typically long-lived (hours to days) because they are not tied to a user session. Store them in a secure vault such as HashiCorp Vault or AWS Secrets Manager, and have the service fetch them on startup with periodic refresh.
+
+### Integration with WebSocket Connections
+
+WebSocket connections present a challenge for JWT authentication because the connection is long-lived and the initial HTTP upgrade handshake is the only opportunity to pass the token. After the connection is established, there is no standard way to re-authenticate mid-session.
+
+**Authenticate during the upgrade handshake.** Pass the JWT as a query parameter or in the `Sec-WebSocket-Protocol` header during the WebSocket upgrade request. The server validates the token before accepting the upgrade:
+
+```python
+# WebSocket upgrade with JWT authentication
+import websockets
+
+async def handle_websocket(websocket):
+    token = websocket.request_headers.get("Authorization", "").removeprefix("Bearer ")
+    if not token:
+        token = websocket.query.get("token")
+
+    if not token:
+        await websocket.close(4001, "Missing authentication token")
+        return
+
+    try:
+        claims = verify_token(token)
+    except jwt.InvalidTokenError:
+        await websocket.close(4001, "Invalid token")
+        return
+
+    # Store claims in connection context
+    websocket.user_id = claims["sub"]
+    websocket.roles = claims.get("roles", [])
+
+    async for message in websocket:
+        await handle_message(websocket, message)
+```
+
+**Token expiry during a WebSocket session.** If the access token expires while the WebSocket is open, you have two options. The simpler approach is to use long-lived tokens (one hour) for WebSocket connections and accept the security trade-off. The more robust approach is to implement a custom ping-pong protocol that includes a token refresh mechanism: the client sends a new token in a ping frame, and the server validates it and updates the session context.
+
+### Integration with gRPC Services
+
+gRPC uses HTTP/2 under the hood, which means JWTs can be passed as gRPC metadata. The standard approach is to use interceptors on both the client and server side:
+
+```python
+# gRPC client interceptor for JWT attachment
+class JwtClientInterceptor(grpc.UnaryUnaryClientInterceptor):
+
+    def __init__(self, token_provider):
+        self.token_provider = token_provider
+
+    def intercept_unary_unary(self, continuation, client_call_details, request):
+        metadata = []
+        if client_call_details.metadata:
+            metadata = list(client_call_details.metadata)
+        metadata.append(("authorization", f"Bearer {self.token_provider()}"))
+        new_details = client_call_details._replace(metadata=metadata)
+        return continuation(new_details, request)
+```
+
+gRPC server interceptors validate the token from the incoming metadata and attach the verified claims to the gRPC context for use by handler methods. This pattern is consistent across all gRPC-supported languages.
+
+### Integration with Mobile Applications
+
+Mobile apps present unique challenges for JWT storage and transmission. The token lives on a device you do not control.
+
+**Secure storage is mandatory.** On iOS, store tokens in the Keychain. On Android, use the EncryptedSharedPreferences or the Android Keystore. Never store tokens in plaintext SharedPreferences, UserDefaults, or localStorage in a web view.
+
+**Token transmission over mobile networks.** Mobile networks introduce latency and intermittent connectivity. Your mobile client should implement retry logic with exponential backoff for token refresh requests. Monitor for 401 responses and trigger a silent refresh before the access token expires.
+
+**Biometric authentication for sensitive operations.** For high-value actions such as password changes or financial transactions, require biometric re-authentication even if the user holds a valid JWT. The token proves the user was authenticated at some point, but it does not prove the user is still holding the device.
+
+**Certificate pinning.** Mobile apps should pin the TLS certificate of the auth service to prevent man-in-the-middle attacks that could steal tokens. Use public key pinning rather than certificate pinning to avoid breakage during certificate rotation.
+
+### Token Storage Strategies for Single-Page Applications
+
+Single-page applications (SPAs) are the most vulnerable clients for JWT storage because the browser is a hostile environment. Every decision about token storage involves trade-offs between security and usability.
+
+**HTTP-only cookies are the most secure option for SPAs.** Set the access token as an HTTP-only, Secure, SameSite=Strict cookie. This prevents JavaScript from reading the token, eliminating XSS-based token theft. The downside is that you need a backend that sets the cookie on login and sends it back to the API gateway on every request. The cookie is automatically attached to requests by the browser, so your SPA JavaScript never touches the token directly.
+
+```text
+Set-Cookie: access_token=eyJhbGci...; HttpOnly; Secure; SameSite=Strict; Path=/api; Max-Age=900
+Set-Cookie: refresh_token=abc123...; HttpOnly; Secure; SameSite=Strict; Path=/auth; Max-Age=604800
+```
+
+**Memory-only storage for SPAs without a backend.** If your SPA talks directly to an API without a co-located backend, you cannot use HTTP-only cookies. In this case, store the token in JavaScript memory only, never in localStorage or sessionStorage. The token is lost on page refresh, which means the user must re-authenticate. This is intentional: it prevents token persistence in a location accessible to JavaScript malware.
+
+**localStorage is convenient but dangerous.** Many tutorials recommend storing JWTs in localStorage. This is acceptable for development but hazardous in production. Any XSS vulnerability in your application or any third-party script you include can read the token from localStorage and exfiltrate it. If you must use localStorage, mitigate the risk with a strict Content Security Policy (CSP) that blocks inline scripts and restricts script sources to a known allowlist.
+
+```text
+# Recommended CSP headers for SPAs using JWT
+Content-Security-Policy: default-src 'self'; script-src 'self' https://trusted-cdn.com; 
+                         connect-src 'self' https://api.example.com; 
+                         form-action 'none';
+```
+
+**Token storage decision matrix:**
+
+| Storage Method | XSS Resistance | Persistence | Complexity | Recommendation |
+|---------------|---------------|-------------|------------|---------------|
+| HTTP-only cookie | High | Yes | Medium (needs backend) | Preferred |
+| In-memory variable | High | No (lost on refresh) | Low | Best for SPA-only |
+| SessionStorage | Medium | Tab-scoped | Low | Acceptable with caution |
+| localStorage | Low | Yes | Low | Avoid in production |
+| IndexedDB | Low | Yes | Medium | Avoid in production |
+
+### Refresh Token Flow
+
+Access tokens are short-lived (15-30 minutes) to limit the damage if one is stolen. Refresh tokens live longer (days to weeks) and allow clients to obtain new access tokens without requiring the user to log in again.
+
+<AsciiDiagram
+  id="system-design-fundamentals/jwt/refresh-token-flow"
+  content={`
+    ┌──────────┐                  ┌──────────────┐          ┌──────────────┐
+    │  Client   │                  │  Auth Service │          │  Token Store  │
+    │  (Mobile) │                  │  (Issuer)    │          │  (Redis)     │
+    └─────┬────┘                  └──────┬───────┘          └──────┬───────┘
+          │                               │                        │
+          │  1. POST /login               │                        │
+          │  (username, password)         │                        │
+          │──────────────────────────────▶│                        │
+          │                               │                        │
+          │  2. Validate credentials      │                        │
+          │                               │                        │
+          │  3. Generate access_token     │                        │
+          │     (RS256, 15min TTL)        │                        │
+          │                               │                        │
+          │  4. Generate refresh_token    │                        │
+          │     (opaque, 7 day TTL)       │                        │
+          │                               │                        │
+          │  5. Store refresh_token hash  │                        │
+          │──────────────────────────────────────────────────────▶│
+          │                               │                        │
+          │  6. Return tokens             │                        │
+          │◀──────────────────────────────│                        │
+          │                               │                        │
+          │  ─── Time passes (access token expires) ───           │
+          │                               │                        │
+          │  7. POST /refresh             │                        │
+          │  (refresh_token)              │                        │
+          │──────────────────────────────▶│                        │
+          │                               │                        │
+          │  8. Hash refresh_token,       │                        │
+          │     lookup in store           │                        │
+          │──────────────────────────────────────────────────────▶│
+          │                               │                        │
+          │  9. Verify match + check      │                        │
+          │     revocation status         │                        │
+          │◀──────────────────────────────────────────────────────│
+          │                               │                        │
+          │  10. Issue new access_token   │                        │
+          │      (rotate refresh_token)   │                        │
+          │◀──────────────────────────────│                        │
+          │                               │                        │
+          │  11. Use new access_token     │                        │
+          │      for API calls            │                        │
+          │                               │                        │
+    └─────┴────┘                  └──────┴───────┘          └──────┴───────┘
+
+    Token Characteristics:
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Access Token:  Signed JWT, 15 min TTL, stateless verification      │
+    │  Refresh Token: Opaque string, 7 day TTL, stateful verification     │
+    │                 Stored as bcrypt hash in Redis                      │
+    │                 Rotated on each use (rotation detection)           │
+    └─────────────────────────────────────────────────────────────────────┘
+  `}
+  alt="Refresh token flow showing the interaction between client, auth service, and token store for obtaining new access tokens."
+  caption="Refresh token flow: access tokens are short-lived JWTs, refresh tokens are opaque and stored server-side."
+/>
+
+### Refresh Token Rotation and Reuse Detection
+
+**Rotate on every use.** Each time a client exchanges a refresh token for a new access token, issue a new refresh token and invalidate the old one. This limits the window in which a stolen refresh token is usable.
+
+**Reuse detection.** If a client tries to use an already-rotated refresh token, it likely means an attacker has stolen the token and is racing the legitimate client. When you detect reuse, invalidate all refresh tokens for that user and force re-authentication. This is a strong signal that the user's device may be compromised.
+
+```python
+# Refresh token rotation with reuse detection
+def refresh_token(request):
+    old_token_hash = sha256(request.refresh_token)
+    stored = redis.get(f"refresh:{old_token_hash}")
+
+    if not stored:
+        # Token not found — may be expired or already rotated
+        return 401
+
+    stored = json.loads(stored)
+
+    if stored["status"] == "rotated":
+        # Reuse detected! Someone else is using this token.
+        # Invalidate ALL tokens for this user.
+        redis.delete(f"user_tokens:{stored['user_id']}")
+        log_security_event("refresh_token_reuse", stored["user_id"])
+        return 401
+
+    # Issue new tokens
+    new_access = create_access_token(stored["user_id"])
+    new_refresh = secrets.token_urlsafe(64)
+    new_hash = sha256(new_refresh)
+
+    # Mark old token as rotated
+    stored["status"] = "rotated"
+    redis.set(f"refresh:{old_token_hash}", json.dumps(stored))
+
+    # Store new token
+    new_entry = {"user_id": stored["user_id"], "status": "active"}
+    redis.set(f"refresh:{new_hash}", json.dumps(new_entry), ex=7*86400)
+
+    return {"access_token": new_access, "refresh_token": new_refresh}
+```
+
+---
+
+## Multi-Region Architecture
+
+Global applications must authenticate users across multiple geographic regions. The JWT architecture must work reliably with region-local validation while maintaining a consistent global state for revocation.
+
+<AsciiDiagram
+  id="system-design-fundamentals/jwt/multi-region"
+  content={`
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │                         Multi-Region JWT                            │
+    ├─────────────────────────────────────────────────────────────────────┤
+    │                                                                      │
+    │  ╔══════════════════════╗    ╔══════════════════════╗               │
+    │  ║   US-East Region     ║    ║   EU-West Region     ║               │
+    │  ║                      ║    ║                      ║               │
+    │  ║  ┌──────────────┐   ║    ║  ┌──────────────┐   ║               │
+    │  ║  │ Auth Service  │   ║    ║  │ Auth Service  │   ║               │
+    │  ║  │ (primary)    │   ║    ║  │ (replica)    │   ║               │
+    │  ║  │              │   ║    ║  │              │   ║               │
+    │  ║  │ Private Key  │   ║    ║  │ JWKS Cache   │   ║               │
+    │  ║  │ (KMS)        │   ║    ║  │ (read-only)  │   ║               │
+    │  ║  └──────┬───────┘   ║    ║  └──────┬───────┘   ║               │
+    │  ║         │           ║    ║         │           ║               │
+    │  ║  ┌──────▼───────┐   ║    ║  ┌──────▼───────┐   ║               │
+    │  ║  │  Redis       │   ║    ║  │  Redis       │   ║               │
+    │  ║  │  (revocation  │   ║    ║  │  (replica)   │   ║               │
+    │  ║  │   + refresh)  │   ║    ║  │             │   ║               │
+    │  ║  └──────────────┘   ║    ║  └──────────────┘   ║               │
+    │  ╚══════════════════════╝    ╚══════════════════════╝               │
+    │         │                           │                               │
+    │         │       Global JWKS         │                               │
+    │         └─────── CDN ──────────────┘                               │
+    │                 │                                                   │
+    │         ┌───────▼────────┐                                          │
+    │         │  CloudFront /  │                                          │
+    │         │  Global CDN    │                                          │
+    │         │  /.well-known/ │                                          │
+    │         │  jwks.json     │                                          │
+    │         └────────────────┘                                          │
+    │                                                                      │
+    │  ╔══════════════════════╗    ╔══════════════════════╗               │
+    │  ║  APAC Region         ║    ║  Service Mesh       ║               │
+    │  ║                      ║    ║  (all regions)      ║               │
+    │  ║  ┌──────────────┐   ║    ║                      ║               │
+    │  ║  │ Auth Service  │   ║    ║  Local cache of      ║               │
+    │  ║  │ (replica)    │   ║    ║  JWKS keys, TTL=3600  ║               │
+    │  ║  │              │   ║    ║                      ║               │
+    │  ║  │ JWKS Cache   │   ║    ║  Verify tokens with   ║               │
+    │  ║  │ (read-only)  │   ║    ║  no cross-region call  ║               │
+    │  ║  └──────────────┘   ║    ║                      ║               │
+    │  ╚══════════════════════╝    ╚══════════════════════╝               │
+    └─────────────────────────────────────────────────────────────────────┘
+  `}
+  alt="Multi-region JWT architecture with primary auth service in US-East, replicas in EU-West and APAC, global JWKS CDN distribution, and region-local Redis for revocation state."
+  caption="Multi-region architecture: region-local verification with global JWKS distribution via CDN."
+/>
+
+### Key Challenges in Multi-Region Deployments
+
+**JWKS distribution.** You must ensure that all regions can access the current set of public keys. The standard solution is to serve the JWKS endpoint from a global CDN such as CloudFront or Fastly. The CDN caches the JWKS response at edge locations, so a service in Sydney fetches keys from a Sydney edge cache, not from the US-East origin. Set the `Cache-Control: max-age=3600` header to control CDN cache TTL.
+
+**Clock skew.** JWT validation checks the `exp` (expiration) and `nbf` (not before) claims, which depend on the system clock. Servers in different regions may have clock skew of up to several seconds. Most JWT libraries accept a `leeway` parameter (typically 30-60 seconds) to accommodate this. AWS Cognito, for example, allows 5 minutes of clock skew by default.
+
+```python
+# Allow clock skew across regions
+claims = jwt.decode(
+    token,
+    public_key,
+    algorithms=["RS256"],
+    leeway=30,  # 30 seconds tolerance for multi-region clock skew
+    options={"verify_exp": True, "verify_nbf": True}
+)
+```
+
+**Revocation at global scale.** Revocation is inherently stateful. When a user is revoked in one region, all regions must learn about it. You have two options:
+
+1. **Global Redis with replication.** A single Redis cluster with read replicas in each region. Writes go to the primary in US-East. Reads from the local replica with eventual consistency. Accept that there is a propagation delay of 100-500 milliseconds.
+
+2. **CRDT-based revocation sets.** Use conflict-free replicated data types to maintain a set of revoked token IDs in each region. This eliminates the single point of failure but adds complexity. Each region can write locally, and the sets converge automatically through background synchronization.
+
+**Latency budget for token issuance.** Token issuance is a write-heavy operation that often requires contacting the primary region. Users in APAC or EU may experience higher latency for login and token refresh. Mitigate this by routing auth requests to the nearest region that can reach the primary with acceptable latency, rather than routing all auth traffic to a single region.
+
+---
+
+## Capacity and Performance
+
+You must plan for the throughput requirements of your JWT infrastructure. The numbers below are based on production experience at large-scale deployments.
+
+### Token Size
+
+A typical JWT contains three parts: header, payload, and signature, each base64-encoded.
+
+```text
+Header (uncompressed):   {"alg":"RS256","kid":"key-2026-q2","typ":"JWT"}
+Header (base64):          eyJhbGciOiAiUlMyNTYiLCAia2lkIjogImtleSQyMDI2LXEyIn0
+
+Payload (uncompressed):  {"sub":"user_abc123","iss":"https://auth.example.com",
+                          "aud":"https://api.example.com","iat":1760000000,
+                          "exp":1760000900,"roles":["admin","billing"],
+                          "org_id":"org_42"}
+Payload (base64):         eyJzdWIiOiAidXNlcl9hYmMxMjMiLCA...
+
+Signature:                3045022100e0b2a2a3...
+```
+
+Token size varies based on the number of claims:
+
+| Claim Set | Approximate Size | Example Use Case |
+|-----------|-----------------|------------------|
+| Minimal (sub, iss, aud, iat, exp) | 350-450 bytes | Microservice-to-microservice |
+| Standard (add roles, org_id) | 500-700 bytes | Web application |
+| Rich (add permissions, groups, tenant metadata) | 800-1500 bytes | Enterprise multi-tenant |
+| Custom (add 10+ custom claims) | 1.5-3 KB | Monolithic migration |
+
+**Impact of large tokens.** Each additional 100 bytes of token size adds roughly 0.5 microseconds to network transfer time per request. More importantly, large tokens exceed HTTP header size limits in some proxies and load balancers. The default limit for most web servers is 8 KB for the combined header block. If your JWT exceeds 4 KB, you risk hitting this ceiling when combined with other headers.
+
+**Compression.** JWT supports compressed payloads using the `zip` header claim. You use the `DEFLATE` algorithm to reduce token size by 40-60 percent. However, compression adds CPU overhead on every verification and increases code complexity. Reserve compression for tokens that exceed 2 KB.
+
+### Verification Throughput
+
+Signature verification is the dominant cost in JWT processing. The numbers below assume a single core on a modern server-class CPU (AWS c7g.large, Graviton3).
+
+| Algorithm | Verifications/sec (single core) | Relative Cost |
+|-----------|--------------------------------|---------------|
+| HS256 (HMAC-SHA256) | ~250,000 | 1x |
+| RS256 (RSA 2048-bit) | ~40,000 | 6x |
+| RS256 (RSA 4096-bit) | ~12,000 | 20x |
+| ES256 (ECDSA P-256) | ~80,000 | 3x |
+| EdDSA (Ed25519) | ~100,000 | 2.5x |
+
+**Key insights:**
+
+- **HS256 is fastest but dangerous at scale.** Symmetric verification requires both parties to share the secret. In a distributed system, this means every service holds the secret. A single compromised service exposes the entire authentication system. Never use HS256 beyond a single-process application.
+
+- **ES256 offers the best trade-off at scale.** ECDSA verification is roughly twice as fast as RSA 2048-bit with equivalent security. Token sizes are smaller because ECDSA keys are shorter (64 bytes vs 512 bytes for RSA 2048-bit). Most modern auth systems have migrated to ECDSA.
+
+- **EdDSA (Ed25519) is the emerging standard.** It offers better performance and security than both RSA and ECDSA, with constant-time verification that resists side-channel attacks. Adoption is growing, but library support is still maturing in some ecosystems.
+
+#### Benchmarking Your Verification Pipeline
+
+Before you commit to an algorithm, benchmark it against your actual workload. The numbers in the table above are laboratory measurements. Your production performance depends on several factors:
+
+**Token size affects verification time.** A JWT with 20 custom claims takes longer to decode than one with 3 claims. The signature verification itself is constant time for a given algorithm, but the base64 decode and JSON parse of the payload scale linearly with token size. Benchmark with your actual payload structure.
+
+**CPU generation matters.** Graviton3 (ARM) performs ECDSA verification differently than Intel Ice Lake. AMD Milan has different crypto instruction throughput than Intel. Test on the instance types you actually use in production.
+
+**Concurrent verification throughput.** Single-core numbers are useful for capacity planning, but real services handle many concurrent requests. Measure the P99 latency of JWT verification under your expected concurrency level. A service handling 10,000 requests per second with 100 concurrent workers will see different verification latency than one handling the same throughput with 10 workers.
+
+```python
+# Simple JWT verification benchmark
+import time
+import jwt
+import statistics
+
+def benchmark_verify(token, public_key, iterations=10000):
+    latencies = []
+    for _ in range(iterations):
+        start = time.perf_counter_ns()
+        jwt.decode(token, public_key, algorithms=["RS256"])
+        elapsed = time.perf_counter_ns() - start
+        latencies.append(elapsed)
+
+    mean = statistics.mean(latencies) / 1_000  # microseconds
+    p99 = sorted(latencies)[int(len(latencies) * 0.99)] / 1_000
+    return {"mean_us": mean, "p99_us": p99, "iterations": iterations}
+```
+
+**Caching saves more than verification cost.** If you cache verified tokens by their `jti` (JWT ID) claim, you can skip signature verification entirely for repeated requests. The cache hit ratio depends on your traffic patterns. For read-heavy APIs where the same user makes many requests within a short window, a 60-second token cache can achieve a 95 percent hit rate, reducing verification overhead by 95 percent.
+
+**Verification throughput planning.** For a service handling 100,000 requests per second with JWT verification on every request, using RS256:
+
+```text
+100,000 req/s ÷ 40,000 verifications/core = 2.5 cores
+```
+
+You should allocate at least 4 cores for verification alone to handle spikes and leave headroom. With ES256:
+
+```text
+100,000 req/s ÷ 80,000 verifications/core = 1.25 cores
+```
+
+Allocate 2-3 cores for ES256 verification. The savings compound across dozens of services.
+
+### JWKS Cache TTL and Staleness
+
+Every service caches the JWKS response. The TTL you choose represents a trade-off between freshness and performance.
+
+<AsciiDiagram
+  id="system-design-fundamentals/jwt/jwks-cache-tradeoff"
+  content={`
+    Cache TTL Trade-off Spectrum
+    ──────────────────────────────────────────────────────────────────────
+
+    Short TTL (60 seconds)            Long TTL (24 hours)
+    ──────────────────────────       ──────────────────────────
+    │ Fast key rotation          │    │ Minimal JWKS fetch cost  │
+    │ High JWKS request load    │    │ Slow key adoption        │
+    │ Auth service load spikes  │    │ Rotation window          │
+    │ Every service re-fetches  │    │ extends by TTL           │
+    │ More network cost         │    │ Less network cost        │
+    └──────────────────────────┘    └──────────────────────────┘
+
+                              ┌─────┐
+                              │  ▲  │
+                              │  │  │
+                              │ Opt │
+                              │ imum│
+                              │  │  │
+                              │  ▼  │
+                              └─────┘
+                          3600 seconds
+                          (1 hour)
+
+    Recommended Strategy:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  Cache-Control: public, max-age=3600, stale-while-revalidate=300 │
+    │                                                                   │
+    │  max-age=3600       : Serve cached JWKS for 1 hour               │
+    │  stale-while-revalidate=300: Serve stale for 5 min while re-fetch │
+    │                                                                   │
+    │  Result: Services check JWKS every hour, but can survive          │
+    │  5 minutes of auth service downtime without rejecting tokens.     │
+    └─────────────────────────────────────────────────────────────────┘
+  `}
+  alt="JWKS cache TTL trade-off spectrum showing the balance between fast key rotation and minimal fetch cost."
+  caption="JWKS cache TTL trade-off: 1 hour is the recommended default with stale-while-revalidate for resilience."
+/>
+
+### Token State Storage
+
+Even though JWT verification is stateless, refresh tokens and revocation require storage. Estimate your storage requirements:
+
+```text
+Example: 10 million active users, each with one refresh token
+
+Refresh token storage (Redis):
+  Per token hash: ~200 bytes (key + value + metadata)
+  Total: 10M × 200 bytes = 2 GB
+
+Revocation set (active revoked tokens within their TTL window):
+  Assuming 0.1% revocation rate over 15-min access token TTL
+  Concurrent revoked: ~15,000
+  Per entry (token jti + timestamp): ~100 bytes
+  Total: 15,000 × 100 bytes = 1.5 MB
+
+Key rotation metadata:
+  Negligible — a few KB for key metadata
+```
+
+Your token storage infrastructure is small relative to your main data stores. Redis with a few gigabytes of memory comfortably handles tens of millions of active sessions.
+
+---
+
+## Observability and Monitoring
+
+A JWT infrastructure at scale is invisible when it works and catastrophic when it breaks. You need observability into every layer of the token lifecycle.
+
+### Metrics to Track
+
+Every service that verifies JWTs should emit the following metrics:
+
+| Metric | Type | What It Detects |
+|--------|------|-----------------|
+| `jwt.verification.count` | Counter (tagged by status: success, expired, invalid_sig, malformed) | Overall verification load and error rates |
+| `jwt.verification.duration` | Histogram (microseconds) | Verification latency, can indicate CPU saturation |
+| `jwt.jwks.fetch.count` | Counter (tagged by cache: hit, miss, refresh) | JWKS endpoint load and cache efficiency |
+| `jwt.jwks.fetch.duration` | Histogram (milliseconds) | JWKS fetch latency, affects cold-start verification |
+| `jwt.token.cache.hit_ratio` | Gauge (0.0 to 1.0) | Effectiveness of token caching |
+| `jwt.refresh.rotation.count` | Counter (tagged by status: normal, reuse_detected) | Refresh token health and potential compromise |
+| `jwt.revocation.check.count` | Counter (tagged by status: allowed, revoked) | Revocation list hit rate |
+
+### Alerting Thresholds
+
+Set alerts for the following conditions:
+
+**Spike in invalid signature errors.** A sudden increase in `jwt.verification.count` with status `invalid_sig` may indicate that the JWKS cache is stale or that an attacker is probing your endpoints with forged tokens. Investigate immediately.
+
+**Drop in verification count.** If `jwt.verification.count` drops sharply across all services, the API gateway may be rejecting tokens before they reach services, or traffic may have been rerouted. This could indicate a misconfiguration during deployment.
+
+**JWKS fetch failures.** If `jwt.jwks.fetch.duration` exceeds 1 second or the error rate rises above 1 percent, your auth service or CDN may be degraded. Services with stale JWKS caches cannot verify tokens signed with new keys.
+
+**Refresh token reuse detection.** Each `jwt.refresh.rotation.count` with status `reuse_detected` is a potential token theft. Alert on any occurrence. A single reuse event may be a network race condition. Two or more from the same user within a 5-minute window is almost certainly an attack.
+
+### Distributed Tracing
+
+Tag every HTTP request with the JWT claims that are most relevant for debugging. Include the following as span tags in your distributed tracing system:
+
+```text
+jwt.sub       = user_abc123      # User identifier for debugging
+jwt.iss       = auth.example.com # Issuer for multi-issuer environments
+jwt.kid       = key-2026-q2      # Key used for verification
+jwt.exp_at    = 1760000900       # Expiration timestamp for debugging token expiry
+jwt.verified  = true             # Whether verification succeeded
+```
+
+Do not include the full JWT or PII-bearing claims in tracing spans. The raw token is a credential, and tracing systems often have broader access than production systems. A span tag containing a JWT in a tracing system like Jaeger or Datadog is a security incident waiting to happen.
+
+### Structured Audit Logging
+
+Every authentication event must produce a structured audit log entry. The schema should be consistent across all services and regions:
+
+```json
+{
+  "event": "token_verification",
+  "timestamp": "2026-07-02T12:00:00Z",
+  "service": "order-service",
+  "region": "us-east-1",
+  "sub": "user_abc123",
+  "kid": "key-2026-q2",
+  "result": "success",
+  "latency_us": 42,
+  "request_id": "req-abc-123"
+}
+```
+
+Audit logs must be append-only and stored in a write-once, read-many store such as Amazon S3 with Object Lock or a dedicated SIEM system. Retain audit logs for at least one year for compliance requirements.
+
+---
+
+## Security Considerations at Scale
+
+### Token Side-Channel Leakage
+
+In a distributed system, tokens propagate through many layers. Each layer is a potential leak point:
+
+- **Load balancer logs.** Do not log the `Authorization` header. Configure your load balancers to redact headers containing JWT data.
+
+- **Service mesh sidecars.** If you use Envoy or Linkerd sidecars that inspect HTTP headers, ensure they do not log or expose the raw JWT.
+
+- **Error responses.** When JWT verification fails, return a generic `401 Unauthorized` without revealing why. Do not distinguish between expired tokens, invalid signatures, malformed tokens, or revoked tokens in the error message. This prevents attackers from probing the token structure.
+
+- **Monitoring and metrics.** Strip PII from JWT claims before emitting them to monitoring systems. A metric tagged with `user_id` is a data leak if the monitoring system is compromised.
+
+### JWKS Endpoint Hardening
+
+The JWKS endpoint is a critical piece of public infrastructure. Protect it:
+
+- **Rate limit the JWKS endpoint.** An attacker cannot forge tokens without the private key, but they can cause a denial of service by flooding the JWKS endpoint with requests, starving legitimate services of key updates.
+
+- **Serve from a separate domain.** Host the JWKS endpoint on a domain that does not share cookies with your application (`auth-cdn.example.com` vs `app.example.com`). This prevents cookie-based attacks from affecting the key distribution channel.
+
+- **Use a content delivery network.** CDNs absorb traffic spikes and provide DDoS protection. They also reduce latency for global key distribution.
+
+### Rotation Under Attack
+
+If you suspect the private key has been compromised, you must rotate immediately. The emergency rotation procedure differs from routine rotation:
+
+1. Generate a new key pair with a new `kid`.
+2. Add the new public key to the JWKS endpoint immediately.
+3. Switch the auth service to sign with the new key.
+4. Keep the old key in the JWKS for the remaining token TTL plus one hour.
+5. Increase monitoring for forged tokens bearing the old `kid`.
+6. Force re-authentication for all users to invalidate tokens signed with the compromised key, if the risk warrants it.
+
+**Emergency rotation is a trade-off.** Force re-authentication logs every user out and causes a massive spike in auth requests. Reserve this for confirmed key compromise, not just suspected compromise. For suspected compromise, a controlled rotation without forced logout is usually sufficient.
+
+---
+
+## Summary: Architecture Decision Matrix
+
+| Concern | Naive Approach | Production Approach | Multi-Region Approach |
+|---------|---------------|-------------------|----------------------|
+| Signing | Symmetric key (HS256) | Asymmetric key (RS256/ES256) | Asymmetric key in KMS |
+| Verification | In-process with shared secret | Local with JWKS cached keys | Local with CDN-distributed JWKS |
+| Key rotation | File replacement + restart | JWKS with overlapping keys | Automated via CI/CD pipeline |
+| Revocation | None (stateless) | Redis-backed blacklist | Global Redis or CRDT set |
+| Token refresh | None | Opaque refresh token with rotation | Cross-region refresh token store |
+| Clock handling | Assumes synchronized clock | Single region, minimal skew | Leeway parameter (30-60s) |
+| Cache management | None | max-age=3600 with stale-while-revalidate | CDN distribution |
+| Failure mode | Full auth outage | Degraded: cached keys serve | Degraded: stale CDN cache |
+
+---
+
+## Next Steps: Trade-offs
+
+You have now seen how JWT architecture evolves from a naive single-server setup to a production-grade multi-region system. Every decision along this path involves trade-offs. Asymmetric signing adds verification CPU cost but dramatically reduces the blast radius of a key compromise. Refresh token rotation protects against token theft but introduces stateful storage and reuse detection complexity. Multi-region deployment reduces latency for global users but adds clock skew management and cross-region revocation challenges.
+
+The next page, **JWT: Trade-offs and Alternatives**, covers the hard decisions you must make when designing a real-world JWT system: session tokens versus JWTs, opaque tokens versus structured tokens, blacklists versus short TTLs, and when to abandon JWTs entirely in favor of alternatives like paseto, biscuit, or macaroon tokens. Each alternative eliminates specific JWT pain points at the cost of ecosystem maturity and tooling support.
+
+Proceed to **Trade-offs and Alternatives** to complete your understanding of JWT at scale.

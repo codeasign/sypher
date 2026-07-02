@@ -1,0 +1,1183 @@
+---
+id: secrets-management-deep-dive
+title: Secrets Management — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Vault Internals
+
+You have a running HashiCorp Vault cluster. A client sends a request to read a secret. What happens between the network packet arriving and the secret being returned? This page walks through every layer.
+
+### Barrier Encryption
+
+Every secret stored in Vault is encrypted by the **barrier** before it touches the storage backend. The barrier is an AES-256-GCM encryption layer wrapped around the entire storage system. Vault never writes plaintext data to disk.
+
+The barrier key hierarchy:
+
+<AsciiDiagram
+  id="secrets-management/barrier-key-hierarchy"
+  title="Vault Barrier Key Hierarchy"
+  alt="Three-layer key hierarchy: master key at top, unwrap key in middle, barrier encryption key at bottom. Master key encrypts the unwrap key; unwrap key encrypts the barrier key."
+  caption="Vault's key hierarchy protects the barrier encryption key behind the master key."
+  content={`
+     ┌──────────────────────────────────────────────────┐
+     │              Master Key (Shamir-sealed)           │
+     │  Split across N key holders, requires K to seal  │
+     │  Encrypts the Unseal Key                          │
+     └──────────────────────┬───────────────────────────┘
+                            │ decrypts
+                            ▼
+     ┌──────────────────────────────────────────────────┐
+     │              Unseal Key (Key Encryption Key)      │
+     │  Stored inside the seal wrapped ciphertext        │
+     │  Rotates when the cluster re-seals                │
+     └──────────────────────┬───────────────────────────┘
+                            │ decrypts
+                            ▼
+     ┌──────────────────────────────────────────────────┐
+     │          Barrier Encryption Key (Data Key)        │
+     │  AES-256-GCM key used to encrypt/decrypt every    │
+     │  storage entry written to the backend             │
+     │  Rotated periodically (auto-rotation) or on seal  │
+     └──────────────────────────────────────────────────┘
+  `}
+/>
+
+When Vault starts, it is **sealed**. The barrier encryption key is encrypted with the unseal key, which is encrypted with the master key. The master key is split into shards using Shamir's Secret Sharing. To unseal, you provide K of N shards. Vault reconstructs the master key, decrypts the unseal key, decrypts the barrier key, and now the barrier can read and write storage entries.
+
+### Seal and Unseal State Machine
+
+Vault operates in two states: sealed and unsealed.
+
+| State   | Barrier Access | Can Serve Requests | Notes                                      |
+|---------|---------------|--------------------|--------------------------------------------|
+| Sealed  | Locked        | No                 | Cannot read or write any storage entry     |
+| Unsealed| Unlocked      | Yes                | Barrier key is in memory                   |
+| Auto-unseal | Unlocked | Yes                | KMS decrypts the unseal key automatically  |
+
+When sealed, Vault rejects all API calls — even authentication. The health endpoint returns a 503 with `sealed=true`. This is a safety mechanism: if an attacker gains access to the storage backend, they find only encrypted ciphertext with no way to decrypt it without the key shards.
+
+### Secret Engines
+
+A **secret engine** is the component that generates, stores, or rotates secrets. Vault has many secret engines, each with its own behavior:
+
+- **KV (Key-Value)**: Stores static secrets (API keys, database passwords). Two versions: v1 (no versioning) and v2 (versioned with delete/undelete).
+- **Database**: Generates dynamic credentials (short-lived database users with limited privileges).
+- **AWS**: Generates dynamic IAM users or STS credentials.
+- **PKI**: Issues X.509 certificates with configurable TTLs.
+- **Transit**: Encryption-as-a-service; data never leaves your system.
+- **SSH**: Signs SSH public keys for one-time access to machines.
+
+Each engine is mounted at a path. For example, `secret/` for KV, `database/` for database secrets, `pki/` for certificates. Engines are isolated from each other — they cannot access each other's data.
+
+### Auth Methods
+
+An **auth method** is how a client proves their identity. Vault supports many auth methods:
+
+| Method           | Identity Source        | Use Case                          |
+|------------------|------------------------|-----------------------------------|
+| Token            | Vault-issued token     | Machine-to-machine, bootstrapping |
+| AppRole          | RoleID + SecretID      | CI/CD pipelines, automation       |
+| Kubernetes       | Service account token  | Pod identity in Kubernetes        |
+| LDAP             | LDAP directory         | Human users, existing SSO         |
+| OIDC / JWT       | External IdP           | Human users, federated identity   |
+| AWS IAM          | AWS EC2 instance doc   | AWS-native workloads              |
+| GitHub           | GitHub personal token  | Developer workflows               |
+| Userpass         | Username + password    | Simple testing, demos             |
+
+When a client authenticates, Vault validates the identity, checks any associated policies, and returns a **client token** with a TTL. All subsequent requests use this token.
+
+### Audit Devices
+
+An **audit device** logs every request and response to Vault's API. Vault supports:
+
+- **File audit**: Writes JSON-formatted logs to a local file.
+- **Syslog audit**: Sends logs to syslog (Linux).
+- **Socket audit**: Sends logs to a TCP or UDP endpoint.
+- **Custom audit**: Via the audit device plugin interface.
+
+Every audit log entry contains:
+
+- **Request**: Path, method, headers, remote address, client token (HMAC'd).
+- **Response**: Status code, response data (HMAC'd for sensitive fields).
+- **Timestamps**: Request time, response time, elapsed time.
+- **Mount point**: The secret engine mount that handled the request.
+
+Audit logs are **write-ahead**: Vault writes the audit entry before processing the request. This ensures that if Vault crashes partway through, the audit trail is complete. The trade-off is latency — every request pays an I/O cost for the audit log.
+
+## KMS Integration
+
+Vault integrates with cloud KMS providers for **auto-unseal**. Instead of splitting the master key into shards, Vault wraps the unseal key using the cloud KMS's encryption key. This eliminates the need for human operators to unseal Vault after a restart.
+
+<AsciiDiagram
+  id="secrets-management/auto-unseal-flow"
+  title="Auto-Unseal Flow with Cloud KMS"
+  alt="Sequence: Vault starts, reads encrypted unseal key from storage, sends it to KMS for decryption, receives the unseal key, decrypts the barrier key, and opens the barrier."
+  caption="Auto-unseal uses a cloud KMS to decrypt the unseal key, removing the need for manual unseal."
+  content={`
+     Vault                 Storage              Cloud KMS
+       │                      │                    │
+       │  ① Start             │                    │
+       │──────────────────────│                    │
+       │                      │                    │
+       │  ② Read encrypted    │                    │
+       │─────────────────────>│                    │
+       │                      │                    │
+       │  ③ Encrypted blob    │                    │
+       │<─────────────────────│                    │
+       │                      │                    │
+       │  ④ Decrypt request   │                    │
+       │──────────────────────────────────────────>│
+       │                      │                    │
+       │  ⑤ Plaintext unseal  │                    │
+       │<──────────────────────────────────────────│
+       │                      │                    │
+       │  ⑥ Decrypt barrier   │                    │
+       │     key with unseal  │                    │
+       │──────────────────────│                    │
+       │                      │                    │
+       │  ⑦ Barrier open ✅   │                    │
+       │     Ready to serve   │                    │
+       └───────────────────────────────────────────┘
+  `}
+/>
+
+Supported KMS providers:
+
+| Provider       | Service                 | Key Type          | Cost                            |
+|----------------|-------------------------|-------------------|---------------------------------|
+| AWS            | KMS (CMK)               | AES-256, RSA-2048 | $1/month per key + $0.03/10k ops|
+| Azure          | Key Vault               | RSA-2048, RSA-HSM | $0.03/10k operations            |
+| GCP            | Cloud KMS               | AES-256, RSA-2048 | $0.06/10k operations            |
+| GCP            | Cloud HSM               | AES-256, HSM      | $3/version/month + $0.05/10k ops|
+| HashiCorp      | Cloud Platform (HCP)    | Managed           | Included in HCP Vault tier      |
+
+The KMS decrypt call is the most expensive operation in the Vault startup path. Latency varies by provider:
+
+- AWS KMS: 10-50ms per decrypt
+- Azure Key Vault: 20-80ms per decrypt
+- GCP Cloud KMS: 10-40ms per decrypt
+- HCP Vault: 5-15ms per decrypt
+
+For a Vault cluster with 3 nodes, each node makes one KMS decrypt call on startup. The total startup time is the slowest node's KMS latency plus barrier initialization.
+
+### KMS Rate Limits
+
+Cloud KMS APIs have rate limits. Exceeding them causes throttling (HTTP 429). This is critical for Vault clusters that restart frequently, such as during auto-scaling events or rolling deployments.
+
+| Provider   | Rate Limit (Decrypt)         | Throttle Behavior          |
+|------------|------------------------------|----------------------------|
+| AWS KMS    | 10,000 requests/second (soft)| Exponential backoff, retry |
+| Azure KV   | 2,000 requests/second (Tier1)| 429 response, retry-after  |
+| GCP KMS    | 5,000 requests/second        | 429 response, 60s cooldown |
+
+If you operate a large Vault fleet (100+ nodes), you must request a rate limit increase from your cloud provider or use a caching layer between Vault and KMS.
+
+## Dynamic Secrets
+
+Dynamic secrets are the killer feature of Vault. Instead of storing a static password, Vault generates a credential on-demand with a short TTL. When the TTL expires, Vault automatically revokes the credential.
+
+### Dynamic Database Credentials
+
+<AsciiDiagram
+  id="secrets-management/dynamic-db-secret-lifecycle"
+  title="Lifecycle of a Dynamic Database Secret"
+  alt="Timeline: application requests a database credential, Vault generates a database user with limited privileges, application uses it, TTL expires, Vault revokes the user."
+  caption="Dynamic secrets are generated, used, and automatically revoked. No human ever sees the credential."
+  content={`
+     Application               Vault                    Database
+        │                        │                        │
+        │  ① Request DB creds    │                        │
+        │───────────────────────>│                        │
+        │                        │  ② Generate user       │
+        │                        │  CREATE USER 'app_xxx' │
+        │                        │───────────────────────>│
+        │                        │  GRANT SELECT ON db.*  │
+        │                        │───────────────────────>│
+        │                        │                        │
+        │  ③ Return creds       │                        │
+        │  user: app_a1b2       │                        │
+        │  pass: tmp_xyz        │                        │
+        │  TTL: 3600s           │                        │
+        │<───────────────────────│                        │
+        │                        │                        │
+        │  ┌─────────────────┐   │                        │
+        │  │ Application     │   │                        │
+        │  │ connects using  │   │                        │
+        │  │ dynamic creds   │   │                        │
+        │  └────────┬────────┘   │                        │
+        │           │            │                        │
+        │           │            │  ④ Use credential      │
+        │           │────────────│───────────────────────>│
+        │           │            │                        │
+        │        TTL expires     │                        │
+        │           │            │  ⑤ Revoke user         │
+        │           │            │───────────────────────>│
+        │           │            │  DROP USER 'app_a1b2'  │
+        │           │            │<───────────────────────│
+        │           │            │                        │
+        │           │            │  User gone             │
+        └─────────────────────────────────────────────────┘
+  `}
+/>
+
+The database secret engine works by:
+
+1. **Configure root credentials**: You provide Vault with a database user that has `CREATE USER` and `GRANT` privileges.
+2. **Define roles**: A role specifies the SQL statements to run when creating a user and the TTL for the credential.
+3. **Request credentials**: The application calls `vault read database/creds/my-role`. Vault creates a database user, executes the grant statements, and returns the generated username and password.
+4. **Use the credential**: The application connects to the database using the short-lived credential.
+5. **Lease expiration**: Vault tracks the lease. When the TTL expires, Vault executes the revocation SQL (typically `DROP USER 'username'`).
+
+The generated username is prefixed with a token that identifies the lease. For example, `v-app-abc123-def456` where `v` indicates Vault, `app` is the role name, and the rest is a random suffix.
+
+```python
+# Requesting a dynamic database credential
+import hvac
+
+client = hvac.Client(url="https://vault.example.com", token="hvs.xxx")
+cred = client.secrets.database.generate_credentials(
+    mount_point="database",
+    name="readonly-role"
+)
+
+# cred contains:
+# {
+#   "data": {
+#     "username": "v-readonly-a1b2c3d4",
+#     "password": "A1b2C3d4E5f6G7h8",
+#   },
+#   "lease_id": "database/creds/readonly-role/a1b2c3d4-e5f6-...",
+#   "lease_duration": 3600,
+#   "renewable": True
+# }
+
+# Use the credential
+db_conn = psycopg2.connect(
+    host="db.example.com",
+    user=cred["data"]["username"],
+    password=cred["data"]["password"]
+)
+```
+
+### Dynamic AWS Credentials
+
+Vault can generate dynamic AWS IAM credentials:
+
+- **IAM user**: Vault creates a new IAM user with specific policies, generates access key and secret key, and returns them.
+- **STS federation**: Vault calls STS to generate temporary credentials (15min - 36h TTL).
+
+```python
+# Requesting dynamic AWS credentials
+aws_cred = client.secrets.aws.generate_credentials(
+    mount_point="aws",
+    name="s3-readonly",
+    ttl="15m"
+)
+
+# Sets up environment variables for AWS SDK
+import os
+os.environ["AWS_ACCESS_KEY_ID"] = aws_cred["data"]["access_key"]
+os.environ["AWS_SECRET_ACCESS_KEY"] = aws_cred["data"]["secret_key"]
+os.environ["AWS_SESSION_TOKEN"] = aws_cred["data"]["security_token"]
+```
+
+## Data Structures
+
+Understanding the internal data structures helps you diagnose issues and design better configurations.
+
+### Encrypted Secret Storage
+
+Every storage entry in Vault has this structure:
+
+```json
+{
+  "path": "secret/data/my-secret",
+  "value": {
+    "ciphertext": "vault:v1:aes256-gcm:base64...",
+    "hmac": "sha256:hex...",
+    "key_version": 3
+  },
+  "meta": {
+    "created": "2026-07-01T12:00:00Z",
+    "modified": "2026-07-02T08:30:00Z",
+    "version": 5,
+    "destroyed": false
+  }
+}
+```
+
+The `path` is the logical key. The `value` is the encrypted blob. The `meta` contains metadata. The entire `value` field is encrypted by the barrier — the storage backend sees only the ciphertext.
+
+For KV v2, each version is stored separately:
+
+```json
+{
+  "path": "secret/data/my-secret/versions/5",
+  "value": {
+    "ciphertext": "vault:v1:aes256-gcm:base64..."
+  },
+  "meta": {
+    "created": "2026-07-02T08:30:00Z",
+    "version": 5,
+    "deletion_time": ""
+  }
+}
+```
+
+The storage backend (Consul, Raft, or file) stores these as key-value pairs. The barrier encrypts before writing and decrypts after reading.
+
+### Lease Database
+
+When Vault issues a dynamic secret or a token, it creates a **lease**. Leases are stored in Vault's internal lease database (also barrier-encrypted):
+
+```json
+{
+  "lease_id": "database/creds/readonly-role/a1b2c3d4-e5f6-7890-abcd",
+  "path": "database/creds/readonly-role",
+  "issue_time": "2026-07-02T09:00:00Z",
+  "expire_time": "2026-07-02T10:00:00Z",
+  "last_renewal": "2026-07-02T09:30:00Z",
+  "renewable": true,
+  "ttl": 3600,
+  "max_ttl": 86400,
+  "namespace": "production",
+  "secret_type": "database",
+  "internal_data": {
+    "username": "v-readonly-a1b2c3d4",
+    "password": "A1b2C3d4E5f6G7h8",
+    "role": "readonly-role"
+  }
+}
+```
+
+The `internal_data` field contains the revocation data. Vault uses this to revoke the credential when the lease expires. The `password` is stored in plaintext here because Vault needs it to connect to the database during revocation.
+
+Vault's lease manager:
+
+| Component               | Responsibility                                          |
+|-------------------------|---------------------------------------------------------|
+| Lease Manager           | Tracks all active leases in memory and storage          |
+| Expiration Checker      | Periodic goroutine that checks for expired leases       |
+| Revocation Worker       | Executes revocation logic for expired leases            |
+| Lease Renewal Handler   | Processes renewal requests from clients                 |
+| Lease Tidy              | Cleans up stale leases from storage (lazy expiration)   |
+
+### Audit Log
+
+Audit log entries are JSON objects. Each entry contains:
+
+```json
+{
+  "time": "2026-07-02T09:00:00.123456Z",
+  "type": "response",
+  "auth": {
+    "client_token": "hmac-sha256:abc123...",
+    "policies": ["default", "readonly"],
+    "metadata": {
+      "role": "app-role",
+      "service": "payment-processor"
+    }
+  },
+  "request": {
+    "path": "secret/data/payment-api-key",
+    "operation": "read",
+    "mount_type": "kv",
+    "remote_address": "10.0.1.50:43521"
+  },
+  "response": {
+    "data": "hmac-sha256:def456...",
+    "mount_type": "kv",
+    "warnings": null
+  },
+  "error": ""
+}
+```
+
+Sensitive fields (client tokens, secret data) are HMAC'd using a separate HMAC key. The HMAC key is derived from the barrier key, ensuring that only someone with access to the unsealed Vault can reverse the HMAC.
+
+## Request Lifecycle
+
+Every request to Vault passes through at least 12 stages. Here is the full lifecycle of a read request for a static secret.
+
+<AsciiDiagram
+  id="secrets-management/request-lifecycle-overview"
+  title="Full Request Lifecycle Through Vault"
+  alt="Flow diagram: client sends request through TLS termination, routing, authentication, authorization, barrier decryption, secret engine processing, audit logging, and response."
+  caption="Every Vault request passes through 12+ stages from arrival to response."
+  content={`
+     Client             Vault
+       │                  │
+       │  ① TLS handshake │
+       │─────────────────>│
+       │<─────────────────│
+       │                  │
+       │  ② HTTP request  │
+       │  GET /v1/secret/  │
+       │  data/my-api-key  │
+       │─────────────────>│
+       │                  │
+       │  ③ Route to      │
+       │     mount point  │
+       │──────────────────│
+       │                  │
+       │  ④ Authenticate  │
+       │     token        │
+       │──────────────────│
+       │                  │
+       │  ⑤ Authorize     │
+       │     policy check │
+       │──────────────────│
+       │                  │
+       │  ⑥ Barrier       │
+       │     decryption   │
+       │──────────────────│
+       │                  │
+       │  ⑦ Secret engine │
+       │     read         │
+       │──────────────────│
+       │                  │
+       │  ⑧ Barrier       │
+       │     re-encrypt   │
+       │──────────────────│
+       │                  │
+       │  ⑨ Audit log     │
+       │──────────────────│
+       │                  │
+       │  ⑩ JSON response │
+       │<─────────────────│
+       │                  │
+       └──────────────────┘
+  `}
+/>
+
+### Stage 1: TLS Termination
+
+The client connects to Vault over HTTPS. Vault terminates TLS using its configured certificate. The TLS connection validates the client certificate if mutual TLS is configured.
+
+```python
+# Client establishes TLS
+import requests
+response = requests.get(
+    "https://vault.example.com:8200/v1/secret/data/my-api-key",
+    headers={"X-Vault-Token": "hvs.xxx"},
+    verify="/path/to/vault-ca.pem"
+)
+```
+
+### Stage 2: HTTP Request Parsing
+
+Vault's HTTP listener parses the request. It extracts:
+
+- **HTTP method**: GET, PUT, POST, DELETE, LIST
+- **Path**: `/v1/secret/data/my-api-key`
+- **Headers**: `X-Vault-Token`, `X-Vault-Namespace`, `X-Vault-Request`
+- **Body**: JSON payload (for writes)
+
+### Stage 3: Routing to Mount Point
+
+Vault's router maps the request path to a secret engine mount. The path `/v1/secret/data/my-api-key` maps to the KV v2 engine mounted at `secret/`.
+
+```json
+{
+  "mount_path": "secret/",
+  "mount_type": "kv",
+  "mount_accessor": "kv_a1b2c3d4",
+  "local_path": "data/my-api-key",
+  "namespace": "production"
+}
+```
+
+### Stage 4: Authentication
+
+Vault extracts the token from the `X-Vault-Token` header. It looks up the token in its internal token store:
+
+- Is the token valid? (not expired, not revoked)
+- Does the token's parent token exist? (for orphan tokens)
+- What policies are attached to the token?
+- What is the token's TTL and remaining life?
+
+```python
+# Pseudocode for token validation
+def validate_token(token_id):
+    # Look up token in storage
+    token_entry = storage.get(f"core/token/{token_id}")
+    if not token_entry:
+        return None  # Token not found
+    
+    # Check expiration
+    if token_entry.expire_time < now():
+        return None  # Token expired
+    
+    # Check if token is revoked
+    if token_entry.revoked:
+        return None  # Token revoked
+    
+    # Return token metadata
+    return {
+        "id": token_id,
+        "policies": token_entry.policies,
+        "ttl": token_entry.ttl,
+        "meta": token_entry.meta
+    }
+```
+
+### Stage 5: Authorization (Policy Check)
+
+Vault evaluates the request against the token's policies. Policies are expressed in HCL or JSON:
+
+```hcl
+# Example policy: readonly-kv
+path "secret/data/payment*" {
+  capabilities = ["read", "list"]
+}
+
+path "secret/data/internal*" {
+  capabilities = ["deny"]
+}
+
+path "secret/metadata/*" {
+  capabilities = ["list"]
+}
+```
+
+Each policy is compiled into a **capability set**. Vault checks:
+
+1. Does any policy deny the path? If yes, reject.
+2. Does any policy grant the required capability? If yes, allow.
+3. If no policy matches, reject (default deny).
+
+```python
+# Authorization check
+def authorize(token_policies, path, required_capability):
+    for policy in token_policies:
+        if policy.denies(path):
+            return False
+        if policy.grants(path, required_capability):
+            return True
+    return False  # Default deny
+```
+
+### Stage 6: Barrier Decryption
+
+The router calls the KV secret engine. The KV engine reads the encrypted entry from storage. The barrier decrypts the ciphertext using the barrier encryption key.
+
+```python
+# Barrier decryption (simplified)
+def barrier_decrypt(ciphertext):
+    key_version = extract_key_version(ciphertext)
+    encryption_key = get_barrier_key(key_version)
+    
+    # AES-256-GCM decryption
+    nonce = ciphertext[:12]
+    tag = ciphertext[-16:]
+    aad = "vault-barrier"  # Additional authenticated data
+    
+    plaintext = aes_gcm_decrypt(
+        key=encryption_key,
+        nonce=nonce,
+        ciphertext=ciphertext[12:-16],
+        aad=aad,
+        tag=tag
+    )
+    return plaintext
+```
+
+### Stage 7: Secret Engine Processing
+
+The KV engine processes the decrypted data. For a read request, it returns the stored value. For a write request, it encrypts the new value and stores it. For KV v2, it also manages versioning.
+
+### Stage 8: Barrier Re-encryption
+
+If the request modified data (create, update, delete), the barrier re-encrypts the data before writing to storage. The barrier uses the current key version and may trigger a key rotation if the key is too old.
+
+### Stage 9: Audit Logging
+
+Vault writes the audit log entry. The entry contains the request details and response. Sensitive fields are HMAC'd.
+
+### Stage 10: Response Construction
+
+Vault constructs the JSON response and returns it to the client.
+
+```json
+{
+  "request_id": "abc-123-def-456",
+  "lease_id": "",
+  "renewable": false,
+  "lease_duration": 0,
+  "data": {
+    "data": {
+      "api_key": "sk-live-xxxxxxxxxxxx"
+    },
+    "metadata": {
+      "created_time": "2026-07-01T12:00:00Z",
+      "version": 3
+    }
+  },
+  "wrap_info": null,
+  "warnings": null,
+  "auth": null
+}
+```
+
+### Lease Creation Lifecycle
+
+For dynamic secrets, the lifecycle includes lease management.
+
+<AsciiDiagram
+  id="secrets-management/lease-creation-lifecycle"
+  title="Lease Creation and Revocation Lifecycle"
+  alt="Sequence: client requests dynamic secret, Vault creates credential, stores lease, client uses credential, client renews lease, TTL expires, Vault revokes credential."
+  caption="Dynamic secrets have a lease lifecycle: issue, renew, expire, revoke."
+  content={`
+     Client              Vault               Target System
+       │                   │                     │
+       │ ① Request creds   │                     │
+       │──────────────────>│                     │
+       │                   │                     │
+       │                   │ ② Create resource   │
+       │                   │─────────────────────>│
+       │                   │                     │
+       │                   │ ③ Store lease       │
+       │                   │──┐                  │
+       │                   │  │ lease_id, ttl    │
+       │                   │<─┘                  │
+       │                   │                     │
+       │ ④ Return creds    │                     │
+       │<──────────────────│                     │
+       │                   │                     │
+       │ ⑤ Use creds       │                     │
+       │─────────────────────────────────────────>│
+       │                   │                     │
+       │ ⑥ Renew lease     │                     │
+       │──────────────────>│                     │
+       │                   │ ⑦ Extend lease      │
+       │<──────────────────│                     │
+       │                   │                     │
+       │ ... TTL elapses ...│                     │
+       │                   │                     │
+       │                   │ ⑧ Revoke lease      │
+       │                   │─────────────────────>│
+       │                   │                     │
+       │                   │ ⑨ Confirm revoke    │
+       │                   │<─────────────────────│
+       │                   │                     │
+       │                   │ ⑩ Clean up lease    │
+       │                   │──┐                  │
+       │                   │  │ delete from store │
+       │                   │<─┘                  │
+       │                   │                     │
+  `}
+/>
+
+### Request Routing in a Cluster
+
+In a multi-node Vault cluster, requests are routed based on the cluster configuration.
+
+<AsciiDiagram
+  id="secrets-management/cluster-request-routing"
+  title="Request Routing in a Vault Cluster"
+  alt="Three Vault nodes: one active, two standby. Client request goes to standby node A, which forwards to active node. Active node processes and responds. Standby node B is also available."
+  caption="Vault uses an active-standby architecture. Standby nodes forward requests to the active node."
+  content={`
+     ┌──────────────┐
+     │   Client     │
+     └──────┬───────┘
+            │
+            │ ① GET /v1/secret/data/key
+            │
+            ▼
+     ┌─────────────────────────────────────────────────┐
+     │  Load Balancer                                   │
+     │  (round-robin or least-connections)              │
+     └──────┬──────────────────────┬────────────────────┘
+            │                      │
+            ▼                      ▼
+     ┌──────────────┐      ┌──────────────┐
+     │ Standby A    │      │ Standby B    │
+     │              │      │              │
+     │ ② Forward    │      │ ④ Forward    │
+     │    to active │      │    to active │
+     └──────┬───────┘      └──────┬───────┘
+            │                      │
+            └──────────┬───────────┘
+                       │
+                       ▼
+               ┌──────────────┐
+               │ Active Node  │
+               │              │
+               │ ③ Process    │
+               │    request   │
+               │ ⑤ Respond    │
+               └──────┬───────┘
+                      │
+                      │ ⑥ Response back to client
+                      ▼
+               ┌──────────────┐
+               │   Client     │
+               └──────────────┘
+  `}
+/>
+
+## Consistency: Seal/Unseal Quorum
+
+Vault uses Shamir's Secret Sharing to split the master key into shards. To unseal Vault, you need K of N shards. This is a **quorum** — no single person can unseal Vault alone.
+
+### Shamir's Secret Sharing
+
+Shamir's Secret Sharing works by constructing a polynomial of degree K-1 where the constant term is the master key. Each shard is a point on the polynomial. With K points, you can reconstruct the polynomial and find the constant term. With K-1 points, you learn nothing about the constant term.
+
+```python
+# Shamir's Secret Sharing (conceptual)
+# Given a secret S, split into N shards where K are needed to reconstruct
+def split_secret(secret, total_shards, threshold):
+    # Create a polynomial of degree threshold-1
+    # f(x) = secret + a1*x + a2*x^2 + ... + a_{k-1}*x^{k-1}
+    coefficients = [secret] + [random_256bit() for _ in range(threshold - 1)]
+    
+    shards = []
+    for i in range(1, total_shards + 1):
+        # Evaluate f(i) mod prime
+        value = sum(c * (i ** idx) for idx, c in enumerate(coefficients))
+        shards.append((i, value))
+    
+    return shards
+
+def reconstruct_secret(shards):
+    # Lagrange interpolation at x=0
+    secret = 0
+    for i, (x_i, y_i) in enumerate(shards):
+        numerator = 1
+        denominator = 1
+        for j, (x_j, _) in enumerate(shards):
+            if i == j:
+                continue
+            numerator *= -x_j
+            denominator *= x_i - x_j
+        secret += y_i * numerator * inverse(denominator)
+    return secret
+```
+
+### Unseal Process
+
+When you unseal Vault, you provide K shards:
+
+```bash
+# Operator 1 provides shard 1
+vault operator unseal <shard-1>
+# Seal status: 1/3 shards provided
+
+# Operator 2 provides shard 2
+vault operator unseal <shard-2>
+# Seal status: 2/3 shards provided
+
+# Operator 3 provides shard 3
+vault operator unseal <shard-3>
+# Seal status: Unsealed! Barrier is now open.
+```
+
+With auto-unseal, this process is automatic. The KMS decrypts the unseal key, and Vault can start without human intervention.
+
+### Replication Lag
+
+Vault Enterprise supports **performance replication** and **disaster recovery replication**.
+
+| Replication Type | Purpose               | Data Replicated               | Lag                          |
+|------------------|-----------------------|-------------------------------|------------------------------|
+| Performance      | Geographic scaling    | Secrets, tokens, leases       | 50-500ms (cross-region)      |
+| DR               | Disaster recovery     | Everything (including policies)| 100ms-5s (cross-region)      |
+
+Replication lag occurs when:
+
+- **Network latency**: Cross-region replication has higher latency than intra-region.
+- **Write volume**: High write throughput on the primary causes replication backlog.
+- **Storage performance**: Slow storage on the secondary causes replication lag.
+- **Large entries**: PKI certificates, large secrets, or bulk operations increase replication time.
+
+Monitoring replication lag:
+
+```bash
+# Check replication status
+vault read -format=json sys/replication/status
+
+# Output includes:
+# {
+#   "data": {
+#     "performance": {
+#       "state": "secondary",
+#       "last_remote_wal": 142857,
+#       "last_local_wal": 142860,
+#       "merkle_root": "abc123...",
+#       "last_remote_wal_age": 350  # milliseconds
+#     }
+#   }
+# }
+```
+
+### Disaster Recovery
+
+Vault Enterprise DR replication creates a warm standby cluster in another region. If the primary fails, you promote the DR secondary:
+
+```bash
+# On the DR secondary node
+vault operator promote
+# Promotes DR secondary to primary
+# DR secondary becomes the new primary
+# All nodes re-point to the new primary
+```
+
+During promotion:
+
+1. The DR secondary becomes the new primary.
+2. All performance secondaries re-point to the new primary.
+3. Clients update their Vault addresses to the new primary.
+4. Any secrets written to the old primary after the last replication are lost (RPO = replication lag + time to detect failure).
+
+## Performance
+
+### Vault Throughput
+
+Vault's performance is limited by several factors:
+
+| Factor               | Typical Limit              | Bottleneck                 |
+|----------------------|----------------------------|----------------------------|
+| API requests         | 1,000-5,000 req/s per node| CPU (TLS, encryption)      |
+| Encryption ops       | 10,000-50,000 ops/s       | AES-GCM (CPU, no hardware) |
+| Token creation       | 500-2,000 tokens/s        | Storage write latency      |
+| Lease expirations    | 5,000-10,000/s            | Revocation script latency  |
+| Audit logging        | 500-3,000 log entries/s   | Disk I/O (file audit)      |
+
+For high-throughput deployments:
+
+- **Use a fast storage backend**: Raft (integrated storage) with SSD provides lower latency than Consul on the same hardware.
+- **Tune the barrier**: The barrier encryption key can be pinned to a specific CPU core using `GOMAXPROCS`.
+- **Batch leases**: Renew leases in batches instead of one at a time.
+- **Disable audit logging**: Remove audit devices from the hot path (not recommended for production).
+
+```python
+# Performance tuning: batch lease renewal
+# Instead of:
+for lease_id in lease_ids:
+    client.sys.renew_lease(lease_id)
+
+# Use batch renewal (Vault Enterprise)
+client.sys.renew_lease_batch(lease_ids)
+```
+
+### KMS Rate Limits
+
+KMS rate limits affect Vault in two scenarios:
+
+1. **Startup**: Each node calls KMS once to decrypt the unseal key.
+2. **Key rotation**: When Vault rotates the barrier key, it re-encrypts all entries. This calls KMS once per entry.
+
+For a large Vault cluster, consider:
+
+```yaml
+# Vault configuration for KMS rate limit handling
+seal "awskms" {
+  region     = "us-east-1"
+  kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+  endpoint   = "https://vpce-kms.us-east-1.vpce.amazonaws.com"
+  # Use VPC endpoint to avoid internet egress and reduce latency
+}
+```
+
+### Secret Caching
+
+Clients should cache secrets to reduce load on Vault. The cache TTL should be less than the secret's lease TTL.
+
+```python
+# Secret caching in a Python application
+import time
+from functools import lru_cache
+
+class VaultCache:
+    def __init__(self, vault_client, default_ttl=300):
+        self.client = vault_client
+        self.cache = {}
+        self.default_ttl = default_ttl
+    
+    def get_secret(self, path):
+        now = time.time()
+        if path in self.cache:
+            entry = self.cache[path]
+            if entry["expires"] > now:
+                return entry["value"]
+        
+        # Cache miss — fetch from Vault
+        result = self.client.secrets.kv.v2.read_secret_version(
+            path=path,
+            mount_point="secret"
+        )
+        
+        self.cache[path] = {
+            "value": result["data"]["data"],
+            "expires": now + self.default_ttl
+        }
+        return self.cache[path]["value"]
+    
+    def invalidate(self, path):
+        self.cache.pop(path, None)
+```
+
+## Configuration
+
+Vault is configured via an HCL file. Here is a production-grade configuration with all key options.
+
+### Seal Type
+
+```hcl
+# Option 1: Shamir seal (default, manual unseal)
+# No seal block needed — Vault uses Shamir by default
+# Requires N operators to provide K shards
+
+# Option 2: AWS KMS auto-unseal
+seal "awskms" {
+  region     = "us-east-1"
+  kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+  endpoint   = "https://vpce-kms.us-east-1.vpce.amazonaws.com"
+}
+
+# Option 3: Azure Key Vault auto-unseal
+seal "azurekeyvault" {
+  tenant_id      = "abc-123-456-789"
+  vault_name     = "my-vault-kms"
+  key_name       = "vault-unseal-key"
+  environment    = "AzurePublicCloud"
+}
+
+# Option 4: GCP Cloud KMS auto-unseal
+seal "gcpckms" {
+  project     = "my-project"
+  region      = "global"
+  key_ring    = "vault-keyring"
+  crypto_key  = "vault-unseal-key"
+}
+```
+
+### Storage Backend
+
+```hcl
+# Option 1: Raft (integrated storage) — recommended for most deployments
+storage "raft" {
+  path = "/opt/vault/data"
+  node_id = "node-1"
+
+  retry_join {
+    leader_api_addr = "https://vault-1.example.com:8200"
+  }
+  retry_join {
+    leader_api_addr = "https://vault-2.example.com:8200"
+  }
+  retry_join {
+    leader_api_addr = "https://vault-3.example.com:8200"
+  }
+  
+  performance_multiplier = 5  # Raft heartbeat interval multiplier
+}
+
+# Option 2: Consul — external service discovery
+storage "consul" {
+  address     = "127.0.0.1:8500"
+  path        = "vault/"
+  service     = "vault"
+  scheme      = "https"
+  tls_ca_file = "/etc/consul/ca.pem"
+}
+
+# Option 3: File — single-node, development only
+storage "file" {
+  path = "/opt/vault/data"
+}
+```
+
+### Auth Methods
+
+```hcl
+# Enable and configure auth methods
+# Kubernetes auth
+path "auth/kubernetes" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+
+# AppRole for CI/CD
+path "auth/approle" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+
+# LDAP for humans
+path "auth/ldap" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+```
+
+### Lease TTL Configuration
+
+```hcl
+# Global lease settings
+max_lease_ttl = "768h"   # 32 days — maximum TTL for any lease
+default_lease_ttl = "24h" # 24 hours — default TTL
+
+# Per-engine lease settings (via tune)
+# vault secrets tune -max-lease-ttl=1h database/
+```
+
+### Replication Mode (Vault Enterprise)
+
+```hcl
+# Performance replication — primary
+replication {
+  performance {
+    # Primary cluster
+    primary_cluster_addr = "https://vault-primary.example.com:8201"
+  }
+}
+
+# Performance replication — secondary
+replication {
+  performance {
+    secondary_mode = "add"
+    primary_api_addr = "https://vault-primary.example.com:8200"
+    primary_token = "hvs.xxx"  # Initial token for replication setup
+  }
+}
+
+# DR replication — secondary
+replication {
+  dr {
+    secondary_mode = "add"
+    primary_api_addr = "https://vault-primary.example.com:8200"
+    primary_token = "hvs.xxx"
+  }
+}
+```
+
+### Full Listener Configuration
+
+```hcl
+listener "tcp" {
+  address       = "0.0.0.0:8200"
+  cluster_address = "0.0.0.0:8201"
+  tls_cert_file = "/etc/vault/certs/vault.crt"
+  tls_key_file  = "/etc/vault/certs/vault.key"
+  tls_client_ca_file = "/etc/vault/certs/ca.crt"
+  
+  # Performance tuning
+  max_request_size = 33554432  # 32 MB
+  max_request_duration = "90s"
+  
+  # Proxy protocol for load balancers
+  proxy_protocol_behavior = "use_always"
+  
+  # Telemetry
+  telemetry {
+    unauthenticated_metrics_access = true
+  }
+}
+```
+
+### Full Configuration Example
+
+```hcl
+# /etc/vault/config.hcl
+ui = true
+api_addr = "https://vault.example.com:8200"
+cluster_addr = "https://vault.example.com:8201"
+disable_mlock = false  # Set to true in containers
+
+# Storage
+storage "raft" {
+  path = "/opt/vault/data"
+  node_id = "node-1"
+  retry_join {
+    leader_api_addr = "https://vault-1.example.com:8200"
+  }
+  retry_join {
+    leader_api_addr = "https://vault-2.example.com:8200"
+  }
+  retry_join {
+    leader_api_addr = "https://vault-3.example.com:8200"
+  }
+}
+
+# Listener
+listener "tcp" {
+  address       = "0.0.0.0:8200"
+  cluster_address = "0.0.0.0:8201"
+  tls_cert_file = "/etc/vault/certs/vault.crt"
+  tls_key_file  = "/etc/vault/certs/vault.key"
+}
+
+# Seal
+seal "awskms" {
+  region     = "us-east-1"
+  kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/abc-123"
+}
+
+# Lease
+max_lease_ttl = "768h"
+default_lease_ttl = "24h"
+
+# Logging
+log_level = "info"
+
+# Telemetry
+telemetry {
+  prometheus_retention_time = "24h"
+  disable_hostname = true
+}
+```
+
+## Production Checklist
+
+Here is a checklist for running Vault in production:
+
+| Category          | Item                              | Why It Matters                              |
+|-------------------|-----------------------------------|---------------------------------------------|
+| High Availability | 3+ node Raft cluster              | Survives node failure                       |
+| High Availability | Active node health check          | Load balancer routes to healthy nodes       |
+| Backup            | Snapshot daily                    | Point-in-time recovery                      |
+| Backup            | Snapshot before upgrades          | Rollback capability                         |
+| Security          | Auto-unseal (KMS)                 | No manual unseal needed                     |
+| Security          | Audit logging                     | Incident response, compliance               |
+| Security          | Policy as code (GitOps)           | Reviewable, version-controlled policies     |
+| Monitoring        | Prometheus metrics                | Alert on latency, errors, lease churn       |
+| Monitoring        | Replication lag alerts            | Detect replication issues early             |
+| Capacity          | Storage capacity monitoring       | Prevent full storage (Vault goes read-only) |
+| Capacity          | Lease count monitoring            | Prevent lease exhaustion                    |
+| Networking        | KMS VPC endpoint                  | Reduce latency, avoid internet egress       |
+| Networking        | Internal load balancer            | No public Vault endpoint                    |
+
+## Common Pitfalls
+
+| Pitfall                           | Symptom                                   | Fix                                           |
+|-----------------------------------|-------------------------------------------|-----------------------------------------------|
+| Storage full                      | Vault goes read-only, writes fail         | Add storage, run compaction, increase limits  |
+| Too many leases                   | Lease creation fails, high memory usage   | Reduce TTL, increase max lease count          |
+| Clock skew > 5s                   | Token validation fails, lease timing off  | Run NTP, configure clock sync                 |
+| KMS key deleted                   | Vault cannot unseal on restart            | Restore KMS key, rotate immediately           |
+| Consul cluster unstable           | Vault read/write latency spikes           | Fix Consul, switch to Raft storage            |
+| Audit log disk full               | Vault stops processing requests           | Log rotation, separate disk for audit logs    |
+| Token policy too permissive       | Secrets exposed to unauthorized services  | Least privilege, policy review, audit checks  |
+| Static secrets never rotated      | Credentials leaked, no rotation schedule  | Migrate to dynamic secrets, set rotation TTL  |
+
+## What You Learned
+
+You now understand the full internals of secrets management:
+
+- **Barrier encryption**: The key hierarchy from master key to barrier encryption key, and how AES-256-GCM protects every storage entry.
+- **Seal/unseal**: The state machine and how Shamir's Secret Sharing or KMS auto-unseal works.
+- **Secret engines**: How KV, database, PKI, and other engines generate and manage secrets.
+- **Auth methods**: How tokens, AppRole, Kubernetes, and other methods authenticate clients.
+- **Audit logging**: How every request is logged before execution.
+- **Dynamic secrets**: The full lifecycle from generation to automatic revocation.
+- **Request lifecycle**: All 12+ stages from TLS handshake to JSON response.
+- **Consistency**: Seal quorum, replication lag, and disaster recovery.
+- **Performance**: Throughput limits, KMS rate limits, and caching strategies.
+- **Configuration**: Seal type, storage backend, auth methods, lease TTL, and replication mode.
+
+This deep understanding is essential for the next step: designing a complete secrets management architecture for a production system.

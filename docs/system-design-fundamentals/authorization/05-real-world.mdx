@@ -1,0 +1,801 @@
+---
+id: authorization-real-world
+title: Authorization in Production
+sidebar_label: Real World
+sidebar_position: 5
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Authorization in Production
+
+Theory takes you only so far. In production systems, authorization is a
+hardened, multi-layered subsystem that must balance expressiveness, latency,
+auditability, and scale. Every major platform solves the same core problem --
+"who can do what to which resource" -- but arrives at radically different
+architectures shaped by its threat model, infrastructure topology, and growth
+trajectory.
+
+This page walks you through four production authorization systems, compares the
+leading open-source policy engines, surveys cloud IAM offerings, and distills
+patterns you can apply in your own designs.
+
+---
+
+## Case Study 1: Google -- Borg ACLs and Low-Level AuthZ
+
+Google's internal infrastructure runs on Borg, its cluster-management system.
+Before any RPC reaches its target, the caller must pass through a stack of
+checks: channel-level security (mutual TLS), service-level identity, and
+resource-level access control lists (ACLs).
+
+Every Borg job declares an ACL on the objects it owns. ACLs are stored in a
+distributed, Paxos-replicated database called Chubby. When a client attempts an
+operation, the Borglet (node agent) consults the local ACL cache, which is
+invalidated via Chubby change notifications. A miss triggers a read from Chubby
+directly -- at the cost of several milliseconds and a Paxos round.
+
+<AsciiDiagram
+  id="system-design-fundamentals/authorization/borg-acl-flow"
+  alt="Diagram showing Borg ACL evaluation flow from client through Borglet to Chubby"
+  caption="Borg ACL evaluation path"
+  title="Borg ACL Evaluation Path"
+  content={`
+┌──────────┐     ┌───────────┐     ┌────────────────┐
+│  Client  │────>│  Borglet  │────>│  ACL Cache     │
+│  Process │     │  (Node    │     │  (in-memory)   │
+│          │     │   Agent)  │     │                │
+└──────────┘     └───────────┘     └───────┬────────┘
+                                          │
+                                    ┌──────▼────────┐
+                                    │  Cache Hit?   │
+                                    └──┬─────────┬──┘
+                                       │         │
+                                   Yes │         │ No
+                                       │         │
+                              ┌────────▼┐  ┌─────▼─────────┐
+                              │  Allow  │  │  Chubby       │
+                              │  /      │  │  (Paxos       │
+                              │  Deny   │  │   Replicated) │
+                              └─────────┘  └───────┬───────┘
+                                                   │
+                                             ┌─────▼──────┐
+                                             │  Update    │
+                                             │  Cache     │
+                                             └─────┬──────┘
+                                                   │
+                                             ┌─────▼──────┐
+                                             │  Evaluate  │
+                                             │  ACL Entry │
+                                             └─────┬──────┘
+                                                   │
+                                             ┌─────▼──────┐
+                                             │  Allow     │
+                                             │  / Deny    │
+                                             └────────────┘
+  `}
+/>
+
+**Key design decisions:**
+
+- **Deny by default.** Every ACL is a list of principals granted access. An
+  unlisted principal is denied. There is no "deny" entry type -- absence is
+  denial.
+- **Cache aggressively.** Borglets cache ACL results with a TTL of 30 seconds.
+  This absorbs the vast majority of reads without hitting Chubby.
+- **Audit every decision.** Each Borglet emits a structured audit log entry --
+  principal, operation, resource, decision, timestamp -- for every authorization
+  check. These logs feed downstream SIEM and anomaly-detection pipelines.
+- **Principals are not users.** ACLs reference service accounts and job IDs, not
+  human usernames. Human access goes through a separate, higher-scrutiny system.
+
+The lesson for you: **cache authorization decisions, not policies.** Google caches
+the evaluated result, not the ACL itself. This avoids re-evaluating the ACL
+every time and reduces the blast radius of a policy update (the cache TTL
+bounds how stale a decision can be).
+
+---
+
+## Case Study 2: AWS IAM -- Policy Evaluation Engine
+
+AWS Identity and Access Management (IAM) is arguably the most widely deployed
+authorization system in the world. Every AWS API call -- across 200+ services --
+passes through the IAM policy evaluation engine before reaching the target
+service.
+
+The engine evaluates up to four policy types for every request:
+
+1.  **Identity-based policies** -- attached to the principal (user, group, role).
+2.  **Resource-based policies** -- attached to the target resource (S3 bucket
+    policy, KMS key policy).
+3.  **Permissions boundaries** -- set on a role to cap its maximum permissions.
+4.  **Organizations service control policies (SCPs)** -- applied at the AWS
+    account or organizational-unit level.
+
+<AsciiDiagram
+  id="system-design-fundamentals/authorization/iam-evaluation-engine"
+  alt="Diagram of the AWS IAM policy evaluation engine processing an API request through multiple policy layers"
+  caption="AWS IAM multi-layer policy evaluation"
+  title="AWS IAM Policy Evaluation Engine"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│                        AWS IAM Engine                          │
+│                                                                 │
+│  ┌──────────────┐     ┌──────────────┐     ┌────────────────┐  │
+│  │  Incoming     │────>│  Identity    │────>│  Resource      │  │
+│  │  Request      │     │  Policies    │     │  Policies      │  │
+│  │  (Principal,  │     │  (Allow /    │     │  (Allow /      │  │
+│  │   Action,     │     │   Deny)      │     │   Deny)        │  │
+│  │   Resource)   │     └──────┬───────┘     └───────┬────────┘  │
+│  └──────────────┘            │                     │           │
+│                              │                     │           │
+│                        ┌─────▼─────────────────────▼────┐      │
+│                        │       Implicit Deny Check      │      │
+│                        │  (default-deny -- no match =   │      │
+│                        │   forbidden)                   │      │
+│                        └─────┬─────────────────────┬────┘      │
+│                              │                     │           │
+│                        ┌─────▼──────┐       ┌──────▼───────┐  │
+│                        │ SCP Limit  │       │ Permissions  │  │
+│                        │ (Org-level │       │ Boundary     │  │
+│                        │  guard)    │       │ (Role cap)   │  │
+│                        └─────┬──────┘       └──────┬───────┘  │
+│                              │                     │           │
+│                        ┌─────▼─────────────────────▼────┐      │
+│                        │     Explicit Deny Wins         │      │
+│                        │  (any Deny overrides Allow)    │      │
+│                        └───────────┬────────────────────┘      │
+│                                    │                           │
+│                              ┌─────▼──────┐                    │
+│                              │  Allow /   │                    │
+│                              │  Deny      │                    │
+│                              └────────────┘                    │
+└─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+**The evaluation rules are deceptively simple:**
+
+- An explicit `Deny` always wins. It overrides any `Allow`.
+- If no policy explicitly allows the action, the result is an implicit `Deny`.
+- An `Allow` in identity-based policy OR resource-based policy is sufficient --
+  unless blocked by an SCP or permissions boundary.
+- `NotAction`, `NotResource`, and `Condition` (with `StringEquals`, `IpAddress`,
+  `Bool`, etc.) add combinatorial complexity.
+
+**Performance considerations:**
+
+- AWS pre-computes a **policy summary** for each principal (the effective set
+  of allowed actions). This summary is cached and updated when policies change.
+- For the hot path (millions of requests per second), the engine evaluates
+  against the summary, not the raw policy document. Only when the summary is
+  ambiguous does it fall back to full policy evaluation.
+- Condition keys that reference external state (e.g., `aws:CurrentTime`,
+  `aws:SourceIp`) are evaluated lazily and can invalidate the summary cache.
+
+The lesson for you: **pre-compute effective permissions.** The policy-summary
+technique trades policy-update latency (a few seconds to rebuild) for request
+latency (sub-millisecond evaluation). This trade-off is correct when reads
+vastly outnumber writes -- which is true in nearly every authorization system.
+
+---
+
+## Case Study 3: GitHub -- Repository Permission Model
+
+GitHub authorizes tens of millions of repositories. Its model is role-based
+access control (RBAC) with a twist: roles are inherited through a hierarchy
+(organization, team, repository), and custom repository roles can be defined
+at the organization level.
+
+The core data model is a directed acyclic graph (DAG) of membership
+relationships. A user inherits permissions from every team they belong to, and
+teams inherit from parent teams. Each repository has an access-control list that
+maps a principal (user or team) to a role (read, triage, write, maintain, admin,
+or a custom role).
+
+<AsciiDiagram
+  id="system-design-fundamentals/authorization/github-permissions-dag"
+  alt="Diagram showing GitHub's DAG of organization, teams, repositories, and how permissions propagate through inheritance"
+  caption="GitHub permission inheritance DAG"
+  title="GitHub Permission Inheritance DAG"
+  content={`
+┌──────────────────┐
+│   Organization   │     (root node)
+└────────┬─────────┘
+         │
+    ┌────┴────┐
+    │         │
+    ▼         ▼
+┌─────────┐ ┌──────────┐
+│  Team   │ │  Team    │     (parent teams)
+│  Core   │ │  Docs    │
+└────┬────┘ └────┬─────┘
+     │           │
+     ├────┐      │
+     │    │      │
+     ▼    ▼      ▼
+┌─────────┐ ┌──────────┐
+│  Team   │ │  Team    │     (child teams inherit
+│  API    │ │  Writers │      permissions from parent)
+└────┬────┘ └──────────┘
+     │
+     ├──────────────────┐
+     │                  │
+     ▼                  ▼
+┌───────────┐    ┌────────────┐
+│  Repo A   │    │   Repo B   │     (repositories
+│  Role:    │    │  Role:     │      with assigned roles)
+│  Write    │    │  Admin     │
+└───────────┘    └────────────┘
+     │                  │
+     ▼                  ▼
+┌───────────┐    ┌────────────┐
+│  Member   │    │  Member    │     (users inherit
+│  Alice    │    │  Bob       │      the highest role
+└───────────┘    └────────────┘      across all paths)
+  `}
+/>
+
+**Permission resolution algorithm:**
+
+1. Collect all teams the user is a direct member of.
+2. Walk the team-parent DAG upward to collect all ancestor teams (memoized).
+3. From the collected set of principals, filter to those with a direct
+   association to the target repository.
+4. Take the maximum role across all matching associations (admin over write
+   over read).
+5. Check for any organization-wide rules (outside collaborator restrictions,
+   branch protection, required reviewers) that override the role.
+
+**Scaling challenges:**
+
+- The DAG is shallow (typically 3-4 levels), so the walk is fast. But GitHub
+  must handle burst of membership changes (e.g., a new hire added to 20 teams).
+- Every membership change invalidates the cached permission set for that user
+  across all repositories. GitHub uses an **invalidation queue** processed by
+  a background worker. During propagation, the stale cache is served with a
+  `Warning` header.
+- Custom repository roles (introduced in 2022) add a second dimension: the
+  role definition itself can change, which invalidates all cached decisions
+  that reference that role.
+
+The lesson for you: **model permissions as a DAG, and cache resolved
+permissions (not raw memberships).** GitHub's approach -- resolve the DAG to
+a flat set of (principal, role) pairs per repository -- turns every
+authorization check into a simple map lookup. This is the same pre-computation
+technique AWS uses, applied at a different granularity.
+
+---
+
+## Case Study 4: Netflix -- SPIFFE for Service-to-Service AuthZ
+
+Netflix migrated from a monolithic application to microservices over several
+years. With thousands of services communicating over the network, authorization
+could no longer rely on network boundaries or IP-based allowlists. Every service
+needed to authenticate and authorize every request from every other service.
+
+Netflix's solution builds on the SPIFFE (Secure Production Identity Framework
+for Every Process) standard. Every service instance gets a SPIFFE ID -- a URI
+like `spiffe://netflix.com/ns/production/sa/recommendation` -- attested by
+a hardware root of trust and delivered as an X.509 certificate with a short TTL.
+
+<AsciiDiagram
+  id="system-design-fundamentals/authorization/netflix-spiffe-flow"
+  alt="Sequence diagram showing SPIFFE-based authorization between a calling service and a target service with workload attestation"
+  caption="Netflix SPIFFE-based service authorization"
+  title="Netflix SPIFFE Service Authorization"
+  content={`
+┌──────────────┐        ┌──────────────┐        ┌──────────────┐
+│   Caller     │        │  Workload    │        │  Target      │
+│   Service    │        │  Identity    │        │  Service     │
+│              │        │  Provider    │        │              │
+└──────┬───────┘        └──────┬───────┘        └──────┬───────┘
+       │                       │                       │
+       │  1. Request SPIFFE    │                       │
+       │   SVID (cert)        │                       │
+       │──────────────────────>                        │
+       │                       │                       │
+       │  2. Return short-     │                       │
+       │   lived certificate   │                       │
+       │   (SPIFFE Verifiable  │                       │
+       │   Identity Document)  │                       │
+       │<──────────────────────                        │
+       │                       │                       │
+       │  3. gRPC call with    │                       │
+       │   mTLS (SPIFFE ID     │                       │
+       │   in X.509 SAN)       │                       │
+       │───────────────────────────────────────────────>
+       │                       │                       │
+       │                       │                       │
+       │                       │    4. Validate cert   │
+       │                       │     Extract SPIFFE ID │
+       │                       │     Check authZ       │
+       │                       │     policy (Permit    │
+       │                       │     or OPA)           │
+       │                       │                       │
+       │  5. Response (allow/  │                       │
+       │   deny)               │                       │
+       │<───────────────────────────────────────────────
+       │                       │                       │
+  ┌────┴────┐            ┌────┴────┐            ┌─────┴────┐
+  │ SVID    │            │ SPIRE   │            │ AuthZ    │
+  │ Cache   │            │ Server  │            │ Engine   │
+  │ (1 min) │            │ (CA)    │            │ (OPA)    │
+  └─────────┘            └─────────┘            └──────────┘
+  `}
+/>
+
+**Why SPIFFE instead of API keys:**
+
+- **Short-lived certificates (1-hour TTL).** A compromised certificate is
+  useless after expiration. No revocation list needed.
+- **Hardware-backed attestation.** The initial workload identity is attested
+  using the instance's TPM (Trusted Platform Module). Spoofing requires
+  physical hardware access.
+- **No shared secrets.** There are no API keys to rotate, leak, or manage.
+  Each service proves its identity through cryptographic attestation.
+- **Policy decoupled from identity.** SPIFFE handles authentication
+  (proving who you are). Authorization is delegated to a policy engine
+  (OPA -- Open Policy Agent) that evaluates the SPIFFE ID against the
+  resource's access policy.
+
+**Lessons from Netflix:**
+
+- Service-to-service authZ needs **identity, not just authentication**. An
+  API key authenticates a client but doesn't tell you what service it is.
+- The **control plane (identity provisioning)** and **data plane (policy
+  evaluation)** should be separate services. Netflix uses SPIRE for identity
+  and OPA for policy.
+- **Default-deny with explicit allow paths.** Every service maintains a
+  whitelist of SPIFFE IDs it accepts for each endpoint. Unknown IDs are
+  rejected.
+
+The lesson for you: **treat identity as ephemeral, not static.** Short-lived
+certificates eliminate the hardest operational problems in authorization:
+key rotation and revocation. This pattern is increasingly standard in
+cloud-native architectures.
+
+---
+
+## Case Study 5: AirBnB -- Real-Time Policy with Apache Ranger
+
+AirBnB's data platform processes petabytes of data daily across thousands of
+datasets. The authorization challenge was not "who can read this dataset" but
+"who can read this dataset under which conditions" -- temporal constraints,
+PII classification, data-warehouse tier, and query engine.
+
+AirBnB extended Apache Ranger, an open-source policy administration system, to
+create a unified authorization layer across its data lake (Hive, Presto, Spark)
+and stream-processing (Flink, Kafka) environments.
+
+<AsciiDiagram
+  id="system-design-fundamentals/authorization/airbnb-ranger-policy"
+  alt="Diagram showing how AirBnB's policy-based authorization layer sits between users and data processing engines"
+  caption="AirBnB unified data authorization with Ranger"
+  title="AirBnB Data Authorization with Ranger"
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│                  AirBnB Data Platform                        │
+│                                                              │
+│  ┌──────────┐  ┌──────────┐  ┌────────┐  ┌──────────────┐  │
+│  │  User    │  │  User    │  │  User  │  │  Service     │  │
+│  │  Alice   │  │  Bob     │  │  Carol │  │  Account     │  │
+│  └────┬─────┘  └────┬─────┘  └───┬────┘  └──────┬───────┘  │
+│       │              │            │              │          │
+│       └──────────────┼────────────┼──────────────┘          │
+│                      │            │                         │
+│                 ┌────▼────────────▼────┐                    │
+│                 │   Apache Ranger     │                    │
+│                 │   Policy Admin      │                    │
+│                 │   Server            │                    │
+│                 │   (stores policies  │                    │
+│                 │    in DB + Solr)    │                    │
+│                 └────┬────────────┬────┘                    │
+│                      │            │                         │
+│         ┌────────────┼────────────┼────────────┐            │
+│         │            │            │            │            │
+│    ┌────▼───┐  ┌─────▼────┐ ┌────▼────┐ ┌─────▼─────┐     │
+│    │ Presto │  │ Spark    │ │ Flink   │ │ Kafka     │     │
+│    │ Ranger │  │ Ranger   │ │ Ranger  │ │ Ranger    │     │
+│    │ Plugin │  │ Plugin   │ │ Plugin  │ │ Plugin    │     │
+│    └───┬────┘  └─────┬────┘ └────┬────┘ └─────┬─────┘     │
+│        │              │           │             │           │
+│        └──────────────┼───────────┼─────────────┘           │
+│                       │           │                         │
+│                  ┌────▼───────────▼────┐                    │
+│                  │   Data Lake        │                    │
+│                  │   (S3 + HDFS)      │                    │
+│                  │   Partitioned by   │                    │
+│                  │   sensitivity      │                    │
+│                  │   tier + dataset   │                    │
+│                  └────────────────────┘                    │
+└──────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+**Key innovations:**
+
+- **Attribute-based policies.** A policy can say "allow access to datasets
+  classified as PII only if the query runs on the encrypted compute cluster
+  and the user has completed PII training in the last 90 days." This is
+  RBAC plus context.
+- **Policy plugins.** Each query engine embeds a Ranger plugin that intercepts
+  every query and evaluates it against the local policy cache. Policies are
+  synced from the admin server every 5 minutes.
+- **Row-level and column-level filtering.** A user may see the `email` column
+  masked (e.g., `j***@example.com`) or excluded entirely, depending on their
+  role and the query context.
+- **Audit trail.** Every policy evaluation produces a record: user, query,
+  dataset, rows returned, decision, timestamp. These feed into AirBnB's
+  compliance and anomaly detection pipelines.
+
+The lesson for you: **data authorization is fundamentally different from
+service authorization.** In a data platform, you must enforce policies at the
+row and column level, not just the resource level. This requires the
+authorization engine to be deeply integrated with the query engine, not
+sitting as a separate gateway.
+
+---
+
+## Open Source Authorization Engines
+
+Four open-source projects lead the authorization space. Each takes a
+fundamentally different approach to policy definition, evaluation, and
+distribution.
+
+### Open Policy Agent (OPA)
+
+OPA is a general-purpose policy engine that decouples policy from application
+code. You write policies in Rego, a declarative query language purpose-built
+for expressing authorization rules.
+
+**Strengths:**
+- Policy as code -- Rego policies are testable, versionable, reviewable.
+- Sidecar or gateway deployment -- OPA can run as a sidecar (low latency)
+  or as a central service.
+- Rich context -- Rego can evaluate nested JSON structures, making it ideal
+  for attribute-based access control (ABAC).
+- Bundles -- policies and data can be packaged into bundles and distributed
+  via HTTP, minimizing policy distribution latency.
+
+**Weaknesses:**
+- Rego has a steep learning curve. Developers accustomed to imperative
+  languages struggle with its declarative, logic-programming style.
+- Performance degrades with large data sets in memory. A policy that
+  iterates over 100,000 users to find group membership will be slow.
+- No built-in model for RBAC or relationships. You must model RBAC yourself
+  in Rego.
+
+### Casbin
+
+Casbin is an authorization library (Go, Java, Node.js, Python, and others)
+rather than a service. You embed Casbin directly into your application.
+
+**Strengths:**
+- Familiar model -- Casbin uses a configuration file (model.conf) that
+  defines RBAC, ABAC, or ACL in a table-driven format. No new language
+  to learn.
+- Multi-language support -- native libraries for most major languages.
+- Performance -- in-process evaluation has almost no network overhead.
+- Built-in RBAC with role hierarchies, domain (tenant) separation, and
+  resource-scoped roles.
+
+**Weaknesses:**
+- No central policy distribution -- each application instance loads the
+  model from its local filesystem or database. You need your own mechanism
+  for policy propagation.
+- In-process means blocking your application thread during evaluation.
+  For complex ABAC rules, this can affect request latency.
+- Limited to the capabilities of the model.conf DSL. Unusual authorization
+  patterns may require custom functions.
+
+### Keycloak
+
+Keycloak is a full identity and access management (IAM) platform with
+built-in authorization services. It handles authentication (OAuth 2.0,
+OIDC, SAML) and authorization (RBAC, ABAC, user-managed access).
+
+**Strengths:**
+- All-in-one -- authentication, authorization, user management, session
+  management, and social login in a single deployment.
+- Fine-grained authorization -- resource-based permissions, scopes,
+  policies, and evaluation context.
+- Admin UI -- non-technical administrators can manage policies and roles
+  through a web interface.
+- User-managed access -- users can grant access to their resources to
+  other users (like Google Drive sharing).
+
+**Weaknesses:**
+- Heavy -- Keycloak is a Java application with a large memory footprint
+  and startup time. Overkill if you only need authorization.
+- Database dependency -- all policies and state live in a relational
+  database. This is a single point of failure and a scaling bottleneck.
+- OPA integration -- Keycloak can delegate policy evaluation to OPA,
+  which adds complexity but gives you Rego's expressiveness.
+
+### Permify
+
+Permify is a newer entrant based on Google Zanzibar -- the global
+authorization system behind Google Drive and YouTube. It uses a
+relationship-based access control (ReBAC) model: permissions are derived
+from relationships between users and objects in a directed graph.
+
+**Strengths:**
+- Zanzibar-inspired -- uses the same relationship-tuple model as Google.
+  Every permission is a tuple of (user, relation, object).
+- Horizontal scalability -- tuples are sharded across a database cluster.
+  The API is designed for shard-friendly queries.
+- Snapshot-based consistency -- reads are served from a snapshot,
+  enabling horizontal read scaling without coordination.
+- Strong consistency guarantees -- write operations are linearizable.
+  After a write, all subsequent reads will observe it.
+
+**Weaknesses:**
+- Relatively young -- the ecosystem is smaller than OPA or Casbin. Fewer
+  integrations and community resources.
+- ReBAC is not always the right model -- some authorization patterns
+  (attribute-based, context-dependent) are awkward to express as
+  relationships.
+- Database is the bottleneck -- all tuples live in a relational store
+  (PostgreSQL or CockroachDB). Performance is bounded by the database.
+
+### Tradeoff Summary
+
+<AsciiDiagram
+  id="system-design-fundamentals/authorization/oss-authz-tradeoffs"
+  alt="Four-quadrant comparison of OPA, Casbin, Keycloak, and Permify across deployment model and policy expressiveness"
+  caption="Open-source authorization engine tradeoffs"
+  title="Open-Source Authorization Tradeoffs"
+  content={`
+┌────────────────────────────────────────────────────────────────────┐
+│            Deployment Model                                        │
+│                                                                     │
+│  Service         ┌──────────────────────┐                          │
+│  (Networked)     │  OPA                 │                          │
+│                  │  ▲                   │                          │
+│                  │  │  General-purpose  │                          │
+│  Service         │  │  Rego language    │                          │
+│  (All-in-one)    │  │  Bundle delivery  │                          │
+│                  │  │                   │                          │
+│  Service         │  Keycloak            │  Permify                 │
+│  (AuthZ only)    │  ▲                   │  ▲                       │
+│                  │  │  │                   │  │                       │
+│  In-process      │  Casbin              │  (not typical)          │
+│  (Library)       │  ▲                   │                          │
+│                  │  │  RBAC-first       │                          │
+│                  │  │  Multi-language   │                          │
+│                  │  └──────────────────────┘                       │
+│                     RBAC / ACL          ABAC / ReBAC               │
+│                                         │  Relationship-based     │
+│                              Policy Expressiveness                │
+└────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+**How to choose:**
+
+| Criteria                      | Pick           |
+|-------------------------------|----------------|
+| Need a standalone authZ service | OPA or Permify |
+| Need an all-in-one IAM platform | Keycloak       |
+| Embedding into an existing app  | Casbin         |
+| Policy as code, testable        | OPA            |
+| Google Drive-style sharing      | Permify        |
+| Admin UI for non-engineers      | Keycloak       |
+| Low latency, in-process         | Casbin         |
+| Complex ABAC rules              | OPA            |
+
+---
+
+## Cloud IAM: AWS vs. GCP vs. Azure
+
+Every major cloud provider offers an IAM system. They share the same core
+model (principals, actions, resources, conditions) but differ in granularity,
+policy language, and advanced features.
+
+### AWS IAM
+
+AWS IAM is the most mature cloud IAM system, with the largest ecosystem.
+
+- **Policy language:** JSON with a well-defined schema (`Version`, `Statement`,
+  `Effect`, `Action`, `Resource`, `Condition`).
+- **Policy types:** Identity-based, resource-based, permissions boundaries,
+  service control policies (SCPs), access control lists (ACLs), and
+  session policies.
+- **Granularity:** Action-level and resource-level. Condition keys cover
+  IP address, time, multi-factor authentication (MFA) status, VPC endpoint,
+  and tags.
+- **Advanced features:** IAM Roles Anywhere (for workloads outside AWS),
+  IAM Access Analyzer (identifies public and cross-account access),
+  policy simulation (test policies without applying them).
+- **Limitations:** No native ABAC (you build it with tag-based conditions).
+  No row-level or column-level filtering (delegated to services).
+
+### GCP IAM
+
+GCP IAM is simpler than AWS but less expressive.
+
+- **Policy language:** YAML or JSON with roles (predefined, custom, basic).
+  Policies are `bindings` that map principals to roles. Conditions
+  (CEL expressions) were added in 2020.
+- **Policy types:** Organization, folder, project, and resource policies.
+  Only identity-based -- no resource-based policies in the core IAM system.
+- **Granularity:** Role-level (not action-level). A role bundles many actions.
+  GCP has 3,000+ predefined roles covering 200+ services.
+- **Advanced features:** IAM Conditions (CEL-based), deny policies
+  (introduced in 2021), workload identity federation (similar to AWS IAM
+  Roles Anywhere), policy intelligence (recommender tools that identify
+  unused or over-permissive roles).
+- **Limitations:** No explicit deny (until 2021). No resource-based policies
+  (some GCP services implement their own, like Cloud Storage bucket ACLs).
+  Role granularity can mean you grant more permissions than you need.
+
+### Azure RBAC
+
+Azure uses role-based access control as its primary authorization model,
+with Azure Policy providing governance-level guardrails.
+
+- **Policy language:** Azure RBAC uses role definitions written in JSON
+  (`Actions`, `NotActions`, `DataActions`, `AssignableScopes`). Azure
+  Policy uses a separate JSON format with `if-then` logic.
+- **Policy types:** RBAC role assignments (principal, role definition,
+  scope). Azure Policy (compliance rules that can deny, audit, or modify
+  resources at creation time).
+- **Granularity:** Action-level and scope-level (management group,
+  subscription, resource group, resource). Data actions for data-plane
+  access (like reading a blob) are separate from control-plane actions.
+- **Advanced features:** Privileged Identity Management (PIM -- just-in-time
+  role activation), Azure AD Conditional Access (context-aware access
+  policies for Azure AD resources), Azure Policy initiatives (grouped
+  policies for compliance frameworks like SOC 2, PCI DSS).
+- **Limitations:** Two separate systems (RBAC and Policy) with overlapping
+  capabilities. Complex policy interactions can be hard to debug. No native
+  ABAC (conditions require Azure AD Conditional Access, which only covers
+  Azure AD resources).
+
+### Comparison Table
+
+| Feature                     | AWS IAM                          | GCP IAM                          | Azure RBAC                        |
+|-----------------------------|----------------------------------|----------------------------------|------------------------------------|
+| Policy format               | JSON                             | YAML / JSON (bindings + roles)   | JSON (role definitions)           |
+| Deny model                  | Explicit deny overrides allow    | Explicit deny (2021+)            | Explicit deny (deny assignments)  |
+| Resource-based policies     | Yes (S3, KMS, SQS, etc.)        | No (service-specific ACLs)       | No (resource-level RBAC only)     |
+| Condition evaluation        | JSON condition blocks            | CEL (Common Expression Language) | Azure Policy conditions           |
+| Policy inheritance          | Hierarchical (org, OU, account)  | Hierarchical (org, folder, proj) | Hierarchical (MG, sub, RG, rsrc)  |
+| Granularity                 | Action + resource + condition    | Role level (bundled actions)     | Action + scope + data actions     |
+| Predefined roles            | 1,200+                            | 3,000+                            | 250+ (built-in)                   |
+| Just-in-time access         | IAM Access Analyzer + external   | No native (requires third party) | PIM (built-in, feature-rich)      |
+| Policy simulation           | Yes (IAM Simulator)              | Yes (Policy Troubleshooter)      | Yes (What If)                     |
+
+The lesson for you: **no cloud IAM is perfect.** AWS gives you the most control
+but the most complexity. GCP is simpler but less expressive. Azure has the
+strongest identity foundation (Azure AD) but two parallel authorization
+systems that create cognitive overhead. Your choice depends on your threat
+model, team expertise, and compliance requirements.
+
+---
+
+## Lessons Learned: Five Key Patterns
+
+After examining these production systems, five patterns emerge that you can
+apply to any authorization design, regardless of technology stack.
+
+### Pattern 1: Default Deny with Explicit Allow
+
+Every system we examined -- Google Borg, AWS IAM, GitHub, Netflix SPIFFE --
+uses default-deny semantics. If no policy explicitly grants access, access is
+denied. This is the single most important authorization pattern.
+
+**Why it matters:**
+- A misconfiguration (missing policy) produces a denial, not a breach.
+- New resources are secure by default. You must explicitly grant access.
+- Audit logs capture every intentional grant, making compliance review easier.
+
+**Implementation tip:** Surface the deny reason in logs and error messages.
+Without it, developers waste hours debugging "why was I denied."
+
+### Pattern 2: Pre-Compute Effective Permissions
+
+AWS computes policy summaries. GitHub resolves the DAG to flat permission sets.
+OPA distributes bundles. All of them trade policy-update latency for
+authorization-check latency.
+
+**Why it matters:**
+- Authorization checks are on the hot path of every request. They must be
+  sub-millisecond.
+- Policy evaluation (walking a DAG, evaluating Rego rules, applying SCPs)
+  is expensive. Doing it on every request would add 10-50 ms.
+- The cache-and-invalidate pattern works because policy changes are rare
+  compared to authorization checks (read-to-write ratio of 10,000:1 or more).
+
+**Implementation tip:** Use a versioned cache. Increment the version on every
+policy change. The cache key is `(principal, resource, action, version)`. This
+lets you invalidate all cached decisions atomically.
+
+### Pattern 3: Audit Everything, But Don't Block on Audit
+
+Every production system we covered logs every authorization decision. But they
+write audit logs asynchronously -- the audit record must never block the
+authorization check.
+
+**Why it matters:**
+- Audit logs are essential for incident response, compliance, and forensics.
+- Synchronous audit logging adds latency and couples your authZ system to your
+  log storage system.
+
+**Implementation tip:** Write the authorization decision to a ring buffer in
+memory. A background consumer drains the buffer to the audit store (S3, Kafka,
+BigQuery). The buffer absorbs spikes and allows batch writes.
+
+### Pattern 4: Separate Policy from Evaluation
+
+The policy definition (what the rules are) should be separate from the policy
+evaluation (applying the rules to a request). This is the architecture behind
+OPA (Rego policies evaluated by the OPA engine), Ranger (XML policies evaluated
+by plugins), and Casbin (model.conf evaluated by the Casbin library).
+
+**Why it matters:**
+- Policy changes can be reviewed, tested, and deployed independently of
+  application code.
+- The evaluation engine can be optimized independently of the policy format.
+- Multiple applications can share the same evaluation engine with different
+  policies.
+
+**Implementation tip:** Define a stable API between your policy store and your
+evaluation engine. A protobuf or JSON schema for the policy format allows the
+two to evolve independently.
+
+### Pattern 5: Use the Right Abstraction for the Problem
+
+The systems we studied use different authorization models for different
+problems:
+
+- **ACLs** (Google Borg, AWS S3) -- simple, flat resources with a small
+  number of principals. Low cognitive overhead.
+- **RBAC** (GitHub, Azure) -- large number of users, well-defined roles.
+  Roles encapsulate common permission sets.
+- **ABAC** (AWS with tags, OPA with Rego) -- complex, context-dependent
+  rules. High expressiveness, but complex to manage.
+- **ReBAC** (Permify, Google Drive) -- sharing-oriented systems where
+  permissions are derived from relationships. Natural for social and
+  collaboration apps.
+
+**Why it matters:**
+- Choosing the wrong model leads to policy complexity, performance problems,
+  or security gaps.
+- You can mix models. AWS combines RBAC (IAM roles) with ABAC (tag-based
+  conditions). GitHub combines RBAC (repository roles) with ACLs (outside
+  collaborator access).
+
+**Implementation tip:** Start with the simplest model that covers 80 percent of
+your use cases. ACL or RBAC. Only add ABAC or ReBAC when you have a concrete
+requirement that the simpler model cannot satisfy. Premature expressiveness is
+the most common cause of authorization-system failure.
+
+---
+
+## Bridging to the Interview
+
+When you design an authorization system in a system design interview, you now
+have a mental toolkit:
+
+- **Start with default-deny.** Say it explicitly: "Every request is denied
+  unless a policy explicitly allows it."
+- **Choose the right model.** Justify your choice: "For a document-sharing
+  service, I would use ReBAC because permissions derive from relationships
+  between users and documents, similar to Google Drive."
+- **Discuss caching.** "I would pre-compute effective permissions for each
+  principal and cache them with version invalidation on policy changes."
+- **Plan for audit.** "Every authorization decision is written to an
+  append-only audit log asynchronously."
+- **Acknowledge the tradeoffs.** "This system prioritizes read latency over
+  policy-update latency, which is the right tradeoff because policy changes
+  are infrequent relative to authorization checks."
+
+The best candidates do not just describe a system -- they justify every
+decision with a concrete tradeoff analysis. Now you can.
+
+---
+
+**Next:** Head to the [practice section](/docs/system-design-fundamentals/authorization/06-practice)
+to work through hands-on exercises and interview questions.

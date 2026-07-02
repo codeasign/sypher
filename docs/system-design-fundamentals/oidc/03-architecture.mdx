@@ -1,0 +1,758 @@
+---
+id: oidc-architecture
+title: OIDC at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# OIDC at Scale
+
+OpenID Connect (OIDC) is the standard authentication layer on top of OAuth 2.0. When you build at FAANG scale, every naive assumption about OIDC integration gets stress-tested by traffic volume, latency budgets, key rotation schedules, and multi-region demands. This page walks you from a fragile self-rolled integration to a production-grade architecture that handles billions of authentications per day.
+
+You should already understand the OIDC flow basics -- authorization request, token exchange, ID token validation, UserInfo. This page focuses on what changes when you operate at scale.
+
+---
+
+## The Naive Self-Rolled Approach
+
+Most teams start by wiring OIDC directly into their application code. They read a blog post, find a library, and add a few routes. This works for a prototype and breaks immediately under production load.
+
+Here is what the naive integration looks like:
+
+<AsciiDiagram
+  id="oidc/naive-self-rolled-flow"
+  title="Naive Self-Rolled OIDC Integration"
+  alt="Sequence diagram showing a browser, application, and OIDC provider with five problem areas annotated: no JWKS cache, no key rotation handling, no discovery document, hardcoded endpoints, and synchronous token validation."
+  caption="The naive flow -- every step has a hidden failure mode"
+  content={`
+                Naive Self-Rolled OIDC Integration
+
+  Browser               Your App                  OIDC Provider
+    │                      │                          │
+    │── GET /login ────────▶                          │
+    │                      │── auth request ──────────▶
+    │                      │◀─ auth response ─────────│
+    │◀─ 302 redirect ──────│                          │
+    │── GET /cb?code ──────▶                          │
+    │                      │── POST /token ──────────▶│
+    │                      │◀─ id_token + at ─────────│
+    │                      │                          │
+    │                      │── GET /.well-known ─────▶│
+    │                      │   (every startup!)       │
+    │                      │◀─ discovery doc ─────────│
+    │                      │                          │
+    │                      │── GET /jwks ────────────▶│
+    │                      │   (every validation!)    │
+    │                      │◀─ JWKS response ─────────│
+    │                      │                          │
+    │                      │  verify id_token sig     │
+    │                      │  (sync, blocking)        │
+    │                      │                          │
+    │◀── session cookie ───│                          │
+    │                      │                          │
+
+  ╔══════════════════════════════════════════════════════╗
+  ║  Five Failure Modes Built In                        ║
+  ║                                                      ║
+  ║  1. No discovery document caching                   ║
+  ║     -- Fetches /.well-known/openid-configuration     ║
+  ║        on every startup or even every request        ║
+  ║                                                      ║
+  ║  2. No JWKS caching                                 ║
+  ║     -- Fetches signing keys on every validation      ║
+  ║        Adds 50-200ms to every auth check             ║
+  ║                                                      ║
+  ║  3. No key rotation handling                         ║
+  ║     -- When the provider rotates keys, your cache    ║
+  ║        has the old key. Validation fails for all     ║
+  ║        new tokens. Hard outage.                      ║
+  ║                                                      ║
+  ║  4. Hardcoded endpoint URLs                          ║
+  ║     -- Provider migration or endpoint change         ║
+  ║        requires a code deploy to fix.                ║
+  ║                                                      ║
+  ║  5. Synchronous validation in request path           ║
+  ║     -- Every HTTP request blocks on token validation ║
+  ║        Thread pool exhaustion under load.            ║
+  ╚══════════════════════════════════════════════════════╝
+  `}
+/>
+
+Each of these five problems is a P0 incident waiting to happen. Let you examine them one by one.
+
+### 1. No Discovery Document Caching
+
+The OpenID Connect Discovery endpoint (`.well-known/openid-configuration`) tells you everything about the provider: authorization endpoint, token endpoint, JWKS URI, supported algorithms, scopes, claims, and more. In the naive integration, you fetch this on every application startup -- or worse, on every auth request.
+
+At a few hundred requests per second, this creates a thundering herd against the provider's discovery endpoint. The provider may rate-limit you. More importantly, if the discovery fetch fails during startup, your application refuses to start at all. You have created a hard dependency on an external endpoint for your application's lifecycle.
+
+**Fix:** Fetch the discovery document on a background thread at startup. Cache it in memory with a TTL of 24-48 hours. Use a stale-while-revalidate pattern: serve the cached document immediately while fetching a fresh copy in the background. Only block startup if you have never successfully fetched a discovery document.
+
+### 2. No JWKS Caching
+
+Every OIDC token validation requires fetching the provider's public signing keys from the JWKS endpoint. In the naive integration, you fetch these keys on every token validation. At 10,000 requests per second, that is 10,000 HTTP calls to the JWKS endpoint per second.
+
+No provider can sustain that volume. They will rate-limit you, and your token validation latency will climb from microseconds to hundreds of milliseconds. Your application's throughput collapses.
+
+**Fix:** Cache the JWKS set in memory or in Redis. Set the cache TTL based on the `Cache-Control` header from the JWKS response or a conservative default (4-6 hours). Look up keys by the `kid` (key ID) in the JWT header. When a `kid` is not found in the cache, fetch the JWKS endpoint immediately -- this handles key rotation without waiting for the next cache refresh.
+
+### 3. No Key Rotation Handling
+
+OIDC providers rotate signing keys on a regular schedule -- every 24 hours for some, every 6 hours for highly security-conscious providers. When the provider issues a new key, it starts signing new ID tokens with that key. If your JWKS cache still holds only the old key, every token validation fails.
+
+This is the most common OIDC production incident. Someone rotates keys, and authentication breaks globally until the cache expires.
+
+**Fix:** Always check the `kid` header in the JWT before looking up the key. If the `kid` is not in your cache, fetch the JWKS endpoint immediately. This handles rotation gracefully -- you pay one extra HTTP call when a new key appears, but validation continues uninterrupted. Also subscribe to the provider's key rotation webhook or change notification if one exists.
+
+### 4. Hardcoded Endpoint URLs
+
+Hardcoding the authorization endpoint, token endpoint, and JWKS URI into your application configuration creates a tight coupling to a specific provider deployment. If the provider changes URLs during an infrastructure migration, your application breaks. There is no graceful degradation -- you must redeploy.
+
+**Fix:** Always use the discovery document to resolve endpoints dynamically. Store only the issuer URL in configuration. Everything else comes from discovery at runtime. This lets the provider change endpoints without requiring your application to redeploy.
+
+### 5. Synchronous Validation in Request Path
+
+Validating a JWT requires base64-decoding the token, parsing the header, looking up the key by `kid`, and verifying the RSA or ECDSA signature. This is CPU-bound work. When you do it synchronously in the request-handling thread, every HTTP request contends for CPU with every other request.
+
+Under load, your thread pool fills with threads doing cryptographic work. Request latency spikes. Throughput drops. You have effectively DDoS'd yourself.
+
+**Fix:** Offload token validation to a background thread pool or use an async validation library. For applications with extreme throughput, consider validating tokens in a middleware layer that runs on a dedicated thread pool, separate from your application logic. Or use a sidecar process for token validation so the application process never blocks on crypto.
+
+### The Real Cost of the Naive Approach
+
+What happens when these five failures compound in production? Consider a real scenario: a major e-commerce platform that skipped JWKS caching and key rotation handling. The OIDC provider rotated keys at 2:00 AM UTC. By 2:01 AM, every new token validation failed. All users who logged in after the rotation received a 401 on their next API call. By 2:05 AM, the platform's login rate dropped to zero. New users could not register. Existing users whose sessions expired were locked out. The incident lasted until the on-call engineer manually flushed the JWKS cache and restarted the application servers -- 47 minutes of total authentication outage.
+
+The cost: an estimated 1.2 million lost login attempts, 340,000 abandoned sessions, and a cascading impact on revenue from users who could not complete purchases.
+
+This is why you must treat OIDC integration as a critical infrastructure component, not a library you add to your `package.json` and forget about.
+
+### The Production Baseline
+
+Here is the minimum viable production integration that avoids all five failure modes:
+
+1. On startup, spawn a background goroutine that fetches the discovery document. Cache it in memory. The application starts serving traffic immediately with the cached document. If no cached document exists, block startup after a 5-second timeout and log a fatal error.
+2. Maintain an in-memory map of JWKS keys indexed by `kid`. On each token validation, look up the key by `kid`. If the key is missing, fetch the full JWKS set synchronously, cache it, and retry the validation.
+3. Set the JWKS cache TTL based on the `Cache-Control` header from the provider's JWKS response. If no header is present, default to 4 hours. Before the TTL expires, refresh the cache in the background.
+4. Store only the issuer URL in configuration. Resolve all endpoints from the discovery document at runtime.
+5. Validate tokens in a dedicated thread pool with a bounded queue. If the queue is full, return a 503 to the client instead of blocking the request thread.
+
+This baseline handles 99% of the failure modes that plague naive OIDC integrations. The next section shows you what the provider itself looks like at scale.
+
+---
+
+## Production OIDC Provider Architecture
+
+When you are building an OIDC provider -- or choosing one to run at scale -- the provider's internal architecture determines your application's reliability. Here is what a production-grade OIDC provider looks like internally:
+
+<AsciiDiagram
+  id="oidc/provider-architecture-internal"
+  title="Production OIDC Provider Internal Architecture"
+  alt="Large architecture diagram of an OIDC provider showing CDN layer, load balancers, multiple service endpoints (discovery, auth, token, JWKS, UserInfo, session, consent), a key management service with active and standby signing keys, a distributed cache layer for sessions and JWKS, and persistent storage for user records, client registrations, and auth codes."
+  caption="Internal architecture of a production OIDC provider handling millions of requests per second"
+  content={`
+         ┌───────────────── OIDC Provider ──────────────────────────────┐
+         │                                                               │
+         │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────┐    │
+         │  │   CDN       │  │  External LB │  │  Internal LB     │    │
+         │  │  (static    │  │  (TLS term,  │  │  (service mesh)  │    │
+         │  │   configs)  │  │   rate-limit)│  │                  │    │
+         │  └──────┬──────┘  └──────┬───────┘  └────────┬─────────┘    │
+         │         │                │                     │             │
+         │  ┌──────┴──────┐  ┌──────┴───────┐  ┌────────┴─────────┐   │
+         │  │  Discovery  │  │   Auth       │  │   Token          │   │
+         │  │  Endpoint   │  │   Endpoint   │  │   Endpoint       │   │
+         │  │  (static)   │  │   (consent,  │  │   (code exchange,│   │
+         │  │             │  │    login)    │  │    refresh,      │   │
+         │  │             │  │              │  │    client creds) │   │
+         │  └─────────────┘  └──────┬───────┘  └────────┬─────────┘   │
+         │                           │                     │           │
+         │  ┌─────────────┐  ┌──────┴───────┐  ┌────────┴─────────┐   │
+         │  │  UserInfo   │  │  Session     │  │   JWKS           │   │
+         │  │  Endpoint   │  │  Service     │  │   Endpoint       │   │
+         │  │  (claims    │  │  (SSO        │  │   (public keys,  │   │
+         │  │   assembly) │  │   sessions)  │  │    rotated on    │   │
+         │  │             │  │              │  │    schedule)     │   │
+         │  └─────────────┘  └──────────────┘  └──────────────────┘   │
+         │                                                               │
+         │  ┌─────────────────────────────────────────────────────────┐ │
+         │  │             Key Management Service (KMS)                │ │
+         │  │  ┌────────────┐  ┌────────────┐  ┌──────────────────┐  │ │
+         │  │  │ Active Key │  │ Standby    │  │ Retired Key      │  │ │
+         │  │  │ (signs new │  │ Key (not   │  │ (validate only,  │  │ │
+         │  │  │  tokens)   │  │  signing)  │  │  will be deleted)│  │ │
+         │  │  └────────────┘  └────────────┘  └──────────────────┘  │ │
+         │  │  Rotation: overlap period where both active and         │ │
+         │  │  retired keys are available for validation.             │ │
+         │  └─────────────────────────────────────────────────────────┘ │
+         │                                                               │
+         │  ┌─────────────────────────────────────────────────────────┐ │
+         │  │            Distributed Cache Layer                       │ │
+         │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │ │
+         │  │  │ Auth Code    │  │ Session      │  │ Rate Limit   │  │ │
+         │  │  │ Store (TTL)  │  │ Tokens (TTL) │  │ Counters     │  │ │
+         │  │  └──────────────┘  └──────────────┘  └──────────────┘  │ │
+         │  │  ┌──────────────┐  ┌──────────────┐                   │ │
+         │  │  │ JWKS Cache   │  │ Client Meta  │                   │ │
+         │  │  │ (local to    │  │ (allowed     │                   │ │
+         │  │  │  each node)  │  │  redirects)  │                   │ │
+         │  │  └──────────────┘  └──────────────┘                   │ │
+         │  └─────────────────────────────────────────────────────────┘ │
+         │                                                               │
+         │  ┌─────────────────────────────────────────────────────────┐ │
+         │  │            Persistent Storage (SQL + NoSQL)              │ │
+         │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │ │
+         │  │  │ User Store   │  │ Client Reg   │  │ Audit Log    │  │ │
+         │  │  │ (profiles,   │  │ (client_id,  │  │ (token       │  │ │
+         │  │  │  claims)     │  │  secrets,    │  │  issuance,   │  │ │
+         │  │  │              │  │  scopes)     │  │  consent)    │  │ │
+         │  │  └──────────────┘  └──────────────┘  └──────────────┘  │ │
+         │  └─────────────────────────────────────────────────────────┘ │
+         └─────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Key Architectural Decisions
+
+**Discovery endpoint is static.** The discovery document (`/.well-known/openid-configuration`) should be served from a CDN or a static file server. It rarely changes -- only when the provider adds or removes endpoints. Serving it from the CDN avoids putting load on your provider infrastructure for what is essentially configuration data.
+
+**Token endpoint is the bottleneck.** The token endpoint handles authorization code exchange, refresh token grant, and client credentials grant. Each request requires cryptographic signing of the ID token and access token. This is CPU-intensive work. The token endpoint is horizontally scaled behind an internal load balancer, and each instance caches its own signing key locally for performance.
+
+**JWKS endpoint serves multiple keys.** At any given time, a production provider exposes at least three keys: the active signing key, the standby key (next in rotation), and the most recently retired key (allows validation of tokens issued before the last rotation). The JWKS endpoint response is cached aggressively by CDNs and by Relying Parties.
+
+**Session service is stateful.** The session service maintains SSO sessions for users who checked "remember this browser." It is stateful and requires a distributed cache with replication across regions. Session data includes the user's authentication timestamp, the set of consented scopes, and the SSO session identifier.
+
+**UserInfo is a read path.** The UserInfo endpoint assembles claims from the user store and returns them as a JSON response. This endpoint is read-heavy and can be scaled independently from the authentication endpoints. Use database read replicas and cache frequently accessed claims.
+
+### Authentication Flow Through the Provider
+
+Understanding the full path of an authentication request through the provider helps you debug issues and size capacity correctly. Here is the end-to-end flow:
+
+1. **User initiates login** at the Relying Party, which redirects to the provider's authorization endpoint.
+2. **Authorization endpoint** receives the request, validates the `client_id`, `redirect_uri`, `scope`, and `response_type`. It stores the PKCE code challenge if present. It creates an auth session and sets an SSO session cookie in the user's browser.
+3. **User authenticates** at the provider's login page, either by entering credentials or using an existing SSO session. The authentication service validates the credentials against the user store and records the authentication event in the session.
+4. **Consent service** checks whether the user has previously consented to the requested scopes for this client. If not, the user sees a consent page. Consent records are cached in Redis to avoid database reads on repeat authentications.
+5. **Authorization code generation** creates a one-time-use code, associates it with the session and PKCE challenge, and stores it in the distributed cache with a 5-minute TTL.
+6. **Redirect back** to the Relying Party with the authorization code in the query string.
+7. **Token exchange** begins when the Relying Party sends the authorization code and PKCE verifier to the token endpoint. The token endpoint validates the code verifier, looks up the auth session, generates the ID token (signed with the active KMS key), generates the access token, and optionally generates a refresh token.
+8. **Response delivery:** The provider returns the tokens to the Relying Party as a JSON response.
+
+Each step in this flow has its own latency budget, scaling strategy, and failure mode. The authorization endpoint and consent service are read-heavy with cache-friendly workloads. The token endpoint is CPU-bound due to cryptographic signing.
+
+### Key Rotation Lifecycle
+
+Key rotation is the most critical operational process in an OIDC provider. Here is the lifecycle you must follow:
+
+1. **Pre-rotation:** The KMS generates a new signing key pair. The new key is added to the JWKS endpoint but is not yet used for signing. This lets Relying Parties prefetch the key and warm their caches.
+2. **Rotation:** The KMS marks the new key as active. All new tokens are signed with this key. The previously active key becomes the standby. The standby key from the previous rotation becomes retired.
+3. **Post-rotation:** The retired key remains in the JWKS response for a grace period (typically 6-24 hours). During this period, tokens signed with the retired key are still valid. After the grace period, the retired key is removed from the JWKS endpoint.
+4. **Cache invalidation:** The provider sends a cache invalidation signal to its CDN for the JWKS endpoint. Relying Parties should detect the new `kid` in incoming tokens and refresh their caches if needed.
+
+The grace period is essential. Without it, every token issued in the last rotation cycle becomes invalid the moment the key rotates. Users whose tokens were issued 23 hours ago would be force-logged out.
+
+---
+
+## RP Integration Patterns
+
+You integrate with an OIDC provider from four distinct client types. Each has different security properties, different token storage strategies, and different failure modes. Here is how you handle each one at scale.
+
+<AsciiDiagram
+  id="oidc/integration-web-mobile"
+  title="Web and Mobile OIDC Integration Patterns"
+  alt="Two-panel diagram showing web application integration using authorization code flow with PKCE, server-side session store, and httpOnly cookies; and mobile app integration using AppAuth pattern with system browser, proof key for code exchange, and secure enclave for token storage."
+  caption="Web and mobile OIDC integration patterns -- each optimizes for a different threat model"
+  content={`
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │                   OIDC Integration Patterns                         │
+    ├──────────────────────────────────┬──────────────────────────────────┤
+    │      Web Application            │      Mobile Application          │
+    │      (Authorization Code + PKCE)│      (AppAuth Pattern)           │
+    │                                  │                                  │
+    │  Browser       Web Server        │  App         System Browser     │
+    │    │               │             │    │              │              │
+    │    │── Login ─────▶│             │    │── Login ────▶│              │
+    │    │               │── Auth Req ─│    │              │── Auth Req ─│
+    │    │               │    to IdP   │    │              │    to IdP   │
+    │    │◀─ Redirect ──│             │    │◀─ Redirect ──│              │
+    │    │               │             │    │              │              │
+    │    │── Auth Code ─▶│             │    │── Auth Code ─│              │
+    │    │   + PKCE ver  │             │    │   + PKCE ver │              │
+    │    │               │── Token Req │    │              │── Token Req │
+    │    │               │    to IdP   │    │              │    to IdP   │
+    │    │               │◀─ Tokens ──│    │              │◀─ Tokens ──│
+    │    │               │             │    │    (via      │              │
+    │    │◀─ httpOnly ───│             │    │     custom   │              │
+    │    │   cookie      │             │    │     scheme)  │              │
+    │    │               │             │    │              │              │
+    │  ┌─ Security ────┐ │             │  ┌─ Security ────┐              │
+    │  │ Tokens in     │ │             │  │ Tokens in    │              │
+    │  │ server session│ │             │  │ Keychain/    │              │
+    │  │ + httpOnly    │ │             │  │ Secure       │              │
+    │  │ cookie        │ │             │  │ Enclave      │              │
+    │  └───────────────┘ │             │  └───────────────┘              │
+    ├──────────────────────────────────┼──────────────────────────────────┤
+    │  Key details:                    │  Key details:                    │
+    │  ● PKCE verifier in session      │  ● PKCE verifier in memory       │
+    │  ● Server makes token req        │  ● AppAuth library handles flow  │
+    │  ● ID token validated server-side│  ● Token response via custom     │
+    │  ● Session cookie, httpOnly      │    URL scheme or universal link  │
+    │  ● CSRF token in login form      │  ● Biometric lock on token store │
+    │  ● Refresh rotated server-side   │  ● Refresh token in keychain     │
+    └──────────────────────────────────┴──────────────────────────────────┘
+  `}
+/>
+
+<AsciiDiagram
+  id="oidc/integration-spa-server"
+  title="SPA and Server-to-Server OIDC Integration Patterns"
+  alt="Two-panel diagram showing SPA integration using authorization code flow with PKCE via the BFF (Backend for Frontend) pattern, and server-to-server integration using client credentials grant with token cache and managed identity."
+  caption="SPA and server-to-server OIDC patterns -- SPAs use BFF for token safety, servers use client credentials for automation"
+  content={`
+    ┌──────────────────────────────────┬──────────────────────────────────┐
+    │  Single Page Application         │  Server-to-Server               │
+    │  (Auth Code + PKCE via BFF)      │  (Client Credentials Grant)     │
+    │                                  │                                  │
+    │  Browser        BFF      IdP     │  Service A    IdP    Service B  │
+    │    │            │        │       │    │          │        │        │
+    │    │── Login ──▶│        │       │    │── Token  │        │        │
+    │    │            │── Auth │       │    │   Req    │        │        │
+    │    │            │   Req ─│       │    │──────────▶│        │        │
+    │    │◀─ Redirect │        │       │    │◀── Token ─│        │        │
+    │    │            │        │       │    │──────────▶│        │        │
+    │    │── Auth     │        │       │    │   (cache  │        │        │
+    │    │   Code ───▶│        │       │    │    token) │        │        │
+    │    │            │── Token│       │    │    │      │        │        │
+    │    │            │   Req ─│       │    │  ┌─ Security ──┐  │        │
+    │    │            │◀─ Tok  │       │    │  │ Token in   │  │        │
+    │    │            │   ----│       │    │  │ in-memory  │  │        │
+    │    │◀─ session  │        │       │    │  │ cache with │  │        │
+    │    │   cookie   │        │       │    │  │ TTL based  │  │        │
+    │    │            │        │       │    │  │ on exp     │  │        │
+    │    │            │        │       │    │  └────────────┘  │        │
+    │    │            │        │       │    │                  │        │
+    │  ┌─ Security ─┐│        │       │  ┌─ Security ────┐   │        │
+    │  │ No tokens  ││        │       │  │ Use managed  │   │        │
+    │  │ in browser ││        │       │  │ identity or  │   │        │
+    │  │ Tokens on  ││        │       │  │ client creds │   │        │
+    │  │ BFF only   ││        │       │  │ Rotate secret│   │        │
+    │  └────────────┘│        │       │  └──────────────┘   │        │
+    ├────────────────┼────────┤       ├─────────────────────┼────────┤
+    │  Key details:  │        │       │  Key details:       │        │
+    │  ● BFF owns    │        │       │  ● No user context  │        │
+    │    the tokens  │        │       │  ● Token acts as    │        │
+    │  ● SPA gets    │        │       │    service identity │        │
+    │    httpOnly    │        │       │  ● Cache until      │        │
+    │    cookie      │        │       │    near-expiry      │        │
+    │  ● Refresh     │        │       │  ● Use mTLS or     │        │
+    │    invisible   │        │       │    managed identity │        │
+    │    to SPA      │        │       │    when possible    │        │
+    └────────────────┴────────┘       └─────────────────────┴────────┘
+  `}
+/>
+
+### Web Applications (Server-Side Rendered)
+
+For traditional web applications with a server-side backend, use the authorization code flow with PKCE. This is the most secure pattern for server-rendered apps.
+
+Your server initiates the auth request, generates a PKCE code verifier and challenge, and stores both in the user's session before redirecting to the provider. When the user returns with the authorization code, your server exchanges it for tokens using the code verifier. The ID token and access token are stored server-side. The browser receives only an httpOnly session cookie.
+
+**Token storage strategy:** The ID token and access token are stored in the server-side session store. The session ID is the only thing sent to the browser as an httpOnly, Secure, SameSite=Lax cookie. On every subsequent request, the server reads the session, retrieves the tokens, validates the access token (or uses it to call downstream APIs), and serves the response.
+
+**Token refresh strategy:** Before the access token expires, the server uses the refresh token to obtain a new access token. The refresh happens transparently -- the user sees no interruption. The refresh token itself is rotated on each use (if the provider supports refresh token rotation), limiting the blast radius of a leaked refresh token.
+
+**At scale, watch for:** Session store capacity. Each in-flight auth request holds a session with the PKCE verifier. If your session store is disk-backed or database-backed, this creates write amplification under high login volume. Use an in-memory session store (Redis) with a short TTL equal to the auth code expiry (typically 5 minutes). Also watch for session churn during flash sales when login rates spike 100x in seconds. Pre-warm session capacity and use connection pooling for your Redis cluster.
+
+### Mobile Applications
+
+Mobile apps integrate with OIDC through the system browser -- never through an embedded WebView. The AppAuth pattern (RFC 8252) is the standard. The app opens the system browser, the user authenticates there, and the provider redirects back to the app via a custom URL scheme or universal link.
+
+The critical difference from web apps: on mobile, the app receives the token response directly. You must store tokens securely. Use the platform's secure keychain (iOS Keychain, Android Keystore). Always use PKCE -- mobile apps cannot keep a client secret confidential because the app binary can be decompiled.
+
+**Token storage strategy:** On iOS, store tokens using the Keychain with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` to prevent backup to iCloud. On Android, use the EncryptedSharedPreferences backed by the Android Keystore. Encrypt the refresh token separately from the access token -- the access token is short-lived and less sensitive, but the refresh token is long-lived and must be protected at the highest level.
+
+**Token refresh strategy:** Use the refresh token to obtain a new access token before the current one expires. The refresh should happen in the background, triggered at 80% of the access token's TTL. If the refresh fails due to a network error, retry with exponential backoff. If the refresh fails due to an invalid refresh token (revoked or expired), log the user out and force re-authentication.
+
+**App lifecycle considerations:** When the app is backgrounded, the system may terminate it. On relaunch, the app must restore tokens from the secure keychain and validate them. If the tokens have expired, the app must use the refresh token to obtain new ones before the user can interact with the app. This cold-start token validation should complete in under 200ms to avoid a noticeable delay on app launch.
+
+**At scale, watch for:** Universal link configuration. If your universal links fail, the auth response is lost and the user sees a blank browser tab. Test universal link registration with every app release. Monitor universal link resolution in your observability pipeline. Also watch for keychain corruption on iOS -- a bug in iOS 16 caused occasional keychain item loss, forcing users to re-authenticate. Implement a backup auth mechanism (e.g., a secondary refresh token stored in a different keychain category) for resilience.
+
+### Single Page Applications
+
+SPAs are the most challenging OIDC integration because the browser environment is inherently untrusted. You cannot keep secrets in the browser. The authorization code flow with PKCE is the only acceptable pattern. The implicit flow (returning tokens in the URL fragment) is deprecated and insecure.
+
+The recommended architecture is the Backend for Frontend (BFF) pattern. Your SPA communicates with a lightweight backend that owns the OIDC tokens. The BFF handles the authorization code exchange, stores tokens server-side, and issues an httpOnly session cookie to the SPA. The SPA never sees the tokens.
+
+**BFF deployment considerations:** The BFF must be deployed as a separate service or a sidecar, not embedded in the SPA's static files. It should be stateless from the BFF's perspective -- session state is stored in Redis, not in the BFF process. This allows the BFF to scale horizontally without session affinity. Each BFF instance shares the same Redis cluster for session storage.
+
+**BFF token refresh flow:** The BFF owns the refresh token and uses it to obtain new access tokens before they expire. The SPA only sees the httpOnly session cookie. When the access token expires, the BFF silently refreshes it using the refresh token stored in the session. The SPA experiences zero interruption. If the refresh token has also expired, the BFF returns a 401 to the SPA, which triggers a full re-authentication redirect.
+
+If you cannot use a BFF, use the authorization code flow with PKCE directly from the browser. Use the `openid` scope and request the `code` response type. The provider redirects back to your SPA with an authorization code. Your SPA exchanges the code for tokens via a fetch to the provider's token endpoint. Store tokens in memory only -- never in localStorage.
+
+**Browser-based token storage (no BFF fallback):** When storing tokens in the browser without a BFF, use a JavaScript closure or a module-scoped variable. Never use localStorage, sessionStorage, or IndexedDB -- these are all accessible to any JavaScript running on the same origin. An XSS vulnerability compromises all stored tokens. In-memory storage is the only safe option, but it means the user must re-authenticate on every page refresh because the tokens are lost when the JavaScript context is destroyed.
+
+**At scale, watch for:** Silent authentication failures. SPAs often use iframe-based silent auth (`prompt=none`) to refresh sessions without user interaction. Third-party cookie blocking by browsers breaks this pattern. Use the BFF pattern with a refresh token rotation strategy instead. Also watch for the SPA's bundle size -- OIDC client libraries can add 50-100 KB to the JavaScript bundle. Tree-shake unused flows and consider lazy-loading the OIDC module on the login route only.
+
+### Server-to-Server
+
+For service-to-service communication, use the client credentials grant. This grant type requires no user interaction -- the service authenticates with its own `client_id` and `client_secret` and receives an access token that represents the service itself.
+
+The token is cached in memory with a TTL slightly shorter than the token's `exp` claim. Use a background thread to refresh the token before it expires so the request path never blocks on a token fetch.
+
+**Token caching strategy for services:** Unlike user-facing tokens, service tokens benefit from aggressive caching across service instances. Use a shared cache (Redis) so all instances of a service use the same token. This reduces the number of token requests to the provider. The cache key is the client ID. Set the cache TTL to the access token's `exp` minus 5 minutes. The background refresh goroutine wakes up 5 minutes before the current token expires, fetches a new one, and updates the cache.
+
+**Managed identity integration:** In cloud environments (AWS, GCP, Azure), use managed identities instead of static client secrets. A managed identity automatically rotates the credential and eliminates the need for secret management. The service obtains a token by calling the cloud provider's instance metadata service -- no `client_id` or `client_secret` is stored anywhere. This is the most secure approach for server-to-server OIDC at scale.
+
+**At scale, watch for:** Client secret rotation. Every service has a client secret that must be rotated regularly. Use a secrets manager (HashiCorp Vault, AWS Secrets Manager) and subscribe to rotation events. When the secret rotates, the service must re-authenticate with the new secret. Build your service's OIDC integration to detect 401 responses from the provider and retry with the new secret from the secrets manager. Also watch for token propagation latency -- when a new access token is issued, it takes time for all service instances to acquire and cache it. During this window, some instances may use an expired token. Implement a retry with backoff in the service's HTTP client to handle this gracefully.
+
+---
+
+## Multi-Region Provider Topology
+
+When your users are distributed across the globe, a single-region OIDC provider creates unacceptable latency and availability risk. Every auth request must traverse a continent. A regional outage takes down authentication for everyone.
+
+Here is the multi-region topology you need:
+
+<AsciiDiagram
+  id="oidc/multi-region-topology"
+  title="Multi-Region OIDC Provider Topology"
+  alt="Three-region OIDC provider topology showing US East, US West, and EU West regions each with their own provider instance, local cache, and read replica of the user store; a centralized global KMS distributes signing keys to all regions; traffic is routed to the nearest region via global load balancer."
+  caption="Multi-region OIDC topology -- each region is self-sufficient for reads, with a centralized key management layer"
+  content={`
+                  Global Load Balancer (DNS-based anycast)
+                           │            │
+                 ┌─────────┴────────────┴─────────┐
+                 │           │            │        │
+                 ▼           ▼            ▼        ▼
+         ┌────────────┐ ┌────────────┐ ┌────────────┐
+         │  US East   │ │  US West   │ │  EU West   │
+         │  Region    │ │  Region    │ │  Region    │
+         └──────┬─────┘ └──────┬─────┘ └──────┬─────┘
+                │              │              │
+         ┌──────┴─────┐ ┌──────┴─────┐ ┌──────┴─────┐
+         │ Provider   │ │ Provider   │ │ Provider   │
+         │ Instance   │ │ Instance   │ │ Instance   │
+         │            │ │            │ │            │
+         │ ┌────────┐ │ │ ┌────────┐ │ │ ┌────────┐ │
+         │ │ Local  │ │ │ │ Local  │ │ │ │ Local  │ │
+         │ │ Cache  │ │ │ │ Cache  │ │ │ │ Cache  │ │
+         │ │(JWKS,  │ │ │ │(JWKS,  │ │ │ │(JWKS,  │ │
+         │ │ tokens)│ │ │ │ tokens)│ │ │ │ tokens)│ │
+         │ └────────┘ │ │ └────────┘ │ │ └────────┘ │
+         │            │ │            │ │            │
+         │ ┌────────┐ │ │ ┌────────┐ │ │ ┌────────┐ │
+         │ │ Read   │ │ │ │ Read   │ │ │ │ Read   │ │
+         │ │Replica │ │ │ │Replica │ │ │ │Replica │ │
+         │ │(user   │ │ │ │(user   │ │ │ │(user   │ │
+         │ │ store) │ │ │ │ store) │ │ │ │ store) │ │
+         │ └────────┘ │ │ └────────┘ │ │ └────────┘ │
+         └──────┬─────┘ └──────┬─────┘ └──────┬─────┘
+                │              │              │
+                └──────────────┼──────────────┘
+                               │
+                    ┌──────────┴──────────┐
+                    │   Global KMS        │
+                    │                     │
+                    │  ┌───────────────┐  │
+                    │  │  Active Key   │  │
+                    │  │  (distributed │  │
+                    │  │   to all      │  │
+                    │  │   regions)    │  │
+                    │  └───────────────┘  │
+                    │  ┌───────────────┐  │
+                    │  │  Standby Key  │  │
+                    │  └───────────────┘  │
+                    │  ┌───────────────┐  │
+                    │  │  Write Master │  │
+                    │  │  (user store) │  │
+                    │  └───────────────┘  │
+                    └────────────────────┘
+  `}
+/>
+
+### Active-Active vs Active-Passive
+
+For global OIDC at FAANG scale, use an **active-active** topology. Every region serves auth requests independently. Each region has:
+
+- A full OIDC provider instance (auth, token, JWKS, UserInfo endpoints)
+- A local cache layer (Redis or Memcached) for sessions and tokens
+- A read replica of the user store (asynchronous replication from the write master)
+- The current signing key, distributed from the global KMS
+
+The global load balancer routes users to the nearest region based on DNS anycast or GeoDNS. Within a region, traffic is balanced across multiple provider instances.
+
+### Key Distribution Strategy
+
+Signing keys are the most sensitive asset in your OIDC infrastructure. Distribution must balance availability against security:
+
+- **Centralized generation:** Keys are generated in a single region by the global KMS. The KMS holds the root of trust -- it governs key generation, rotation, and destruction.
+- **Regional distribution:** When a new key is generated, the KMS distributes it to all regions asynchronously. Each region receives the private key material and stores it in a hardware security module (HSM) or a key management service within that region.
+- **Grace period for key rotation:** When the KMS rotates keys, it signals all regions simultaneously. Each region transitions to the new key within a configurable grace period (typically 5-15 minutes). During this window, both old and new keys are accepted for signing.
+- **Offline fallback:** If a region loses connectivity to the global KMS, it continues operating with the last known key set. Token issuance continues. Validation uses the cached keys. When connectivity is restored, the region syncs the current key set from the KMS.
+
+### Regional Failover Scenarios
+
+Even with an active-active topology, failures happen. Here is how each scenario plays out and what you must plan for:
+
+**Scenario 1: Single region loses connectivity to the global KMS.** The region's provider instances continue operating with the last known key set. Token issuance continues. Validation uses the cached keys. The risk is that the KMS may have rotated keys while the region was disconnected. When connectivity is restored, the region must immediately sync the current key set and invalidate any tokens signed with the old keys. Users who authenticated during the disconnect window may have tokens signed with a now-retired key. Accept those tokens for the remainder of their natural TTL.
+
+**Scenario 2: Single region becomes completely unavailable.** The global load balancer detects the region is unhealthy through health-check probes and routes traffic to the remaining regions. The health-check probes must test the full OIDC flow -- issuing a token and validating it -- not just an HTTP 200 from the load balancer. During the failover window, users who were in the middle of an auth flow (redirected to the provider, waiting for the authorization code) must retry their request. The SPA or mobile app should detect the timeout and retry the login flow against the new region.
+
+**Scenario 3: Global KMS becomes unavailable.** This is the worst case. No region can generate new signing keys. Existing keys continue to be valid for their remaining lifetime. The provider can issue tokens signed with the last known key, but cannot rotate keys. If the KMS outage lasts longer than the key's remaining lifetime, the provider must stop issuing tokens to avoid using an expired key. Mitigate this by keeping a reserve signing key with a long TTL (72 hours) in a separate, isolated KMS that is only activated during a primary KMS outage.
+
+### Session Affinity vs Global Tokens
+
+You face a choice: use sticky sessions that pin a user to one region, or use global tokens that work in any region.
+
+**Sticky sessions** simplify the provider's state management -- the user's SSO session lives in one region's cache. But they create problems during failover. If the user's region goes down, their session is lost, and they must re-authenticate even if another region is healthy.
+
+**Global tokens** use self-contained tokens (JWTs) that include all necessary claims and metadata. No server-side session is needed for token validation. This is the preferred pattern at scale because it eliminates session affinity entirely. Users can be routed to any region without losing their authentication state.
+
+The trade-off: global tokens are larger (more claims in the JWT) and cannot be revoked server-side (no session to delete). Use short TTLs (5-15 minutes) and refresh tokens for revocation capability.
+
+---
+
+## Observability and Monitoring
+
+You cannot operate an OIDC integration at scale without visibility into every layer of the authentication pipeline. Here are the metrics and alerts you must have in place.
+
+### Critical Metrics
+
+**For the Relying Party:**
+- Discovery document cache hit ratio -- alert if below 99% over a 5-minute window.
+- JWKS cache hit ratio by `kid` -- alert if any `kid` has a miss rate above 1%. A spike in cache misses signals a key rotation that your system may not be handling correctly.
+- Token validation latency, p50, p95, p99 -- the p99 should be under 5ms when the cache is hot. If it exceeds 20ms, investigate cache contention or CPU starvation.
+- Token refresh success rate -- alert if below 99.5%. A failed refresh means the user will be logged out on their next request.
+- Auth code exchange latency -- the time between receiving the authorization code and completing the token exchange. This should be under 200ms at the p99. High latency here indicates provider-side issues.
+
+**For the OIDC Provider:**
+- Token issuance rate per second, per client ID -- this helps you detect anomalous traffic patterns, such as a compromised client secret being used for bulk token harvesting.
+- Key rotation success rate -- every rotation should succeed. If a rotation fails, the provider is signing tokens with an aging key, and the risk of key compromise increases.
+- Auth endpoint error rate by error code -- track `invalid_client`, `invalid_grant`, `unauthorized_client`, and `access_denied` separately. A spike in `invalid_grant` errors may indicate a PKCE verifier mismatch bug in your client.
+- Consent page load time -- this is a user-facing metric. If the consent page takes more than 1 second to load, users abandon the login flow.
+
+### Alerting Thresholds
+
+Configure these alerts at minimum:
+
+1. **P0: Token validation failure rate exceeds 5%.** This means something is broken -- key rotation not handled, clock skew, or provider outage. Wake up the on-call engineer immediately.
+2. **P0: Discovery document refresh fails for 3 consecutive attempts.** The application may be using stale discovery data, which will cause auth failures when the provider changes endpoints.
+3. **P1: JWKS cache hit ratio drops below 95%.** The cache is not warming correctly. Investigate cache TTL configuration and key rotation handling.
+4. **P1: Token refresh failure rate exceeds 1%.** Users are being silently logged out. Check the refresh token rotation configuration and the provider's token endpoint health.
+5. **P2: Auth code exchange latency exceeds 500ms at p50.** The provider is slowing down. Investigate before it becomes a P0 during peak traffic.
+
+### Logging
+
+Every authentication event should produce a structured log entry with these fields:
+
+- `correlation_id` -- traces the auth request from the user's browser through the Relying Party and the provider.
+- `client_id` -- identifies which application is authenticating.
+- `grant_type` -- `authorization_code`, `refresh_token`, or `client_credentials`.
+- `token_type` -- `id_token`, `access_token`, or `refresh_token`.
+- `token_id` -- the `jti` (JWT ID) claim for traceability.
+- `kid` -- the key ID used for signing. This is critical for debugging key rotation issues.
+- `latency_ms` -- end-to-end auth latency.
+- `success` -- boolean.
+- `error_code` -- if the auth failed, the OIDC error code (`invalid_grant`, `invalid_request`, etc.).
+
+Store these logs in a centralized log aggregation system (Elasticsearch, Loki, or equivalent) with a retention period of at least 90 days for compliance analysis.
+
+### Tracing
+
+Use distributed tracing to track authentication requests across service boundaries. A single auth request may traverse the load balancer, the authorization endpoint, the consent service, the user store, the token endpoint, and the KMS. Each hop adds latency. Tracing shows you where the time is spent.
+
+The most important trace to monitor is the end-to-end login flow: from the user clicking "Log In" to the Relying Party receiving the ID token. This trace should complete in under 2 seconds at the p95. If it exceeds 3 seconds, users abandon the login flow and your conversion rate drops.
+
+---
+
+## Capacity Planning: Caching Strategies
+
+At scale, the difference between a working OIDC integration and a failing one comes down to caching. Two caches matter above all others: the discovery document cache and the JWKS cache.
+
+<AsciiDiagram
+  id="oidc/caching-strategy"
+  title="Discovery and JWKS Caching Architecture"
+  alt="Architecture diagram of the RP-side caching layer showing a discovery document cache with 24-hour TTL and stale-while-revalidate pattern, a JWKS cache indexed by key ID with TTL set to key expiry, and the token validation pipeline that looks up the kid in JWKS cache, fetches on miss, and returns the validated token."
+  caption="RP-side caching architecture -- two caches prevent thundering herds against the provider"
+  content={`
+          ┌──────────── RP Application ───────────────────────────────┐
+          │                                                           │
+          │  ┌─────────────────────┐   ┌────────────────────────┐    │
+          │  │  Discovery Cache    │   │   JWKS Cache           │    │
+          │  │                     │   │                        │    │
+          │  │  /.well-known/      │   │  kid-1 ────▶ RSA Pub  │    │
+          │  │  openid-config      │   │  kid-2 ────▶ EC Pub   │    │
+          │  │                     │   │  kid-3 ────▶ RSA Pub  │    │
+          │  │                     │   │                        │    │
+          │  │  TTL: 24 hours      │   │  TTL: key expiry -    │    │
+          │  │  Refresh: stale-    │   │        1 hour grace   │    │
+          │  │  while-revalidate   │   │  Refresh: on cache    │    │
+          │  │                     │   │           miss by kid │    │
+          │  └─────────────────────┘   └────────────────────────┘    │
+          │                                                           │
+          │  ┌──────────────────────────────────────────────────┐    │
+          │  │         Token Validation Pipeline                 │    │
+          │  │                                                   │    │
+          │  │  Incoming Token                                     │    │
+          │  │       │                                            │    │
+          │  │       ▼                                            │    │
+          │  │  Parse JWT Header ────▶ Extract kid + alg          │    │
+          │  │       │                                            │    │
+          │  │       ▼                                            │    │
+          │  │  Lookup kid in JWKS Cache                          │    │
+          │  │       │                    │                       │    │
+          │  │       ▼                    ▼                       │    │
+          │  │  [Cache Hit]          [Cache Miss]                 │    │
+          │  │       │                    │                       │    │
+          │  │       ▼                    ▼                       │    │
+          │  │  Verify Signature     Fetch /jwks endpoint         │    │
+          │  │  with cached key      Update cache                 │    │
+          │  │       │               Verify signature             │    │
+          │  │       │                    │                       │    │
+          │  │       ▼                    ▼                       │    │
+          │  │  Token Valid ◀────────────┘                       │    │
+          │  │       │                                            │    │
+          │  │       ▼                                            │    │
+          │  │  Check exp, iss, aud, nonce                        │    │
+          │  │       │                                            │    │
+          │  │       ▼                                            │    │
+          │  │  Return validated identity                         │    │
+          │  └──────────────────────────────────────────────────┘    │
+          │                                                           │
+          │  ┌──────────────────────────────────────────────────┐    │
+          │  │         Local Key Cache (Per-Node)               │    │
+          │  │                                                   │    │
+          │  │  Each application node caches the JWKS set        │    │
+          │  │  in local memory. No Redis dependency for         │    │
+          │  │  token validation -- eliminates network hop.      │    │
+          │  │                                                   │    │
+          │  │  Cache TTL is set to the min(key_exp) - 1 hour   │    │
+          │  │  to ensure keys are refreshed before they expire.  │    │
+          │  │                                                   │    │
+          │  │  On cache miss by kid, the node fetches JWKS      │    │
+          │  │  synchronously. Cache the full set, not just the  │    │
+          │  │  missing key, to avoid repeated misses.           │    │
+          │  └──────────────────────────────────────────────────┘    │
+          └──────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Discovery Document Caching
+
+The discovery document changes rarely -- typically only during provider infrastructure updates. Cache it aggressively.
+
+**Strategy:**
+- Fetch the discovery document on application startup in a background goroutine or thread.
+- Cache it in local memory with a 24-hour TTL.
+- Use stale-while-revalidate: serve the cached version immediately and refresh in the background.
+- Add a health-check endpoint that reports discovery document freshness. Alert if the document has not been refreshed in 48 hours.
+
+**Capacity:**
+- The discovery document is typically 2-5 KB. For an application with 100 nodes, this is 200-500 KB of memory total. Negligible.
+- The cache refresh generates one HTTP request per node per day. Even with 10,000 nodes, that is 10,000 requests per day -- trivial load on the provider.
+
+### JWKS Caching
+
+The JWKS cache is more performance-critical. Every incoming token validation requires a key lookup. If the lookup misses the cache, the application must make a synchronous HTTP call to the provider, adding 50-200ms of latency to every authentication check.
+
+**Strategy:**
+- Cache the JWKS set in local memory on each application node. Do not use a shared Redis cache for JWKS -- the network hop adds latency to every validation. Local memory is nanoseconds.
+- Set the cache TTL to the expiry time of the earliest-expiring key in the set, minus a 1-hour grace period. This ensures keys are refreshed before they expire.
+- When a `kid` from an incoming token is not found in the cache, fetch the full JWKS set, not just the missing key. The missing `kid` likely signals a key rotation, and other `kid`s may also be new.
+- After fetching, update the cache asynchronously. Do not block the request path for the background refresh.
+
+**Capacity:**
+- A typical JWKS set contains 3-5 keys, each 1-3 KB. Total size: 5-15 KB per application node. For 1,000 nodes, this is 5-15 MB of memory. Trivial.
+- Under normal operation (no key rotation), the cache generates zero network requests per validation. Under key rotation, each node fetches the JWKS endpoint once when it encounters a new `kid`. For 1,000 nodes, this is 1,000 requests at the moment of rotation -- well within the capacity of a production provider.
+
+### Token Size and Bandwidth Considerations
+
+At FAANG scale, the size of your tokens matters. A 2 KB token sent 10 billion times per day consumes 20 TB of bandwidth -- just for the token itself. Here is how to optimize:
+
+**ID token size:** The ID token contains the `sub`, `iss`, `aud`, `exp`, `iat`, and `nonce` claims by default. Each additional custom claim adds bytes. Keep the ID token under 1 KB. If you need more claims, use the UserInfo endpoint instead of bloating the ID token.
+
+**Access token size:** Opaque access tokens are typically 32-64 bytes (a UUID or a database reference). JWT access tokens are typically 500-1500 bytes depending on the number of claims. Opaque tokens are more bandwidth-efficient but require a database lookup or cache hit for validation. JWT tokens are self-contained but consume more bandwidth. Choose based on your validation latency requirements.
+
+**Refresh token size:** Refresh tokens are typically opaque strings of 32-64 bytes. They should never be JWTs because refresh tokens are not meant to be parsed by the client -- they are credentials, not data carriers.
+
+**Bandwidth budget calculation:**
+- Login flow: 1 auth request + 1 redirect + 1 token exchange = 3 round trips. Each round trip involves the ID token, access token, and possibly a refresh token. Total bytes per login: 3-5 KB.
+- Token validation: Each API call includes the access token in the HTTP Authorization header. At 1 KB per token and 10,000 requests per second, that is 10 MB/s of token overhead in the request headers alone.
+- Token refresh: Each refresh cycle sends the refresh token (64 bytes) and receives a new access token (1 KB) and optionally a new refresh token (64 bytes). Total: 1.1 KB per refresh.
+
+### Token Validation Pipeline
+
+The full validation pipeline should run in under 1 millisecond when the cache is hot:
+
+```
+Step                    Cost           Cache Dependency
+─────────────────────   ────────────   ────────────────
+Parse JWT header        < 0.01 ms      None
+Lookup kid in cache     < 0.001 ms     Memory hit
+Verify signature        0.1 - 0.5 ms   Key from cache
+Check expiration        < 0.01 ms      None
+Check issuer/audience   < 0.01 ms      None
+Check nonce             < 0.01 ms      None
+─────────────────────   ────────────   ────────────────
+Total                   < 1 ms         Cache hit
+```
+
+When the cache misses (key rotation), the total latency is the JWKS fetch time plus validation: 50-200ms. This is acceptable for the first few requests after a rotation but must not become the steady state.
+
+### Rate Limiting for JWKS Fetching
+
+When a key rotation happens, every node in your fleet may detect the new `kid` simultaneously and fetch the JWKS endpoint at the same instant. This creates a thundering herd.
+
+**Mitigation:**
+- Add jitter to the cache refresh timing. Each node should add a random delay of 0-10 seconds before fetching.
+- Use a shared distributed lock (Redis) for the JWKS refresh. Only one node per cluster fetches the JWKS set and distributes it to other nodes via a shared channel.
+- Implement circuit breaking on the JWKS endpoint. If the provider returns 429 (Too Many Requests) or 5xx, back off exponentially and serve from stale cache.
+
+---
+
+## Token Storage Architecture
+
+Token storage is a cross-cutting concern that affects every integration pattern. Here is how to think about it at scale:
+
+**Server-side tokens (web apps, BFF):** Store tokens in memory or in Redis. Never in a database -- database reads add 1-10ms of latency to every request that needs the token. Use the session identifier as the cache key. Set the TTL to the token's expiry time. On server restart, all sessions are invalidated -- this is acceptable because the user's browser still has the session cookie and will get a new session on the next request.
+
+**Memory vs Redis for server-side tokens:** For single-instance applications, in-memory storage is sufficient and fastest. For multi-instance deployments behind a load balancer, use Redis to share session state across instances. The trade-off is a 0.5-2ms latency penalty for the Redis network round trip. At 10,000 requests per second, this adds 5-20 seconds of cumulative latency. Consider using a local cache (e.g., Memcached on each node) with Redis as the backing store for session data to reduce the network overhead.
+
+**Mobile tokens:** Store tokens in the platform keychain. The keychain is encrypted at rest and accessible only to your application. Do not store tokens in `UserDefaults` or `SharedPreferences`. On iOS, use the `kSecClassGenericPassword` class with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` to prevent backup to iCloud. On Android, use `EncryptedSharedPreferences` from the AndroidX Security library with `KeyEncryptionScheme.AES256_SIV`.
+
+**SPA tokens:** Do not store tokens in the browser. The BFF pattern eliminates token storage in the browser entirely. If you must store tokens in the browser (no BFF), use in-memory storage only -- a JavaScript variable or a closure. Never use localStorage, sessionStorage, or cookies accessible to JavaScript.
+
+**Service tokens:** Store tokens in local memory with a TTL. Use a background goroutine to refresh the token before it expires. The refresh should complete 5 minutes before the token's actual expiry to provide a safety margin for clock skew.
+
+**Token encryption at rest:** Any token stored persistently must be encrypted at rest. Use AES-256-GCM for encryption. Store the encryption key in a hardware security module (HSM) or a key management service (AWS KMS, GCP Cloud KMS, Azure Key Vault). Rotate the encryption key on a regular schedule (every 90 days is standard). Never hardcode the encryption key in application configuration or source code.
+
+**Token lifetime management:** Tokens should be bound to the shortest practical lifetime. Access tokens: 15-30 minutes. ID tokens: 1 hour or less (they are used only at login to bootstrap identity). Refresh tokens: 24 hours for consumer apps, 8 hours for enterprise apps with stricter security requirements. When a user logs out, all tokens for that session must be invalidated immediately. For server-side sessions, this means deleting the session from Redis. For mobile apps, this means clearing the keychain. For services, this means flushing the token cache.
+
+---
+
+## Integration Checklist
+
+Before you deploy an OIDC integration at scale, verify each of these items:
+
+1. **Discovery document** is fetched once at startup and cached for 24 hours with stale-while-revalidate.
+2. **JWKS set** is cached in local memory with TTL aligned to key expiry.
+3. **Key rotation** is handled by looking up `kid` from the JWT header and fetching on cache miss.
+4. **PKCE** is used for all public clients (SPAs, mobile apps).
+5. **Client secret** is never hardcoded -- pulled from a secrets manager at startup.
+6. **Token validation** is async, off the main request thread.
+7. **Clock skew** is handled with a 30-60 second leeway in token validation.
+8. **Nonce** is generated, stored in session, validated against ID token claim, and immediately deleted.
+9. **Refresh token rotation** is enabled to limit the blast radius of a leaked refresh token.
+10. **Circuit breakers** are in place for the provider's JWKS and token endpoints.
+11. **Observability** tracks discovery fetch latency, JWKS fetch latency, cache hit ratio, key rotation events, and validation failures.
+12. **Graceful degradation** is tested: when the provider is unreachable, the application serves cached sessions and shows a clear message for new logins.
+
+---
+
+## Bridge to Trade-offs
+
+This page walked you through the architecture of OIDC at scale -- how to integrate with a provider, how to cache discovery documents and JWKS keys, how to handle key rotation, and how to design multi-region topologies. You now know the patterns that FAANG-scale systems use to authenticate billions of users without collapsing under the load.
+
+But every architectural decision has a cost. OIDC makes trade-offs that may not suit every context. When should you use OIDC versus SAML? What happens when your provider goes down? Which anti-patterns look reasonable but cause production incidents?
+
+Those questions are covered on the next page, where you will evaluate the trade-offs, failure modes, and anti-patterns of OIDC in production.

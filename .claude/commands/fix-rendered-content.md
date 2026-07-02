@@ -42,6 +42,30 @@ Double-encoded UTF-8: box-drawing, arrow, and punctuation characters that got ma
 - **Detect (punctuation form — common and easy to miss):** corrupted em-dashes, en-dashes, curly quotes, and ellipses in prose, which show up as literal sequences like `?????s???,??`, `?£???`, `Ã¢â‚¬â€`, `Ã¢â‚¬â„¢`, or a stray `?` cluster mid-sentence where an em-dash (—), en-dash (–), curly apostrophe (’), or ellipsis (…) belongs. Scan prose for `?????` runs and for `?` characters wedged between two words with no spacing logic — these are corrupted punctuation, not literal question marks.
 - **Detect (multi-layer, unrecoverable):** long unbroken runs like `ÃƒÆ'Ã‚Â¢ÃƒÂ¢Ã¢â‚¬...` or `?£???,?????a??£???,?????` — triple-or-more-encoded; the original character is unrecoverable by simple reversal.
 
+### Defect A3 — Bare `{`/`}` in prose ("Could not parse expression with acorn")
+Bare `{` and `}` characters in prose are interpreted by MDX as JSX expression boundaries, causing `Could not parse expression with acorn` build errors. This happens most often with GraphQL schemas (`type Query { ... }`), JSON examples (`{ "errors": [...] }`), and object destructuring patterns.
+- **Detect:** `Can't render static file` + `Could not parse expression with acorn` in build output. Search for bare `{` characters outside fenced code blocks.
+- **Fix:** Wrap the content in a fenced code block with the appropriate language tag (```` ```graphql ````, ```` ```json ````, etc.).
+
+### Defect A4 — Unescaped backticks inside AsciiDiagram template literals
+When an AsciiDiagram's `content` template literal contains inline backtick-wrapped code (e.g., `` `union select` ``), the backticks close the template literal prematurely. This causes garbled rendering or build errors.
+- **Detect:** Build errors at the line where the AsciiDiagram opens. Search AsciiDiagram `content` blocks for literal backticks.
+- **Fix:** Escape inner backticks with `\`` and escape `${` with `\${` to prevent template interpolation.
+
+### Defect A5 — `alt`/`caption` props after template literal close
+An AsciiDiagram may have its `alt` and `caption` props placed on the same line as the closing backtick and `}`:
+```
+`}" alt="..." caption="..." />
+```
+The MDX parser chokes on `}"` (unexpected quote character before attribute name).
+- **Detect:** Search for `}" alt=` or `}" caption=` patterns in `.mdx` files.
+- **Fix:** Move `alt` and `caption` to the opening tag before `content`, producing the canonical form:
+  ```
+  alt="..." caption="..." content={`
+  ...
+  `} />
+  ```
+
 ### Defect A2 — Corrupted frontmatter fence rendering as body text
 The opening `---` of a file's YAML frontmatter is corrupted (a leading BOM, stray character, or mojibake before or on the `---` line), so Docusaurus fails to recognize the frontmatter and renders the raw `id: ... title: ... sidebar_position: ...` block as visible text at the top of the page.
 - **Detect:** the literal strings `id:`, `title:`, `sidebar_position:` appearing in rendered body content, OR a file whose first line is not exactly `---` (check for a leading `?`, BOM byte, whitespace, or any character before the opening `---`).

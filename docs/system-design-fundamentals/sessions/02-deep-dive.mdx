@@ -1,0 +1,490 @@
+---
+id: sessions-deep-dive
+title: Sessions Deep Dive
+sidebar_position: 2
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Session Store Internals
+
+The session store is the backbone of any server-side session system. Understanding its internals — data structures, eviction policies, replication strategies, and failure modes — is essential for building production-grade session management.
+
+### Data Structures
+
+Most session stores are key-value stores. The key is the session ID, and the value is a serialized blob of session data. The most common implementations are:
+
+**Redis** stores sessions as hash maps or JSON strings with a TTL:
+```redis
+SET session:abc123def456 '{"user_id":42,"role":"admin","cart":[]}' EX 3600
+```
+
+Redis uses a hash table internally for O(1) lookups. TTL keys are tracked in a separate dict (the expires hash) and lazily evicted on access. Redis also runs a periodic timer (every 100ms by default) that samples and expires keys with expired TTLs.
+
+**Memcached** stores sessions as key-value pairs with an expiration time:
+```
+set session:abc123def456 0 3600 <data_length>
+<binary data>
+```
+
+Memcached uses a slab allocator with LRU eviction per slab class. When memory is full, the least recently used item in the slab class is evicted regardless of TTL.
+
+**PostgreSQL** stores sessions in a table:
+```sql
+CREATE TABLE sessions (
+    id VARCHAR(128) PRIMARY KEY,
+    data JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_access TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX idx_sessions_expires ON sessions (expires_at);
+```
+
+With PostgreSQL, a background vacuum process handles cleanup of expired sessions, or a periodic `DELETE FROM sessions WHERE expires_at < NOW()` query.
+
+### Serialization
+
+Session data must be serialized before storage and deserialized on retrieval. The serialization format affects both performance and interoperability:
+
+| Format | Speed | Size | Readable | Language Support |
+|---|---|---|---|---|
+| JSON | Fast | Medium | Yes | Universal |
+| MessagePack | Fast | Small | Binary | Many |
+| Protocol Buffers | Fast | Small | Binary | Many |
+| Python pickle | Medium | Medium | No | Python only |
+| Ruby Marshal | Medium | Medium | No | Ruby only |
+
+JSON is the most common choice because it is human-readable, language-agnostic, and fast enough for session data (typically 1-10 KB).
+
+---
+
+## Concurrency and Race Conditions
+
+When multiple requests from the same client arrive simultaneously, race conditions can corrupt session data. Consider a shopping cart scenario:
+
+1. Request A reads the cart (currently empty).
+2. Request B reads the cart (currently empty).
+3. Request A adds item X and writes the cart: `[X]`.
+4. Request B adds item Y and writes the cart: `[Y]`.
+5. Result: Item X is lost because Request B overwrote the cart with a stale value.
+
+This is a classic read-modify-write race condition. Three solutions exist:
+
+### Solution 1: Optimistic Locking with Version Tokens
+
+Each session entry has a version number. On write, the server checks that the version has not changed since the read:
+
+```python
+def update_session(session_id, update_fn, retries=3):
+    for attempt in range(retries):
+        session = session_store.get(session_id)
+        version = session["__version__"]
+        new_data = update_fn(session)
+        new_data["__version__"] = version + 1
+        # Atomic compare-and-swap
+        success = session_store.cas(session_id, version, new_data)
+        if success:
+            return new_data
+        # Version conflict: another request modified the session
+        # Retry with fresh data
+    raise SessionUpdateConflictError()
+```
+
+Redis supports this via the `WATCH` command (optimistic locking) or Lua scripts (atomic execution).
+
+### Solution 2: Pessimistic Locking
+
+The server acquires a lock on the session before reading and releases it after writing:
+
+```python
+def with_session_lock(session_id, timeout=5):
+    lock_key = f"lock:session:{session_id}"
+    lock = redis.lock(lock_key, timeout=timeout)
+    with lock:
+        session = session_store.get(session_id)
+        # Modify session
+        session_store.set(session_id, session)
+```
+
+Redis Redlock or a dedicated lock service (ZooKeeper, etcd) provides distributed locking. This approach serializes access to the session but adds latency and can cause contention under high concurrency.
+
+### Solution 3: Session Sharding
+
+Each session is pinned to a single server, and all requests for that session are routed to that server. This avoids distributed locking entirely because the session data is local to one process. Session affinity (sticky sessions) in the load balancer implements this strategy.
+
+<AsciiDiagram
+  id="sessions/deep-dive-sharding"
+  title="Session sharding with sticky sessions"
+  alt="Three application servers each with a local session store. Load balancer routes requests based on session ID hash to ensure all requests for the same session reach the same server."
+  caption="Session sharding eliminates distributed locking by pinning each session to one server"
+  content={`Session sharding with sticky sessions
+
+  ┌─────────────────────────────────────────────────────────┐
+  │                    Load Balancer                         │
+  │  Routes by hash(session_id) % N                          │
+  │                                                          │
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+  │  │  Hash mod 3  │  │  Hash mod 3  │  │  Hash mod 3  │   │
+  │  │  = 0         │  │  = 1         │  │  = 2         │   │
+  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘   │
+  │         │                 │                 │            │
+  └─────────┼─────────────────┼─────────────────┼────────────┘
+            │                 │                 │
+            ▼                 ▼                 ▼
+  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+  │  App Server 1   │ │  App Server 2   │ │  App Server 3   │
+  │  ┌───────────┐  │ │  ┌───────────┐  │ │  ┌───────────┐  │
+  │  │ Session   │  │ │  │ Session   │  │ │  │ Session   │  │
+  │  │ Store     │  │ │  │ Store     │  │ │  │ Store     │  │
+  │  │ (local)   │  │ │  │ (local)   │  │ │  │ (local)   │  │
+  │  └───────────┘  │ │  └───────────┘  │ │  └───────────┘  │
+  │                 │ │                 │ │                 │
+  │  Sessions:      │ │  Sessions:      │ │  Sessions:      │
+  │  S1, S4, S7     │ │  S2, S5, S8     │ │  S3, S6, S9     │
+  └─────────────────┘ └─────────────────┘ └─────────────────┘
+`}
+/>
+
+The downside of session sharding: if a server fails, all sessions on that server are lost. A shared session store (Redis, database) avoids this but adds the latency of a network hop for every session lookup.
+
+---
+
+## Cookie Attributes and Security
+
+The `Set-Cookie` header supports several attributes that control cookie behavior. Each attribute is a security control.
+
+### Domain and Path
+
+```http
+Set-Cookie: session_id=abc123; Domain=.example.com; Path=/app
+```
+
+- **Domain**: Controls which subdomains receive the cookie. `.example.com` sends the cookie to `api.example.com` and `app.example.com`. A narrow domain reduces the attack surface.
+- **Path**: Controls which URL paths receive the cookie. `/app` excludes requests to `/admin`. A narrow path reduces unnecessary cookie transmission.
+
+### Expires and Max-Age
+
+```http
+Set-Cookie: session_id=abc123; Max-Age=3600
+```
+
+- **Expires**: An absolute date string. The browser deletes the cookie at that date.
+- **Max-Age**: A relative number of seconds. Preferred over Expires because it avoids clock skew issues.
+
+If neither is set, the cookie is a session cookie — it is deleted when the browser closes. Persistent cookies (with Max-Age) survive browser restarts.
+
+### Security Flags
+
+```http
+Set-Cookie: session_id=abc123; HttpOnly; Secure; SameSite=Strict
+```
+
+- **HttpOnly**: No JavaScript access (`document.cookie` returns empty). This is the single most important defense against XSS-based session theft.
+- **Secure**: Only sent over HTTPS. Prevents session ID leakage on HTTP pages. Without this flag, an attacker on the same Wi-Fi can intercept the cookie via ARP spoofing.
+- **SameSite**: Controls cross-site request behavior:
+  - `Strict`: Cookie is not sent on any cross-site request (including GET navigations). Most secure but breaks legitimate cross-site links.
+  - `Lax`: Cookie is sent on top-level GET navigations (clicking a link) but not on POST forms or iframe loads. Good default for most applications.
+  - `None`: Cookie is sent on all cross-site requests. Requires `Secure` flag. Necessary for third-party widgets and embedded content.
+
+### Cookie Prefixes
+
+```http
+Set-Cookie: __Host-session_id=abc123; Path=/; Secure
+```
+
+- `__Host-`: The cookie must have `Path=/` and `Secure`. The domain must not be set. This prevents subdomain-based cookie injection.
+- `__Secure-`: The cookie must have `Secure`. A weaker guarantee than `__Host-`.
+
+---
+
+## Session ID Generation
+
+The session ID is the most critical security element of the entire session system. A weak session ID undermines every other security control.
+
+### Requirements
+
+1. **Sufficient entropy**: A 128-bit random value provides 2^128 possible values. At 1 billion guesses per second, an attacker would need 10^22 years to find a valid session ID.
+2. **Cryptographic randomness**: Use `secrets.token_hex(32)` (Python), `crypto.randomBytes(32)` (Node.js), or `java.security.SecureRandom` (Java). Do not use `Math.random()`, `rand()`, or any non-cryptographic PRNG.
+3. **Uniqueness**: The collision probability for 128-bit random values is negligible. At 1 billion active sessions, the birthday paradox collision probability is approximately 10^-20.
+4. **No encoded data**: The session ID should be opaque. Do not encode user IDs, timestamps, or IP addresses into the session ID. If you need to inspect session metadata, store it in the session store, not in the ID.
+
+### Bad Patterns
+
+```python
+# BAD: Sequential session IDs
+session_id = f"session_{next_counter()}"  # Predictable
+
+# BAD: Timestamp-based
+session_id = f"session_{int(time.time())}_{user_id}"  # Reveals user and time
+
+# BAD: Hash of user data
+session_id = hashlib.md5(f"{user_id}{password}".encode()).hexdigest()  # Deterministic, not unique
+
+# BAD: UUID v1
+session_id = str(uuid.uuid1())  # Contains MAC address and timestamp
+```
+
+### Good Pattern
+
+```python
+# GOOD: Cryptographically random, opaque
+session_id = secrets.token_urlsafe(32)  # 256-bit random value
+```
+
+---
+
+## Session Lifecycle in Detail
+
+Every session goes through a lifecycle: creation, maintenance, and termination. Understanding the full lifecycle helps identify failure modes.
+
+<AsciiDiagram
+  id="sessions/deep-dive-lifecycle"
+  title="Detailed session lifecycle state machine"
+  alt="State machine diagram showing session states: Created, Active, Idle, Expired, Revoked, and Deleted, with transitions between each state"
+  caption="The session lifecycle state machine with allowed transitions"
+  content={`Session lifecycle state machine
+
+                         ┌──────────────────────┐
+                         │                      │
+                         ▼                      │
+  ┌──────────┐     ┌──────────┐     ┌──────────┐│
+  │ Created  │────>│  Active  │────>│  Idle    ││
+  │          │     │          │     │          ││
+  │ Initial  │     │ Regular  │     │ No       ││
+  │ creation │     │ requests │     │ activity ││
+  └──────────┘     └──────────┘     └──────────┘│
+       │                │                │       │
+       │                │                │       │
+       │                ▼                │       │
+       │          ┌──────────┐           │       │
+       └─────────>│ Expired  │<──────────┘       │
+                  │          │                   │
+                  │ TTL hit  │                   │
+                  └──────────┘                   │
+       ┌─────────────────────────────────────────┘
+       │                │
+       ▼                ▼
+  ┌──────────┐     ┌──────────┐
+  │ Revoked  │     │ Deleted  │
+  │          │     │          │
+  │ Admin    │     │ GC sweep │
+  │ force    │     │ or       │
+  │ logout   │     │ explicit │
+  └──────────┘     └──────────┘
+`}
+/>
+
+### Phase 1: Creation
+
+The session is created on the first meaningful interaction. The server:
+1. Generates a cryptographically random session ID.
+2. Creates the session store entry with initial data.
+3. Sends the session ID to the client via `Set-Cookie`.
+4. Records the creation timestamp and sets the expiry.
+
+### Phase 2: Active
+
+The session is active. Each request:
+1. Includes the session ID cookie.
+2. The server looks up the session.
+3. If sliding expiration is used, the server extends the TTL.
+4. The server processes the request using session data.
+5. The server may update session data if the request modifies state.
+
+### Phase 3: Idle
+
+The session enters the idle state when the user stops sending requests. The session data remains in the store, and the TTL counts down. Idle sessions consume storage but do not consume server resources.
+
+### Phase 4: Expiry
+
+The session expires when the TTL or absolute timeout is reached. The server rejects any subsequent request with this session ID. The session data remains in the store until the garbage collector removes it.
+
+### Phase 5: Revocation
+
+The session is explicitly revoked by an administrator or by the system (password change, account suspension). The session store entry is deleted or marked as invalid. Revocation is immediate — the user's next request is rejected.
+
+### Phase 6: Deletion
+
+The session store entry is removed by the garbage collector, Redis TTL eviction, or an explicit DELETE. At this point, the session cannot be recovered even if the session ID is known.
+
+---
+
+## Distributed Session Stores
+
+When an application runs on multiple servers, the session store must be accessible from all servers. Two approaches dominate.
+
+### Centralized Session Store
+
+A single Redis cluster or database serves as the session store for all application servers.
+
+<AsciiDiagram
+  id="sessions/deep-dive-centralized"
+  title="Centralized session store architecture"
+  alt="Multiple application servers all reading and writing to the same Redis cluster, with a single source of truth for session data"
+  caption="A centralized Redis cluster serves as the single source of truth for all application servers"
+  content={`Centralized session store
+
+  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+  │  App Server  │  │  App Server  │  │  App Server  │
+  │      1       │  │      2       │  │      3       │
+  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+         │                 │                 │
+         └─────────────────┼─────────────────┘
+                           │
+                           ▼
+                 ┌─────────────────┐
+                 │   Redis Cluster │
+                 │                 │
+                 │  ┌──────┐       │
+                 │  │Master│──────>│
+                 │  └──────┘       │
+                 │      │          │
+                 │      ▼          │
+                 │  ┌──────┐       │
+                 │  │Replica│      │
+                 │  └──────┘       │
+                 └─────────────────┘
+`}
+/>
+
+**Pros:** Single source of truth. No session affinity required. Any server can handle any request. Easy to scale application servers independently.
+**Cons:** Redis is a single point of failure (mitigated by replication and sentinel). Network latency to Redis adds to every request. Redis throughput limits total session operations.
+
+### Replicated Session Store
+
+Session data is replicated to all application servers or to a set of regional stores.
+
+```python
+# Session replication pseudo-code
+def write_session(session_id, data):
+    for store in session_stores:
+        store.set(session_id, data, ttl=3600)
+
+def read_session(session_id):
+    # Try local first, then fall back to replicas
+    for store in session_stores:
+        data = store.get(session_id)
+        if data:
+            return data
+    return None
+```
+
+**Pros:** Low latency (local reads). No single point of failure. Survives individual store failures.
+**Cons:** Write amplification (N writes per session update). Stale reads from replicas. Eventual consistency means a session update may not be immediately visible on all servers.
+
+---
+
+## Failure Modes
+
+### Failure 1: Session Store Goes Down
+
+If the session store becomes unavailable, every authenticated request fails. The application cannot verify session validity or retrieve session data.
+
+**Mitigations:**
+- Session store replication with automatic failover (Redis Sentinel, Redis Cluster).
+- Read replicas and fallback to stale cached data.
+- Graceful degradation: allow read-only access to unauthenticated users while the session store is unavailable.
+- Circuit breaker: if the session store is down, fail open to a limited anonymous mode rather than returning 500 errors.
+
+### Failure 2: Session ID Collision
+
+Two clients receive the same session ID. This is extremely unlikely with a good CSPRNG but theoretically possible.
+
+**Mitigation:** Check for existing sessions on creation. If the generated ID already exists, generate a new one. This is a O(1) check that adds negligible overhead.
+
+### Failure 3: Session Store Overflow
+
+The session store runs out of memory (Memcached, Redis) or storage (PostgreSQL). New sessions cannot be created.
+
+**Mitigations:**
+- Set aggressive TTLs. A 24-hour TTL on a Redis instance with 8 GB RAM can hold approximately 2 million sessions (assuming 4 KB per session).
+- Implement LRU or LFU eviction. Redis with `maxmemory-policy allkeys-lru` evicts the least recently used sessions when memory is full.
+- Monitor session store usage and alert before capacity is reached.
+- Shard sessions across multiple stores.
+
+### Failure 4: Clock Skew on Session Expiry
+
+If the server's clock is skewed, session expiry calculations are incorrect. A server with a fast clock expires sessions early. A server with a slow clock keeps sessions alive longer than intended.
+
+**Mitigation:** Use Redis TTL (server-side expiry) rather than comparing timestamps. Redis TTL is based on the Redis server's clock, which is consistent for all clients of that Redis instance.
+
+### Failure 5: Cookie Replay After Logout
+
+A user logs out, but the session ID cookie is still present in the browser. If the server does not immediately invalidate the session, the cookie can be replayed to resume the session.
+
+**Mitigation:** Delete the session from the session store on logout (not just clear the cookie). Add the session ID to a blocklist with a short TTL until the cookie expires naturally.
+
+---
+
+## Session Security Threats
+
+### Session Hijacking
+
+An attacker steals a valid session ID and uses it to impersonate the victim.
+
+**Attack vectors:**
+- Network sniffing (if session ID is sent over HTTP)
+- XSS (JavaScript reads `document.cookie` if HttpOnly is not set)
+- Malware on the client device
+- Server-side log leakage
+- Referrer header leakage (session ID in URL, not cookie)
+
+**Defenses:**
+- Always use HttpOnly, Secure, and SameSite cookie flags.
+- Use HTTPS for all traffic (HSTS header).
+- Rotate session IDs on login.
+- Implement IP address binding (optional, breaks legitimate mobile users who switch networks).
+- Implement user-agent fingerprinting (optional, detects session misuse).
+
+### Session Fixation
+
+An attacker forces a victim to use a known session ID. After the victim logs in, the attacker uses the known session ID to access the authenticated session.
+
+**Attack flow:**
+1. Attacker creates a session with ID `abc123`.
+2. Attacker sends a link to the victim: `https://example.com/?session_id=abc123`.
+3. The server sets the session ID to `abc123` (because the server accepts session IDs from query parameters).
+4. The victim logs in. The server authenticates the user but does not change the session ID.
+5. The attacker uses `abc123` to access the victim's authenticated session.
+
+**Defenses:**
+- Rotate session IDs on login (this is the most important defense).
+- Never accept session IDs from query parameters or request bodies. Only from cookies.
+- Always regenerate the session ID when the user's privilege level changes.
+
+### Cross-Site Request Forgery (CSRF)
+
+An attacker tricks a victim's browser into making a request to a target site where the victim is authenticated. The browser automatically includes the session cookie.
+
+**Attack flow:**
+1. Victim is logged in to `bank.com`.
+2. Victim visits `evil.com`, which contains:
+   ```html
+   <form action="https://bank.com/transfer" method="POST">
+     <input type="hidden" name="amount" value="10000">
+     <input type="hidden" name="to" value="attacker">
+   </form>
+   <script>document.forms[0].submit();</script>
+   ```
+3. The browser sends the POST request to `bank.com` with the session cookie.
+4. The server sees a valid session and processes the transfer.
+
+**Defenses:**
+- SameSite cookie attribute (Lax or Strict). This is the most effective defense.
+- CSRF tokens: a random value embedded in forms that the server validates.
+- Custom request headers (e.g., `X-Requested-By: XMLHttpRequest`).
+- Double-submit cookies: send the CSRF token both as a cookie and as a request header, and verify they match.
+
+---
+
+## Key Takeaways
+
+- Session stores are key-value stores with TTL support. Redis is the most common production choice.
+- Read-modify-write race conditions on session data require optimistic locking, pessimistic locking, or session sharding.
+- Cookie security flags (HttpOnly, Secure, SameSite) are the primary defense against session hijacking and CSRF.
+- Session IDs must be generated with a CSPRNG, be opaque, and have sufficient entropy (128+ bits).
+- Session rotation on privilege escalation prevents session fixation attacks.
+- Centralized session stores (Redis) provide a single source of truth but add latency and are a potential single point of failure.
+- Distributed session stores eliminate the single point of failure but introduce write amplification and eventual consistency.
+- Session store failures can be mitigated with replication, stale cache fallbacks, and graceful degradation.
+- Session hijacking, fixation, and CSRF are the three primary session security threats, each with specific defenses.

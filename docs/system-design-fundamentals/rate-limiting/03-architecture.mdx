@@ -1,0 +1,969 @@
+---
+id: rate-limiting-architecture
+title: Rate Limiting at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Rate Limiting at Scale
+
+## From Naive to Production
+
+Rate limiting is a progression. You start with a simple counter in memory, discover it breaks the moment you add a second server, and iterate toward a distributed architecture that coordinates rate decisions across thousands of nodes, multiple data centers, and global user populations.
+
+### Naive: In-Memory Counters on a Single Server
+
+The simplest rate limiter lives in the application process memory. A dictionary of counters, a timer that resets them every minute, and a check before each request.
+
+```
+┌──────────────────────────────────────────────────┐
+│              Single Application Server            │
+│                                                    │
+│  ┌──────────────────────────────────────────────┐ │
+│  │          In-Memory Rate Limiter              │ │
+│  │                                              │ │
+│  │  process: {                                  │ │
+│  │    "user:42:api:minute": 85,                 │ │
+│  │    "user:42:api:hour": 1200,                 │ │
+│  │    "ip:10.0.0.1:api:minute": 32,             │ │
+│  │    "user:99:api:minute": 100                 │ │
+│  │  }                                           │ │
+│  │                                              │ │
+│  │  Reset timer: every 60 seconds               │ │
+│  │  Memory: ~200 bytes per counter entry        │ │
+│  │  Max entries: unlimited (until OOM)          │ │
+│  └──────────────────────────────────────────────┘
+│                    │
+│                    ▼
+│  ┌──────────────────────────────────────────────┐ │
+│  │           Request Handler                     │ │
+│  │  if counter[user][minute] < limit:            │ │
+│  │    counter[user][minute]++                    │ │
+│  │    process_request()                          │ │
+│  │  else:                                        │ │
+│  │    return 429 Too Many Requests               │ │
+│  └──────────────────────────────────────────────┘ │
+│                                                    │
+│  Throughput: ~500K checks/sec (single-threaded)   │
+│  Latency: <1 microsecond per check                 │
+│  Memory: grows unbounded (no eviction)             │
+└──────────────────────────────────────────────────────┘
+```
+
+**What works at this level:**
+- Sub-microsecond latency per check (pure dictionary lookup)
+- Zero network calls (everything is local)
+- Simple to implement: 50 lines of Python or Java
+- Atomic increment with `synchronized` or `Lock` in single-threaded context
+
+**What breaks immediately:**
+- **Server restart loses all counters** — every user gets a fresh window. An attacker can restart the server and bypass the limit.
+- **No memory limit** — a malicious user can create millions of unique keys (e.g., spoofed IPs) and cause an OOM crash.
+- **Single server only** — the moment you scale to two servers, each server has its own counter. A user can send 100 requests to server A and 100 to server B, hitting 200 total while each server thinks they only sent 100.
+
+### Step 1: Sticky Sessions (Wrong Direction)
+
+The naive fix is to pin each user to a specific server using sticky sessions. This keeps the in-memory counter working — but it creates a worse problem.
+
+```
+┌────────────────────────────────────────────────┐
+│              Load Balancer                       │
+│         sticky session: hash(user_id) % N       │
+└────────────────────┬───────────────────────────┘
+                      │
+         ┌────────────┼────────────┐
+         │            │            │
+         ▼            ▼            ▼
+   ┌──────────┐ ┌──────────┐ ┌──────────┐
+   │ Server A │ │ Server B │ │ Server C │
+   │          │ │          │ │          │
+   │ user:42  │ │ user:99  │ │ user:155 │
+   │ count: 85│ │ count: 92│ │ count: 78│
+   │          │ │          │ │          │
+   └──────────┘ └──────────┘ └──────────┘
+
+Problems:
+- Uneven load: some servers get more users than others
+- Server failure = all state lost for that user partition
+- Scaling up (adding servers) remaps hash → limits reset for moved users
+- Deployment (rolling update) drains servers → state lost
+```
+
+Sticky sessions for rate limiting are worse than the original problem. You trade a counting problem for a distribution and availability problem, and you still lose all counters on deploy.
+
+### Step 2: Centralized Redis Counter
+
+The first real improvement: move the counter out of the application process and into a shared Redis instance.
+
+```
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  Server A    │  │  Server B    │  │  Server C    │
+│              │  │              │  │              │
+│  INCR key    │  │  INCR key    │  │  INCR key    │
+│  TTL 60s     │  │  TTL 60s     │  │  TTL 60s     │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       └─────────────────┼─────────────────┘
+                         │
+                  ┌──────▼───────┐
+                  │   {Redis}    │
+                  │  Single node │
+                  │              │
+                  │  INCR "user: │
+                  │   42:minute" │
+                  │  → returns 86│
+                  │  TTL: 60s   │
+                  └──────────────┘
+```
+
+**Advantages:**
+- All servers see the same counter — accurate rate limiting
+- Atomic operations (INCR, EXPIRE) prevent race conditions
+- Counters survive server restarts
+- Adding or removing servers does not affect counters
+
+**Disadvantages:**
+- Every request incurs a network round-trip to Redis (~1ms)
+- Redis is a single point of failure — if Redis dies, rate limiting stops
+- Redis can become a bottleneck at high throughput (single-threaded event loop)
+- Network latency adds ~0.5-2ms to every request
+
+## Production Architecture: The Hybrid Global Rate Limiter
+
+A production-grade rate limiter combines three layers: a centralized Redis cluster for global accuracy, per-node local rate limiters for latency-sensitive enforcement, and a hybrid approach that blends both. This design gives you the accuracy of global counters and the speed of local counters, with graceful degradation when either layer fails.
+
+<AsciiDiagram
+  id="rate-limiting/arch-global-rate-limiter"
+  title="Hybrid Global Rate Limiter Architecture"
+  alt="Three-tier rate limiting architecture: each application node has a local token bucket, a Redis cluster provides global counters across all nodes, and a local rate limiter on each node provides fast-path enforcement. The hybrid decision logic checks local first, then global, and allows the request if both pass."
+  caption="The hybrid rate limiter uses local token buckets for fast-path decisions and a Redis cluster for global coordination."
+  content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Global Rate Limiter Architecture                      │
+│                                                                             │
+│  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐ │
+│  │     Node 1           │  │     Node 2           │  │     Node 3           │ │
+│  │                      │  │                      │  │                      │ │
+│  │  ┌────────────────┐  │  │  ┌────────────────┐  │  │  ┌────────────────┐  │ │
+│  │  │  Local Token   │  │  │  │  Local Token   │  │  │  │  Local Token   │  │ │
+│  │  │  Bucket        │  │  │  │  Bucket        │  │  │  │  Bucket        │  │ │
+│  │  │  100 tokens    │  │  │  │  100 tokens    │  │  │  │  100 tokens    │  │ │
+│  │  │  refill: 10/s  │  │  │  │  refill: 10/s  │  │  │  │  refill: 10/s  │  │ │
+│  │  └───────┬────────┘  │  │  └───────┬────────┘  │  │  └───────┬────────┘  │ │
+│  │          │           │  │          │           │  │          │           │ │
+│  │  ┌───────▼────────┐  │  │  ┌───────▼────────┐  │  │  ┌───────▼────────┐  │ │
+│  │  │  Hybrid        │  │  │  │  Hybrid        │  │  │  │  Hybrid        │  │ │
+│  │  │  Decision      │  │  │  │  Decision      │  │  │  │  Decision      │  │ │
+│  │  │  Logic         │  │  │  │  Logic         │  │  │  │  Logic         │  │ │
+│  │  └───────┬────────┘  │  │  └───────┬────────┘  │  │  └───────┬────────┘  │ │
+│  └──────────┼───────────┘  └──────────┼───────────┘  └──────────┼───────────┘ │
+│             │                          │                       │              │
+│             └──────────────────────────┼───────────────────────┘              │
+│                                        │                                     │
+│                               ┌────────▼────────┐                            │
+│                               │   Redis Cluster  │                            │
+│                               │                  │                            │
+│                               │  ┌────────────┐  │                            │
+│                               │  │ Shard 0:   │  │                            │
+│                               │  │ slots 0-5460│  │                            │
+│                               │  │ user:42     │  │                            │
+│                               │  │ user:99     │  │                            │
+│                               │  └────────────┘  │                            │
+│                               │  ┌────────────┐  │                            │
+│                               │  │ Shard 1:   │  │                            │
+│                               │  │ slots 5461- │  │                            │
+│                               │  │ 10922      │  │                            │
+│                               │  │ ip:10.0.0.1 │  │                            │
+│                               │  │ ip:10.0.0.2 │  │                            │
+│                               │  └────────────┘  │                            │
+│                               │  ┌────────────┐  │                            │
+│                               │  │ Shard 2:   │  │                            │
+│                               │  │ slots 10923-│  │                            │
+│                               │  │ 16383      │  │                            │
+│                               │  │ api:global  │  │                            │
+│                               │  │ api:burst   │  │                            │
+│                               │  └────────────┘  │                            │
+│                               │                   │                            │
+│                               │  3 masters + 3   │                            │
+│                               │  replicas         │                            │
+│                               │  maxmemory: 8GB   │                            │
+│                               └───────────────────┘                            │
+│                                                                                │
+│  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │  Hybrid Decision Logic for each request:                                │  │
+│  │                                                                         │  │
+│  │  1. Check local token bucket (in-memory, 0µs)                          │  │
+│  │     - Has tokens? → consume one, proceed                               │  │
+│  │     - No tokens? → check global counter                                 │  │
+│  │                                                                         │  │
+│  │  2. Optionally check global Redis counter (async, ~1ms)                 │  │
+│  │     - Under limit? → increment, allow request                           │  │
+│  │     - Over limit? → deny request, return 429                            │  │
+│  │                                                                         │  │
+│  │  3. If Redis is unreachable (timeout/failover):                         │  │
+│  │     - Fall back to local-only rate limiting (degraded mode)             │  │
+│  │     - Log the incident for observability                                │  │
+│  └─────────────────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### How the Hybrid Decision Logic Works
+
+The hybrid approach gives you the best of both worlds. Here is the exact algorithm:
+
+**Local token bucket** (per-node, in-memory):
+- Each node maintains a token bucket for every rate limit key.
+- A background process refills tokens at the configured rate (e.g., 10 tokens per second).
+- If the local bucket has tokens, the request is allowed immediately — zero network calls.
+- If the local bucket is empty, the node checks the global counter before denying.
+
+**Global Redis counter** (cluster-wide, shared state):
+- The Redis cluster maintains the authoritative counter for each rate limit key.
+- On every request, the node asynchronously sends an INCR command to Redis (fire-and-forget).
+- Redis responds with the current count. If it exceeds the limit, the node returns 429.
+- Redis counters have a TTL matching the rate limit window (e.g., 60 seconds for per-minute limits).
+
+**Graceful degradation:**
+- If Redis is unreachable (network partition, failover, overload), the node falls back to local-only rate limiting.
+- In degraded mode, each node allows up to its local token bucket limit. Total throughput may exceed the configured limit by (N * local_bucket_size) during the degradation window.
+- The system logs the Redis failure and alerts the operations team.
+- Once Redis recovers, the system returns to normal operation — counters are recalculated from scratch.
+
+### Pseudocode: Hybrid Decision Logic
+
+```
+allow_request(key, user_id):
+    # Step 1: Fast path — local token bucket (0 microseconds)
+    if local_bucket.try_consume():
+        redis.incr_async("ratelimit:" + key + ":" + user_id + ":" + window)
+        return ALLOW
+
+    # Step 2: Slow path — check global counter
+    count = redis.get("ratelimit:" + key + ":" + user_id + ":" + window)
+    if count >= max_requests:
+        return DENY  # 429 Too Many Requests
+
+    redis.incr(key)
+    return ALLOW
+
+    # Step 3: Degraded mode
+    on redis.ConnectionError:
+        log("Redis unreachable, falling back to local-only")
+        return ALLOW
+```
+
+## Four Integration Patterns
+
+Rate limiting touches every layer of your system. You must integrate it with the API gateway, the CDN, microservices, and the authentication service. Each integration has different requirements for latency, accuracy, and failure modes.
+
+### Pattern 1: API Gateway Integration
+
+The API gateway is the most natural place to enforce rate limits. Every request passes through the gateway before reaching your services. This gives you a single enforcement point with minimal changes to downstream services.
+
+<AsciiDiagram
+  id="rate-limiting/arch-api-gateway-integration"
+  title="API Gateway Rate Limiting"
+  alt="API gateway rate limiting architecture: client requests arrive at the gateway, which checks rate limits against a Redis cluster. If the limit is exceeded, the gateway returns 429 with Retry-After header. If under the limit, the request is forwarded to the appropriate backend service. Different rate limit tiers apply per API key, per user, per IP, and per endpoint."
+  caption="The API gateway enforces rate limits before requests reach your backend services, with different tiers for API keys, users, IPs, and endpoints."
+  content={`
+                      ┌────────────────────────────────────────────┐
+                      │           API Gateway (Kong/NGINX/Envoy)    │
+                      │                                            │
+                      │  ┌──────────────────────────────────────┐  │
+                      │  │  Rate Limit Middleware Pipeline       │  │
+                      │  │                                       │  │
+                      │  │  Step 1: Extract identity             │  │
+                      │  │    - API key from header              │  │
+                      │  │    - User ID from JWT                 │  │
+                      │  │    - Client IP from X-Forwarded-For   │  │
+                      │  │                                       │  │
+                      │  │  Step 2: Classify request             │  │
+                      │  │    - Tier: Free/Pro/Enterprise        │  │
+                      │  │    - Endpoint: /api/v1/orders         │  │
+                      │  │    - Method: POST                     │  │
+                      │  │                                       │  │
+                      │  │  Step 3: Check rate limits (in order) │  │
+                      │  │    [1] Global per-API-key limit       │  │
+                      │  │    [2] Per-endpoint limit             │  │
+                      │  │    [3] Per-user limit                 │  │
+                      │  │    [4] Per-IP limit (global fallback) │  │
+                      │  │                                       │  │
+                      │  │  Step 4: Execute decision             │  │
+                      │  │    ALLOW → forward to backend         │  │
+                      │  │    DENY  → return 429 + Retry-After   │  │
+                      │  └────────────────┬─────────────────────┘  │
+                      └───────────────────┼────────────────────────┘
+                                          │
+                            ┌─────────────┼─────────────┐
+                            │             │             │
+                            ▼             ▼             ▼
+                     ┌──────────┐  ┌──────────┐  ┌──────────┐
+                     │ Service  │  │ Service  │  │ Service  │
+                     │  A       │  │  B       │  │  C       │
+                     └──────────┘  └──────────┘  └──────────┘
+
+  Rate Limit Tiers:
+  ┌─────────────────┬───────────┬───────────┬──────────────┐
+  │ Tier            │ RPM       │ Burst     │ Price/month  │
+  ├─────────────────┼───────────┼───────────┼──────────────┤
+  │ Free            │ 1,000     │ 100       │ $0           │
+  │ Pro             │ 100,000   │ 5,000     │ $99          │
+  │ Enterprise      │ 1,000,000 │ 50,000    │ Custom       │
+  └─────────────────┴───────────┴───────────┴──────────────┘
+  `}
+/>
+
+**API gateway rate limit configuration (Kong example):**
+
+```yaml
+# Kong declarative config for rate limiting
+_format_version: "3.0"
+services:
+  - name: orders-service
+    host: orders.internal
+    port: 8080
+    routes:
+      - name: orders-route
+        paths:
+          - /api/v1/orders
+    plugins:
+      - name: rate-limiting
+        config:
+          second: null
+          minute: 1000
+          hour: 50000
+          policy: redis
+          redis_host: redis-cluster.rate-limiting.svc
+          redis_port: 6379
+          redis_database: 0
+          redis_timeout: 2000
+          fault_tolerant: true
+          hide_client_headers: false
+          limit_by: consumer  # consumer, credential, ip, service, path, header
+```
+
+**Key configuration parameters:**
+- **policy**: `redis` for production (shared state), `local` for development (per-node, inaccurate)
+- **fault_tolerant**: If true, allow the request when Redis is unreachable (degraded mode)
+- **limit_by**: How to identify the client — by consumer (API key), credential, IP, or a custom header
+- **hide_client_headers**: Controls whether `X-RateLimit-*` headers are sent to the client
+
+**Response headers the API gateway should return:**
+
+```
+HTTP/1.1 200 OK (or 429 Too Many Requests)
+X-RateLimit-Limit: 1000
+X-RateLimit-Remaining: 842
+X-RateLimit-Reset: 1625097600
+Retry-After: 37
+```
+
+These headers let the client understand their current rate limit state and back off appropriately. The `Retry-After` header on 429 responses tells the client how many seconds to wait before retrying.
+
+### Pattern 2: CDN Edge Rate Limiting
+
+Rate limiting at the CDN edge is the fastest enforcement point. It stops abusive traffic before it reaches your origin servers, saving bandwidth and compute costs. The trade-off is that CDN rate limiting is less flexible — you are limited by the features of your CDN provider.
+
+<AsciiDiagram
+  id="rate-limiting/arch-cdn-edge"
+  title="CDN Edge Rate Limiting"
+  alt="CDN edge rate limiting architecture: client requests hit a CDN edge POP (200+ locations worldwide). The edge node checks rate limits using a local counter. If within limits, the request is served from cache or forwarded to origin. If over limits, a 429 response is returned from the edge. Rate limit counters are periodically synced to a central configuration store."
+  caption="CDN edge rate limiting stops abusive traffic at 200+ global POPs before it reaches origin servers."
+  content={`
+┌──────────────┐
+│   Client      │
+│  (IP: 1.2.3.4)│
+└──────┬───────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                       CDN Edge POP (200 locations)                    │
+│                                                                       │
+│  ┌──────────────────────────────────────────────────────────────────┐│
+│  │  Edge Rate Limiter (per-POP, in-memory)                          ││
+│  │                                                                   ││
+│  │  ┌─────────────────────────────────────────────────────────────┐ ││
+│  │  │  Check 1: IP-based rate limit (100 req/min per IP)          │ ││
+│  │  │  Check 2: Geo-based rate limit (10,000 req/min per region)  │ ││
+│  │  │  Check 3: Path-based rate limit (5,000 req/min per endpoint)│ ││
+│  │  │  Check 4: User-Agent rate limit (1,000 req/min per UA)      │ ││
+│  │  └─────────────────────────────────────────────────────────────┘ ││
+│  │                                                                   ││
+│  │  Decision:                                                       ││
+│  │    ALLOW → serve from cache or forward to origin                 ││
+│  │    DENY  → return 429 from edge (no origin hit)                  ││
+│  └──────────────────────────────────────────────────────────────────┘│
+│                                                                       │
+│  ┌──────────────────────────────────────────────────────────────────┐│
+│  │  Rate Limit Config Sync                                          ││
+│  │  Central config ──> Edge POPs (every 60 seconds)                ││
+│  │  Edge counters ──> Central analytics (every 5 minutes)          ││
+│  └──────────────────────────────────────────────────────────────────┘│
+└──────────────────────────────────────────────────────────────────────┘
+       │
+       │ (if allowed and cache miss)
+       ▼
+┌──────────────┐
+│  Origin       │
+│  Server       │
+│  (protected)  │
+└──────────────┘
+
+Edge vs Origin Rate Limiting:
+┌─────────────────────────┬──────────────────┬──────────────────┐
+│                         │ Edge             │ Origin           │
+├─────────────────────────┼──────────────────┼──────────────────┤
+│ Latency impact          │ 0ms (local)      │ +1-5ms (network) │
+│ Origin traffic savings  │ 100% for blocked │ 0% for blocked   │
+│                        │ requests         │ requests         │
+│ Global accuracy         │ Eventual (per-   │ Strong (Redis)   │
+│                        │ POP counters)    │                  │
+│ Configuration flex      │ Limited (provider│ Full control     │
+│                        │ API)             │                  │
+│ Failure mode            │ Per-POP only     │ Global           │
+└─────────────────────────┴──────────────────┴──────────────────┘
+  `}
+/>
+
+**CDN edge rate limiting strategies:**
+
+- **IP-based rate limiting**: The simplest edge strategy. Block IPs that exceed a threshold (e.g., 100 requests per minute). This is effective against DDoS attacks from a small number of IPs but ineffective against distributed attacks (thousands of unique IPs each sending one request).
+- **Geo-based rate limiting**: Block or throttle traffic from regions where you do not have users. If your application is US-only, blocking traffic from outside North America at the edge eliminates 30-50% of automated abuse.
+- **Path-based rate limiting**: Protect expensive endpoints (search, checkout, data export) with stricter limits at the edge. A search endpoint might have a 10 req/min limit per IP, while a static page has no limit.
+- **User-Agent rate limiting**: Block or throttle requests with suspicious User-Agent headers (e.g., curl, python-requests, or missing User-Agent). This catches scripted attacks that do not bother to spoof a browser User-Agent.
+
+**Cloudflare rate limiting example (abbreviated):**
+
+```json
+{
+  "rules": [
+    {
+      "expression": "(http.request.uri.path eq \"/api/v1/login\")",
+      "actions": [{
+        "mode": "rate_limit",
+        "rate_limit": {
+          "characteristics": ["ip.src"],
+          "requests_per_period": 10,
+          "period": "60s",
+          "mitigation_timeout": 300
+        }
+      }]
+    }
+  ]
+}
+```
+
+### Pattern 3: Microservice Rate Limiting
+
+In a microservice architecture, each service must enforce its own rate limits. The API gateway rate limit is a coarse first line of defense, but individual services need finer-grained control — especially when one service calls another.
+
+<AsciiDiagram
+  id="rate-limiting/arch-microservice"
+  title="Microservice Rate Limiting"
+  alt="Microservice rate limiting with per-service limits: a user service calls order service, which calls payment service. Each service has its own rate limit configuration stored in shared Redis. The order service limits calls from user service to 500 req/min, and limits calls from payment service callback to 200 req/min. Circuit breakers protect downstream services from overload."
+  caption="Each microservice enforces its own rate limits per upstream caller, with circuit breakers for downstream protection."
+  content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Microservice Rate Limiting                          │
+│                                                                         │
+│  ┌────────────────┐     ┌────────────────┐     ┌────────────────┐      │
+│  │  User Service   │────>│  Order Service  │────>│  Payment Service │      │
+│  │                 │     │                 │     │                  │      │
+│  │  Rate limit:    │     │  Rate limit:    │     │  Rate limit:     │      │
+│  │  - 1000/min     │     │  - 500/min      │     │  - 200/min       │      │
+│  │    per user     │     │    from user svc │     │    from order svc│      │
+│  │  - 100/min      │     │  - 200/min      │     │  - 50/min        │      │
+│  │    per endpoint │     │    from admin svc│     │    from admin svc│      │
+│  │                 │     │                 │     │                  │      │
+│  │  Local bucket   │     │  Local bucket   │     │  Local bucket   │      │
+│  │  + Redis sync   │     │  + Redis sync   │     │  + Redis sync   │      │
+│  └────────────────┘     └────────────────┘     └────────────────┘      │
+│         │                      │                      │                 │
+│         └──────────────────────┼──────────────────────┘                 │
+│                                │                                        │
+│                        ┌───────▼────────┐                              │
+│                        │  {Redis        │                              │
+│                        │   Cluster}     │                              │
+│                        │                │                              │
+│                        │  Shared rate   │                              │
+│                        │  limit counters │                              │
+│                        └────────────────┘                              │
+│                                                                         │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │  Per-Service Rate Limit Configuration                           │     │
+│  │                                                                 │     │
+│  │  order-service: {                                               │     │
+│  │    "user-service": {max: 500, window: 60, burst: 100},         │     │
+│  │    "admin-service": {max: 200, window: 60, burst: 50},         │     │
+│  │    "internal-cron": {max: 1000, window: 60, burst: 500}        │     │
+│  │  }                                                               │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Cascading Failure Prevention:
+  User Service flood ──> Order Service rate limit kicks in
+                        Order Service returns 429 to User Service
+                        User Service retries with exponential backoff
+                        No pressure on Payment Service
+  `}
+/>
+
+**Microservice rate limiting strategies:**
+
+- **Per-caller limits**: Each service tracks how many requests each upstream service sends. This prevents one noisy neighbor from starving others. The order service tracks requests from the user service separately from requests from the admin service.
+- **Per-endpoint limits**: Expensive endpoints (e.g., report generation, data export) get stricter limits than cheap endpoints (e.g., list items, get by ID). A report generation endpoint might have a 10 req/min limit while a list endpoint has 1000 req/min.
+- **Circuit breaker integration**: Rate limiting and circuit breakers work together. The rate limiter prevents the caller from sending too many requests. The circuit breaker prevents the callee from being overwhelmed when it is already degraded. Configure the circuit breaker to open when the rate limiter is returning 429 for more than 50% of requests.
+- **Propagate rate limit state**: Include rate limit headers in inter-service HTTP calls. The caller sees `X-RateLimit-Remaining: 12` and can slow down before hitting the limit. This prevents cascading 429 responses.
+
+The service mesh approach (Envoy + Istio) lets you enforce rate limits at the network level without modifying application code. Every sidecar proxy enforces limits before the request reaches the application process.
+
+### Pattern 4: Authentication Service Rate Limiting
+
+The authentication service (login, signup, password reset, MFA) requires the most aggressive rate limiting. A brute-force attack on login endpoints is one of the most common security threats. The rate limiting strategy for auth must be stricter than any other service.
+
+<AsciiDiagram
+  id="rate-limiting/arch-auth-service"
+  title="Authentication Service Rate Limiting"
+  alt="Authentication service rate limiting with multiple layers: per-IP rate limit for login attempts, per-account rate limit after failed attempts, per-device rate limit, and global rate limit for suspicious patterns. Failed login attempts increment an account lockout counter. After 5 failed attempts, the account is locked for 15 minutes. A separate Redis cluster stores auth-specific rate limit counters."
+  caption="Authentication rate limiting uses multiple layers of protection: per-IP, per-account, per-device, and global suspicious pattern detection."
+  content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Authentication Service                              │
+│                                                                         │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │  Rate Limit Layers (checked in order, most restrictive wins)    │     │
+│  │                                                                 │     │
+│  │  Layer 1: Per-IP (5 attempts/min per IP)                       │     │
+│  │    ┌──────────────────────────────────────────────────────┐    │     │
+│  │    │  ALLOW  │  IP: 1.2.3.4 has 3 attempts this minute   │    │     │
+│  │    │  DENY   │  IP: 5.6.7.8 has 8 attempts this minute   │    │     │
+│  │    └──────────────────────────────────────────────────────┘    │     │
+│  │                                                                 │     │
+│  │  Layer 2: Per-Account (3 failed attempts/min per username)     │     │
+│  │    ┌──────────────────────────────────────────────────────┐    │     │
+│  │    │  ALLOW  │  user@example.com: 1 failed attempt       │    │     │
+│  │    │  DENY   │  admin@company.com: 5 failed attempts     │    │     │
+│  │    │  LOCK   │  user@example.com: 10 failed (locked 15m) │    │     │
+│  │    └──────────────────────────────────────────────────────┘    │     │
+│  │                                                                 │     │
+│  │  Layer 3: Per-Device (10 attempts/min per device fingerprint)  │     │
+│  │    ┌──────────────────────────────────────────────────────┐    │     │
+│  │    │  ALLOW  │  Device ABC: 4 attempts this minute       │    │     │
+│  │    │  DENY   │  Device XYZ: 15 attempts this minute      │    │     │
+│  │    └──────────────────────────────────────────────────────┘    │     │
+│  │                                                                 │     │
+│  │  Layer 4: Global Suspicious Pattern Detection                  │     │
+│  │    ┌──────────────────────────────────────────────────────┐    │     │
+│  │    │  1000+ failed attempts from same /24 subnet in 5m   │    │     │
+│  │    │  → Block entire subnet for 30 minutes               │    │     │
+│  │    │  5000+ failed attempts globally in 1 minute          │    │     │
+│  │    │  → Enable CAPTCHA for all login attempts             │    │     │
+│  │    └──────────────────────────────────────────────────────┘    │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │  Auth-Specific Redis Keys                                       │     │
+│  │                                                                 │     │
+│  │  ratelimit:auth:ip:1.2.3.4:minute     → 3 (TTL: 60s)           │     │
+│  │  ratelimit:auth:user:user@example.com → 5 (TTL: 60s)           │     │
+│  │  ratelimit:auth:lock:user@example.com → 1 (TTL: 900s)          │     │
+│  │  ratelimit:auth:device:ABC:minute     → 4 (TTL: 60s)           │     │
+│  │  ratelimit:auth:subnet:1.2.3.0/24     → 850 (TTL: 300s)        │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Auth Rate Limit Tiers:
+┌──────────────┬──────────────┬──────────────┬──────────────┐
+│ Endpoint     │ Per-IP       │ Per-Account  │ Lockout      │
+├──────────────┼──────────────┼──────────────┼──────────────┤
+│ POST /login  │ 5/min        │ 3/min        │ 10 → 15 min  │
+│ POST /signup │ 3/min        │ 1/min/IP     │ N/A          │
+│ POST /reset  │ 2/min        │ 1/min/email  │ 5 → 60 min   │
+│ POST /mfa    │ 10/min       │ 5/min/user   │ 15 → 30 min  │
+└──────────────┴──────────────┴──────────────┴──────────────┘
+  `}
+/>
+
+**Auth rate limiting best practices:**
+
+- **Never reveal whether the username exists**: Return a generic "Invalid credentials" message regardless of whether the username is valid. If you return "User not found" for invalid usernames and "Invalid password" for valid usernames, you are helping attackers enumerate valid accounts.
+- **Account lockout with exponential backoff**: After 5 failed attempts, lock for 15 minutes. After 10, lock for 1 hour. After 20, lock until manually unlocked. This makes brute-force attacks impractical.
+- **CAPTCHA escalation**: Instead of locking accounts outright, introduce CAPTCHA after the first rate limit violation. Humans can solve CAPTCHAs. Automated scripts cannot. Apply CAPTCHA to all requests from the suspected IP or account for the next hour.
+- **Separate Redis instance for auth**: Auth rate limiting has different latency and durability requirements than general API rate limiting. Use a dedicated Redis instance with `maxmemory-policy: allkeys-lru` and ensure it has enough capacity to never evict active rate limit keys.
+
+## Multi-Region Rate Limiting
+
+When your application runs in multiple regions, rate limiting becomes significantly harder. Each region has its own Redis cluster, and a user can send requests to any region. You need eventually consistent rate counters that converge across regions.
+
+<AsciiDiagram
+  id="rate-limiting/arch-multi-region"
+  title="Multi-Region Rate Limiting"
+  alt="Multi-region rate limiting architecture with three geographic regions (US, EU, AP). Each region has its own local Redis cluster and application nodes. Rate counters are eventually consistent across regions using CRDT-based replication. A global configuration store pushes rate limit rules to all regions. Users may be routed to any region, but their rate limit counters are synchronized across regions with a configurable staleness window."
+  caption="Multi-region rate limiting uses eventually consistent CRDT counters with a configurable staleness window to coordinate across regions."
+  content={`
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      Global Rate Limiting Across Regions                          │
+│                                                                                   │
+│  ┌─────────────── US-East ───────────────┐  ┌─────────────── EU-West ───────────┐│
+│  │                                       │  │                                     ││
+│  │  ┌────────────┐  ┌────────────┐      │  │  ┌────────────┐  ┌────────────┐    ││
+│  │  │  App       │  │  App       │      │  │  │  App       │  │  App       │    ││
+│  │  │  Node 1    │  │  Node 2    │      │  │  │  Node 1    │  │  Node 2    │    ││
+│  │  └─────┬──────┘  └─────┬──────┘      │  │  └─────┬──────┘  └─────┬──────┘    ││
+│  │        │               │             │  │        │               │           ││
+│  │  ┌─────▼───────────────▼──────┐      │  │  ┌─────▼───────────────▼──────┐    ││
+│  │  │     {Redis Cluster US}     │      │  │  │     {Redis Cluster EU}     │    ││
+│  │  │  Local counters:           │      │  │  │  Local counters:           │    ││
+│  │  │  user:42:minute = 45       │      │  │  │  user:42:minute = 30       │    ││
+│  │  │  user:99:minute = 12       │      │  │  │  user:99:minute = 8        │    ││
+│  │  │  ip:1.2.3.4:minute = 5    │      │  │  │  ip:1.2.3.4:minute = 2    │    ││
+│  │  └────────────┬───────────────┘      │  │  └────────────┬───────────────┘    ││
+│  │               │                     │  │               │                     ││
+│  └───────────────┼─────────────────────┘  └───────────────┼─────────────────────┘│
+│                  │                                         │                      │
+│                  │         CRDT Replication                │                      │
+│                  │  ┌──────────────────────────────────┐   │                      │
+│                  └──│  Eventually consistent counters   │──┘                      │
+│                     │  - Merge interval: 5 seconds      │                         │
+│                     │  - Max staleness: 10 seconds      │                         │
+│                     │  - Conflict resolution: MAX       │                         │
+│                     │  - Each region has a local replica │                         │
+│                     └──────────────────────────────────┘                          │
+│                                                                                   │
+│  ┌─────────────── Asia-Pacific ────────────┐                                     │
+│  │                                         │                                     │
+│  │  ┌────────────┐  ┌────────────┐        │                                     │
+│  │  │  App       │  │  App       │        │                                     │
+│  │  │  Node 1    │  │  Node 2    │        │                                     │
+│  │  └─────┬──────┘  └─────┬──────┘        │                                     │
+│  │        │               │               │                                     │
+│  │  ┌─────▼───────────────▼──────┐        │                                     │
+│  │  │     {Redis Cluster AP}     │        │                                     │
+│  │  │  Local counters:           │        │                                     │
+│  │  │  user:42:minute = 15       │        │                                     │
+│  │  │  user:99:minute = 3        │        │                                     │
+│  │  │  ip:1.2.3.4:minute = 1    │        │                                     │
+│  │  └────────────────────────────┘        │                                     │
+│  └─────────────────────────────────────────┘                                     │
+│                                                                                   │
+│  Global Rate Limit: 100 req/min for user:42                                      │
+│  Current total (SUM of all regions): 45 + 30 + 15 = 90                          │
+│  Remaining budget: 10 requests across all regions                                │
+│                                                                                   │
+│  Staleness window: 10 seconds                                                    │
+│  Worst-case overshoot: 3 regions x 10 seconds x 10 req/s = 300 extra requests  │
+│  To stay safe: set global limit to 70, not 100 (30% safety margin)              │
+└─────────────────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Eventually Consistent Counters
+
+The key insight for multi-region rate limiting is that you cannot have strong consistency across regions without adding significant latency. Every request to a global counter would need to wait for responses from all regions — adding 100-300ms of latency. Instead, you accept eventual consistency and account for the staleness.
+
+**CRDT (Conflict-Free Replicated Data Type) counters:**
+- Each region maintains a local counter for each rate limit key.
+- Every 5 seconds, regions exchange counter values using a gossip protocol.
+- When two regions report different values for the same key, the merge rule is MAX (the highest value wins).
+- Each region keeps a local replica of the merged counter from other regions.
+
+**Staleness budget:**
+- If the maximum staleness is 10 seconds and users can send 10 requests per second from each region, the worst-case overshoot is 3 regions x 10 seconds x 10 req/s = 300 extra requests.
+- To stay within a hard limit of 100 req/min, configure the limit to 70 on each region. This gives you a 30% safety margin for staleness.
+- For stricter limits, reduce the staleness window (more frequent syncs) or increase the safety margin.
+
+**Handling user migration:**
+- A user starts in US-East, sends 50 requests, then switches to EU-West.
+- The EU-West counter may not have the latest US-East count for up to 10 seconds.
+- During this window, the user can exceed the limit by sending requests in EU-West.
+- After the sync, the EU-West counter merges with the US-East count, and the user is correctly limited.
+
+### Global Coordination Strategies
+
+You have three strategies for coordinating rate limits across regions, each with different trade-offs.
+
+**Strategy 1: Strict Global (Strong Consistency)**
+
+Use a single Redis cluster in one region for all rate limit checks. Every request to every region must read from this cluster.
+
+```
+Pros:  Accurate, no overshoot
+Cons:  +200ms latency for non-local regions
+       Single point of failure
+       Bandwidth costs (all regions send all requests to one Redis)
+       Not viable for global applications
+```
+
+**Strategy 2: Per-Region with Safety Margin (Recommended)**
+
+Each region has its own Redis cluster. Rate limits are configured lower than the true limit to account for staleness.
+
+```
+Pros:  Low latency (local Redis)
+       No single point of failure
+       Scales to any number of regions
+Cons:  Overshoot possible during staleness window
+       Requires careful safety margin calculation
+       Users who switch regions can briefly exceed limits
+```
+
+**Strategy 3: Centralized with Local Cache**
+
+A single authoritative Redis cluster in one region. Each region has a local Redis cache that serves rate limit checks with a configurable TTL. The local cache is refreshed asynchronously from the central cluster.
+
+```
+Pros:  Eventual accuracy (no permanent overshoot)
+       Lower latency than Strategy 1
+       Central cluster is the source of truth
+Cons:  Central cluster is still a SPOF
+       Local cache returns stale data during refresh interval
+       Higher bandwidth costs than Strategy 2
+```
+
+**Recommendation:** Start with Strategy 2 (per-region with safety margin). It is the simplest, most resilient, and most scalable. The safety margin is a small downside (you leave some capacity unused) but the operational simplicity is worth it. Move to Strategy 3 only if you need tighter accuracy and can tolerate the central cluster dependency.
+
+## Capacity Planning for Rate Limiting
+
+Rate limiting infrastructure must be provisioned for peak traffic plus a safety margin. If the rate limiter itself becomes a bottleneck, the system is unprotected at the moment it needs protection most.
+
+### Redis Memory for Rate Counters
+
+Each rate limit counter in Redis consumes memory. The exact amount depends on the key structure, the value size, and the TTL.
+
+```
+Memory per counter entry:
+
+  Key:    "ratelimit:user:42:api:1740960000"  → ~45 bytes
+  Value:  "85"                                → ~3 bytes (as string)
+  Redis overhead:                             → ~50 bytes (dict entry, etc.)
+  TTL metadata:                               → ~20 bytes
+  ──────────────────────────────────────────────
+  Total per counter:                          → ~120 bytes
+
+With 1 million active users and 3 rate limit keys per user:
+  1,000,000 * 3 * 120 bytes = 360 MB
+
+With 10 million active users:
+  10,000,000 * 3 * 120 bytes = 3.6 GB
+
+Additional keys:
+  IP-based limits: 100,000 active IPs * 2 keys * 120 bytes = 24 MB
+  Global limits: 100 endpoints * 1 key * 120 bytes = 12 KB
+  Auth limits: 1,000,000 users * 4 keys * 120 bytes = 480 MB
+
+Total estimated memory for 10M users:
+  User limits:    3.6 GB
+  IP limits:      24 MB
+  Auth limits:    480 MB
+  Global limits:  12 KB
+  ─────────────────────
+  Total:          ~4.1 GB
+  With 50% buffer: ~6.2 GB
+```
+
+**Memory sizing rules:**
+- Estimate 120-150 bytes per active counter entry.
+- Count only active users (users who made a request in the last window), not total registered users.
+- Add 50% buffer for unexpected spikes and key expansion.
+- Add 30% for replication overhead (Redis replica nodes maintain their own copy).
+- Set `maxmemory` on each Redis node to prevent OOM crashes.
+- Configure `maxmemory-policy: allkeys-lru` so Redis evicts least-recently-used keys when memory is full.
+
+### QPS Limits for the Rate Limiter Itself
+
+The rate limiter must handle the full request throughput of your application. Each request triggers at least one Redis command (INCR or GET + INCR). If the rate limiter cannot keep up, requests are allowed through without checking — defeating the purpose.
+
+```
+Redis single-node throughput: ~100,000 INCR operations/sec
+Redis cluster (3 shards): ~300,000 INCR operations/sec
+Redis cluster (12 shards): ~1,200,000 INCR operations/sec
+
+If your application handles 500,000 requests per second:
+  - Each request triggers 1 INCR (rate limit check)
+  - Total: 500,000 INCR operations/sec
+  - Redis cluster needed: 5-6 shards (with 50% headroom)
+
+If your application handles 2,000,000 requests per second:
+  - Each request triggers 1 INCR
+  - Total: 2,000,000 INCR operations/sec
+  - Redis cluster needed: 20-25 shards
+  - Consider: local rate limiter to reduce Redis load by 90%
+```
+
+**Reducing Redis load with local rate limiting:**
+- If the local token bucket handles 90% of requests (fast path), only 10% reach Redis.
+- 2,000,000 RPS application → 200,000 Redis INCR/sec → 2-3 shards instead of 20-25.
+- This is the primary benefit of the hybrid approach described earlier.
+
+### Quota Storage
+
+Rate quotas (the configuration that defines how many requests each user or tier is allowed) must be stored separately from the counters. Quotas change infrequently and must survive Redis restarts.
+
+<AsciiDiagram
+  id="rate-limiting/arch-quota-storage"
+  title="Rate Limit Quota Storage Architecture"
+  alt="Rate limit quota storage: a database stores the authoritative quota configuration (user tiers, limits, burst sizes). A cache layer (Redis) stores frequently accessed quotas. A background sync job refreshes the cache every 60 seconds. Each application node reads from the local cache first, then falls back to Redis, then falls back to the database."
+  caption="Quota configuration is stored in a database, cached in Redis, and refreshed periodically by a background sync job."
+  content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Quota Storage Architecture                        │
+│                                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                  │
+│  │  App Node 1  │  │  App Node 2  │  │  App Node 3  │                  │
+│  │              │  │              │  │              │                  │
+│  │  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │                  │
+│  │  │ Local  │  │  │  │ Local  │  │  │  │ Local  │  │                  │
+│  │  │ Quota  │  │  │  │ Quota  │  │  │  │ Quota  │  │                  │
+│  │  │ Cache  │  │  │  │ Cache  │  │  │  │ Cache  │  │                  │
+│  │  │ 60s    │  │  │  │ 60s    │  │  │  │ 60s    │  │                  │
+│  │  │ TTL    │  │  │  │ TTL    │  │  │  │ TTL    │  │                  │
+│  │  └───┬────┘  │  │  └───┬────┘  │  │  └───┬────┘  │                  │
+│  └──────┼───────┘  └──────┼───────┘  └──────┼───────┘                  │
+│         │                 │                 │                           │
+│         └─────────────────┼─────────────────┘                           │
+│                           │                                             │
+│                    ┌──────▼───────┐                                     │
+│                    │  {Redis      │                                     │
+│                    │   Quota      │                                     │
+│                    │   Cache}     │                                     │
+│                    │              │                                     │
+│                    │  user:42     │                                     │
+│                    │  → {tier:    │                                     │
+│                    │    "pro",    │                                     │
+│                    │    max: 100K,│                                     │
+│                    │    burst: 5K}│                                     │
+│                    │              │                                     │
+│                    │  user:99     │                                     │
+│                    │  → {tier:    │                                     │
+│                    │    "free",   │                                     │
+│                    │    max: 1K,  │                                     │
+│                    │    burst: 100}│                                    │
+│                    └──────┬───────┘                                     │
+│                           │                                             │
+│                    ┌──────▼───────┐                                     │
+│                    │  ((Database  │                                     │
+│                    │   Quota      │                                     │
+│                    │   Source))   │                                     │
+│                    │              │                                     │
+│                    │  Table:      │                                     │
+│                    │  rate_limits │                                     │
+│                    │  ┌──────────┐│                                     │
+│                    │  │ user_id  ││                                     │
+│                    │  │ tier     ││                                     │
+│                    │  │ max_rpm  ││                                     │
+│                    │  │ max_burst││                                     │
+│                    │  │ updated  ││                                     │
+│                    │  └──────────┘│                                     │
+│                    └──────────────┘                                     │
+│                                                                         │
+│  Background Sync Job (every 60 seconds):                                │
+│  SELECT * FROM rate_limits WHERE updated > last_sync                    │
+│  → For each changed quota: SET redis key                                │
+│  → Log: "Synced 142 quota changes in 300ms"                            │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Quota Schema:
+┌──────────────┬────────────┬──────────────┬──────────────┐
+│ user_id      │ tier       │ max_rpm      │ burst        │
+├──────────────┼────────────┼──────────────┼──────────────┤
+│ user:42      │ enterprise │ 1,000,000    │ 50,000       │
+│ user:99      │ pro        │ 100,000      │ 5,000        │
+│ user:155     │ free       │ 1,000        │ 100          │
+│ api:stripe   │ system     │ 10,000,000   │ 500,000      │
+│ ip:internal  │ internal   │ unlimited    │ unlimited    │
+└──────────────┴────────────┴──────────────┴──────────────┘
+  `}
+/>
+
+**Quota storage best practices:**
+
+- **Database is the source of truth**: Store quota configuration in a relational database (PostgreSQL, MySQL) with a well-defined schema. Quotas change infrequently (hours or days, not seconds) so the database is not a bottleneck.
+- **Redis is the cache**: Cache active quotas in Redis with a 60-second TTL. This gives you sub-millisecond access during rate limit checks without hitting the database.
+- **Local cache on each node**: Each application node maintains an in-memory cache of the quotas it accesses most frequently. This eliminates Redis lookups for the hot path. Refresh every 60 seconds.
+- **Background sync**: A background job queries the database for changed quotas and updates Redis. This is more efficient than TTL-based expiry because it pushes changes immediately rather than waiting for the next cache miss.
+- **Bulk operations**: When a user upgrades their tier (e.g., free to pro), update the quota in the database, push to Redis, and broadcast an invalidation message to all nodes. The user's new rate limit takes effect within seconds.
+
+### Capacity Calculation Example
+
+```
+Rate Limiter Capacity Plan (500K RPS, 10M users)
+
+Throughput:
+  Application RPS:                   500,000
+  Redis INCR/sec (no local cache):   500,000
+  Redis INCR/sec (90% local cache):  50,000
+
+Redis Cluster (3 shards, 6 nodes):
+  Memory per master:        8 GB (6.2 GB counters + 1.8 GB buffer)
+  Node type:                r6g.xlarge (4 vCPU, 32 GB RAM)
+  Max throughput:           ~300,000 INCR/sec (3 shards)
+  Utilization with cache:   50,000 / 300,000 = 17%
+  Utilization without cache: 500,000 / 300,000 = 167% → need 10+ shards
+
+Memory per master:
+  User counters:           3.6 GB    Auth counters: 480 MB
+  IP counters:             24 MB     Quota cache:   500 MB
+  Redis overhead:          500 MB    Buffer (50%):  2.6 GB
+  ──────────────────────────────
+  Total:                   7.7 GB (fits in 8 GB maxmemory)
+
+Cost estimate (monthly):
+  Redis (6 x r6g.xlarge):  $2,400   Quota DB:       $200
+  ──────────────────────────────
+  Total:                   $2,600/month
+  Cost per million requests: $0.00012
+```
+
+### Key Configuration Values
+
+The following table summarizes the recommended configuration values for a production rate limiter based on the capacity analysis above.
+
+```
+┌─────────────────────────────────┬──────────────┬──────────────────────────┐
+│ Parameter                       │ Value        │ Notes                    │
+├─────────────────────────────────┼──────────────┼──────────────────────────┤
+│ Redis maxmemory per node        │ 8 GB         │ Enough for 10M users     │
+│ Redis maxmemory-policy          │ allkeys-lru  │ Evicts stale counters    │
+│ Redis cluster shards            │ 3-6          │ 3 for 500K RPS, 6 for 2M│
+│ Redis replica per shard         │ 1            │ Required for failover    │
+│ Local token bucket size         │ 20 tokens    │ Absorbs traffic spikes   │
+│ Local token refill rate         │ rate / 10    │ Covers 90% of traffic    │
+│ Redis timeout                   │ 50ms         │ Fail fast to degrade     │
+│ Redis max retries               │ 2            │ Avoid cascading failures │
+│ Quota cache TTL                 │ 60 seconds   │ Balances freshness vs    │
+│                                 │              │ database load            │
+│ Cross-region sync interval      │ 5 seconds    │ Balances staleness vs    │
+│                                 │              │ bandwidth                │
+│ Cross-region safety margin      │ 30%          │ Accounts for staleness   │
+│ Rate limit response headers     │ Always       │ Required for clients to  │
+│                                 │              │ self-regulate            │
+│ Degraded mode (Redis down)      │ Local only   │ Allow requests, log      │
+│                                 │              │ incident                 │
+└─────────────────────────────────┴──────────────┴──────────────────────────┘
+```
+
+## Operational Considerations
+
+Rate limiting infrastructure must be monitored as carefully as the application it protects. Key metrics and alerting thresholds:
+
+```
+Rate Limiter Metrics:
+  p50 latency: <1ms (local) / <2ms (Redis)        p99 latency: <5ms / <10ms
+  Local cache hit ratio: target >90%               Quota cache hit ratio: target >99%
+  Redis connection errors: 0/min                   Degraded mode activations: 0/min
+  429 rate by endpoint/tier/region                 False positive rate: <0.1%
+
+Alerting Thresholds:
+  Redis latency > 50ms for 5 min             → Check cluster health and network
+  Local cache hit ratio < 80%                → Increase local bucket size
+  Degraded mode active > 1 min               → Redis is unreachable, investigate
+  429 rate > 10% of total requests           → Spike or misconfigured limit
+  Quota sync failure > 5 min                 → Users may have stale quotas
+```
+
+---
+
+**Next up**: The [Trade-offs](rate-limiting-tradeoffs) section examines the hard choices — accuracy versus latency, simplicity versus flexibility, and cost versus precision — with a decision framework for choosing the right rate limiting strategy for your system.

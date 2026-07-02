@@ -1,0 +1,954 @@
+---
+id: authentication-deep-dive
+title: Authentication — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A production authentication system is not a single service that checks a password against a hash. It is a pipeline of seven subsystems, each with its own failure modes and performance characteristics.
+
+<AsciiDiagram
+  id="authentication/internal-arch"
+  title="Authentication System Internal Architecture"
+  content={`
+┌───────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              Authentication System Internal Architecture                        │
+│                                                                                               │
+│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────┐  ┌───────────────────────────┐    │
+│  │ Credential   │  │ Rate Limiter     │  │ Credential     │  │ MFA Service               │    │
+│  │ Collector    │  │                  │  │ Validator      │  │                           │    │
+│  │              │  │  ┌────────────┐  │  │                │  │  ┌───────────┐            │    │
+│  │  parse body  │──▶  │ per-IP     │──▶│  format check  │──▶│  │ TOTP      │            │    │
+│  │  parse header│  │  │ per-user   │  │  │ null/empty     │  │  │ generator │            │    │
+│  │  decode      │  │  │ per-route  │  │  │ type coercion  │  │  └───────────┘            │    │
+│  │  base64      │  │  └────────────┘  │  └────────────────┘  │  ┌───────────┐            │    │
+│  └──────────────┘  └──────────────────┘                      │  │ SMS /     │            │    │
+│                                                              │  │ Email OTP │            │    │
+│                                                              │  └───────────┘            │    │
+│                                                              │  ┌───────────┐            │    │
+│                                                              │  │ WebAuthn  │            │    │
+│                                                              │  │ / Passkey │            │    │
+│                                                              │  └───────────┘            │    │
+│                                                              └───────────────────────────┘    │
+│                                                                       │                       │
+│                                                                       ▼                       │
+│  ┌──────────────────┐  ┌────────────────────┐  ┌────────────────┐  ┌───────────────────────┐  │
+│  │ Password Hasher  │  │ Token Issuer       │  │ Session        │  │ User Store            │  │
+│  │                  │  │                    │  │ Manager        │  │                       │  │
+│  │  ┌────────────┐  │  │  ┌──────────────┐  │  │                │  │  ┌─────────────────┐  │  │
+│  │  │ bcrypt     │  │  │  │ JWT signing  │  │  │  ┌──────────┐  │  │  │ User DB         │  │  │
+│  │  │ (cost 12)  │  │  │  │ (RS256 /     │  │  │  │ Create   │  │  │  │ (users table)   │  │  │
+│  │  └────────────┘  │  │  │  ES256)      │  │  │  │ Read     │  │  │  └─────────────────┘  │  │
+│  │  ┌────────────┐  │  │  └──────────────┘  │  │  │ Update   │  │  │  ┌─────────────────┐  │  │
+│  │  │ argon2id   │  │  │  ┌──────────────┐  │  │  │ Delete   │  │  │  │ Credential DB   │  │  │
+│  │  │ (mem 64MB) │  │  │  │ Opaque token │  │  │  │ ────────▶│  │  │  │ (password       │  │  │
+│  │  └────────────┘  │  │  │ (session_id) │  │  │  │ Redis    │  │  │  │  hashes, MFA     │  │  │
+│  │  ┌────────────┐  │  │  └──────────────┘  │  │  └──────────┘  │  │  │  secrets)        │  │  │
+│  │  │ scrypt     │  │  └────────────────────┘  │  ┌──────────┐  │  │  └─────────────────┘  │  │
+│  │  │ (mem 16MB) │  │                          │  │ Invali-  │  │  ┌─────────────────┐  │  │
+│  │  └────────────┘  │                          │  │ date on  │  │  │ Audit Log       │  │  │
+│  │  ┌────────────┐  │                          │  │ logout / │  │  │ (login_attempts, │  │  │
+│  │  │ Salt       │  │                          │  │ password │  │  │  password_changes,│  │  │
+│  │  │ Generator  │  │                          │  │ change   │  │  │  MFA_enrollments) │  │  │
+│  │  └────────────┘  │                          │  └──────────┘  │  └─────────────────┘  │  │
+│  └──────────────────┘  └────────────────────┘  └────────────────┘  └───────────────────────┘  │
+│                                                                                               │
+│  ┌───────────────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                    Audit Logger                                           │ │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  │ │
+│  │  │ Login        │  │ Password     │  │ Account      │  │ Token        │  │ MFA        │  │ │
+│  │  │ Events       │  │ Changes      │  │ Lockouts     │  │ Refreshes    │  │ Events     │  │ │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘  └────────────┘  │ │
+│  └───────────────────────────────────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────────────────────────────────────┘
+
+Legend:
+  [ ] = Subsystem
+  ──▶  = Data flow direction
+`}
+  caption="Seven subsystems process every authentication request. The credential validator is the gatekeeper, the password hasher is the most CPU-intensive component, and the audit logger records every event for forensic analysis."
+/>
+
+## Data Structures -- Password Hashing Algorithms
+
+Password hashing is deliberately expensive. The three dominant algorithms -- bcrypt, scrypt, and argon2 -- each use a different strategy to resist brute-force and ASIC/GPU-based attacks.
+
+### bcrypt
+
+bcrypt embeds a cost factor directly into the algorithm. The cost factor (2^cost) determines the number of key expansion rounds. A cost of 12 means 2^12 = 4,096 rounds of Blowfish key expansion.
+
+| Property | Value |
+|---|---|
+| Algorithm | Blowfish-based key schedule + 64 iterations of the cipher |
+| Salt size | 16 bytes (128 bits) |
+| Hash output | 184 bits (23 bytes) encoded as 60-character string |
+| Memory usage | ~4 KB per hash (fixed, low) |
+| Time complexity | O(2^cost) -- each round is the same computation |
+| Space complexity | O(1) -- constant memory, no large buffers |
+| GPU resistance | Low -- fits easily in GPU shared memory |
+| Collision resistance | 2^184 |
+
+The output format embeds everything needed for verification:
+
+```
+$2b$12$WlI3qJk9X7M5pR2KvBnDzu4m1Yp8RfTgHjNkLpQwErTyUiOpAsDfGhJkLzXcV
+ \_/ \_/ \_____________________________________________________________/
+  |   |                          |
+  |   cost                    hash + salt
+  algorithm prefix
+```
+
+### scrypt
+
+scrypt adds memory hardness. It fills a large buffer with pseudo-random data, then reads from that buffer in a data-dependent pattern. This defeats ASIC attackers because the memory footprint is too large for chip-embedded SRAM.
+
+| Property | Value |
+|---|---|
+| Parameters | N (CPU/memory cost), r (block size), p (parallelization) |
+| Typical N | 2^14 = 16,384 (interactive), 2^20 = 1,048,576 (sensitive) |
+| Memory usage | 128 * N * r bytes -- typically 16 MB (N=2^14, r=8) |
+| Time complexity | O(N * r * p) |
+| Space complexity | O(N * r) -- proportional to N and r |
+| GPU resistance | High -- memory bandwidth bottleneck |
+| Collision resistance | 256-bit (SHA-256 finalization) |
+
+### argon2
+
+argon2 is the winner of the 2015 Password Hashing Competition. It has three variants: argon2d (data-dependent, GPU-resistant), argon2i (data-independent, side-channel resistant), and argon2id (hybrid, recommended).
+
+| Property | Value |
+|---|---|
+| Parameters | m (memory), t (time), p (parallelism) |
+| Typical m | 64 MB (interactive), 256 MB (sensitive) |
+| Typical t | 2 (interactive), 3 (sensitive) |
+| Typical p | 1 (single thread) |
+| Time complexity | O(m * t) -- memory accesses x iterations |
+| Space complexity | O(m) -- proportional to memory parameter |
+| GPU resistance | Very high -- memory bandwidth bottleneck + data-dependent access |
+| Side-channel resistance | High (argon2id) -- first pass uses i variant, rest uses d variant |
+
+### Why Salt Is Required
+
+Without a salt, two users with the same password produce the same hash. An attacker with a precomputed rainbow table can reverse the hash in seconds. With a per-user salt, each password hash is unique, and the attacker must brute-force each hash individually.
+
+<AsciiDiagram
+  id="authentication/hashing-process"
+  title="Password Hashing Process -- Salted Hash Generation"
+  content={`
+Password Hashing Process (argon2id example)
+
+                           ┌──────────────────────┐
+                           │   User Password       │
+                           │   "Tr0ub4dor&3"       │
+                           └──────────┬───────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        argon2id Hash Function                               │
+│                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  Initial block matrix (m blocks, each 1 KB)                         │   │
+│  │                                                                      │   │
+│  │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐   │   │
+│  │  │ B0   │ │ B1   │ │ B2   │ │ B3   │ │ B4   │ │ B5   │ │ ...  │   │   │
+│  │  │ P,S  │ │ P    │ │ P    │ │ P    │ │ P    │ │ P    │ │      │   │   │
+│  │  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘   │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                         │
+│    ┌───────────────────────────────┼───────────────────────────────┐         │
+│    │   t=1 (data-independent)     │     t=2 (data-dependent)      │         │
+│    │   ┌──────┐ ┌──────┐          │     ┌──────┐ ┌──────┐        │         │
+│    │   │ B0'  │ │ B1'  │          │     │ B0"  │ │ B1"  │        │         │
+│    │   │P,S,  │ │P,B0' │          │     │P,S,  │ │P,B0" │        │         │
+│    │   │Bm-1  │ │(rand)│          │     │Bm-1' │ │(rand)│        │         │
+│    │   └──────┘ └──────┘          │     └──────┘ └──────┘        │         │
+│    │   ... block lanes ...        │     ... block lanes ...       │         │
+│    └──────────────────────────────┴───────────────────────────────┘         │
+│                                    │                                         │
+│                                    ▼                                         │
+│                     ┌──────────────────────────┐                            │
+│                     │   Finalization: XOR all  │                            │
+│                     │   blocks, Blake2b hash   │                            │
+│                     └───────────┬──────────────┘                            │
+└─────────────────────────────────┼───────────────────────────────────────────┘
+                                  │
+                                  ▼
+                   ┌──────────────────────────────┐
+                   │  $argon2id$v=19$m=65536,     │
+                   │  t=2,p=1$<salt>$<hash>       │
+                   └──────────────────────────────┘
+                                  │
+                                  ▼
+                   ┌──────────────────────────────┐
+                   │  Stored in credential DB      │
+                   │  ┌────────────────────────┐   │
+                   │  │ user_id | hash_string  │   │
+                   │  │ 42      | $argon2id... │   │
+                   │  │ 99      | $2b$12...    │   │
+                   │  └────────────────────────┘   │
+                   └──────────────────────────────┘
+
+Legend:
+  P = password bytes     S = salt bytes
+  B0 = seed block        Bn = derived block
+  (rand) = data-dependent memory access
+  m = memory in KB       t = time iterations
+  p = parallelism lanes
+`}
+  caption="argon2id fills a memory buffer with pseudo-random blocks, then reads from that buffer in a data-dependent pattern. The memory cost (m=65536 = 64 MB) makes it infeasible to implement on an ASIC with on-chip SRAM. The time cost (t=2) adds computational iterations."
+/>
+
+### Comparison Summary
+
+| Algorithm | Cost per hash (modern CPU) | Memory per hash | GPU resistance | Recommended for |
+|---|---|---|---|---|
+| bcrypt cost 10 | ~80 ms | 4 KB | Low | Legacy systems, low-traffic APIs |
+| bcrypt cost 12 | ~250 ms | 4 KB | Low | Most web applications (default) |
+| bcrypt cost 14 | ~1,000 ms | 4 KB | Low | Admin accounts, high-security |
+| scrypt N=2^14 r=8 p=1 | ~150 ms | 16 MB | Medium | General purpose, password managers |
+| argon2id m=64MB t=2 p=1 | ~200 ms | 64 MB | High | New systems, high-security apps |
+| argon2id m=256MB t=3 p=1 | ~1,200 ms | 256 MB | Very high | Key derivation, cryptocurrency |
+
+## Request Lifecycle -- 12 Steps from Credential to Session
+
+Every login request passes through a 12-step pipeline. Each step has a measurable latency budget.
+
+### Step 1: Credential Submission
+
+The client sends a POST request to `/auth/login` with a JSON body containing `email` and `password`. The credential collector parses the body, validates the Content-Type header, and decodes base64-encoded credentials if present.
+
+### Step 2: Rate Limiting Check
+
+The rate limiter checks three keys: the client IP, the email address, and the global rate. If any exceeds its threshold, the request is rejected with HTTP 429 and a `Retry-After` header.
+
+### Step 3: Credential Validation
+
+The credential validator checks format rules: email format via regex, minimum password length, null byte injection, and SQL injection patterns. Invalid requests are rejected at this stage without touching the database or hasher.
+
+### Step 4: Credential Lookup
+
+The user store queries the credential database by email. If the user does not exist, the system returns a generic "invalid credentials" error (not "user not found") to prevent enumeration attacks.
+
+### Step 5: Password Verification
+
+The password hasher loads the stored hash string, extracts the algorithm identifier, salt, and cost parameters, and runs the hash function with the submitted password. The result is compared to the stored hash in constant time to prevent timing attacks.
+
+### Step 6: MFA Challenge (if enabled)
+
+If the user has MFA enabled, the MFA service generates a challenge. For TOTP, the service verifies the six-digit code against the current time window. For WebAuthn, the service sends a challenge nonce for the authenticator to sign.
+
+### Step 7: Token Issuance
+
+The token issuer generates one of two token types: a signed JWT (stateless, carries claims) or an opaque session ID (stateful, stored in Redis). The choice depends on the system architecture.
+
+### Step 8: Session Creation
+
+The session manager creates a session record in Redis (for opaque sessions) or encodes claims into the JWT (for stateless sessions). The session record includes the user ID, roles, permissions, expiration time, and a refresh token fingerprint.
+
+### Step 9: Audit Logging
+
+The audit logger records the login event: timestamp, user ID, IP address, user agent, success/failure status, and MFA method used. Failed attempts are logged with the reason for failure.
+
+### Step 10: Response Construction
+
+The authentication service constructs the HTTP response. For a successful login, it sets a secure, HttpOnly, SameSite cookie containing the session token or JWT. It also returns a refresh token in the response body (for SPAs to store in memory).
+
+### Step 11: Background Processing
+
+After the response is sent, the system triggers background tasks: updating the last login timestamp, clearing failed attempt counters, and enqueueing a login notification email.
+
+### Step 12: Client-Side Token Storage
+
+The client stores the token (cookie for browser apps, memory for mobile apps) and attaches it to subsequent requests via the `Authorization` header or cookie.
+
+<AsciiDiagram
+  id="authentication/lifecycle-overview"
+  title="Login Request Lifecycle -- 12 Steps"
+  content={`
+┌──────────┐    ┌────────────────────────────────────────────────────────────────────┐    ┌───────────┐
+│  Client  │    │                      Authentication Service                         │    │  Backend  │
+└────┬─────┘    └───┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬───────┘    └─────┬─────┘
+     │              │      │      │      │      │      │      │      │      │                  │
+     │  1. POST     │      │      │      │      │      │      │      │      │                  │
+     │  /auth/login │      │      │      │      │      │      │      │      │                  │
+     │─────────────▶│      │      │      │      │      │      │      │      │                  │
+     │              │  2. Rate Limit Check │      │      │      │      │      │                  │
+     │              │     (IP, email, global)      │      │      │      │      │                  │
+     │              │      │      │      │      │      │      │      │      │                  │
+     │              │  3. Validate Format          │      │      │      │      │                  │
+     │              │     (email regex, no SQLi)   │      │      │      │      │                  │
+     │              │      │      │      │      │      │      │      │      │                  │
+     │              │  4. Lookup User              │      │      │      │      │                  │
+     │              │─────────────────────────────────────────────────────────────────────▶  4a. DB query
+     │              │◀─────────────────────────────────────────────────────────────────────  4b. user row
+     │              │      │      │      │      │      │      │      │      │                  │
+     │              │  5. Verify Password          │      │      │      │      │                  │
+     │              │     (argon2id, 64 MB, t=2)   │      │      │      │      │                  │
+     │              │      │      │      │      │      │      │      │      │                  │
+     │              │  6. MFA Challenge            │      │      │      │      │                  │
+     │◀═══ 6b. TOTP prompt ═══│      │      │      │      │      │      │                  │
+     │═══ 6c. TOTP code ═════▶│      │      │      │      │      │      │                  │
+     │              │      │      │      │      │      │      │      │      │                  │
+     │              │  7. Issue Token              │      │      │      │      │                  │
+     │              │     (JWT RS256 or opaque)     │      │      │      │      │                  │
+     │              │      │      │      │      │      │      │      │      │                  │
+     │              │  8. Create Session           │      │      │      │      │                  │
+     │              │─────────────────────────────────────────────────────────────────────▶  8a. Redis SET
+     │              │◀─────────────────────────────────────────────────────────────────────  8b. OK
+     │              │      │      │      │      │      │      │      │      │                  │
+     │              │  9. Audit Log                │      │      │      │      │                  │
+     │              │─────────────────────────────────────────────────────────────────────▶  9a. Insert log
+     │              │      │      │      │      │      │      │      │      │                  │
+     │  10. HTTP 200│      │      │      │      │      │      │      │      │                  │
+     │  Set-Cookie  │      │      │      │      │      │      │      │      │                  │
+     │◀─────────────│      │      │      │      │      │      │      │      │                  │
+     │              │  11. Background Tasks        │      │      │      │      │                  │
+     │              │     (update last_login,       │      │      │      │      │                  │
+     │              │      clear fail counters,     │      │      │      │      │                  │
+     │              │      enqueue email)           │      │      │      │      │                  │
+     │              │      │      │      │      │      │      │      │      │                  │
+     │  12. Store   │      │      │      │      │      │      │      │      │                  │
+     │  token in    │      │      │      │      │      │      │      │      │                  │
+     │  cookie jar  │      │      │      │      │      │      │      │      │                  │
+     │              │      │      │      │      │      │      │      │      │                  │
+`}
+  caption="All 12 steps execute in sequence. Steps 5 (password hashing) and 8 (session creation) dominate the latency budget. The entire flow should complete in under 500 ms for a good user experience."
+/>
+
+### System State at Key Moments
+
+<AsciiDiagram
+  id="authentication/state-credential-lookup"
+  title="System State at Step 4 -- Credential Lookup"
+  content={`
+System State at Step 4 (Credential Lookup)
+
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  Request: POST /auth/login                                                           │
+│  Body:    {"email": "alice@example.com", "password": "correct-horse-battery-staple"} │
+│  Headers: Content-Type: application/json, User-Agent: Mozilla/5.0, X-Forwarded-For:  │
+│           203.0.113.42                                                               │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  Rate Limiter State                                                                  │
+│  ┌──────────────────┬──────────┬──────────┐   ┌──────────────────┬──────────┐        │
+│  │ Key              │ Count    │ Window   │   │ Key              │ Count    │        │
+│  ├──────────────────┼──────────┼──────────┤   ├──────────────────┼──────────┤        │
+│  │ ip:203.0.113.42  │ 3        │ 60s      │   │ ip:198.51.100.7  │ 47       │        │
+│  │ email:alice@ex   │ 1        │ 60s      │   │ email:admin@ex   │ 83       │        │
+│  │ global           │ 1420     │ 1s       │   │ global           │ 1530     │        │
+│  └──────────────────┴──────────┴──────────┘   └──────────────────┴──────────┘        │
+│  Result: PASS (3 < 10 limit, 1 < 5 limit, 1420 < 5000 limit)                        │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  User Store Query                                                                     │
+│                                                                                      │
+│  SQL: SELECT id, email, password_hash, mfa_enabled, mfa_type,                        │
+│            failed_attempts, locked_until, email_verified                              │
+│       FROM users WHERE email = 'alice@example.com'                                   │
+│                                                                                      │
+│  ┌──────┬──────────────────┬────────────────────────────────┬───────────┬────────┐  │
+│  │ id   │ email            │ password_hash                  │ mfa_type  │ locked │  │
+│  ├──────┼──────────────────┼────────────────────────────────┼───────────┼────────┤  │
+│  │ 42   │ alice@example.com│ $argon2id$v=19$m=65536,t=2,   │ totp      │ NULL   │  │
+│  │      │                  │ p=1$<salt>$<hash>              │           │        │  │
+│  └──────┴──────────────────┴────────────────────────────────┴───────────┴────────┘  │
+│                                                                                      │
+│  Result: FOUND (user exists, not locked, MFA enabled)                               │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+`}
+  caption="At step 4, the system has checked rate limits and is about to query the user store. The rate limiter shows three sliding windows. The user row shows the full credential state including the argon2id hash, MFA type, and lockout status."
+/>
+
+<AsciiDiagram
+  id="authentication/state-password-verify"
+  title="System State at Step 5 -- Password Verification"
+  content={`
+System State at Step 5 (Password Verification)
+
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  Password Hasher: argon2id                                                            │
+│                                                                                      │
+│  Submitted password: "correct-horse-battery-staple"                                  │
+│  Stored hash: $argon2id$v=19$m=65536,t=2,p=1$<salt>$<expected_hash>                 │
+│                                                                                      │
+│  Memory allocation: 64 MB buffer (65536 blocks x 1024 bytes)                         │
+│  Threads: 1 (p=1)                                                                    │
+│  Iterations: 2 (t=2)                                                                 │
+│                                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
+│  │  Phase 1 (data-independent): Fill memory with pseudo-random blocks              │ │
+│  │  ┌───────┐  ┌───────┐  ┌───────┐  ┌───────┐  ┌───────┐  ┌───────┐  ┌───────┐  │ │
+│  │  │ B0:   │  │ B1:   │  │ B2:   │  │ B3:   │  │ B4:   │  │ B5:   │  │ B6:   │  │ │
+│  │  │seed   │  │derived│  │derived│  │derived│  │derived│  │derived│  │derived│  │ │
+│  │  │P,S    │  │from   │  │from   │  │from   │  │from   │  │from   │  │from   │  │ │
+│  │  │       │  │B0,Bm-1│  │B1,Bm-2│  │B2,Bm-3│  │B3,Bm-4│  │B4,Bm-5│  │B5,Bm-6│  │ │
+│  │  └───────┘  └───────┘  └───────┘  └───────┘  └───────┘  └───────┘  └───────┘  │ │
+│  │                                                                                 │ │
+│  │  Phase 2 (data-dependent): Re-read blocks in random-access pattern              │ │
+│  │  ┌───────┐  ┌───────┐  ┌───────┐  ┌───────┐  ┌───────┐  ┌───────┐  ┌───────┐  │ │
+│  │  │ B0':  │  │ B1':  │  │ B2':  │  │ B3':  │  │ B4':  │  │ B5':  │  │ B6':  │  │ │
+│  │  │XOR    │  │XOR    │  │XOR    │  │XOR    │  │XOR    │  │XOR    │  │XOR    │  │ │
+│  │  │B0,B17 │  │B1,B3  │  │B2,B42 │  │B3,B9  │  │B4,B31 │  │B5,B12 │  │B6,B28 │  │ │
+│  │  └───────┘  └───────┘  └───────┘  └───────┘  └───────┘  └───────┘  └───────┘  │ │
+│  │                                                                                 │ │
+│  │  Finalization: Blake2b hash of all blocks                                       │ │
+│  │  computed_hash = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3" │ │
+│  └─────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                      │
+│  Comparison: constant-time memcmp(computed_hash, stored_hash)                         │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
+│  │  computed  │ d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3  │ │
+│  │  stored    │ d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3  │ │
+│  │  match?    │ YES                                                             │ │
+│  └─────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                      │
+│  Result: PASSWORD CORRECT (took 198 ms)                                              │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+`}
+  caption="At step 5, the password hasher allocates 64 MB of memory and runs two passes of the argon2id algorithm. The constant-time comparison ensures the verification takes the same duration regardless of how many bytes match, preventing timing side-channel attacks."
+/>
+
+<AsciiDiagram
+  id="authentication/state-session-created"
+  title="System State at Step 8 -- Session Created"
+  content={`
+System State at Step 8 (Session Created)
+
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  Token Issuer                                                                         │
+│                                                                                      │
+│  Token type: JWT (RS256 signed)                                                      │
+│  Private key: RSA 2048-bit (loaded at startup, never exposed to network)             │
+│                                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
+│  │  Header:  {"alg":"RS256","typ":"JWT","kid":"key-v2"}                           │ │
+│  │  Payload: {                                                                     │ │
+│  │    "sub": "42",                        -- user ID                              │ │
+│  │    "email": "alice@example.com",                                                │ │
+│  │    "roles": ["user", "premium"],       -- RBAC roles                           │ │
+│  │    "iat": 1727913600,                  -- issued at (unix ts)                  │ │
+│  │    "exp": 1727917200,                  -- expires in 1 hour (3600s)            │ │
+│  │    "jti": "550e8400-e29b-41d4-a716-446655440000",  -- unique token ID          │ │
+│  │    "mfa": true,                        -- MFA was verified                     │ │
+│  │    "sid": "sess_abc123"                -- server-side session ID               │ │
+│  │  }                                                                              │ │
+│  │  Signature: RS256(header + "." + payload, private_key)                          │ │
+│  └─────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                      │
+│  Result: JWT = eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0Mi...<truncated>    │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  Session Manager (Redis)                                                              │
+│                                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
+│  │  SET sess_abc123                                                                 │ │
+│  │  {                                                                               │ │
+│  │    "user_id": 42,                                                                │ │
+│  │    "email": "alice@example.com",                                                 │ │
+│  │    "created_at": "2026-07-02T12:00:00Z",                                        │ │
+│  │    "expires_at": "2026-07-02T13:00:00Z",                                        │ │
+│  │    "ip": "203.0.113.42",                                                        │ │
+│  │    "user_agent": "Mozilla/5.0",                                                 │ │
+│  │    "mfa_verified": true,                                                         │ │
+│  │    "refresh_token_hash": "a1b2c3d4e5..."                                        │ │
+│  │  }                                                                               │ │
+│  │  EX 3600    -- TTL: 1 hour                                                       │ │
+│  └─────────────────────────────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
+│  │  INCR user:42:login_count                                                       │ │
+│  │  SET user:42:last_login "2026-07-02T12:00:00Z"                                  │ │
+│  └─────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                      │
+│  Result: OK (session created, TTL set to 3600 seconds)                               │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  HTTP Response                                                                        │
+│                                                                                      │
+│  HTTP/1.1 200 OK                                                                     │
+│  Content-Type: application/json                                                      │
+│  Set-Cookie: session_token=eyJhbGciOiJSUzI1NiIs...; Path=/; HttpOnly; Secure;        │
+│              SameSite=Lax; Max-Age=3600                                              │
+│  Set-Cookie: refresh_token=rta1b2c3d4e5f6...; Path=/auth/refresh; HttpOnly; Secure;  │
+│              SameSite=Strict; Max-Age=2592000                                         │
+│                                                                                      │
+│  {                                                                                   │
+│    "user": {"id": 42, "email": "alice@example.com", "roles": ["user", "premium"]},  │
+│    "expires_in": 3600                                                                │
+│  }                                                                                   │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+`}
+  caption="At step 8, the session is committed to Redis with a 1-hour TTL and the JWT is signed with the RS256 private key. The response sets two cookies: a short-lived session token and a longer-lived refresh token. The refresh token can only be used on the refresh endpoint."
+/>
+
+## Consistency and State
+
+Authentication systems face three challenging consistency problems. Each one can cause user-facing issues if not handled correctly.
+
+### Scenario 1: Node Crashes Mid-Signup
+
+A user submits the signup form. The web server node receives the request, inserts the user row into the database, and then crashes before sending the response. The user sees a timeout error.
+
+<AsciiDiagram
+  id="authentication/crash-mid-signup"
+  title="Node Crash During Signup -- Orphaned User"
+  content={`
+Time ────────────────────────────────────────────────────────────────────────────────▶
+
+┌──────────┐    ┌──────────────────────────┐    ┌──────────────┐
+│  Client  │    │  Auth Service (Node A)    │    │  Database    │
+└────┬─────┘    └──────────┬───────────────┘    └──────┬───────┘
+     │                     │                            │
+     │  POST /auth/signup  │                            │
+     │  {email, password}  │                            │
+     │────────────────────▶│                            │
+     │                     │  BEGIN TRANSACTION         │
+     │                     │───────────────────────────▶│
+     │                     │  INSERT INTO users         │
+     │                     │  (email, password_hash)    │
+     │                     │───────────────────────────▶│
+     │                     │                            │  Row inserted
+     │                     │  COMMIT                    │
+     │                     │───────────────────────────▶│
+     │                     │                            │
+     │                     │   ┌───────┐                │
+     │                     │   │CRASH! │  Node A dies   │
+     │                     │   │OOM    │  before sending │
+     │                     │   └───────┘  response       │
+     │                     │                            │
+     │  Connection reset   │                            │
+     │◀────────────────────│                            │
+     │                     │                            │
+     │  User retries       │                            │
+     │                     │                            │
+     │  POST /auth/signup  │  Auth Service (Node B)    │
+     │  {email, password}  │                            │
+     │────────────────────▶│───────────────────────────▶│
+     │                     │                            │
+     │                     │  INSERT INTO users         │
+     │                     │  WHERE email=?             │
+     │                     │  Duplicate email!          │
+     │                     │  ┌────────────────────┐    │
+     │                     │  │ unique constraint  │    │
+     │                     │  │ violation          │    │
+     │                     │  └────────────────────┘    │
+     │                     │                            │
+     │  HTTP 409 Conflict  │                            │
+     │◀────────────────────│                            │
+     │                     │                            │
+     │  User cannot sign up -- email is "taken"         │
+     │  but user never received a confirmation          │
+     │  ── Support ticket required to resolve           │
+     │     (DB admin deletes orphaned row)              │
+`}
+  caption="A node crash mid-signup creates an orphaned user row. The user retries and gets a duplicate email error. The fix requires a transactional approach: either use a two-phase commit with a signup token, or implement a cleanup job that deletes orphaned unverified users after 24 hours."
+/>
+
+**Root cause**: The database commit is durable but the response never reaches the client. The user row exists in a half-verified state.
+
+**Fix options**:
+1. Use a signup token: generate a UUID before the DB insert, store it in the session, and only commit the transaction after confirming the token is still valid. If the node crashes, the token is lost and the orphaned row is never committed.
+2. Use a cleanup job: run a periodic task that deletes user rows where `email_verified = false` and `created_at < NOW() - INTERVAL 24 HOURS`.
+3. Use a two-phase commit protocol: the coordinator node writes a "prepare" record, then waits for acknowledgement from all participants before issuing the "commit". If the coordinator crashes, the recovery process rolls back the partial transaction.
+
+### Scenario 2: Race Condition on Email Verification
+
+The user clicks the email verification link twice -- once from their laptop and once from their phone. Two verification requests arrive at nearly the same time.
+
+<AsciiDiagram
+  id="authentication/race-email-verify"
+  title="Race Condition -- Concurrent Email Verification"
+  content={`
+Time ────────────────────────────────────────────────────────────────────────────────▶
+
+Email verification link: GET /auth/verify-email?token=abc123&user_id=42
+
+┌──────────────┐    ┌──────────────────────────┐    ┌──────────────┐
+│  Laptop      │    │  Auth Service             │    │  Database    │
+│  (Client A)  │    │  (multiple workers)       │    │              │
+└──────┬───────┘    └──────────┬───────────────┘    └──────┬───────┘
+       │                       │                            │
+       │  GET /verify-email    │                            │
+       │  token=abc123         │                            │
+       │──────────────────────▶│                            │
+       │                       │  SELECT email_verified     │
+       │                       │  FROM users WHERE id=42   │
+       │                       │───────────────────────────▶│
+       │                       │◀───────────────────────────│
+       │                       │  email_verified = false    │
+       │                       │                            │
+       │                       │  UPDATE users              │
+       │                       │  SET email_verified=true   │
+       │                       │  WHERE id=42              │  ─┐
+       │                       │───────────────────────────▶│   │
+       │                       │                            │   │ Two UPDATEs
+       │                       │  UPDATE users              │   │ race!
+       │                       │  SET email_verified=true   │  ─┘
+       │                       │  WHERE id=42              │
+       │                       │───────────────────────────▶│
+       │                       │                            │
+       │                       │  Both succeed (same value) │
+       │                       │  ── no conflict detected   │
+       │                       │                            │
+       │  HTTP 200 OK          │                            │
+       │◀──────────────────────│                            │
+       │                       │                            │
+       │  Verification token   │                            │
+       │  should be one-time   │                            │
+       │  ── but both requests │                            │
+       │  succeeded because the│                            │
+       │  read-then-write gap  │                            │
+       │  allowed both to see  │                            │
+       │  email_verified=false │                            │
+       │                       │                            │
+       │  Real problem: if the │                            │
+       │  token has a validity │                            │
+       │  window, an attacker  │                            │
+       │  could race the user  │                            │
+       │  to verify their own  │                            │
+       │  email address        │                            │
+       │                       │                            │
+`}
+  caption="Two concurrent verification requests both read email_verified=false, then both write email_verified=true. The verification token should be consumed atomically: use a single UPDATE ... WHERE token=abc123 and check the affected row count, or use a database-side optimistic lock with a version number."
+/>
+
+**Root cause**: The read-then-write pattern is not atomic. Two concurrent requests read the same value and both proceed.
+
+**Fix options**:
+1. Use a single atomic UPDATE: `UPDATE users SET email_verified=true WHERE verification_token='abc123' AND email_verified=false`. Check the affected row count -- if it is 0, the token was already used.
+2. Use a verification token table with a unique constraint: `INSERT INTO verification_tokens (user_id, token) VALUES (42, 'abc123')` with a unique constraint on `token`. The second insert fails with a duplicate key error.
+3. Use an optimistic lock: include a `version` column in the users table. The UPDATE includes `WHERE version = N`. If the version has changed, the update affects zero rows and the request is rejected.
+
+### Scenario 3: Concurrent Login from Two Devices
+
+The user logs in from their laptop and their phone at the same time. The session manager creates two sessions for the same user. The system needs to decide whether to allow multiple sessions or terminate the previous one.
+
+<AsciiDiagram
+  id="authentication/concurrent-login"
+  title="Concurrent Login from Two Devices"
+  content={`
+Time ────────────────────────────────────────────────────────────────────────────────▶
+
+┌──────────────┐    ┌──────────────────────────┐    ┌───────────────────────────────┐
+│  Laptop      │    │  Auth Service             │    │  Session Store (Redis)        │
+│  (Client A)  │    │  (multiple workers)       │    │                               │
+└──────┬───────┘    └──────────┬───────────────┘    └──────────────┬────────────────┘
+       │                       │                                    │
+       │  POST /auth/login     │                                    │
+       │  (laptop)             │                                    │
+       │──────────────────────▶│                                    │
+       │                       │  SELECT * FROM users WHERE id=42  │
+       │                       │───────────────────────────────────▶│
+       │                       │◀───────────────────────────────────│
+       │                       │                                    │
+       │                       │  Verify password (argon2id, 200ms) │
+       │                       │                                    │
+       │                       │  Generate session token            │
+       │                       │  SET sess_laptop_1                 │
+       │                       │───────────────────────────────────▶│
+       │                       │  OK                                │
+       │                       │◀───────────────────────────────────│
+       │                       │                                    │
+       │  Set-Cookie: sess_1   │                                    │
+       │◀──────────────────────│                                    │
+       │                       │                                    │
+       │                       │  ┌──────────────────────────────┐  │
+       │                       │  │ Phone login arrives mid-     │  │
+       │  POST /auth/login     │  │ cookie set (same timestamp)  │  │
+       │  (phone)              │  └──────────────────────────────┘  │
+       │──────────────────────▶│                                    │
+       │  Wait, both requests  │  Verify password (argon2id, 200ms) │
+       │  are at the SAME      │                                    │
+       │  timestamp!           │  Generate session token            │
+       │                       │  SET sess_phone_1                  │
+       │                       │───────────────────────────────────▶│
+       │                       │  OK                                │
+       │                       │◀───────────────────────────────────│
+       │                       │                                    │
+       │  Set-Cookie: sess_2   │                                    │
+       │◀──────────────────────│                                    │
+       │                       │                                    │
+       │  Both sessions exist in Redis.                             │
+       │  ── If policy is "single session per user":                │
+       │     second login should invalidate the first                │
+       │  ── But the first login's session was just created         │
+       │     and the second login has no way to know about it       │
+       │     without a read-before-write check                      │
+       │                                                            │
+       │  Solution:                                                  │
+       │  ┌──────────────────────────────────────────────────────┐  │
+       │  │ 1. Before creating a new session, check              │  │
+       │  │    user:42:active_sessions in Redis                  │  │
+       │  │ 2. If count > 0 and policy is single-session:        │  │
+       │  │    DELETE all existing sessions for user 42          │  │
+       │  │ 3. Then create the new session                       │  │
+       │  │ 4. Use Lua script or Redis transaction for           │  │
+       │  │    atomicity (read + delete + create)                │  │
+       │  └──────────────────────────────────────────────────────┘  │
+`}
+  caption="Two concurrent login requests from different devices both create sessions. If the system enforces single-session-per-user, the second request must atomically read existing sessions, invalidate them, and create the new one. A Redis Lua script ensures this three-step operation is atomic."
+/>
+
+**Root cause**: The session manager does not check for existing sessions before creating a new one. Two concurrent logins create two valid sessions.
+
+**Fix options**:
+1. Use a Redis Lua script that atomically checks existing sessions, deletes them, and creates the new one.
+2. Use a per-user mutex (distributed lock) during login. Only one login request per user can proceed at a time.
+3. Accept multiple sessions -- most systems allow concurrent sessions from different devices. Track the session count and enforce a limit (e.g., max 5 sessions per user).
+
+## Performance Characteristics
+
+The password hashing step dominates the authentication latency budget. The cost factor directly controls how long each hash takes.
+
+### bcrypt Cost Factor vs Latency
+
+| Cost factor | Rounds (2^cost) | Typical latency | CPU usage | Memory | Recommended use |
+|---|---|---|---|---|---|
+| 8 | 256 | ~25 ms | Low | 4 KB | Dev/test environments only |
+| 10 | 1,024 | ~80 ms | Moderate | 4 KB | Low-traffic APIs, non-critical |
+| 12 | 4,096 | ~250 ms | High | 4 KB | Most web applications (default) |
+| 13 | 8,192 | ~500 ms | Very high | 4 KB | Admin portals, high-security |
+| 14 | 16,384 | ~1,000 ms | Extreme | 4 KB | Password managers, key derivation |
+
+### Full Authentication Pipeline Latency Budget
+
+| Step | Operation | p50 latency | p99 latency | Contribution |
+|---|---|---|---|---|
+| 1 | Credential collection | 0.1 ms | 0.5 ms | 0.03% |
+| 2 | Rate limiting check | 0.3 ms | 1.0 ms | 0.10% |
+| 3 | Credential validation | 0.1 ms | 0.3 ms | 0.03% |
+| 4 | Credential lookup (DB query) | 2.0 ms | 10.0 ms | 0.70% |
+| 5 | Password verification (argon2id, 64 MB) | 200.0 ms | 350.0 ms | 70.00% |
+| 6 | MFA verification (TOTP) | 1.0 ms | 5.0 ms | 0.35% |
+| 7 | Token issuance (JWT signing) | 0.5 ms | 2.0 ms | 0.18% |
+| 8 | Session creation (Redis SET) | 1.0 ms | 5.0 ms | 0.35% |
+| 9 | Audit logging | 0.5 ms | 3.0 ms | 0.18% |
+| 10 | Response construction | 0.1 ms | 0.3 ms | 0.03% |
+| 11 | Background tasks | async | async | 0% (async) |
+| **Total** | | **~205.6 ms** | **~377.1 ms** | **100%** |
+
+### Throughput Limits
+
+The password hasher is the bottleneck. A single CPU core can handle approximately:
+
+- bcrypt cost 10: 12.5 hashes/second
+- bcrypt cost 12: 4 hashes/second
+- bcrypt cost 14: 1 hash/second
+- argon2id m=64MB t=2: 5 hashes/second
+- argon2id m=256MB t=3: 0.8 hashes/second
+
+For a server with 16 cores (32 hyperthreads), the maximum login throughput is:
+
+| Algorithm | Core | Hashes/sec (16 cores) | Max logins/minute |
+|---|---|---|---|
+| bcrypt cost 10 | 25 ms | 200 | 12,000 |
+| bcrypt cost 12 | 250 ms | 64 | 3,840 |
+| bcrypt cost 14 | 1,000 ms | 16 | 960 |
+| argon2id m=64MB | 200 ms | 80 | 4,800 |
+| argon2id m=256MB | 1,200 ms | 13 | 780 |
+
+### Memory Footprint
+
+| Component | Memory per request | Total at 1,000 concurrent logins |
+|---|---|---|
+| HTTP request buffer | 8 KB | 8 MB |
+| Credential validator state | 1 KB | 1 MB |
+| bcrypt hash (4 KB) | 4 KB | 4 MB |
+| argon2id hash (64 MB) | 64 MB | 64 GB (not practical) |
+| Session token | 2 KB | 2 MB |
+| Audit log buffer | 1 KB | 1 MB |
+| Total per request (bcrypt) | ~16 KB | 16 MB |
+| Total per request (argon2id) | ~64 MB + overhead | 64+ GB |
+
+Argon2id with 64 MB memory per hash is not practical for high-concurrency systems. You need to either use bcrypt (4 KB, lower memory) or limit concurrent login requests to a small number of workers. A common pattern is to use a separate, small pool of hashing workers (1-4 cores) and queue login requests behind them.
+
+### CPU Breakdown (bcrypt cost 12)
+
+| Component | CPU usage |
+|---|---|
+| Password hashing (bcrypt) | 70% |
+| TLS termination | 10% |
+| JSON parsing / serialization | 5% |
+| Session store (Redis) | 5% |
+| Rate limiting | 3% |
+| Audit logging | 3% |
+| Other (DB query, validation, MFA) | 4% |
+
+## Configuration and Tuning
+
+### Password Policy
+
+| Setting | Default | Recommended | Effect |
+|---|---|---|---|
+| min_length | 8 | 12 | Prevents brute-force on short passwords |
+| require_uppercase | false | true | Increases entropy per character |
+| require_lowercase | false | true | Increases entropy per character |
+| require_digit | false | true | Prevents dictionary-only passwords |
+| require_special_char | false | true | Expands character set to 95+ |
+| max_length | 128 | 128 | Prevents hash-length DoS attacks |
+| hash_algorithm | bcrypt | argon2id | Resistance to GPU/ASIC attacks |
+| hash_cost | 10 | 12 (bcrypt) or m=64MB,t=2 (argon2id) | Iteration count for hash |
+| password_history | 0 | 5 | Prevents password reuse |
+| password_expiry_days | 0 | 90 | Forces periodic rotation |
+
+### Account Lockout
+
+| Setting | Default | Recommended | Effect |
+|---|---|---|---|
+| max_failed_attempts | 5 | 5 | Locks account after N failed attempts |
+| lockout_duration_minutes | 15 | 30 | How long the account stays locked |
+| failed_attempt_window_minutes | 15 | 15 | Sliding window for counting failures |
+| lockout_escalation | false | true | Double lockout duration on each repeat |
+| admin_unlock | true | true | Support team can manually unlock |
+
+### MFA Enforcement
+
+| Setting | Default | Recommended | Effect |
+|---|---|---|---|
+| mfa_enabled | false | true | Master toggle for MFA |
+| mfa_required_roles | [] | ["admin", "finance"] | Roles that must use MFA |
+| mfa_optional_roles | ["user"] | ["user"] | Roles that can opt in |
+| mfa_methods | ["totp"] | ["totp", "webauthn"] | Available MFA methods |
+| mfa_remember_device_days | 0 | 30 | Skip MFA for trusted devices |
+| mfa_lockout_after_failures | 3 | 3 | Lock MFA after N bad codes |
+| backup_codes_count | 0 | 8 | One-time use recovery codes |
+
+### Session Management
+
+| Setting | Default | Recommended | Effect |
+|---|---|---|---|
+| session_ttl_seconds | 3600 | 3600 | Session lifetime (1 hour) |
+| refresh_token_ttl_days | 30 | 7 | Refresh token lifetime |
+| session_limit_per_user | unlimited | 5 | Max concurrent sessions |
+| idle_timeout_minutes | 0 | 30 | Auto-logout after inactivity |
+| rotate_on_refresh | true | true | Issue new token on each refresh |
+| revoke_on_password_change | true | true | Invalidate all sessions on password change |
+| revoke_on_role_change | true | true | Invalidate sessions when roles change |
+
+### Rate Limiting
+
+| Setting | Default | Recommended | Effect |
+|---|---|---|---|
+| login_per_ip_per_minute | 30 | 10 | Prevents IP-based brute-force |
+| login_per_user_per_minute | 10 | 5 | Prevents credential stuffing |
+| signup_per_ip_per_hour | 10 | 5 | Prevents account creation abuse |
+| totp_per_user_per_minute | 5 | 3 | Prevents MFA brute-force |
+| password_reset_per_user_per_hour | 3 | 2 | Prevents reset abuse |
+| global_login_per_second | 10000 | 5000 | System-wide rate cap |
+| rate_limiter_backend | redis | redis | Distributed rate limiting |
+
+### TLS and Cookie Security
+
+| Setting | Value | Why |
+|---|---|---|
+| Cookie: HttpOnly | true | Prevents JavaScript access to the token |
+| Cookie: Secure | true | Only send over HTTPS |
+| Cookie: SameSite | Lax | Prevents CSRF on state-changing requests |
+| Cookie: Max-Age | 3600 | Match session TTL |
+| Cookie: Path | / | Restrict to API domain |
+| TLS min version | 1.2 | PCI DSS compliance, prevents downgrade |
+| TLS ciphers | ECDHE+AESGCM | Forward secrecy, hardware acceleration |
+
+### Monitoring and Alerting Thresholds
+
+| Metric | Warning | Critical | What it means |
+|---|---|---|---|
+| Login success rate | < 95% | < 90% | Possible credential stuffing attack |
+| Login latency p99 | > 500 ms | > 1,000 ms | Hashing worker pool saturated |
+| Failed login rate | > 100/min | > 1,000/min | Brute-force attack in progress |
+| Account lockout rate | > 10/min | > 50/min | Coordinated attack on accounts |
+| MFA failure rate | > 5% | > 10% | MFA service degraded or attack |
+| Token refresh rate | > 10,000/min | > 50,000/min | Token harvesting or replay attack |
+| Rate limiter rejections | > 1,000/min | > 10,000/min | System under DoS attack |
+
+### Production Configuration Example
+
+```json
+{
+  "password_policy": {
+    "min_length": 12,
+    "require_uppercase": true,
+    "require_lowercase": true,
+    "require_digit": true,
+    "require_special_char": true,
+    "max_length": 128,
+    "hash_algorithm": "argon2id",
+    "hash_memory_kb": 65536,
+    "hash_iterations": 2,
+    "hash_parallelism": 1,
+    "password_history": 5,
+    "password_expiry_days": 90
+  },
+  "account_lockout": {
+    "max_failed_attempts": 5,
+    "lockout_duration_minutes": 30,
+    "failed_attempt_window_minutes": 15,
+    "lockout_escalation": true,
+    "admin_unlock": true
+  },
+  "mfa": {
+    "enabled": true,
+    "required_roles": ["admin", "finance"],
+    "optional_roles": ["user"],
+    "methods": ["totp", "webauthn"],
+    "remember_device_days": 30,
+    "lockout_after_failures": 3,
+    "backup_codes_count": 8
+  },
+  "session": {
+    "ttl_seconds": 3600,
+    "refresh_token_ttl_days": 7,
+    "limit_per_user": 5,
+    "idle_timeout_minutes": 30,
+    "rotate_on_refresh": true,
+    "revoke_on_password_change": true,
+    "revoke_on_role_change": true
+  },
+  "rate_limiting": {
+    "login_per_ip_per_minute": 10,
+    "login_per_user_per_minute": 5,
+    "signup_per_ip_per_hour": 5,
+    "totp_per_user_per_minute": 3,
+    "password_reset_per_user_per_hour": 2,
+    "global_login_per_second": 5000,
+    "backend": "redis"
+  },
+  "monitoring": {
+    "login_success_rate_warning": 95,
+    "login_success_rate_critical": 90,
+    "login_latency_p99_warning_ms": 500,
+    "login_latency_p99_critical_ms": 1000,
+    "failed_login_rate_warning_per_min": 100,
+    "failed_login_rate_critical_per_min": 1000
+  }
+}
+```
+
+### Edge Cases and Failure Modes
+
+| Scenario | Impact | Mitigation |
+|---|---|---|
+| Hash algorithm upgrade | Old passwords become unverifiable | Re-hash on next successful login using the new algorithm, store versioned hash |
+| Redis outage | Session validation fails, all users logged out | Use a local cache fallback (5-second TTL) or switch to stateless JWT tokens |
+| Clock skew on TOTP | TOTP codes generated at wrong time | Allow a window of +/- 30 seconds (one code before and after current) |
+| Database connection pool exhaustion | Login requests queue up waiting for a DB connection | Set a short connection timeout (2 seconds), return 503 to clients |
+| Concurrent password change | Old session still valid, new session created, race condition | Use a session version counter: increment on password change, invalidate all sessions with old version |
+| Mass account lockout (DoS) | Attacker attempts 5 failed logins on every user account | Use progressive lockout (first lockout: 1 minute, doubling each time) and CAPTCHA after 2 failures |
+| Token leaked in URL | JWT or session ID appears in server logs, referrer headers | Only accept tokens in headers or cookies, never in URL query parameters |
+| Weak password after migration | Legacy system had no password policy, migrated users have weak hashes | Flag weak passwords on next login, force password change, and re-hash with the current algorithm |
+
+---
+
+**The architecture page shows how to build an authentication layer that handles 10 million users with MFA, session management, and rate limiting across multiple regions.**

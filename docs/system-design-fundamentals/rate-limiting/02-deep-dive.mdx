@@ -1,0 +1,918 @@
+---
+id: rate-limiting-deep-dive
+title: Rate Limiting — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Rate Limiting — Under the Hood
+
+You have learned what the four fundamental rate limiting algorithms are. Now you open the engine bay. You will see exactly how each algorithm tracks state, where their weaknesses hide, how data structures map to production storage, and what happens on every single request from the moment it arrives until the rate limiter decides its fate.
+
+By the end of this deep dive, you will understand the internal mechanics well enough to implement any of these algorithms from scratch, reason about their performance trade-offs, and debug race conditions that only surface under high concurrency.
+
+---
+
+## 1. Token Bucket Internals
+
+Token Bucket is the most widely deployed rate-limiting algorithm in production. You will find it in Amazon API Gateway, Stripe, Kong, and Nginx. The idea is simple: a bucket holds tokens, tokens drip in at a fixed rate, and each request removes one token. If the bucket is empty, the request is denied. The clever part is that the bucket never runs a background timer.
+
+### The Data Structure
+
+At its heart, Token Bucket needs only two counters:
+
+```
+TokenBucketState {
+  tokens:        float   // current token count
+  lastRefillTs:  int64   // Unix nanoseconds of last refill
+  capacity:      float   // max tokens (burst limit)
+  refillRate:    float   // tokens per second
+}
+```
+
+You never use a timer or cron job to refill tokens. Instead, you compute the refill lazily on every request. Here is the key insight:
+
+```
+elapsed = now - lastRefillTs
+refill  = elapsed * refillRate
+tokens  = min(capacity, tokens + refill)
+lastRefillTs = now
+```
+
+This is lock-free and constant-time -- O(1) per check. No background goroutine, no scheduled task, no timer wheel.
+
+### The Refill Formula Explained
+
+When a request arrives, you compute how many tokens should have accumulated since the last request. If the last request was 2.5 seconds ago and the refill rate is 10 tokens per second, you add 25 tokens (capped at capacity). This works because the refill function is linear and deterministic. The order of arrival does not matter, only the elapsed time.
+
+<AsciiDiagram
+  id="rate-limiting/token-bucket-flow"
+  alt="Token bucket state machine showing token consumption and lazy refill computation"
+  caption="Token Bucket internals: lazy refill computes tokens from elapsed time, no timers needed"
+  content={`
+┌─────────────────────────────────────────────────────────┐
+│                  TOKEN BUCKET INTERNALS                  │
+│                                                         │
+│  ┌──────────────────────┐      ┌──────────────────┐    │
+│  │  Request arrives     │─────>│  Read bucket      │    │
+│  │  at t=10.25          │      │  state from cache │    │
+│  └──────────────────────┘      └──────────────────┘    │
+│                                          │               │
+│                                          ▼               │
+│                               ┌──────────────────┐    │
+│                               │  Compute elapsed  │    │
+│                               │  10.25 - 8.00     │    │
+│                               │  = 2.25 seconds  │    │
+│                               └──────────────────┘    │
+│                                          │               │
+│                                          ▼               │
+│                               ┌──────────────────┐    │
+│                               │  refill = 2.25   │    │
+│                               │  * 10 tps = 22.5 │    │
+│                               │  tokens = 5 +    │    │
+│                               │  22.5 = 27.5     │    │
+│                               │  capped at 20    │    │
+│                               └──────────────────┘    │
+│                                          │               │
+│                                          ▼               │
+│                               ┌──────────────────┐    │
+│                               │  tokens > 0?     │    │
+│                               │  yes ──> consume 1 │    │
+│                               │  no  ──> deny 429  │    │
+│                               └──────────────────┘    │
+│                                                         │
+│  Key formula: tokens = min(capacity, tokens + elapsed   │
+│               * refillRate)                             │
+│  No timers. No background jobs. O(1) per request.       │
+└─────────────────────────────────────────────────────────┘
+`}
+/>
+
+### Burst Handling
+
+Bursts are handled naturally by the capacity parameter. If the bucket has been idle for a long time, the lazy refill caps at capacity, giving the caller a full burst of requests immediately. After the burst, the bucket drains and subsequent requests are limited to the refill rate.
+
+For example, a bucket with capacity 100 and refill rate 10 per second allows a burst of 100 requests instantly, then settles to 10 requests per second. This is exactly how you want to handle a mobile client that was offline and comes back.
+
+### Distributed Token Bucket
+
+In a distributed setting, you cannot trust the local clock or local state. You store the bucket state in Redis. The problem is that Redis is not infinitely fast, and network latency means two concurrent requests might read the same stale state. The solution is Lua scripting, which you will see in Section 5.
+
+---
+
+## 2. Fixed Window — The Boundary Problem
+
+Fixed Window divides time into discrete buckets of size N seconds. All requests within a window count toward the same limit. At the start of a new window, the counter resets.
+
+### Why Fixed Window Fails
+
+Imagine a limit of 100 requests per minute. A client sends 100 requests at 11:59:30 and another 100 at 12:00:30. Each window (11:59:00-12:00:00 and 12:00:00-12:01:00) sees only 100 requests, so both are allowed. But the client sent 200 requests in 60 seconds. The load on your system is double what you intended.
+
+This is the boundary problem, also called the burst at the edge problem.
+
+<AsciiDiagram
+  id="rate-limiting/fixed-window-boundary-problem"
+  alt="Fixed window boundary problem where two adjacent windows each see 100 requests but the combined load is 200 in 60 seconds"
+  caption="Fixed Window boundary problem: 200 requests in 60 seconds, 100 in each window"
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│              FIXED WINDOW BOUNDARY PROBLEM                    │
+│                                                              │
+│  Window 1 (11:59:00 - 12:00:00)   Window 2 (12:00:00 -      │
+│                                      12:01:00)               │
+│  ┌──────────────────────────┐    ┌──────────────────────┐   │
+│  │  Counter: 100 / 100      │    │  Counter: 100 / 100  │   │
+│  │                          │    │                       │   │
+│  │  req  ───────── ──── 99  │    │  100 ──────── 100 ── │   │
+│  │  \\\\                    //│    │  \\\\\\\\          ///// │   │
+│  │   \\\\   11:59:30      // │    │   \\\\\\  12:00:30  /// │   │
+│  │    \\\\              //   │    │    \\\\\\          ///   │   │
+│  │     ──── 100 ─────      │    │     ──── 100 ─────     │   │
+│  │                          │    │                       │   │
+│  └──────────────────────────┘    └──────────────────────┘   │
+│         │                                    │               │
+│         └─────────── 200 requests ───────────┘               │
+│                      in 60 seconds                           │
+│                                                              │
+│  Each window is under the limit. The system is overloaded.   │
+│  This is why Fixed Window is not recommended for production  │
+│  rate limiting.                                              │
+└──────────────────────────────────────────────────────────────┘
+`}
+/>
+
+### Where Fixed Window Works
+
+Fixed Window is acceptable when you are enforcing a hard quota that does not need to be smooth — for example, 1000 API calls per month. The boundary problem is negligible over a month-long window because the edge effect is a small fraction of the total. For sub-second or second-level windows, the boundary problem is severe.
+
+---
+
+## 3. Sliding Window Log — Precise but Expensive
+
+Sliding Window Log keeps a timestamped log of every request. When a new request arrives, you remove all timestamps older than `windowSize` seconds ago, count the remaining timestamps, and check if the count is below the limit.
+
+### The Memory Cost
+
+If you have a limit of 10,000 requests per minute, you store 10,000 timestamps in memory. At 100,000 requests per minute, you store 100,000 timestamps. This is O(N) in the number of requests per window, and it grows linearly with your limit.
+
+Each timestamp is typically an 8-byte Unix millisecond integer plus overhead for the data structure. Redis Sorted Set node overhead is approximately 40-60 bytes per entry. At 1 million requests per minute, you are looking at 50-60 MB of memory just for the log.
+
+### The Cleanup Cost
+
+Every request triggers a cleanup of expired entries, which is O(log N) for a sorted set or O(N) for a list. At high throughput, the cleanup itself becomes a bottleneck.
+
+### When to Use Sliding Window Log
+
+Use Sliding Window Log only when you need perfect accuracy and the request rate is low (under 100 requests per second per key). It is ideal for per-user limits in a system with few users, or for administrative endpoints where precision matters more than throughput.
+
+<AsciiDiagram
+  id="rate-limiting/sliding-window-log-ds"
+  alt="Sliding window log data structure showing timestamp entries and the sliding window cutoff"
+  caption="Sliding Window Log: each request appends a timestamp; expired entries are pruned on every check"
+  content={`
+┌─────────────────────────────────────────────────────────────┐
+│             SLIDING WINDOW LOG DATA STRUCTURE                │
+│                                                             │
+│  Sorted Set key: ratelimit:user:42                          │
+│                                                             │
+│  ┌──────┬──────────────────┐    ┌──────────────────┐       │
+│  │ Rank │ Timestamp (ms)   │    │  Window boundary │       │
+│  ├──────┼──────────────────┤    │  now - 60s       │       │
+│  │  1   │ 1748711100000    │    │  = 1748711040000 │       │
+│  │  2   │ 1748711100500    │    └──────────────────┘       │
+│  │  3   │ 1748711110000    │           │                    │
+│  │  4   │ 1748711110500    │           ▼                    │
+│  │  5   │ 1748711120000    │    ┌──────────────────┐       │
+│  │  6   │ 1748711120500    │    │  REMOVE all      │       │
+│  │  7   │ 1748711130000    │    │  entries with    │       │
+│  │  8   │ 1748711130500    │    │  score < cutoff  │       │
+│  │  9   │ 1748711140000    │    └──────────────────┘       │
+│  │ 10   │ 1748711140500    │           │                    │
+│  │ 11   │ 1748711150000    │           ▼                    │
+│  │ ..   │ ...              │    ┌──────────────────┐       │
+│  │ 500  │ 1748711200000    │    │  COUNT remaining │       │
+│  └──────┴──────────────────┘    │  Compare to      │       │
+│                                  │  limit           │       │
+│  Memory: 500 entries x 56 bytes │  Allow or deny   │       │
+│  = 28 KB per key                 └──────────────────┘       │
+│                                                             │
+│  At 10K req/min: 560 KB per key                             │
+│  At 100K req/min: 5.6 MB per key                            │
+│  At 1M req/min: 56 MB per key                               │
+└─────────────────────────────────────────────────────────────┘
+`}
+/>
+
+### Redis Sorted Set Commands
+
+The canonical implementation uses `ZREMRANGEBYSCORE` to purge old entries and `ZCARD` to count:
+
+```python
+import time
+import redis.asyncio as aioredis
+
+r = aioredis.Redis()
+
+async def sliding_window_log(key: str, limit: int, window_ms: int) -> bool:
+    now = int(time.time() * 1000)
+    cutoff = now - window_ms
+    pipe = r.pipeline(transaction=True)
+    pipe.zremrangebyscore(key, 0, cutoff)
+    pipe.zcard(key)
+    _, count = await pipe.execute()
+    if count < limit:
+        await r.zadd(key, {str(now): now})
+        await r.expire(key, window_ms // 1000 + 1)
+        return True
+    return False
+```
+
+The `expire` call with a TTL slightly longer than the window prevents orphaned keys from accumulating when clients stop sending requests.
+
+---
+
+## 4. Sliding Window Counter — The Practical Compromise
+
+Sliding Window Counter is the algorithm used by Kong, AWS (in some services), and many CDN-based rate limiters. It gives you approximately sliding window behavior with the memory footprint of a fixed window.
+
+### How It Works
+
+You maintain two counters: the current window counter and the previous window counter. When a request arrives, you compute a weight based on how far into the current window you are:
+
+```
+weight = (currentWindowStart + windowSize - now) / windowSize
+count   = previousCounter * weight + currentCounter
+```
+
+If `count` is below the limit, you allow the request and increment the current counter.
+
+### Why This Works
+
+The weight represents the overlap between the sliding window and the previous fixed window. At the very start of a new window, the weight is 1.0 (fully overlapping with the previous window), so you count the entire previous window. At the midpoint, the weight is 0.5, so you count half of the previous window. Just before the next window, the weight approaches 0.
+
+This gives you a smooth rate limit that avoids the boundary problem while using only two counters per key.
+
+<AsciiDiagram
+  id="rate-limiting/sliding-window-counter-algo"
+  alt="Sliding Window Counter algorithm showing the weighted blend of previous and current window counters"
+  caption="Sliding Window Counter: two counters per key, weighted blend eliminates the boundary problem"
+  content={`
+┌────────────────────────────────────────────────────────────────┐
+│               SLIDING WINDOW COUNTER ALGORITHM                  │
+│                                                                │
+│  ┌─────────────────────┐     ┌─────────────────────┐          │
+│  │  Previous Window    │     │  Current Window     │          │
+│  │  12:00:00 - 12:01:00│     │  12:01:00 - 12:02:00│          │
+│  │                     │     │                      │          │
+│  │  Counter: 80        │     │  Counter: 30         │          │
+│  └──────────┬──────────┘     └──────────┬───────────┘          │
+│             │                           │                      │
+│             │                           │                      │
+│             ▼                           ▼                      │
+│  ┌──────────────────────────────────────────────┐             │
+│  │  now = 12:01:15                              │             │
+│  │  weight = (60 - 15) / 60 = 0.75              │             │
+│  │  estimated = 80 * 0.75 + 30 = 90             │             │
+│  │                                              │             │
+│  │  limit = 100 ──> 90 < 100 ──> ALLOW         │             │
+│  └──────────────────────────────────────────────┘             │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │  Why this is accurate enough:                            │ │
+│  │                                                          │ │
+│  │  At the boundary (12:01:00): weight = 1.0, estimated    │ │
+│  │  = previous window, so 80 requests in the last 60s.     │ │
+│  │                                                          │ │
+│  │  At midpoint (12:01:30): weight = 0.5, estimated =      │ │
+│  │  40 + 30 = 70, reflecting the true sliding window.      │ │
+│  │                                                          │ │
+│  │  The error is bounded by +/-1 request per window.       │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│                                                                │
+│  Memory: 2 counters per key (2 x 8 bytes = 16 bytes)          │
+│  Vs Sliding Window Log: 56 bytes per request entry             │
+│  At 100K req/min: 16 bytes vs 5.6 MB per key                  │
+└────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+### The Accuracy Trade-off
+
+Sliding Window Counter is not perfectly accurate. The estimate can be off by up to the number of requests in the previous window divided by the window size in seconds, times the rate of the current window. In practice, this error is usually less than 5% for most workloads. If you need perfect accuracy, use Sliding Window Log. If you need a good approximation with tiny memory, use Sliding Window Counter.
+
+### Algorithm Comparison at a Glance
+
+<AsciiDiagram
+  id="rate-limiting/algorithm-comparison-table"
+  alt="Comparison table of four rate limiting algorithms showing accuracy, memory, and performance"
+  caption="Algorithm comparison: accuracy, memory, performance, and complexity"
+  content={`
+┌──────────────────────────────────────────────────────────────────────┐
+│             RATE LIMITING ALGORITHM COMPARISON                        │
+├──────────────┬───────────┬──────────┬───────────┬───────────────────┤
+│  Algorithm   │ Accuracy  │ Memory   │ Perf      │ Complexity        │
+├──────────────┼───────────┼──────────┼───────────┼───────────────────┤
+│  Token       │ Perfect   │ 32 bytes │ O(1)      │ Low ── two floats │
+│  Bucket      │           │ per key  │ in-memory │ and one int       │
+├──────────────┼───────────┼──────────┼───────────┼───────────────────┤
+│  Fixed       │ Poor at   │ 8 bytes  │ O(1)      │ Lowest ── one     │
+│  Window      │ edges     │ per key  │           │ counter           │
+├──────────────┼───────────┼──────────┼───────────┼───────────────────┤
+│  Sliding     │ Perfect   │ 56 bytes │ O(log N)  │ High ── sorted    │
+│  Window Log  │           │ per req  │           │ set maintenance   │
+├──────────────┼───────────┼──────────┼───────────┼───────────────────┤
+│  Sliding     │ Approx    │ 16 bytes │ O(1)      │ Low ── two        │
+│  Window      │ ~95%+     │ per key  │           │ counters          │
+│  Counter     │           │          │           │                   │
+└──────────────┴───────────┴──────────┴───────────┴───────────────────┘
+`}
+/>
+
+---
+
+## 5. Data Structures Under the Microscope
+
+The four algorithms map to three core data structures. Your choice of data structure determines your memory footprint, latency, and consistency guarantees.
+
+### Token Bucket Counters
+
+For Token Bucket, you need exactly two numeric values per key:
+
+```
+Key: "ratelimit:api:user_42"
+Values: {
+  tokens:       12.5
+  last_refill:  1748712345678
+}
+```
+
+In Redis, you store these as a Hash with two fields. The hash is 8 bytes for the key plus the two double-precision floats (16 bytes), plus Redis overhead of approximately 40 bytes per key. Total: approximately 64 bytes per user.
+
+### Redis Sorted Sets for Sliding Window Log
+
+Sliding Window Log uses a Redis Sorted Set where the score is the timestamp and the member is a unique identifier (usually a UUID or a counter):
+
+```
+ZADD ratelimit:user:42 1748712345678 "req-abc123"
+ZREMRANGEBYSCORE ratelimit:user:42 0 1748712285678
+ZCARD ratelimit:user:42
+```
+
+Each entry in the sorted set costs approximately 56 bytes in Redis (8 bytes for the score, 16 bytes for the member, 32 bytes for the skip list node and dictionary entry). For 100,000 requests in a window, that is 5.6 MB per key.
+
+### Redis Atomic Counters for Fixed Window
+
+Fixed Window uses a single Redis key with a TTL:
+
+```
+INCR ratelimit:user:42:12:01
+EXPIRE ratelimit:user:42:12:01 60
+```
+
+If the key does not exist, Redis creates it with TTL 60 seconds and sets the value to 1. If it exists, Redis increments it. The TTL ensures automatic cleanup. This is the most memory-efficient approach at 8 bytes per key plus Redis overhead.
+
+### Redis Strings for Sliding Window Counter
+
+Sliding Window Counter uses two Redis String keys per client -- one for the current window and one for the previous window. Each key has a TTL of twice the window size to ensure the previous window counter is available for the weighted calculation.
+
+```
+INCR ratelimit:sw:user_42:1748712360
+EXPIRE ratelimit:sw:user_42:1748712360 120
+GET ratelimit:sw:user_42:1748712300
+```
+
+The memory cost is approximately 80 bytes per client regardless of how many requests they send, making it the most scalable option for high-throughput systems.
+
+---
+
+## 6. The Request Lifecycle — 12 Steps
+
+When a request travels through a rate limiter, it passes through a carefully orchestrated series of steps. Here is the full lifecycle.
+
+<AsciiDiagram
+  id="rate-limiting/request-lifecycle-ingress"
+  alt="Steps 1 through 6 of the rate limiting request lifecycle: ingress, key extraction, and state lookup"
+  caption="Request lifecycle part 1: ingress, key extraction, and state lookup"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│            RATE LIMITING REQUEST LIFECYCLE — STEPS 1-6          │
+│                                                                 │
+│  Step 1: HTTP Request arrives at load balancer                  │
+│          ┌─────────────────────────────────────┐                │
+│          │  GET /api/v1/users HTTP/1.1          │                │
+│          │  Host: api.example.com              │                │
+│          │  X-API-Key: sk_live_abc123          │                │
+│          │  X-Forwarded-For: 203.0.113.42     │                │
+│          └─────────────────────────────────────┘                │
+│                          │                                      │
+│                          ▼                                      │
+│  Step 2: Load balancer forwards to API gateway                  │
+│                          │                                      │
+│                          ▼                                      │
+│  Step 3: API gateway extracts rate limit key:                  │
+│          ┌─────────────────────────────────────┐                │
+│          │  key = "ratelimit:api_key:" +        │                │
+│          │         hash(api_key)               │                │
+│          │  OR key = "ratelimit:ip:" + ip       │                │
+│          └─────────────────────────────────────┘                │
+│                          │                                      │
+│                          ▼                                      │
+│  Step 4: Gateway selects algorithm and reads config:            │
+│          ┌─────────────────────────────────────┐                │
+│          │  algorithm: "token_bucket"           │                │
+│          │  capacity: 100                       │                │
+│          │  refill_rate: 10                     │                │
+│          │  window_size: 60                     │                │
+│          └─────────────────────────────────────┘                │
+│                          │                                      │
+│                          ▼                                      │
+│  Step 5: Gateway looks up current state:                        │
+│          ┌─────────────────────────────────────┐                │
+│          │  Redis GET ratelimit:sk_live_abc123  │                │
+│          │  Response: {tokens: 5,               │                │
+│          │   last_refill: 1748712345678}        │                │
+│          └─────────────────────────────────────┘                │
+│                          │                                      │
+│                          ▼                                      │
+│  Step 6: Lazy refill computation:                               │
+│          ┌─────────────────────────────────────┐                │
+│          │  elapsed = now - last_refill         │                │
+│          │  refill = elapsed * refill_rate      │                │
+│          │  tokens = min(100, 5 + refill)       │                │
+│          └─────────────────────────────────────┘                │
+│                          │                                      │
+│                          ▼                                      │
+│                  (continued below)                              │
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+<AsciiDiagram
+  id="rate-limiting/request-lifecycle-decision"
+  alt="Steps 7 through 12 of the rate limiting request lifecycle: decision, enforcement, and response"
+  caption="Request lifecycle part 2: decision, enforcement, and response"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│           RATE LIMITING REQUEST LIFECYCLE — STEPS 7-12          │
+│                                                                 │
+│                    (continued from above)                        │
+│                          │                                      │
+│                          ▼                                      │
+│  Step 7: Decision:                                              │
+│          ┌─────────────────────────────────────┐                │
+│          │  if tokens >= 1:                    │                │
+│          │    tokens -= 1                      │                │
+│          │    ALLOW                            │                │
+│          │  else:                              │                │
+│          │    DENY                             │                │
+│          └─────────────────────────────────────┘                │
+│                          │                                      │
+│                    ┌─────┴─────┐                                │
+│                    ▼           ▼                                 │
+│              ALLOW           DENY                                │
+│                    │           │                                 │
+│                    ▼           ▼                                 │
+│  Step 8:      Write state   Set response headers:               │
+│  (DENY)       and proceed   X-RateLimit-Remaining: 0            │
+│                           Retry-After: 6                        │
+│                    │           │                                 │
+│                    ▼           ▼                                 │
+│  Step 9:      Forward to    Return 429 Too Many Requests        │
+│  (ALLOW)      upstream      Body: {"error":"rate_limit_exceeded"│
+│               service       "retry_after_seconds":6}             │
+│                    │                                             │
+│                    ▼                                             │
+│  Step 10:     Upstream processes request,                       │
+│               returns response                                  │
+│                    │                                             │
+│                    ▼                                             │
+│  Step 11:     Gateway adds rate limit headers to response:      │
+│               X-RateLimit-Limit: 100                            │
+│               X-RateLimit-Remaining: 4                          │
+│               X-RateLimit-Reset: 1748712400000                  │
+│                    │                                             │
+│                    ▼                                             │
+│  Step 12:     Response returns to client                        │
+│               Client can now rate-limit itself using            │
+│               the remaining and reset headers                   │
+│                                                                 │
+│  Total lifecycle: 2-5 ms in-memory, 5-15 ms with Redis         │
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+### The Three-Phase Decision
+
+Every rate limit check has three phases: **read**, **compute**, **write**. This is crucial to understand because the gap between read and write is where race conditions live.
+
+**Phase 1 — Read**: Fetch the current state from the data store (local memory or Redis).
+
+**Phase 2 — Compute**: Apply the algorithm to decide allow or deny.
+
+**Phase 3 — Write**: Persist the updated state so the next request sees the new state.
+
+Between Phase 1 and Phase 3, another request may read the same state and both requests will see the same token count, leading to a double-allow. This is the classic read-modify-write race condition.
+
+---
+
+## 7. Consistency — Race Conditions in Distributed Rate Limiting
+
+When you have multiple API gateway instances and a shared Redis store, you face the fundamental distributed systems problem: two requests arriving at the same instant at two different gateways.
+
+### The Race Condition
+
+```
+Gateway A                          Gateway B                          Redis
+    │                                 │                                 │
+    │  GET tokens=5                   │                                 │
+    │────────────────────────────────>│                                 │
+    │<─── tokens=5 ──────────────────│                                 │
+    │                                 │                                 │
+    │                                 │  GET tokens=5                   │
+    │                                 │────────────────────────────────>│
+    │                                 │<─── tokens=5 ─────────────────│
+    │                                 │                                 │
+    │  tokens=5 >= 1 ──> ALLOW       │  tokens=5 >= 1 ──> ALLOW       │
+    │  tokens=4                       │  tokens=4                       │
+    │                                 │                                 │
+    │  SET tokens=4                   │                                 │
+    │────────────────────────────────>│                                 │
+    │                                 │  SET tokens=4                   │
+    │                                 │────────────────────────────────>│
+    │                                 │                                 │
+    │         Both requests allowed! 6 tokens consumed but             │
+    │         only 5 were available. The rate limit is broken.         │
+```
+
+This is a classic read-modify-write race condition. Two gateways read the same value (5), both see it as sufficient, both decrement, and both write back. The result is that 6 tokens were consumed when only 5 existed.
+
+### The Redis Lua Solution
+
+You solve this by atomizing the read-modify-write cycle using a Redis Lua script. Redis guarantees that Lua scripts execute atomically. No other client can interleave commands while the script runs.
+
+```lua
+-- Lua script for token bucket rate limiting
+-- KEYS[1] = rate limit key
+-- ARGV[1] = capacity
+-- ARGV[2] = refill rate (tokens per second)
+-- ARGV[3] = current timestamp in seconds
+-- ARGV[4] = cost (usually 1)
+
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refillRate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local cost = tonumber(ARGV[4])
+
+-- Read current state
+local state = redis.call("HGETALL", key)
+local tokens = capacity
+local lastRefill = now
+
+if #state > 0 then
+    tokens = tonumber(state[2])   -- state[1]="tokens", state[2]=value
+    lastRefill = tonumber(state[4]) -- state[3]="lastRefill", state[4]=value
+end
+
+-- Lazy refill
+local elapsed = now - lastRefill
+if elapsed > 0 then
+    tokens = math.min(capacity, tokens + elapsed * refillRate)
+end
+
+-- Decision
+local allowed = 0
+local remaining = tokens
+
+if tokens >= cost then
+    tokens = tokens - cost
+    allowed = 1
+    remaining = tokens
+end
+
+-- Write state atomically
+redis.call("HSET", key, "tokens", tokens, "lastRefill", now)
+
+-- Return: allowed, remaining, resetTimestamp
+return {allowed, remaining, math.floor(now) + math.ceil(capacity / refillRate)}
+```
+
+Every gateway instance calls this script with `EVALSHA` instead of a multi-step read-compute-write. The script serializes access to the key, so two concurrent calls from different gateways are queued and executed sequentially by Redis.
+
+### Beyond Atomic Operations — Distributed Consensus
+
+Redis Lua scripts give you **atomicity** but not **consensus**. If one gateway writes and then crashes before the response reaches the client, the client may retry and the counter was already decremented. This is a different problem: it is the at-least-once delivery versus at-most-once decrement trade-off.
+
+For most rate limiting use cases, this is acceptable. Rate limiting is a best-effort mechanism, not a financial ledger. If you need exactly-once decrements, you need a consensus protocol like Raft or Paxos, which adds significant complexity and latency.
+
+### Clock Skew
+
+In a distributed system, clocks are not perfectly synchronized. If your gateways use local timestamps for the lazy refill computation, clock skew of even 100 milliseconds can cause a few extra requests to be allowed or denied at the boundary.
+
+The mitigation is to use the Redis TIME command to get a consistent timestamp from the Redis server, which acts as a single source of truth. This adds one round trip to the Lua script, but it removes clock skew entirely.
+
+---
+
+## 8. Performance — Latency and Throughput
+
+The performance characteristics of your rate limiter determine both the user experience and the cost of operating the system.
+
+### In-Memory (Local) Rate Limiting
+
+When the rate limiter runs in the same process as the API gateway, there is no network round trip. The latency is measured in microseconds.
+
+| Operation | Latency (P50) | Latency (P99) |
+|-----------|--------------|--------------|
+| Token Bucket check | 0.5 microsec | 2 microsec |
+| Fixed Window check | 0.3 microsec | 1 microsec |
+| Sliding Window Counter | 0.4 microsec | 1.5 microsec |
+| Sliding Window Log | 5 microsec | 50 microsec |
+
+In-memory rate limiting is the fastest option, but it has a critical flaw: state is not shared across instances. A user hitting gateway A sees one counter, and hitting gateway B sees a different counter. This means you must use sticky sessions or accept that the effective limit is multiplied by the number of gateways.
+
+### Redis-Based (Distributed) Rate Limiting
+
+When the rate limiter stores state in Redis, each check requires a network round trip. The latency is dominated by the network.
+
+| Operation | Latency (P50) | Latency (P99) |
+|-----------|--------------|--------------|
+| Token Bucket (Lua) | 1 ms | 5 ms |
+| Fixed Window (INCR) | 0.5 ms | 3 ms |
+| Sliding Window Counter (Lua) | 1 ms | 5 ms |
+| Sliding Window Log (ZADD+ZREMRANGEBYSCORE) | 2 ms | 10 ms |
+
+Redis on the same AWS region (same availability zone) gives you the lowest latency at approximately 0.3-0.5 ms per round trip. Cross-region Redis adds 50-100 ms and should be avoided for rate limiting.
+
+### Throughput
+
+A single Redis instance can handle approximately 100,000 Lua script executions per second on modern hardware. For Token Bucket, this means 100,000 rate limit checks per second. If you need more, you can shard by key across multiple Redis instances.
+
+### Memory Cost Comparison
+
+The memory cost difference between algorithms is dramatic at scale.
+
+<AsciiDiagram
+  id="rate-limiting/memory-cost-at-scale"
+  alt="Memory cost comparison across algorithms showing orders of magnitude difference at scale"
+  caption="Memory cost per 10,000 keys at 100 requests per window per key"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│           MEMORY COST AT SCALE (10,000 keys, 100 req/key)       │
+│                                                                 │
+│  Algorithm              Memory per key    Total for 10K keys    │
+│  ────────────────────────────────────────────────────────────── │
+│                                                                 │
+│  Token Bucket           64 bytes          640 KB                │
+│  (2 counters + Redis overhead)                                  │
+│                                                                 │
+│  Fixed Window           48 bytes          480 KB                │
+│  (1 counter + TTL + Redis overhead)                             │
+│                                                                 │
+│  Sliding Window         16 bytes          160 KB                │
+│  Counter                 (2 counters)                            │
+│                                                                 │
+│  Sliding Window         5.6 MB            56 GB                 │
+│  Log                     (100 entries                           │
+│                          at 56 bytes each)                      │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Sliding Window Log at 56 GB is likely too expensive   │   │
+│  │  for most production systems. Use Sliding Window        │   │
+│  │  Counter instead unless you need perfect accuracy.      │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  Note: Redis memory overhead varies by version and config.     │
+│  These are conservative estimates for Redis 7.x.               │
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+### The Cold Start Problem
+
+When a client sends their first request, the rate limiter must initialize their bucket or counter. This means a cache miss in Redis. The first request incurs a full round trip to create the key, populate the initial state, and set the TTL. For a Token Bucket, this means an HSET instead of a lighter HINCRBY.
+
+Mitigation: pre-create buckets for known clients (paying users, integrated services) during onboarding. This shifts the cost from the first request to a background initialization job.
+
+---
+
+## 9. Configuration — The Knobs You Turn
+
+Every rate limiter needs configuration. The parameters you choose determine the behavior of the system, and misconfiguration is one of the most common causes of production incidents.
+
+### Token Bucket Parameters
+
+| Parameter | Type | Description | Typical Value |
+|-----------|------|-------------|---------------|
+| capacity | float | Maximum burst size | 100 |
+| refillRate | float | Tokens per second | 10 |
+| initialTokens | float | Starting tokens | capacity (full) |
+
+`capacity` divided by `refillRate` gives you the time to fully drain the bucket. For capacity=100 and refillRate=10, it takes 10 seconds to drain from full to empty at maximum load. After that, the rate settles to 10 requests per second.
+
+### Fixed Window Parameters
+
+| Parameter | Type | Description | Typical Value |
+|-----------|------|-------------|---------------|
+| windowSize | int | Window duration in seconds | 60 |
+| maxRequests | int | Requests allowed per window | 100 |
+
+### Sliding Window Log Parameters
+
+| Parameter | Type | Description | Typical Value |
+|-----------|------|-------------|---------------|
+| windowSize | int | Window duration in seconds | 60 |
+| maxRequests | int | Requests allowed per window | 100 |
+| precision | int | Timestamp precision in ms | 1000 (1 second) |
+
+### Sliding Window Counter Parameters
+
+| Parameter | Type | Description | Typical Value |
+|-----------|------|-------------|---------------|
+| windowSize | int | Window duration in seconds | 60 |
+| maxRequests | int | Requests allowed per window | 100 |
+
+### Per-User vs Per-IP vs Global
+
+You must decide the scope of your rate limit key. The scope determines what happens when a user switches IPs or when multiple users share an IP.
+
+**Per-User**: Keyed by API key, user ID, or session token. This is the most common approach. Each user gets their own bucket. The downside is that a user with 1000 API keys could bypass the limit by rotating keys.
+
+**Per-IP**: Keyed by client IP address. This is useful for unauthenticated endpoints. The downside is that users behind a NAT share an IP, so one user's burst can block another user. Carrier-grade NAT makes this particularly problematic.
+
+**Global**: A single key shared by all requests. This is used for system-wide limits (for example, the entire API cannot exceed 1 million requests per minute). This is usually combined with per-user limits to create a two-tier rate limiting system.
+
+### Two-Tier Rate Limiting
+
+Most production systems use two tiers:
+
+```
+Tier 1 (Per-User): token bucket, capacity=100, refillRate=10
+Tier 2 (Global):   sliding window counter, max=10000 per minute
+```
+
+A request passes only if both tiers allow it. This prevents a single user from hogging the system while also protecting the system from a coordinated attack across many users.
+
+<AsciiDiagram
+  id="rate-limiting/two-tier-architecture-diagram"
+  alt="Two-tier rate limiting architecture showing per-user and global tiers with Lua scripts in Redis"
+  caption="Two-tier rate limiting: per-user bucket and global counter, checked in sequence"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│              TWO-TIER RATE LIMITING ARCHITECTURE                  │
+│                                                                 │
+│  Request ──> ┌──────────────────────────────────────────────┐   │
+│              │              API Gateway                      │   │
+│              │                                                │   │
+│              │  1. Extract user ID from API key               │   │
+│              │  2. Extract client IP from headers             │   │
+│              │  3. Look up rate limit config for this route   │   │
+│              └────────┬───────────────────────────┬───────────┘   │
+│                       │                           │               │
+│                       ▼                           ▼               │
+│              ┌──────────────────┐      ┌──────────────────┐      │
+│              │   Tier 1         │      │   Tier 2         │      │
+│              │   Per-User       │      │   Global         │      │
+│              │   Token Bucket   │      │   Sliding Window │      │
+│              │   Lua script     │      │   Counter        │      │
+│              │   Redis:         │      │   Lua script     │      │
+│              │   ratelimit:     │      │   Redis:         │      │
+│              │   user:{id}      │      │   ratelimit:     │      │
+│              └────────┬─────────┘      │   global:api     │      │
+│                       │                └────────┬──────────┘      │
+│                       │                         │               │
+│                       ▼                         ▼               │
+│              ┌──────────────────────────────────────────────┐   │
+│              │  Decision:                                   │   │
+│              │  - Both tiers allow   ──> Forward to upstream │   │
+│              │  - Either tier denies ──> Return 429         │   │
+│              │  - Headers show the more restrictive limit   │   │
+│              └──────────────────────────────────────────────┘   │
+│                                                                 │
+│  Redis Lua scripts ensure atomicity at each tier independently. │
+│  The two checks are sequential, not parallel, to avoid charging │
+│  Tier 1 if Tier 2 will deny the request.                        │
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+---
+
+## 10. Rate Limit Headers — The Contract with Clients
+
+Your rate limiter must communicate its state to clients so they can self-regulate. The standard set of headers, defined by the IETF draft standard, is:
+
+| Header | Description |
+|--------|-------------|
+| `X-RateLimit-Limit` | The maximum requests allowed in the window |
+| `X-RateLimit-Remaining` | The number of requests remaining in the window |
+| `X-RateLimit-Reset` | Unix timestamp when the limit resets |
+
+For Token Bucket, `Reset` is the time when the bucket will be full again (capacity / refillRate seconds from now). For Fixed Window, it is the end of the current window. For Sliding Window, it is approximately `windowSize` seconds from now.
+
+### The Retry-After Header
+
+When you return a 429 response, you must include the `Retry-After` header. This tells the client how long to wait before retrying. The value can be seconds (integer) or an HTTP-date.
+
+```
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1748712400
+Retry-After: 6
+
+{
+  "error": "rate_limit_exceeded",
+  "message": "You have exceeded the rate limit of 100 requests per minute. Please wait 6 seconds and retry.",
+  "retry_after_seconds": 6
+}
+```
+
+### Why Good Headers Matter
+
+Clients that respect these headers will not hammer your API with 429 retries. They will back off gracefully. This is especially important for mobile clients, where retries consume battery and mobile data. Well-behaved clients reduce your server load by 30-50% in practice.
+
+---
+
+## 11. Common Pitfalls and How to Avoid Them
+
+### Pitfall 1: Refill Rate Too High
+
+If you set `refillRate` to match the expected peak traffic, the bucket never drains and you never actually rate limit. The bucket only provides protection if the refill rate is below the rate you want to limit.
+
+**Fix**: Set `refillRate` to your target sustained rate, not your peak rate. Let `capacity` handle the bursts.
+
+### Pitfall 2: Unbounded Key Space
+
+If you use per-IP rate limiting and a malicious client rotates through millions of IPs (via a botnet), you create millions of keys in Redis. This can exhaust Redis memory.
+
+**Fix**: Set a TTL on every rate limit key. For Token Bucket, set the TTL to `capacity / refillRate * 2` seconds. If the key is not accessed in that time, Redis will reclaim it.
+
+### Pitfall 3: One-Size-Fits-All Limits
+
+Applying the same rate limit to all endpoints is a mistake. A `/health` endpoint that returns a static response should have a much higher limit than a `/search` endpoint that does a database query.
+
+**Fix**: Configure per-route rate limits. Use a configuration file or a database table that maps routes to rate limit parameters.
+
+### Pitfall 4: Ignoring Warm-Up
+
+When a new user sends their first request, the rate limiter must initialize their state. If you set `initialTokens` to `capacity`, the user immediately gets a full burst. This is usually what you want, but it means the first request might be slower because it creates the key in Redis.
+
+**Fix**: Pre-create keys for known users on login. For anonymous users, the one-time cost of creating the key is negligible.
+
+### Pitfall 5: Not Monitoring Rate Limiting
+
+You must know how often your rate limiter is denying requests. A sudden spike in 429 responses could indicate a legitimate client misconfiguration, or it could be an attack.
+
+**Fix**: Emit metrics for every rate limit decision — total checks, allowed, denied, per key, per algorithm. Alert on a sudden increase in denial rate.
+
+---
+
+## 12. Decision Framework — Choosing the Right Algorithm
+
+Here is a decision tree you can follow when choosing a rate limiting algorithm for a new system:
+
+```
+Is perfect accuracy required?
+  └── Yes ──> Is request rate under 100 req/s per key?
+              └── Yes ──> Sliding Window Log
+              └── No  ──> Split into shards, use Sliding Window Log per shard
+
+  └── No  ──> Is memory a primary concern?
+              └── Yes ──> Sliding Window Counter (16 bytes per key)
+
+              └── No  ──> Do you need burst handling?
+                          └── Yes ──> Token Bucket (natural burst support)
+                          └── No  ──> Is the system simple with few keys?
+                                      └── Yes ──> Fixed Window (acceptable for daily quotas)
+                                      └── No  ──> Token Bucket or Sliding Window Counter
+```
+
+In practice, the recommendation is straightforward:
+
+- **Token Bucket** for most API rate limiting. It handles bursts, is simple to implement, and is O(1).
+- **Sliding Window Counter** when memory is tight and you need smooth limits.
+- **Sliding Window Log** only when you need perfect accuracy and the rate is low.
+- **Fixed Window** only for long-duration quotas (daily, monthly) where the boundary problem is irrelevant.
+
+---
+
+## 13. Summary — What You Now Know
+
+| Concept | Key Takeaway |
+|---------|-------------|
+| Token Bucket | Lazy refill is O(1), no timers needed. Burst = capacity. |
+| Fixed Window | Boundary problem can double the effective rate. Acceptable for long windows. |
+| Sliding Window Log | Perfect accuracy at O(N) memory cost. Use only for low-rate, high-precision cases. |
+| Sliding Window Counter | Two counters per key, ~95% accuracy, O(1) memory. The practical choice. |
+| Race Conditions | Redis Lua scripts atomize read-modify-write. Never use multi-step check-and-set. |
+| Performance | In-memory: ~0.5 microsec. Redis: ~1 ms. Sliding Window Log is 10x more expensive. |
+| Memory | Sliding Window Log: 56 bytes per request. Others: 16-64 bytes per key. |
+| Configuration | capacity, refillRate, windowSize, maxRequests. Per-user > per-IP > global. |
+| Headers | Limit, Remaining, Reset, Retry-After. They let clients self-regulate. |
+
+### Bridge to Architecture
+
+You now understand the internal mechanics of rate limiting algorithms, data structures, and the consistency challenges of distributed deployment. On the next page, you will step back and look at the system architecture — how rate limiting fits into a microservices deployment, how you integrate it with an API gateway, how you handle configuration management at scale, and how you monitor and alert on rate limiting in production. The algorithms you learned here become the building blocks of a complete rate limiting subsystem.
