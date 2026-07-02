@@ -1,0 +1,410 @@
+---
+id: consistent-hashing-architecture
+title: Consistent Hashing at Scale
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest consistent hashing implementation is a ring data structure in a single application process. All routing logic lives in the application, and each node is a plain HTTP server. This works up to a point, and then it breaks.
+
+### The Naive Code
+
+```python
+import hashlib
+
+class NaiveRing:
+    def __init__(self):
+        self.nodes = {}  # hash -> node_address
+        self.sorted_hashes = []
+
+    def add_node(self, node_address):
+        h = hashlib.md5(node_address.encode()).hexdigest()
+        self.nodes[h] = node_address
+        self.sorted_hashes.append(h)
+        self.sorted_hashes.sort()
+
+    def get_node(self, key):
+        h = hashlib.md5(key.encode()).hexdigest()
+        for ring_hash in self.sorted_hashes:
+            if ring_hash >= h:
+                return self.nodes[ring_hash]
+        return self.nodes[self.sorted_hashes[0]]
+```
+
+This works for a cache with 3 servers. Each server gets roughly one-third of the keys. When you add a fourth server, only the keys whose hashes fall in the new server's ring segment move — roughly 25 percent instead of 100 percent.
+
+### What Breaks at 1,000 Users
+
+At 1,000 users, each node handles roughly 333 cache entries. The naive ring works fine. Request latency is dominated by network round trips, not the hash lookup.
+
+### What Breaks at 100,000 Users
+
+At 100,000 users and 10 nodes, each node handles 10,000 cache entries. The naive ring starts showing problems:
+
+- **Uneven distribution**: With only 1 hash per physical node, some nodes end up with larger ring arcs than others. In a 10-node cluster, the largest arc may be 18 percent of the ring while the smallest is 2 percent. The node with the largest arc handles 9x the load of the smallest.
+- **Hot spots**: A few popular keys (celebrity user profiles) concentrate requests on specific nodes regardless of ring distribution.
+- **Single node failure overload**: When a node fails, its keys go to the next clockwise node, which suddenly handles double the load. That node may also fail from overload, cascading to the next node.
+
+<AsciiDiagram
+  id="consistent-hashing/naive-breaks"
+  title="What Breaks in Naive Consistent Hashing at 100,000 Users"
+  content={`
+      NAIVE RING — 10 NODES, 1 HASH PER NODE
+      ┌──────────────────────────────────────────────────────────┐
+      │                                                        │
+      │    [A]────[B]────[C]────[D]────[E]────[F]────[G]────  │
+      │     │                              │                   │
+      │   15% of ring                    2% of ring            │
+      │   Node_A handles 15% of keys     Node_G handles 2%    │
+      │                                                        │
+      │    WITHOUT VIRTUAL NODES:                              │
+      │    ┌─────────┬──────────┬──────────┬─────────────────┐  │
+      │    │ Node    │ Ring %  │ Keys     │ Requests/sec    │  │
+      │    ├─────────┼──────────┼──────────┼─────────────────┤  │
+      │    │ A       │ 15      │ 15,000   │ 3,750           │  │
+      │    │ B       │ 12      │ 12,000   │ 3,000           │  │
+      │    │ C       │ 11      │ 11,000   │ 2,750           │  │
+      │    │ D       │ 10      │ 10,000   │ 2,500           │  │
+      │    │ E       │ 10      │ 10,000   │ 2,500           │  │
+      │    │ F       │ 8       │ 8,000    │ 2,000           │  │
+      │    │ G       │ 2       │ 2,000    │ 500             │  │
+      │    │ H       │ 15      │ 15,000   │ 3,750           │  │
+      │    │ I       │ 10      │ 10,000   │ 2,500           │  │
+      │    │ J       │ 7       │ 7,000    │ 1,750           │  │
+      │    └─────────┴──────────┴──────────┴─────────────────┘  │
+      │                                                        │
+      │    Node_G is idle (500 req/s). Node_A is overloaded    │
+      │    (3,750 req/s, 85% CPU). Scale fails unevenly.       │
+      └──────────────────────────────────────────────────────────┘
+  `}
+  alt="A naive 10-node consistent hash ring without virtual nodes showing uneven ring arc sizes from 2 percent to 15 percent, causing severe load imbalance"
+  caption="Without virtual nodes, small rings produce severely uneven load distribution. Node_A handles 7.5x the load of Node_G."
+/>
+
+### What Breaks at 10 Million Users
+
+At 10 million users and 50 nodes, the naive ring collapses under multiple failure modes:
+
+- **Router single point of failure**: If the application process that runs the ring logic crashes, no requests route. Every client needs its own copy of the ring.
+- **Stale topology**: When a new node joins, existing clients do not learn about it until they restart. New nodes serve no traffic for minutes or hours.
+- **Rebalancing storms**: Adding or removing a node triggers a full scan of affected keys. With 50 million keys, scanning the affected ring segment (2 percent of keys = 1 million keys) takes minutes of sequential I/O.
+- **No heterogeneity**: A 64 GB RAM node and a 16 GB RAM node both get the same number of keys. The large node is underutilized, the small node is oversaturated.
+
+---
+
+## Production-Grade Architecture
+
+A production consistent hashing system solves the naive ring's problems with four architectural additions: virtual nodes, gossip-based topology discovery, sidecar-based routing, and weighted capacity.
+
+<AsciiDiagram
+  id="consistent-hashing/production-architecture"
+  title="Production-Grade Consistent Hashing Architecture"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────┐
+│                      PRODUCTION-GRADE ARCHITECTURE                          │
+├──────────────────────────────────────────────────────────────────────────┤
+│  SERVICE DISCOVERY LAYER                                                   │
+│  ┌──────────────────────────────────────────────────────────────────┐     │
+│  │  [etcd]───[etcd]───[etcd]    (Raft cluster, 3-5 nodes)           │     │
+│  │  Stores: ring topology, node metadata, version counter            │     │
+│  └──────────────────────────────────────────────────────────────────┘     │
+│                           │ watches for changes                           │
+│                           ▼                                                │
+│  ROUTING LAYER (Sidecar proxies)                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐     │
+│  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐   │     │
+│  │  │ Proxy  │  │ Proxy  │  │ Proxy  │  │ Proxy  │  │ Proxy  │   │     │
+│  │  │ App A  │  │ App B  │  │ App C  │  │ App D  │  │ App E  │   │     │
+│  │  └────┬───┘  └────┬───┘  └────┬───┘  └────┬───┘  └────┬───┘   │     │
+│  └───────┼───────────┼───────────┼───────────┼───────────┼───────┘     │
+│          │           │           │           │           │              │
+│          ▼           ▼           ▼           ▼           ▼              │
+│  DATA LAYER (Cache / Storage Nodes)                                     │
+│  ┌──────────────────────────────────────────────────────────────────┐     │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌───────┐ │     │
+│  │  │ Node 1   │ │ Node 2   │ │ Node 3   │ │ Node 4   │ │Node 5 │ │     │
+│  │  │ 64 GB    │ │ 32 GB    │ │ 32 GB    │ │ 32 GB    │ │16 GB  │ │     │
+│  │  │ w=2.0   │ │ w=1.0   │ │ w=1.0   │ │ w=1.0   │ │w=0.5 │ │     │
+│  │  │ 2000 vN │ │ 1000 vN │ │ 1000 vN │ │ 1000 vN │ │500 vN │ │     │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └───────┘ │     │
+│  └──────────────────────────────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+    Legend: [etcd] = Configuration service   [Proxy] = Sidecar router
+           [Node]  = Data node               w = weight, vN = virtual nodes
+`}
+  alt="Three-layer production architecture showing discovery layer (etcd cluster), routing layer (sidecar proxies), and data layer (weighted cache nodes with virtual nodes)"
+  caption="Production architecture separates service discovery, routing, and data storage into independently scalable layers"
+/>
+
+### Service Discovery Layer
+
+A Raft-based configuration service (etcd or ZooKeeper) stores the authoritative ring topology. Nodes register themselves on startup and update their health status. The configuration service publishes topology changes to all watching sidecar proxies.
+
+**Key properties**:
+- Every topology change goes through Raft consensus, ensuring a consistent global ordering.
+- Watchers receive push notifications within 5 milliseconds of a topology update.
+- The configuration service stores the versioned ring topology as a single key-value pair: `ring/topology/v42` containing the sorted ring array.
+
+### Routing Layer
+
+Each application instance runs a sidecar proxy (Envoy, linkerd, or a custom process). The proxy watches the configuration service for topology changes and maintains a local copy of the sorted ring array. Application code sends all requests to `localhost:PORT`. The proxy handles ring-aware routing to the correct data node.
+
+**Key properties**:
+- Application code never needs to know about the ring topology. It just talks to localhost.
+- Proxy handles retries, circuit breaking, and load shedding.
+- Topology updates are atomic within the proxy: old requests finish on the old topology, new requests use the new topology.
+
+### Data Layer
+
+Each data node runs a caching or storage server (Redis, Cassandra, Memcached). Nodes are heterogeneous — different sizes, different weights. The weight determines the number of virtual nodes on the ring, which determines the fraction of keys the node stores.
+
+**Key properties**:
+- Nodes register their weight and capacity on startup via the configuration service.
+- Nodes stream keys to new neighbors during rebalancing.
+- Nodes report health and load metrics via the gossip protocol.
+
+---
+
+## Integration Patterns
+
+### Pattern 1: RDBMS Read Replica Sharding
+
+A PostgreSQL read replica farm uses consistent hashing to distribute read queries across replicas. Each replica registers on the ring with a weight proportional to its CPU cores. Write queries go to the primary database; read queries route to the replica indicated by the consistent hash of the query's shard key.
+
+```python
+# Application sidecar routes read queries
+shard_key = extract_shard_key(sql_query)  # e.g., user_id from WHERE clause
+replica = ring.get_node(shard_key)
+forward(sql_query, replica)  # Routes to the correct read replica
+```
+
+**Benefit**: Read replicas scale horizontally without any change to application code. Adding a replica automatically redistributes read queries.
+
+<AsciiDiagram
+  id="consistent-hashing/rdbms-integration"
+  title="Integration Pattern — RDBMS Read Replica Sharding"
+  content={`
+      ┌──────────┐     ┌──────────┐     ┌──────────┐
+      │  App 1   │     │  App 2   │     │  App 3   │
+      └────┬─────┘     └────┬─────┘     └────┬─────┘
+           │                │                │
+           ▼                ▼                ▼
+      ┌──────────────────────────────────────────────┐
+      │           SIDECAR PROXY (Ring Router)          │
+      └────┬──────┬──────┬──────┬──────┬──────┬───────┘
+           │      │      │      │      │      │
+           ▼      ▼      ▼      ▼      ▼      ▼
+      ┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐
+      │ Pg R1││ Pg R2││ Pg R3││ Pg R4││ Pg R5││ Pg R6│
+      │w=1.0 ││w=2.0 ││w=1.0 ││w=1.5 ││w=1.0 ││w=0.5 │
+      └──────┘└──────┘└──────┘└──────┘└──────┘└──────┘
+           │      │      │      │      │      │
+           └──────┴──────┴──────┴──────┴──────┘
+                              │
+                              ▼
+                      ┌──────────────┐
+                      │  Pg Primary   │
+                      │  (Write-only) │
+                      └──────────────┘
+
+      Write path: App → Primary (always)
+      Read path:  App → Sidecar → Ring lookup → Specific replica
+  `}
+  alt="Architecture diagram showing application sidecars routing read queries to PostgreSQL read replicas via consistent hashing, while writes go to the primary"
+  caption="Consistent hashing distributes read queries across PostgreSQL read replicas. Writes go to the primary. Adding a replica is a topology update — no application changes needed."
+/>
+
+### Pattern 2: Distributed Cache (Redis Cluster)
+
+A Redis cluster uses consistent hashing to partition cache keys across nodes. Each Redis node stores a subset of keys. Virtual nodes ensure even distribution. The sidecar proxy handles routing, retries, and replica failover.
+
+**Key metrics**: 10-node Redis cluster with 1,000 virtual nodes each achieves 99.2 percent balanced distribution (max node load / average node load = 1.08). Compare to 1 virtual node per node: max/average = 2.4.
+
+### Pattern 3: Message Queue Partitioning
+
+A Kafka-like message queue uses consistent hashing to partition messages across brokers. Each message is assigned a partition key. The consistent hash of the partition key determines which broker stores the message.
+
+```python
+# Producer side: hash message to a broker
+partition_key = message.user_id
+broker = ring.get_node(partition_key)
+producer.send(broker, message)
+
+# Consumer side: each consumer reads from a subset of ring positions
+my_node = ring.get_node(consumer_id)
+for message in broker.consume(my_node):
+    process(message)
+```
+
+**Benefit**: Producers and consumers independently compute the same broker assignment without coordination. This is the foundation of Kafka's partition assignment strategy.
+
+### Pattern 4: External API Rate Limiting
+
+A multi-tenant API gateway uses consistent hashing to distribute rate limit counters across Redis nodes. The tenant ID is the shard key. Rate limit counters for each tenant land on the same Redis node, enabling accurate per-tenant rate limiting without distributed counters.
+
+```python
+tenant_id = extract_tenant_id(request)
+counter_node = ring.get_node(f"ratelimit:{tenant_id}")
+counter = counter_node.increment(f"counter:{tenant_id}")
+if counter > tenant_limit:
+    return 429 Too Many Requests
+```
+
+**Benefit**: Rate limiting is accurate per tenant without any cross-node coordination. Adding Redis nodes scales rate limiting capacity without affecting existing tenant assignments.
+
+---
+
+## Multi-Region and Global Scale
+
+At global scale, a single hash ring spanning all data centers introduces cross-region latency for every request. The solution is a ring-per-region topology with asynchronous replication between rings.
+
+<AsciiDiagram
+  id="consistent-hashing/global-topology"
+  title="Multi-Region Consistent Hashing Topology"
+  content={`
+      GLOBAL TOPOLOGY — RING PER REGION
+
+      us-east-1                     eu-west-1
+      ┌──────────────────┐         ┌──────────────────┐
+      │  Ring: us-east    │         │  Ring: eu-west    │
+      │  ┌──┐ ┌──┐ ┌──┐ │         │  ┌──┐ ┌──┐ ┌──┐ │
+      │  │N1│ │N2│ │N3│ │         │  │N4│ │N5│ │N6│ │
+      │  └──┘ └──┘ └──┘ │         │  └──┘ └──┘ └──┘ │
+      │  Local writes:   │         │  Local writes:   │
+      │  hash(key) % us  │         │  hash(key) % eu  │
+      └────────┬─────────┘         └────────┬─────────┘
+               │                            │
+               │  Async replication          │  Async replication
+               │  (Kafka, SQS, CDC)         │  (Kafka, SQS, CDC)
+               │                            │
+               ▼                            ▼
+      ┌──────────────────────────────────────────────┐
+      │              CROSS-REGION BUS                  │
+      │  Writes replicated between regions asynchronously│
+      └──────────────────────────────────────────────┘
+
+      ap-southeast-1                 sa-east-1
+      ┌──────────────────┐         ┌──────────────────┐
+      │  Ring: ap-southeast│        │  Ring: sa-east    │
+      │  ┌──┐ ┌──┐ ┌──┐ │         │  ┌──┐ ┌──┐ ┌──┐ │
+      │  │N7│ │N8│ │N9│ │         │  │N10││N11││N12││
+      │  └──┘ └──┘ └──┘ │         │  └──┘ └──┘ └──┘ │
+      │  Local writes    │         │  Local writes    │
+      └──────────────────┘         └──────────────────┘
+
+      Key property: Each region has its own ring, own nodes.
+      Cross-region replication runs asynchronously.
+      Reads always served from local ring (under 10ms).
+      Writes acknowledged locally (under 5ms), replicated eventually.
+  `}
+  alt="Four-region global topology with separate hash rings per region (us-east, eu-west, ap-southeast, sa-east) and asynchronous cross-region replication"
+  caption="Multi-region deployments use independent rings per region. Cross-region replication is asynchronous, keeping local writes under 5ms latency."
+/>
+
+**Key design decisions**:
+- Each region has its own ring with local nodes only. A request in eu-west-1 routes to eu-west-1 nodes.
+- Cross-region replication runs asynchronously via Kafka, SQS, or change data capture (CDC).
+- Read operations never cross regions. P99 read latency stays under 10ms.
+- Write operations acknowledge locally within 5ms. Cross-region replication adds 200-500ms of eventual consistency lag.
+- Conflict resolution at global scale requires CRDTs or last-write-wins with hybrid logical clocks.
+
+---
+
+## Capacity Planning
+
+### The Math
+
+Consider a cache cluster starting at 500 GB total data with plans to grow to 5 TB over two years. Each cache node is a 64 GB RAM instance.
+
+**Current state**: 500 GB data, 10 nodes (640 GB total RAM, using 78 percent of capacity).
+
+**Growth**: Data grows at 30 percent per year. In 12 months: 650 GB. In 24 months: 845 GB.
+
+**Node count**:
+- Storage per node: 64 GB RAM, target 75 percent utilization = 48 GB usable per node.
+- Nodes needed at launch: 500 GB / 48 GB = 11 nodes (round up from 10.4).
+- Nodes needed at 12 months: 650 GB / 48 GB = 14 nodes.
+- Nodes needed at 24 months: 845 GB / 48 GB = 18 nodes.
+
+**With consistent hashing**: Adding 4 nodes at month 12 causes approximately 4/14 = 28 percent of keys to move. At 650 GB, that is 182 GB of data transfer. At 1 Gbps per node, parallel transfer completes in under 30 minutes. Zero cache cold start.
+
+**Without consistent hashing (modulo)**: Adding 4 nodes causes 100 percent key movement. 650 GB transferred. All caches cold. The system serves from the database for 30+ minutes.
+
+### Node Sizing
+
+For a given ring, the recommended virtual node count per physical node is:
+
+```
+v = N * 100  (for clusters under 50 nodes)
+v = N * 20   (for clusters over 50 nodes)
+```
+
+Where N is the total number of physical nodes. A 10-node cluster gets 1,000 virtual nodes each. A 200-node cluster gets 4,000 virtual nodes each (20 * 200 = 4,000).
+
+---
+
+## Deployment and Operations
+
+### Zero-Downtime Deployment
+
+Adding a new node to the consistent hash ring without downtime follows this sequence:
+
+1. **Provision**: Start the new node with the same configuration as existing nodes. Do not register it on the ring yet.
+2. **Pre-warm**: Load the node with data from neighbors. Stream the keys the new node will own based on the planned ring position.
+3. **Register**: Atomically update the ring topology in the configuration service. The new node's hash positions are now part of the ring.
+4. **Propagate**: The configuration service pushes the updated topology to all sidecar proxies within 5-50 milliseconds.
+5. **Redirect**: New requests for keys owned by the new node route to it. Existing in-flight requests complete on the old nodes.
+
+**Duration**: The entire add operation completes in under 2 minutes for a 100 GB data transfer. The topology update is atomic — there is no window where two proxies disagree on the ring.
+
+### Monitoring
+
+Monitor these metrics to detect consistent hashing problems:
+
+- **Skew ratio**: `max_node_load / average_node_load`. Above 1.15 indicates poor virtual node distribution. Investigate the hash function and virtual node count.
+- **Rebalancing rate**: Keys moved per second during a topology change. A rate below 50 MB/s suggests network congestion. Above 500 MB/s suggests the node is overwhelmed.
+- **Ring convergence time**: Time from topology change to all proxies having the same ring. Above 5 seconds suggests a proxy configuration issue.
+- **Stale routing percentage**: Fraction of requests that route to a node that no longer owns the key. Above 0.1 percent indicates topology propagation lag or proxy bugs.
+
+### Debugging
+
+Common debugging commands and tools:
+
+```bash
+# Dump the local ring topology from a sidecar proxy
+curl localhost:8080/ring/dump | jq '.entries | length'
+
+# Check the virtual node distribution
+curl localhost:8080/ring/stats
+# {
+#   "total_virtual_nodes": 15000,
+#   "nodes": [
+#     {"id": "node1", "vnode_count": 3000, "estimated_load": 0.21},
+#     {"id": "node2", "vnode_count": 1000, "estimated_load": 0.07},
+#   ]
+# }
+
+# Trigger a ring topology refresh
+curl -X POST localhost:8080/ring/refresh
+
+# View the ring version history from the configuration service
+etcdctl get --prefix /ring/topology/
+```
+
+### Upgrades
+
+Upgrade a node in the consistent hash ring:
+
+1. **Drain**: Set the node's weight to 0. The next gossip cycle redistributes its virtual nodes evenly across remaining nodes. Keys gradually migrate to neighbors.
+2. **Verify**: Wait for the ring convergence metric to reach 100 percent. The draining node should serve zero requests.
+3. **Upgrade**: Apply the software or configuration change to the drained node.
+4. **Rejoin**: Restart the node with its original identity. It re-occupies its original ring positions. The configuration service pushes the updated topology to all proxies.
+5. **Replenish**: The rejoined node streams keys from its neighbors to rebuild its data. Traffic gradually shifts back to it.
+
+---
+
+The architectural patterns explored here — from naive ring to global multi-region topology — inform the trade-off decisions analyzed on the Trade-offs page.

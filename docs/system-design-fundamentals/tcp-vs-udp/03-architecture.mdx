@@ -1,0 +1,422 @@
+---
+id: tcp-vs-udp-architecture
+title: TCP vs UDP at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest possible TCP server listens on a port, accepts one connection at a time, and handles requests sequentially.
+
+```python
+# Naive TCP echo server — one connection at a time
+import socket
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(('0.0.0.0', 8080))
+server.listen(5)
+while True:
+    client, addr = server.accept()
+    data = client.recv(1024)
+    client.send(b'echo: ' + data)
+    client.close()
+```
+
+This works for one user sending one request. At 10 users, the 5th client's SYN is dropped because the listen backlog is 5. At 100 concurrent users, the time spent in the serial loop means the first client connects, sends data, and waits 50 seconds for the next `accept()` to be called. Throughput: approximately 5 requests per second.
+
+The naive UDP server is equally simple:
+
+```python
+# Naive UDP echo server — single thread, no connection state
+import socket
+
+server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+server.bind(('0.0.0.0', 9090))
+while True:
+    data, addr = server.recvfrom(1024)
+    server.sendto(b'echo: ' + data, addr)
+```
+
+This handles 10,000 datagrams per second on a single core because there is no per-connection state, no accept queue, and no connection establishment overhead. The kernel delivers each datagram to the same socket. The problem at scale is not throughput — it is the one-thread bottleneck. At 100,000 datagrams per second, a single thread spending 10 microseconds per datagram uses 100% CPU and drops incoming datagrams because the kernel's receive queue overflows.
+
+### What Breaks at Each Scale Tier
+
+| Scale | TCP Problem | UDP Problem |
+|-------|-------------|-------------|
+| 1K clients | Serial accept starves clients; backlog fills | Single-thread recvfrom is fine (under 1% CPU) |
+| 100K clients | File descriptor limit (default 1024 per process); OOM from socket buffers at 128 KB each = 12.8 GB RAM | Single-thread recvfrom at 100K datagrams/sec uses 80-90% CPU; receive queue overflow on bursts |
+| 10M clients | Cannot have 10M open file descriptors on one machine; kernel TCP table has 10M entries costing 400 MB-1.2 GB just for control blocks; arp cache fills; connection tracking blows up | No problem — 10M clients do not mean 10M open sockets; each datagram is processed and forgotten. Performance depends on datagrams/sec, not client count |
+
+## Production-Grade Architecture
+
+A production TCP server uses an event loop or thread pool to handle thousands of concurrent connections efficiently.
+
+<AsciiDiagram
+  id="tcp-vs-udp/prod-arch"
+  title="Production TCP and UDP Server Architecture"
+  content={`
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                       PRODUCTION TCP SERVER                              │
+  │                                                                         │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐               │
+  │  │ Worker 1 │  │ Worker 2 │  │ Worker 3 │  │ Worker 4 │  N workers    │
+  │  │ (epoll)  │  │ (epoll)  │  │ (epoll)  │  │ (epoll)  │  via SO_REUSE │
+  │  └─────┬────┘  └─────┬────┘  └─────┬────┘  └─────┬────┘  PORT         │
+  │        │             │             │             │                     │
+  │  ┌─────▼─────────────▼─────────────▼─────────────▼──┐                  │
+  │  │           Kernel TCP Table (SO_REUSEPORT)         │                  │
+  │  │         hash distributes connections to workers    │                  │
+  │  └─────────────────────┬─────────────────────────────┘                  │
+  │                        │                                               │
+  │  ┌─────────────────────▼─────────────────────────────┐                  │
+  │  │               Network Interface (NIC)              │                  │
+  │  │            RSS (Receive Side Scaling)              │                  │
+  │  │       hardware distributes across CPU cores        │                  │
+  │  └───────────────────────────────────────────────────┘                  │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                       PRODUCTION UDP SERVER                              │
+  │                                                                         │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐               │
+  │  │ Worker 1 │  │ Worker 2 │  │ Worker 3 │  │ Worker 4 │  N workers,   │
+  │  │ (recvmsg)│  │ (recvmsg)│  │ (recvmsg)│  │ (recvmsg)│  each bound   │
+  │  └─────┬────┘  └─────┬────┘  └─────┬────┘  └─────┬────┘  to same port │
+  │        │             │             │             │    with SO_REUSE-  │
+  │  ┌─────▼─────────────▼─────────────▼─────────────▼──┐  PORT           │
+  │  │         Kernel UDP Table (hash by dest port)      │                  │
+  │  │     kernel distributes datagrams per-packet       │                  │
+  │  └─────────────────────┬─────────────────────────────┘                  │
+  │                        │                                               │
+  │  ┌─────────────────────▼─────────────────────────────┐                  │
+  │  │               Network Interface (NIC)              │                  │
+  │  │      RSS directs flows to queues per CPU core      │                  │
+  │  └───────────────────────────────────────────────────┘                  │
+  └─────────────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────┐
+  │ LEGEND:  [Worker] = OS process or thread                    │
+  │          ────  = kernel-mode boundary                      │
+  │          SO_REUSEPORT = socket option for multi-worker      │
+  │          RSS = NIC feature, spreads load across cores       │
+  └─────────────────────────────────────────────────────────────┘
+  `}
+  caption="TCP requires per-connection worker affinity (the same worker handles all packets for a connection). UDP has no affinity requirement — any worker can handle any datagram."
+/>
+
+### The Event Loop Pattern (libuv, epoll, kqueue)
+
+Production TCP servers use non-blocking I/O with an event loop:
+
+```python
+# Production-style TCP server with asyncio
+import asyncio
+
+async def handle_client(reader, writer):
+    data = await reader.read(1024)
+    writer.write(b'echo: ' + data)
+    await writer.drain()
+    writer.close()
+
+async def main():
+    server = await asyncio.start_server(handle_client, '0.0.0.0', 8080)
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+```
+
+This handles 50,000 concurrent connections on a single machine because the event loop does not create a thread per connection. The `async with` block registers each connection's file descriptor with the kernel's epoll instance and only wakes up when data is ready.
+
+## Integration Patterns
+
+### Pattern 1: TCP with a Database
+
+Every database client library uses TCP under the hood. PostgreSQL, MySQL, and Redis all speak their protocols over TCP.
+
+<AsciiDiagram
+  id="tcp-vs-udp/db-tcp"
+  title="Database Connection Pool via TCP"
+  content={`
+  ┌─────────┐                           ┌─────────┐
+  │  App    │                           │  DB     │
+  │  Server │                           │ Server  │
+  └────┬────┘                           └────┬────┘
+       │                                     │
+       │  ┌─ Connection Pool ───┐            │
+       │  │ [TCP conn 1]        │            │
+       │  │ [TCP conn 2]        │            │
+       │  │ [TCP conn 3]        │            │
+       │  │ ...                 │            │
+       │  │ [TCP conn N]        │            │
+       │  └─────────────────────┘            │
+       │                                     │
+       │  Each query:                        │
+       │  1. Borrow conn from pool ───────►  │
+       │  2. Send SQL query (TCP write)      │
+       │  3. Receive result (TCP read)       │
+       │  4. Return conn to pool             │
+       │                                     │
+       │  Pool size: 30-200 connections      │
+       │  per app instance                   │
+       │                                     │
+       │  Why TCP: queries need guaranteed   │
+       │  delivery and ordering. Losing a    │
+       │  SQL statement mid-stream corrupts  │
+       │  the transaction boundary.          │
+       └─────────────────────────────────────┘
+  `}
+  caption="Database connections always use TCP. A connection pool amortizes the 1-RTT handshake cost over many queries. Pool size balances throughput (more connections = more concurrent queries) against database CPU (each connection costs a backend process)."
+/>
+
+### Pattern 2: UDP with a Caching Layer (Memcached)
+
+Memcached uses UDP for read queries where performance matters and TCP for set commands where reliability matters.
+
+<AsciiDiagram
+  id="tcp-vs-udp/memcache"
+  title="Memcached — UDP Gets, TCP Sets"
+  content={`
+  ┌─────────┐                              ┌────────────┐
+  │  App    │                              │ Memcached  │
+  │  Server │                              │  (cache)   │
+  └────┬────┘                              └─────┬──────┘
+       │                                         │
+       │  GET key (UDP, no retry)                │
+       │  ───────────────────────►              │
+       │  ◄─── VALUE key (UDP, best-effort)     │
+       │                                         │
+       │  If UDP response lost:                  │
+       │  ── App retries after 1ms timeout       │
+       │  ── Second attempt usually succeeds     │
+       │  ── Miss penalty: hit the DB instead    │
+       │                                         │
+       │  SET key (TCP, must succeed)            │
+       │  ─────────────────────────►             │
+       │  ◄─── OK (TCP, guaranteed)              │
+       │                                         │
+       │  Why:                                    │
+       │  GET = read-mostly, tolerant of loss     │
+       │  SET = critical (cache miss on write     │
+       │         means stale data forever)        │
+       │                                         │
+       │  Memcached default: UDP port 11211      │
+       │  Optional: TCP port 11211 for writes     │
+       └─────────────────────────────────────────┘
+  `}
+  caption="Memcached's dual-protocol approach: 95% of traffic is UDP GETs, 5% is TCP SETs. A lost GET costs 1ms + a database query. A lost SET costs data inconsistency."
+/>
+
+### Pattern 3: Message Queue — Kafka's TCP-Based Protocol
+
+Kafka uses a custom binary protocol over TCP, not HTTP. Each Kafka client maintains a persistent TCP connection to each broker partition leader.
+
+<AsciiDiagram
+  id="tcp-vs-udp/kafka"
+  title="Kafka — TCP Connections to Partition Leaders"
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                        Kafka Cluster                            │
+  │                                                                 │
+  │  ┌────────────┐   ┌────────────┐   ┌────────────┐             │
+  │  │ Broker 1    │   │ Broker 2    │   │ Broker 3    │             │
+  │  │             │   │             │   │             │             │
+  │  │ Partition 0 │   │ Partition 0 │   │ Partition 0 │             │
+  │  │ Partition 2 │   │ Partition 1 │   │ Partition 3 │             │
+  │  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘             │
+  │         │                 │                 │                    │
+  └─────────┼─────────────────┼─────────────────┼────────────────────┘
+            │                 │                 │
+  ┌─────────▼─────────────────▼─────────────────▼────────────────────┐
+  │  Producer (persistent TCP to each broker it writes to)           │
+  │                                                                  │
+  │  ┌─────────────────────────────────────────────────────────┐    │
+  │  │ Batch acks = 1: producer sends 16 KB batch, waits for   │    │
+  │  │ all in-sync replicas to acknowledge before sending next  │    │
+  │  └─────────────────────────────────────────────────────────┘    │
+  │                                                                  │
+  │  Why TCP, not UDP:                                               │
+  │  - In-order delivery by partition (message 5 before message 6)   │
+  │  - Exactly-once semantics require ack + sequence number tracking │
+  │  - Batching amortizes TCP overhead (16 KB per send)             │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+  caption="Kafka's batching strategy makes TCP efficient: each batch carries 16 KB of payload, amortizing the per-packet overhead over many messages."
+/>
+
+### Pattern 4: External APIs — HTTP/2 over TCP
+
+When your service calls an external API, HTTP/2 multiplexes multiple request-response streams over a single TCP connection.
+
+```python
+# HTTP/2 multiplexing — 100 requests on one TCP connection
+import aiohttp
+
+async def fetch_all(urls):
+    connector = aiohttp.TCPConnector(limit=1)  # single connection
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [session.get(url) for url in urls]
+        responses = await asyncio.gather(*tasks)
+        return responses
+```
+
+With a single TCP connection to each external service, you avoid the 1-RTT handshake cost for every request. At 10,000 requests per second, this saves 200 round trips per second (200ms RTT to a European API from US East Coast = 40 seconds of cumulative handshake delay saved per second).
+
+## Multi-Region and Global Scale
+
+When a service spans multiple geographic regions, TCP and UDP behave very differently under the added latency and packet loss of inter-continental links.
+
+<AsciiDiagram
+  id="tcp-vs-udp/global-topology"
+  title="Global Multi-Region Transport Topology"
+  content={`
+  ┌──────────────────┐            ┌──────────────────┐
+  │  US East          │            │  EU West          │
+  │  (us-east-1)      │  80ms RTT  │  (eu-west-1)      │
+  │                   │◄──────────►│                   │
+  │  ┌─────────────┐  │  0.05% loss│  ┌─────────────┐  │
+  │  │ Service A   │  │            │  │ Service B   │  │
+  │  │ (TCP)       │  │            │  │ (TCP)       │  │
+  │  └─────────────┘  │            │  └─────────────┘  │
+  └──────────────────┘            └──────────────────┘
+           │                               │
+           │ 20ms                           │ 30ms
+           ▼                               ▼
+  ┌──────────────────┐            ┌──────────────────┐
+  │  US West          │            │  AP Southeast     │
+  │  (us-west-2)      │  150ms RTT │  (ap-southeast-1) │
+  │                   │◄──────────►│                   │
+  │  ┌─────────────┐  │  0.1% loss │  ┌─────────────┐  │
+  │  │ Service C   │  │            │  │ Service D   │  │
+  │  │ (UDP)       │  │            │  │ (UDP)       │  │
+  │  └─────────────┘  │            │  └─────────────┘  │
+  └──────────────────┘            └──────────────────┘
+
+  Cross-region TCP throughput calculation:
+  Bandwidth-delay product = 1 Gbps x 0.08s RTT = 80 Mbit in flight
+  TCP window must be at least 80 Mbit (10 MB) to fill the pipe
+  Single loss at 0.05% drops window by half → 40 Mbit throughput
+  Recovery: additive increase, +1 segment per RTT = 20 seconds to recover
+
+  Cross-region UDP behavior:
+  No window. No congestion control. No window halving.
+  Application sends at 1 Gbps. 0.05% of packets are lost.
+  Application decides which packets matter (keyframes vs. deltas).
+  `}
+  caption="At intercontinental distances, TCP's congestion control halves throughput on any loss. UDP loses packets but keeps sending at the application's chosen rate."
+/>
+
+### Replication Strategies
+
+For cross-region replication of stateful data (databases, caches), TCP is used for consistency-critical paths:
+
+- **Synchronous replication**: The leader waits for TCP ACK from all replicas before confirming to the client. This adds at least one inter-region RTT (80-300ms) to every write. Used by Spanner, Aurora, and CockroachDB for strong consistency.
+- **Asynchronous replication**: The leader confirms to the client, then streams changes over TCP to replicas. Replicas may lag by 1-10 seconds. Used by MySQL async replication, DynamoDB global tables.
+- **UDP broadcast replication**: Used only within a datacenter for cache invalidation (Redis Sentinel heartbeats). Never across regions — the application cannot distinguish "lost" from "never sent."
+
+### Failover
+
+When a region goes down, TCP connections to that region time out after heartbeat probing (60 seconds with aggressive settings). UDP-based service discovery (Consul, etcd) detects the failure in 5-10 seconds via gossip protocol — which is itself UDP-based. The failover timelines differ by a factor of 6-12x due entirely to the transport choice.
+
+## Capacity Planning
+
+### Scenario: 10 Million Daily Active Users, Real-Time Collaboration Tool
+
+Each user sends 5 messages per minute during active use. Each message is 1 KB. Peak load is 3x average (evening hours, US timezone).
+
+**Traffic calculation**:
+
+```
+Daily active hours: 4 hours per user (staggered)
+Active users at any time: 10M / 24 * 4 = ~1.67M concurrent
+Messages per second: 1.67M * (5/60) = ~139,000 msg/sec
+Peak messages per second: 139,000 * 3 = ~417,000 msg/sec
+Bandwidth (payload): 417,000 msg/sec * 1 KB = ~417 MB/s = 3.3 Gbps
+```
+
+**TCP capacity**:
+
+```
+Per-connection memory: 128 KB (send + recv buffer)
+Total TCP memory at 1.67M connections: 1.67M * 128 KB = 213 GB
+Minimum server count (128 GB RAM per server): 213 / 128 = ~2 servers for memory
+But TCP throughput: 23 Gbps per server (with tuned settings)
+Network bottleneck: 3.3 Gbps → fits in one server
+Real bottleneck: CPU for per-packet processing on 417K msg/sec
+
+With TCP: Each message requires 4 TCP segments (send, ACK, deliver, ACK for next)
+Total packet processing: ~1.67M packets/sec per server with 2 servers
+Modern CPU with 64 cores processes ~20M TCP packets/sec (kernel stack)
+TCP is CPU-bound at ~30% of capacity → feasible
+```
+
+**UDP capacity**:
+
+```
+Per-connection memory: 0 bytes
+UDP throughput: 25 Gbps per server (same NIC)
+CPU per packet: ~0.5x TCP (no ACK processing)
+With UDP: 417K msg/sec uses ~15% of CPU on one server
+UDP can handle peak load with 2 servers for redundancy (not capacity)
+```
+
+**Decision**: Use TCP for message delivery (messages must arrive in order and without loss). Use UDP for presence/heartbeat data (losing one heartbeart is acceptable, 50 updates per second is fine). Total servers: 3 TCP instances, 2 UDP instances.
+
+## Deployment and Operations
+
+### Zero-Downtime Deployment
+
+**TCP servers**: When deploying a new version, the old server must drain its existing connections before shutting down. The sequence:
+
+1. Old server calls `shutdown(SHUT_RD)` to stop accepting new data but continue sending responses.
+2. Load balancer health check fails (old server stops responding on health check port).
+3. Load balancer drains existing connections (timeout: 30-60 seconds).
+4. Old server calls `close()` on remaining connections when all in-flight requests complete.
+
+Total drain time: approximately 30 seconds. During this window, clients cannot reconnect to the old server but existing connections survive.
+
+**UDP servers**: Zero-downtime deployment is simpler. The new server binds to the same port with `SO_REUSEPORT`. The kernel distributes new datagrams to both old and new workers. After 30 seconds (to flush any in-flight datagrams to the old server), the old server is stopped. No drain logic needed — UDP is stateless.
+
+### Monitoring Metrics
+
+| Metric | TCP Signal | UDP Signal |
+|--------|-----------|------------|
+| Connection establishment rate | SYN received/sec, accept queue depth | N/A |
+| Active connections | `ss -s` | N/A |
+| Retransmission rate | `tcpi_total_retrans` / total segments | N/A |
+| RTT | `tcpi_rtt` | N/A |
+| Send buffer pressure | `tcpi_snd_cwnd` < `tcpi_snd_wnd` | N/A |
+| Receive buffer drops | `TcpExtTCPBacklogDrop` | `UdpRcvbufErrors` |
+| Packet loss | `tcpi_lost` > 0 | N/A |
+| Datagram drops | N/A | `UdpInErrors` (if receive queue overflows) |
+| Listener drops | `TcpExtListenOverflows` | N/A |
+
+### Debugging Common Issues
+
+**TCP Issue: High Retransmissions (> 1%)**
+
+Cause: Network congestion, buffer under-provisioned, or packet loss. Check `ss -ti` for retransmit counters. Run `mtr <target>` to identify the hop with packet loss. Solution: increase `tcp_wmem`, enable BBR congestion control, or move to a different network path.
+
+**TCP Issue: Connection Timeout on connect()**
+
+Cause: Server's listen backlog full or server overloaded. Check `netstat -s | grep listen` for `TCPBacklogDrop`. Solution: increase `somaxconn`, add more server instances, or implement connection retry with exponential backoff on the client.
+
+**TCP Issue: TIME_WAIT Accumulation**
+
+10,000+ connections in TIME_WAIT on a server handling ephemeral connections (short HTTP requests). Each TIME_WAIT socket consumes a small amount of kernel memory. At 50,000 TIME_WAIT connections, memory is negligible but the port range (16-bit ephemeral ports for outbound connections) may exhaust. Solution: enable `tcp_tw_reuse` for outbound connections, or pool connections to reuse them.
+
+**UDP Issue: Receive Buffer Overflow**
+
+`UdpRcvbufErrors` in `/proc/net/snmp` increases. The application cannot read datagrams as fast as they arrive. Solution: increase `rmem_max` and `SO_RCVBUF`, or shard incoming traffic across more workers with `SO_REUSEPORT`.
+
+**UDP Issue: Silent Packet Loss**
+
+The application experiences data gaps but no error is returned. Every system call succeeds. Solution: add application-level sequence numbers and a gap detection mechanism. Log gaps and alert if the gap rate exceeds 0.1%.
+
+**UDP Issue: MTU Fragmentation**
+
+Datagrams larger than the path MTU (typically 1500 bytes) are fragmented by IP. Losing one fragment loses the entire datagram. Solution: stay under 1400 bytes per datagram, or implement MTU path discovery at the application level.

@@ -1,0 +1,686 @@
+---
+id: why-caching-deep-dive
+title: Why Caching — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+A cache appears simple from the outside — store a key, retrieve a value. Inside, a production-grade cache is an intricate system of data structures, memory management, concurrency control, and expiration mechanics. Understanding these internals separates an engineer who can configure a cache from one who can diagnose why it is failing at 3 AM.
+
+## Internal Architecture
+
+Every cache, whether local or distributed, is built from the same core components arranged in a pipeline.
+
+<AsciiDiagram
+  id="why-caching/internal-architecture"
+  title="Internal architecture of a cache server showing core components"
+  alt="Anatomy of a cache server with hash table, eviction tracker, TTL scheduler, network listener, and serialization layer"
+  content={`
+    ┌──────────────────────────────────────────────────────┐
+    │                 Cache Server Internals                │
+    │                                                       │
+    │  ┌─────────────────────────────────────────────┐     │
+    │  │          Network Listener                    │     │
+    │  │   Accepts connections, parses protocol       │     │
+    │  │   (RESP, ASCII, gRPC, custom TCP)            │     │
+    │  └────────────────────┬────────────────────────┘     │
+    │                       │                              │
+    │                       ▼                              │
+    │  ┌─────────────────────────────────────────────┐     │
+    │  │          Serialization Layer                 │     │
+    │  │   Deserialize request → Serialize response   │     │
+    │  │   Formats: string, JSON, protobuf, msgpack  │     │
+    │  └────────────────────┬────────────────────────┘     │
+    │                       │                              │
+    │                       ▼                              │
+    │  ┌─────────────────────────────────────────────┐     │
+    │  │          Command Router                      │     │
+    │  │   Routes GET/SET/DELETE to correct handler  │     │
+    │  └──────┬──────────────┬──────────────┬────────┘     │
+    │         │              │              │               │
+    │         ▼              ▼              ▼               │
+    │  ┌──────────┐  ┌──────────────┐  ┌──────────┐       │
+    │  │ Hash     │  │ Eviction     │  │ TTL      │       │
+    │  │ Table    │  │ Tracker      │  │ Scheduler│       │
+    │  │ O(1)     │  │ (LRU/LFU)   │  │ (Min-    │       │
+    │  │ lookup   │  │             │  │  Heap)   │       │
+    │  └──────────┘  └──────────────┘  └──────────┘       │
+    │         │              │              │               │
+    │         ▼              ▼              ▼               │
+    │  ┌─────────────────────────────────────────────┐     │
+    │  │          Memory Allocator                    │     │
+    │  │   jemalloc / slab allocator                  │     │
+    │  │   Fragmentation management                   │     │
+    │  └─────────────────────────────────────────────┘     │
+    │                                                       │
+    │  ┌─────────────────────────────────────────────┐     │
+    │  │          Persistence (optional)              │     │
+    │  │   RDB snapshot / AOF log / WAL              │     │
+    │  └─────────────────────────────────────────────┘     │
+    └──────────────────────────────────────────────────────┘
+  `}
+  caption="Internal architecture of a production cache server showing the request pipeline from network to memory"
+/>
+
+The pipeline begins at the network listener. Redis uses the REdis Serialization Protocol (RESP), a binary-safe protocol that multiplexes commands over a single TCP connection. Memcached uses a simpler ASCII protocol with multiple TCP connections. The listener handles thousands of concurrent connections using an event loop — select, poll, epoll (Linux), or kqueue (macOS) — to avoid one-thread-per-connection overhead.
+
+The serialization layer converts between the wire format and internal representations. Integers are stored as native machine words. Strings are stored as byte arrays with length prefixes. Composite types — lists, sets, hashes, sorted sets — are serialized into their corresponding C data structures.
+
+The command router dispatches operations to the correct handler. GET routes to the hash table lookup. SET routes to the hash table insert plus eviction check. DEL routes to the hash table delete plus TTL queue removal. EXISTS, EXPIRE, TTL, and other metadata operations route to specialized handlers that inspect or modify entry metadata without moving the value data.
+
+The hash table stores all key-value pairs. Production caches use chained hash tables with lazy resizing to guarantee O(1) amortized lookup. The memory allocator — typically jemalloc or a custom slab allocator — manages the heap to minimize fragmentation from entries of varying sizes being allocated and freed.
+
+The eviction tracker monitors memory pressure and selects entries to remove when the cache reaches its memory limit. LRU (Least Recently Used) and LFU (Least Frequently Used) are the two dominant policies.
+
+The TTL scheduler maintains a priority queue of expiration times. A background thread polls the queue, evicts expired entries, and sleeps until the next expiration. This is distinct from eviction — TTL expiration is based on time, while eviction is based on memory pressure.
+
+## Data Structures and Algorithms
+
+The performance characteristics of a cache are determined by the data structures it uses. Each structure makes a specific trade-off between read speed, write speed, and memory overhead.
+
+### Hash Table — The Primary Index
+
+<AsciiDiagram
+  id="why-caching/hash-table"
+  title="Hash table structure with chaining for collision resolution"
+  alt="Diagram of a hash table showing key hashing, bucket array, and collision chains"
+  content={`
+    Key: "feed:42:page=1"
+           │
+           ▼
+    Hash Function (MurmurHash3 / SipHash)
+           │
+           ▼
+    Hash: 0xA3F72B (truncated to 16 bits = 0x72B)
+           │
+           ▼
+    ┌──────┴──────┐
+    │ Bucket Array│  Size: 65536 entries
+    ├─────────────┤
+    │ [0x000]     │─── null
+    │ [0x001]     │─── null
+    │ ...         │
+    │ [0x72B]     │───▶ ┌─────────┐  ┌─────────┐
+    │ ...         │    │ key:    │  │ key:    │
+    │ [0xFFFF]    │    │ feed:42 │  │ feed:99 │
+    └─────────────┘    │ value:  │  │ value:  │
+                       │ <json>  │  │ <json>  │
+                       │ next: ──┼──▶ next:   │──▶ null
+                       │ ttl: 300│  │ ttl: 300│
+                       │ size: 4K│  │ size: 4K│
+                       └─────────┘  └─────────┘
+
+    Load factor = number_of_keys / bucket_count
+    Redis default: load factor threshold ~1.0 → trigger resize
+    Resize: double bucket array, rehash all keys
+  `}
+  caption="Hash table structure with chaining — the primary index backing every cache lookup"
+/>
+
+The hash table is the heart of every cache. When you call `GET key`, the cache:
+
+1. Applies a hash function (MurmurHash3 in Redis, a modified Jenkins hash in Memcached) to convert the key string into a fixed-size hash value.
+2. Masks the hash value to the current bucket array size to select a bucket index.
+3. Follows the linked list at that bucket, comparing keys byte-by-byte until it finds a match or reaches the end.
+
+The load factor — the ratio of stored keys to buckets — determines lookup performance. At a load factor of 1.0, the average chain length is 1. At 5.0, the average chain length is 5, and lookups degrade from O(1) to O(n) in the chain. Redis triggers a rehash when the load factor exceeds approximately 1.0. The rehash doubles the bucket array and reinserts every key — an O(n) operation that Redis performs incrementally to avoid latency spikes. Memcached uses a fixed-size hash table calculated at startup based on the configured maximum memory.
+
+The hash table stores not just keys and values but also metadata: TTL expiration time, value size, access timestamp for LRU, and flags for serialization format. Redis stores this metadata in a `redisObject` structure alongside the key entry. Memcached stores it in an `item` structure with a fixed header followed by the key and value bytes.
+
+### LRU Linked List — Eviction Ordering
+
+<AsciiDiagram
+  id="why-caching/lru-list"
+  title="LRU linked list showing eviction ordering"
+  alt="Doubly linked list ordered by access time with most recently used at head and eviction candidate at tail"
+  content={`
+    Most Recently Used                        Least Recently Used
+         │                                          │
+         ▼                                          ▼
+    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+    │ Key: A   │◄──▶│ Key: C   │◄──▶│ Key: B   │◄──▶│ Key: D   │
+    │ Value:   │    │ Value:   │    │ Value:   │    │ Value:   │
+    │ <json>   │    │ <json>   │    │ <json>   │    │ <json>   │
+    │ prev: ───┼───▶│ prev: ───┼───▶│ prev: ───┼───▶│ prev: ───┤
+    │ next: ───┼───▶│ next: ───┼───▶│ next: ───┼───▶│ next: nil│
+    └──────────┘    └──────────┘    └──────────┘    └──────────┘
+                                                         │
+                                                         ▼
+                                                  ┌──────────────┐
+                                                  │  Eviction    │
+                                                  │  Candidate   │
+                                                  │  Remove D    │
+                                                  │  when memory │
+                                                  │  is full     │
+                                                  └──────────────┘
+
+    On GET key B:
+    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+    │ Key: A   │◄──▶│ Key: C   │◄──▶│ Key: D   │◄──▶│ Key: B   │
+    └──────────┘    └──────────┘    └──────────┘    └──────────┘
+    B moves from position 3 to 4 (most recently used)
+  `}
+  caption="LRU doubly linked list showing eviction ordering — entries at the tail are evicted first when memory pressure triggers eviction"
+/>
+
+The LRU linked list maintains entries in order of access. Every time a key is read or written, the cache moves its entry to the head of the list (most recently used). When eviction is triggered — either by memory limit or by maxkeys limit — the cache removes entries from the tail (least recently used).
+
+Implementation details matter. Redis uses an approximated LRU: instead of maintaining a perfect global linked list (which would require locks on every access), Redis samples a small set of keys (configurable, default 5) and evicts the oldest among them. This approximation is nearly as effective as perfect LRU in practice and avoids the synchronization overhead. Memcached uses a perfect LRU within each slab class.
+
+The LRU list interacts with the TTL expiration mechanism. When a key expires via TTL, it is removed from both the hash table and the LRU list. The eviction tracker never sees it — it was already gone. This is why setting appropriate TTLs reduces memory pressure: expired keys free space without triggering eviction.
+
+### TTL Priority Queue
+
+<AsciiDiagram
+  id="why-caching/ttl-priority-queue"
+  title="TTL priority queue for expiration scheduling"
+  alt="Min-heap structure sorted by expiration time with background tick thread"
+  content={`
+    ┌──────────────────────────────────────┐
+    │       TTL Scheduler Thread           │
+    │                                      │
+    │  Sleep until next expiration         │
+    │  → Wake up → Check min-heap          │
+    │  → Evict expired entries             │
+    │  → Sleep until next expiration       │
+    └──────────────────────────────────────┘
+                      │
+                      ▼
+    ┌──────────────────────────────────────┐
+    │       Min-Heap (Priority Queue)      │
+    │                                      │
+    │  Root = next key to expire           │
+    │                                      │
+    │    expires_at: 12:00:01 ────▶ Key: A │  ← evict next
+    │    expires_at: 12:00:05 ────▶ Key: C │
+    │    expires_at: 12:00:10 ────▶ Key: B │
+    │    expires_at: 12:00:15 ────▶ Key: D │
+    │    expires_at: 12:00:20 ────▶ Key: E │
+    │    expires_at: 12:00:25 ────▶ Key: F │
+    │    expires_at: 12:00:30 ────▶ Key: G │
+    └──────────────────────────────────────┘
+
+    Insert: O(log n) — push onto heap, sift up
+    Peek:   O(1) — read root
+    Evict:  O(log n) — pop root, sift down
+
+    Redis uses a different approach:
+    Each key stores expiration time in the hash table entry.
+    Every 100ms, Redis samples 20 random keys and evicts expired ones.
+    This avoids maintaining a separate heap.
+  `}
+  caption="TTL priority queue — a min-heap keyed by expiration time that drives the background expiration scheduler"
+/>
+
+A cache that supports per-key TTL needs a mechanism to efficiently determine which keys have expired. The naive approach — scanning the entire hash table every second — is O(n) and would destroy performance. Instead, caches use a priority queue.
+
+Each cache entry stores its expiration timestamp as an absolute Unix timestamp (not a relative TTL). When a key is set with TTL, the cache pushes a reference to the entry into a min-heap keyed by expiration time. A background thread peeks at the heap root. If the root's expiration time is in the past, it pops the root, evicts the key from the hash table, and repeats. If the root's expiration time is in the future, the thread sleeps until that time (or wakes earlier if a new key with a shorter TTL is inserted).
+
+Redis uses a different approach for historical performance reasons. Instead of a dedicated priority queue, Redis stores the expiration time as metadata on the hash table entry itself. A background timer (the "serverCron" function, runs every 100ms) samples 20 random keys and evicts all that have expired. If more than 25% of the sample was expired, it repeats. This probabilistic approach achieves effectively the same result as a priority queue with constant memory overhead per key and avoids the O(log n) insertion cost of a heap.
+
+### Skip List — Sorted Set Operations
+
+<AsciiDiagram
+  id="why-caching/skip-list"
+  title="Skip list data structure for sorted set operations"
+  alt="Skip list with multiple levels of linked list allowing O(log n) range queries"
+  content={`
+    Level 3: ──────────────────────────────────────────▶ nil
+                │
+    Level 2: ────────────▶ ┌─────┐ ─────────────────────▶ nil
+                │          │ 50  │
+                │          │     │
+    Level 1: ────────▶ ┌───┴──┐──┴───┐ ────────────────▶ nil
+                │      │  30  │      │
+                │      │      │      │
+    Level 0: ────┐───▶ └──────┴──────┴───┐ ────▶ ┌─────┐───┐───▶ nil
+                │   10         │        30     │ 50   │   │
+                │              │               │      │   │
+                └──────────────┘               └──────┘   │
+                                                          │
+                                                          ▼
+                                                    ┌──────────┐
+                                                    │ Key:     │
+                                                    │ Member:  │
+                                                    │ Score:   │
+                                                    └──────────┘
+
+    Average search: O(log n)
+    Range query: O(log n + k) where k = number of elements in range
+    Insert: O(log n)
+  `}
+  caption="Skip list data structure used for Redis sorted sets — enables O(log n) range queries and leaderboard operations"
+/>
+
+Redis sorted sets use skip lists to support ordered iteration and range queries. A skip list is a probabilistic alternative to a balanced tree that maintains multiple levels of linked lists. The bottom level contains all elements in sorted order. Each higher level contains a subset of elements, acting as an express lane for searches.
+
+When a cache uses sorted sets for TTL ordering or eviction tracking, the skip list enables operations that a hash table alone cannot support efficiently: finding all keys that expire within a time range, iterating keys in eviction order, or computing the rank of a key by access frequency.
+
+### Serialization and Wire Protocols
+
+Every time data enters or leaves a cache, it must be serialized (converted from in-memory objects to bytes) or deserialized (bytes back to objects). The cost of serialization is often the hidden bottleneck in cache performance.
+
+**String encoding:** Redis and Memcached store values as byte arrays. The application is responsible for serializing before storing and deserializing after retrieving. Common formats:
+
+- **Plain string:** Fastest serialization (zero cost for string data), but limited to string-compatible values. Integers and booleans must be converted.
+- **JSON:** Universally supported, human-readable, but slow to serialize/deserialize for large payloads. Python's `json` module handles 100MB/s. JavaScript's `JSON.parse` handles 200MB/s. Not suitable for high-throughput cache workloads without optimization.
+- **MsgPack:** Binary JSON. 20-30% smaller than JSON, 1.5-2x faster to serialize. Good balance of performance and debuggability (MsgPack can be inspected with hex dump tools).
+- **Protocol Buffers:** Schema-defined binary format. 30-50% smaller than JSON, 5-10x faster to serialize and deserialize. Requires schema management and code generation. The fastest option for structured data.
+- **Custom binary:** Application-specific encoding that avoids any serialization overhead. Used in latency-critical systems like high-frequency trading where every microsecond matters.
+
+**Compression interaction:** Serialization and compression interact. A Protocol Buffer that compresses with LZ4 to 20% of its original size requires two passes: serialize to Protobuf bytes, then compress with LZ4. On read, decompress LZ4, then deserialize Protobuf. This adds CPU overhead but reduces memory and network bandwidth. The trade-off is favorable for values larger than 1KB.
+
+**Redis wire protocol (RESP):** Redis uses the REdis Serialization Protocol, a text-based protocol that is human-readable and efficient to parse. A SET command looks like:
+```
+*3\r\n$3\r\nSET\r\n$12\r\nprofile:42\r\n$25\r\n{"name":"Alice"}\r\n
+```
+RESP types: simple strings (+OK), errors (-ERR), integers (:1), bulk strings ($6\r\nfoobar\r\n), arrays (*2\r\n...). RESP3, introduced in Redis 6, adds typed responses (maps, sets, booleans, null) and push notifications for client-side caching.
+
+**Memcached wire protocol:** Memcached uses a simpler ASCII protocol:
+```
+set profile:42 0 300 25\r\n{"name":"Alice"}\r\n
+STO\rED\r\n
+```
+The first line: command, key, flags (0), TTL (300), byte count (25). The second line: the value. Response: `STO\rED` (stored), or `END` (not found). Memcached also supports a binary protocol for performance, but the ASCII protocol is more common.
+
+**Performance impact of serialization:** For a 5KB JSON value, Python's json.loads takes approximately 10µs. Protocol Buffers deserialization takes approximately 2µs. This difference matters when your cache handles 100,000 requests per second — 10µs per request adds 1 second of CPU time per second (one full core). Switching to Protocol Buffers reclaims 0.8 cores per 100K requests.
+
+### Memory Allocator Tuning
+
+The memory allocator is arguably the most important component for cache performance. Caches allocate and free memory at a furious rate. The default system allocator (glibc `malloc`) causes fragmentation and performance degradation under cache workloads.
+
+Redis uses jemalloc by default. jemalloc reduces fragmentation by dividing memory into size classes (8, 16, 32, 64 bytes, etc.) and serving allocations from the smallest class that fits the request. It uses per-thread caches to avoid lock contention. It periodically returns unused memory to the operating system.
+
+Memcached uses a slab allocator. The slab allocator pre-divides memory into slabs of fixed-size chunks (slab class 1: 96 bytes, class 2: 120 bytes, class 3: 152 bytes, etc.). When a value is stored, Memcached selects the slab class whose chunk size is the smallest that can hold the value. This eliminates fragmentation entirely within a slab class but introduces internal fragmentation (wasted space within a chunk) and can cause slab imbalance (one slab class runs out of memory while others have free chunks).
+
+Understanding the allocator is critical for capacity planning. A Redis instance configured with 10GB maxmemory may run out of memory at 8GB of actual data due to jemalloc overhead and fragmentation. Monitoring `used_memory_rss` vs `used_memory` in Redis INFO output reveals the fragmentation ratio — a ratio above 1.5 indicates significant waste.
+
+## The Request Lifecycle
+
+This section traces a single request through every internal component. The scenario: an application requests a user profile with key `"profile:uid=42"`.
+
+### Full Lifecycle: Cache Miss
+
+<AsciiDiagram
+  id="why-caching/request-lifecycle-miss"
+  title="Full request lifecycle on a cache miss showing all internal components"
+  alt="Timeline showing a request passing through network listener, serialization, hash table miss, origin query, and cache population"
+  content={`
+    Time ──────────────────────────────────────────────────────────────────────>
+    
+    Client         App Server         Cache Server           Database
+      │                 │                  │                    │
+      │── GET /user/42 ──▶                │                    │
+      │                 │── GET profile:42 ──▶                │
+      │                 │                  │                    │
+      │                 │        ┌─────────────────────┐       │
+      │                 │        │ Network Listener    │       │
+      │                 │        │ Parse RESP command  │       │
+      │                 │        │ Dispatch to handler │       │
+      │                 │        └─────────────────────┘       │
+      │                 │                  │                    │
+      │                 │        ┌─────────────────────┐       │
+      │                 │        │ Hash Table Lookup   │       │
+      │                 │        │ hash("profile:42")  │       │
+      │                 │        │ → bucket index: 0xA3│       │
+      │                 │        │ → chain walk: miss  │       │
+      │                 │        └─────────────────────┘       │
+      │                 │                  │                    │
+      │                 │◄── (nil) ────────┤                    │
+      │                 │                  │                    │
+      │                 │── Query DB ──────────────────────────▶│
+      │                 │                  │                    │
+      │                 │                  │       ┌────────────────┐
+      │                 │                  │       │ Index Scan     │
+      │                 │                  │       │ Hash Join      │
+      │                 │                  │       │ Sort           │
+      │                 │                  │       │ Return 20 rows │
+      │                 │                  │       └────────────────┘
+      │                 │◄── result ─────────────────────────────┤
+      │                 │                  │                    │
+      │                 │── SET profile:42 ──▶                  │
+      │                 │   EX 300                              │
+      │                 │                  │                    │
+      │                 │        ┌─────────────────────┐       │
+      │                 │        │ Serialize value     │       │
+      │                 │        │ Allocate memory     │       │
+      │                 │        │ Insert into hash    │       │
+      │                 │        │ Add to LRU list     │       │
+      │                 │        │ Add to TTL queue    │       │
+      │                 │        │ Check eviction      │       │
+      │                 │        └─────────────────────┘       │
+      │                 │◄── OK ─────────────────┤              │
+      │                 │                  │                    │
+      │◄── 200 OK ──────┤                   │                    │
+      │   X-Cache:MISS   │                  │                    │
+      │                 │                  │                    │
+  `}
+  caption="Full request lifecycle on a cache miss — the request passes through network parsing, hash table lookup (miss), database query, and cache population before returning"
+/>
+
+The lifecycle begins when the application server constructs a Redis command using the RESP protocol. The command `GET profile:42` is encoded as an array of bulk strings: `*2\r\n$3\r\nGET\r\n$12\r\nprofile:42\r\n`. The cache's network listener reads this from the TCP socket buffer.
+
+The listener operates on an event loop. On Linux, Redis uses `epoll` with a single-threaded event loop (the "reactor" pattern). The epoll instance monitors thousands of socket file descriptors. When data arrives on a socket, epoll wakes the event loop, which reads the data into a per-connection input buffer, parses the RESP data into command objects, and pushes them into a queue.
+
+The command router pops the next command and dispatches to the GET handler. The GET handler computes the hash of `"profile:42"` using MurmurHash3, masks to the bucket array size, and walks the chain comparing keys. The key is not found — cache miss.
+
+The cache returns a nil response to the application. The application receives the nil, constructs a database query, and sends it to PostgreSQL. The database executes an index scan on the `users` table with a hash join to `profiles`, sorts by `last_updated DESC`, and returns 20 rows.
+
+The application serializes the result to JSON and sends `SET profile:42 <json> EX 300` to the cache. The cache's SET handler:
+
+1. Calls jemalloc to allocate memory for the key, value, and metadata structures.
+2. Inserts the entry into the hash table at the computed bucket.
+3. Appends the entry to the head of the LRU linked list.
+4. Pushes the expiration time into the TTL priority queue (or marks it for the probabilistic scanner in Redis).
+5. Checks the current memory usage against maxmemory. If over the limit, the eviction tracker pops the tail of the LRU list and frees the memory of the evicted entry.
+6. Returns OK to the application.
+
+The application receives OK and returns the HTTP 200 response to the client with header `X-Cache: MISS`.
+
+### Full Lifecycle: Cache Hit
+
+On a cache hit, the lifecycle is shorter:
+
+1. Same network receive and command parsing.
+2. Hash table lookup: the key exists. The handler checks the expiration timestamp stored alongside the entry. Current time minus stored expiration is positive — the key has expired, so it is treated as a miss. Current time is before expiration — proceed.
+3. The handler calls `lru_list_promote(entry)` to move the entry to the head of the LRU list.
+4. The handler reads the value pointer from the hash table entry and returns it through the serialization layer.
+5. The serialization layer encodes the value bytes into the RESP wire format and writes them to the connection's output buffer.
+6. The event loop registers a write event for the socket. On the next iteration, it flushes the output buffer to the TCP socket.
+7. The application receives the response, deserializes the JSON, and returns the HTTP 200 with header `X-Cache: HIT`.
+
+Total cache server time: approximately 50 microseconds for a small value (under 1KB) on Redis. The dominant cost is the network round trip — typically 500 microseconds to 5 milliseconds depending on network topology.
+
+## Consistency and State
+
+Caching introduces a copy of data that can become inconsistent with the origin. Understanding when and how inconsistency arises is essential for building reliable systems.
+
+### Cache Node Crash
+
+<AsciiDiagram
+  id="why-caching/node-crash"
+  title="Cache node crash and its effect on cache data"
+  alt="Timeline showing a cache node crashing, all data lost, and the system reverting to direct database queries"
+  content={`
+    Time ────────────────────────────────────────────────────────────>
+    
+    Normal Operation:        Crash ──▶
+         │                             │
+    ┌──────────┐                 ┌──────────┐
+    │ {Cache}  │                 │ {Cache}  │
+    │ Key: A   │                 │ (empty)  │
+    │ Key: B   │                 │          │
+    │ Key: C   │                 │          │
+    │ Key: D   │                 │          │
+    └──────────┘                 └──────────┘
+         │                             │
+    Cache hits: 95%              Cache hits: 0%
+    DB load: 5%                  DB load: 100% (SPIKE!)
+    Latency p99: 5ms             Latency p99: 500ms (DEGRADED!)
+    
+    Recovery:
+         │
+    ┌──────────┐
+    │ {Cache}  │  Re-populating...
+    │ Key: A   │
+    │ ...      │  Hit ratio climbing back to 95%
+    └──────────┘  over 5-15 minutes (warm-up period)
+  `}
+  caption="A cache node crash causes immediate loss of all cached data, spiking database load until the cache warms up"
+/>
+
+When a cache node crashes — whether from a software fault, out-of-memory kill, or hardware failure — every entry it held is lost instantaneously. From the perspective of the application, every request that was previously served by that node now produces a cache miss.
+
+The impact depends on how many requests the lost node served. In a three-node Redis cluster with consistent hashing, losing one node invalidates approximately one-third of all cached entries. The database must absorb that one-third's worth of read traffic until the cache repopulates.
+
+Recovery involves two phases. Phase one: the cache node restarts and registers with the cluster. Phase two: the cache warms up as requests flow in and populate entries. During warm-up, the hit ratio climbs from 0% to its steady state of 90-95%. The warm-up period typically lasts 5-15 minutes for a production workload, depending on the number of unique keys and request rate.
+
+**Mitigation:** Run cache replicas (Redis replicas) so that if the primary crashes, a replica can be promoted without data loss. Use persistent storage (Redis RDB/AOF) so the cache survives restarts. Pre-warm the cache by replaying recent traffic or running a data load script after a restart.
+
+### Network Partition
+
+<AsciiDiagram
+  id="why-caching/network-partition"
+  title="Network partition isolating cache from application servers"
+  alt="Network split scenario where application servers cannot reach the cache and fall through to database"
+  content={`
+    Before Partition:
+    ┌──────────┐    ┌──────────┐    ┌──────────┐
+    │  App 1   │    │  App 2   │    │  App 3   │
+    └────┬─────┘    └────┬─────┘    └────┬─────┘
+         │               │               │
+         └───────────────┼───────────────┘
+                         │
+                    ┌────┴────┐
+                    │ {Cache} │
+                    └─────────┘
+                         │
+                    ┌────┴────┐
+                    │  ((DB)) │
+                    └─────────┘
+
+    During Partition:
+    ┌──────────┐    ┌──────────┐    ┌──────────┐
+    │  App 1   │    │  App 2   │    │  App 3   │
+    └────┬─────┘    └────┬─────┘    └────┬─────┘
+         │               │               │
+         │     ~~~ NETWORK SPLIT ~~~      │
+         │               │               │
+         │          ┌────┴────┐          │
+         │          │ {Cache} │          │
+         │          └─────────┘          │
+         │               │               │
+         │          ┌────┴────┐          │
+         └──────────┤  ((DB)) ├──────────┘
+                    └─────────┘
+
+    App 1 and App 3 can reach the database.
+    App 1 can reach the cache. App 3 cannot.
+    App 3's requests all suffer cache misses.
+  `}
+  caption="During a network partition, application servers that cannot reach the cache fall back to direct database queries, increasing latency and database load"
+/>
+
+A network partition occurs when a segment of the network becomes unreachable from another segment. Application servers on one side of the partition can reach the database but not the cache, or can reach the cache but not the database. The behavior depends entirely on how the application handles cache connection errors.
+
+**Pattern A — Fail-open:** The application catches the cache connection error and falls through to the database. Latency increases (no cache benefit) but the system remains functional. This is the safer pattern for availability.
+
+**Pattern B — Fail-close:** The application treats a cache connection error as a fatal error and returns 500 to the client. This is rarely what you want for a read cache — the cache is an optimization, not a source of truth.
+
+The correct approach is fail-open with circuit breaking. If the cache is unreachable, skip it and query the database. But if the cache is reachable but slow (degraded — responding in 100ms instead of 1ms), a circuit breaker prevents the application from wasting time on slow cache reads. The circuit opens after N consecutive slow responses, and the application reads directly from the database until the circuit resets.
+
+### Read-after-Write Consistency
+
+One of the trickiest consistency problems in caching is read-after-write consistency: a user writes data, refreshes the page, and sees the old data from the cache. This happens when the cache is invalidated before the database write is committed, or when a read replica lags behind the primary.
+
+Consider a user updating their profile photo. The application issues: (1) UPDATE the profile photo in the database. (2) DELETE the cache key `profile:{user_id}`. Under normal operation, this sequence works because the delete happens after the database write. But if the delete succeeds and the database write fails — because of a constraint violation or a connection error — the cache now has no entry, and the NEXT read will correctly fetch from the database (which still has the old photo). This is safe: the user sees a cache miss and gets the old photo, which is stale but not incorrect.
+
+The dangerous sequence is: (1) DELETE the cache key. (2) UPDATE the database. (3) A concurrent read between steps 1 and 2 sees the cache miss, queries the database (which still has the old data), and repopulates the cache with the old data. Now the cache has stale data even after the write completes. This is a "delete-then-set" race condition.
+
+**Mitigation:** Use a "write-through" approach for consistency-critical data: write to the database, write to the cache in the same transaction, or use a compare-and-swap operation on the cache entry with a version number. The application only overwrites the cache if the stored version is older than the write version. Alternatively, invert the order: write to the database first, then delete the cache key. If the read happens between the write and the delete, it gets fresh data from the database.
+
+### Cache and Replication Lag
+
+<AsciiDiagram
+  id="why-caching/replication-lag"
+  title="Cache interaction with database replication lag"
+  alt="Timeline showing a write to primary, replication lag, and cache serving stale data before replication completes"
+  content={`
+    User A writes: "name = Alice"
+         │
+         ▼
+    Primary DB ── Write "Alice" ──▶ DEL cache key
+         │
+         │  Replication in progress (100ms lag)
+         │
+         ▼
+    Read Replica ── Still has old value ("Bob")
+         │
+         ▼
+    User B reads ──▶ Cache miss ──▶ Read Replica ──▶ "Bob" (stale!)
+         │                                │
+         │                                │  Replication completes
+         │                                │  Read Replica now has "Alice"
+         │                                ▼
+         └──────────▶ SET cache: "Bob" ──▶ Cache now has stale "Bob"
+                                  until TTL expires!
+
+    Problem: Cache was populated from a stale replica.
+    Fix: Always read from the primary when populating the cache,
+         or use "read-your-writes" consistency by reading from
+         the primary for a short window after the write.
+  `}
+  caption="Database replication lag can cause the cache to be populated with stale data if reads are served from a replica that has not yet received the latest write"
+/>
+
+When using database read replicas, replication lag creates a subtle caching problem. The write goes to the primary. The cache invalidation deletes the cache key. A subsequent read misses the cache, queries the read replica — which has not yet received the replication — and gets stale data. The stale data is then written back to the cache, where it remains until the TTL expires.
+
+**Solutions:** (1) Always read from the primary when populating the cache after a miss. The read replica is fine for cache hit traffic but must not be the source for cache population. (2) Implement "read-your-writes" by reading from the primary for N milliseconds after a write, where N exceeds the maximum expected replication lag. (3) Set a very short TTL (seconds) so the stale data is quickly overwritten.
+
+### Simultaneous Writes
+
+When two application instances update the same data simultaneously, the cache can end up with the wrong value. Consider: instance A writes "name: Alice" to the database. Instance B writes "name: Bob" to the database. Instance B's write completes first. Instance A's write completes second — the database now has "Alice". But instance A populated the cache before the database write completed, so the cache has "Bob" while the database has "Alice".
+
+This is a write-ordering consistency problem. The cache has no knowledge of the relative ordering of writes — it just stores whatever it is told to store. Resolving this requires either:
+
+- Write-through caching with a single serialization point (a write coordinator or database sequence number).
+- Caching only data that changes infrequently and accepting the staleness window.
+- Version stamps: the cache stores a version number alongside the value, and the application only writes to the cache if the stored version is less than the new version.
+
+### Stale Data and Invalidation
+
+Stale data is the fundamental cost of caching. You trade perfect freshness for performance. The question is not whether staleness occurs but whether the application can tolerate it.
+
+The staleness window is the time between a write at the origin and the cache reflecting that write. With a TTL of 300 seconds, the maximum staleness window is 300 seconds. With explicit invalidation (delete the cache entry when the data changes), the window is the time to process the write plus the time to send the invalidation command — typically 10-100 milliseconds.
+
+Some applications can tolerate hours of staleness (a weather app that updates hourly). Some tolerate seconds (a social feed). Some tolerate none (a payment processing system where stale balance information would cause overdrafts). Knowing the staleness tolerance of each data type in your system is the first design decision when adding caching.
+
+## Performance Characteristics
+
+Understanding the latency and throughput characteristics of each cache type lets you make informed trade-offs.
+
+### Latency by Component
+
+| Component | p50 Latency | p99 Latency | p999 Latency |
+|-----------|-------------|-------------|--------------|
+| Local cache (in-process) | 1µs | 10µs | 50µs |
+| Local cache (shared memory) | 5µs | 30µs | 100µs |
+| Redis (same datacenter) | 0.5ms | 2ms | 5ms |
+| Memcached (same datacenter) | 0.5ms | 3ms | 8ms |
+| Redis (cross-AZ) | 2ms | 10ms | 30ms |
+| Database query (indexed, simple) | 5ms | 50ms | 200ms |
+| Database query (complex join) | 20ms | 200ms | 1000ms |
+
+The key insight: a local cache is 1,000x faster than a database query. A distributed cache is 10-100x faster. The gap widens as database load increases — under high load, database queries degrade to seconds, while a properly tuned cache maintains consistent sub-millisecond latency.
+
+### Hit Ratio Impact
+
+The cache hit ratio determines the effective performance of the system. With a hit ratio of 0% (no cache), every request hits the database. With a hit ratio of 99%, only 1% of requests hit the database — a 100x reduction in database load.
+
+The relationship between hit ratio and database load is nonlinear. Improving from 90% to 95% halves the database load (10% of requests to 5%). Improving from 95% to 99% reduces database load by 80% (5% to 1%). The effort required to improve the hit ratio increases as you approach 100% — the long tail of infrequently accessed data is hard to cache.
+
+### Throughput Limits
+
+| Component | Single-node throughput (GETs/sec) |
+|-----------|-----------------------------------|
+| Local cache (in-process) | 5,000,000 - 20,000,000 |
+| Redis single instance | 100,000 - 200,000 |
+| Memcached single instance | 200,000 - 500,000 |
+| Redis cluster (10 nodes) | 1,000,000 - 2,000,000 |
+
+Throughput is bounded by CPU (parsing + hashing) and network (packet processing). Redis is single-threaded for command execution, so throughput is limited to one CPU core. Memcached is multi-threaded, using one thread per CPU core, giving it an advantage on multi-core machines.
+
+### Command Pipelining and Batching
+
+In production systems, a single request often needs multiple cache lookups — retrieving a user's profile, their permissions, their preferences, and their session data. Making four separate round trips to the cache adds 4x the network latency. Command pipelining sends multiple commands in a single network packet and receives multiple responses in a single response packet.
+
+```
+Without pipelining (4 round trips):
+  Client              Redis
+    │── GET profile:42 ──▶│
+    │◄── <json> ──────────┤  1 RTT (1ms)
+    │── GET perm:42 ──────▶│
+    │◄── <json> ──────────┤  2 RTT (1ms)
+    │── GET pref:42 ──────▶│
+    │◄── <json> ──────────┤  3 RTT (1ms)
+    │── GET sess:abc ─────▶│
+    │◄── <json> ──────────┤  4 RTT (1ms)
+ Total: 4ms
+
+With pipelining (1 round trip):
+    Client              Redis
+    │── GET profile:42    │
+    │── GET perm:42       │
+    │── GET pref:42       │
+    │── GET sess:abc ─────▶│
+    │◄── <json> ──────────┤
+    │◄── <json> ──────────┤
+    │◄── <json> ──────────┤
+    │◄── <json> ──────────┤  1 RTT (1ms)
+ Total: 1ms
+```
+
+Pipelining reduces latency from N x RTT to 1 x RTT. The savings are proportional to the round-trip time: in a cross-datacenter deployment with 5ms RTT, fetching 10 keys without pipelining costs 50ms; with pipelining, it costs 5ms — a 10x improvement.
+
+Redis supports pipelining natively. Most Redis client libraries provide a pipeline or multi-exec API. Memcached supports batching via the `mget` command (multi-get), which retrieves multiple keys in a single round trip.
+
+**Trade-off:** Pipelining increases memory usage on both the client and server because commands and responses are buffered until the pipeline completes. A pipeline with 10,000 commands buffers all responses before returning any, consuming 10,000 x average response size in memory. Use moderate pipeline sizes (50-100 commands) for latency-sensitive workloads and larger pipelines (500-1000) for throughput-oriented batch jobs.
+
+## Configuration and Tuning
+
+A cache is only as effective as its configuration. These parameters determine whether a cache performs well, performs poorly, or fails entirely.
+
+### TTL Settings
+
+TTL is the most important configuration parameter. Too short: low hit ratio, high database load. Too long: stale data, risk of serving outdated information.
+
+Guidelines by data type:
+
+- **Session data:** 15-30 minutes. Sessions often last hours, and staleness of a few minutes is acceptable.
+- **User profiles:** 5-15 minutes. Profiles change infrequently. A 5-minute staleness window is invisible to users.
+- **Product catalog (ecommerce):** 1-24 hours. Prices and inventory change on human timescales. CDN caching at 1 hour is typical.
+- **Social feeds:** 1-5 minutes. Feeds change frequently, but users tolerate slight staleness.
+- **Configuration data:** 5-60 minutes. Application config rarely changes. Longer TTL reduces load on config services.
+- **Rate limit counters:** No TTL — use explicit expiration aligned with the rate limit window.
+
+### Memory Limits and Eviction Policies
+
+`maxmemory` (Redis) or `-m` (Memcached) sets the maximum memory the cache may use. Choosing the right value requires understanding your working set — the set of keys accessed frequently enough to benefit from caching. A cache too small evicts valuable entries. A cache too large wastes memory that could serve other purposes.
+
+Eviction policy determines what happens when the cache exceeds its memory limit:
+
+- **allkeys-lru:** Evict the least recently used key regardless of TTL. Best default for most workloads.
+- **allkeys-lfu:** Evict the least frequently used key. Better for workloads where access frequency matters more than recency, such as content delivery.
+- **volatile-lru:** Evict only keys with a TTL set. Useful when you want to guarantee that keys without TTL (configuration data, for example) are never evicted.
+- **volatile-ttl:** Evict the key with the shortest remaining TTL. Useful when you want to maximize the time between cache misses.
+- **noeviction:** Return errors on writes when memory is full. Never use this in production — it causes cascading write failures.
+
+### Connection Pools
+
+Each application instance maintains a pool of connections to the cache. The pool size must balance concurrency against resource usage. Too few connections: requests queue up waiting for a connection, adding latency. Too many connections: the cache spends CPU managing connection state, degrading throughput.
+
+A reasonable starting point: `min_idle=5, max_total=20` per application instance for Redis, and `min_idle=10, max_total=50` for Memcached. Adjust based on observed connection wait times and cache CPU usage.
+
+### Serialization Format
+
+The format used to serialize values before storing them in the cache affects both memory usage and CPU cost.
+
+| Format | Memory Efficiency | Serialization Speed | Language Support |
+|--------|------------------|---------------------|------------------|
+| JSON | Low | Medium | Universal |
+| MessagePack | Medium | Medium | Universal |
+| Protocol Buffers | High | Fast | Requires schema |
+| Apache Avro | High | Fast | Requires schema |
+| Custom binary | Highest | Fastest | Application only |
+
+JSON is the default for most systems because it is debuggable, universally supported, and compressed well. When memory is tight or throughput is critical, switch to Protocol Buffers. A well-optimized Protocol Buffers encoding uses 30-50% less space than JSON and serializes/deserializes 5-10x faster.
+
+### Compression
+
+Enable compression for values larger than 1KB. LZ4 compression provides the best balance of speed and ratio for cache workloads — it compresses at hundreds of MB/s and decompresses at over 1 GB/s. Snappy is similar. Gzip achieves better compression ratios (2-3x LZ4) but is 5-10x slower.
+
+For Redis, compress values in the application layer before storing. Redis does not support server-side compression. For Memcached, the client library often includes compression flags.
+
+With compression, a 50KB JSON response compresses to under 5KB — a 10x reduction in cache memory and network bandwidth. The CPU cost of decompression (under 10 microseconds for 5KB) is negligible compared to the savings in memory and network.

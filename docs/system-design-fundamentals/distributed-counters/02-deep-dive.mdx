@@ -1,0 +1,470 @@
+---
+id: distributed-counters-deep-dive
+title: Distributed Counters — Under the Hood
+sidebar_position: 2
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A production-grade distributed counter system contains six internal layers, each with distinct responsibilities. Understanding each layer's internals is essential before tuning or debugging.
+
+<AsciiDiagram
+  id="distributed-counters/internal-arch"
+  title="Internal Architecture of a Distributed Counter System"
+  content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    DISTRIBUTED COUNTER — INTERNAL ARCHITECTURE           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌──────────────────────────────────────────┐                          │
+│  │ LAYER 1: INGESTION                        │                          │
+│  │  [API Gateway] → [Rate Limiter] → [Validator]                      │
+│  │  Accepts HTTP/gRPC. Validates payload.                             │
+│  │  Rejects > 50K req/s per client.                                   │
+│  └────────────────┬─────────────────────────┘                          │
+│                   │                                                     │
+│  ┌────────────────▼─────────────────────────┐                          │
+│  │ LAYER 2: SHARD ROUTER                     │                          │
+│  │  [Consistent Hash Ring]                   │                          │
+│  │  hash(key) % 1024 → shard_id              │                          │
+│  │  Virtual nodes=256 per physical node      │                          │
+│  └────────────────┬─────────────────────────┘                          │
+│                   │                                                     │
+│  ┌────────────────▼─────────────────────────┐                          │
+│  │ LAYER 3: COUNTER SHARD                    │                          │
+│  │  (Redis or in-memory node)                │                          │
+│  │  ┌─────────────────────────────────┐      │                          │
+│  │  │ Per-key state machine            │      │                          │
+│  │  │  {counter_key → [value, version, │      │                          │
+│  │  │   last_write_timestamp,          │      │                          │
+│  │  │   delta_vector]}                  │      │                          │
+│  │  └─────────────────────────────────┘      │                          │
+│  └────────────────┬─────────────────────────┘                          │
+│                   │                                                     │
+│  ┌────────────────▼─────────────────────────┐                          │
+│  │ LAYER 4: REPLICATION ENGINE               │                          │
+│  │  [Async Stream]    [Raft Log]    [Gossip]  │                          │
+│  │  Default: async stream to 2 replicas      │                          │
+│  │  Optional: Raft for strong consistency    │                          │
+│  └────────────────┬─────────────────────────┘                          │
+│                   │                                                     │
+│  ┌────────────────▼─────────────────────────┐                          │
+│  │ LAYER 5: MERGE / RECONCILIATION           │                          │
+│  │  [Delta Exchange] [Conflict Resolution]   │                          │
+│  │  Cron schedule: every 100ms or 1000 ops   │                          │
+│  │  Merge function: element-wise max         │                          │
+│  └────────────────┬─────────────────────────┘                          │
+│                   │                                                     │
+│  ┌────────────────▼─────────────────────────┐                          │
+│  │ LAYER 6: READ AGGREGATOR                  │                          │
+│  │  [Parallel Fan-out] [Cache Layer]         │                          │
+│  │  Queries all 1024 shards → sum → cache    │                          │
+│  │  Cache TTL: 100ms for hot counters        │                          │
+│  └──────────────────────────────────────────┘                          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+  Legend: [ ] = service   { } = cache   ( ) = queue
+  `}
+  alt="Six-layer internal architecture of a distributed counter: ingestion, shard router, counter shard, replication engine, merge/reconciliation, read aggregator"
+  caption="Internal architecture showing all six layers of a distributed counter system"
+/>
+
+Each layer has a specific failure mode:
+* **Ingestion failure**: Rate limiter misconfiguration causes legitimate traffic to be dropped, or allows a thundering herd through.
+* **Shard router failure**: Consistent hash ring update race causes requests to route to the wrong (stale) owner, splitting the counter across two shards.
+* **Counter shard failure**: A shard crashes and loses un-replicated increments — the counter undercounts until reconciliation recovers the delta from client retry logs.
+* **Replication engine failure**: Async replication lag exceeds the staleness SLA, causing reads to miss recent increments.
+* **Merge failure**: A merge cycle misses a delta due to clock skew — the node's contribution vector appears older than it actually is.
+* **Read aggregator failure**: Fan-out reads time out on a slow shard, causing the total to undercount by the unread shard's value.
+
+---
+
+## Data Structures and Algorithms
+
+### G-Counter (Grow-Only Counter)
+
+**Structure**: A vector `V[1..N]` where `N` is the number of replicas (nodes). Each element `V[i]` is the contribution of replica `i`.
+
+```
+G-Counter State (3 replicas):
+           ┌─────┬─────┬─────┐
+  Vectors: │ A:  │ B:  │ C:  │
+           │48320│29105│55712│
+           └─────┴─────┴─────┘
+  Total = 48320 + 29105 + 55712 = 133,137
+```
+
+**Operations**:
+- `increment(i)`: `V[i] += 1`
+- `value()`: `sum(V[1..N])`
+- `merge(other)`: `V[i] = max(V[i], other[i])` for all `i`
+
+**Why G-Counter**: Increments are commutative and associative. Element-wise max as merge ensures that no increment is ever lost — the highest observed value for each node is always preserved. The structure is trivially correct by construction: you cannot double-count or miss a contribution because each node owns exactly one vector element.
+
+**Time complexity**: O(N) for value (sum across N nodes), O(1) per increment, O(N) per merge. In practice, N is 3-100 replica nodes, and systems use delta state (only send changed elements) to reduce merge cost to O(changed_nodes).
+
+**Space complexity**: O(N) per counter key. With 64 replicas and 8 bytes per count, each counter uses 512 bytes of metadata plus the value. For 1 billion active counters: 512 GB of metadata — this is why real systems use delta CRDTs or compressed vector clocks.
+
+### PN-Counter (Positive-Negative Counter)
+
+**Structure**: Two G-Counters: `P[1..N]` for increments, `N[1..N]` for decrements.
+
+```
+PN-Counter State:
+  Positives: [A: 58320, B: 37105, C: 65712]
+  Negatives: [A: 12000, B: 8000,  C: 14000]
+  Total = (58320+37105+65712) - (12000+8000+14000) = 127,137
+```
+
+**Operations**:
+- `increment(i)`: `P[i] += 1`
+- `decrement(i)`: `N[i] += 1`
+- `value()`: `sum(P) - sum(N)`
+- `merge(other)`: `P[i] = max(P[i], other.P[i])`, `N[i] = max(N[i], other.N[i])`
+
+**Why PN-Counter over G-Counter**: A G-Counter cannot decrement. Decrementing a G-Counter would require negative values in a grow-only vector, which breaks the monotonic increase invariant. PN-Counter solves this by treating decrements as a separate monotonic sequence, then subtracting at query time.
+
+**Key invariant**: The positivity of the final value is NOT guaranteed. If there are more decrements than increments, `total < 0`. Systems that need non-negative counters must cap the result at zero at read time.
+
+### Sharded Counter (Sum Across Shards)
+
+**Structure**: A logical counter split across `M` shards. Each shard stores a local integer. The total is the sum of all shard values.
+
+```
+Sharded Counter (M=1024 shards):
+  Shard 0:    2,304   │ Shard 512:    4,109
+  Shard 1:    1,887   │ Shard 513:    3,216
+  ...                  │ ...
+  Shard 511:  3,451   │ Shard 1023:   2,998
+                       │
+  Total: sum of all 1024 shard values
+```
+
+**Shard assignment**: `shard_id = hash(key) % M`. Consistent hashing with virtual nodes ensures that adding or removing a shard only re-maps `1/M` of keys.
+
+**Why sharding**: Eliminates the single-node write bottleneck. Each shard handles 1/M of the write traffic. With M=1024 and per-shard throughput of 50,000 operations/second, aggregate throughput reaches 51 million operations/second.
+
+### Count-Min Sketch (Approximate Counter)
+
+**Structure**: A 2D array of `d` rows by `w` columns, each cell an integer counter. Each row has a separate hash function `h_i`.
+
+```
+  Column:     0   1   2   3  ...  w-1
+  Row 0:   [ 12,  0,  3, 45, ...,  7 ]  h_0(key) = 3  → cell[0][3]++
+  Row 1:   [  0, 22,  4,  2, ..., 11 ]  h_1(key) = 1  → cell[1][1]++
+  Row 2:   [  5,  0,  0, 33, ...,  0 ]  h_2(key) = 4  → cell[2][4]++
+  Row 3:   [  0,  0, 18,  0, ...,  0 ]  h_3(key) = 2  → cell[3][2]++
+```
+
+**Estimate**: `min(row[0][h_0(key)], row[1][h_1(key)], ..., row[d-1][h_d-1(key)])`
+
+**Why Count-Min Sketch**: Provides a space-efficient approximate counter. Instead of storing one counter per distinct key (which grows with cardinality), you store a fixed-size sketch. The error is bounded by the total count over all keys divided by `w`. With `w=10000` and `d=4`, error rate is below 1% for most workloads.
+
+## Request/Write/Read Lifecycle
+
+A complete 12-step lifecycle traces a distributed counter increment from mobile app tap to globally convergent state.
+
+<AsciiDiagram
+  id="distributed-counters/lifecycle-overview"
+  title="12-Step Lifecycle of a Distributed Counter Increment"
+  content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│             12-STEP INCREMENT LIFECYCLE                                  │
+│                                                                         │
+│  ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐                       │
+│  │ 1 │   │ 2 │   │ 3 │   │ 4 │   │ 5 │   │ 6 │                       │
+│  │C→A│   │A→R│   │R→S│   │INCR│   │ACK│   │LOG│                       │
+│  │Tap│   │GW │   │Ing│   │Exe│   │API│   │AOF│                       │
+│  └───┘   └───┘   └───┘   └───┘   └───┘   └───┘                       │
+│     │       │       │       │       │       │                          │
+│     └───┬───┘       │       └───┬───┘       │                          │
+│         │           │           │           │                          │
+│  ┌───┐  │  ┌───┐   │   ┌───┐   │   ┌───┐   │                          │
+│  │ 7 │  │  │ 8 │   │   │ 9 │   │   │10 │   │                          │
+│  │REP│  │  │ACK│   │   │MER│   │   │AGG│   │                          │
+│  │Lic│  │  │Cli│   │   │Ge │   │   │Reg│   │                          │
+│  └───┘  │  └───┘   │   └───┘   │   └───┘   │                          │
+│         │          │           │           │                          │
+│         └──────┬───┘           └───┬───────┘                          │
+│                │                   │                                   │
+│         ┌───┐  │            ┌───┐  │                                   │
+│         │11 │  │            │12 │  │                                   │
+│         │CON│  │            │GC │  │                                   │
+│         │VI│  │            │Tom│  │                                   │
+│         └───┘  │            └───┘                                      │
+│                │                                                       │
+└────────────────┴───────────────────────────────────────────────────────┘
+  `}
+  alt="12-step lifecycle: client tap, API gateway, shard router, INCR execution, acknowledgment, AOF log, replication, client reply, merge, aggregator, convergence, garbage collection"
+  caption="12-step lifecycle from user tap to global convergence"
+/>
+
+**Step 1 — Client Tap**: A user taps the "like" button on a mobile app. The app constructs an HTTP request: `POST /api/v1/likes` with body `{"post_id": "abc123", "user_id": "user456"}`. The request includes an idempotency key: `Idempotency-Key: tap-98765`. This key prevents double-counting if the client retries due to network timeout.
+
+**Step 2 — API Gateway Validation**: The API gateway validates the request: checks the idempotency key against a 5-minute sliding window cache, verifies the user has not already liked this post (idempotency within a session), and applies per-IP rate limiting at 100 requests per second.
+
+**Step 3 — Shard Router Assignment**: The routing layer computes `consistent_hash("abc123")` on the consistent hash ring of 1,024 virtual nodes. The hash maps to shard 417. The router attaches `{"shard_id": 417, "version": 3}` to the request metadata and forwards to shard 417's Redis primary node.
+
+<AsciiDiagram
+  id="distributed-counters/lifecycle-shard-route"
+  title="Shard Router Assigns Counter to Shard 417 via Consistent Hash"
+  content={`
+┌──────────┐                  ┌────────────────┐
+│ [Client]  │  POST /like       │ [API Gateway]  │
+│  Phone    │ ───────────────>   │  Validate req   │
+└──────────┘                    │  Rate limit     │
+                                │  Idempotency    │
+                                └───────┬─────────┘
+                                        │
+                                        ▼
+                                ┌────────────────┐
+                                │ [Consistent     │
+                                │  Hash Ring]     │
+                                │ hash(abc123)    │
+                                │ → vnode 417     │
+                                │ → shard 417     │
+                                └───────┬─────────┘
+                                        │
+                                        ▼
+                                ┌────────────────┐
+                                │ (Redis Shard   │
+                                │  417 Primary)  │
+                                └────────────────┘
+  Legend: [ ] = service   ( ) = database
+  `}
+  alt="Client request flows through API gateway to consistent hash ring, which maps to Redis shard 417 primary"
+  caption="Steps 2-3: Validation and shard routing via consistent hash"
+/>
+
+**Step 4 — INCR Execution**: Shard 417 receives the command `INCR post:abc123`. Redis executes this on a single-threaded event loop. The increment is guaranteed atomic: no concurrent read or write interleaves. The command modifies the in-memory hash table entry for `post:abc123`. Time from receipt to completion: 45 microseconds (p50) to 120 microseconds (p99).
+
+**Step 5 — Idempotency Check and Acknowledgment**: Before responding, shard 417 checks the idempotency key `tap-98765` in a Redis Set with TTL of 300 seconds. If the key exists, the increment has already been applied and this request is a retry — return the current value without incrementing. If the key is new, add it to the set and proceed. This prevents double-counting even if the API gateway retries the request 5 times.
+
+**Step 6 — Append-Only File Write**: Redis appends the `INCR` command to the AOF buffer. The AOF is fsynced to disk every 1 second by default. If the server crashes between receiving the INCR and the fsync, the increment is lost (at most 1 second of data). Configuring `appendfsync always` fsyncs every write but reduces throughput from 50,000 ops/sec to approximately 500 ops/sec — a 99% throughput reduction.
+
+**Step 7 — Async Replication**: Shard 417's primary asynchronously streams the INCR command to its replica. The replica acknowledges receipt but the primary does not wait. Replication lag: typically 1-10 milliseconds on the same datacenter, 50-500 milliseconds across regions.
+
+**Step 8 — Client Response**: The API gateway responds to the client with HTTP 200 and `{"count": 14823}`. Total end-to-end latency: 3-15 milliseconds.
+
+**Step 9 — Periodic Merge (Reconciliation)**: Every 100 milliseconds, each shard computes its delta vector (changes since last sync) and exchanges it with 3 random peers via gossip. For shard 417, the delta might be `{417: 4820}` — 4,820 increments applied since last sync. Peers merge by taking element-wise max of their vector and the received delta.
+
+<AsciiDiagram
+  id="distributed-counters/lifecycle-merge"
+  title="Periodic Merge via Gossip Protocol Between Shards"
+  content={`
+t=0ms                         t=100ms
+┌──────┐                      ┌──────┐
+│[Shard│  ── delta: ──────>  │[Shard│
+│ 417] │  {417: 4820}        │ 218] │
+│      │  <── merge ──────   │      │
+│total:│                      │total:│
+│ 1.4M │                      │ 1.4M │
+└──┬───┘                      └──┬───┘
+   │  ┌──────┐                   │  ┌──────┐
+   └─>│[Shard│  ── delta ──>    └─>│[Shard│
+      │ 891] │  <── merge ──       │ 955] │
+      │total:│                      │total:│
+      │ 1.4M │                      │ 1.4M │
+      └──────┘                      └──────┘
+  `}
+  alt="Shard 417 sends delta {417: 4820} to shards 218 and 891 via gossip at 100ms intervals; merged state converges"
+  caption="Step 9: Gossip-based merge at 100ms intervals converges all shards to identical total"
+/>
+
+**Step 10 — Read Aggregation**: When a client requests the counter value, the read aggregator fans out requests to all 1,024 shards in parallel using non-blocking I/O. Each shard responds with its local count. The aggregator sums all responses. If one shard does not respond within 10 milliseconds, the aggregator retries once. If the shard still does not respond, the aggregator uses the last-known value from a local cache (metadata TTL: 1 second).
+
+```python
+async def read_counter(post_id: str) -> int:
+    """Fan-out read across all 1024 shards, with timeout and fallback."""
+    shard_ids = list(range(1024))
+    results = await asyncio.gather(
+        *[get_shard_value(shard_id, post_id) for shard_id in shard_ids],
+        return_exceptions=True
+    )
+    total = 0
+    for shard_id, result in zip(shard_ids, results):
+        if isinstance(result, Exception):
+            # Fall back to cached value
+            total += shard_cache.get(shard_id, last_known.get(shard_id, 0))
+        else:
+            total += result
+    return total
+```
+
+**Step 11 — Convergence**: Over 4-5 gossip rounds (400-500 milliseconds), all 1,024 shards converge to the same total for `post:abc123`. The system guarantees eventual consistency: given no new writes for 500 milliseconds, every shard returns the same value.
+
+**Step 12 — Garbage Collection of Tombstones (PN-Counter only)**: Every 24 hours, a background task scans the tombstone vector of each PN-Counter. Entries for nodes that have not produced any updates in the last 24 hours are zeroed out. The GC pass reduces metadata size by 60-80% for counters with intermittent writers.
+
+---
+
+## Consistency and State
+
+Four failure scenarios and their impact on a distributed counter.
+
+### Scenario 1: Crash — Single Shard Loses Unreplicated Increments
+
+Shard 417's primary crashes. The AOF has logged up to 1 second of increments (approximately 50,000 writes at 50,000 ops/sec). The replica at shard 417-rep has received all but the last 500 milliseconds of data through async replication.
+
+<AsciiDiagram
+  id="distributed-counters/crash-scenario"
+  title="Shard 417 Primary Crashes — Unreplicated Increments Lost"
+  content={`
+Timeline:
+  t=0ms    t=500ms  t=1000ms t=1500ms
+  ─────────┼─────────┼─────────┼──▶
+  INCRs:   │         │         │
+  ┌───┐   │  ┌───┐  │  ┌───┐  │  ┌───┐
+  │ 1 │   │  │ 2 │  │  │ 3 │  │  │ 4 │
+  │ 1 │   │  │ 1 │  │  │ 1 │  │  │ 1 │
+  │ 1 │   │  │ 1 │  │  │ 1 │  │  │ 1 │
+  └───┘   │  └───┘  │  └───┘  │  └───┘
+          │         │         │
+  Repl lag:         │         │
+  ──────────>500ms─>│         │
+          │         │         │
+          CRASH ────┘?        │
+          (fsync every 1s)    │
+                              │
+  Lost: increments from         │
+  t=500ms to t=1000ms = ~25K   │
+  (in AOF buffer, not on disk) │
+  and not yet replicated        │
+  `}
+  alt="Timeline showing shard 417 crash at t=1000ms: 25,000 increments in AOF buffer lost, 25,000 increments replicated but not yet applied on replica"
+  caption="Crash scenario: 25,000 increments lost between AOF fsync and crash"
+/>
+
+**Blast radius**: 25,000 increments undercounted for posts assigned to shard 417. If the total counter is 14 million, the error is 0.18%. On a viral post with 500,000 likes, the displayed count is 475,000 — a 5% undercount.
+
+**Resolution**: When the primary restarts, it replays the AOF (up to the last fsync point) and picks up from there. The replica is promoted to primary during failover. The lost 25,000 increments are not recoverable from the counter subsystem alone — they require client retry (idempotency keys) or reconciliation from an event log.
+
+### Scenario 2: Partition — Counter Diverges
+
+A network partition splits the cluster: shards 1-512 can reach each other but cannot reach shards 513-1,024, and vice versa. Both sides continue accepting increments for the same logical counters.
+
+<AsciiDiagram
+  id="distributed-counters/partition-scenario"
+  title="Network Partition Splits Counter Cluster — Both Sides Accept Writes"
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│                    NETWORK PARTITION                          │
+│                                                              │
+│    Side A (Shards 1-512)     Side B (Shards 513-1024)       │
+│  ┌────────────────────┐  X   ┌────────────────────┐        │
+│  │ [Shard 1]  [Shard 2]│  X   │ [Shard 513] [Shard 514]│        │
+│  │ [Shard 3]  ...      │──X──│ [Shard 515] ...        │        │
+│  │ [Shard 512]         │  X   │ [Shard 1024]          │        │
+│  └────────────────────┘  X   └────────────────────┘        │
+│         │                    X          │                    │
+│         │                    X          │                    │
+│   INCRs applied          X    INCRs applied                 │
+│   on Side A              X    on Side B                     │
+│   Total: 1,482,300       X    Total: 1,480,100              │
+│                                                              │
+│         └─────────── Both accept writes ────────────┘       │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+  `}
+  alt="Network partition divides 1024 shards into two groups; both sides accept increments independently, diverging counter values"
+  caption="Partition scenario: both sides accept writes, counter values diverge"
+/>
+
+**Blast radius**: 100% of counters are affected because every counter has its primary shard and its replicas potentially on opposite sides of the partition. Counters diverge by the difference in increments accepted on each side.
+
+**Detection**: The system runs a heartbeat protocol every 50 milliseconds. After 3 missed heartbeats (150ms), a shard assumes its peer is partitioned. Each shard records the partition epoch and continues accepting increments.
+
+**Recovery**: When the partition heals, each shard exchanges its delta vector with the peer. For G-Counters, merge is lossless — element-wise max preserves all increments. If shard 512 has `[512: 1482300]` and shard 513 has `[513: 1480100]`, after merge both shards have the union of contributions: the total from the merged vector includes increments accepted on both sides during the partition.
+
+### Scenario 3: Concurrent Writes — No Data Loss
+
+Two clients like the same post at nearly the same instant. Client A's request routes to shard 417. Client B's request also routes to shard 417 (same key = same shard). Redis processes them sequentially on its single-threaded event loop: INCR post:abc123, then INCR post:abc123 again. No data loss, no race.
+
+This is the fundamental advantage of sharded counters over CRDT counters for concurrent writes: a single shard's serial execution eliminates the merge problem entirely, at the cost of a single-writer bottleneck per key.
+
+### Scenario 4: Stale Read — One Shard Returns Old Value
+
+The read aggregator fans out to all 1,024 shards. Shard 417's replica processes the read while its primary has not yet replicated the latest 200 milliseconds of increments. The replica returns a value that undercounts by 10,000.
+
+<AsciiDiagram
+  id="distributed-counters/stale-read"
+  title="Stale Read Caused by Replication Lag on One Shard"
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│                    STALE READ SCENARIO                        │
+│                                                              │
+│    [Read Aggregator]                                         │
+│         │                                                    │
+│         │  Fan-out read to all 1024 shards                   │
+│         │                                                    │
+│   ┌─────┼────────┬────────┬────────┬────────┬────┐          │
+│   │     │        │        │        │        │    │          │
+│   ▼     ▼        ▼        ▼        ▼        ▼    ▼          │
+│ [S1]  [S2] ... [S417]  [S418] [S419] ... [S1024]           │
+│                  │                                           │
+│                  │ (Replica — lagging by 200ms)              │
+│                  │ Value: 14,820  (actual: 24,820)          │
+│                  ▼                                           │
+│         Aggregated total: 1,482,000                          │
+│         Actual total:     1,492,000                          │
+│         Error: 10,000 (0.67% undercount)                    │
+└──────────────────────────────────────────────────────────────┘
+  `}
+  alt="Read aggregator fans out to all shards; shard 417 replica lags by 200ms, returning stale value that undercounts by 10,000"
+  caption="Stale read: one shard's replica lag creates a 0.67% undercount"
+/>
+
+**Blast radius**: The error is bounded to one shard's contribution (1/1024th of the throughput). If traffic is evenly distributed, a 200ms lag on one shard causes at most 0.1% undercount. If the shard handled a viral post, the undercount is larger relative to that specific counter.
+
+**Resolution**: Three options. (1) Strong reads: route reads to the primary shard using the consistent hash, bypassing replicas. Adds 1-5ms latency but eliminates stale reads. (2) Read-repair: the aggregator queries 2 of the shard's replicas and takes the maximum value. (3) Bounded staleness: the aggregator rejects responses from replicas whose advertised staleness exceeds a threshold (100ms), falls back to cached value, and retries.
+
+---
+
+## Performance Characteristics
+
+These numbers are for a sharded Redis counter with 64 shards, each shard on an AWS c6g.2xlarge instance (8 vCPUs, 16 GB RAM, 10 Gbps network).
+
+| Metric | p50 | p99 | p999 | Notes |
+|---|---|---|---|---|
+| Increment latency (single shard) | 0.08ms | 0.3ms | 0.8ms | Redis INCR on hot key |
+| Increment throughput (single shard) | 50K ops/sec | — | — | Redis single-threaded limit |
+| Aggregate throughput (64 shards) | 3.2M ops/sec | — | — | 64 × 50K, limited by hash distribution skew |
+| Read latency (fan-out 64 shards) | 2ms | 10ms | 50ms | Parallel async HTTP, network-bound |
+| Read latency (cached) | 0.2ms | 0.5ms | 1ms | Local cache hit |
+| Merge convergence (64 nodes, gossip) | 200ms | 500ms | 1,000ms | 100ms rounds × 4-5 rounds |
+| AOF fsync interval | 1s | — | — | Configurable; 1 second default |
+| Staleness window (async replication) | 5ms | 50ms | 200ms | Same-region replication |
+
+**Throughput limits**: At 50,000 ops/sec per shard, a single Redis shard reaches 100% CPU on one core. Scaling beyond this requires: (a) faster single-core CPUs (Redis is single-threaded), (b) more shards (each shard adds another 50K ops/sec), or (c) replacing Redis with a multi-threaded counter engine like a custom C++ or Rust service (Dragonfly, KeyDB achieve 500K-1M ops/sec per node using multi-threaded architectures).
+
+**Memory cost**: Each counter key in Redis consumes approximately 72 bytes of overhead plus 8 bytes for the integer value. One billion counters = 80 GB of RAM. For counters with TTL (like daily aggregates), the memory cost drops proportionally to the number of active keys.
+
+**Network cost**: Each increment sends a TCP packet of approximately 200 bytes (request + response). At 3.2 million ops/sec aggregate, the network bandwidth is 640 MB/sec of counter traffic alone, plus overhead for replication, gossip, and reads.
+
+---
+
+## Configuration and Tuning
+
+Key configuration parameters for a sharded Redis counter system.
+
+| Parameter | Default | Safe range | Change when | What breaks |
+|---|---|---|---|---|
+| Number of shards | 64 | 16-1024 | Throughput exceeds 800K ops/sec | Too many shards increases read fan-out latency; too few limits write throughput |
+| AOF fsync interval | 1 second | always / 1s / 30s | You need < 1s crash recovery (use "always" — 99% throughput penalty) | "always" drops throughput from 50K to 500 ops/sec; "30s" risks losing 30s of increments |
+| Replication factor | 2 | 1-3 | Shard loss causes unacceptable undercount | Higher factor increases network traffic and replication lag |
+| Gossip interval | 100ms | 50-500ms | You need faster convergence after partition heal | Shorter interval increases gossip network traffic by 2-5x |
+| Read cache TTL | 100ms | 10-1,000ms | You need fresher reads without fan-out penalty | Shorter TTL increases read aggregator load; longer TTL increases staleness |
+| Consistent hash virtual nodes | 256 per physical | 64-1,024 | Load distribution skew exceeds 20% | Too few virtual nodes causes hot shards; too many increases routing table memory |
+| Idempotency key TTL | 300 seconds | 60-3,600s | Retry window exceeds 5 minutes | Shorter TTL risks double-counting on retries; longer TTL wastes memory |
+| Rate limit (per client) | 100 req/s | 10-10,000 req/s | A client misbehaves or is a legitimate high-volume publisher | Too low blocks legitimate bulk operations; too high allows abuse |
+
+**Tuning checklist**:
+1. Start with 64 shards and 2 replicas per shard.
+2. Monitor shard CPU — if any shard exceeds 80% single-core utilization, double the shard count.
+3. Monitor replication lag — if p99 lag exceeds 100ms, move replicas closer to primaries (same AZ) or reduce replication factor.
+4. Monitor read fan-out latency — if p99 exceeds 50ms, reduce read TTL (contrary to intuition, a shorter TTL reduces aggregator load because it returns more fresh data).
+5. Monitor gossip convergence — if partition recovery takes longer than 2 seconds, reduce gossip interval to 50ms.
+
+---
+
+On the Architecture page, you will see how these internals compose into a production-grade system serving 5 billion increments per day across three AWS regions.

@@ -1,0 +1,742 @@
+---
+id: availability-deep-dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Availability Deep Dive
+
+## The Internal Stack
+
+A highly available system is built from multiple layers, each providing a specific mechanism for detecting, isolating, and recovering from failures. Below the application code, an availability stack runs continuously.
+
+<AsciiDiagram
+  id="availability/deepdive-stack"
+  title="Availability Stack Internals"
+  alt="Vertical stack showing DNS anycast, global load balancer, regional load balancer, circuit breakers, health check agents, retry logic with backoff, and fallback handlers."
+  content={`
+     ┌──────────────────────────┐
+     │  DNS                     │  Route53 / Cloudflare
+     │  Anycast / Geo-routing   │  TTL: 60-300s
+     ├──────────────────────────┤
+     │  Global Load Balancer    │  GCP HTTP LB / AWS Global Accelerator
+     │  Cross-region routing    │  Active-active or active-passive
+     ├──────────────────────────┤
+     │  Regional Load Balancer  │  AWS NLB / ALB, GCP TCP LB
+     │  Health-checked pool     │  Liveness + readiness probes
+     ├──────────────────────────┤
+     │  Circuit Breaker Layer   │  Per-dependency state machine
+     │  Per-service threshold   │  50% error rate → open in 10s
+     ├──────────────────────────┤
+     │  Retry + Backoff Layer   │  Exponential backoff + jitter
+     │  Max retries: 3-5       │  Initial interval: 100ms
+     ├──────────────────────────┤
+     │  Fallback Handler        │  Graceful degradation
+     │  Cache fallback          │  Static content, stale data
+     ├──────────────────────────┤
+     │  Application Logic       │  Your business code
+     └──────────────────────────┘
+  `}
+  caption="The seven-layer availability stack. Each layer handles a different failure domain."
+/>
+
+The key insight: availability mechanisms at different layers operate at different time scales. DNS changes take 60-300 seconds to propagate. Load balancer health checks detect failure in 5-15 seconds. Circuit breakers react within a single request cycle (milliseconds). Retries handle transient failures in under a second. A robust system uses all layers together — they complement, not replace, each other.
+
+### Layer 1: DNS Redundancy
+
+DNS is the first point of contact. If DNS fails, no traffic reaches your system. DNS redundancy comes in two forms:
+
+- **Multiple A/AAAA records**: DNS round-robin — the client picks an IP at random from the list.
+- **Anycast**: Multiple servers share the same IP. BGP routing sends each client to the nearest healthy server.
+
+Anycast is strictly better for availability because it handles server failure without client-side changes — the BGP withdrawal propagates in seconds to minutes, and traffic naturally reroutes to the next-closest server.
+
+### Layer 2: Load Balancer Health Checking
+
+The load balancer is the traffic cop. It must detect failures within seconds and drain connections gracefully.
+
+Health check architecture:
+
+```
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│  Health      │      │  Target      │      │  Target      │
+│  Checker     │─────▶│  Group       │─────▶│  Monitoring  │
+│  (Control    │      │  (EC2,       │      │  (CloudWatch,│
+│   Plane)     │      │   ECS, IP)   │      │   Prometheus)│
+└──────────────┘      └──────────────┘      └──────────────┘
+       │                                          │
+       │  Every N seconds                         │  Publish status
+       ▼                                          ▼
+┌─────────────────────────────────────────────────────┐
+│               Target State Table                      │
+│  +-------+-------------+-------------+-----------+   │
+│  | Node  | Consecutive | Consecutive | Status    |   │
+│  |       | Successes   | Failures    |           |   │
+│  +-------+-------------+-------------+-----------+   │
+│  | N1    | 42          | 0           | Healthy   |   │
+│  | N2    | 0           | 3           | Unhealthy |   │
+│  | N3    | 17          | 0           | Healthy   |   |
+│  +-------+-------------+-------------+-----------+   |
+└─────────────────────────────────────────────────────┘
+```
+
+The control plane maintains a target state table. Each health check response updates the consecutive success/failure counters. When the failure counter hits the threshold, the target is marked unhealthy and removed from the routing table. This happens in the control plane — the data plane (which forwards actual traffic) checks the routing table before each connection.
+
+## Data Structures and Algorithms
+
+### Failure Detection: The Phi Accrual Algorithm
+
+The standard approach — fixed interval health checks — has a fundamental problem: it cannot distinguish between a dead node and a slow node. The **Phi Accrual Failure Detector**, popularized by Apache Cassandra and Akka, uses a probabilistic approach.
+
+<AsciiDiagram
+  id="availability/deepdive-phi-accrual"
+  title="Phi Accrual Failure Detection"
+  alt="Timeline showing heartbeat arrival times. The phi value increases as the gap between expected and actual arrival widens. At phi=8, the node is declared dead."
+  content={`
+     Heartbeat arrivals over time:
+     
+     ──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──▶
+       t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11
+       │  │  │  │  │  │  │  │  │  │   │
+       │  │  │  │  │  │  │  │  │  │   └── MISSED! phi = 8.2
+       │  │  │  │  │  │  │  │  │  │          → SUSPECTED
+       │  │  │  │  │  │  │  │  │  └── phi = 3.1 (late)
+       │  │  │  │  │  │  │  │  │
+       │  │  │  │  │  │  │  │  └── phi = 0.5 (arrived slightly late)
+       │  │  │  │  │  │  │  │
+       │  │  │  │  │  │  │  └── phi = 0.1 (arrived as expected)
+       │  │  │  │  │  │  │
+       │  │  │  │  │  │  └── phi = 0.08 (arrived as expected)
+     
+     ──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──▶
+       0  1  2  3  4  5  6  7  8  9  10 11  seconds
+     
+     How phi works:
+     1. Track inter-arrival times of heartbeats
+     2. Model arrival times as a normal distribution
+     3. phi(t) = -log10(P(likelihood of this gap))
+     4. phi = 1 → 10% chance the node is dead
+     5. phi = 8 → 0.000001% chance the node is alive
+  `}
+  caption="Phi Accrual Failure Detector: probability-based detection that adapts to network conditions."
+/>
+
+The phi accrual detector is adaptive. In a high-latency environment, it accepts wider gaps before suspecting failure. In a low-latency environment, it detects failure faster. This eliminates the need for manual threshold tuning — the algorithm learns the network's normal behavior.
+
+Common threshold: phi >= 8 means the node is declared dead. This corresponds to approximately 1 in 100 million probability that the node is still alive.
+
+### Gossip Protocol
+
+In large distributed systems, a centralized health monitor is itself a SPOF. Gossip protocols distribute failure detection across all nodes.
+
+<AsciiDiagram
+  id="availability/deepdive-gossip"
+  title="Gossip Protocol Communication"
+  alt="Ring of 6 nodes. Node A sends gossip to B and C. Node B sends to D and E. Node C sends to F. Each gossip message contains the sender's view of every node's state."
+  content={`
+     Round 1:              Round 2:              Round 3:
+     A ───▶ B              A                     A
+     │                     │                     │
+     ├───▶ C               B ───▶ D              B
+                           │                     │
+                           ├───▶ E               │
+                           │                     │
+                           C ───▶ F              C
+                                                 │
+                        Each node shares:        D ────▶ B
+                        - Node state (alive/     │
+                          suspected/dead)         │
+                        - Version vector         E ────▶ C
+                        - Membership changes
+                                                 F ────▶ A
+                                                 
+     After 3 rounds, all 6 nodes converge
+     on the same membership view.
+  `}
+  caption="Gossip protocol: epidemic-style information dissemination achieves convergence in O(log N) rounds."
+/>
+
+Each gossip round:
+1. Pick a random node or a small set of nodes (typically 2-3).
+2. Exchange membership tables — each entry includes node ID, IP address, incarnation number, and state (ALIVE, SUSPECT, DEAD).
+3. Update local membership table with any new information.
+
+Convergence time: O(log N) rounds where N is the number of nodes. For a 100-node cluster, convergence takes approximately 7 rounds at 100ms per round = 700ms total.
+
+The incarnation number prevents stale information from overriding newer state. When a node restarts, it increments its incarnation number. If a gossip message arrives saying "node X is DEAD with incarnation 3," but the local table shows "node X is ALIVE with incarnation 5," the local table wins — the message is stale.
+
+### Heartbeat Mechanisms
+
+Heartbeats are the raw signals that feed failure detectors. Three common mechanisms:
+
+1. **TCP Keepalive**: Built into TCP. Sends empty packets after a configurable idle period. Default: 2 hours. You must reduce this (e.g., 15 seconds) for timely failure detection.
+
+2. **Application-Level Heartbeat**: The application sends "I am alive" messages at a fixed interval (e.g., every 1 second). More reliable than TCP keepalive because it verifies the application process, not just the kernel's TCP stack.
+
+3. **Custom UDP Heartbeat**: A lightweight heartbeat over UDP. Discardable — if a packet is lost, the next heartbeat overwrites it. No connection overhead. Used by systems like etcd and Consul.
+
+<AsciiDiagram
+  id="availability/deepdive-heartbeat-comparison"
+  title="Heartbeat Mechanism Comparison"
+  alt="Timeline comparing TCP keepalive (2-hour delay), application heartbeat (1-second interval), and UDP heartbeat (100ms interval) during a process crash."
+  content={`
+     Process crashes at time 0:
+     
+     TCP Keepalive (default):
+     │━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━│
+     crash                         detection at
+     │                              7200 seconds
+     │                                (2 hours)
+     
+     Application Heartbeat (1s):
+     │━┅━┅━┅━┅━┅━┅━┅━┅━┅━┅━┅━┅━┅━┅━┅━┅━│
+     crash       expected  │  detection
+     │            miss     │  at ~3 seconds
+     │                     │  (3 missed beats)
+     
+     UDP Heartbeat (100ms):
+     │┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅│
+     crash      │  detection
+     │          │  at ~400ms
+     │          │  (4 missed beats)
+     
+     ───────────────────▶ time (not to scale)
+  `}
+  caption="Three heartbeat mechanisms with vastly different detection latency."
+/>
+
+## Lifecycle: Request Through a Highly Available System
+
+A single request in a highly available system passes through 10+ stages of availability logic.
+
+<AsciiDiagram
+  id="availability/deepdive-request-lifecycle"
+  title="Request Lifecycle in an HA System"
+  alt="Flowchart: DNS resolution → anycast routing → global LB → regional LB → circuit breaker check → app server → DB with health check pathway → fallback if DB fails → response with retry logic on error."
+  content={`
+     Step 1:  Client resolves DNS
+              ├── Multiple A records or anycast IP
+              └── If primary DNS fails → secondary DNS
+     
+     Step 2:  Anycast routes to nearest healthy PoP
+              ├── BGP withdraws unhealthy routes
+              └── Failover to next PoP in ~30s
+     
+     Step 3:  Global LB selects region
+              ├── Active-active: route by latency
+              └── Active-passive: route to primary
+     
+     Step 4:  Regional LB picks healthy backend
+              ├── Least connections routing
+              └── Excludes unhealthy nodes
+     
+     Step 5:  Circuit breaker check (per dependency)
+              ├── CLOSED: pass through
+              └── OPEN: fail fast or fallback
+     
+     Step 6:  App server processes request
+              ├── DB query needed?
+              │   ├── YES ───▶ Step 7
+              │   └── NO  ───▶ Return response
+              └──
+     
+     Step 7:  DB query with fallback
+              ├── Primary DB healthy → query primary
+              ├── Primary DB slow → query replica
+              ├── Both slow → read from cache
+              └── All unavailable → serve stale cache
+     
+     Step 8:  Response assembles and returns
+              ├── Success → return 200
+              └── Error → trigger retry logic
+     
+     Step 9:  [If error] Retry with backoff
+              ├── Max 3 retries
+              ├── Exponential backoff: 100ms, 200ms, 400ms
+              └── Jitter: ±25% 
+     
+     Step 10: Post-response bookkeeping
+              ├── Log response time
+              ├── Update SLI counters
+              └── Report to observability system
+  `}
+  caption="Ten-step request lifecycle through a highly available system."
+/>
+
+### Stage Details
+
+**Stage 2 — Anycast BGP withdrawal**: When a Point of Presence (PoP) fails, the router stops advertising the prefix to BGP peers. BGP convergence takes 30-120 seconds during which some traffic may still route to the dead PoP. DNS-based failover is faster (controlled by TTL) but requires the client to re-resolve.
+
+**Stage 5 — Circuit breaker decision**: The circuit breaker uses a sliding window of recent requests. For each dependency (database, cache, downstream API), it tracks:
+
+- Total requests in window (e.g., last 60 seconds)
+- Failed requests in window
+- Request volume sufficient for statistical significance (minimum 100 requests)
+
+If the failure rate exceeds the threshold (e.g., 50% in the last 60 seconds), the circuit opens. It stays open for a configurable cooldown (e.g., 30 seconds) before transitioning to half-open.
+
+**Stage 7 — Replica fallback**: A common pattern: try the primary. If it does not respond within 50ms, try a replica. If the replica does not respond within 100ms, read from cache. This cascading timeout pattern maximizes the chance of serving a response while bounding latency.
+
+## Consistency Challenges in HA Systems
+
+### Split-Brain
+
+A **split-brain** occurs when a network partition causes both nodes in a primary-replica pair to believe they are the primary. Both accept writes. When the partition heals, the data diverges.
+
+<AsciiDiagram
+  id="availability/deepdive-split-brain"
+  title="Split-Brain Scenario"
+  alt="Network partition splits two database nodes. Each node thinks the other is dead, so both promote to primary and start accepting writes. Data diverges."
+  content={`
+     ┌───────────────────────────────────┐
+     │          Network Partition          │
+     │                                     │
+     │   ┌──────────────┐    ┌──────────┐  │
+     │   │  ((Node A))  │    │ ((Node B))│  │
+     │   │  Primary     │    │ Replica  │  │
+     │   └──────┬───────┘    └─────┬────┘  │
+     │          │                  │        │
+     │          │   X X X X X X   │        │
+     │          │   Partition     │        │
+     │          │   X X X X X X   │        │
+     │          │                  │        │
+     │   No heartbeat from B      │ No HB  │
+     │   ┌────────────────────┐   │ from A  │
+     │   │"B is dead. I am   │   │ ┌──────┐│
+     │   │ the only primary." │   │ │"A is ││
+     │   └────────────────────┘   │ │dead. ││
+     │                            │ │I am  ││
+     │   Writes accepted:         │ │the   ││
+     │   user_1: $100 deposit     │ │primary││
+     │   user_2: transfer to 3   │ └──────┘│
+     │                            │         │
+     │                            │ Writes: │
+     │                            │ user_1: │
+     │                            │ withdraw │
+     │                            │ user_3:  │
+     │                            │ new acct │
+     └───────────────────────────────────────┘
+     
+     When partition heals:
+     ┌───────────────────────────────────────┐
+     │  CONFLICT! Different data on A and B  │
+     │  Manual resolution needed             │
+     └───────────────────────────────────────┘
+  `}
+  caption="Split-brain scenario: a network partition causes both nodes to accept writes, creating divergent data."
+/>
+
+Split-brain is one of the hardest problems in distributed availability. Prevention strategies:
+
+1. **Quorum-based decisions**: A node only promotes to primary if it can reach a majority of peers.
+2. **Fencing (STONITH)**: Shoot The Other Node In The Head. Forcefully shut down the other node before promoting.
+3. **Lease-based leadership**: A primary holds a lease from a coordinator. If the lease expires, the node must stop accepting writes. Another node can only acquire the lease after the lease period.
+4. **Generation clocks**: Each leadership term has a monotonically increasing number. Writes from an older term are rejected.
+
+### Quorum-Based Consensus
+
+Quorum systems trade availability for consistency. A read/write quorum requires:
+
+- Write quorum: W nodes must acknowledge a write
+- Read quorum: R nodes must respond to a read
+- Condition: W + R > N (where N is total nodes)
+
+<AsciiDiagram
+  id="availability/deepdive-quorum"
+  title="Quorum Read and Write"
+  alt="Three database replicas. A write to all 3 requires W=2 acknowledgments. A read requires R=2 responses. W+R > N guarantees at least one overlapping node has the latest write."
+  content={`
+     N = 3 nodes: Node 1, Node 2, Node 3
+     
+     Write (W=2):                          Read (R=2):
+     ┌──────┐     ┌──────┐                ┌──────┐     ┌──────┐
+     │Node 1│◀────│Client│                │Node 1│─────▶│Client│
+     │Write │     └──────┘                │Read  │     └──────┘
+     └──┬───┘        │                    └──┬───┘        │
+        │            │                       │            │
+     ┌──▼───┐        │                    ┌──▼───┐        │
+     │Node 2│◀───────┘                    │Node 2│────────┘
+     │Write │                             │Read  │
+     └──────┘                             └──────┘
+     ┌──────┐
+     │Node 3│  Not written (failed)
+     └──────┘
+     
+     W=2 acknowledges → write succeeds   R=2 has latest data → read is consistent
+     Even if Node 3 is down              Even though Node 3 was down during write
+  `}
+  caption="Quorum W+R > N ensures at least one node in the read set has the latest write."
+/>
+
+Common configurations:
+- **W=R=N/2+1** (majority quorum): Tolerates N/2 node failures. Standard for consensus systems like Raft and Paxos.
+- **W=N, R=1**: Strong consistency (all nodes must write), poor write availability. A single node failure blocks writes.
+- **W=1, R=N**: Fast writes, strong reads. Write availability is high (tolerates N-1 failures), but reads are slow.
+
+For availability, you would typically choose W=N/2+1, R=N/2+1 — the majority quorum. This gives the best trade-off between availability and consistency.
+
+### Leader Election
+
+Consensus algorithms like Raft and Paxos use leader election to maintain a single authoritative node for writes. The leader is elected through a voting process.
+
+<AsciiDiagram
+  id="availability/deepdive-leader-election"
+  title="Raft Leader Election"
+  alt="Three-node Raft cluster. Node A starts as leader. Node A fails, Nodes B and C start an election. Node B requests votes, C votes for B. Node B becomes the new leader."
+  content={`
+     ┌───────────────────────────────────────────┐
+     │  Normal Operation (Term 1)              │
+     │  ┌─────────┐    ┌─────────┐  ┌─────────┐ │
+     │  │ Node A  │    │ Node B  │  │ Node C  │ │
+     │  │ LEADER  │───▶│ FOLLOWER│  │ FOLLOWER│ │
+     │  └─────────┘    └─────────┘  └─────────┘ │
+     │  Heartbeats ──────────────────────────▶   │
+     ├───────────────────────────────────────────┤
+     │  Leader Failure (Term 2)                  │
+     │  ┌─────────┐    ┌─────────┐  ┌─────────┐ │
+     │  │ Node A  │    │ Node B  │  │ Node C  │ │
+     │  │ DOWN    │    │CANDIDATE│  │ FOLLOWER│ │
+     │  │         │    │         │  │         │ │
+     │  │         │    │ vote B?─▶  │ grant vote│
+     │  └─────────┘    │(if no    │  └─────────┘ │
+     │                 │ heartbeat│              │
+     │                 │ from A   │              │
+     │                 │ for >150ms│             │
+     │                 └──────────┘              │
+     ├───────────────────────────────────────────┤
+     │  New Leader Elected (Term 2)              │
+     │  ┌─────────┐    ┌─────────┐  ┌─────────┐ │
+     │  │ Node A  │    │ Node B  │  │ Node C  │ │
+     │  │ DOWN    │    │ LEADER  │──▶│ FOLLOWER│ │
+     │  └─────────┘    └─────────┘  └─────────┘ │
+     └───────────────────────────────────────────┘
+  `}
+  caption="Raft leader election: a candidate needs majority (N/2+1) votes to become leader."
+/>
+
+Leader election timeout is randomized (e.g., 150-300ms) to prevent all followers from becoming candidates simultaneously — this avoids election conflicts. Once elected, the leader sends periodic heartbeats to maintain authority. If the leader fails, the next timeout triggers a new election.
+
+## Performance: Concrete Numbers
+
+### Failover Time by Method
+
+| Method | Typical Failover Time | Downtime per Month (at 4 nines budget) |
+|---|---|---|
+| Manual failover | 5-30 minutes | Exceeds 4 nines (52 min/month) by 10-60x |
+| Scripted semi-automated | 2-10 minutes | May exceed 4 nines depending on frequency |
+| Automated with DNS update | 60-120 seconds | ~8% of budget per event |
+| Automated with VIP move | 10-30 seconds | ~2% of budget per event |
+| Active-active (no failover) | 0 seconds (no failover needed) | 0% — traffic shifts automatically |
+
+A single manual failover can consume an entire month's four-nines budget. This is why automation is non-negotiable at four nines and above.
+
+### MTTR and MTTF
+
+Two metrics define availability math:
+
+**MTTF (Mean Time To Failure)**: The average time between failures. If a system fails once every 30 days, MTTF = 30 days.
+
+**MTTR (Mean Time To Recovery)**: The average time to restore service after a failure. If recovery takes 15 minutes, MTTR = 15 minutes.
+
+Availability = MTTF / (MTTF + MTTR)
+
+Example:
+- MTTF = 720 hours (30 days)
+- MTTR = 0.5 hours (30 minutes)
+- Availability = 720 / 720.5 = 99.93%
+
+To reach 99.99% with the same MTTF:
+- Required MTTR = 720 * (1/0.9999 - 1) = 720 * 0.0001 = 0.072 hours = 4.32 minutes
+
+The path to five nines is either making MTTF astronomically high (99.999% requires MTTF = 720 hours, MTTR = 0.0072 hours = 26 seconds) or reducing MTTR to near zero through active-active architectures.
+
+### Cost of Each Nine
+
+| Availability Level | Approximate Cost Multiplier | Typical Infrastructure |
+|---|---|---|
+| 95% | 1x | Single server, no redundancy |
+| 99% | 1.5x | Single server with RAID, backup |
+| 99.9% | 2-3x | Load-balanced servers, database replica |
+| 99.95% | 3-5x | Multi-AZ, automated failover |
+| 99.99% | 5-10x | Multi-region active-passive |
+| 99.999% | 10-20x | Multi-region active-active, chaos engineering, dedicated SRE team |
+
+The cost increases exponentially because each additional nine requires addressing an increasingly rare set of failure modes: power distribution failures, network partition, region-wide outages, cascading failures, and human error during incident response.
+
+## Failure Detection Algorithms in Practice
+
+### Phi Accrual Implementation Details
+
+The phi accrual failure detector is widely used in production systems. Here is how it works at the implementation level:
+
+The detector maintains a sampling window of the last N heartbeat inter-arrival times (typically N = 1000). From these samples, it computes:
+
+- Mean arrival interval (mu): The average time between consecutive heartbeats.
+- Variance (sigma-squared): How much arrival times vary.
+
+When the expected heartbeat does not arrive by time t, phi is calculated as:
+
+```
+phi = -log10(P(likelihood of interval >= t))
+
+where P assumes a normal distribution with the observed mu and sigma.
+
+Example calculation:
+  mu = 1000ms (heartbeat interval)
+  sigma = 200ms (some variation in network)
+  t since last heartbeat = 2500ms
+  
+  Standard deviation units from mean: (2500 - 1000) / 200 = 7.5
+  P(interval >= 2500ms) = approximately 3.2e-14 (from normal CDF)
+  phi = -log10(3.2e-14) = 13.5
+  phi = 13.5 >= 8 → declare node DEAD
+```
+
+Advantages over fixed-threshold health checks:
+
+- **Adaptive to network conditions**: A high-latency environment naturally has larger mu and sigma, so acceptable gaps are wider. A low-latency environment detects failure faster.
+- **Configurable suspicion level**: phi = 1 is a weak suspicion (10% chance the node is dead). Phi = 8 is a strong suspicion. Different thresholds can be used for different actions (phi = 3: stop routing traffic; phi = 8: declare node dead).
+- **No hard thresholds**: No need to tune "3 failures in 15 seconds" — the algorithm tunes itself from observed behavior.
+
+### SWIM Protocol
+
+SWIM (Scalable Weakly-consistent Infection-style Protocol) improves on basic gossip. It separates failure detection from membership dissemination:
+
+1. **Failure detection**: Each node periodically picks a random target and sends a ping. If the target does not respond within a timeout, the pinger sends indirect pings through K other nodes (typically K = 3). If all indirect pings also fail, the target is declared SUSPECT and this is disseminated through the gossip.
+
+2. **Membership dissemination**: Suspect and Alive messages propagate through infection-style gossip. Each node periodically gossips its full membership view to a random peer.
+
+SWIM provides provable convergence: the probability that a node remains undetected after a round of gossip decreases exponentially with the number of rounds. Expected detection time: O(log N / log log N) rounds.
+
+### Failure Detection in Kubernetes
+
+Kubernetes uses a simplified failure detection model:
+
+- **kubelet** reports node status to the control plane every `--node-status-update-frequency` (default 10 seconds).
+- The **node controller** checks node status every `--node-monitor-period` (default 5 seconds).
+- If the node controller does not receive a status update for `--node-monitor-grace-period` (default 40 seconds), it marks the node as UNKNOWN.
+- After `--pod-eviction-timeout` (default 5 minutes), the node controller evicts pods from the unknown node.
+
+Total time from node failure to pod reschedule: approximately 5 minutes and 40 seconds. This is conservative to avoid premature eviction during transient network partitions. For faster detection, use liveness probes at the pod level (not the node level).
+
+## Gossip Protocol: Convergence Analysis
+
+The time required for all N nodes in a gossip cluster to learn about a state change is governed by the gossip fan-out (the number of nodes each node contacts per round).
+
+<AsciiDiagram
+  id="availability/deepdive-gossip-convergence"
+  title="Gossip Convergence Rounds by Cluster Size"
+  alt="Table showing cluster sizes 10, 50, 100, 500, 1000 and rounds to convergence at fan-out 2, 3, and 4. Larger clusters and higher fan-out converge faster."
+  content={`
+     Cluster Size   Fan-out 2   Fan-out 3   Fan-out 4
+     ──────────────────────────────────────────────
+        10            4           3           2
+        50            6           4           3
+       100            7           5           4
+       500            9           7           5
+      1000           10           7           6
+     
+     Formula: Rounds ≈ log(N) / log(fan-out + 1)
+     
+     Example: N=100, fan-out=3
+     Rounds ≈ log(100) / log(4) = 4.6 / 1.39 ≈ 3.3 rounds
+     Each round takes ~100ms
+     Convergence time ≈ 330ms
+  `}
+  caption="Gossip convergence rounds for different cluster sizes and fan-out rates."
+/>
+
+Key tuning parameters:
+
+- **Gossip interval**: How often each node initiates a gossip round (typically 100ms-1s). Shorter intervals mean faster convergence but more network traffic.
+- **Fan-out**: How many peers each node contacts per round (typically 2-3). Higher fan-out converges faster but increases bandwidth per node proportionally.
+- **Full vs incremental sync**: Full sync sends the entire membership table (linear in N). Incremental sync sends only changes since last sync (typically constant size). Incremental sync is preferred for large clusters.
+
+## Raft Deep Dive: Log Replication and Availability
+
+Raft provides a practical implementation of distributed consensus with strong availability guarantees for the leader. Understanding Raft's log replication is essential for designing highly available databases.
+
+<AsciiDiagram
+  id="availability/deepdive-raft-log"
+  title="Raft Log Replication"
+  alt="Three-node Raft cluster showing the leader receiving a client request, appending to its log, replicating to followers, and committing after majority acknowledgment."
+  content={`
+     Client Request: SET x=5
+     
+     ┌───────── LEADER ─────────┐     ┌── FOLLOWER 1 ──┐     ┌── FOLLOWER 2 ──┐
+     │                          │     │                 │     │                 │
+     │  1. Append entry to      │     │                 │     │                 │
+     │     local log            │     │                 │     │                 │
+     │  ┌─────┐                 │     │  ┌─────┐        │     │  ┌─────┐        │
+     │  │term3│──── AppendEntries────▶│  │term3│        │     │  │     │        │
+     │  │  x=5│                 │     │  │  x=5│        │     │  │     │        │
+     │  └─────┘                 │     │  └─────┘        │     │  └─────┘        │
+     │        \──── AppendEntries─────────────\───────▶│     │  │     │        │
+     │                          │     │                 │     │  │     │        │
+     │  2. Wait for majority    │     │  3. Acknowledge │     │  3. Ack         │
+     │     (2/3)                │     │                 │     │                 │
+     │                          │     │                 │     │                 │
+     │  4. Commit locally       │     │  5. Apply to    │     │  5. Apply       │
+     │     (apply x=5)          │     │     state mchn  │     │     to state    │
+     │                          │     │                 │     │     machine     │
+     │  6. Respond to client    │     │                 │     │                 │
+     └──────────────────────────┘     └─────────────────┘     └─────────────────┘
+     
+     Commit occurs when majority (2 out of 3 in a 3-node cluster)
+     have the entry in their logs. The leader then responds to client.
+  `}
+  caption="Raft log replication: the leader does not respond to the client until a majority of followers have acknowledged the entry."
+/>
+
+Raft availability characteristics:
+
+- **Tolerates minority failures**: A 3-node Raft cluster can tolerate 1 node failure and still serve writes. A 5-node cluster tolerates 2 failures.
+- **Election timeout**: If the leader fails, followers wait for a randomized election timeout (typically 150-300ms) before starting a new election. The randomization prevents multiple followers from starting elections simultaneously (avoids split votes).
+- **Read availability**: Raft can serve reads from the leader (linearizable reads) or from followers (stale reads). For maximum read availability, implement follower reads with periodic safety checks against the leader's commit index.
+
+## Timeouts and Deadlines in Distributed Systems
+
+### The Tail-at-Scale Problem
+
+In a system with 1,000 servers, if each server has a 1% chance of being slow on any request, the probability that at least one server is slow for a given request is:
+
+```
+P(no server slow) = (0.99)^1000 = 0.00004
+P(at least one slow) = 1 - 0.00004 = 99.996%
+```
+
+In a system of 1,000 servers, nearly every request experiences at least one slow server. This is the tail-at-scale problem, and it directly affects availability: a system where every request is slow is effectively unavailable for latency-sensitive use cases.
+
+Solutions:
+- **Hedged requests**: Send the same request to two servers. Use the first response. Cancel the second. This reduces p99 latency at the cost of doubling server load.
+- **Request hedging by percentile**: If the request is not complete by the p50 latency, send a hedged request. If the original completes first, cancel the hedged request. This adds only 50% load on average instead of 100%.
+- **Tied requests**: Send the request to N servers and wait for the first K responses. K=1 gives the fastest response. K=quorum gives strong consistency.
+
+### Connection Pool Exhaustion
+
+Connection pools are a common availability bottleneck. Each database connection consumes a thread on the database server and a file descriptor on both sides.
+
+```
+Connection pool config:
+maxTotal: 50
+maxWaitMillis: 5000
+minIdle: 5
+
+Under normal load:
+- 30 connections active
+- 20 connections idle
+- No queuing
+
+Under slow-query load:
+- 50 connections active (all busy)
+- 0 idle connections
+- New requests wait 5000ms for a connection
+- After 5000ms, requests throw ConnectionTimeoutException
+- User-visible errors: HTTP 503
+- Effectively unavailable for writes
+```
+
+Prevention strategies:
+- **Separate pools for critical paths**: Read pool (max 30), write pool (max 20). A slow analytical query does not starve the write path.
+- **Circuit breaker for slow queries**: If a query takes longer than 1 second, terminate it and mark the query pattern as suspicious.
+- **Dynamic pool sizing**: Reduce pool size when latency increases to prevent queue buildup. This is counterintuitive — smaller pools under load — but it prevents saturation and preserves throughput.
+
+### Timeout Cascades
+
+A timeout cascade occurs when a downstream service slowdown propagates upward through the call chain, amplifying the impact.
+
+<AsciiDiagram
+  id="availability/deepdive-timeout-cascade"
+  title="Timeout Cascade Through Service Layers"
+  alt="Five-layer call chain: API Gateway -> Web App -> Payment Service -> Database. Each layer adds its own timeout. A 500ms DB slowdown becomes a 2500ms user-facing timeout due to cumulative timeouts at each layer."
+  content={`
+     Normal flow:                    Slow DB flow:
+     
+     API Gateway                     API Gateway
+     timeout: 3000ms                 timeout: 3000ms
+          │                               │
+          ▼                               ▼
+     Web App[1]                       Web App[1] waits...
+     timeout: 2500ms                  timeout: 2500ms
+          │                               │
+          ▼                               ▼
+     Payment[2]                       Payment[2] waits...
+     timeout: 2000ms                  timeout: 2000ms
+          │                               │
+          ▼                               ▼
+     ((DB))                           ((DB)) slow - 500ms
+     responds 50ms                    response takes 1500ms
+
+     
+     Without cascading protections:  
+     DB slow 1500ms  →  Payment wait 1500ms  →  Web wait 1500ms  →  Gateway wait 1500ms
+     Total: 4500ms of thread blocking, 3 threads held hostage
+     
+     With circuit breakers:
+     DB slow 1500ms  →  Payment circuit opens after 3 failures
+                      →  Web gets instant error after 1st failure
+                      →  Gateway returns degraded response immediately
+     Total: 3 threads impacted (the original failures), then instant rejection
+  `}
+  caption="Timeout cascade: a single slow database call can tie up threads across the entire call chain."
+/>
+
+Preventing timeout cascades requires:
+- **Cascading timeouts**: Each upstream timeout must be shorter than the downstream timeout. API Gateway (5000ms) > Web App (3000ms) > Payment (2000ms) > Database (1000ms). This way, the inner service times out first and releases its thread.
+- **Circuit breaker per dependency**: A slow payment service is isolated. It does not affect the web app's ability to call other services.
+- **Bulkheads**: Separate thread pools per downstream dependency. A slow payment service exhausts only the payment thread pool, not the shared thread pool.
+
+### Asynchronous Processing for Availability
+
+Synchronous request-response patterns couple the caller's availability to the callee's availability. Asynchronous processing decouples them:
+
+- **Request acceptance**: The system accepts the request, writes it to a queue, and returns "202 Accepted" immediately.
+- **Background processing**: A worker picks up the request from the queue, processes it, and stores the result.
+- **Result retrieval**: The client polls for the result or receives a callback.
+
+```
+Timeline:
+Client ──▶ POST /order ──▶ 202 Accepted {order_id: 123}
+                     Queue: <order_123>
+                              Worker picks up: processes
+                              Worker writes to: ((DB))
+Client ──▶ GET /order/123 ──▶ 200 {status: "processing"}
+Client ──▶ GET /order/123 ──▶ 200 {status: "completed", data: {...}}
+```
+
+The advantage for availability: if the payment processor is slow, the queue buffers the orders. The client sees an immediate acceptance. The system continues accepting requests even when downstream services are degraded.
+
+### Health Check Configuration
+
+| Parameter | Recommended Value | Notes |
+|---|---|---|
+| Check interval | 5 seconds | Lower values increase CPU/network load |
+| Healthy threshold | 2 consecutive successes | Avoids flapping |
+| Unhealthy threshold | 3 consecutive failures | Prevents false positives |
+| Timeout | 2 seconds | Must be less than check interval |
+| Slow start duration | 60 seconds | Gradual traffic ramp-up for new targets |
+| Deregistration delay | 30 seconds | Allow in-flight requests to complete |
+
+### Circuit Breaker Configuration
+
+| Parameter | Recommended Value | Notes |
+|---|---|---|
+| Error threshold | 50% over 60-second window | Adjust based on dependency criticality |
+| Cooldown (open → half-open) | 30 seconds | Gives dependency time to recover |
+| Half-open max requests | 3 | Only probe with a few requests |
+| Minimum request volume | 100 | Avoid opening on small sample sizes |
+
+### Retry Configuration
+
+| Parameter | Recommended Value | Notes |
+|---|---|---|
+| Max retries | 3 | Beyond 3, fail fast and alert |
+| Initial backoff | 100ms | First retry after 100ms |
+| Exponential factor | 2x | Double after each retry |
+| Max backoff | 10 seconds | Cap to avoid excessive wait |
+| Jitter | ±25% | Randomize to prevent thundering herd |
+
+---
+
+**Next up**: [Architecture](availability-architecture) shows how these mechanisms integrate into real system designs — databases, caches, queues, and multi-region topologies.

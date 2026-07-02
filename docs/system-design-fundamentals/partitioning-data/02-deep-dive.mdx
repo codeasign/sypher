@@ -1,0 +1,683 @@
+---
+id: partitioning-data-deep-dive
+title: Partitioning Data — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A partitioned database system has five layers between the application and the physical storage. Each layer contributes to routing correctness, fault tolerance, and performance.
+
+<AsciiDiagram
+  id="partitioning-data/deepdive-sharded-cluster"
+  title="Sharded database cluster architecture showing the proxy routing tier, query coordinator, and individual shards with replicas"
+  alt="Architecture diagram of a sharded cluster: application connects to a proxy router, which routes to one of four shards, each shard has a primary and two replicas, and a cross-shard coordinator handles scatter-gather queries"
+  caption="Five-layer architecture of a sharded database cluster — proxy, router, coordinator, shard primaries, and shard replicas"
+  content={`
+                    ┌──────────────────────┐
+                    │   Application Layer   │
+                    └──────────┬───────────┘
+                               │
+                    ┌──────────▼───────────┐
+                    │   Connection Proxy   │
+                    │   (ProxySQL, HAProxy,│
+                    │    pgBouncer)        │
+                    │   Connection pooling │
+                    │   Auth + TLS         │
+                    └──────────┬───────────┘
+                               │
+                    ┌──────────▼───────────┐
+                    │   Query Router       │
+                    │   (Vitess VTGate,    │
+                    │    Citus Coordinator)│
+                    │                      │
+                    │   ┌────────────────┐ │
+                    │   │  Routing Table │ │
+                    │   │  key -> shard  │ │
+                    │   │  mapping       │ │
+                    │   └────────────────┘ │
+                    └───┬──────┬──────┬────┘
+                        │      │      │
+          ┌─────────────┘      │      └─────────────┐
+          │                    │                    │
+  ┌───────▼────────┐  ┌───────▼────────┐  ┌───────▼────────┐
+  │  Shard 0       │  │  Shard 1       │  │  Shard 2       │
+  │  Primary       │  │  Primary       │  │  Primary       │
+  │  user_id:      │  │  user_id:      │  │  user_id:      │
+  │  1-10M         │  │  10M-20M       │  │  20M-30M       │
+  ├────────────────┤  ├────────────────┤  ├────────────────┤
+  │  Replica A     │  │  Replica A     │  │  Replica A     │
+  │  Replica B     │  │  Replica B     │  │  Replica B     │
+  └────────────────┘  └────────────────┘  └────────────────┘
+                          │      │      │
+          ┌───────────────┘      │      └──────────────┐
+          │                      │                     │
+  ┌───────▼────────┐  ┌──────────▼────────┐  ┌───────▼────────┐
+  │  Shard 3       │  │  Shard 4         │  │  Shard ...     │
+  │  Primary       │  │  Primary         │  │  Primary       │
+  │  user_id:      │  │  user_id:        │  │  user_id:      │
+  │  30M-40M       │  │  40M-50M         │  │  >50M          │
+  └────────────────┘  └──────────────────┘  └────────────────┘
+
+  ┌───────────────────────────────────────────────────────────┐
+  │   Cross-Shard Query Coordinator                           │
+  │   Merges results, handles ORDER BY, LIMIT, aggregations   │
+  │   Used when query predicate does not include shard key    │
+  └───────────────────────────────────────────────────────────┘
+`}
+/>
+
+### How the Layers Interact During a Query
+
+A query travels through the five layers sequentially. Each layer modifies the query context or handles a specific concern:
+
+1. The application opens a TCP connection to the proxy. The proxy authenticates using TLS and maps the connection to a pool slot.
+2. The proxy hands the connection to the router. The router parses the SQL, extracting the query type (SELECT/INSERT/UPDATE/DELETE) and the WHERE clause predicates.
+3. The router identifies the partition key value from the WHERE clause. It looks up the shard in its routing table. The routing table is an in-memory hash map: key ranges to shard IDs.
+4. If the partition key is present, the router opens a connection to the target shard's primary (or a replica for read-only queries) and forwards the query.
+5. If the partition key is absent, the router sends the query to the cross-shard coordinator. The coordinator fans out the query to all shard primaries, collects results, and returns the merged result.
+6. The target shard processes the query against its local data, using its own buffer pool, transaction log, and query executor. It returns results through the same path.
+
+Each hop adds 0.5-3ms of latency. The proxy and router layers are designed to be stateless so they can be scaled horizontally behind a load balancer. Adding more proxies or routers increases throughput without changing the shard topology.
+
+**Connection management across layers.** Each layer manages its own connection pool. The proxy maintains a pool of connections to the router layer. The router maintains a pool of connections to each shard. For 100 shards with 10 connections each: the router manages 1,000 connections. For 4 router instances: 4,000 router-to-shard connections. Connection pooling is essential — creating a new TCP connection to a shard adds 1-5ms of latency and consumes ephemeral ports. Configure pool sizes to handle peak throughput with a 20 percent headroom margin.
+
+**Authentication and authorization across layers.** In a production deployment, each layer should authenticate the layer above it. The application authenticates to the proxy using database credentials (MySQL user/password or PostgreSQL client certificates). The proxy authenticates to the router using a service account with limited privileges. The router authenticates to each shard using a shard-specific credential. This layered authentication ensures that a compromise at one layer does not grant access to all layers. A compromised proxy cannot directly access shards — it can only route through the router.
+
+### Layer 1: Connection Proxy
+
+The connection proxy manages database connections from application servers. It pools connections to reduce connection overhead, authenticates clients, and provides basic load balancing. ProxySQL and pgBouncer sit at this layer. They do not understand partition keys — they forward connections to the query router layer.
+
+### Layer 2: Query Router
+
+The query router is the heart of the partitioned system. It maintains the routing table — a mapping from partition key ranges or hash values to specific shards. When a query arrives, the router inspects the `WHERE` clause for the partition key. If present, it forwards the query to exactly one shard (or a subset of shards for composite keys). If absent, it forwards to the cross-shard coordinator.
+
+Vitess calls this layer VTGate. Citus implements it as the coordinator node. CockroachDB uses a gateway node that routes by the range descriptor for each key.
+
+### Layer 3: Shard Primary
+
+Each shard is an independent database instance with its own storage, buffer pool, transaction log, and replication stream. The primary handles all writes for its data range. Reads may go to replicas. Each shard is fully independent — a crash on shard 2 does not affect queries on shards 1, 3, or 4.
+
+### Layer 4: Shard Replicas
+
+Each shard primary has one or more replicas that receive the write-ahead log (WAL) or replication stream. Replicas handle read-only queries. If the primary fails, a replica is promoted. Replicas may be in different availability zones for geographic resilience.
+
+### Layer 5: Cross-Shard Coordinator
+
+The cross-shard coordinator handles queries that cannot be pruned to a single shard. It sends the query to all shards in parallel, collects partial results, and performs final aggregation. The coordinator is the bottleneck for scatter-gather queries — it must buffer, sort, and merge results from potentially hundreds of shards.
+
+---
+
+## Data Structures and Algorithms
+
+### Consistent Hashing
+
+Consistent hashing solves the fundamental problem of hash partitioning: when the number of partitions changes, most keys must be remapped. Traditional `hash(key) % N` mapping causes nearly all keys to remap when N changes. Consistent hashing ensures that only `K/N` keys remap on average, where K is the total number of keys and N is the number of nodes.
+
+<AsciiDiagram
+  id="partitioning-data/deepdive-consistent-hashing"
+  title="Consistent hash ring showing three physical nodes each with three virtual nodes, and the path a key takes around the ring"
+  alt="Hash ring with marks for Node A (3 virtual nodes), Node B (3 virtual nodes), Node C (3 virtual nodes), a key arriving at a position on the ring and walking clockwise to the closest virtual node belonging to Node B"
+  caption="Consistent hash ring: each physical node appears as multiple virtual nodes on the ring; a key is assigned to the nearest virtual node clockwise from its hash position"
+  content={`
+                    Hash Ring (0 to 2^32 - 1)
+
+                    Node A ─ vNode A1
+                   /  │
+           vNode B3   │   vNode C1
+              │       │       │
+              │       │       │
+     ┌────────┴───────┴───────┴────────┐
+     │                                  │
+     │       ○ vNode A2                 │
+     │    Node A                         │
+     │                                  │
+     │  ○ vNode B2              ○ vNode  │
+     │   Node B                  C2      │
+     │                          Node C   │
+     │                                  │
+     │     ○ vNode A3          ○ vNode   │
+     │       Node A              C3     │
+     │                          Node C   │
+     │                                  │
+     │           ○ vNode B1              │
+     │            Node B                 │
+     └──────────────────────────────────┘
+                     │
+                     │  Key: "user_48192"
+                     │  hash("user_48192") = 0x9F3B
+                     │
+                     ▼
+           Walk clockwise → hits vNode B2
+           → Route to Node B
+
+  When Node C leaves:
+  - vNode C1, C2, C3 (3/9 = 33%) reassign
+  - Nearest clockwise neighbors absorb
+  - Only 33% of keys move, not 100%
+
+  Each physical node maps to V virtual nodes
+  V = 150 (typical)
+  Even distribution when V >= 100 * N
+`}
+/>
+
+### Partition Metadata: How the System Knows Where Data Lives
+
+The routing table is the brain of a partitioned system. It maintains the mapping from partition key values to physical shards. Three approaches exist for storing and distributing the routing table.
+
+**Embedded routing table.** Each application server or proxy server stores a local copy of the routing table in memory. The table is a hash map: `partition_key_range -> shard_connection_string`. The table is loaded at startup from a configuration file or database query. Updates are propagated by polling a metadata service on a timer (etcd watch, ZooKeeper watch, or periodic HTTP refresh). This is the approach used by Vitess (VTGate caches the routing table from the topo service) and ProxySQL (configuration tables loaded into memory at startup).
+
+**Centralized routing directory.** A single metadata service (etcd, ZooKeeper, Consul) stores the authoritative routing table. Every query goes through a central router that queries the directory for the target shard. This ensures all queries see the same routing table, eliminating stale-cache issues. The downside: the central directory is a single point of failure and a potential bottleneck for query routing. This approach is used by HBase (HMaster provides region location) and Kafka (controller manages partition leadership).
+
+**Gossip-based routing.** Each node shares routing information with a random subset of other nodes. Over time, all nodes converge to the same routing view. No central metadata service is needed. This is the approach used by Cassandra (gossip protocol for topology discovery) and Redis Cluster (cluster bus for slot assignment). The tradeoff is convergence time: after a topology change, it takes O(log N) gossip rounds for all nodes to learn the new mapping.
+
+**Routing table size scaling.** The routing table grows with the number of partitions. For 1,000 partitions with 50-byte entries: 50 KB. This fits in L1 cache on any modern CPU. For 100,000 partitions (Elasticsearch cluster with 1,000 nodes): 5 MB. Still fits in RAM but may cause noticeable CPU overhead for lookup. For 1 million partitions: 50 MB. The routing table must be stored in a hash table optimized for fast lookup. Cassandra's approach of using a bloom filter before the hash table lookup reduces unnecessary routing table probes.
+
+### Hash Functions for Partitioning
+
+The choice of hash function directly affects partition quality. Three categories of hash functions exist, each with different tradeoffs between speed and distribution quality.
+
+**Cryptographic hash functions** (SHA-256, MD5): Produce uniformly distributed output across the full range. The distribution is statistically indistinguishable from random. A good choice for partitioning because every bit of the input affects the output — changing one character in the partition key produces a completely different hash value. The downside is computational cost: SHA-256 processes data in 64-byte blocks with 64 rounds of compression. For high-throughput systems hashing every query's partition key, this CPU cost adds up. Benchmark: SHA-256 hashes at approximately 400 MB/second on a modern CPU. At 10 million keys per second with 16-byte keys, SHA-256 consumes 4 percent of a CPU core. Acceptable for most systems but wasteful when a faster hash suffices.
+
+**Non-cryptographic hash functions** (MurmurHash3, xxHash, CityHash): Designed for speed rather than cryptographic security. xxHash runs at 10 GB/second on modern CPUs — fast enough to hash every query key without measurable latency. MurmurHash3 is the most common choice for consistent hashing implementations (Cassandra, DynamoDB, Redis Cluster). These functions provide excellent distribution uniformity with minimal CPU cost. Benchmark: xxHash hashes at 10 GB/second, consuming 0.02 percent of a CPU core at 10 million keys per second. The speed difference matters when hashing is in the hot path of every query.
+
+**Database built-in hash functions:** PostgreSQL's `HASH` operator class uses a 32-bit hash function with good distribution for integer keys. MySQL's `PARTITION BY HASH` uses a modulo operation on the key value directly for integer keys, or a 32-bit CRC for non-integer keys. These are convenient because they require no external library, but the distribution quality varies by database vendor. Testing is essential: hash 1 million distinct partition key values, assign each to a partition by `hash % N`, and count the rows per partition. The standard deviation should be under 5 percent of the mean partition size.
+
+**Distribution quality benchmark.** A good hash function distributes 1 million distinct keys across 100 partitions within 5 percent of perfect uniformity. Testing: hash 1 million distinct partition key values, assign each to a partition by `hash % N`, and count the rows per partition. The standard deviation should be under 5 percent of the mean partition size. If the standard deviation exceeds 10 percent, switch to a better hash function.
+
+**Hash ring.** A consistent hash ring is a circular address space from 0 to 2^32 - 1 (or 2^64 - 1). Each physical node is assigned multiple positions on the ring called virtual nodes. Each key is hashed to a position on the ring, then assigned to the nearest virtual node encountered by walking clockwise from that position.
+
+**Virtual nodes.** Each physical node maps to V virtual nodes — typically 100 to 200 per node. Virtual nodes spread each node's data across many small segments of the ring. When a node joins or leaves, its V virtual nodes are distributed across the remaining nodes, each receiving roughly 1/V of the departing node's data. This prevents cascading load spikes: no single remaining node inherits all of a departing node's traffic.
+
+**Data movement.** When a node leaves the ring, only the keys whose virtual nodes belonged to that node must move. This is approximately `1/N` of total keys for N physical nodes. When a node joins, it claims V positions on the ring, each carved from an existing node's range. The joining node receives approximately `1/N` of total keys from the other N-1 nodes.
+
+### Range Partitioning Tree
+
+Range partitioning organizes partition boundaries in a tree structure for fast lookup. The tree maps partition key values to partition IDs.
+
+```
+Internal node:  key <= 2024-06-01
+              /                     \
+Left child                      Right child
+key <= 2024-03-01              key <= 2024-09-01
+   /            \                 /            \
+p_2024_q1   p_2024_q2       p_2024_q3    p_2024_q4
+```
+
+A query with `WHERE order_date = '2024-05-15'` traverses the tree: the root says `<= 2024-06-01` (true), left child says `<= 2024-03-01` (false), so the query routes to `p_2024_q2`. The lookup is O(log P) where P is the number of partition boundaries.
+
+### Mod-N Hashing
+
+The simplest partitioning algorithm: `partition_id = hash(partition_key) % N`. Each key maps to exactly one partition. The algorithm is deterministic, simple to implement, and provides uniform distribution for well-behaved hash functions.
+
+**Problems.** Mod-N hashing breaks when N changes. Going from N=16 to N=32 remaps approximately 50 percent of keys. Every remapped key must be physically moved. During the migration window, the system must maintain both routing tables and handle dual-reads for recently moved keys. This makes live resharding with mod-N hashing extremely expensive.
+
+**When it is acceptable.** Mod-N hashing works well when the number of partitions is fixed from the start and the system is over-provisioned for growth. Many SaaS systems use mod-N with a large N (for example, 1024 physical partitions on day one, even if only 16 servers back them). Each server handles 64 logical partitions. Adding servers rebalances logical partitions without changing N.
+
+<AsciiDiagram
+  id="partitioning-data/deepdive-modn-vs-consistent"
+  title="Comparison of mod-N hashing versus consistent hashing when adding a node, showing data movement percentages"
+  alt="Side-by-side comparison: adding a 4th node to mod-N hashing moves 9 of 16 keys (56 percent) versus consistent hashing moving approximately 4 of 16 keys (25 percent)"
+  caption="Mod-N hashing moves 56 percent of keys when N changes from 3 to 4; consistent hashing moves only 25 percent"
+  content={`
+Mod-N: 16 keys, 3 nodes → 4 nodes     Consistent Hashing: 16 keys, 3 → 4 nodes
+
+Before (3 nodes):                     Before (3 nodes, 2 vnodes each):
+node=hash(key)%3                      ring positions: A1, A2, B1, B2, C1, C2
+A: keys 0,3,6,9,12,15                A: keys 3,4,8,13,15
+B: keys 1,4,7,10,13                  B: keys 0,2,7,10,11
+C: keys 2,5,8,11,14                  C: keys 1,5,6,9,12,14
+
+After (4 nodes):                      After (add node D at D1, D2):
+node=hash(key)%4                      D claims ranges from A,B,C
+A: keys 0,4,8,12   ← 2 changed       A: keys 3,8,13    ← 2 moved
+B: keys 1,5,9,13   ← 2 changed       B: keys 2,7,10,11  ← 0 moved
+C: keys 2,6,10,14  ← 2 changed       C: keys 9,12,14    ← 3 moved
+D: keys 3,7,11,15  ← 4 new           D: keys 0,1,4,5,6,15 ← 4 new
+
+Moved: 9/16 = 56%                    Moved: ~4/16 = 25%
+`}
+/>
+
+### Dynamic Partitioning vs Fixed Partitioning
+
+**Fixed partitioning** creates N partitions at setup time and never changes N. Each partition maps to a physical node. Adding nodes requires re-mapping existing partitions to new nodes without changing N. This is simpler but requires accurate up-front capacity planning.
+
+**Dynamic partitioning** allows the number of partitions to grow as the dataset grows. Cassandra uses dynamic partitioning: when a partition exceeds a configurable size (default 100 MB), it splits into two partitions. HBase uses the same approach: regions split when they reach a threshold. Dynamic partitioning avoids up-front planning but adds the complexity of split and merge operations.
+
+### Rebalancing Algorithms
+
+Four algorithms are commonly used, each with different tradeoffs:
+
+**1. Linear rebalancing.** Move data from overloaded nodes to underloaded nodes in fixed-size chunks. A central rebalancer monitors partition sizes and query rates. When imbalance exceeds a threshold, it selects chunks to move. Used by Elasticsearch and MongoDB. Predictable but requires a central coordinator.
+
+**2. Consistent hashing rebalancing.** Data movement is limited to the immediate neighbors of joining or leaving nodes. No central coordinator needed — each node independently determines which keys it owns. Used by Cassandra and Amazon Dynamo. Decentralized but can be slower to converge.
+
+**3. Rack-aware rebalancing.** Extends consistent hashing with rack and data center awareness. Virtual nodes are constrained to distribute replicas across failure domains. Used by Cassandra's `NetworkTopologyStrategy`. Prevents replicas of the same data from landing on the same rack.
+
+**4. Proportional rebalancing.** Each node's share of the hash ring is proportional to its capacity. A node with 2x the disk space of others owns twice the key range. Requires capacity metadata and periodic renegotiation of ring assignments. Used by Facebook's Tao.
+
+### Query Routing Techniques
+
+**1. Partition key lookup table.** A separate database or in-memory cache stores the mapping `partition_key_value -> shard_id`. Fast for lookups but requires maintaining the table. Used when partition keys are not uniformly hashable.
+
+**2. Range-based routing.** Each shard is assigned a range of partition key values. The router determines the correct shard by binary search over the range boundaries. Vitess uses this approach.
+
+**3. Hash-based routing.** The router computes `hash(key) % N` or walks a consistent hash ring. No external lookup table needed. Deterministic and fast. Used by Cassandra, Redis Cluster, and Couchbase.
+
+**4. Directory-based routing.** A centralized metadata service (ZooKeeper, etcd) stores the partition-to-shard mapping. Each server watches the metadata for changes. Used by Kafka (controller node), HBase (HMaster), and Elasticsearch.
+
+---
+
+## The Query Lifecycle
+
+### Partition-Aware Query (Single Shard)
+
+A query that includes the partition key follows this optimized path:
+
+<AsciiDiagram
+  id="partitioning-data/deepdive-single-shard-query"
+  title="Lifecycle of a partition-aware query that prunes to a single shard"
+  alt="Sequence of 12 steps: application sends query, proxy authenticates, router extracts partition key, router looks up shard mapping, router forwards to shard, shard parses SQL, shard checks buffer pool, shard executes query on local data, shard returns result, router passes to proxy, proxy to application"
+  caption="A query with an exact partition key match visits 12 checkpoints but only touches one shard — the fastest path through the system"
+  content={`
+  Application           Proxy           Router          Shard 3       Storage
+      │                   │               │               │             │
+      │  ① SELECT *       │               │               │             │
+      │  FROM rides       │               │               │             │
+      │  WHERE user_id=42 │               │               │             │
+      │ ────────────────> │               │               │             │
+      │                   │  ② Auth +     │               │             │
+      │                   │  Pool conn    │               │             │
+      │                   │ ────────────> │               │             │
+      │                   │               │  ③ Extract    │             │
+      │                   │               │  user_id=42   │             │
+      │                   │               │  ④ Lookup     │             │
+      │                   │               │  user_id→S3   │             │
+      │                   │               │  ⑤ Forward    │             │
+      │                   │               │ ────────────> │             │
+      │                   │               │               │  ⑥ Parse    │
+      │                   │               │               │  ⑦ Check    │
+      │                   │               │               │  buffer pool│
+      │                   │               │               │ ──────────> │
+      │                   │               │               │  ⑧ Disk     │
+      │                   │               │               │  read (miss)│
+      │                   │               │               │ <────────── │
+      │                   │               │               │  ⑨ Execute  │
+      │                   │               │               │  (42 rows)  │
+      │                   │               │               │  ⑩ Return   │
+      │                   │               │ <──────────── │             │
+      │                   │  ⑪ Route back   │               │             │
+      │                   │ <──────────── │               │             │
+      │  ⑫ Response      │               │               │             │
+      │ <──────────────── │               │               │             │
+      │                   │               │               │             │
+      Total latency: 2-5ms (p50), 10-20ms (p99)           │             │
+      Data touched: 1 partition, ~100 MB                   │             │
+`}
+/>
+
+**Step 1-2:** The application issues a query. The proxy authenticates and assigns a connection from the pool.
+
+**Step 3-4:** The router parses the query, extracts the partition key `user_id = 42`, and looks up the shard mapping. The routing table (in memory, updated via metadata watch) returns shard 3.
+
+**Step 5:** The router forwards the query to shard 3's primary. No other shards are involved.
+
+**Step 6-8:** Shard 3 parses the SQL, checks its buffer pool for the relevant pages, and reads from disk if there is a cache miss.
+
+**Step 9-10:** Shard 3 executes the query against its local subset of rides. For a user with 100 rides, this scans roughly 100 rows from its local table — not the 5 billion rows across the entire dataset.
+
+**Step 11-12:** The result returns through the router and proxy back to the application.
+
+**Total latency:** 2-5 milliseconds at p50, 10-20 milliseconds at p99. Data touched: one partition.
+
+### Scatter-Gather Query (All Shards)
+
+A query without the partition key follows a dramatically more expensive path:
+
+<AsciiDiagram
+  id="partitioning-data/deepdive-scatter-gather"
+  title="Scatter-gather query lifecycle where the same query fans out to all shards and merges results"
+  alt="Sequence showing a query without partition key sent to all 4 shards, each computing partial results, the coordinator merging and sorting, then returning to the application"
+  caption="A scatter-gather query touches every shard and incurs latency equal to the slowest shard plus the merge cost"
+  content={`
+  Application           Router/Coordinator      Shard 0    Shard 1    Shard 2    Shard 3
+      │                        │                  │          │          │          │
+      │  SELECT COUNT(*)       │                  │          │          │          │
+      │  FROM rides            │                  │          │          │          │
+      │  WHERE fare > 100      │                  │          │          │          │
+      │ ─────────────────────> │                  │          │          │          │
+      │                        │  Fan-out query   │          │          │          │
+      │                        │ ────> S0 ──────> │          │          │          │
+      │                        │ ────> S1 ────────────────> │          │          │
+      │                        │ ────> S2 ──────────────────────────> │          │
+      │                        │ ────> S3 ─────────────────────────────────────> │
+      │                        │                  │          │          │          │
+      │                        │  Partial results  │          │          │          │
+      │                        │ <──── S0 ────────│          │          │          │
+      │                        │ <──── S1 ─────────────────│          │          │
+      │                        │ <──── S2 ────────────────────────────│          │
+      │                        │ <──── S3 ───────────────────────────────────────│
+      │                        │                  │          │          │          │
+      │                        │  Merge: COUNT=   │          │          │          │
+      │                        │  1,247 + 842 +   │          │          │          │
+      │                        │  1,984 + 603     │          │          │          │
+      │                        │  = 4,676         │          │          │          │
+      │ <───────────────────── │                  │          │          │          │
+      │                        │                  │          │          │          │
+      Latency = MAX(all shards) + merge overhead   │          │          │          │
+      Data touched: ALL partitions (100% of data)  │          │          │          │
+`}
+/>
+
+**Step 1:** The router parses the query and detects no partition key in the `WHERE` clause. It cannot prune.
+
+**Step 2:** The router fans out the query to all N shards in parallel. Each shard receives the exact same SQL.
+
+**Step 3:** Each shard executes the query independently against its local data. For `COUNT(*)` queries, each shard returns a scalar. For queries requiring global ordering or limits, each shard returns more data that must be merged.
+
+**Step 4:** The coordinator waits for all N shards to respond. Total latency equals the slowest shard (the straggler). If one shard has a hot spot or is under heavy load, it slows down the entire query.
+
+**Step 5:** The coordinator merges partial results. For scalar aggregates (COUNT, SUM, AVG), this is trivial math. For sorted results with LIMIT, the coordinator must merge N sorted streams and select the top K — this requires O(N + K) memory and O(K log N) time.
+
+**Total latency:** equals the slowest shard plus merge time. For a 50-shard system with one overloaded shard at 200ms, the query takes over 200ms even if 49 shards responded in 10ms. Data touched: every partition — 100 percent of the dataset.
+
+---
+
+## Consistency and State
+
+### Cross-Shard Transactions
+
+Transactions that span multiple shards are the hardest problem in partitioned databases. A transaction that updates user A's balance on shard 1 and user B's balance on shard 2 requires a distributed commit protocol.
+
+**Two-Phase Commit (2PC).** The classic protocol for distributed transactions across shards:
+
+1. **Prepare phase:** The coordinator sends a "prepare" message to all participating shards. Each shard executes the transaction but does not commit — it writes to a durable log and responds "ready" or "abort."
+2. **Commit phase:** If all shards respond "ready," the coordinator sends "commit" to all shards. If any shard responds "abort," the coordinator sends "abort" to all shards.
+
+**Problem:** 2PC is slow (2 round trips to every participating shard), blocking (a shard that has prepared but not received a commit/abort holds locks indefinitely), and susceptible to coordinator failure (if the coordinator crashes after some shards commit and others have not, the system has an inconsistent state that requires manual recovery).
+
+**XA Transactions.** The X/Open XA standard implements 2PC at the database level. PostgreSQL, MySQL, and Oracle support XA. In practice, XA transactions are rarely used in partitioned systems because of the performance penalty — each transaction requires synchronizing with all participating shards, adding 5-15ms per participant.
+
+**Alternatives to distributed transactions:**
+- **Single-shard transactions.** Design the schema so that related data lives on the same shard. User profiles and their orders live on the same shard keyed by user_id.
+- **Idempotent operations.** Design operations to be safely retried. If a credit operation fails, retry it. Duplicate credits are prevented by idempotency keys.
+- **Compensating transactions.** If a cross-shard operation fails partway through, perform a compensating action to undo the partial work. This is the Saga pattern.
+- **Eventually consistent reconciliation.** Accept temporary inconsistency and run background reconciliation jobs. Commonly used for aggregations and counters.
+
+### Partition Merge and Split Internals
+
+Partition split and merge are fundamental operations for adapting partition count to data growth.
+
+**Split operation (one partition becomes two):** The system divides the partition's key range into two equal sub-ranges. For range partitioning, this means splitting the range boundary. For hash partitioning, the split is more complex because the hash function modulus must change. The split process: (1) mark the partition as splitting in the routing table so queries continue to work, (2) create two new empty partitions with the new key ranges, (3) stream data from the old partition to both new partitions — each row goes to exactly one new partition based on its key, (4) verify consistency by comparing checksums between old and new partitions for a representative sample of rows, (5) atomically update the routing table to replace the old partition with the two new ones, (6) drop the old partition after confirming the new partitions are serving traffic correctly.
+
+**Merge operation (two partitions become one):** The inverse of split. Two adjacent partitions are merged into one when partition sizes are small enough that separate management is not beneficial. The merge process: (1) mark both partitions as merging, (2) create a new empty partition with the combined key range, (3) stream data from both old partitions to the new one, (4) verify consistency, (5) update the routing table, (6) drop the old partitions.
+
+**Cost analysis:** A split operation reads the full partition data and writes it to two new locations. For a 200 GB partition, this is 200 GB of read I/O and 200 GB of write I/O — approximately 15-30 minutes on modern hardware with 10 Gbps networking. During the split, the partition remains readable but is marked as splitting. The routing layer sends queries to the old partition until the cutover completes. Write amplification during split is 2x: the row exists in both old and new locations until the cutover.
+
+**PostgreSQL implementation:** PostgreSQL's `PARTITION BY RANGE` with `DEFAULT` partition enables managed splits. Create a new partition with the desired sub-range. Move data from the old partition to the new one using `ALTER TABLE ... ATTACH PARTITION` and `INSERT ... SELECT`. The old partition's range is narrowed. The operation is online but requires an `ACCESS EXCLUSIVE` lock on the partition being altered — other partitions are not affected.
+
+### Partition Recovery
+
+When a shard fails and its replica is promoted, the system must ensure that in-flight writes are not lost. The recovery process:
+
+1. The proxy detects the primary failure (missed heartbeat for 5 seconds, or connection timeout).
+2. A replica is promoted to primary. Depending on replication configuration, the replica may have lagged behind the failed primary.
+3. If synchronous replication is used, all acknowledged writes are durable on the replica. No data loss.
+4. If asynchronous replication is used, writes that were acknowledged by the old primary but not replicated to the replica are lost. The application must handle these as failed writes.
+5. The routing table is updated to point the partition's range to the new primary.
+6. When the old primary recovers, it rejoins as a replica and streams the backlog from the new primary.
+
+### Scalability Limits of Partitioned Systems
+
+Every partitioned system hits scalability limits at some point. Understanding these limits helps with capacity planning and system design.
+
+**Write throughput ceiling.** Each shard has a maximum write throughput determined by its hardware (disk IOPS, CPU, network). For a MySQL shard on modern hardware with NVMe SSDs: approximately 10,000-20,000 writes per second. For 100 shards: 1-2 million writes per second total. Beyond this, shards must be further split or the application must tolerate higher write latency by batching.
+
+**Partition count limits.** Each partition consumes resources: file descriptors (open database files), memory (buffer pool, metadata), and network connections. PostgreSQL supports up to 5,000 partitions per table, but performance degrades after 500. Each partition adds overhead to query planning: the planner must examine all partition constraints to determine which partitions to prune. At 5,000 partitions, query planning time exceeds 100ms even for simple queries.
+
+**Cross-shard coordination cost.** As shard count increases, cross-shard coordination (scatter-gather queries, distributed transactions) becomes more expensive. A scatter-gather query in a 10-shard system touches 10 nodes. In a 1,000-shard system, the same query touches 1,000 nodes. The probability of at least one shard being slow increases linearly with shard count. A system with 1,000 shards where each shard has a 1 percent chance of being slow has a 99.995 percent chance that at least one shard is slow on any given query.
+
+**Network topology limits.** In a multi-region deployment, cross-region network bandwidth and latency are constraints. A 100-shard system replicating 1 TB of data across 3 regions requires 2 TB of cross-region data transfer. On a 1 Gbps cross-region link, this takes 4.5 hours. On a 100 Mbps link (typical for some inter-region connections), this takes 45 hours. Network topology must be factored into the replication strategy.
+
+### Partitioning for Different Database Engines
+
+Each database engine implements partitioning differently. Understanding the engine-specific behavior is critical for choosing the right platform.
+
+**PostgreSQL declarative partitioning** supports range and list partitioning only (no hash partitioning for declarative). Partitions are created with `PARTITION BY RANGE` or `PARTITION BY LIST`. Each partition is a separate table with its own indexes. The parent table is a virtual table that the planner rewrites to access the child partitions. PostgreSQL 12+ includes significant partition pruning improvements: the planner can prune partitions based on `WHERE` clauses involving the partition key, even with complex expressions. Partition-wise joins (joining two tables partitioned on the same key) are supported in PostgreSQL 12+ and can join partitions directly without cross-join overhead.
+
+**MySQL partitioning** supports range, list, hash, key, and composite partitioning. MySQL's `PARTITION BY HASH` uses a simple modulo of the integer key value. `PARTITION BY KEY` uses MySQL's internal hash function (CRC32-based) and provides better distribution for non-integer keys. MySQL does not support partition-wise joins. Sub-partitioning is supported: `PARTITION BY RANGE (year) SUBPARTITION BY HASH (user_id)`. Each partition and sub-partition is a separate tablespace file.
+
+**Oracle partitioning** is the most feature-rich: range, list, hash, composite, reference (partition a child table to match its parent's partition), interval (auto-create partitions as data arrives), and system (application controls partition placement). Oracle supports partition-wise joins, partition exchange loading (swap a table with a partition in milliseconds), and parallel partition scanning. Oracle's partitioning is enterprise-grade but requires the Partitioning option license.
+
+**Cassandra partitioning** uses the partition key specified in the PRIMARY KEY definition. The partition key value is hashed (MurmurHash3, 64-bit) and the hash determines which node owns the data. Cassandra's partition count is determined by the number of tokens — each node has a range of the token ring. Virtual nodes (vnodes) assign multiple token ranges to each node for better distribution. Cassandra does not support range partitioning within a partition: all rows with the same partition key are stored together as a single partition on one node.
+
+**MongoDB sharding** uses a shard key specified at collection creation. MongoDB supports range, hash, and zone-based sharding. Range sharding distributes documents by shard key value ranges. Hash sharding distributes by hash of the shard key. Zone sharding assigns shard key ranges to specific shards (useful for geo-partitioning). MongoDB automatically splits chunks when they exceed the configured chunk size (default 64 MB). The balancer migrates chunks between shards to maintain balance.
+
+**Practical maximums for common systems:**
+
+| System | Max Shards | Practical Max Writes/sec | Max Data |
+|---|---|---|---|
+| PostgreSQL + Vitess | 500 (per keyspace) | 2M | 100 TB per keyspace |
+| MySQL + Vitess | Unlimited | 5M | 500 TB |
+| Cassandra | 1M tokens | 1M per cluster | 10 PB |
+| MongoDB | Unlimited chunks | 500K | Petabytes |
+| Elasticsearch | 1,000 per node | 100K per cluster | 10s of TB per node |
+
+### Choosing Between Database-Level and Application-Level Partitioning
+
+This architectural decision affects every aspect of the partitioned system.
+
+**Database-level partitioning** uses the database's built-in partition management (PostgreSQL declarative partitioning, MySQL partitioning, Citus distributed tables). The database manages partition creation, routing, and pruning. The application sends standard SQL queries.
+
+Advantages: No application changes needed for basic partitioning. The query planner handles partition pruning automatically. Schema changes propagate to all partitions. Maintenance operations (backup, vacuum, reindex) can target specific partitions.
+
+Disadvantages: Limited to the database's supported strategies (PostgreSQL supports range and list, but not hash for declarative partitioning). Partition count limits are rigid — PostgreSQL starts to show planning time degradation beyond 500 partitions. Cross-database partitioning (multiple database instances) requires replication or a separate sharding layer.
+
+**Application-level partitioning** uses a routing layer (proxy or application code) to direct queries to the correct database instance. The database knows nothing about the partitioning scheme. Each shard is a completely independent database instance.
+
+Advantages: Full control over the partitioning strategy — any algorithm can be implemented. Independent scaling — each shard can have different hardware, indexes, or schema. Database vendor independence — the routing layer abstracts the underlying database type.
+
+Disadvantages: Every application service must implement the same routing logic. Schema changes must be coordinated across all shards manually. Cross-shard queries require a coordinator service. The routing layer is additional infrastructure to deploy and maintain.
+
+**Recommendation:** Start with database-level partitioning when the data fits on a single database instance (up to 100 TB across up to 500 partitions). Move to application-level partitioning with a proxy layer (Vitess, Citus) when data needs to span multiple database instances for throughput or storage.
+
+### When to Scale vs When to Re-Architect
+
+Knowing when to add shards versus when to redesign the partitioning scheme is a critical operational skill.
+
+**Add shards (horizontal scaling)** when: write throughput is approaching the cluster limit, per-shard disk usage exceeds 70 percent of capacity, or per-shard query latency is increasing because the working set exceeds the buffer pool. Adding shards with consistent hashing or pre-split logical partitions is a routine operational task.
+
+**Re-architect the partitioning scheme** when: the access pattern has fundamentally changed (for example, the dominant query used to filter by user_id but now filters by team_id), the partition key is causing hot spots that cannot be mitigated with sub-sharding or caching, or the data model has changed (for example, a new data type requires co-location with existing data but the partition keys are incompatible).
+
+**Signs that re-architecting is needed:**
+- Per-shard latency is increasing despite adding more shards. Adding shards used to reduce per-shard latency by 50 percent; now it reduces latency by only 5 percent. The bottleneck has shifted from disk I/O to cross-shard coordination overhead.
+- Cross-shard queries have grown from 5 percent of traffic to 30 percent of traffic. The partition key no longer matches the dominant access pattern because the application's features have evolved. A new feature that queries by "team" instead of "user" is driving the growth.
+- Schema changes are blocked because the partition key is hard-coded into application logic. Adding a new feature requires changing the partition key, but the key is embedded in 15 microservices' routing libraries.
+- The routing layer has become a bottleneck — it cannot keep up with the number of shard lookups per second. VTGate proxies are at 80 percent CPU just doing routing table lookups. More proxies don't help because the bottleneck is the topo service's watch mechanism.
+- The cost of rebalancing exceeds the cost of rebuilding. Moving 10 TB of data across shards takes 8+ hours. The team estimates it would be faster to export all data to Parquet files, repartition using Spark, and import into new shards.
+
+---
+
+## Performance Characteristics
+
+### Latency by Query Type
+
+| Query Type | Latency (p50) | Latency (p99) | Data Scanned | Shards Touched |
+|---|---|---|---|---|
+| Single-shard point lookup | 1-3 ms | 10-20 ms | ~10 KB | 1 |
+| Single-shard range (100 rows) | 3-10 ms | 20-50 ms | ~1 MB | 1 |
+| Scatter-gather COUNT | 10-200 ms | 500-2000 ms | 100% | All |
+| Scatter-gather with sort + LIMIT | 20-500 ms | 1000-5000 ms | 100% | All |
+| Cross-shard transaction (2 shards) | 15-50 ms | 100-300 ms | Varies | 2 |
+| Cross-shard transaction (5 shards) | 40-150 ms | 300-1000 ms | Varies | 5 |
+
+Single-shard queries are 10x to 100x faster than scatter-gather queries. This differential drives the most important rule of partitioning: design the partition key to match the dominant access pattern.
+
+### Optimal Shard Count
+
+The optimal number of shards balances three competing factors:
+
+**Too few shards:** Each shard is large, backups are slow, maintenance operations lock large datasets, and there is insufficient parallelism for writes.
+
+**Too many shards:** The overhead of connection management for hundreds of shards becomes significant. Cross-shard queries become very expensive. Routing tables grow. The probability of at least one shard being slow or failing increases linearly with shard count.
+
+**Rule of thumb:** 50-200 GB per shard for relational databases. 100 GB to 1 TB per shard for analytical databases. For a 10 TB dataset, 50-200 shards is the sweet spot for a transactional workload.
+
+### Data Skew Impact
+
+Data skew is the single biggest performance risk in a partitioned system. When 10 percent of partitions hold 90 percent of the data or traffic, the system effectively operates at 10 percent of its potential capacity.
+
+**Size skew:** Some partitions grow faster than others. In range partitioning by date, the most recent partition often contains the most data. In list partitioning by region, one region may dominate. Mitigation: use hash partitioning for uniform distribution, or composite partitioning to combine range with hash.
+
+**Access skew:** Some keys receive disproportionate read or write traffic. A celebrity user who generates 100x more queries than average creates a hot spot on their shard. Mitigation: shuffle the celebrity's data across multiple sub-keys or use a dedicated cache layer in front of the hot shard.
+
+<AsciiDiagram
+  id="partitioning-data/deepdive-data-skew"
+  title="Impact of data skew on a sharded system showing normal distribution vs skewed distribution across 8 shards"
+  alt="Bar chart of 8 shards: normally distributed has each shard at 12-14 percent utilization; skewed shows one shard at 65 percent utilization and the rest at 5 percent each"
+  caption="Data skew reduces effective system capacity: one overloaded shard creates a bottleneck while other shards are underutilized"
+  content={`
+Normal distribution (balanced)       Skewed distribution (hot spot)
+
+Shard  ┌────┐                         ┌────────────────────────┐
+utilization                          utilization
+ 0 │ ██ │ 12%                       0 │ ██████████████████████ │ 65%  ← HOT
+ 1 │ ███│ 13%                       1 │ ██ │                   │  8%
+ 2 │ ██ │ 12%                       2 │ █  │                   │  4%
+ 3 │ ███│ 14%                       3 │ █  │                   │  4%
+ 4 │ ██ │ 12%                       4 │ ███│                   │  9%
+ 5 │ ███│ 13%                       5 │ █  │                   │  3%
+ 6 │ ██ │ 11%                       6 │ █  │                   │  3%
+ 7 │ ███│ 13%                       7 │ █  │                   │  4%
+
+Effective: 100% capacity             Effective: ~35% capacity
+All shards equally loaded            6 shards idle while 1 overloaded
+`}
+/>
+
+### Rebalancing Cost
+
+Rebalancing imposes a cost that must be factored into capacity planning:
+
+- **Network bandwidth.** Moving 1 TB of data across a 10 Gbps link takes at least 800 seconds for the data transfer alone, plus protocol overhead.
+- **CPU overhead.** Each moved row must be serialized, sent, received, deserialized, indexed, and written to the new shard's transaction log.
+- **Read amplification.** During rebalancing, data may be split across old and new locations, requiring the proxy to check both for the same key.
+- **Write amplification.** During rebalancing, writes to in-flight keys must be applied to both the old shard and the new shard (dual-write or buffered replay).
+
+### Performance Benchmarking Methodology
+
+When designing a partitioned system, benchmark the partition key, strategy, and shard count before committing to production. Use this methodology.
+
+**Step 1: Hash function quality test.** Generate 1 million distinct partition key values. Apply the hash function. Compute `hash % N` for N = 16, 64, 256. Count the number of keys per partition. Calculate the standard deviation as a percentage of the mean. A good hash function has standard deviation under 5 percent. If the standard deviation exceeds 10 percent, choose a different hash function (MurmurHash3, xxHash) or use consistent hashing with virtual nodes.
+
+**Step 2: Query latency benchmark.** Create a test table with 200 GB of data (the target partition size). Create the partition key index. Run the top 5 queries from production (captured from pg_stat_statements or performance_schema) in a loop for 10 minutes each. Measure p50, p95, and p99 latency. Compare against the same queries on a monolithic table of the equivalent total size. The partitioned query should be 10-100x faster for partition-key queries and 2-5x slower for non-partition-key queries. If the speedup for partition-key queries is less than 2x, the partition key is not providing enough pruning benefit.
+
+**Step 3: Write throughput benchmark.** With the same test table, run a write-heavy workload (INSERT and UPDATE) targeting a single partition key value (simulating a hot spot scenario). Measure the write throughput in writes per second as the hot spot increases from 1x to 100x the average per-partition throughput. This benchmark reveals the headroom before a hot spot causes performance degradation. If throughput degrades by more than 50 percent at 10x the average, the system needs hot spot mitigation from day one.
+
+**Step 4: Rebalancing cost benchmark.** Create 8 partitions with 100 GB of data each. Simulate adding a 9th partition. Measure: total data moved (GB), total time (minutes), impact on query latency during rebalancing (p50 and p99), and CPU/network utilization on source and target nodes during rebalancing. This benchmark provides the data needed for capacity planning: if rebalancing a 100 GB partition causes a 50 percent latency increase for 30 minutes, schedule rebalancing during off-peak hours and alert the on-call team.
+
+**Minimizing rebalancing cost:**
+- Pre-split partitions to 2x or 4x the expected number of physical nodes, then remap logical partitions to physical nodes without moving data.
+- Use consistent hashing to limit data movement to immediate neighbors.
+- Perform rebalancing in the lowest traffic window. Rate-limit the data transfer to avoid saturating network links.
+- Use incremental rebalancing: move a few partitions at a time, verify consistency, then proceed.
+
+---
+
+## Configuration and Tuning
+
+### Number of Partitions
+
+The partition count decision depends on the database system and workload:
+
+| System | Recommended Partition Count | Max Practical |
+|---|---|---|
+| PostgreSQL (declarative) | 50-500 | 5,000 |
+| MySQL (partitioned tables) | 50-1,000 | 8,192 |
+| Vitess (shards) | 10-200 per keyspace | Unlimited |
+| Cassandra (tokens) | 256 per node | 1M per cluster |
+| Elasticsearch (shards) | 1 shard per 20-50 GB | 1,000 per node |
+| Kafka (partitions) | 10-50 per topic | 200,000 per cluster |
+
+**Key considerations:**
+- More partitions = higher parallelism but more overhead.
+- Each partition consumes file descriptors, memory for metadata, and connection pool slots.
+- PostgreSQL subpartition files consume OS file descriptors: 500 partitions with a primary key and two indexes = 1,500 open file descriptors.
+
+### Partition Key Selection
+
+The partition key is the single most consequential decision. Rules of thumb:
+
+**High cardinality.** The partition key should have at least 10,000 distinct values for a 100-shard system, ideally 100,000 or more. A key with only 100 distinct values across 100 shards means each shard gets roughly one value — the routing table is essentially meaningless.
+
+**Uniform access frequency.** No single partition key value should account for more than 1-2 percent of total traffic. If user ID 48192 has 100x more data than the average user, every query for that user loads shard 3 disproportionately.
+
+**Natural in queries.** The partition key must appear in 80-95 percent of all queries. If queries rarely filter by the chosen key, partition pruning is ineffective and scatter-gather becomes the norm.
+
+**Immutable after creation.** Partition keys should not change over time. Changing a user's shard requires moving all of the user's data from one shard to another. This is expensive, risky, and should be avoided.
+
+### Pre-Splitting vs Dynamic Splitting
+
+**Pre-splitting.** Create all partitions at table creation time, over-provisioned for expected growth. For example, create 512 partitions on day one even though only 4 physical servers exist. Each server manages 128 logical partitions. As data grows, add servers and reassign logical partitions.
+
+**Advantages:** No partition split operations during operation. Predictable performance. Simple to reason about.
+
+**Disadvantages:** Requires accurate capacity planning up front. Hard to change partition count later. Each partition consumes resources (file descriptors, metadata) even when empty.
+
+**Dynamic splitting.** Start with a small number of partitions and split them as they grow. Cassandra splits partitions at 100 MB by default. HBase splits at 10 GB.
+
+**Advantages:** No up-front planning. Adapts automatically to data distribution. Resources consumed only where data exists.
+
+**Disadvantages:** Split operations add latency. During a split, the partition being split is briefly unavailable. Metadata churn from split notifications.
+
+### Advanced Performance Tuning: Partition-Level Optimization
+
+Beyond shard count and key selection, several advanced tuning parameters affect partition performance.
+
+**Partition parallelism.** Queries that scan a single partition can be parallelized within the partition if the database supports parallel query execution. PostgreSQL's parallel sequential scan uses multiple workers to scan a single partition. For a 100 GB partition, 4 parallel workers reduce scan time from 30 seconds to 8 seconds. The tradeoff is that parallel workers consume CPU and memory that could be used for other queries. Set `max_parallel_workers_per_gather` to 2-4 for partitioned tables.
+
+**Partition-local indexes.** Each partition maintains its own B-Tree index. A partition-local index on `(user_id, created_at)` has depth proportional to the partition's size, not the full table size. For a 100 GB partition, the index depth is approximately 3-4 levels. For a 5 TB monolithic table, the same index has depth of 5-6 levels. The 2 fewer levels means 2 fewer disk reads for each index lookup — a 40 percent improvement in index lookup latency.
+
+**Buffer pool allocation per partition.** In a partitioned database with separate instances per shard, each instance has its own buffer pool. A shard with 100 GB of data and 32 GB of buffer pool has a 32 percent cache ratio. A different shard with 10 GB of data and 32 GB buffer pool has a 100 percent cache ratio. Memory is not shared across shards, so buffer pool allocation must be proportional to each shard's working set. Monitor per-shard cache hit ratio and adjust buffer pool sizes independently.
+
+**Write-ahead log (WAL) configuration per partition.** Each shard writes its own WAL. A shard handling 5,000 writes per second generates WAL traffic proportional to the write rate. Configure WAL size and checkpoint frequency per shard based on its write throughput. A shard that handles 10,000 writes per second needs a larger WAL (16 GB recommended) and more frequent checkpoints than a shard handling 500 writes per second (4 GB WAL).
+
+### Replication Factor Per Partition
+
+Each partition can have its own replication factor. In production systems, replication factor 3 is standard: one primary and two replicas. Partitions containing critical data can be configured with replication factor 5 for higher resilience.
+
+The replication factor multiplies storage cost. A 5 TB dataset with RF=3 consumes 15 TB of raw storage. For hot partitions (for example, the "current month" partition in a time-series setup), RF=3 is adequate. For archival partitions where data rarely changes, RF=2 may be sufficient, or RF=1 with a backup strategy.
+
+### Failure Detection in Partitioned Systems
+
+A partitioned system must detect failures at two levels: individual shard failures and routing layer failures. Different detection mechanisms operate at each level.
+
+**Shard-level failure detection** uses heartbeat protocols. Each shard primary sends a periodic heartbeat to the topo service (etcd, ZooKeeper) every 1-5 seconds. The topo service expects the heartbeat at a configurable interval. If a heartbeat is missed for 3 consecutive intervals (the failure timeout), the topo service marks the shard as suspect. A separate health checker (Orchestrator, Cassandra's gossip protocol) independently verifies the shard's health by attempting a TCP connection and a lightweight query (SELECT 1). If both checks fail, the shard is declared dead and failover begins.
+
+**Routing layer failure detection** uses passive health checks. The proxy monitors open connections to each shard. If a connection returns an error or times out, the proxy marks that shard's endpoint as unhealthy and retries on a different endpoint (a replica of the same shard). After N consecutive failures (configurable, typically 3-5), the proxy removes the shard from the routing table and alerts.
+
+**Split-brain detection.** In a partitioned system, a network partition can cause two nodes to believe they are the primary for the same shard. Split-brain is prevented by requiring a quorum of nodes to agree on leadership. For a shard with 3 replicas, at least 2 must agree. If the primary loses contact with the majority, it steps down. The replica with the most recent data (highest WAL position) is promoted by the remaining majority.
+
+**Recovery process after shard failure:**
+1. Failure detected: heartbeat missing for 3 intervals plus secondary health check fails.
+2. Replica promotion: the replica with the most recent WAL position is promoted to primary. The routing table is updated.
+3. New replica creation: a new replica is provisioned from a snapshot of the new primary, then catches up on WAL changes since the snapshot.
+4. Verification: consistency checks compare checksums between the new replica and the primary for a 1 percent sample of rows.
+5. Back to normal: the new replica enters service. The cluster returns to full replication factor.
+
+The entire process takes 10-60 seconds depending on WAL lag, replica provisioning speed, and verification time.
+
+---
+
+## Bridging to Architecture
+
+This deep dive has covered the internal machinery of partitioned systems: the five-layer architecture, consistent hashing algorithms, query lifecycle for single-shard and scatter-gather queries, cross-shard transaction challenges, and performance characteristics. The next page builds on this foundation by examining partitioned system architectures from naive to production-grade, including integration patterns for Kafka, Elasticsearch, and multi-region deployments.
+
+The deep dive introduced: consistent hashing with virtual nodes, mod-N vs consistent hashing comparison, single-shard query lifecycle with 12 steps, scatter-gather lifecycle, and data skew impact analysis.
+
+The next page covers: naive architecture and its failure at scale, production-grade Vitess/Citus architecture, Kafka topic partitioning, Elasticsearch index sharding, multi-region geo-partitioning, and capacity planning math for 100M-user systems.

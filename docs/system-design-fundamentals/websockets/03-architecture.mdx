@@ -1,0 +1,564 @@
+---
+id: websockets-architecture
+title: WebSockets at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest WebSocket server: a single process that accepts connections, manages them in memory, and fans out messages to all connected clients.
+
+```javascript
+const WebSocket = require('ws');
+const server = new WebSocket.Server({ port: 8080 });
+const connections = new Set();
+
+server.on('connection', (ws) => {
+  connections.add(ws);
+  ws.on('message', (data) => {
+    for (const client of connections) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(data);
+      }
+    }
+  });
+  ws.on('close', () => connections.delete(ws));
+});
+```
+
+### What Breaks at 1,000 Users
+
+Nothing measurable. A single-threaded Node.js process handles 1,000 connections comfortably. Memory usage is under 100 MB. The broadcast loop iterates 1,000 items per message — nanoseconds of work.
+
+### What Breaks at 100,000 Users
+
+**Memory:** Each connection consumes 10-20 KB for socket buffer and WebSocket state. 100,000 connections = 1-2 GB. The connection Set grows to 100,000 entries. The broadcast loop takes 5-10 milliseconds per message — too slow for real-time updates.
+
+**File descriptors:** The process hits the default ulimit of 1024 or 4096 long before 100,000. You need fs.file-max set to 200,000+ and ulimit -n set to 100,000+.
+
+**Single-threaded bottleneck:** A single Node.js event loop processes all connections in one thread. If one client sends a large message that takes 100ms to serialize, every other client's message waits. Head-of-line blocking kills throughput.
+
+**Broadcast inefficiency:** Broadcasting a message to 100,000 clients means 100,000 send() calls. If each send() takes 10 microseconds, the broadcast blocks the event loop for 1 second. During that second, no new connections are accepted and no other messages are processed.
+
+### What Breaks at 10 Million Users
+
+A single process cannot survive. Even with clustering (one process per CPU core), a 32-core machine handles at most 32 x 100,000 = 3.2 million connections. Ten million requires multiple machines, load balancing, sticky sessions, and a pub/sub layer for cross-node broadcast.
+
+**Shared state:** Connection state lives in process memory. A message from one user goes to the local process's connection set. To reach users on other processes or machines, you need a distributed message bus.
+
+**Sticky sessions:** Load balancers must route a client's subsequent WebSocket connections to the same server that handled its first connection. If a load balancer sends a reconnecting client to a different server, that server has no knowledge of the client's state.
+
+**Graceful degradation:** When one server fails, its 100,000+ connections drop simultaneously. All 100,000 clients reconnect at once — a thundering herd that can overwhelm the remaining servers.
+
+## Production-Grade Architecture
+
+A production WebSocket system at scale has five layers. Each layer is independently scalable and failure-isolated.
+
+<AsciiDiagram id="websockets/production-architecture" title="Production WebSocket Architecture at Scale">{` 
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    PRODUCTION WEBSOCKET INFRASTRUCTURE                        │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────┐      │
+│  │  LAYER 1: Clients                                                   │      │
+│  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                  │      │
+│  │  │Browser│Mobile│  │  IoT │  │Desktop│  │CLI  │  │Server│           │      │
+│  │  └──┬───┘ └──┬──┘ └──┬──┘ └──┬───┘ └──┬──┘ └──┬──┘               │      │
+│  │     └────────┴────────┴────────┴────────┴────────┘                  │      │
+│  │                    wss://example.com                                │      │
+│  ├────────────────────────────────────────────────────────────────────┤      │
+│  │  LAYER 2: DNS / CDN / Edge                                         │      │
+│  │  ┌────────┐   ┌──────────┐   ┌──────────────────┐                  │      │
+│  │  │ Route53│   │ CloudFront│   │ Global Accelerator│                │      │
+│  │  │ (DNS)  │   │ (CDN, 443)│   │ (Anycast)        │                │      │
+│  │  └────────┘   └──────────┘   └──────────────────┘                  │      │
+│  ├────────────────────────────────────────────────────────────────────┤      │
+│  │  LAYER 3: Load Balancing                                           │      │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │      │
+│  │  │  ALB / NLB (AWS) / GCLB (GCP) / Azure LB                     │  │      │
+│  │  │  Sticky Sessions: cookie-based (ALB) or proxy protocol (NLB) │  │      │
+│  │  │  Health checks: /ws/health every 5 seconds, 2 failures→drain │  │      │
+│  │  │  Connection draining: 60 seconds to finish in-flight messages │  │      │
+│  │  └──────────────────────────────────────────────────────────────┘  │      │
+│  ├────────────────────────────────────────────────────────────────────┤      │
+│  │  LAYER 4: WebSocket Server Pool                                    │      │
+│  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐                    │      │
+│  │  │ Server │ │ Server │ │ Server │ │ Server │  ... (N nodes)      │      │
+│  │  │  A     │ │  B     │ │  C     │ │  D     │                    │      │
+│  │  │ 100K   │ │ 100K   │ │ 100K   │ │ 100K   │  connections/node  │      │
+│  │  │ conns  │ │ conns  │ │ conns  │ │ conns  │                    │      │
+│  │  └───┬───┘ └───┬───┘ └───┬───┘ └───┬───┘                    │      │
+│  │      └──────────┴──────────┴──────────┴──────────┘              │      │
+│  │                    │              │                              │      │
+│  ├────────────────────┼──────────────┼─────────────────────────────┤      │
+│  │  LAYER 5a: Pub/Sub  │            │  LAYER 5b: State Store       │      │
+│  │  ┌──────────────────▼──┐        ┌─▼────────────────────────┐    │      │
+│  │  │  Redis Cluster       │        │  Redis / MemoryDB        │    │      │
+│  │  │  Pub/Sub channels:   │        │  Per-connection state    │    │      │
+│  │  │  /rooms/{room_id}    │        │  Room membership         │    │      │
+│  │  │  /users/{user_id}    │        │  Session metadata        │    │      │
+│  │  │  /broadcast/{global} │        │  TTL: 24h                │    │      │
+│  │  └──────────────────────┘        └──────────────────────────┘    │      │
+│  │                                                                  │      │
+│  │  LAYER 5c: Persistent Storage   LAYER 5d: Message Queue         │      │
+│  │  ┌──────────────────┐           ┌────────────────────────┐      │      │
+│  │  │ PostgreSQL / Dynamo │          │ Kafka / SQS             │      │      │
+│  │  │ Message history      │          │ Command queue           │      │      │
+│  │  │ User sessions        │          │ Event sourcing          │      │      │
+│  │  │ Offline messages     │          │ Audit trail             │      │      │
+│  │  └──────────────────────┘          └────────────────────────┘      │      │
+│  └────────────────────────────────────────────────────────────────────┘      │
+│                                                                              │
+│  Data Flow:  Client → LB → Server A                                          │
+│  Broadcast:  Server A → Redis PubSub → Server B,C,D → Clients B,C,D         │
+│  Persistence: Server A → Kafka → Backend workers → DB                        │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Load Balancing WebSocket Connections
+
+Load balancing WebSocket adds constraints that HTTP load balancing does not:
+
+| Feature | HTTP | WebSocket |
+|---------|------|-----------|
+| Session persistence | Optional, cookie-based | Required (sticky sessions) |
+| Idle timeout | 30-60 seconds | Must be configurable, often hours |
+| Connection draining | Drain after response completes | Drain after Close or timeout |
+| Health check | HTTP 200 on /health | TCP check or application-level ping |
+| Protocol | HTTP/1.1, HTTP/2 | HTTP upgrade + raw frames |
+
+**Sticky session approaches:**
+- **Cookie-based (ALB):** Load balancer sets a cookie mapping client to target. Works but cookies have size limits and some WebSocket clients strip cookies
+- **Source IP hash:** Consistent hash of client IP. Simple but fails if clients share an IP (NAT). Uneven distribution when a few IPs dominate traffic
+- **Proxy Protocol:** NLB sends the client's IP and port as a header before the WebSocket handshake. Server uses this for consistent routing. Most reliable approach
+
+## Integration Patterns
+
+### Pattern 1: WebSocket + Redis Pub/Sub for Cross-Node Broadcast
+
+When Server A needs to send a message to a user connected to Server B, it cannot directly reach Server B's connection. Redis Pub/Sub bridges the gap.
+
+<AsciiDiagram id="websockets/redis-pubsub" title="Cross-Node Broadcast via Redis Pub/Sub">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│                CROSS-NODE BROADCAST VIA REDIS PUB/SUB            │
+│                                                                  │
+│  User1                         User2                             │
+│    │                             │                               │
+│    │  wss://example.com         │  wss://example.com             │
+│    ▼                             ▼                               │
+│  ┌──────────┐                ┌──────────┐                       │
+│  │  Server A │                │  Server B │                       │
+│  │  (Node 1) │                │  (Node 2) │                       │
+│  │  conn:5112│                │  conn:7843│                      │
+│  └─────┬─────┘                └─────┬─────┘                      │
+│        │                            │                            │
+│        │  User1 sends message       │                            │
+│        │  targeting User2           │                            │
+│        │                            │                            │
+│        ▼                            │                            │
+│  ┌──────────────────────┐           │                            │
+│  │  Redis Publisher      │           │                            │
+│  │  Channel: /users/7843│           │                            │
+│  │  Message: "Hello"     │──────▶ ┌─┴─────────────┐             │
+│  └──────────────────────┘        │  Redis Subscriber│            │
+│                                   │  Server B       │            │
+│                                   │  Channel matches │            │
+│                                   │  conn:7843       │            │
+│                                   └────────┬────────┘            │
+│                                            │                     │
+│                                            ▼                     │
+│                                      User2 receives "Hello"      │
+│                                                                  │
+│  Key insight: Each server subscribes to channels matching        │
+│  its connected user IDs. Redis fans out to all subscribers.      │
+│  All servers see the message; only the server with the           │
+│  matching connection delivers it.                                │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Pattern 2: WebSocket + Database for Persistence
+
+Messages must survive server crashes. Each server writes messages to a database before or after delivering them.
+
+```javascript
+// Write-through pattern: deliver then persist
+async function handleMessage(ws, message) {
+  // 1. Parse message
+  const { targetUserId, payload } = JSON.parse(message);
+  
+  // 2. Deliver via WebSocket if user is connected
+  const targetConn = connectionMap.get(targetUserId);
+  if (targetConn && targetConn.readyState === WebSocket.OPEN) {
+    targetConn.send(payload);
+  }
+  
+  // 3. Persist for offline delivery
+  await db.query(
+    `INSERT INTO messages (from_user, to_user, payload, created_at)
+     VALUES ($1, $2, $3, NOW())`,
+    [ws.userId, targetUserId, payload]
+  );
+  
+  // 4. Acknowledge sender
+  ws.send(JSON.stringify({ type: 'delivered', messageId: message.id }));
+}
+```
+
+**Trade-off:** Writing to the database adds 1-10 milliseconds of latency per message. For high-throughput systems (over 10,000 messages/second), batch writes: accumulate 100 messages or wait 50ms, whichever comes first, then issue a single bulk insert.
+
+### Pattern 3: WebSocket + Message Queue for Async Processing
+
+Heavy processing (image analysis, spam detection, ML inference) should not block the WebSocket handler. Enqueue work to a message queue and respond asynchronously.
+
+<AsciiDiagram id="websockets/message-queue" title="Async Processing with Message Queue">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│                ASYNC PROCESSING WITH MESSAGE QUEUE               │
+│                                                                  │
+│  Client (sends image)       WebSocket Server                     │
+│      │                           │                               │
+│      │──── base64 image ────────▶│                               │
+│      │                           │                               │
+│      │  "processing" response    │                               │
+│      │◀─── {status: "queued"} ───│                               │
+│      │                           │                               │
+│      │                           ▼                               │
+│      │                  ┌────────────────┐                       │
+│      │                  │  Kafka / SQS   │                       │
+│      │                  │  Topic: image. │                       │
+│      │                  │  processing    │                       │
+│      │                  └────────┬───────┘                       │
+│      │                           │                               │
+│      │                           ▼                               │
+│      │                  ┌────────────────┐                       │
+│      │                  │  Worker Pool   │                       │
+│      │                  │  (10 instances)│                      │
+│      │                  │  - Resize img  │                       │
+│      │                  │  - Run ML model│                       │
+│      │                  │  - Detect NSFW │                       │
+│      │                  └────────┬───────┘                       │
+│      │                           │                               │
+│      │                           │  Results topic                │
+│      │                           ▼                               │
+│      │                  ┌────────────────┐                       │
+│      │                  │  Result Relay  │                       │
+│      │                  │  (lookup conn  │                       │
+│      │                  │   via Redis)   │                       │
+│      │                  └────────┬───────┘                       │
+│      │                           │                               │
+│      │◀─── {status: "done", ─────│                               │
+│      │      result: {...}}       │                               │
+│      │                           │                               │
+│  Total latency: 50ms-5s → user sees spinner then result          │
+│  Benefit: WebSocket handler frees in under 1ms, not 5s               │
+│  Worker count tuned to queue depth / processing time            │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Pattern 4: WebSocket + Cache for Presence and State
+
+Frequently accessed state (user online status, room membership, typing indicators) should not hit the database. Use an in-memory cache like Redis.
+
+**Data in cache:**
+- `presence:{user_id}` → `{"status": "online", "server": "server-a", "connected_at": "2026-07-01T10:00:00Z"}`
+- `room:{room_id}:members` → Set of user IDs
+- `typing:{room_id}:{user_id}` → `{"typing": true, "expires_at": ...}`
+
+**TTL strategy:**
+- Presence entries: TTL of 120 seconds, refreshed every Ping/Pong
+- Typing indicators: TTL of 10 seconds, auto-expire after user stops typing
+- Room membership: No TTL, explicitly managed on connect/disconnect
+
+## Multi-Region and Global Scale
+
+### Global Topology
+
+A global WebSocket service requires WebSocket servers in multiple regions, cross-region message replication, and intelligent client routing to the nearest region.
+
+<AsciiDiagram id="websockets/global-topology" title="Multi-Region WebSocket Architecture">{` 
+┌────────────────────────────────────────────────────────────────────────┐
+│                     MULTI-REGION WEBSOCKET TOPOLOGY                     │
+│                                                                        │
+│                        ┌─────────────────────┐                        │
+│                        │   Global DNS /       │                        │
+│                        │   Traffic Router     │                        │
+│                        │   (Route53 / GCLB)  │                        │
+│                        └──────┬──────┬───────┘                        │
+│                               │      │                                 │
+│              Latency-based routing to nearest region                    │
+│                               │      │                                 │
+│     ┌─────────────────────────▼──┐ ┌─▼─────────────────────────┐      │
+│     │     US-EAST-1 (Virginia)    │ │   EU-WEST-1 (Ireland)     │      │
+│     │                             │ │                            │      │
+│     │  ┌───────────────────┐      │ │  ┌───────────────────┐   │      │
+│     │  │ ALB (sticky)      │      │ │  │ ALB (sticky)      │   │      │
+│     │  └────────┬──────────┘      │ │  └────────┬──────────┘   │      │
+│     │           │                 │ │           │               │      │
+│     │  ┌────────▼──────────┐      │ │  ┌────────▼──────────┐   │      │
+│     │  │ WebSocket Pool    │      │ │  │ WebSocket Pool    │   │      │
+│     │  │ (8 x c6g.4xlarge)│      │ │  │ (8 x c6g.4xlarge)│   │      │
+│     │  │ 1.6M connections   │      │ │  │ 1.6M connections   │   │      │
+│     │  └────────┬──────────┘      │ │  └────────┬──────────┘   │      │
+│     │           │                 │ │           │               │      │
+│     │  ┌────────▼────────────┐    │ │  ┌────────▼────────────┐ │      │
+│     │  │ Redis Cluster (local)│    │ │  │ Redis Cluster (local)│ │      │
+│     │  │ Pub/Sub + Presence   │    │ │  │ Pub/Sub + Presence   │ │      │
+│     │  └─────────────────────┘    │ │  └─────────────────────┘ │      │
+│     └──────────┬──────────────────┘ └──────────┬────────────────┘      │
+│                │                               │                       │
+│                │    ┌──────────────────────┐    │                       │
+│                └────│  Cross-Region Bus     │────┘                      │
+│                     │  (Kafka MirrorMaker   │                          │
+│                     │   or Pulsar geo-rep)  │                          │
+│                     └──────────────────────┘                          │
+│                               │                                        │
+│                  ┌────────────▼──────────────┐                        │
+│                  │  Global State Store        │                        │
+│                  │  (DynamoDB Global Tables   │                        │
+│                  │   or CockroachDB)          │                        │
+│                  │  - User regions            │                        │
+│                  │  - Room partitions         │                        │
+│                  │  - Offline messages        │                        │
+│                  └───────────────────────────┘                        │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Cross-Region Message Delivery
+
+When User A in US-East sends a message to User B in EU-West, the message must cross the Atlantic:
+
+1. User A's message hits US-East WebSocket server
+2. Server publishes to local Redis Pub/Sub channel `/users/{user_b_id}`
+3. Redis cluster in US-East does not have User B — no local subscriber
+4. Server writes message to cross-region Kafka topic
+5. Kafka geo-replication mirrors message to EU-West
+6. EU-West consumer reads from cross-region topic, publishes to local Redis
+7. User B's WebSocket server in EU-West picks up from local Redis and delivers
+
+**Target latency:**
+- Same region delivery: under 50ms (p99)
+- Cross-region delivery: under 500ms (p99 for US-East to EU-West)
+- Cross-continent (US to Asia): under 2 seconds
+
+### Failover Between Regions
+
+When US-East degrades or fails:
+
+1. Global traffic router detects health check failures from US-East
+2. DNS TTL is 30 seconds — clients' next DNS resolution points to EU-West or US-West
+3. Clients reconnect to the new region. Reconnection carries a `last_session_id` cookie
+4. New region queries global state store for the user's session: "User A was connected to US-East room #42"
+5. Server loads room membership and latest state from global state store
+6. Client resumes with full state — no missed messages (guaranteed by Kafka offsets)
+
+**Recovery time objective (RTO):** 30-60 seconds for multi-region failover
+
+**Recovery point objective (RPO):** 0 (no message loss guaranteed by Kafka durable acknowledgments)
+
+## Capacity Planning
+
+### Math for 10 Million DAU
+
+**Assumptions:**
+- Daily active users: 10,000,000
+- Peak concurrency factor: 20 percent (2,000,000 simultaneous connections)
+- Messages per user per day: 200 (combined sent and received)
+- Peak messages per second: 50,000 (20x daily average)
+- Average message size: 512 bytes uncompressed
+- Compression ratio: 4:1 (128 bytes compressed)
+
+**Server count:**
+```
+Per-server connections (10M DAU, 20% peak concurrency):
+  Total concurrent = 10,000,000 × 0.20 = 2,000,000
+  Connections per server (target 100K) = 2,000,000 / 100,000 = 20 servers
+  Redundancy buffer (20%) = 24 servers
+```
+
+**Memory:**
+```
+Per-idle-connection: 16 KB (TCP buffer + state)
+Idle memory: 2,000,000 × 16 KB = 32 GB total
+
+Per-active-connection: 64 KB (compression context + active buffers)
+Active at peak (10% of connections): 200,000
+Active memory: 200,000 × 64 KB = 12.8 GB
+
+Compression context per connection: 15 KB
+Total compression: 2,000,000 × 15 KB = 30 GB (if all connections negotiate compression)
+Selective compression: only active connections = 200,000 × 15 KB = 3 GB
+
+Total memory: 32 + 12.8 + 3 = 47.8 GB (approx 2 GB per server)
+```
+
+**CPU:**
+```
+Message processing per second:
+  Peak messages: 50,000/second
+  Frame encode/decode: 1μs per message = 50ms CPU per second = 5% of one core
+  JSON serialize/deserialize: 5μs = 250ms = 25% of one core
+  Compression: 15μs per message = 750ms = 75% of one core
+  
+  Total CPU per message: ~21μs = 1.05 seconds per core = 1 core
+  Broadcast fanout (avg 10 recipients): 10x = 10 cores
+  Headroom (2x): 20 cores
+
+Per server: 20 cores / 24 servers = less than 1 core per server
+  But cross-node broadcast via Redis adds overhead:
+  Redis pub/sub publish: 50μs per message (across all subscribers)
+  Total at 50K msg/s: 2.5 seconds per second = 2.5 cores
+  
+  Total per server: ~1.5 cores. Use c6g.4xlarge (16 vCPU) boxes.
+```
+
+**Network bandwidth:**
+```
+Inbound: 50,000 msg/s × 512 bytes = 25.6 MB/s = 204.8 Mbps
+Outbound (10x fanout): 256 MB/s = 2,048 Mbps = 2 Gbps
+Per server (24 servers): 85 Mbps outbound
+NIC requirement: 10 Gbps (plenty of headroom)
+```
+
+**Redis cluster:**
+```
+Messages published to Redis: 50,000 msg/s
+Redis throughput per node: ~200,000 msg/s (Pub/Sub)
+Nodes needed: 2-3 (with replication factor 2)
+Memory: 5 GB for presence + room membership data
+```
+
+**Cost estimate (monthly, AWS us-east-1 on-demand):**
+```
+24 × c6g.4xlarge (16 vCPU, 32 GB): $24 × $0.544/hr = $9,400/month
+3 × r6g.large Redis (13 GB): $3 × $0.165/hr = $360/month
+ALB: $0.0225/hr + $0.008/LCU ≈ $500/month
+Total compute: ~$10,260/month
+Data transfer: 2 Gbps outbound × ~30 TB/month × $0.05/GB = $1,500/month
+Grand total: ~$12,000/month (reserved instances save 40-60%)
+```
+
+## Deployment and Operations
+
+### Zero-Downtime Deployments
+
+Deploying a new version of a WebSocket server is harder than HTTP because connections persist for hours. You cannot simply restart the process.
+
+**Rolling update strategy:**
+
+1. **Signal phase:** Send a custom Close frame (status code 1012 — Service Restart) to all connected clients. Include a `reconnect_url` in the Close reason that points to the new version's load balancer. Set a 30-second drain timeout.
+
+2. **Drain phase:** Stop accepting new connections. Continue processing existing connections for up to 30 seconds. Send buffered messages. Clients receive the Close and reconnect to the new servers.
+
+3. **Replace phase:** Start new server instances with new code. New instances register with the load balancer and begin accepting the reconnecting clients.
+
+4. **Verify phase:** Health check passes. Connections stabilize. Old instances terminate after their last client disconnects.
+
+**Client-side reconnection code:**
+
+```javascript
+function connectWebSocket() {
+  const ws = new WebSocket('wss://example.com/ws');
+  
+  ws.onclose = (event) => {
+    // 1012 = Service Restart
+    if (event.code === 1012) {
+      // Server signaled restart — reconnect with backoff
+      const delay = Math.min(1000 * 2 ** retryCount, 30000) + 
+                     Math.random() * 1000;  // jitter
+      setTimeout(connectWebSocket, delay);
+      retryCount++;
+    } else {
+      // Unexpected close — reconnect quickly
+      retryCount = 0;
+      setTimeout(connectWebSocket, 500);
+    }
+  };
+}
+```
+
+<AsciiDiagram id="websockets/rolling-deployment" title="Zero-Downtime Rolling Deployment Sequence">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│                ZERO-DOWNTIME ROLLING DEPLOYMENT                   │
+│                                                                  │
+│  Phase 1: Signal (T=0s)                                          │
+│  ┌──────┐  Close(1012)   ┌──────┐                               │
+│  │Client│◀───────────────│Server│   "Service Restart"            │
+│  │  1   │  "reconnect    │  A   │   reconnect_url=/ws/v2        │
+│  └──────┘   to /ws/v2"  └──────┘                               │
+│                                                                  │
+│  Phase 2: Drain (T=0s to T=30s)                                  │
+│  ┌──────────────┐  LB: health check starts failing              │
+│  │ Server A     │  Connection count: 50,000 → 0                  │
+│  │ Draining     │  Clients reconnect to Servers B/C/D           │
+│  └──────────────┘  Existing messages flushed                    │
+│                                                                  │
+│  Phase 3: Replace (T=30s)                                        │
+│  ┌──────────────┐  New instance with version v2                 │
+│  │ Server A'    │  Registers with LB                             │
+│  │ (v2)         │  Health check passes                           │
+│  └──────────────┘  Begins accepting connections                  │
+│                                                                  │
+│  Phase 4: Verify (T=60s)                                         │
+│  ┌──────┐       ┌──────┐       ┌──────┐       ┌──────┐         │
+│  │  A'  │       │  B   │       │  C   │       │  D   │         │
+│  │  v2  │       │  v1  │       │  v1  │       │  v1  │         │
+│  └──────┘       └──────┘       └──────┘       └──────┘         │
+│                                                                  │
+│  Phase 5: Repeat for B, C, D                                     │
+│  Total rollout time: 4 servers x 60s = 240 seconds              │
+│  Clients experience at most one reconnect (1012)                 │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Monitoring Metrics
+
+| Metric | Alert Threshold | Why |
+|--------|----------------|-----|
+| Active connections | >95% of max | Approaching capacity, scale up |
+| Connection rate | >80% of accept rate | Overwhelming new connections, scale up |
+| Message latency (p99) | >200ms | Congestion or slow backend |
+| Heartbeat misses | >5% of connections | Network issues or half-open leaks |
+| Write buffer queue depth | >1000 per connection | Backpressure, slow consumers |
+| Error frame rate | >0.1% of frames | Protocol violations or malformed data |
+| Connection churn | >10% per minute | Unstable clients or network issues |
+
+### Debugging WebSocket Issues
+
+**Problem: Connections drop at exactly 60 seconds**
+
+Look for load balancer idle timeout. AWS ALB and NLB default to 60 seconds of idle timeout for WebSocket connections. Set `idle_timeout.value = 3600` on the ALB, or configure heartbeat interval to 30 seconds to keep the connection active.
+
+**Problem: Some connections never reconnect**
+
+Check for WebSocket subprotocol negotiation failure. If your server requires a specific subprotocol but the client sends a different one (or omits it), the handshake fails silently. Enable logging on Sec-WebSocket-Protocol negotiation:
+
+```javascript
+server.on('connection', (ws, req) => {
+  const protocol = req.headers['sec-websocket-protocol'];
+  console.log(`Client requested protocol: ${protocol}`);
+  // If protocol doesn't match, server sends 400 Bad Request
+  // or closes after upgrade with 1002 Protocol Error
+});
+```
+
+**Problem: Messages arrive out of order on reconnect**
+
+The client missed messages while disconnected. Implement message IDs with sequence numbers. The server tracks the last sequence number per connection. On reconnect, the client sends its last received sequence number. The server replays missed messages from a buffer or from the message history database.
+
+**Problem: Memory grows continuously**
+
+Check for connection leaks. A connection object is allocated but never freed. Common causes: the `close` event handler is never called because the close frame is lost (network partition), or the event handler has a bug that prevents cleanup. Track connection count per server and alert if it exceeds the expected maximum.
+
+The next page covers the hard trade-offs you face when building WebSocket systems at scale: sticky sessions versus connection migration, binary versus text framing, and whether WebSocket is even the right protocol for your use case.

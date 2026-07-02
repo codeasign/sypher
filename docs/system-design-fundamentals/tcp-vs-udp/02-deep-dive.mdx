@@ -1,0 +1,422 @@
+---
+id: tcp-vs-udp-deep-dive
+title: TCP vs UDP — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A TCP connection is a state machine living in the operating system kernel. UDP has no connection state machine — the kernel hands datagrams to the application and forgets them. This architectural difference determines everything about how these protocols behave under load.
+
+<AsciiDiagram
+  id="tcp-vs-udp/kernel-stack"
+  title="OS Kernel Transport Layer Architecture"
+  content={`
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                          APPLICATION                                    │
+  │  (socket API: send/recv/connect/bind)                                   │
+  └──────────────────────────┬──────────────────────────────────────────────┘
+                             │ system call boundary
+  ┌──────────────────────────▼──────────────────────────────────────────────┐
+  │                      TRANSPORT LAYER (Kernel)                           │
+  │                                                                         │
+  │  ┌───────────────────────┐    ┌───────────────────┐                    │
+  │  │ TCP                   │    │ UDP               │                    │
+  │  │                       │    │                   │                    │
+  │  │ ┌─────────────────┐   │    │ ┌─────────────┐   │  Per-port receive │
+  │  │ │ Connection Table │   │    │ │ Socket Table │   │  queue only; no  │
+  │  │ │ (hash on 4-tuple)│   │    │ │ (port → queue)│  │  per-connection  │
+  │  │ └─────────────────┘   │    │ └─────────────┘   │  │  state           │
+  │  │                       │    │                   │                    │
+  │  │ ┌─────────────────┐   │    │ ┌─────────────┐   │                    │
+  │  │ │ Send Buffer      │   │    │ │ No send buf │   │  Application      │
+  │  │ │ (per connection) │   │    │ │ (fire-and-  │   │  responsible for  │
+  │  │ └─────────────────┘   │    │ │ forget)      │   │  buffering if     │
+  │  │                       │    │ └─────────────┘   │  needed            │
+  │  │ ┌─────────────────┐   │    │                   │                    │
+  │  │ │ Receive Buffer   │   │    │ ┌─────────────┐   │                    │
+  │  │ │ (per connection) │   │    │ │ Checksum    │   │                    │
+  │  │ └─────────────────┘   │    │ │ verification │   │                    │
+  │  │                       │    │ └─────────────┘   │                    │
+  │  │ ┌─────────────────┐   │    │                   │                    │
+  │  │ │ Retransmit Queue │   │    │ No retransmit    │                    │
+  │  │ └─────────────────┘   │    │                   │                    │
+  │  │                       │    │                   │                    │
+  │  │ ┌─────────────────┐   │    │                   │                    │
+  │  │ │ Congestion Ctrl  │   │    │ No congestion    │                    │
+  │  │ │ (cwnd, ssthresh) │   │    │ control          │                    │
+  │  │ └─────────────────┘   │    │                   │                    │
+  │  └───────────────────────┘    └───────────────────┘                    │
+  │                                                                         │
+  └──────────────────────────────────┬──────────────────────────────────────┘
+                                     │
+  ┌──────────────────────────────────▼──────────────────────────────────────┐
+  │                IP LAYER (Routing, Fragmentation, TTL)                  │
+  └──────────────────────────────────┬──────────────────────────────────────┘
+                                     │
+  ┌──────────────────────────────────▼──────────────────────────────────────┐
+  │                         NETWORK INTERFACE                               │
+  │                         (NIC driver, DMA rings)                         │
+  └─────────────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────┐
+  │ LEGEND:  [TCP] = per-connection state (scales with N conns) │
+  │          [UDP] = per-port state (fixed, scales with N     │
+  │                  datagrams/second, not connections)        │
+  └─────────────────────────────────────────────────────────────┘
+  `}
+  caption="TCP allocates send buffer, receive buffer, retransmit queue, and congestion state per connection. UDP allocates nothing per peer — all state is per socket."
+/>
+
+## Data Structures and Algorithms
+
+### TCP Control Block (TCB)
+
+**Structure**: A hash table keyed by the 4-tuple (source IP, source port, destination IP, destination port). Each entry points to a struct containing send/receive buffers, sequence numbers, window sizes, round-trip time estimator, and congestion state.
+
+**Why this structure**: Hashing on the full 4-tuple provides O(1) lookup for incoming segments. The kernel needs to match an incoming packet to its connection in under 1 microsecond at 10 million packets per second per core.
+
+**Complexity**: O(1) lookup and insert (amortized). Memory per connection: approximately 1-4 KB for the kernel structure plus 64-256 KB for send and receive buffers by default on Linux.
+
+### TCP Send and Receive Buffers
+
+**Structure**: Ring buffers (circular queues) of sk_buff structures, which are kernel memory buffers that hold packet data alongside metadata pointers.
+
+**Why ring buffers**: A ring avoids memory allocation per packet — the kernel pre-allocates a slab cache and reuses entries as they drain. Producers (the application or the NIC DMA engine) and consumers (the NIC or the application) advance pointers around the ring without locks in the hot path.
+
+**Complexity**: O(1) enqueue and dequeue. Default sizes — `tcp_wmem` and `tcp_rmem` default to 16 KB minimum, up to 6 MB autotuned maximum on modern Linux.
+
+### UDP Socket Table
+
+**Structure**: A hash table keyed by destination port. Each entry points to a receive queue (one per socket, shared across all peers sending to that port).
+
+**Why this structure**: UDP has no per-peer state. A server listening on port 53 (DNS) receives all DNS queries into one queue. The application reads the sender address from the datagram metadata and decides how to respond.
+
+**Complexity**: O(1) lookup by port for incoming datagrams. Zero memory per connected client. The only memory cost is the receive queue depth, which defaults to `net.core.rmem_max` (typically 212 KB on Linux) per socket.
+
+### Retransmission Timer (TCP only)
+
+**Structure**: A per-connection timer implementing Jacobson's algorithm for RTT estimation. The retransmission timeout (RTO) is computed as:
+
+```
+SRTT = (1 - alpha) * SRTT + alpha * RTT_sample
+RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - RTT_sample|
+RTO = SRTT + 4 * RTTVAR
+```
+
+Where alpha = 0.125 and beta = 0.25.
+
+**Why this matters**: A fixed timeout would be too short (causing spurious retransmits that waste bandwidth) or too long (causing the application to stall). Jacobson's algorithm adapts to varying network conditions — the RTO is approximately 200ms on a local network but can be several seconds over satellite links.
+
+### Checksum Algorithm
+
+**Structure**: 16-bit one's complement sum of the data. Both TCP and UDP use the same algorithm, computing over a pseudo-header (source IP, dest IP, protocol, length) plus the actual segment.
+
+**Why this algorithm**: It detects any odd number of bit flips and is extremely fast in hardware — modern NICs offload checksum computation to the card. The error detection rate is approximately 99.998% for single-bit errors.
+
+**Key limitation**: The 16-bit checksum is weak compared to modern CRCs. Data centers using TCP with NIC checksum offload have observed undetected corruption rates of 1 in 10 million to 1 in 100 million packets. For critical data, application-level CRC-32 or SHA-256 is recommended.
+
+## The Request/Write/Read Lifecycle
+
+### Step 1: Application Calls socket() — Kernel Creates State
+
+For TCP, socket() creates a file descriptor and allocates a TCP control block in state CLOSED. For UDP, socket() creates a datagram socket with no initial state.
+
+### Step 2: bind() — Pin a Port
+
+Both protocols bind to a port number. On a web server, `bind(80)` creates the entry in the kernel's port table. Only one socket can bind to a given port per transport protocol — this is why you get "address already in use" errors.
+
+### Step 3: listen() — TCP Passive Open
+
+The server calls listen() with a backlog parameter (typically 128-4096). The kernel allocates two queues: the incomplete connection queue (for connections in SYN_RCVD) and the completed connection queue (for connections in ESTABLISHED).
+
+<AsciiDiagram
+  id="tcp-vs-udp/listen-queues"
+  title="TCP Listen Backlog — Two Queues"
+  content={`
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                           TCP Server Port 80                             │
+  │                                                                         │
+  │  ┌─────────────────────────┐    ┌─────────────────────────┐            │
+  │  │ Incomplete (SYN_RCVD)   │    │ Completed (ESTABLISHED) │            │
+  │  │ Queue                   │    │ Queue                   │            │
+  │  │                         │    │                         │            │
+  │  │ [Client A, seq=100]     │    │ [Client E, seq=500]     │            │
+  │  │ [Client B, seq=200]     │    │ [Client F, seq=600]     │            │
+  │  │ [Client C, seq=300]     │    │ [Client G, seq=700]     │            │
+  │  │                         │    │                         │            │
+  │  │ Size = backlog (128)    │    │ Size = backlog (128)    │            │
+  │  │ Max = min(backlog, SOMAXCONN=4096)                     │            │
+  │  └─────────────────────────┘    └─────────────────────────┘            │
+  │                                                                         │
+  │  accept() removes from completed queue → returns fd to application     │
+  │                                                                         │
+  │  If completed queue is full, new SYNs are dropped (not RST)            │
+  │  and the client retries (default 3 retries, 3-21s total waiting)       │
+  └─────────────────────────────────────────────────────────────────────────┘
+  `}
+  caption="When the completed queue is full, the kernel drops incoming SYNs silently. The client retries for up to 21 seconds before giving up — a common cause of intermittent connection failures under high load."
+/>
+
+### Step 4: connect() — TCP Three-Way Handshake (Client Side)
+
+The client sends a SYN with a randomly chosen initial sequence number (ISN). The kernel allocates the TCB immediately and transitions to SYN_SENT state.
+
+### Step 5: SYN Flood Protection — SYN Cookies
+
+<AsciiDiagram
+  id="tcp-vs-udp/syn-cookies"
+  title="SYN Cookies — Defense Against SYN Floods"
+  content={`
+  ┌──────────┐                    ┌──────────┐
+  │ Attacker  │                    │  Server  │
+  │(spoofed IP)│                    └────┬─────┘
+  └─────┬─────┘                          │
+        │                                │
+        │ SYN (spoofed src=1.2.3.4)      │ Incomplete queue full
+        │ ─────────────────────────────► │ No state allocated
+        │                                │
+        │ SYN-ACK with cookie ──────────►│ TCP embeds ISN in
+        │                                │ SYN-ACK sequence number
+        │                                │ using: hash(srcIP, 
+        │ (attacker never sends ACK)     │ srcPort, dstIP,
+        │                                │ dstPort, secret)
+        │                                │
+        │ (10,000 more spoofed SYNs)     │ Still no memory
+        │ ─────────────────────────────► │ allocated; cookies
+        │                                │ computed per SYN
+        │                                │
+        │ LEGITIMATE CLIENT:             │
+        │ SYN ────────────────────────►  │ Cookie sent in SYN-ACK
+        │                                │
+        │ ACK (with cookie + 1) ──────►  │ Kernel validates cookie
+        │                                │ and allocates state
+        └────────────────────────────────┘
+  `}
+  caption="SYN cookies encode connection state in the SYN-ACK sequence number, so the kernel allocates zero memory until the handshake completes. This prevents memory exhaustion from spoofed SYN floods."
+/>
+
+### Step 6: Data Transfer — TCP's Byte Stream Abstraction
+
+The application writes bytes, and TCP segments them into packets up to the MSS (Maximum Segment Size, typically 1460 bytes for standard Ethernet).
+
+<AsciiDiagram
+  id="tcp-vs-udp/segmentation"
+  title="TCP Segmentation and Nagle's Algorithm"
+  content={`
+  Application writes: "HELLO WORLD HOW ARE YOU TODAY?"
+  
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Without Nagle (TCP_NODELAY=1):                              │
+  │                                                             │
+  │ Write 4 bytes → send packet (4 bytes + 20 TCP + 20 IP)     │
+  │ Write 5 bytes → send packet (5 bytes + 20 TCP + 20 IP)     │
+  │                                                             │
+  │ Efficiency: (4+5)/(4+5+40+40) = 10% useful bytes          │
+  │                                                             │
+  │ With Nagle (default):                                       │
+  │                                                             │
+  │ Write 4 bytes → buffer (4 bytes in buffer)                  │
+  │ Write 5 bytes → buffer (9 bytes, still under MSS=1460)     │
+  │ Write 7 bytes → still buffering (16 bytes)                  │
+  │ ... flush on ACK from previous data or when buffer ≥ MSS    │
+  │                                                             │
+  │ Flush: send 16 bytes (only 40 bytes overhead, 29% useful) │
+  └─────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Nagle problem: interactive apps (SSH, VNC)                 │
+  │                                                             │
+  │ User types "ls" → TCP sends "l" but Nagle defers "s"      │
+  │ waits for ACK or Nagle delay (200ms default)               │
+  │ User sees: "l" immediately, then 200ms pause, then "s"    │
+  │                                                             │
+  │ Fix: setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, 1)           │
+  └─────────────────────────────────────────────────────────────┘
+  `}
+  caption="Nagle's algorithm buffers small writes to send fewer, larger packets. It is on by default and harmful for interactive protocols. Every low-latency application should disable it."
+/>
+
+### Step 7: UDP Write — No Buffering, No Segmentation
+
+The application calls `sendto(fd, data, len, flags, dest_addr)` and the kernel either transmits the datagram immediately or returns EAGAIN if the send buffer is full.
+
+### Step 8: Receive — TCP Reassembly
+
+TCP delivers a continuous byte stream to the application. Out-of-order segments are held in the receive buffer until the gap is filled.
+
+<AsciiDiagram
+  id="tcp-vs-udp/reassembly"
+  title="TCP Receive Buffer — Out-of-Order Handling"
+  content={`
+  Packets arrive at receiver:
+  
+  Time  ├─── Packet 1 (bytes 1-1460) ───────► [OK] gap=0, deliver to app
+  Time+1├─── Packet 2 (bytes 1461-2920) ────► [OK] gap=0, deliver to app
+  Time+2├─── Packet 4 (bytes 4381-5840) ────► [GAP] bytes 2921-4380 missing
+        │                                        Store in receive buffer
+        │  ┌─────────────────────────────────┐
+        │  │ Receive Buffer:                  │
+        │  │ [2921-4380] = EMPTY              │
+        │  │ [4381-5840] = Packet 4            │
+        │  └─────────────────────────────────┘
+        │
+  Time+3├─── Packet 5 (bytes 5841-7300) ────► [GAP] still missing 2921-4380
+        │                                        Store Packet 5
+        │
+  Time+4├─── Packet 3 (bytes 2921-4380) ────► [OK] gap filled!
+        │                                        Deliver bytes 2921-7300
+        │                                        to application in order
+        │
+  Total delivered: bytes 1-7300, in sequence
+  Application never saw the gap.
+  `}
+  caption="TCP hides network reordering from the application. The receive buffer reassembles data and delivers it in order. This is the source of head-of-line blocking — if the gap fills slowly, all subsequent data waits."
+/>
+
+### Step 9: UDP Receive — Datagram at a Time
+
+Each `recvfrom()` call returns exactly one datagram. If the application reads 4 bytes from a 1000-byte datagram, the remaining 996 bytes are lost — UDP does not support partial reads. The kernel's receive queue for a UDP socket holds individual datagrams (`sk_buff` structures). If the queue overflows, new datagrams are dropped silently — no notification to the sender.
+
+### Step 10: Teardown — Four-Way Handshake
+
+The FIN exchange closes the connection. The TIME_WAIT state holds the connection slot for 2 * MSL (60-120 seconds) to handle delayed duplicate segments.
+
+## Consistency and State
+
+### Crash — Server Goes Down Mid-Transfer
+
+**TCP scenario**: The server crashes while it has unacknowledged data in its send buffer. The client's TCP stack detects the connection failure after the keepalive timeout (default 2 hours on Linux, configurable to 10 seconds). The client gets an error on the next read/write.
+
+**UDP scenario**: The server crashes. The client has no indication any datagram was lost. The client's next sendto() succeeds (the kernel queues the datagram for the local interface, which may discard it silently if the server is unreachable). No error is returned — ever.
+
+<AsciiDiagram
+  id="tcp-vs-udp/crash-behavior"
+  title="Crash Behavior — TCP vs UDP"
+  content={`
+  TCP Server Crash:
+  ┌──────┐                              ┌──────┐
+  │Client│                              │Server│
+  └──┬───┘                              └──┬───┘
+     │  unacked data in flight             │
+     │ ──────────────────────────────────► │
+     │                                     │ X CRASH
+     │                                     │
+     │  [no ACK received]                  │
+     │  RTO timer expires                  │
+     │  Retransmit (seq=X)                 │
+     │ ─────────────────────────X (silent) │
+     │                                     │
+     │  Retransmit again                   │
+     │  ──X──                              │
+     │                                     │
+     │  After 15+ retransmits (~15 min)    │
+     │  Connection reset                   │
+     │  Error: ETIMEDOUT or ECONNRESET     │
+     └─────────────────────────────────────┘
+  
+  UDP Server Crash:
+  ┌──────┐                              ┌──────┐
+  │Client│                              │Server│
+  └──┬───┘                              └──┬───┘
+     │  datagram 1                         │
+     │ ──────────────────────────────────► │
+     │                                     │ X CRASH
+     │                                     │
+     │  datagram 2                         │
+     │ ──────────────X (silent)            │
+     │                                     │
+     │  datagram 3                         │
+     │ ──────────────X (silent)            │
+     │                                     │
+     │  Client has no idea anything is     │
+     │  wrong. sendto() returns success.   │
+     │  Application must use a heartbeat   │
+     │  or timeout to detect failure       │
+     └─────────────────────────────────────┘
+  `}
+  caption="TCP notifies the application of connection failure after timeout. UDP never notifies. Any UDP application that needs reliability must implement heartbeat or timeout logic at the application layer."
+/>
+
+### Partition — Network Split
+
+**TCP scenario**: During a network partition, both sides keep their connection open. The TCP keepalive mechanism (if enabled) probes after 2 hours idle, then sends 9 probes 75 seconds apart. Total detection time: 2 hours 11 minutes by default. Production systems set `tcp_keepalive_time=60` and `tcp_keepalive_intvl=10` for 60-second detection.
+
+**UDP scenario**: Neither side detects the partition. The application must implement its own health check — for example, an echo request every 5 seconds. If three consecutive echoes go unanswered, the peer is considered dead. This is how DNS resolver health checks work in production.
+
+### Concurrent Writes — Multiple Threads
+
+**TCP**: Writes from multiple threads to the same socket are serialized by the kernel's socket lock. The kernel merges writes into the send buffer in the order they arrive at the lock. This means thread A's write can be interleaved with thread B's write at TCP segment boundaries — use application-level framing (message length prefixes) to delimit messages.
+
+**UDP**: Writes from multiple threads to the same socket are also serialized, but each write produces exactly one datagram. No interleaving. Each datagram is atomic — the receiver gets either the complete datagram or nothing. This makes UDP naturally thread-safe for the common pattern of one thread sending to many receivers.
+
+### Stale Reads — Old Data from the Receive Buffer
+
+**TCP**: The receive buffer delivers data in order. There is no concept of "stale" data — every byte is delivered exactly once, in the exact order sent. The only staleness is latency: data that is in the receive buffer but not yet read by the application.
+
+**UDP**: The receive buffer holds whichever datagrams arrived most recently. "Stale" is meaningless because each datagram is self-contained. However, if the application reads slowly and the queue fills, old datagrams are dropped — the receiver gets the most recent datagrams and loses old ones. This is the correct behavior for video streaming (new frame matters more than old one) but catastrophic for financial data (every update matters).
+
+## Performance Characteristics
+
+All numbers assume a modern server with a 25 Gbps NIC, Intel Xeon Platinum 8380, Linux 6.x kernel, and no application-level processing overhead.
+
+| Metric | TCP (single connection) | TCP (10,000 connections) | UDP (single socket) | UDP (10,000 sockets) |
+|--------|------------------------|--------------------------|---------------------|-----------------------|
+| Throughput (small 64B) | 1.2 Gbps | 0.4 Gbps | 18 Gbps | 15 Gbps |
+| Throughput (large 1460B) | 23 Gbps | 19 Gbps | 25 Gbps | 23 Gbps |
+| P50 latency (local) | 45 microseconds | 120 microseconds | 12 microseconds | 18 microseconds |
+| P99 latency (local) | 180 microseconds | 1.2 milliseconds | 45 microseconds | 120 microseconds |
+| P99.9 latency (cross-DC, 5ms RTT) | 5.2 milliseconds | 7.8 milliseconds | 5.01 milliseconds | 5.03 milliseconds |
+| Memory per connection | 128 KB (typical) | 1.3 GB total | 0 bytes | 0 bytes |
+| CPU per 10K packets/sec | 3% core | 15% core | 0.5% core | 2% core |
+| Connection setup cost | 1 RTT + kernel alloc | 1 RTT + kernel alloc | N/A | N/A |
+
+**Key observations**:
+
+For small payloads (under 100 bytes), UDP throughput is 15 times higher than TCP. The TCP per-packet overhead (20-60 bytes of header, ACK processing, congestion window sizing for small segments) dominates the transmission cost. This is why DNS, NTP, and monitoring protocols all use UDP.
+
+For large payloads (near MSS), TCP approaches UDP throughput because the overhead per byte drops. The ACK processing cost is amortized over 1460 bytes of payload.
+
+TCP P99 latency under load degrades more than UDP P99. The cause is tail latency from TCP's congestion control reacting to transient network micro-bursts. When the kernel processes 10,000 TCP connections, the per-connection timer management adds scheduler overhead that shifts the tail.
+
+## Configuration and Tuning
+
+### TCP Settings (Linux sysctl, set via `/etc/sysctl.conf` or `sysctl -w`)
+
+| Setting | Default | What It Controls | When To Change | What Breaks |
+|---------|---------|-----------------|----------------|-------------|
+| `net.ipv4.tcp_rmem` | `4096 131072 6291456` | TCP receive buffer: min, default, max bytes | Increase for high-bandwidth-delay-product links (transcontinental, satellite) | Too large = wasted memory per connection; server with 100K connections using 6MB each = 600GB |
+| `net.ipv4.tcp_wmem` | `4096 16384 4194304` | TCP send buffer: min, default, max bytes | Same as tcp_rmem per direction | Same memory risk |
+| `net.core.rmem_max` | `212992` (208 KB) | Max receive buffer any socket can request | Must match tcp_rmem max if you increase buffer beyond default | Application mmap or setsockopt call fails |
+| `net.ipv4.tcp_congestion_control` | `cubic` | Congestion control algorithm | `bbr` for throughput-sensitive, `bbr` suffers on bursty loss; `cubic` for fairness with other TCP flows | Wrong algorithm loses bandwidth on your specific path |
+| `net.ipv4.tcp_slow_start_after_idle` | `1` (enabled) | Resets congestion window to initial window after idle period | Set to 0 for long-lived connections with intermittent traffic bursts | Without reset, a connection that was idle for 10 seconds sends at full window — potential congestion burst |
+| `net.ipv4.tcp_fastopen` | `0` (disabled) | Allows data in SYN during three-way handshake (TFO) | Set to 3 to enable on client and server; saves 1 RTT on repeat connections | Middleboxes that reject SYN+data payloads |
+| `net.ipv4.tcp_tw_reuse` | `0` | Allows reuse of TIME_WAIT sockets for new connections | Set to 1 on high-connection-rate servers | Only safe when used with `tcp_timestamps` enabled; violates TCP spec for passive connections |
+| `net.ipv4.tcp_tw_recycle` | `0` (or removed in newer kernels) | Faster TIME_WAIT recycling | Do not use. Removed in Linux 4.12. Breaks behind NAT. | Clients behind NAT experience random connection drops |
+| `net.core.somaxconn` | `128` | Maximum listen backlog queue | Increase to 4096 for high-connection-rate servers (nginx, haproxy) | Kernel memory for SYN queue grows; SYN flood vulnerability without SYN cookies |
+| `net.ipv4.tcp_syncookies` | `1` (enabled) | SYN flood protection | Keep enabled | Slight CPU overhead per SYN; disables certain TCP extensions (like large windows) when active |
+
+### UDP Settings
+
+| Setting | Default | What It Controls | When To Change | What Breaks |
+|---------|---------|-----------------|----------------|-------------|
+| `net.core.rmem_max` | `212992` | Max receive buffer for UDP socket | Increase for high-throughput UDP (DNS servers, media streaming) | Application `setsockopt(SO_RCVBUF)` fails: `ENOBUFS` |
+| `net.core.rmem_default` | `212992` | Default receive buffer | Keep default, or set larger if all apps are high-throughput | Wasted memory for low-throughput apps |
+| `net.core.wmem_max` | `212992` | Max send buffer | Rarely changed for UDP | Application `setsockopt(SO_SNDBUF)` fails |
+| `net.core.netdev_max_backlog` | `1000` | Packets queued per NIC receive ring before kernel processes them | Increase to 10000 for 25+Gbps NICs | Increased memory pressure; packet drops at high rates |
+| `net.ipv4.udp_mem` | `760305 1013814 1520491` | Min, pressure, max pages for all UDP sockets | Increase for DNS or media servers handling millions of concurrent flows | OOM killer may target the process allocating beyond limits |
+
+### Socket-Level Options (Application Code)
+
+| Option | Protocol | What It Does | When To Set | Risk |
+|--------|----------|-------------|-------------|------|
+| `TCP_NODELAY` | TCP | Disables Nagle's algorithm | Always for interactive, real-time, or low-latency TCP | Slightly more packets on the wire (smaller packets) |
+| `TCP_QUICKACK` | TCP | Sends ACKs immediately instead of delaying | For request-response protocols (HTTP, Redis) | Slightly more ACK traffic (~1% overhead) |
+| `SO_REUSEADDR` | Both | Allows binding to a port in TIME_WAIT | Always set before bind in production; enables fast restart | None in practice; prevents "address already in use" on restart |
+| `SO_REUSEPORT` | Both | Multiple processes bind to same port; kernel load balances | Set on high-traffic servers (nginx, haproxy) for multi-core scaling | Connection per-packet distribution is approximate; some processes may get more |
+| `SO_RCVBUF` | Both | Set receive buffer size explicitly | When auto-tuning gives wrong value for your workload | Setting too low drops packets; too high wastes memory |
+| `IP_MTU_DISCOVER` | TCP | Controls Path MTU Discovery behavior | Set to `IP_PMTUDISC_DO` (default) or `IP_PMTUDISC_PROBE` for non-standard MTU | Wrong value causes fragmentation or black holes |
+| `SO_SNDBUF` | UDP | Sets send buffer | Increase to prevent EAGAIN on bursts of datagrams | Application blocks on send; buffer fills silently |

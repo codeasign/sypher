@@ -1,0 +1,355 @@
+---
+id: indexing-real-world
+title: Indexing in Production
+sidebar_label: Real World
+sidebar_position: 5
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Company Case Studies
+
+### Uber: Tuning MySQL Indexes for Ride Requests
+
+Uber operates a fleet of MySQL databases to power its ride-request matching system. Each ride request triggers a query that finds nearby drivers. The core query pattern:
+
+```sql
+SELECT driver_id, lat, lng, status
+FROM drivers
+WHERE status = 'available'
+  AND lat BETWEEN ? AND ?
+  AND lng BETWEEN ? AND ?
+ORDER BY last_heartbeat DESC;
+```
+
+**Initial approach**: A composite index on `(status, lat, lng)`. At 2 million drivers, the index worked reasonably well. At 20 million drivers across 400 cities, the index became a bottleneck.
+
+**Problems encountered**:
+- The `status` column had 2 values (available, offline) — extremely low selectivity. The index's B+Tree still scanned millions of rows for `status = 'available'`.
+- The `last_heartbeat` sort caused the database to sort in memory rather than using index ordering, because no index covered the ORDER BY direction.
+- Page splits on the monotonically increasing `last_heartbeat` column caused write amplification on every driver heartbeat update.
+- The lat/lng bounding box filter was evaluated as a secondary filter after fetching all available drivers — millions of rows were fetched and then discarded.
+
+**Solution**: Uber redesigned their indexing approach in three generations:
+
+1. **Partial index**: `WHERE status = 'available'` reduced index size by 60 percent, excluding the 12 million offline drivers entirely.
+2. **Geohash expression index**: An expression index on `FLOOR(lat / 0.01)` and `FLOOR(lng / 0.01)` bucketed drivers into grid cells. Each query computed the grid cells overlapping the bounding box and scanned only those cells.
+3. **Covering index**: Added `driver_id`, `lat`, `lng`, and `last_heartbeat` as INCLUDE columns, enabling index-only scans and eliminating heap fetches.
+
+**Result**: Index size dropped from 4.2GB to 1.1GB per region. Query latency dropped from 350ms to 18ms at p99. Write throughput improved because the partial index excluded offline driver heartbeats from index maintenance.
+
+<AsciiDiagram
+  id="indexing/uber-index-evolution"
+  title="Uber's MySQL index evolution from simple composite index to geohash-partitioned partial indexes across three generations"
+  alt="Three panels showing Uber's index design evolution: Generation 1 shows a single composite index on (status, lat, lng) with all 20M drivers; Generation 2 shows a partial index WHERE status='available' with 40 percent of drivers and a geohash grid; Generation 3 shows geohash-based expression indexes on FLOOR(lat/0.01) with separate read replicas"
+  caption="Uber's index strategy evolved from a monolithic composite index to a geohash-based partial index design"
+  content={`Uber index evolution
+
+  Generation 1: Simple composite index (broke at 20M drivers)
+
+  ┌─────────────────────────────────────────────────────┐
+  │  INDEX on (status, lat, lng)                         │
+  │                                                      │
+  │  ┌──────────────────────────────────────────┐        │
+  │  │ status='available'  → 8M rows in index   │        │
+  │  │ status='offline'    → 12M rows in index  │        │
+  │  │                                             │        │
+  │  │ Problem: still scanning 8M "available"     │        │
+  │  │ rows to find nearest 50 drivers             │        │
+  │  └──────────────────────────────────────────┘        │
+  │  Size: 4.2GB  Latency: 350ms at p99                   │
+  └─────────────────────────────────────────────────────┘
+
+  Generation 2: Partial + geohash
+
+  ┌─────────────────────────────────────────────────────┐
+  │  PARTIAL INDEX WHERE status='available'              │
+  │  + EXPRESSION INDEX on (FLOOR(lat/0.01), ...)       │
+  │                                                      │
+  │  ┌──────────────────────────────────────────┐        │
+  │  │ Grid cell (a1):  ~200 drivers             │        │
+  │  │ Grid cell (a2):  ~180 drivers             │        │
+  │  │ Grid cell (b1):  ~220 drivers             │        │
+  │  │ ...                                       │        │
+  │  │                                            │        │
+  │  │ Query scans only cells in bounding box    │        │
+  │  │ ~2,000 rows instead of 8M                 │        │
+  │  └──────────────────────────────────────────┘        │
+  │  Size: 1.1GB  Latency: 18ms at p99                    │
+  └─────────────────────────────────────────────────────┘
+
+  Generation 3: Read replicas + covering index
+
+  ┌─────────────────────────────────────────────────────┐
+  │  Read replicas handle matching queries separately   │
+  │  from the main write path. Covering index on        │
+  │  (geohash_cell, last_heartbeat DESC) INCLUDE         │
+  │  (driver_id, lat, lng)                              │
+  │                                                      │
+  │  Size: 0.8GB  Latency: 5ms (p50), 18ms (p99)       │
+  └─────────────────────────────────────────────────────┘
+`}
+/>
+
+### Discord: Moving from MongoDB to Cassandra for Message Indexing
+
+Discord started with MongoDB for message storage. As the platform grew to billions of messages, MongoDB's indexing model struggled.
+
+**Problem**: MongoDB stores messages per channel. The query pattern: `WHERE channel_id = ? ORDER BY message_id DESC LIMIT 50`. MongoDB's B-Tree index on `(channel_id, message_id)` worked until a single channel accumulated millions of messages. Write throughput on hot channels (large servers with millions of active users) caused index contention and page splits.
+
+**Detailed failure mode**: In a busy server with 10,000 messages per minute, the B-Tree index on the messages collection experienced constant rightmost-page splits. The MongoDB journal (write-ahead log) grew under the write load. Read latency for channel history queries spiked from 10ms to 500ms.
+
+**Migration**: Discord migrated to Cassandra, using a compound primary key `PRIMARY KEY ((channel_id), message_id)` with `message_id` as a clustering column. Cassandra's LSM-Tree index structure handles the write-heavy workload without page splits or lock contention:
+
+- Writes are sequential appends to the memtable, not random B-Tree updates.
+- The index is effectively free — it is the primary key's clustering column.
+- Cassandra stores data in sorted order per partition, so range scans are sequential reads.
+- Bloom filters rapidly discard SSTables that do not contain the requested channel.
+
+**Lesson**: Changing the storage engine changed the indexing model. MongoDB's B-Tree with random inserts caused write amplification. Cassandra's LSM-Tree with sorted inserts within a partition eliminated random writes entirely. The choice of database engine determines which indexing patterns are efficient.
+
+### Netflix: Catalog Indexing at 200 Million Subscribers
+
+Netflix's content catalog serves recommendations to 200 million subscribers. Each recommendation query must return results in under 50ms. The indexing challenge involves multiple dimensions: genre, language, release year, ratings, user preferences, and real-time viewing behavior.
+
+**Architecture**: Netflix uses Elasticsearch for the catalog search index. Each piece of content is indexed across 30+ fields. The inverted index structure allows filtering on any combination of dimensions without predefining query patterns.
+
+**Performance techniques**:
+- Elasticsearch indexes are stored in memory-mapped files. The entire hot index fits in the OS page cache of the Elasticsearch nodes.
+- Each shard's inverted index uses finite state transducers (FSTs) for compact in-memory term lookup. An FST can store 100 million terms in under 2GB of memory.
+- Netflix tunes `index.refresh_interval` to 30 seconds for the catalog index, accepting a 30-second delay between content metadata updates and search availability in exchange for lower segment merge overhead.
+- Composite scoring combines 8+ signals (match quality, popularity, freshness, personalization) in a single pass over the inverted index.
+
+**Scale**: The catalog index stores 100GB of compressed data across 12 Elasticsearch nodes. Each query touches fewer than 10 shards because the routing key (user segment) directs queries to the correct shard group. The index refresh interval of 30 seconds means new content takes up to 30 seconds to appear in search results — Netflix considers this an acceptable trade-off.
+
+### Cloudflare: Indexing Trillions of Log Entries
+
+Cloudflare processes millions of HTTP requests per second across its global network. Each request generates log entries for DNS queries, HTTP requests, firewall events, and analytics counters. The total volume exceeds trillions of entries per day.
+
+**Problem**: How to index this data for interactive querying. Traditional B+Tree indexes cannot handle the write volume or the storage requirements. A B+Tree index on all log entries would require petabytes of storage and millions of writes per second.
+
+**Solution**: Cloudflare developed a custom columnar storage format with min-max indexes (zonemaps). Each column chunk stores the minimum and maximum value for each column. A query with a time range filter first checks the min-max index — if the query's time range does not overlap with a chunk's range, the entire chunk is skipped.
+
+**How min-max indexes work**:
+- Data is organized into row groups of 1 million rows each.
+- Each row group stores min and max for every indexed column.
+- A query `WHERE timestamp BETWEEN '2025-03-01' AND '2025-03-02'` checks the min-max of each row group's timestamp column.
+- If a row group's timestamp range is '2025-01-01' to '2025-01-15', the entire group is skipped.
+- This approach avoids per-row indexing costs entirely.
+
+**Comparison with B+Tree**:
+| Metric | B+Tree on timestamp | Min-max index (zonemap) |
+|---|---|---|
+| Storage overhead per row | 14-18 bytes per row | 0 bytes per row (8 bytes per million-row group) |
+| Write overhead | O(log n) per write | O(1) per write (update min/max per group) |
+| Range scan speed | Fast (linked leaves) | Fast (skip non-overlapping groups) |
+| Point lookup speed | Instant (tree traversal) | Must scan the group's rows |
+| Best for | OLTP with mixed read patterns | Columnar/analytics with range queries |
+
+---
+
+## Open Source Implementations
+
+### PostgreSQL B+Tree Implementation
+
+PostgreSQL's B+Tree implementation (src/backend/access/nbtree/) is one of the most mature open-source index structures:
+- Uses Lehman and Yao's B-link-tree algorithm for high-concurrency access.
+- Supports both forward and backward index scans.
+- Deduplication (PostgreSQL 13+) compresses duplicate keys in unique indexes, saving space.
+- Bottom-up deletion (PostgreSQL 14+) opportunistically removes dead index entries during reads, reducing bloat without requiring a separate vacuum pass.
+- The `nbtree` access method handles all standard comparison operators.
+
+### SQLite Indexing
+
+SQLite uses a compact B+Tree implementation designed for embedded use:
+- Smaller page sizes (1KB default, configurable up to 64KB).
+- Each table is stored as a B+Tree (rowid table) or as a B-Tree (WITHOUT ROWID table).
+- Indexes are separate B+Trees with rowid as the pointer.
+- No concurrent index builds — SQLite uses table-level locking.
+- In-memory databases use the same B+Tree structure but pages exist only in memory.
+
+### Elasticsearch Inverted Index (Lucene)
+
+Lucene's inverted index is the foundation of Elasticsearch performance:
+- Terms are stored in a sorted dictionary using FST (Finite State Transducer) — extremely memory-efficient.
+- Postings lists store document IDs in delta-encoded, bit-packed format for compression (typically 2-5 bits per document ID).
+- Skip lists enable fast skipping within postings lists during conjunction queries — the query can skip large blocks of documents that cannot match.
+- Segment-level indexes are merged in the background. Each segment is a complete inverted index.
+
+### RocksDB LSM-Tree
+
+RocksDB (Facebook) extends Google's LevelDB with:
+- Column families — separate LSM-Trees per column group, sharing the write-ahead log.
+- Configurable compaction strategies: leveled (default, 10x write amplification, low space), tiered (lower write amplification, higher space), universal (optimized for SSD), and FIFO (no compaction, for time-series data).
+- Bloom filters per SSTable — configurable false-positive rate (default 1 percent).
+- Range deletion tombstones for efficient bulk deletes.
+
+<AsciiDiagram
+  id="indexing/open-source-comparison"
+  title="Comparison of open-source index implementations: PostgreSQL B+Tree, SQLite B+Tree, Lucene inverted index, and RocksDB LSM-Tree"
+  alt="Four index structures shown: PostgreSQL shows a B-link-tree with high-concurrency lock protocol and deduplication; SQLite shows a compact single-user B+Tree; Lucene shows an FST term dictionary feeding into delta-compressed posting lists with skip lists; RocksDB shows an LSM-Tree with memtable, multiple SSTable levels, Bloom filters, and compaction"
+  caption="Four open-source index implementations — each optimized for a different access pattern"
+  content={`Open-source index implementations
+
+  PostgreSQL (B-link-tree)            SQLite (compact B+Tree)
+
+  ┌──────────────────┐               ┌──────────────────┐
+  │ High-concurrency  │               │ Embedded, single-│
+  │ lock protocol     │               │ user, no MVCC    │
+  │ (Lehman-Yao)      │               │                  │
+  │                   │               │ Root → Internal  │
+  │ Dedup (PG13+)     │               │ → Leaf pages     │
+  │ Bottom-up del     │               │ Data stored in   │
+  │ (PG14+)           │               │ leaf as B+Tree   │
+  └──────────────────┘               └──────────────────┘
+
+  Lucene/ES (Inverted Index)          RocksDB (LSM-Tree)
+
+  ┌──────────────────┐               ┌──────────────────┐
+  │ FST Term Dict    │               │ Memtable (in RAM) │
+  │  ───▶ Postings   │               │    │ flush        │
+  │       delta-enc  │               │    ▼              │
+  │       bit-packed │               │ L0 SSTable        │
+  │                  │               │    │ compaction   │
+  │ Skip lists for   │               │ L1 SSTable        │
+  │ fast conjunction │               │    │ compaction   │
+  │ queries          │               │ L2 SSTable        │
+  └──────────────────┘               │ Bloom filter per │
+                                      │ SSTable (fast miss)│
+                                      └──────────────────┘
+`}
+/>
+
+---
+
+## Cloud Provider Offerings
+
+### AWS RDS Index Tuning
+
+AWS RDS provides managed database features to help index tuning:
+- **Performance Insights**: Top SQL by load identifies queries missing indexes.
+- **Enhanced Monitoring**: Shows index scan rate and buffer cache hit ratio per index.
+- **Index recommendation** (RDS for PostgreSQL): Automatically analyzes workload and suggests missing, duplicate, and underused indexes.
+- **Aurora Auto-Tuning**: Optionally applies index recommendations during maintenance windows.
+
+### GCP Cloud Spanner Interleaved Indexes
+
+Cloud Spanner offers interleaved indexes where index rows are stored physically with parent table rows:
+
+```sql
+CREATE INDEX idx_orders_by_customer
+ON orders (customer_id)
+INTERLEAVE IN customers;
+```
+
+Interleaved indexes co-locate related data, reducing the number of round trips for queries that join parent and child tables. Strong consistency is maintained within the interleaved hierarchy without cross-node communication.
+
+### Azure CosmosDB Indexing Policies
+
+CosmosDB allows fine-grained control over which paths are indexed:
+- **Automatic indexing**: Every path indexed by default — no schema management.
+- **Custom policies**: Include and exclude specific paths.
+- **Composite indexes**: For ORDER BY queries on multiple properties.
+- **Indexing mode**: Consistent (synchronous) or lazy (asynchronous).
+
+---
+
+## Lessons Learned
+
+1. **Profile queries before adding indexes**. Use `pg_stat_statements`, slow query logs, and actual execution plans. Indexes should target the top 5 most expensive queries.
+
+2. **Remove unused indexes quarterly**. A quarterly audit of `pg_stat_user_indexes.idx_scan` drops indexes with zero scans. Each unused index silently degrades write performance and consumes storage.
+
+3. **Use composite indexes carefully**. Column order is the single most common mistake. Leading column must match the query's WHERE clause. Place high-selectivity columns first.
+
+4. **Covering indexes are a superpower**. For the top 3 hottest queries, include all SELECTed columns via INCLUDE. Eliminate heap fetches entirely.
+
+5. **Partial indexes are underused**. A partial index can be 10x smaller than a full index and 10x cheaper to maintain. Most production tables have a status column with a common filter value.
+
+6. **Monitor bloat weekly**. Index bloat creeps up silently. A weekly check on index size trends catches it early. `REINDEX CONCURRENTLY` on indexes with more than 20 percent bloat prevents performance degradation.
+
+7. **Test index changes in staging**. An index that helps Query A may slow Query B. Staging environments with production-like data volume reveal these interactions before they reach production.
+
+<AsciiDiagram
+  id="indexing/lessons-flow"
+  title="Five-step index management workflow: Profile, Design, Test, Deploy, Monitor — the continuous cycle of production index strategy"
+  alt="Circular flow diagram with 5 steps connected by arrows: Profile (magnifying glass on query metrics) → Design (pen on index blueprint) → Test (staging database with load) → Deploy (CONCURRENTLY flag) → Monitor (dashboard with scan counts and size) → back to Profile"
+  caption="Production index management cycle — continuous improvement through measurement and iteration"
+  content={`Production index management cycle
+
+                   ┌───────────────────┐
+                   │  1. Profile       │
+                   │  Identify top 5   │
+                   │  slow queries     │
+                   └────────┬──────────┘
+                            │
+                            ▼
+                   ┌───────────────────┐
+                   │  2. Design        │
+                   │  Composite?       │
+                   │  Covering?        │
+                   │  Partial?         │
+                   └────────┬──────────┘
+                            │
+                            ▼
+                   ┌───────────────────┐
+                   │  3. Test          │
+                   │  Staging with     │
+                   │  prod-scale data  │
+                   │  Benchmark before │
+                   │  and after        │
+                   └────────┬──────────┘
+                            │
+                            ▼
+                   ┌───────────────────┐
+                   │  4. Deploy        │
+                   │  CONCURRENTLY     │
+                   │  to avoid writes  │
+                   │  Measure impact   │
+                   └────────┬──────────┘
+                            │
+                            ▼
+                   ┌───────────────────┐
+                   │  5. Monitor       │
+                   │  idx_scan count   │
+                   │  Bloat percentage │
+                   │  Write latency    │
+                   └────────┬──────────┘
+                            │
+                            └── returns to step 1 ──▶
+`}
+/>
+
+---
+
+## Hard-Earned Lessons from the Field
+
+### Lesson: The Index That Hid in Plain Sight
+
+A financial services company experienced 30-second query times on a 500-million-row transaction table every month-end. The team spent weeks investigating the database server, the storage array, the network — everything. The root cause: an index on `(transaction_date, account_id)` was created with columns in the wrong order. The query filtered by `account_id = ? AND transaction_date BETWEEN ? AND ?`. The leading column was `transaction_date`, not `account_id`. The optimizer could not use the index effectively. Recreating the index with columns reversed — `(account_id, transaction_date DESC)` — reduced query time from 30 seconds to 15ms.
+
+**Lesson**: The most expensive index is the one that exists but cannot be used because its column order is wrong. It still consumes storage and slows writes, but provides zero read benefit.
+
+### Lesson: The Self-Healing Database That Wasn't
+
+An e-commerce platform noticed that their database storage was growing by 500GB per month despite a constant data volume. Investigation revealed that a nightly batch job performed UPDATEs on 20 million rows, but PostgreSQL's autovacuum could not keep pace with the dead tuple generation. The primary key index grew from 2GB to 18GB over 3 months. The fix: a weekly REINDEX CONCURRENTLY job reduced the index back to 2GB and restored query performance.
+
+**Lesson**: Index bloat is invisible to most monitoring systems. Storage grows silently. Query performance degrades gradually. A weekly index size trend chart catches this before users notice.
+
+### Lesson: The Foreign Key That Slowed Everything
+
+A SaaS application had a `notifications` table with 100 million rows referencing `users(id)`. The foreign key `notifications.user_id` had no index. When the team ran a bulk DELETE of inactive users from the `users` table, each DELETE triggered a sequential scan of the 100-million-row `notifications` table to verify referential integrity. The operation took 8 hours. Adding an index on `notifications.user_id` reduced future bulk deletes to under 2 minutes.
+
+**Lesson**: Foreign key columns without indexes are a landmine. They work fine during normal operations but cause catastrophic performance during parent-table DELETE or UPDATE operations.
+
+### Lesson: The Monitoring Query That Saved the Day
+
+A team set up a weekly monitoring query that checked `pg_stat_user_indexes` for indexes with zero scans. In the third week, they found a 4GB index with zero scans. Investigation revealed it was a duplicate: `idx_orders_date` was identical to `idx_orders_created` with a different name. The duplicate had been created during a migration script error. Dropping it saved 4GB of storage and reduced INSERT latency by 8 percent.
+
+**Lesson**: Duplicate indexes are impossible to detect without automated monitoring. They provide zero query benefit while imposing full maintenance cost.
+
+---
+
+## Bridge to Interview
+
+The real-world examples demonstrate that index design is not a one-time decision — it is an ongoing cycle of profiling, designing, testing, deploying, and monitoring. FAANG interviewers assess whether candidates understand this lifecycle. The interview section translates these patterns into the structured approach needed for system design interviews: clarifying query patterns, designing indexes for specific access patterns, estimating storage, and articulating trade-offs with precision.

@@ -1,0 +1,379 @@
+---
+id: write-back-architecture
+title: "Write-Back at Scale"
+position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+Every write-back system starts simple: a single server with an in-memory hash map and a background goroutine that periodically flushes to a database. This works for small workloads. It breaks as soon as scale introduces concurrency, memory pressure, or any kind of failure.
+
+Here is the naive architecture and the exact points where it breaks.
+
+<AsciiDiagram
+  id="write-back/naive-arch"
+  alt="Single-server write-back cache with in-memory dirty buffer and single flusher thread"
+  title="Naive Write-Back Architecture"
+  caption="Single-node write-back: simple but fails at every scaling threshold"
+  content={`┌──────────────────────────────────────────────────────────────────┐
+│                 Naive Single-Server Write-Back                    │
+└──────────────────────────────────────────────────────────────────┘
+                                                                  
+  ┌────────────────────────────────────────────┐                    
+  │            Single Server                    │                    
+  │                                            │                    
+  │  ┌──────┐  set(K,V)  ┌──────────────────┐  │                    
+  │  │ App  │───────────►│  Dirty Buffer     │  │                    
+  │  │      │◄────ACK───┤│  (HashMap)        │  │                    
+  │  └──────┘            │  K1 → V1(D)      │  │                    
+  │                      │  K2 → V2(D)      │  │                    
+  │                      │  K3 → V3(D)      │  │                    
+  │                      └────────┬─────────┘  │                    
+  │                               │             │                    
+  │                               ▼             │                    
+  │                      ┌──────────────────┐  │                    
+  │                      │ Single Flusher   │  │                    
+  │                      │ (goroutine)      │  │                    
+  │                      └────────┬─────────┘  │                    
+  │                               │             │                    
+  │                               ▼             │                    
+  │                      ┌──────────────────┐  │                    
+  │                      │   Connection     │  │                    
+  │                      │   Pool (10)      │  │                    
+  │                      └────────┬─────────┘  │                    
+  └────────────────────────────────┼──────────────────────────┘
+                                   │                              
+                                   ▼                              
+                            ┌────────────┐                        
+                            │  Single    │                        
+                            │ Database   │                        
+                            │ Instance   │                        
+                            └────────────┘                        
+
+  Breaking Points:                                                 
+  ┌─────────┬───────────────────────────────────────────────────┐
+  │ Scale   │ Problem                                           │
+  ├─────────┼───────────────────────────────────────────────────┤
+  │ 1K wps  │ Works fine                                         │
+  │ 10K wps │ Single flusher is bottleneck. Dirty buffer grows   │
+  │ 50K wps │ Memory pressure: dirty buffer > 50% of heap       │
+  │ 100K wps│ Flush backlog: 500K+ entries, latency spikes       │
+  │ 500K wps│ OOM crash. Data loss on restart. No WAL.           │
+  │ Failover│ Single point of failure. No replicas.              │
+  │ Network │ Single DB connection. Flush blocks on DB latency   │
+  └─────────┴───────────────────────────────────────────────────┘`}
+/>
+
+### Breaking Point Analysis
+
+**At 1,000 writes/second**: The naive approach works. The single flusher can keep up. Dirty buffer size stays under 1,000 entries (assuming 500ms flush interval). Memory usage is negligible.
+
+**At 10,000 writes/second**: The single flusher thread becomes the bottleneck. It takes 45ms to flush a batch of 500 entries. With 10,000 writes per second, the dirty buffer grows by 4,550 entries per flush cycle. After 10 seconds, the buffer has 50,000 entries. Memory is climbing.
+
+**At 50,000 writes/second**: Dirty buffer memory exceeds 50% of the server's heap. The garbage collector is under constant pressure. Full GC pauses of 500ms+ cause the flusher to stall. The dirty buffer keeps growing. The server is in a death spiral.
+
+**At 100,000 writes/second**: The dirty buffer has 500,000+ entries. Memory is exhausted. The OOM killer terminates the process. All dirty data is lost because there is no WAL. The 500,000 writes the application thinks are committed are gone.
+
+**At 500,000 writes/second**: Cache crash, data loss, and a cascading failure as the database is suddenly hit with a massive backlog of reads (all the cache misses from the crashed cache re-routing to the database).
+
+## Production-Grade Architecture
+
+A production write-back cache distributes the dirty buffer across multiple nodes, persists writes to a WAL, and uses a coordinator to manage flush scheduling.
+
+<AsciiDiagram
+  id="write-back/production-arch"
+  alt="Production-grade distributed write-back cache with multiple app servers, cache cluster, flush coordinator, WAL storage, and DB cluster"
+  title="Production Write-Back Architecture"
+  caption="Distributed write-back partitions dirty data and adds WAL persistence"
+  content={`┌─────────────────────────────────────────────────────────────────────┐
+│               Production Write-Back Architecture                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                                                      
+  ┌──────────┐  ┌──────────┐  ┌──────────┐                           
+  │ App Svr 1│  │ App Svr 2│  │ App Svr 3│  ...                      
+  └────┬─────┘  └────┬─────┘  └────┬─────┘                           
+       │              │              │                                
+       └──────────────┴──────────────┘                                
+                      │                                               
+                      │ consistent hashing                            
+                      ▼                                               
+  ┌──────────────────────────────────────────────────────────────┐   
+  │               Write-Back Cache Cluster                        │   
+  │                                                               │   
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │   
+  │  │ Cache Node 1  │  │ Cache Node 2 │  │ Cache Node 3 │        │   
+  │  │ ┌──────────┐ │  │ ┌──────────┐ │  │ ┌──────────┐ │        │   
+  │  │ │ Partition│ │  │ │ Partition│ │  │ │ Partition│ │        │   
+  │  │ │ 1 (K-A)  │ │  │ │ 2 (K-M)  │ │  │ │ 3 (K-Z)  │ │        │   
+  │  │ │ Dirty    │ │  │ │ Dirty    │ │  │ │ Dirty    │ │        │   
+  │  │ │ Buffer   │ │  │ │ Buffer   │ │  │ │ Buffer   │ │        │   
+  │  │ └──────────┘ │  │ └──────────┘ │  │ └──────────┘ │        │   
+  │  │ ┌──────────┐ │  │ ┌──────────┐ │  │ ┌──────────┐ │        │   
+  │  │ │ WAL      │ │  │ │ WAL      │ │  │ │ WAL      │ │        │   
+  │  │ │ (NVMe)   │ │  │ │ (NVMe)   │ │  │ │ (NVMe)   │ │        │   
+  │  │ └──────────┘ │  │ └──────────┘ │  │ └──────────┘ │        │   
+  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘        │   
+  │         │                 │                 │                  │   
+  │  ┌──────┴─────────────────┴─────────────────┴──────┐         │   
+  │  │          Flush Coordinator                       │         │   
+  │  │  ┌────────────┐  ┌────────────┐  ┌─────────────┐│         │   
+  │  │  │ Batch      │  │ Retry      │  │ Circuit     ││         │   
+  │  │  │ Scheduler  │  │ Manager    │  │ Breaker     ││         │   
+  │  │  └────────────┘  └────────────┘  └─────────────┘│         │   
+  │  └──────────────────────────────────────────────────┘         │   
+  └──────────────────────────────────────────────────────────────┘   
+                          │                                          
+                          ▼                                          
+  ┌──────────────────────────────────────────────────────────────┐   
+  │                    ((Database Cluster))                       │   
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │   
+  │  │ DB Primary   │  │ DB Replica 1 │  │ DB Replica 2 │        │   
+  │  │ (write)      │  │ (read)       │  │ (read)       │        │   
+  │  └──────────────┘  └──────────────┘  └──────────────┘        │   
+  └──────────────────────────────────────────────────────────────┘`}
+/>
+
+### Partitioned Dirty Buffer
+
+Each cache node owns a partition of the key space, determined by consistent hashing. This means all writes to a given key go to the same node, which simplifies concurrency and eliminates the conflict tracker for intra-cluster writes. The partition ownership is elastic: adding a new node rebalances only a fraction of the keys.
+
+### WAL Persistence
+
+Each cache node has a local NVMe or SSD-mounted WAL. The WAL is append-only, which makes writes fast. When the node restarts, it replays the WAL to reconstruct the dirty buffer. For additional safety, the WAL can be replicated to a remote storage system (S3, GCS) at regular intervals.
+
+### Flush Coordinator
+
+The flush coordinator is a separate service (or a leader-elected role within the cluster) that manages the flush schedule. It receives flush reports from each cache node and adjusts flush parameters dynamically. If a database shard is falling behind, the coordinator reduces the flush rate for that shard and increases the batch size.
+
+## Integration Patterns
+
+Write-back caching integrates differently with different data stores. Here are the common patterns.
+
+### With SQL Database
+
+The flusher converts dirty buffer entries to SQL statements. Each batch is a transaction: `BEGIN; UPDATE ...; UPDATE ...; COMMIT;`. The transaction ensures atomicity of the batch.
+
+<AsciiDiagram
+  id="write-back/sql-integration"
+  alt="Write-back cache with SQL database showing batch UPDATE transaction flow"
+  title="Write-Back with SQL Database"
+  caption="Batch SQL transaction ensures atomic flush for a group of dirty entries"
+  content={`┌──────────────────────────────────────────────────────────────────┐
+│              Write-Back with SQL Database                         │
+└──────────────────────────────────────────────────────────────────┘
+                                                                  
+  {Write-Back Cache}              ((PostgreSQL))                    
+    │                                   │                           
+    │  Batch size: 500 entries           │                           
+    │                                   │                           
+    │  BEGIN;                           │                           
+    │  UPDATE users                     │                           
+    │    SET likes = 503                │                           
+    │    WHERE user_id = 42;            │                           
+    │  UPDATE users                     │                           
+    │    SET likes = 1287               │                           
+    │    WHERE user_id = 99;            │                           
+    │  ... (498 more)                   │                           
+    │  COMMIT;                          │                           
+    │──────────────────────────────────►│                           
+    │                                   │                           
+    │  COMMIT OK (45ms)                │                           
+    │◄──────────────────────────────────┤                           
+    │                                   │                           
+  Considerations:                                                    
+  - Transaction size limit: stay under 1000 rows                    
+  - Lock escalation: short transactions prevent table locks         
+  - Deadlocks possible: use deterministic statement ordering         
+  - Connection pool: dedicate 5-10 connections for flusher`}
+/>
+
+### With NoSQL Database
+
+For Cassandra or DynamoDB, the flusher uses the batch API. NoSQL batch operations have size limits that the batch accumulator must respect.
+
+### With Message Queue (as Write Buffer)
+
+Some architectures use a message queue as the write buffer instead of an in-memory hash map. The app writes to the queue. A consumer reads from the queue and writes to the database. This adds durability (the queue persists messages) but removes the ability to coalesce writes to the same key (each message is independent).
+
+<AsciiDiagram
+  id="write-back/queue-buffer"
+  alt="Write-back using Kafka as the write buffer with consumer group flushing to DB"
+  title="Message Queue as Write Buffer"
+  caption="Kafka provides durability; consumer group provides parallel flush capacity"
+  content={`┌──────────────────────────────────────────────────────────────────┐
+│              Message Queue as Write Buffer                        │
+└──────────────────────────────────────────────────────────────────┘
+                                                                  
+  ┌──────┐   write(K,V)  ┌──────────────────┐                      
+  │ App  │──────────────►│ <Kafka Topic>     │                      
+  │      │               │ Partition 1:      │                      
+  │      │               │   K1, K5, K9      │                      
+  │      │               │ Partition 2:      │                      
+  │      │               │   K2, K6, K10     │                      
+  │      │               │ Partition 3:      │                      
+  │      │               │   K3, K7, K11     │                      
+  │      │◄── ACK ──────┤ Partition 4:      │                      
+  └──────┘               │   K4, K8, K12     │                      
+                         └────────┬─────────┘                      
+                                  │                                 
+                                  │ consumer group                   
+                                  ▼                                 
+                         ┌──────────────────┐                      
+                         │  Consumer Group   │                      
+                         │  C1  C2  C3  C4   │                      
+                         └────┬────┬────┬────┘                      
+                              │    │    │                            
+                              ▼    ▼    ▼                            
+                         ┌──────────────────┐                      
+                         │ Batch Flusher     │                      
+                         │ (per partition)   │                      
+                         └────────┬─────────┘                      
+                                  │                                 
+                                  ▼                                 
+                         ┌──────────────────┐                      
+                         │ ((Database))      │                      
+                         └──────────────────┘                      
+
+  Trade-offs:                                                      
+  + Durable: Kafka persists writes on disk                         
+  + Scalable: more partitions = more parallelism                   
+  - No coalescing: each message is a separate write                
+  - Higher latency: Kafka write + consumer delay                   
+  - At-least-once: duplicates possible on consumer restart         `}
+/>
+
+### With Event Streaming (CDC)
+
+In this pattern, the flusher writes to a Change Data Capture (CDC) stream instead of directly to the database. A CDC consumer (Debezium, Kafka Connect) reads the stream and applies changes to the database. This decouples the cache from the database entirely and provides excellent observability.
+
+## Multi-Region Write-Back
+
+Global applications need write-back caching across regions. This introduces the challenge of coordinating dirty data across geographic boundaries.
+
+### Regional Buffers
+
+Each region has its own write-back cache cluster. Writes within a region are fast (local dirty buffer, local ACK). Each region flushes to its own regional database replica. A cross-region replication mechanism (database replication or CDC stream) propagates changes between regions.
+
+<AsciiDiagram
+  id="write-back/multi-region"
+  alt="Multi-region write-back with regional buffers, cross-region flush coordinator, and conflict resolution"
+  title="Multi-Region Write-Back"
+  caption="Each region has its own write-back cache; cross-region flush adds conflict resolution"
+  content={`┌─────────────────────────────────────────────────────────────────────┐
+│                  Multi-Region Write-Back                            │
+└─────────────────────────────────────────────────────────────────────┘
+                                                                      
+  ┌────────── US-East ──────────────────────┐                         
+  │  [App] → {Cache-US} ──flush──► ((DB-US))│                         
+  │          ┌──────────┐                    │                         
+  │          │ Dirty    │   flush every 1s   │                         
+  │          │ Buffer   │──────────────────►│                         
+  │          └──────────┘                    │                         
+  └─────────────────────────────────────────┘                         
+                      │                                              
+                      │ cross-region replication (async)              
+                      ▼                                              
+  ┌────────── EU-West ──────────────────────┐                         
+  │  [App] → {Cache-EU} ──flush──► ((DB-EU))│                         
+  │          ┌──────────┐                    │                         
+  │          │ Dirty    │   flush every 1s   │                         
+  │          │ Buffer   │──────────────────►│                         
+  │          └──────────┘                    │                         
+  └─────────────────────────────────────────┘                         
+                      │                                              
+                      ▼                                              
+  ┌────────── APAC ─────────────────────────┐                         
+  │  [App] → {Cache-APAC} ──flush──► ((DB-APAC)) │                   
+  │          ┌──────────┐                     │                       
+  │          │ Dirty    │   flush every 1s    │                       
+  │          │ Buffer   │──────────────────►  │                       
+  │          └──────────┘                     │                       
+  └──────────────────────────────────────────┘                       
+                                                                      
+  Conflict Resolution:                                                
+  ┌─────────────┬──────────────┬────────────────────────────────────┐
+  │ Scenario    │ Resolution   │ Implementation                     │
+  ├─────────────┼──────────────┼────────────────────────────────────┤
+  │ Same key,  │ Last Write   │ Timestamp from each region's clock  │
+  │ both dirty │ Wins (LWW)   │ (drift tolerance: 100ms)           │
+  │ Same user, │ Causal       │ Track version vector per user       │
+  │ two fields │ ordering     │ Flush must respect causal order     │
+  │ Counter    │ Merge (SUM)  │ Each flush is delta, not absolute   │
+  └─────────────┴──────────────┴────────────────────────────────────┘`}
+/>
+
+### Active-Active Conflict Resolution
+
+With multiple regions accepting writes, conflicts are inevitable. The system must resolve them. The most common approach is last-write-wins (LWW) with wall-clock timestamps. The risk is clock skew: if the US-East clock is 50ms ahead of EU-West, writes in EU-West may be incorrectly overwritten. Clock synchronization (NTP with careful monitoring) is essential.
+
+A safer approach is to use version vectors or CRDTs. Each cache node tracks a version for each key. Writes increment the version. Conflicting versions are resolved by the merge function. This eliminates clock skew as a failure mode but adds complexity.
+
+## Capacity Planning
+
+For a system with 10 million daily active users (DAU), here is how you size the write-back cache.
+
+### Write QPS Estimation
+
+Assume each user performs 10 write operations per day during peak hours (2 hours). That is 100 million writes per day / 7,200 seconds = approximately 14,000 writes per second average. Peak-to-average ratio of 5x gives 70,000 writes per second peak.
+
+### Buffer Memory
+
+If each dirty entry averages 1 KB (key + value + metadata), and the flush interval is 500ms, the buffer holds 70,000 * 0.5 = 35,000 entries = 35 MB. With a maximum dirty ratio of 25%, allocate 140 MB for the dirty buffer. This is trivial for a modern server.
+
+### Flush Throughput
+
+At 70,000 writes/second with a coalescing ratio of 5:1, the effective database write rate is 14,000 writes/second. With a batch size of 500, that is 28 batch writes per second. Each batch takes 30ms for the database to commit. Total database write load is 28 * 30ms = 840ms per second of database time -- well within a single database node's capacity.
+
+### WAL Storage
+
+Each WAL entry is approximately 100 bytes (key + value + metadata). At 14,000 unique writes per second, that is 1.4 MB/s of WAL data. Over 10 minutes, the WAL grows to 840 MB. A retention policy of 10 minutes before truncation keeps WAL storage on each node under 1 GB.
+
+### DB Write Capacity
+
+At 14,000 writes/second, a modern PostgreSQL instance with NVMe storage can handle the load. For additional safety, shard the database across 4 nodes (3,500 writes/second each). Each shard handles less than one batch write per second.
+
+## Deployment
+
+### Zero-Downtime Deployment
+
+Deploying a write-back cache without data loss requires careful ordering:
+
+1. **Drain the dirty buffer**: Before shutting down a cache node, the flush coordinator signals it to stop accepting new writes and flush its dirty buffer to the database. This is the "drain" phase.
+
+2. **Redirect traffic**: The load balancer removes the node from the write pool. New writes go to other nodes.
+
+3. **Shutdown**: After the dirty buffer is empty and traffic is redirected, the node shuts down.
+
+4. **Startup**: The new version starts, replays its WAL (if any dirty entries remain), and re-joins the cluster.
+
+### Monitoring
+
+Monitor these metrics to detect write-back cache problems before they become incidents:
+
+- **Dirty Ratio**: Percentage of cache entries that are dirty. Spikes indicate the flusher is falling behind.
+- **Flush Latency**: Time to complete a single flush batch. Rising latency suggests database problems.
+- **Flush Backlog**: Number of dirty entries waiting to be flushed. A growing backlog means the flusher cannot keep up.
+- **Flush Error Rate**: Percentage of flushes that fail. High error rate triggers the circuit breaker.
+- **Dirty Buffer Memory**: Memory used by the dirty buffer. Approaching the configured limit triggers backpressure.
+- **Data Loss Risk**: A composite metric based on WAL mode, flush interval, and dirty buffer size. Alert when this exceeds the acceptable threshold.
+
+### Alerting Rules
+
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| Dirty ratio high | > 40% for 5 minutes | Warning |
+| Flush backlog growing | Backlog > 10K and increasing | Warning |
+| Flush latency high | P99 > 200ms for 1 minute | Critical |
+| Flush errors | Error rate > 5% for 30 seconds | Critical |
+| Circuit breaker open | Breaker state = Open | Critical |
+| Data loss risk | WAL async + backlog > 100K | Critical |
+
+### Recovery Procedures
+
+**Scenario: Dirty buffer overflow**. The cache is receiving writes faster than it can flush them. The dirty buffer hits its memory limit. The cache applies backpressure: it throttles new writes by delaying ACKs. If backpressure does not resolve the situation within 30 seconds, the cache begins dropping the lowest-priority dirty entries (and logs which keys were dropped).
+
+**Scenario: Database unavailable for 5 minutes**. The circuit breaker opens. Writes continue to the dirty buffer and WAL. The retry queue grows. After 2 minutes, alerting fires. The operator has three options: (1) wait for the database to recover (the WAL will protect data), (2) redirect flushes to a standby database, or (3) if the dirty buffer is near capacity, throttle writes from the application layer.
+
+**Scenario: Cache node crashes**. The WAL protects dirty data. On restart, the WAL is replayed (typically under 100ms for 1 million entries). If the WAL is also lost (disk failure), all dirty data on that node is lost. The application must be designed to tolerate this level of data loss.

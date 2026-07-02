@@ -1,0 +1,785 @@
+---
+id: denormalization-deep-dive
+title: Denormalization — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Denormalization Under the Hood
+
+⏱️ 30 minutes · Difficulty: Advanced
+
+## What You Will Learn
+
+By the end of this lesson you will be able to:
+
+- Trace the internal architecture of a denormalized data pipeline from source to dashboard
+- Explain star schema and snowflake schema internals and when each applies
+- Describe view maintenance algorithms and incremental refresh strategies
+- Calculate read and write amplification for any denormalization choice
+- Tune materialized view refresh frequency and partitioning for specific latency requirements
+
+## Prerequisites
+
+You should already understand:
+
+- The core concept of denormalization from the Mental Model page
+- Basic database storage mechanisms (pages, blocks, indexes)
+- SQL aggregation and GROUP BY operations
+
+## Internal Architecture
+
+Denormalization is not a single database feature — it is an architectural pattern that spans multiple systems. The diagram below shows the end-to-end flow from a write in the source system to a read in the dashboard.
+
+<AsciiDiagram
+  id="denormalization/deep-dive-architecture"
+  title="Denormalized Data Pipeline Architecture"
+  alt="Data flows from application writes into an OLTP database, through Change Data Capture into a message queue, through an ETL pipeline into a data warehouse with denormalized star schema tables, and finally through cached aggregations into a dashboard."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                   Denormalized Data Pipeline                        │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  Write Path:
+
+  [ Application ] ──INSERT/UPDATE──> (( PostgreSQL ))
+                                         │
+                                    Change Data Capture
+                                         │
+                                    < Kafka Topic >
+                                         │
+                                    ┌────▼─────┐
+                                    │  ETL Job │
+                                    │ (Spark / │
+                                    │  dbt)    │
+                                    └────┬─────┘
+                                         │
+                                         ▼
+                              ┌─────────────────────┐
+                              │  Data Warehouse      │
+                              │  ┌────────────────┐  │
+                              │  │ Fact + Dim     │  │
+                              │  │ (Denormalized) │  │
+                              │  └────────────────┘  │
+                              └──────────┬──────────┘
+                                         │
+                                    ┌────▼─────┐
+                                    │  Cache   │
+                                    │  (Redis) │
+                                    └────┬─────┘
+                                         │
+                                         ▼
+                                   [ Dashboard ]
+
+  Read Path:
+
+  [ Dashboard ] ──query──> { Cache }
+                              │ miss
+                              ▼
+                       (( Data Warehouse ))
+                              │
+                     Denormalized table
+                     scanned, zero JOINs
+                              │
+                         Result returned
+  `}
+/>
+
+### Component Breakdown
+
+**OLTP database** (PostgreSQL, MySQL): Receives writes from the application. Schema is normalized for fast, consistent transactions. This is the system of record — the source of truth.
+
+**Change Data Capture (CDC)**: Reads the database's write-ahead log (WAL) or binlog to capture every insert, update, and delete as it happens. Tools like Debezium, AWS DMS, or GoldenGate stream these changes to a message queue.
+
+**Message queue** (Kafka, Kinesis): Buffers changes so the ETL pipeline can consume them at its own pace. Provides exactly-once or at-least-once delivery guarantees depending on configuration.
+
+**ETL Job** (Spark, dbt, Airflow): Consumes the change stream, applies the denormalization transforms (JOINs, aggregations, lookups), and writes the result to the data warehouse. This is where the denormalization logic lives.
+
+**Data Warehouse** (Snowflake, Redshift, BigQuery): Stores the denormalized tables. Columnar storage and compression reduce the storage overhead of redundancy. Partitions and sort keys optimize query performance.
+
+**Cache** (Redis, Elasticsearch): Optionally caches the most frequently queried results (top-N queries, precomputed summary statistics) to reduce load on the warehouse.
+
+### Why the Pipeline Pattern Matters
+
+The key insight: the denormalized system is decoupled from the source system. Writes in the OLTP database do not block on denormalization. The ETL pipeline can fail, lag, or be rebuilt without affecting the application's ability to process transactions.
+
+This decoupling is what makes lazy denormalization practical at scale. The application writes at full speed. The denormalized copies eventually converge. The dashboard accepts stale data in exchange for fast reads.
+
+## Data Structures and Algorithms
+
+### Star Schema Internals
+
+A star schema consists of two types of tables:
+
+**Fact table**: The center of the star. Contains numeric measures (quantity, revenue, count) and foreign keys to dimension tables. A fact table can have hundreds of millions to billions of rows. The number of columns is typically 10 to 50 — wide compared to a normalized table but narrow compared to a fully denormalized flat table.
+
+```sql
+-- Fact table structure (retail)
+CREATE TABLE fact_sales (
+  sale_sk BIGINT PRIMARY KEY,        -- Surrogate key
+  date_sk INT NOT NULL,               -- FK to dim_date
+  product_sk INT NOT NULL,            -- FK to dim_product
+  customer_sk INT NOT NULL,           -- FK to dim_customer
+  store_sk INT NOT NULL,              -- FK to dim_store
+  quantity INT NOT NULL,
+  unit_price DECIMAL(10,2) NOT NULL,
+  discount DECIMAL(10,2) DEFAULT 0,
+  tax_amount DECIMAL(10,2) NOT NULL,
+  total DECIMAL(10,2) NOT NULL,
+  cost DECIMAL(10,2) NOT NULL
+);
+```
+
+**Dimension table**: Radiates outward from the fact table. Contains descriptive attributes. A dimension is intentionally denormalized — all attributes of an entity are in one table, even if that creates redundancy.
+
+```sql
+-- Product dimension (denormalized — all product attributes flat)
+CREATE TABLE dim_product (
+  product_sk INT PRIMARY KEY,         -- Surrogate key
+  product_id INT NOT NULL,            -- Natural key from source
+  product_name VARCHAR(200),
+  category VARCHAR(100),
+  subcategory VARCHAR(100),
+  brand VARCHAR(100),
+  SKU VARCHAR(50),
+  unit_cost DECIMAL(10,2),
+  current_retail_price DECIMAL(10,2),
+  effective_date DATE,
+  end_date DATE,
+  is_active BOOLEAN
+);
+```
+
+Why no normalization inside dimensions? Because dimension tables are relatively small (thousands to millions of rows) compared to fact tables (billions). The storage cost of duplicating `category` and `subcategory` across 100,000 product rows is trivial. The cost of adding a JOIN every time a query filters by category is not.
+
+**Query pattern**:
+```sql
+SELECT
+  dp.category,
+  SUM(fs.total) AS revenue
+FROM fact_sales fs
+JOIN dim_product dp ON fs.product_sk = dp.product_sk
+WHERE fs.date_sk BETWEEN 20250101 AND 20251231
+GROUP BY dp.category;
+```
+
+This query joins two tables (not five or six). The fact table is filtered by the date key (partition elimination). The dimension table lookup is a hash JOIN on an integer key. The query completes in milliseconds on billions of rows.
+
+### Snowflake Schema Internals
+
+A snowflake schema normalizes dimensions into sub-dimensions:
+
+```sql
+-- Snowflake variant: category lives in its own table
+CREATE TABLE dim_product (
+  product_sk INT PRIMARY KEY,
+  product_name VARCHAR(200),
+  category_sk INT REFERENCES dim_category(category_sk),
+  brand VARCHAR(100),
+  SKU VARCHAR(50)
+);
+
+CREATE TABLE dim_category (
+  category_sk INT PRIMARY KEY,
+  category VARCHAR(100),
+  subcategory VARCHAR(100)
+);
+```
+
+**Query pattern**:
+```sql
+SELECT
+  dc.category,
+  SUM(fs.total) AS revenue
+FROM fact_sales fs
+JOIN dim_product dp ON fs.product_sk = dp.product_sk
+JOIN dim_category dc ON dp.category_sk = dc.category_sk
+WHERE fs.date_sk BETWEEN 20250101 AND 20251231
+GROUP BY dc.category;
+```
+
+**Trade-off**: Two JOINs instead of one. The snowflake schema reduces storage (category names stored once instead of repeated per product) but adds query complexity. In practice, star schemas outperform snowflake schemas for most analytics workloads because the extra JOIN adds latency and the storage savings are negligible at warehouse scale.
+
+### Materialized View Maintenance Algorithms
+
+A materialized view must be kept synchronized with its base tables. The maintenance strategy determines the cost of denormalization.
+
+#### Full Rebuild
+
+Truncate the materialized view and re-insert all rows from the source query.
+
+```sql
+-- Full rebuild (simplified)
+BEGIN;
+TRUNCATE monthly_category_sales;
+INSERT INTO monthly_category_sales
+SELECT
+  DATE_TRUNC('month', o.order_date) AS month,
+  p.category,
+  SUM(oi.quantity * oi.unit_price) AS revenue
+FROM orders o
+JOIN order_items oi ON o.order_id = oi.order_id
+JOIN products p ON oi.product_id = p.product_id
+GROUP BY 1, 2;
+COMMIT;
+```
+
+**Cost**: O(N) where N is the total rows in the source tables. The full query must be re-executed. For large tables, this takes minutes.
+
+**Best for**: Small to medium tables (under 10 million rows), or tables that change infrequently.
+
+#### Incremental Refresh
+
+Only process rows that changed since the last refresh.
+
+```sql
+-- Incremental refresh (conceptual)
+INSERT INTO monthly_category_sales
+SELECT
+  DATE_TRUNC('month', o.order_date) AS month,
+  p.category,
+  SUM(oi.quantity * oi.unit_price) AS revenue
+FROM orders o
+JOIN order_items oi ON o.order_id = oi.order_id
+JOIN products p ON oi.product_id = p.product_id
+WHERE o.order_date >= LAST_REFRESH_TIMESTAMP
+GROUP BY 1, 2;
+```
+
+**Cost**: O(C) where C is the number of changed rows since the last refresh. For append-only data (new orders), this is O(1) per refresh — only new rows are processed.
+
+**Challenge**: Incremental refresh breaks when historical data changes. If a customer's name is updated, all rows in the materialized view that reference that customer must be updated. This requires a different approach — either flag the affected rows and recompute them, or do a full rebuild.
+
+#### View Maintenance with Change Tracking
+
+Some databases track changes to base tables and only update the affected rows in the materialized view.
+
+```sql
+-- PostgreSQL uses materialized view logs (Oracle-style)
+-- 1. Create a materialized view log on base tables
+CREATE MATERIALIZED VIEW LOG ON orders WITH ROWID, PRIMARY KEY INCLUDING NEW VALUES;
+CREATE MATERIALIZED VIEW LOG ON order_items WITH ROWID, PRIMARY KEY INCLUDING NEW VALUES;
+
+-- 2. Create a fast-refreshable materialized view
+CREATE MATERIALIZED VIEW monthly_sales
+REFRESH FAST ON DEMAND
+AS
+SELECT ...;
+```
+
+**Cost**: O(U) where U is the number of changed rows. The database internally maintains a change table and applies only the deltas to the materialized view.
+
+**Support**: PostgreSQL does not support fast refresh natively (as of version 16). Oracle and SQL Server do. In PostgreSQL, you must implement incremental refresh manually using triggers or listen/notify.
+
+### Incremental Refresh vs Full Rebuild Decision Matrix
+
+| Factor | Full Rebuild | Incremental Refresh |
+|--------|-------------|-------------------|
+| Data volume | Under 10M rows | Any size |
+| Change pattern | Bulk loads, periodic | Continuous, streaming |
+| Staleness tolerance | Hours | Minutes |
+| Complexity | Low | High |
+| Consistency guarantee | Strong | Eventual (gaps possible) |
+| Maintenance cost | High (full scan) | Low (deltas only) |
+
+## The Query Lifecycle
+
+The following diagrams compare how a normalized schema and a denormalized star schema handle the same reporting query.
+
+### Normalized Schema Query Lifecycle
+
+<AsciiDiagram
+  id="denormalization/deep-dive-normalized-query"
+  title="Query Lifecycle on a Normalized Schema"
+  alt="Ten-step sequence showing how a normalized query passes through the SQL engine: parse, bind, plan, scan orders table, scan order_items, join, scan products, join, aggregate, and return. Steps 5-9 process millions of intermediate rows."
+  content={`
+  Query: Monthly sales by category (normalized)
+
+  SELECT DATE_TRUNC('month', o.order_date), p.category,
+         SUM(oi.quantity * oi.unit_price)
+  FROM orders o
+  JOIN order_items oi ON o.order_id = oi.order_id
+  JOIN products p ON oi.product_id = p.product_id
+  GROUP BY 1, 2
+
+  ┌─────────────────────────────────────────────────────┐
+  │ Step 1 — Parser: Parse SQL, validate syntax         │
+  │ Step 2 — Binder: Resolve tables and columns         │
+  │ Step 3 — Optimizer: Generate query plan             │
+  │ Step 4 — Executor: Start execution                  │
+  │                                                     │
+  │ Step 5 — Seq Scan on orders (15M rows)              │
+  │           Filter: order_date in range               │
+  │           Output: order_id, order_date              │
+  │                                                     │
+  │ Step 6 — Hash JOIN orders → order_items             │
+  │           Build hash table from orders (15M rows)   │
+  │           Probe with order_items (45M rows)         │
+  │           Output: 45M intermediate rows             │
+  │                                                     │
+  │ Step 7 — Hash JOIN result → products                │
+  │           Build hash table from products (500K rows)│
+  │           Probe with 45M rows                       │
+  │           Output: 45M rows with all columns         │
+  │                                                     │
+  │ Step 8 — GROUP BY (hash aggregation)                │
+  │           Hash table: 1,200 groups (categories×months)│
+  │           45M rows hashed into 1,200 buckets        │
+  │                                                     │
+  │ Step 9 — Sort (ordered by month, category)          │
+  │ Step 10 — Return 1,200 rows to client               │
+  │                                                     │
+  │ Total: 45M rows scanned, 45M rows hashed            │
+  │ Memory: ~8 GB for hash tables                       │
+  │ Time: 30-60 seconds                                 │
+  └─────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Denormalized Star Schema Query Lifecycle
+
+<AsciiDiagram
+  id="denormalization/deep-dive-denormalized-query"
+  title="Query Lifecycle on a Denormalized Star Schema"
+  alt="Six-step sequence: parse, bind, plan, scan fact_sales with partition pruning and dimension key pushdown, hash JOIN with dim_product, aggregate, return. Only the fact table is scanned at full volume; dimension tables are small hash probes."
+  content={`
+  Query: Monthly sales by category (star schema)
+
+  SELECT dd.month, dp.category, SUM(fs.total) AS revenue
+  FROM fact_sales fs
+  JOIN dim_date dd ON fs.date_sk = dd.date_sk
+  JOIN dim_product dp ON fs.product_sk = dp.product_sk
+  WHERE dd.year = 2025
+  GROUP BY dd.month, dp.category
+
+  ┌─────────────────────────────────────────────────────┐
+  │ Step 1 — Parser: Parse SQL, validate syntax         │
+  │ Step 2 — Binder: Resolve tables and columns         │
+  │ Step 3 — Optimizer: Generate query plan             │
+  │                                                     │
+  │ Step 4 — Partition Scan on fact_sales               │
+  │           Partition pruning: 12 partitions (months) │
+  │           Full year: ~100M rows scanned              │
+  │           With date filter: 10M rows in 1 partition │
+  │           Columnar projection: read total, 2 FKs    │
+  │           (skips 8 unused columns)                  │
+  │                                                     │
+  │ Step 5 — Hash JOIN fact_sales → dim_product         │
+  │           Build hash table from dim_product (500K)  │
+  │           Probe with 10M fact rows                  │
+  │           Compute: hash lookup on integer key       │
+  │           Output: 10M rows with category string     │
+  │                                                     │
+  │ Step 6 — GROUP BY (hash aggregation)                │
+  │           Hash table: 100 groups (12 months x ~8    │
+  │           categories)                               │
+  │           10M rows hashed into 100 buckets          │
+  │           Time: sub-second hash                     │
+  │                                                     │
+  │ Total: 10M rows scanned, 500K row dimension lookup  │
+  │ Memory: ~100 MB for hash tables                     │
+  │ Time: 0.2-0.5 seconds                               │
+  └─────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Key Differences in the Query Lifecycle
+
+**Scan volume**: The normalized query scans 60 million rows across three tables. The denormalized star schema scans 10 million rows in one fact table with partition pruning.
+
+**JOIN complexity**: The normalized query performs two hash JOINs, each building a hash table for millions of rows. The star schema performs one hash JOIN on a small dimension table (500,000 rows → fits in memory).
+
+**Columnar efficiency**: The star schema fact table, stored columnarly, reads only the columns needed for the query. The normalized row-oriented tables read entire rows even though only a few columns are needed.
+
+**Memory pressure**: The normalized query needs 8 GB of memory for hash tables and intermediate results. The star schema needs 100 MB. The normalized query may spill to disk if memory is constrained, adding seconds or minutes of I/O.
+
+## Consistency and State
+
+Denormalization introduces redundancy, and redundancy introduces consistency challenges.
+
+### Stale Data in Denormalized Copies
+
+Every denormalized copy has a staleness window — the time between a write to the source system and the propagation of that write to the denormalized copy.
+
+```
+Source write:    │
+                 ▼
+            ┌─────────┐
+            │  OLTP   │  Write committed immediately
+            └────┬────┘
+                 │
+       ┌─────────▼─────────┐
+       │  CDC Capture      │  Captured in 100ms (Debezium)
+       └─────────┬─────────┘
+                 │
+       ┌─────────▼─────────┐
+       │  Kafka Buffer     │  Buffered for batch processing
+       └─────────┬─────────┘      (configurable: 10s or 10,000 events)
+                 │
+       ┌─────────▼─────────┐
+       │  ETL / dbt Run    │  Scheduled every 5 minutes
+       └─────────┬─────────┘
+                 │
+       ┌─────────▼─────────┐
+       │  Warehouse Table  │  Data now visible in denormalized copy
+       └───────────────────┘
+
+  Total staleness window: 5-10 minutes (typical)
+  Acceptable? Depends on the use case.
+```
+
+**Read-your-writes scenario**: If a user creates a new order and immediately opens the dashboard, the order will not appear for 5 minutes. This is unacceptable for operational dashboards but acceptable for weekly business reviews.
+
+**Update scenario**: If a customer updates their address, the old address persists in the denormalized copy until the next refresh. Reports shipped during the staleness window reference the old address.
+
+### Eventual Consistency Guarantees
+
+Denormalized systems typically provide eventual consistency: the denormalized copy will converge to match the source within some time bound. The guarantee is not "all copies agree at all times" but "all copies will eventually agree if writes stop for long enough."
+
+The time bound depends on:
+- **Refresh frequency**: How often the ETL runs
+- **CDC lag**: How fast changes are captured
+- **Replication topology**: Whether multiple denormalized copies exist
+- **Batch window**: How long the ETL job takes to process
+
+### Reconciliation Batch Jobs
+
+For critical data that must be correct, run reconciliation jobs that compare the denormalized copy to the source.
+
+```sql
+-- Reconciliation query: find missing records
+SELECT 'Missing in denormalized' AS issue, o.order_id
+FROM orders o
+LEFT JOIN order_reports r ON o.order_id = r.order_id
+WHERE r.order_id IS NULL;
+
+-- Reconciliation query: find mismatched values
+SELECT 'Price mismatch' AS issue, oi.order_item_id,
+       oi.unit_price AS source_price,
+       r.unit_price AS denormalized_price
+FROM order_items oi
+JOIN order_reports r ON oi.order_item_id = r.order_item_id
+WHERE oi.unit_price != r.unit_price;
+```
+
+**Recommendation**: Run reconciliation on a schedule (daily for most systems, hourly for critical systems). When mismatches are found, trigger a targeted refresh of affected rows rather than a full rebuild.
+
+## Performance Characteristics
+
+The performance gains from denormalization are measurable and predictable.
+
+### Read Amplification
+
+Defined as: bytes read from storage to satisfy a query, divided by the minimal bytes needed to answer the query.
+
+**Normalized query**: 4 JOINs on 60M rows → 8 GB scanned → 8,000 MB read amplification.
+
+**Denormalized query**: 1 table, 10M rows with partition pruning → 200 MB scanned → 200 MB read amplification.
+
+**Ratio**: 40x less data scanned.
+
+### Write Amplification
+
+Defined as: bytes written to storage for each byte of new data, including index updates and redundant copies.
+
+**Normalized write**: One INSERT into `order_items` (72 bytes) → 72 bytes written + indexes (50 bytes) ≈ 122 bytes.
+
+**Denormalized write**: Same INSERT plus updating `order_reports` (120 bytes) and `daily_category_summary` (if affected rows exist) → 72 + 120 + 50 = 242 bytes + index updates.
+
+**Ratio**: 2x write amplification for single-row inserts.
+
+**At batch scale** (ETL refresh rewriting 1M rows): 1M writes in normalized form = 122 MB. Same data in denormalized form = 242 MB. The ETL job processes 2x the data volume.
+
+### Fact Table Scan Speeds
+
+Columnar storage makes denormalized scans practical:
+
+| Format | Compression ratio | Scan speed (GB/s) | 100M row scan |
+|--------|------------------|--------------------|---------------|
+| Row-oriented, no compression | 1x | 0.5 GB/s | 40 seconds |
+| Row-oriented, compressed | 3x | 1.0 GB/s | 13 seconds |
+| Columnar, compressed | 10x | 2.0 GB/s | 2 seconds |
+| Columnar, compressed + projection | 10x | 2.0 GB/s | 0.4 seconds |
+
+A columnar warehouse reading only the 3 columns needed for a query can scan a 10-column fact table at 5x the effective speed of a row store, because each column is stored separately and only the relevant columns are read.
+
+### Pre-Joined Query Latency Improvements
+
+| Schema | Query type | 10M rows | 100M rows | 1B rows |
+|--------|-----------|----------|-----------|---------|
+| Normalized (3NF) | Monthly sales | 2 seconds | 45 seconds | 8+ minutes |
+| Star schema | Monthly sales | 200 ms | 1 second | 8 seconds |
+| Flat denormalized | Monthly sales | 50 ms | 300 ms | 2 seconds |
+| Summary table | Monthly sales | 5 ms | 10 ms | 20 ms |
+
+The gap widens as data grows. At 1B rows, a normalized query becomes impractical for interactive dashboards.
+
+### Storage Overhead Percentage
+
+| Denormalization approach | Storage overhead vs normalized |
+|--------------------------|-------------------------------|
+| Single flat table (all columns) | 200-400 percent |
+| Star schema (fact + dims) | 30-60 percent |
+| Summary tables only | 2-10 percent |
+| Snowflake schema | 10-20 percent |
+
+The star schema strikes the best balance: moderate storage overhead with dramatic query improvement. A fully flat table offers slightly faster reads but at 4x to 6x the storage cost.
+
+## Configuration and Tuning
+
+### Materialized View Refresh Frequency
+
+Choose the refresh interval based on data freshness requirements:
+
+| Refresh interval | Freshness | ETL cost | Use case |
+|-----------------|-----------|----------|----------|
+| Real-time (streaming) | Sub-second | Very high | Operational dashboards, fraud detection |
+| Every minute | 1 minute | High | Live monitoring, real-time pricing |
+| Every 5 minutes | 5 minutes | Moderate | Operational reports |
+| Hourly | 1 hour | Low | Business reviews |
+| Daily | 24 hours | Very low | Executive reports, compliance |
+
+**Rule of thumb**: Set the refresh interval to the maximum staleness the business can tolerate, then add 50 percent margin. If the CEO can wait 1 hour for reports, run the ETL every 90 minutes — not every 5 minutes.
+
+### Partitioning Strategy for Fact Tables
+
+Partitioning makes denormalized fact tables practical at scale. Without partitioning, querying a 1B-row fact table requires a full scan even with date filters.
+
+```sql
+-- Partition by date (most common for fact tables)
+CREATE TABLE fact_sales (
+  sale_sk BIGINT,
+  date_sk INT,
+  product_sk INT,
+  customer_sk INT,
+  quantity INT,
+  total DECIMAL(10,2)
+)
+PARTITION BY RANGE (date_sk);
+
+-- Create monthly partitions
+CREATE TABLE fact_sales_202501 PARTITION OF fact_sales
+  FOR VALUES FROM (20250101) TO (20250201);
+CREATE TABLE fact_sales_202502 PARTITION OF fact_sales
+  FOR VALUES FROM (20250201) TO (20250301);
+-- ... one per month
+```
+
+**Partition pruning**: A query filtering on `date_sk BETWEEN 20250101 AND 20250301` only scans 3 partitions instead of the full table. If each partition is 100 GB, the query scans 300 GB instead of 1.2 TB (annual data).
+
+**Recommendation**: Partition by the most common filter column (usually date). Use monthly partitions for tables under 500 GB, weekly for tables under 100 GB, daily for tables under 10 GB.
+
+### Compression
+
+Columnar storage enables aggressive compression because adjacent values in a column are similar.
+
+```sql
+-- In Redshift: compression encodings per column
+CREATE TABLE fact_sales (
+  sale_sk BIGINT ENCODE delta,        -- Sequential → high ratio
+  date_sk INT ENCODE bytedict,        -- Few distinct values → high ratio
+  product_sk INT ENCODE mostly16,     -- 50K distinct → moderate ratio
+  customer_sk INT ENCODE zstd,        -- 10M distinct → low ratio
+  quantity INT ENCODE zstd,           -- Small values → moderate ratio
+  total DECIMAL(10,2) ENCODE zstd     -- Floating point → moderate ratio
+);
+```
+
+| Column type | Compression ratio | Example |
+|-------------|------------------|---------|
+| Date/Time | 15:1 to 30:1 | 100 GB → 5 GB |
+| Integer (sequential) | 20:1 to 50:1 | 100 GB → 3 GB |
+| Integer (few distinct) | 10:1 to 20:1 | 100 GB → 7 GB |
+| String (few distinct) | 5:1 to 15:1 | 100 GB → 12 GB |
+| String (many distinct) | 2:1 to 4:1 | 100 GB → 35 GB |
+
+**Impact**: A 2 TB denormalized fact table compresses to 150-300 GB after columnar compression. The storage overhead of denormalization is largely eliminated by compression.
+
+### Indexing Denormalized Columns
+
+Denormalized tables benefit from strategic indexing:
+
+```sql
+-- On a flat denormalized table
+CREATE INDEX idx_reports_date ON order_reports(order_date);
+CREATE INDEX idx_reports_category ON order_reports(category);
+CREATE INDEX idx_reports_customer ON order_reports(customer_id);
+
+-- Composite index for the most common dashboard query
+CREATE INDEX idx_reports_date_category ON order_reports(order_date, category);
+```
+
+**Caution**: Each index adds write amplification. If the denormalized table is refreshed in batch (truncate + insert), indexes must be rebuilt after every refresh. This adds minutes to the ETL window.
+
+**Strategy**: For batch-refreshed tables, create indexes only on columns used in WHERE filters, not on every column. For incrementally refreshed tables, maintain indexes as you would on any operational table.
+
+### Sort Keys for Columnar Warehouses
+
+Columnar warehouses (Redshift, Snowflake) benefit from sort keys — physical ordering of the data on disk that enables range-restricted scans.
+
+```sql
+-- Redshift: compound sort key
+CREATE TABLE order_reports (
+  order_date TIMESTAMP,
+  category VARCHAR(100),
+  customer_name VARCHAR(200),
+  total DECIMAL(10,2)
+)
+SORTKEY (order_date, category);
+
+-- Query benefits from sort key
+SELECT category, SUM(total)
+FROM order_reports
+WHERE order_date BETWEEN '2025-01-01' AND '2025-03-31'
+GROUP BY category;
+```
+
+The sort key on `order_date` allows the warehouse to skip entire blocks that fall outside the date range, reducing I/O by the same factor as partition pruning but without the maintenance overhead of partition management.
+
+### Concurrency and Locking Considerations
+
+Denormalized tables that are refreshed in batch have unique concurrency requirements. During a full rebuild, the table must be locked against reads and writes to prevent partial results.
+
+**Blocking refresh** (standard in PostgreSQL):
+
+```sql
+BEGIN;
+TRUNCATE order_reports;
+INSERT INTO order_reports SELECT ...;
+COMMIT;
+-- From TRUNCATE to COMMIT: table is locked
+-- All dashboard queries fail or queue during this window
+```
+
+**Non-blocking refresh** (swap pattern):
+
+```sql
+-- Step 1: Build in background
+CREATE TABLE order_reports_new AS SELECT ...;
+
+-- Step 2: Atomic swap
+BEGIN;
+ALTER TABLE order_reports RENAME TO order_reports_old;
+ALTER TABLE order_reports_new RENAME TO order_reports;
+COMMIT;
+-- Lock window: approximately 50 milliseconds (rename only)
+
+-- Step 3: Clean up
+DROP TABLE order_reports_old;
+```
+
+The swap pattern reduces the lock window from minutes (TRUNCATE + INSERT duration) to milliseconds (RENAME duration). During the swap, queries return results from the old table. After the swap completes, new queries hit the fresh table.
+
+**Concurrent refresh** (PostgreSQL CONCURRENTLY):
+
+```sql
+REFRESH MATERIALIZED VIEW CONCURRENTLY monthly_sales;
+```
+
+This creates a temporary snapshot of the new data, compares it to the existing data, and applies only the differences using an INSERT/UPDATE/DELETE merge. The table remains readable throughout. The trade-off: it requires a unique index on the materialized view and takes roughly 2x the CPU of a full refresh.
+
+### Hybrid Star-Snowflake Trade-Off Details
+
+When dimension tables are large (over 10 million rows), the storage savings of a snowflake schema become meaningful.
+
+**Dimension size comparison at 10 million customers**:
+
+```
+Star schema: dim_customer (15 columns, 500 bytes per row)
+  Storage: 10 million x 500 bytes = 5 GB
+  Query: SELECT ... FROM fact JOIN dim_customer ON ...
+
+Snowflake with separate dim_address:
+  dim_customer (10 columns, 350 bytes per row): 3.5 GB
+  dim_address (5 columns, 200 bytes per row): 2 GB
+  Total: 5.5 GB (more storage overall due to surrogate keys)
+```
+
+The snowflake schema does not always save storage because the JOIN columns add foreign key overhead. The real benefit is normalization of address data: updating a zip code for a city requires changing one row in dim_address instead of updating all customer rows with that address.
+
+**When to break a dimension into sub-dimensions**:
+- The sub-dimension has attributes that change independently (address changes but customer name does not)
+- The sub-dimension is shared across multiple fact tables (date dimension, geography dimension)
+- The sub-dimension has more than 10 attributes that are never queried together with the parent
+
+### Memory Management for Large Denormalized Tables
+
+When a denormalized table is too large to fit in memory, the query engine must spill intermediate results to disk. This destroys the performance advantage of denormalization.
+
+**Memory budget calculation**:
+
+```sql
+-- Estimate hash table memory for a denormalized query
+SELECT category, SUM(total) AS revenue
+FROM order_reports
+WHERE order_date >= '2025-01-01'
+GROUP BY category;
+
+-- Hash table: 100 categories x 100 bytes = 10 KB (fits in L1 cache)
+-- Scan: 100M rows x 200 bytes (3 columns) = 20 GB
+-- If the table is columnar, only 3 columns are read: ~600 MB
+```
+
+The key insight: denormalization reduces the hash table size (fewer GROUP BY columns needed when data is pre-joined), but the scan volume remains proportional to the row count. Columnar projection is what makes the scan fast — reading only 3 columns instead of 20.
+
+**When memory is insufficient**:
+
+```sql
+-- Increase query memory in PostgreSQL
+SET work_mem = '4GB';
+-- The hash table for GROUP BY uses this memory
+-- If work_mem is too small, PostgreSQL spills to disk (temp files)
+```
+
+On a warehouse with 200 GB of RAM and 10 concurrent queries at 20 GB each, memory contention is inevitable. Strategies include reducing concurrency (queue queries), increasing partition pruning (scan fewer partitions), or pre-aggregating into summary tables.
+
+### Merge Algorithms for Incremental Refresh
+
+When updating a denormalized table incrementally, the merge algorithm must handle inserts, updates, and deletes correctly.
+
+**INSERT-only merge** (simplest, append-only data):
+
+```sql
+-- New orders since last refresh
+INSERT INTO order_reports
+SELECT ... FROM source
+WHERE source.created_at > last_refresh;
+```
+
+**UPSERT merge** (handle updates to existing rows):
+
+```sql
+-- PostgreSQL: INSERT ... ON CONFLICT UPDATE
+INSERT INTO order_reports
+SELECT ... FROM source
+WHERE source.updated_at > last_refresh
+ON CONFLICT (order_id) DO UPDATE SET
+  customer_name = EXCLUDED.customer_name,
+  total = EXCLUDED.total,
+  status = EXCLUDED.status;
+```
+
+**DELETE + INSERT merge** (handle deletes):
+
+```sql
+-- Step 1: Delete rows that were deleted in source
+DELETE FROM order_reports
+WHERE order_id IN (
+  SELECT order_id FROM source_deleted
+  WHERE deleted_at > last_refresh
+);
+
+-- Step 2: Upsert new/changed rows
+INSERT INTO order_reports
+SELECT ... FROM source
+WHERE source.updated_at > last_refresh
+ON CONFLICT (order_id) DO UPDATE SET ...;
+```
+
+The DELETE + INSERT merge is the safest but requires tracking deleted rows in the source system (soft deletes or a CDC delete capture).
+
+## Bridging to Architecture
+
+The deep dive revealed the internal mechanics — how denormalized tables are structured, queried, and maintained. The next page takes this understanding and scales it up: building production-grade denormalized architectures with CDC pipelines, multi-region read replicas, and capacity planning for billions of rows.

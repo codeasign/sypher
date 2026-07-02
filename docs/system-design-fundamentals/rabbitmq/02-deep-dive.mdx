@@ -1,0 +1,734 @@
+---
+id: rabbitmq-deep-dive
+sidebar_position: 2
+title: "RabbitMQ — Under the Hood"
+description: "Internal architecture of RabbitMQ — Erlang VM, queue processes, data structures, clustering, and performance internals"
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## RabbitMQ Internals — What Happens Inside the Broker
+
+A publish operation takes under 200 microseconds on average. To understand how RabbitMQ achieves this, you need to understand its architecture — the Erlang runtime, the process model, storage engines, and data structures that route and persist messages.
+
+RabbitMQ is written in Erlang, a language designed at Ericsson for telephony switches. Erlang provides three properties that directly benefit RabbitMQ:
+
+- **Lightweight processes**: Erlang processes (not OS processes) are scheduled by the Erlang VM. They cost a few microseconds to create and a few kilobytes of memory. RabbitMQ spawns one process per queue, per connection, per channel — a cluster might have 50,000+ processes running concurrently.
+- **Actor model isolation**: Each process has its own heap. A crash in one queue process cannot corrupt another queue process. The supervisor tree automatically restarts failed processes.
+- **Hot code swapping**: The Erlang VM can update running code without restarting. RabbitMQ uses this for rolling upgrades — swap the code, migrate processes, then resume.
+
+## Internal Architecture — Process Model
+
+<AsciiDiagram
+  id="rabbitmq/02-deep-dive-architecture"
+  title="RabbitMQ Internal Process Architecture"
+  content={
+
+`┌──────────────────────────────────────────────────────────────┐
+│                  RabbitMQ Erlang VM Process Model             │
+│                                                              │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐               │
+│  │Connection│    │Connection│    │Connection│               │
+│  │ Process  │    │ Process  │    │ Process  │               │
+│  └────┬─────┘    └────┬─────┘    └────┬─────┘               │
+│       │               │               │                      │
+│  ┌────┴─────┐    ┌────┴─────┐    ┌────┴─────┐               │
+│  │ Channel  │    │ Channel  │    │ Channel  │               │
+│  │Processes │    │Processes │    │Processes │   (n per conn) │
+│  └────┬─────┘    └────┬─────┘    └────┬─────┘               │
+│       │               │               │                      │
+│       └───────────────┼───────────────┘                      │
+│                       │                                      │
+│          ┌────────────┴────────────┐                         │
+│          │    Exchange Process     │                         │
+│          │  (binding table in ETS) │                         │
+│          └────────────┬────────────┘                         │
+│                       │                                      │
+│          ┌────────────┴────────────┐                         │
+│          │    Queue Process        │  ┌─────────────┐        │
+│          │  (message store + idx)  │  │  Mnesia DB  │        │
+│          └────────────┬────────────┘  │(config+meta)│        │
+│                       │               └─────────────┘        │
+│          ┌────────────┴────────────┐                         │
+│          │   Consumer Delivery     │                         │
+│          │      Process            │                         │
+│          └─────────────────────────┘                         │
+└──────────────────────────────────────────────────────────────┘
+`
+  }
+  alt="Diagram showing the internal process model of RabbitMQ with connection processes, channel processes, queue processes, exchange processes, and the Mnesia database"
+/>
+
+### Connection Process
+
+Each AMQP connection gets a dedicated Erlang process. This process handles the TCP socket, AMQP frame parsing, heartbeat monitoring, and authentication. Connection processes are thin — they parse incoming frames and forward them to the appropriate channel process.
+
+A single connection process handles up to 100,000 messages per second in typical configurations. The bottleneck is rarely the connection process itself — it is the channel processes and queue processes that do the real work.
+
+Connection processes send heartbeats every `heartbeat` seconds (default 60). If a heartbeat is not received within twice the interval, the connection is closed and all associated resources are cleaned up.
+
+### Channel Processes
+
+Every AMQP channel is a separate Erlang process. Channels multiplex operations over a single TCP connection. Each channel process maintains:
+
+- Channel state: confirm mode, transaction mode, flow control status.
+- Unconfirmed message set: messages published with publisher confirms that have not yet been confirmed.
+- Consumer tags: mapping of consumer tags to queue references.
+
+Channel processes are cheap — you can have hundreds per connection. The limit is typically memory: each channel process consumes approximately 4-8 KB of memory.
+
+### Queue Process
+
+Every queue is a dedicated Erlang process. This is the heart of RabbitMQ's concurrency model — each queue processes messages independently. A queue process manages:
+
+- The message index (α, β, γ segments — described below).
+- Consumer registrations.
+- Delivery scheduling.
+- Dead-letter logic.
+- Queue length monitoring.
+
+Because each queue has its own process, one slow queue does not block other queues. The queue with the slow consumer continues to accumulate messages while other queues deliver messages normally.
+
+### Exchange Process
+
+Exchange routing happens in the channel process that received the publish, not in a separate exchange process. The channel process looks up the exchange by name in an ETS table (Erlang Term Storage — an in-memory key-value store) and evaluates bindings. This design avoids a process hop for exchange routing — messages go from channel process directly to queue processes.
+
+### Mnesia Database Process
+
+Mnesia is Erlang's distributed DBMS. RabbitMQ uses Mnesia to store:
+
+- Exchange definitions (name, type, arguments).
+- Queue definitions (name, durability, arguments).
+- Binding tables (exchange-to-queue mappings).
+- Users and permissions.
+- Vhost definitions.
+- Cluster membership.
+
+Mnesia replicates this metadata across all cluster nodes. When a node joins a cluster, it syncs metadata from an existing node. Metadata operations are transactional — declaring an exchange and binding a queue happen atomically.
+
+## Data Structures
+
+### Exchange Binding Table
+
+The binding table is stored in an ETS table. ETS is an in-memory hash table with O(1) lookups by key. The table maps `(exchange_name, binding_key)` to a list of bound queues.
+
+```
+ETS Binding Table (conceptual):
++------------------+------------------+--------------------------+
+| exchange_name    | binding_key      | queues                   |
++------------------+------------------+--------------------------+
+| "orders"         | "order.created"  | [risk_queue, comp_queue] |
+| "orders"         | "order.cancelled"| [comp_queue, audit_queue]|
+| "events"         | "order.#"        | [order_proc_queue]       |
+| "events"         | "trade.*"        | [trade_queue]            |
++------------------+------------------+--------------------------+
+```
+
+For direct exchanges, the lookup is a hash match on `(exchange_name, routing_key)`. For topic exchanges, RabbitMQ evaluates the binding pattern against the routing key using a trie-like structure optimized for AMQP wildcard matching.
+
+**Routing optimization**: For direct exchanges with many bindings, RabbitMQ uses a radix-tree based matcher. A fanout exchange with 1,000 queues evaluates bindings by iterating a linked list — the cost is O(n) where n is the number of bound queues. For fanout exchanges with thousands of queues, this iteration becomes the bottleneck.
+
+### Queue Index — Message Storage
+
+Each queue process maintains a message index with three segments, labeled α, β, and γ.
+
+<AsciiDiagram
+  id="rabbitmq/02-deep-dive-queue-index"
+  title="Queue Message Index — Alpha, Beta, and Gamma Segments"
+  content={
+
+`┌────────────────────────────────────────────────┐
+│              Queue Process Memory               │
+│                                                 │
+│  ┌──────────────────────────────────────────┐   │
+│  │ α (Alpha) — In-memory only               │   │
+│  │ Messages with seq_id 1001-1050           │   │
+│  │ Not yet written to disk                  │   │
+│  │ Size: ~500 KB                            │   │
+│  └──────────────────────────────────────────┘   │
+│                        │                         │
+│                        ▼                         │
+│  ┌──────────────────────────────────────────┐   │
+│  │ β (Beta) — Being written to disk          │   │
+│  │ Messages with seq_id 951-1000            │   │
+│  │ Pending fsync                            │   │
+│  └──────────────────────────────────────────┘   │
+│                        │                         │
+│                        ▼                         │
+│  ┌──────────────────────────────────────────┐   │
+│  │ γ (Gamma) — On disk, indexed             │   │
+│  │ Messages with seq_id 1-950               │   │
+│  │ Stored in message_store for replay       │   │
+│  └──────────────────────────────────────────┘   │
+└────────────────────────────────────────────────┘
+`
+  }
+  alt="Diagram showing the three-segment queue message index: alpha for recently published messages in memory, beta for messages being written to disk, gamma for fully persisted messages"
+/>
+
+**Alpha segment**: Recently published messages held in memory only. These messages have not been written to disk. If the broker crashes, alpha messages are lost. RabbitMQ moves messages from alpha to beta asynchronously based on a periodic timer (default 25ms).
+
+**Beta segment**: Messages being written to disk. The RabbitMQ message store writes to a write-ahead log. While a message is in beta, it is partially on disk — the write has started but may not have completed. On recovery, RabbitMQ replays the write-ahead log to reconstruct beta messages.
+
+**Gamma segment**: Messages fully persisted to disk. The message store has fsynced the data to the segment file. Gamma messages survive a broker crash.
+
+Segment promotion happens automatically. The `message_store_credit` setting controls the rate at which messages move from alpha to gamma. In high-throughput scenarios, the gamma segment grows while alpha remains small — messages are written to disk faster than they are consumed.
+
+### Message Store — Segment Files
+
+Messages are stored in **segment files** on disk. Each segment file holds a contiguous range of messages. Segment files are append-only — messages are never modified in place.
+
+```
+Segment file: msg_store_persistent.rdq
++------------------+--------+--------+--------+--------+
+| Segment header   | Msg 1  | Msg 2  | Msg 3  | Msg 4  |
+| (seq range,      | (len,  | (len,  | (len,  | (len,  |
+|  created_at)     |  data, |  data, |  data, |  data, |
+|                  |  chksum)|  chksum)|  chksum)|  chksum)|
++------------------+--------+--------+--------+--------+
+```
+
+When a message is consumed and ACKed, RabbitMQ marks it as garbage in the segment file. When a segment file reaches a garbage threshold (default 50%), RabbitMQ runs garbage collection — it compacts the segment by copying live messages to a new segment file and deleting the old one. This compaction runs in the background and can be a source of I/O pressure under heavy workloads.
+
+## Message Lifecycle — Step by Step
+
+### Phase 1: Connection and Channel Setup
+
+```
+[Consumer]                     [RabbitMQ Bro]
+    │                              │
+    │ 1. TCP Connect               │
+    │─────────────────────────────>│
+    │ 2. AMQP Protocol Header      │
+    │  (protocol version 0-9-1)    │
+    │─────────────────────────────>│
+    │ 3. Connection.Start          │
+    │<─────────────────────────────│
+    │ 4. Connection.Start-Ok       │
+    │  (auth + vhost)              │
+    │─────────────────────────────>│
+    │ 5. Connection.Tune           │
+    │  (max frame size, prefetch)  │
+    │<─────────────────────────────│
+    │ 6. Connection.Tune-Ok        │
+    │─────────────────────────────>│
+    │ 7. Connection.Open + Open-Ok │
+    │<─────────────────────────────│
+    │                              │
+    │ 8. Channel.Open              │
+    │─────────────────────────────>│
+    │ 9. Channel.Open-Ok           │
+    │<─────────────────────────────│
+```
+
+The connection handshake negotiates the protocol version, authentication credentials (SASL mechanism), virtual host, and connection parameters (max frame size, heartbeat interval). This happens once per connection. Subsequent operations use channels to avoid repeating the handshake.
+
+### Phase 2: Queue and Exchange Declaration
+
+```python
+# Application code
+channel.queue_declare(queue='orders', durable=True)
+```
+
+Behind the scenes, RabbitMQ:
+
+1. Channel process receives the `Queue.Declare` AMQP method frame.
+2. Channel process checks permissions for the user/vhost/queue combination.
+3. Channel process sends a `queue_declare` message to the Mnesia process.
+4. Mnesia transactionally writes the queue definition: `\{queue: "orders", durable: true, auto_delete: false, arguments: \{\}\}`.
+5. Queue process is spawned if it does not exist.
+6. Queue process initializes its message index (empty alpha/beta/gamma segments).
+7. Queue process registers in the ETS queue table.
+8. Channel process sends `Queue.Declare-Ok` back to the client.
+
+Exchange declaration follows the same pattern but registers in the exchange ETS table instead.
+
+### Phase 3: Binding
+
+```python
+channel.queue_bind(exchange='orders', queue='risk-engine', routing_key='order.created')
+```
+
+1. Channel process receives `Queue.Bind` method frame.
+2. Channel process looks up the exchange and queue in ETS (confirms both exist).
+3. Mnesia transactionally records the binding.
+4. Channel process adds the binding to the exchange's in-memory routing table in ETS.
+5. Channel process sends `Queue.Bind-Ok`.
+
+The binding is now active. Future publishes with matching routing keys route to this queue.
+
+### Phase 4: Publish
+
+```python
+channel.basic_publish(exchange='orders', routing_key='order.created',
+                      body='{"order": "ORD-123"}',
+                      properties=pika.BasicProperties(delivery_mode=2))
+```
+
+1. **Frame receipt**: The connection process receives the AMQP `Basic.Publish` method frame, validates framing, and forwards the payload to the channel process.
+
+2. **Exchange lookup**: The channel process looks up the exchange `"orders"` in the ETS exchange table. If the exchange does not exist, the channel process returns a channel-level error (channel closes, connection stays open).
+
+3. **Binding evaluation**: The channel process evaluates the routing key against the exchange's binding table in ETS:
+   - Direct exchange: hash lookup on `(exchange, routing_key)`.
+   - Topic exchange: trie-based pattern match.
+   - Fanout exchange: iterate all bound queues.
+   - Headers exchange: iterate and compare headers.
+
+4. **Message creation**: The channel process constructs an internal message structure: `\{msg_id: UUID, exchange: "orders", routing_key: "order.created", body: bytes, properties: \{delivery_mode: 2, ...\}, timestamp: T\}`.
+
+5. **Queue enqueue**: For each matching queue:
+   a. Channel process sends a `\{enqueue, message\}` message to the queue process's mailbox.
+   b. The queue process receives the message and appends it to its internal message index (alpha segment if non-persistent, gamma segment if persistent).
+   c. For persistent messages: the queue process writes to the message store segment file and triggers an asynchronous fsync every 25ms (configurable via `msg_store_fsync_threshold`).
+
+6. **Publisher confirm** (if enabled): After the message is written to disk (for persistent messages) or enqueued in memory (for non-persistent), the queue process sends a confirmation back to the channel process. The channel process sends `Basic.Ack` to the publisher.
+
+### Phase 5: Delivery
+
+```python
+def callback(ch, method, properties, body):
+    process(body)
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+channel.basic_consume(queue='orders', on_message_callback=callback)
+```
+
+1. **Consumer registration**: The channel process sends `basic_consume` to the queue process. The queue process adds the consumer to its consumer list with the specified prefetch limit.
+
+2. **Delivery scheduling**: The queue process's event loop selects the next unconsumed message and checks the consumer's prefetch count. If the consumer has room (unACKed count under prefetch_count), the queue process sends a `\{deliver, message, consumer_tag, delivery_tag\}` message to the consumer's channel process.
+
+3. **Frame serialization**: The channel process serializes the message into AMQP `Basic.Deliver`, `ContentHeader`, and `Body` frames and writes them to the TCP socket via the connection process.
+
+4. **ACK receipt**: When the consumer sends `Basic.Ack`, the channel process forwards it to the queue process. The queue process marks the message as processed in its index. If the message was in alpha, it is removed from memory. If in gamma, the segment file position is marked as garbage for later compaction.
+
+## Consistency and High Availability
+
+### Quorum Queues
+
+Quorum queues replace mirrored queues as the recommended HA queue type. They use the Raft consensus protocol to maintain consistency across nodes.
+
+<AsciiDiagram
+  id="rabbitmq/02-deep-dive-quorum"
+  title="Quorum Queue — Raft-Based Consistency"
+  content={
+
+`┌──────────────────────────────────────────────────────────┐
+│                  Quorum Queue (Raft Group)                │
+│                                                          │
+│   ┌────────────┐    ┌────────────┐    ┌────────────┐    │
+│   │   Node 1   │    │   Node 2   │    │   Node 3   │    │
+│   │  (Leader)  │<──>│ (Follower) │<──>│ (Follower) │    │
+│   └─────┬──────┘    └────────────┘    └────────────┘    │
+│         │                                                 │
+│    publish writes                                         │
+│    to leader only                                         │
+│         │                                                 │
+│   ┌─────┴──────┐                                         │
+│   │  Raft Log   │  Append-only, ordered                   │
+│   │  Entry 1    │  Replicated to quorum (N/2 + 1)        │
+│   │  Entry 2    │  before ack to publisher               │
+│   │  Entry 3    │                                         │
+│   └────────────┘                                         │
+└──────────────────────────────────────────────────────────┘
+`
+  }
+  alt="Diagram showing a quorum queue using Raft consensus across three nodes with leader election and log replication"
+/>
+
+Key properties:
+
+- **Leader-based**: All publish and consume operations go through the leader node. Followers replicate the log.
+- **Quorum writes**: A message is committed when a majority of nodes (N/2+1) acknowledge writing it to their Raft log. For a 3-node cluster, 2 nodes must confirm.
+- **Linearizable reads**: Consume operations also go through the leader to guarantee the latest state.
+- **Automatic leader election**: If the leader fails, followers detect the timeout (election timeout, configurable, defaults to 4x `heartbeat_timeout`), hold an election, and a new leader is chosen.
+- **Fault tolerance**: A quorum queue with 3 nodes tolerates 1 node failure. With 5 nodes, it tolerates 2 failures.
+
+```bash
+# Declare a quorum queue
+rabbitmqadmin declare queue name=quorum-orders queue_type=quorum
+```
+
+### Publisher Confirms
+
+Publisher confirms are the standard durability mechanism in modern RabbitMQ (mirrored queues are deprecated). When a publisher sets `confirm_mode`, the broker sends `Basic.Ack` after the message has been committed to quorum.
+
+```python
+# Enable publisher confirms
+channel.confirm_delivery()
+
+# Publish and wait for confirmation
+channel.basic_publish(exchange='orders', routing_key='order.created',
+                      body=body, mandatory=True)
+if channel.wait_for_confirmation():
+    print("Message confirmed by quorum")
+else:
+    print("Message not confirmed — handle failure")
+```
+
+Under the hood, the channel process assigns a sequence number to each published message. As queue processes confirm receipt, the channel process marks sequence numbers as confirmed. The `wait_for_confirmation()` method blocks until the channel receives confirmation or the timeout expires.
+
+**Performance impact**: Publisher confirms add 0.5-2ms of latency per message because the publisher must wait for quorum acknowledgment. Batching confirms improves throughput:
+
+```python
+# Publish 100 messages, then wait for all confirms
+with channel.batch_confirm():
+    for i in range(100):
+        channel.basic_publish(exchange='orders', routing_key='order.created',
+                              body=f'order-{i}')
+# All 100 confirmed here
+```
+
+## Configuration Parameters That Matter
+
+### Prefetch Count
+
+Controls how many unacknowledged messages a consumer can hold at once.
+
+```bash
+# In code
+channel.basic_qos(prefetch_count=100)
+
+# Global prefetch — counts across all consumers on this channel
+channel.basic_qos(prefetch_count=100, global_qos=True)
+```
+
+**Impact on performance**: With prefetch=1, RabbitMQ delivers one message per consumer and waits for an ACK. This minimizes redelivery risk but limits throughput to one in-flight message per consumer. With prefetch=100, a fast consumer processes 100 messages concurrently. The optimal value depends on message processing time.
+
+### Heartbeat
+
+Prevents half-open TCP connections.
+
+```python
+connection = pika.BlockingConnection(
+    pika.ConnectionParameters(heartbeat=60))
+```
+
+If RabbitMQ does not receive any traffic from a connection for 60 seconds, it sends a heartbeat. If no response arrives within 120 seconds, the connection is closed. Heartbeat also keeps NAT and firewall mappings alive.
+
+### Flow Control
+
+When a queue's message count or memory usage exceeds thresholds, RabbitMQ activates flow control. The queue process stops reading from the TCP socket, back-pressuring the publisher. The publisher's socket buffer fills, and `basic_publish` blocks.
+
+```bash
+# Default memory threshold — 40% of RAM
+rabbitmqctl set_vm_memory_high_watermark 0.6
+```
+
+When the high watermark is exceeded, ALL publishing connections are blocked until memory drops below the threshold. This is a last-resort protection — avoid reaching it by setting queue limits (`x-max-length`) and monitoring queue depths.
+
+### File Descriptor Limits
+
+Each connection uses one file descriptor. Each queue uses one. On Linux, the default limit is often 1024 — insufficient for production.
+
+```bash
+# Check current limits
+rabbitmqctl status | grep file_descriptors
+
+# Increase system limit in limits.conf
+# * soft nofile 65536
+# * hard nofile 65536
+```
+
+A cluster with 500 connections and 3,000 queues needs approximately 3,500 file descriptors.
+
+## Performance Characteristics
+
+### Throughput by Exchange Type
+
+| Exchange Type | Messages/sec (single core) | Bottleneck |
+|---|---|---|
+| Direct (1 queue) | 85,000 | Queue process CPU |
+| Direct (100 queues) | 45,000 | ETS lookup + fanout |
+| Topic (10 patterns) | 70,000 | Pattern matching |
+| Fanout (10 queues) | 50,000 | Iterating bound queues |
+| Fanout (1,000 queues) | 4,000 | Iterating bound queues |
+
+### Latency Components
+
+A single message publish consists of:
+
+| Component | Typical Duration | Notes |
+|---|---|---|
+| TCP frame receive | 5-15 microseconds | Kernel TCP stack |
+| Frame parsing | 2-5 microseconds | AMQP frame decoding |
+| Exchange lookup | 0.5-1 microsecond | ETS hash lookup |
+| Binding evaluation | 1-50 microseconds | Depends on exchange type and binding count |
+| Queue enqueue (memory) | 1-3 microseconds | Append to in-memory segment |
+| Queue enqueue (persistent) | 50-500 microseconds | Write + fsync to segment file |
+| Confirm response | 5-10 microseconds | AMQP frame generation |
+| **Total (non-persistent)** | **15-80 microseconds** | Memory-only path |
+| **Total (persistent)** | **65-600 microseconds** | Disk write path |
+
+### Scaling Limits
+
+| Resource | Practical Limit | Hard Limit |
+|---|---|---|
+| Queues per node | 5,000 | 10,000+ |
+| Connections per node | 1,000 | 5,000+ |
+| Channels per connection | 200 | 1,000 |
+| Message size | 10 MB | 512 MB (frame_max) |
+| Binding table size | 100,000 entries | Memory-bound |
+
+Beyond these limits, performance degrades due to process scheduling overhead, ETS table contention, and memory pressure. RabbitMQ clusters can scale horizontally — each node adds approximately the same capacity.
+
+## Storage Engine Summary
+
+The message store has two components:
+
+- **Segment files** (`.rdq`): Store message bodies and metadata. Append-only with compaction.
+- **Queue index** (`.idx`): Stores the position of each message within segment files, plus the segment state (alpha/beta/gamma).
+
+Directory layout:
+
+```
+$RABBITMQ_MNESIA_DIR/
+  msg_store_persistent.rdq   # Persistent message segment
+  msg_store_persistent.idx   # Persistent message index
+  msg_store_transient.rdq    # Transient message segment
+  msg_store_transient.idx    # Transient message index
+  queues/
+    orders/
+      messages.idx            # Queue-specific index
+      messages.seg            # Queue-specific segment (single-file queues)
+  recovery.dets               # Recovery metadata
+```
+
+When RabbitMQ starts, it reads the recovery metadata, checks the segment files for integrity (checksum validation), and reconstructs the queue indices into memory. Corrupted segment files are truncated to the last valid message boundary.
+
+## AMQP Wire Protocol — Frame Structure
+
+Every AMQP interaction happens through frames. A frame is the smallest unit of communication on the wire. Understanding frames helps with debugging network issues and estimating overhead.
+
+### Frame Types
+
+| Type ID | Frame Type | Purpose |
+|---|---|---|
+| 1 | METHOD | RPC calls: `Basic.Publish`, `Queue.Declare` |
+| 2 | HEADER | Content header: message size, properties |
+| 3 | BODY | Message payload bytes |
+| 4 | HEARTBEAT | Connection liveness check |
+| 8 | CONTENT BODY | Continuation frame for large messages |
+
+### Method Frame Structure
+
+Every AMQP method frame contains a 7-byte header and a variable-length payload:
+
+```
+┌──────────┬──────────┬──────────┬──────────┬──────────────────┐
+│ Frame    │ Channel  │ Payload  │ Payload  │ Frame-End Byte   │
+│ Type (1) │  (2)     │  Size    │ (method  │    0xCE          │
+│          │          │  (4)     │  body)   │                  │
+├──────────┼──────────┼──────────┼──────────┼──────────────────┤
+│  1 byte  │ 2 bytes  │ 4 bytes  │ n bytes  │   1 byte         │
+└──────────┴──────────┴──────────┴──────────┴──────────────────┘
+```
+
+A `Basic.Publish` method frame looks like:
+
+```
+Frame type: 0x01 (METHOD)
+Channel:    0x0003
+Size:       22 bytes
+Payload:
+  Class ID:    0x003C (60 = Basic)
+  Method ID:   0x0028 (40 = Publish)
+  Reserved:    0x0000
+  Exchange:    "orders"   (short string)
+  RoutingKey:  "order.created" (short string)
+  Mandatory:   0
+  Immediate:   0
+Frame end:   0xCE
+```
+
+For a message with a 200-byte JSON body, the total wire overhead is:
+
+- 1 METHOD frame: 8 bytes header + ~22 bytes payload + 1 byte end = ~31 bytes
+- 1 HEADER frame: 8 bytes header + ~14 bytes properties + 1 byte end = ~23 bytes
+- 1 BODY frame: 8 bytes header + 200 bytes body + 1 byte end = 209 bytes
+- **Total per message**: ~263 bytes of TCP data
+
+At 50,000 messages/second, RabbitMQ handles approximately 13 MB/second of TCP data just for message delivery — not counting connection handshake, channel management, or acknowledgments.
+
+### Frame Size Limits
+
+The `frame_max` parameter (default 131072 bytes = 128 KB) limits the maximum size of a single frame. Messages larger than `frame_max` are split into multiple body frames:
+
+```bash
+# Increase frame max for large messages
+rabbitmqctl set_vm_memory_high_watermark
+# Set in rabbitmq.conf:
+# frame_max = 262144  # 256 KB
+```
+
+Messages over 512 MB require `frame_max` to be set accordingly, but RabbitMQ recommends keeping messages under 10 MB. Larger messages cause memory pressure and blocking delivery — the entire message must be buffered in memory before delivery.
+
+## Memory Management Details
+
+### Per-Queue Memory
+
+Each Erlang process in RabbitMQ has its own heap. The queue process heap contains:
+
+- **Message index**: For 100,000 messages, the index is approximately 25 MB (250 bytes per message). This includes the sequence ID, segment file offset, and delivery state.
+- **ETS table entries**: Exchange bindings, queue registrations, and consumer registrations. Approximately 100-200 bytes per entry.
+- **Process mailbox**: Undelivered messages waiting for a consumer slot. Each message in the mailbox adds approximately 300 bytes plus the message body (if small, stored on the process heap; if large, stored on the global heap).
+
+### Binary Heaps and Message Bodies
+
+RabbitMQ stores message bodies on Erlang's binary heap (refc binaries), not on individual process heaps. Binary data larger than 64 bytes is reference-counted and shared across processes. This means:
+
+- A 2 KB message body sent to 4 queues creates 4 references to the same binary — approximately 2 KB total for the body, not 8 KB.
+- When one queue removes the message (consumer ACKs), the binary's reference count decrements. The memory is not freed until all queues have released their references.
+- This design significantly reduces memory for fanout exchanges, where the same message goes to many queues.
+
+### Garbage Collection
+
+Erlang's per-process generational garbage collection runs frequently on queue processes because they create and discard message references constantly. Each queue process triggers minor GC approximately every 100-500 messages, depending on heap size. Major GC (full-sweep) runs every 10,000-50,000 messages.
+
+Increasing the queue process heap size reduces GC frequency but increases pause time:
+
+```erlang
+%% rabbitmq.conf — advanced tuning
+queue_explicit_gc_run_operation_threshold = 2000
+queue_explicit_gc_memory_high_watermark = 10000000  %% 10 MB
+```
+
+### Flow Control — Credit-Based
+
+RabbitMQ uses a credit-based flow control system between Erlang processes. Process A gives Process B a credit limit (e.g., 200 messages). Each time B sends a message to A, it decrements its credit. When credit reaches 0, B stops sending until A grants more credit.
+
+This is how queue processes prevent channel processes from overwhelming them:
+
+1. Queue process grants credit to each publishing channel process (default: 200 credits).
+2. Channel process sends messages to the queue process, decrementing credit.
+3. Queue process processes messages, ACKs them, and grants additional credit.
+4. If queue process is slow (CPU-bound or disk-bound), it stops granting credit.
+5. Channel process runs out of credit and stops sending.
+6. Back-pressure propagates to the publisher's TCP socket.
+
+This credit system is why RabbitMQ rarely drops messages due to overload — it slows down the input rather than failing. The trade-off is that publishers block when downstream is slow, which causes confusion if you are not monitoring credit levels.
+
+## Queue Index Data Structure
+
+The queue index tracks the position and state of each message. It is a Gb_tree (Erlang's balanced binary tree) keyed by sequence ID. Each entry contains:
+
+```
+{seq_id, {msg_position, msg_size, state, delivery_count, first_consumer_tag}}
+```
+
+Where:
+- `seq_id`: Monotonically increasing 64-bit integer assigned when the message is enqueued.
+- `msg_position`: Offset within the segment file where the message body is stored (or a memory reference for alpha-segment messages).
+- `msg_size`: Total message size in bytes.
+- `state`: One of `alpha`, `beta`, `gamma`, `delivered`, `acked`.
+- `delivery_count`: Number of times this message has been delivered (incremented on each delivery, used for redelivery detection).
+- `first_consumer_tag`: The consumer tag that first received this message (for redelivery tracking).
+
+### Index Lookup Performance
+
+Index lookups are O(log n), where n is the number of messages in the queue. For 100,000 messages, a lookup takes approximately 5-10 microseconds. For 1,000,000 messages, approximately 15-25 microseconds.
+
+The index grows without bound until messages are consumed and ACKed. When a message is ACKed, it is marked as `acked` in the index but not immediately removed — removal happens during segment file compaction. This means the index can remain large even after messages are consumed, until compaction runs.
+
+## Recovery and Replay
+
+When RabbitMQ starts after an unclean shutdown:
+
+1. **WAL replay**: RabbitMQ reads the write-ahead log for each queue. The WAL contains messages that were written to disk but not yet moved to segment files (beta segment). These messages are replayed into the queue index.
+
+2. **Segment file scan**: RabbitMQ scans all segment files and rebuilds the queue index from disk. It validates checksums for each message. Corrupted messages are truncated and logged.
+
+3. **Alpha segment loss**: Messages in the alpha segment (in-memory only, not written to disk) are lost. This is expected — alpha is a performance optimization for non-persistent messages.
+
+4. **Network partition recovery**: In a cluster, Mnesia nodes reconcile metadata. Conflicting queue definitions are resolved by timestamp (latest wins). Quorum queues rebuild their Raft log from the surviving majority.
+
+### Recovery Time
+
+Recovery time depends on the number of queues, the number of segment files, and the disk I/O speed:
+
+```
+Recovery time = queue_count x (open_queue_time + index_load_time)
+                + segment_file_count x (open_time + checksum_time)
+
+Typical: 1,000 queues, 500 segment files → 30-60 seconds
+         10,000 queues, 5,000 segment files → 5-15 minutes
+```
+
+Large clusters (10,000+ queues) should use quorum queues for faster recovery — quorum queues store their state in the Raft log, which is smaller and faster to reload than the classic queue index.
+
+## Advanced Configuration
+
+### TCP Socket Tuning
+
+```ini
+# rabbitmq.conf
+# Socket buffer sizes — increase for high-throughput links
+tcp_listen_options.sndbuf = 65536
+tcp_listen_options.recbuf = 65536
+
+# TCP keepalive for detecting dead connections
+tcp_listen_options.keepalive = true
+
+# Backlog for pending connections
+tcp_listen_options.backlog = 1024
+```
+
+### Scheduling Tuning
+
+```ini
+# Number of Erlang scheduler threads (default = CPU core count)
+# Fewer schedulers = less context switching, better cache locality
+# Use for CPU-bound workloads
+erlang.schedulers.force_wakeup_interval = 500
+erlang.sched_busy_wait_threshold = 100
+
+# Reduce scheduler wakeup frequency
+# Reduces CPU usage at the cost of slightly higher latency
+erlang.schedulers.force_wakeup_interval = 1000
+```
+
+### Queue Tuning
+
+```ini
+# Default queue type (rabbit, quorum, stream)
+queue_default_type = quorum
+
+# Maximum number of processes in the queue process pool
+queue_agent_max_workers = 100
+
+# Interval for moving messages from alpha to beta segment (microseconds)
+msg_store_beta_deferred_write = 50000
+
+# Sync interval for message store (milliseconds)
+msg_store_fsync_interval = 200
+
+# Number of segment file compaction workers
+msg_store_credit_disc_bound = 1000
+```
+
+### Inspecting Internals Live
+
+RabbitMQ provides ways to inspect internal state through the Erlang VM. These are useful for debugging production issues.
+
+```bash
+# View queue process state (memory, message count, state)
+rabbitmqctl eval 'rabbit_amqqueue:lookup(rabbit_misc:r(<<"/">>, queue, <<"order-processing">>)).'
+
+# View the binding table for a specific exchange
+rabbitmqctl eval 'rabbit_exchange:lookup(rabbit_misc:r(<<"/">>, exchange, <<"orders">>)).'
+
+# Get memory breakdown for a queue
+rabbitmqctl list_queues name memory consumers messages_ready messages_unacknowledged
+
+# View the Erlang process information for a queue
+rabbitmqctl eval '
+  {ok, Q} = rabbit_amqqueue:lookup(rabbit_misc:r(<<"/">>, queue, <<"order-processing">>)),
+  Pid = element(3, element(2, Q)),
+  {process_info(Pid, memory), process_info(Pid, message_queue_len), process_info(Pid, status)}.
+'
+
+# Check the number of Erlang processes running
+rabbitmqctl status | grep -A 5 "erlang_processes"
+```
+
+These commands expose the raw Erlang state behind RabbitMQ's management interface. The `rabbitmqctl eval` command lets you execute arbitrary Erlang expressions — powerful and dangerous. Use read-only expressions in production.

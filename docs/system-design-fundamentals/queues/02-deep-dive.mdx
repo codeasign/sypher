@@ -1,0 +1,957 @@
+---
+id: queues-deep-dive
+sidebar_position: 2
+title: "Queues — Under the Hood"
+description: "Internal architecture, data structures, request lifecycle, consistency, performance, and configuration of queue systems."
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A queue broker is a specialized database. It manages message state, handles concurrent access, persists data, and recovers from failures. Unlike a general-purpose database, it optimizes for append-heavy workloads, sequential reads, and low-latency acknowledgment.
+
+<AsciiDiagram
+  id="queues/02-internal-arch"
+  title="Queue Broker Internal Architecture"
+  content={
+
+`┌──────────────────────────────────────────────────────────────────────────────┐
+│                    Queue Broker — Internal Architecture                         │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │  Layer 1: Network Listener                                                │
+ │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐      │
+ │  │ TCP     │  │ TLS     │  │ HTTP    │  │ WebSock │  │ gRPC    │      │
+ │  │ :5672   │  │ :5671   │  │ :15672  │  │ :15674  │  │ :5673   │      │
+ │  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘      │
+ │       └──────────────┴──────────┴────────────┴─────────────┘           │
+ │                              │                                          │
+ │                     Connection pool (10K conns)                         │
+ └──────────────────────────────┬──────────────────────────────────────────┘
+                                │
+ ┌──────────────────────────────▼──────────────────────────────────────────┐
+ │  Layer 2: Protocol Parsing                                               │
+ │  ┌───────────────────┐  ┌───────────────────┐  ┌──────────────────┐   │
+ │  │ AMQP 0-9-1        │  │ AMQP 1.0          │  │ MQTT             │   │
+ │  │ (RabbitMQ native)  │  │ (standard)         │  │ (IoT protocol)   │   │
+ │  └───────────────────┘  └───────────────────┘  └──────────────────┘   │
+ │  ┌───────────────────┐  ┌───────────────────┐  ┌──────────────────┐   │
+ │  │ STOMP             │  │ HTTP API (REST)    │  │ Kafka Protocol   │   │
+ │  └───────────────────┘  └───────────────────┘  └──────────────────┘   │
+ └──────────────────────────────┬──────────────────────────────────────────┘
+                                │
+ ┌──────────────────────────────▼──────────────────────────────────────────┐
+ │  Layer 3: Virtual Host & Routing                                         │
+ │  ┌──────────────────────────────────────────────────────────────────┐   │
+ │  │ Virtual Host: /production                                      │   │
+ │  │  ┌──────────┐  ┌──────────┐  ┌─────────┐  ┌───────────────┐  │   │
+ │  │  │ Exchange │─>│ Binding  │─>│ Queue   │  │ Policies      │  │   │
+ │  │  │ (direct) │  │ (routing) │  │ (store)  │  │ (TTL, max_len)│  │   │
+ │  │  └──────────┘  └──────────┘  └─────────┘  └───────────────┘  │   │
+ │  └──────────────────────────────────────────────────────────────────┘   │
+ │  ┌──────────────────────────────────────────────────────────────────┐   │
+ │  │ Virtual Host: /staging                                         │   │
+ │  │  (same structure, isolated namespace)                           │   │
+ │  └──────────────────────────────────────────────────────────────────┘   │
+ └──────────────────────────────┬──────────────────────────────────────────┘
+                                │
+ ┌──────────────────────────────▼──────────────────────────────────────────┐
+ │  Layer 4: Queue Engine                                                   │
+ │  ┌───────────────────┐  ┌───────────────────┐  ┌──────────────────┐   │
+ │  │ Message Router     │  │ Ack Tracker       │  │ Delivery Tagger  │   │
+ │  │ (match consumer)   │  │ (in-flight msgs)   │  │ (per-msg tag)    │   │
+ │  └───────────────────┘  └───────────────────┘  └──────────────────┘   │
+ │  ┌───────────────────┐  ┌───────────────────┐  ┌──────────────────┐   │
+ │  │ Prefetch Controller│  │ Dead-Letter Mgr   │  │ Delay Scheduler  │   │
+ │  │ (flow control)     │  │ (max retry logic)  │  │ (timed delivery) │   │
+ │  └───────────────────┘  └───────────────────┘  └──────────────────┘   │
+ └──────────────────────────────┬──────────────────────────────────────────┘
+                                │
+ ┌──────────────────────────────▼──────────────────────────────────────────┐
+ │  Layer 5: Storage Engine                                                 │
+ │  ┌───────────────────┐  ┌───────────────────┐  ┌──────────────────┐   │
+ │  │ Message Store      │  │ Index Store        │  │ Metadata Store   │   │
+ │  │ (append-only log)  │  │ (B-tree / LSM)     │  │ (queue config)   │   │
+ │  └────────┬──────────┘  └────────┬──────────┘  └──────────────────┘   │
+ │           │                       │                                      │
+ └───────────┼───────────────────────┼──────────────────────────────────────┘
+             │                       │
+ ┌───────────▼───────────────────────▼──────────────────────────────────────┐
+ │  Layer 6: Disk I/O                                                        │
+ │  ┌───────────────────┐  ┌───────────────────┐  ┌──────────────────┐   │
+ │  │ Page Cache        │  │ Write-Ahead Log    │  │ Compaction       │   │
+ │  │ (OS buffer)       │  │ (crash recovery)    │  │ (garbage collect)│   │
+ │  └───────────────────┘  └───────────────────┘  └──────────────────┘   │
+ └──────────────────────────────────────────────────────────────────────────┘
+`
+  }
+  alt="Layered diagram showing network layer, protocol handling, virtual host routing, exchange/queue binding, storage engine, and persistence modules"
+  caption="The six-layer internal architecture of a queue broker, from network handling through to disk persistence"
+/>
+
+## Data Structures
+
+The queue engine relies on three fundamental data structures. Each serves a different purpose and dominates a different part of the performance profile.
+
+### Linked List — The Standard FIFO Queue
+
+A doubly linked list is the simplest implementation for a FIFO queue. Each node contains a message, a pointer to the next node, and a pointer to the previous node.
+
+```python
+class QueueNode:
+    __slots__ = ('message', 'msg_id', 'next', 'prev')
+    def __init__(self, message, msg_id):
+        self.message = message
+        self.msg_id = msg_id
+        self.next = None
+        self.prev = None
+
+class LinkedListQueue:
+    def __init__(self):
+        self.head = None
+        self.tail = None
+        self._size = 0
+
+    def enqueue(self, message, msg_id):
+        node = QueueNode(message, msg_id)
+        if self.tail is None:
+            self.head = self.tail = node
+        else:
+            self.tail.next = node
+            node.prev = self.tail
+            self.tail = node
+        self._size += 1
+
+    def dequeue(self):
+        if self.head is None:
+            return None
+        node = self.head
+        self.head = node.next
+        if self.head is None:
+            self.tail = None
+        else:
+            self.head.prev = None
+        self._size -= 1
+        return node
+```
+
+**Performance characteristics:**
+- Enqueue: O(1) — append at tail
+- Dequeue: O(1) — remove from head
+- Memory: 40-80 bytes per node overhead plus payload
+- Fragmentation: High — each node is a separate allocation
+
+**Used by:** RabbitMQ default queue mode, in-process queues, Redis Lists.
+
+<AsciiDiagram
+  id="queues/02-linked-list"
+  title="Doubly Linked List Queue Structure"
+  content={
+
+`┌───────────────────────────────────────────────────────────────────────────────┐
+│                        Doubly Linked List Queue                                 │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+                  ┌──────────┐    ┌──────────┐    ┌──────────┐
+  head ──────────>│ Node A   │───>│ Node B   │───>│ Node C   │───> tail
+                  │          │<───│          │<───│          │
+                  │ msg:"A"  │    │ msg:"B"  │    │ msg:"C"  │
+                  │ id:0x1A3 │    │ id:0x1A4 │    │ id:0x1A5 │
+                  └──────────┘    └──────────┘    └──────────┘
+
+  Enqueue:  allocate Node D, tail.next = D, tail = D
+  Dequeue:  head = head.next, free old head
+
+  Complexity: O(1) both operations
+  Memory:  Node: 24 bytes pointers + 8 bytes ID + message payload
+           Overhead: 32-56 bytes per message before payload
+`
+  }
+  alt="Diagram showing a doubly linked list with head and tail pointers, each node containing message data and next/prev references"
+  caption="A doubly linked list provides O(1) enqueue and dequeue operations for FIFO queue implementations"
+/>
+
+### Circular Buffer — The High-Throughput FIFO
+
+A circular buffer (ring buffer) uses a fixed-size array with head and tail pointers that wrap around. It avoids per-message allocation by pre-allocating the buffer.
+
+```python
+class CircularBufferQueue:
+    def __init__(self, capacity=65536):
+        self.buffer = [None] * capacity
+        self.capacity = capacity
+        self.head = 0  # read position
+        self.tail = 0  # write position
+        self._size = 0
+
+    def enqueue(self, message):
+        if self._size == self.capacity:
+            raise OverflowError("Queue is full")
+        self.buffer[self.tail] = message
+        self.tail = (self.tail + 1) % self.capacity
+        self._size += 1
+
+    def dequeue(self):
+        if self._size == 0:
+            return None
+        message = self.buffer[self.head]
+        self.buffer[self.head] = None  # release reference
+        self.head = (self.head + 1) % self.capacity
+        self._size -= 1
+        return message
+```
+
+**Performance characteristics:**
+- Enqueue: O(1) — single array write, no allocation
+- Dequeue: O(1) — single array read, no deallocation
+- Memory: Fixed — no per-message allocation overhead
+- Limitation: Maximum capacity set at creation time
+
+**Used by:** LMAX Disruptor (Java), Aeron (messaging at 10M msg/sec/core), Linux kernel task queues.
+
+<AsciiDiagram
+  id="queues/02-circular-buffer"
+  title="Circular Buffer (Ring Buffer) Queue"
+  content={
+
+`┌───────────────────────────────────────────────────────────────────────────────┐
+│                       Circular Buffer (Ring Buffer)                             │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+  Empty buffer:  head == tail
+
+  ┌────┬────┬────┬────┬────┬────┬────┬────┐
+  │    │    │    │    │    │    │    │    │
+  └────┴────┴────┴────┴────┴────┴────┴────┘
+   ▲
+   head/tail
+
+  After enqueue A, B, C:
+
+  ┌────┬────┬────┬────┬────┬────┬────┬────┐
+  │ A  │ B  │ C  │    │    │    │    │    │
+  └────┴────┴────┴────┴────┴────┴────┴────┘
+   ▲              ▲
+   head           tail
+
+  After dequeue A:
+
+  ┌────┬────┬────┬────┬────┬────┬────┬────┐
+  │    │ B  │ C  │    │    │    │    │    │
+  └────┴────┴────┴────┴────┴────┴────┴────┘
+        ▲        ▲
+       head      tail
+
+  When tail wraps:
+
+  ┌────┬────┬────┬────┬────┬────┬────┬────┐
+  │ F  │ G  │ C  │ D  │ E  │    │    │    │
+  └────┴────┴────┴────┴────┴────┴────┴────┘
+              ▲    ▲
+             tail  head
+
+  Complexity: O(1) both operations, zero allocation
+  Throughput: 10-50 million msg/sec/core
+  Limitation: Fixed capacity, must pre-allocate
+`
+  }
+  alt="Diagram showing a fixed-size array with head and tail pointers that wrap around, avoiding per-message allocation"
+  caption="A circular buffer pre-allocates its array and achieves sub-microsecond operations with zero heap allocation"
+/>
+
+### B-Tree — The Persistent Queue
+
+Persistent queues need a data structure that lives on disk and supports fast random access for acknowledgment and deletion. A B-tree provides O(log n) operations with an n-ary branching factor optimized for disk page sizes (4 KB or 8 KB).
+
+```text
+B-Tree of order 4 (4 children per node):
+
+                    ┌──────┬──────┬──────┐
+                    │  AAA │  MMM │  ZZZ │
+                    └──┬───┴──┬───┴──┬───┘
+              ┌────────┘      │      └──────────┐
+         ┌────▼────┐    ┌────▼────┐     ┌───────▼───┐
+         │  BBB    │    │  NNN   │     │  ZZZ       │
+         │  CCC    │    │  PPP   │     │  (overflow) │
+         │  DDD    │    │        │     │            │
+         └─────────┘    └─────────┘     └────────────┘
+```
+
+For queue operations:
+- **Insert:** Insert message into B-tree ordered by sequence number or timestamp. O(log_b n) where b is the branching factor (typically 100-500).
+- **Dequeue:** Find minimum sequence number and remove it. O(log_b n) + disk I/O.
+- **Acknowledgment:** Mark message as deleted without physically removing it (tombstone). Periodic compaction reclaims space.
+
+**Used by:** Kafka (segmented append-only logs with in-memory indexes), RabbitMQ in persistent mode, ActiveMQ, SQS backend.
+
+<AsciiDiagram
+  id="queues/02-btree-structure"
+  title="B-Tree for Persistent Queue Storage"
+  content={
+
+`┌───────────────────────────────────────────────────────────────────────────────┐
+│              B-Tree Index for Persistent Queue Storage                          │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+                     ┌──────────────────────┐
+                     │   Root Node (in mem)  │
+                     │   [seq: 1000]         │
+                     │   [seq: 2000]         │
+                     │   [seq: 3000]         │
+                     └──┬───────┬───────┬────┘
+              ┌──────────┘       │       └───────────────┐
+         ┌────▼────────┐  ┌─────▼─────────┐   ┌─────────▼────┐
+         │ Internal     │  │ Internal       │   │ Internal      │
+         │ [1000]       │  │ [2000]         │   │ [3000]        │
+         │ [1250]       │  │ [2250]         │   │ [3250]        │
+         │ [1500]       │  │ [2500]         │   │ [3500]        │
+         └──┬─────┬───┬─┘  └──┬──────┬───┬──┘   └───┬─────┬───┬─┘
+            │     │   │       │      │   │         │     │   │
+         ┌──▼┐ ┌──▼┐ ┌▼──┐ ┌──▼┐ ┌──▼┐ ┌▼──┐   ┌──▼┐ ┌──▼┐ ┌▼──┐
+         │ L │ │ L │ │ L │ │ L │ │ L │ │ L │   │ L │ │ L │ │ L │
+         │eaf│ │eaf│ │eaf│ │eaf│ │eaf│ │eaf│   │eaf│ │eaf│ │eaf│
+         └───┘ └───┘ └───┘ └───┘ └───┘ └───┘   └───┘ └───┘ └───┘
+
+     Leaf nodes point to:
+         ┌─────────────────────────────────────────────┐
+         │ [seq][offset][length][timestamp][ack_state] │
+         └─────────────────────────────────────────────┘
+                              │
+                              ▼
+         ┌─────────────────────────────────────────────┐
+         │     Append-Only Message Log on Disk          │
+         │  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐   │
+         │  │msg1000│  │msg1001│  │msg1002│  │msg1003│  │
+         │  │~12KB │  │~8KB  │  │~15KB │  │~4KB  │   │
+         │  └──────┘  └──────┘  └──────┘  └──────┘   │
+         └─────────────────────────────────────────────┘
+
+     Complexity: O(log_b n) for insert/delete
+     Fan-out (b): typically 100-500 children per node
+     4 KB page: ~200 entries per internal node
+`
+  }
+  alt="Diagram showing a B-tree index structure mapping sequence numbers to disk offsets for fast persistent queue operations"
+  caption="B-trees provide the disk-optimized access pattern needed for persistent queues, with high fan-out reducing disk seeks"
+/>
+
+## Request Lifecycle — Step by Step
+
+The following traces a message from the moment a producer sends it to the moment the broker deletes it after successful consumption. This lifecycle is divided into four phases, each shown with an evolving diagram.
+
+### Phase I: Ingestion (Steps 1-3)
+
+#### Step 1: TCP Connection Establishment
+
+The producer opens a TCP connection to the broker. This connection is reused for many messages. Connection establishment takes one round trip (plus TLS if encrypted).
+
+```
+Producer               Broker
+   │                      │
+   │── SYN ──────────────►│
+   │◄─ SYN-ACK ───────────│
+   │── ACK ──────────────►│
+   │                      │
+   │── TLS ClientHello ──►│  (if using AMQPS)
+   │◄─ TLS Certificate ───│
+   │── TLS Key Exchange ─►│
+   │◄─ TLS Finished ──────│
+   │                      │
+   │── AMQP Start ───────►│
+   │◄─ AMQP Start-OK ─────│
+   │── AMQP Tune ────────►│
+   │◄─ AMQP Tune-OK ──────│
+   │── AMQP Open ────────►│
+   │◄─ AMQP Open-OK ──────│
+   │                      │
+   ~ Connection established ~
+```
+
+Connection setup costs 2-10ms for TCP, 15-50ms for TLS. Production systems reuse connections across thousands of messages.
+
+#### Step 2: Producer Sends Message
+
+The producer sends the message as an AMQP `basic.publish` frame or equivalent. The frame contains:
+
+```
+Frame Header (7 bytes):
+  [type: publish] [channel: 1] [size: 1042]
+
+Content Header:
+  [class_id: 60] [weight: 0] [body_size: 1024]
+  [properties: delivery_mode=2, priority=5, ...]
+
+Message Body (1024 bytes):
+  {"event": "user.signup", "user_id": "u_8a3f1c", ...}
+
+Frame End (1 byte):
+  [frame_end: 0xCE]
+```
+
+#### Step 3: Broker Validates and Dispatches
+
+The broker performs these checks in order:
+
+1. **Protocol parsing:** Is the frame valid AMQP?
+2. **Channel validation:** Is channel 1 open?
+3. **Exchange resolution:** Does the target exchange exist?
+4. **Routing key match:** Does the routing key match at least one binding?
+5. **Queue existence:** Does the target queue exist?
+6. **Message validation:** Is the message within size limits?
+7. **Authorization:** Does the producer have write permission?
+8. **Resource limits:** Is the broker below its memory/disk watermarks?
+
+```text
+< Broker >
+    │
+    ├── 1. Parse AMQP frame ───────────> Error: malformed frame
+    ├── 2. Validate channel ───────────> Error: channel closed
+    ├── 3. Resolve exchange ──────────> Error: exchange not found
+    ├── 4. Match routing key ──────────> Error: no binding
+    ├── 5. Check queue exists ────────> Error: queue deleted
+    ├── 6. Validate message size ──────> Error: max 256 KB
+    ├── 7. Check permissions ─────────> Error: access denied
+    ├── 8. Check broker capacity ─────> Error: flow control
+    │
+    └── All passed → proceed to storage
+```
+
+### Phase II: Persistence (Steps 4-6)
+
+#### Step 4: Write to Write-Ahead Log
+
+For durable queues, the broker writes the message to the write-ahead log (WAL) before any other operation. The WAL is an append-only file on disk. This ensures recovery after a crash.
+
+```python
+class WriteAheadLog:
+    def __init__(self, path):
+        self.file = open(path, 'ab')
+        self.file.seek(0, 2)  # append at end
+
+    def append(self, seq_id, message_bytes):
+        # Format: [4-byte length][8-byte seq_id][message_bytes][4-byte CRC]
+        record = struct.pack('!I', len(message_bytes))
+        record += struct.pack('!Q', seq_id)
+        record += message_bytes
+        record += struct.pack('!I', zlib.crc32(message_bytes))
+        self.file.write(record)
+        self.file.flush()
+        os.fsync(self.file.fileno())  # force to disk
+```
+
+An `fsync` call is the slowest part of ingestion — it blocks until the OS confirms the data is on physical media.
+
+#### Step 5: Update In-Memory Index
+
+After the WAL write succeeds, the broker inserts the message into the in-memory index. For FIFO queues, this means appending to the tail of a linked list or inserting into a concurrent skip list.
+
+```python
+def enqueue(self, message):
+    # 1. Assign sequence ID
+    seq_id = self.next_seq_id()
+    # 2. Serialize message
+    data = self.serialize(message)
+    # 3. Write to WAL (fsync)
+    self.wal.append(seq_id, data)
+    # 4. Insert into in-memory index
+    self.index.insert(seq_id, data)
+    # 5. Signal consumers waiting on empty queue
+    self.notify_consumers()
+```
+
+#### Step 6: Acknowledge to Producer
+
+The broker sends a confirmation frame to the producer. The producer can now continue executing, knowing the message is safely stored.
+
+```text
+Producer            < Broker >
+   │                      │
+   │── basic.publish ────►│
+   │                      │── 4. WAL append (fsync)
+   │                      │── 5. In-memory index insert
+   │                      │── 6. Consumer notification
+   │◄─ basic.ack ────────│
+   │                      │
+   │  (release resources) │
+```
+
+### Phase III: Consumption (Steps 7-9)
+
+#### Step 7: Consumer Polls or Receives Push
+
+Consumers obtain messages in one of two ways:
+
+**Basic.Get (poll):** The consumer explicitly requests a message. The broker returns immediately with either a message or an empty response.
+
+**Basic.Consume (push):** The consumer subscribes to the queue. The broker pushes messages as they arrive, up to the consumer's prefetch limit.
+
+```python
+# Push-based consumption with prefetch control
+channel.basic_qos(prefetch_count=10)  # max 10 unacknowledged
+
+def callback(ch, method, properties, body):
+    process(body)
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+channel.basic_consume(queue='tasks', on_message_callback=callback)
+```
+
+#### Step 8: Broker Marks Message as In-Flight
+
+The broker removes the message from the ready queue and places it in an in-flight tracking structure. It starts the visibility timeout.
+
+```python
+class InFlightTracker:
+    def __init__(self):
+        self.in_flight = {}  # delivery_tag -> (message, deadline)
+
+    def mark_in_flight(self, delivery_tag, message, timeout_ms):
+        deadline = time.monotonic() + timeout_ms / 1000
+        self.in_flight[delivery_tag] = (message, deadline)
+        # Schedule timeout check
+        self._schedule_timeout(delivery_tag, deadline)
+
+    def ack(self, delivery_tag):
+        msg, deadline = self.in_flight.pop(delivery_tag, (None, None))
+        return msg  # caller can now delete from storage
+
+    def nack(self, delivery_tag, requeue=True):
+        msg, deadline = self.in_flight.pop(delivery_tag, (None, None))
+        if msg and requeue:
+            self._requeue(msg)  # make visible again
+```
+
+<AsciiDiagram
+  id="queues/02-lifecycle-step4"
+  title="In-Flight Message Tracking"
+  content={
+
+`┌───────────────────────────────────────────────────────────────────────────────┐
+│                         In-Flight Message Tracking                              │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+                           <  Broker State  >
+
+     ┌─────────────────────────┐      ┌─────────────────────────┐
+     │   Ready Queue            │      │   In-Flight Tracking     │
+     │   (visible to consumers) │      │   (hidden from others)   │
+     │                          │      │                          │
+     │  ┌──────┐  ┌──────┐     │      │  ┌──────┐  ┌──────┐     │
+     │  │ Msg  │  │ Msg  │     │      │  │ Msg  │  │ Msg  │     │
+     │  │  D   │  │  E   │     │      │  │  C   │  │  B   │     │
+     │  │      │  │      │     │      │  │ T-14s │  │ T-25s│     │
+     │  └──────┘  └──────┘     │      │  └──────┘  └──────┘     │
+     │  (next to deliver)       │      │  (timeout countdown)     │
+     └─────────────────────────┘      └─────────────────────────┘
+               │                               │
+               │                               │
+               ▼                               ▼
+     ┌─────────────────────────┐      ┌─────────────────────────┐
+     │   Consumer receives     │      │   Timeout monitor        │
+     │   delivery_tag: tag_C   │      │   checks every 100ms    │
+     └─────────────────────────┘      └─────────────────────────┘
+                                               │
+                                    if deadline passed:
+                                      ┌──────────────────────┐
+                                      │ Move Msg back to     │
+                                      │ ready queue          │
+                                      │ Increment retry count │
+                                      └──────────────────────┘
+`
+  }
+  alt="Diagram showing the broker splitting messages into ready and in-flight states with visibility timeout timers"
+  caption="The broker tracks in-flight messages with individual timers to handle consumer failures via visibility timeout"
+/>
+
+#### Step 9: Consumer Processes and Acknowledges
+
+The consumer processes the message and sends either `basic.ack` (success) or `basic.nack` (failure).
+
+```python
+def handle_message(ch, method, properties, body):
+    try:
+        result = process_message(body)
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        return result
+    except TemporaryError:
+        # NACK and requeue — message goes back to queue
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+    except PermanentError:
+        # NACK without requeue — message goes to DLQ or is dropped
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+```
+
+### Phase IV: Completion (Steps 10-12)
+
+#### Step 10: Broker Deletes Message from Index
+
+Upon receiving the ACK, the broker removes the message from both the in-flight tracker and the persistent index.
+
+```python
+def handle_ack(self, delivery_tag):
+    # 1. Remove from in-flight tracker
+    message = self.in_flight.ack(delivery_tag)
+    if message is None:
+        raise UnknownDeliveryTagError(f"No message with tag {delivery_tag}")
+
+    # 2. Mark as deleted in persistent store (tombstone)
+    self.index.mark_deleted(message.seq_id)
+
+    # 3. Optionally record to audit log
+    if self.audit_enabled:
+        self.audit_log.write(f"DELETED {message.seq_id} at {time.time()}")
+```
+
+The message is not physically removed from the append-only log at this point. Physical removal happens during compaction.
+
+#### Step 11: Compaction (Background)
+
+A background compaction process reclaims space from deleted messages.
+
+```
+Before compaction:
+  [msg_100] [msg_101]* [msg_102] [msg_103]* [msg_104]
+  * = deleted/acknowledged
+
+After compaction:
+  [msg_100] [msg_102] [msg_104]
+```
+
+Compaction runs when the ratio of deleted to active messages exceeds a threshold (typically 50%). It reads the log, skips deleted messages, and writes a new log file. The old file is deleted once the new one is fsynced.
+
+#### Step 12: Flow Control — Prefetch and Backpressure
+
+The broker enforces flow control to prevent any consumer from being overwhelmed and to prevent the queue from growing without bound.
+
+**Prefetch count:** The maximum number of unacknowledged messages the broker will send to a single consumer. A prefetch of 1 ensures sequential processing. A prefetch of 100 allows batch processing but risks duplicate work if the consumer crashes.
+
+**Broker memory alarm:** When broker memory usage exceeds a configurable high-water mark (default 40% of RAM), the broker blocks all producers. When usage drops below the low-water mark (default 30%), it unblocks producers.
+
+```text
+Broker Memory:
+  ┌───────────────────────────────────────────────────────────────┐
+  │                                                               │
+  │   Used: 3.2 GB / 8 GB (40%)                              ▲   │
+  │                                                         HIGH │
+  │   ┌──────────────┐                                        │   │
+  │   │ Producers    │  BLOCKED! ──── backpressure ────> [API]│   │
+  │   │ blocked      │                                        │   │
+  │   └──────────────┘                                     LOW  │
+  │                                                         │   │
+  │   Target: below 30% (2.4 GB) for unblock              ▼   │
+  │                                                               │
+  └───────────────────────────────────────────────────────────────┘
+```
+
+<AsciiDiagram
+  id="queues/02-lifecycle-complete"
+  title="Complete Message Lifecycle with Timing"
+  content={
+
+`┌───────────────────────────────────────────────────────────────────────────────┐
+│                    Complete Message Lifecycle (12 Steps)                        │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+Timeline (not to scale):
+          ┌───  0.2ms  ──┐  ┌───  1.5ms  ──┐  ┌───  50ms  ───┐  ┌──  0.3ms  ─┐
+          │   Phase I    │  │   Phase II   │  │  Phase III   │  │  Phase IV  │
+          ▼              ▼  ▼              ▼  ▼              ▼  ▼            ▼
+
+Producer  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐
+          │1 │──│2 │──│3 │──│4 │──│5 │──│6 │──│7 │──│8 │──│9 │──│10│──│11│──│12│
+          │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │
+          └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘
+                          Latency per step:
+  1. TCP/TLS connect:         2-50 ms     (amortized across many messages)
+  2. Send frame:              0.01 ms     (network round trip within datacenter)
+  3. Validate and dispatch:   0.03 ms     (in-memory checks)
+  4. WAL append + fsync:      0.5-2 ms    (blocking, disk-bound)
+  5. In-memory index insert:  0.01 ms     (lock + linked list append)
+  6. ACK to producer:         0.1 ms      (network)
+  7. Consumer poll/push:      0.1-20 ms   (depends on polling interval)
+  8. Mark in-flight:          0.005 ms    (hash map insert)
+  9. Process + ACK:           10-500 ms   (application logic)
+ 10. Delete from index:       0.01 ms     (mark tombstone)
+ 11. Compaction (bg):         seconds     (runs periodically, not per-message)
+ 12. Flow control check:      0.001 ms    (counter increment)
+
+  Total producer-observed latency:  ~2 ms (steps 1-6, with connection reuse)
+  Total consumer-observed latency:  ~15-500 ms (depends on polling and processing)
+`
+  }
+  alt="Full lifecycle diagram showing all 12 steps with real-world latency numbers for each phase"
+  caption="End-to-end message lifecycle with typical latency for each step"
+/>
+
+## Consistency and State
+
+Queue brokers face the same consistency challenges as databases. Understanding crash scenarios reveals the trade-offs in every configuration.
+
+### Crash Scenario 1: Producer Crashes After Send
+
+**Sequence:** Producer sends message and crashes before receiving the ACK.
+
+**Outcome:** The broker has the message (it acknowledged to itself but the producer never heard the response). The producer, on restart, does not know whether the message was accepted. The message may be processed zero times (producer skips it, thinking it was sent) or twice (producer resends on restart).
+
+**Mitigation:** Use publisher confirms. The producer tracks which messages have confirmed ACKs and resends unconfirmed messages on recovery. The consumer must be idempotent.
+
+```
+Producer                          Broker
+   │                                │
+   │── basic.publish ──────────────►│
+   │                                │── WAL append (fsync)
+   │                                │── index insert
+   │      *** PRODUCER CRASHES ***  │
+   │                                │
+   │◄─ basic.ack (never received) ──│
+   │                                │
+   (On restart: resend unconfirmed)
+```
+
+### Crash Scenario 2: Broker Crashes After ACK to Consumer
+
+**Sequence:** Consumer sends ACK, broker receives it, but crashes before removing the message from durable storage.
+
+**Outcome:** On recovery, the broker replays the WAL and reconstructs state. The acknowledged message re-enters the queue because the tombstone was never persisted. The consumer receives the same message again.
+
+**Mitigation:** Idempotent consumers. The consumer tracks the last N processed message IDs in a local database. Before processing, it checks if it has already processed the message.
+
+```
+Consumer                          Broker
+   │                                │
+   │── basic.ack ──────────────────►│
+   │                                │── mark in-flight as deleted (memory)
+   │     *** BROKER CRASHES ***     │
+   │                                │
+   (On restart: WAL replay)
+   │                                │── message NOT tombstoned
+   │                                │── msg reappears as ready
+   │◄─ message redelivered ────────│
+```
+
+### Crash Scenario 3: Consumer Crashes During Processing
+
+**Sequence:** Consumer receives message, starts processing, crashes before sending ACK.
+
+**Outcome:** The visibility timeout expires. The message reappears in the ready queue. Another consumer picks it up.
+
+**Mitigation:** This is the intended behavior. The visibility timeout should be set to 3-5x the expected processing time. If the timeout is too short, messages time out during legitimate slow processing. If too long, consumer failures delay recovery.
+
+### State Diagram
+
+Every message exists in exactly one of five states at any moment:
+
+```
+                  ┌──────────┐
+                  │ Created  │
+                  └────┬─────┘
+                       │
+                       ▼
+                  ┌──────────┐
+          ┌──────>│  Ready   │<──────┐
+          │       └────┬─────┘       │
+          │            │             │
+          │            ▼             │
+          │       ┌──────────┐       │
+          │       │In-Flight │───────┤  (timeout, NACK + requeue)
+          │       └────┬─────┘       │
+          │            │             │
+          │            ├─────────────┤
+          │            │             │
+          │            ▼             ▼
+          │       ┌──────────┐  ┌──────────┐
+          │       │  ACK'd   │  │   DLQ    │
+          │       └──────────┘  └──────────┘
+          │            │
+          │            ▼
+          │       ┌──────────┐
+          └───────│ Deleted  │
+                  └──────────┘
+```
+
+- **Created:** Message serialized but not yet sent to broker
+- **Ready:** Message stored in broker, visible to consumers
+- **In-Flight:** Message delivered to consumer, awaiting ACK
+- **ACK'd:** Message acknowledged, awaiting compaction
+- **DLQ:** Message exceeded max delivery count
+- **Deleted:** Message physically removed from storage
+
+<AsciiDiagram
+  id="queues/02-crash-scenario"
+  title="Message State Transitions Through Crash Scenarios"
+  content={
+
+`┌───────────────────────────────────────────────────────────────────────────────┐
+│                    Message State Machine with Crash Paths                       │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+                                  ┌─────────────┐
+                         send     │             │
+                    ┌────────────>│   READY     │<──────────┐
+                    │             │             │           │
+                    │             └──────┬──────┘           │
+                    │                    │                  │
+               [Producer           [Consumer               │
+                crash]             poll]                   │
+                    │                    │                  │
+                    │             ┌──────▼──────┐           │
+                    │             │             │           │
+                    └─────────────│ IN-FLIGHT   │───────────┤
+                                  │             │timeout    │
+                                  └──────┬──────┘or NACK    │
+                                         │                  │
+                                   ┌─────┴──────┐          │
+                                   │            │          │
+                                   ▼            ▼          │
+                              ┌─────────┐ ┌─────────┐     │
+                              │         │ │         │     │
+                              │ ACK'D   │ │   DLQ   │     │
+                              │         │ │         │     │
+                              └────┬────┘ └─────────┘     │
+                                   │                      │
+                              ┌────▼────┐                 │
+                              │         │                 │
+                              │ DELETED │                 │
+                              │ (after  │                 │
+                              │ compact)│                 │
+                              └─────────┘                 │
+                                                          │
+              Crash recovery paths (dashed):              │
+              ┌─────────────────────────────┐             │
+              │ Producer crash: message is │             │
+              │   resent → may duplicate   │             │
+              │ Broker crash: in-flight    │             │
+              │   → reappears as READY     │             │
+              │ Consumer crash: timeout    │             │
+              │   → moves back to READY    │─────────────┘
+              └─────────────────────────────┘
+`
+  }
+  alt="State machine diagram showing the five message states and transitions triggered by ACKs, timeouts, NACKs, and delivery count limits"
+  caption="Every message moves through these states, with crash recovery transitions shown as dashed lines"
+/>
+
+## Performance Benchmarks
+
+The following numbers are representative of production queue systems running on modern hardware (32-core Xeon, NVMe SSD, 64 GB RAM).
+
+### In-Memory Queue
+
+| Operation | Latency (p50) | Latency (p99) | Throughput |
+|-----------|--------------|--------------|------------|
+| Enqueue   | 75 ns        | 250 ns       | 12M msg/s  |
+| Dequeue   | 70 ns        | 240 ns       | 12M msg/s  |
+| Peek      | 40 ns        | 150 ns       | 20M msg/s  |
+
+**Memory overhead per message:** 32 bytes (deque node) + 8 bytes (pointer alignment) + payload.
+
+### Disk-Backed Queue (fsync per message)
+
+| Operation | Latency (p50) | Latency (p99) | Throughput |
+|-----------|--------------|--------------|------------|
+| Enqueue   | 1.2 ms       | 8.5 ms       | 8K msg/s   |
+| Dequeue   | 0.8 ms       | 6.2 ms       | 12K msg/s  |
+| ACK       | 0.1 ms       | 1.5 ms       | 40K msg/s  |
+
+### Disk-Backed Queue (batch fsync, 1000 messages/batch)
+
+| Operation | Latency (p50) | Latency (p99) | Throughput |
+|-----------|--------------|--------------|------------|
+| Enqueue   | 0.05 ms      | 0.4 ms       | 800K msg/s |
+| Dequeue   | 0.03 ms      | 0.3 ms       | 1.2M msg/s |
+| ACK       | 0.01 ms      | 0.1 ms       | 5M msg/s   |
+
+### Key Insight: Batching Is Everything
+
+The `fsync` system call dominates disk-backed queue latency. An `fsync` call takes 0.5-5ms for a 4 KB write. Batching 1000 messages into a single `fsync` reduces the per-message cost from 1.2ms to 5 microseconds.
+
+```python
+# Without batching (slow)
+def enqueue_single(self, msg):
+    self.wal.write(msg)
+    os.fsync(self.wal.fileno())  # 2ms per message!
+    self.index.insert(msg)
+    # Total: ~2ms -> 500 msgs/sec
+
+# With batching (fast)
+def enqueue_batch(self, msgs):
+    for msg in msgs:
+        self.wal.write(msg)
+    os.fsync(self.wal.fileno())  # 2ms for 1000 messages!
+    for msg in msgs:
+        self.index.insert(msg)
+    # Total: ~3ms for 1000 -> 0.003ms per message -> 333K msgs/sec
+```
+
+## Configuration Parameters
+
+Every queue system exposes these knobs. The defaults vary, and the right values depend on your workload.
+
+### Max Queue Size
+
+Controls how many messages the queue can hold before rejecting or blocking producers.
+
+- **Unbounded:** Dangerous — memory grows until the OS runs OOM killer. Use only for development.
+- **Bounded by message count:** RabbitMQ `max-length` — default 10,000 for some policies.
+- **Bounded by total bytes:** Kafka `log.segment.bytes` and `log.retention.bytes`.
+- **Bounded by memory percentage:** RabbitMQ `vm_memory_high_watermark` — blocks producers at 40%.
+
+### Prefetch Count
+
+The maximum number of unacknowledged messages the broker sends to one consumer before waiting for ACKs.
+
+- **Prefetch = 1:** Each consumer processes one message at a time. Load is balanced evenly. Latency per message is higher because the broker waits for ACK before sending the next batch.
+- **Prefetch = 100:** A fast consumer stays busy without waiting for the broker. A slow consumer builds up unacknowledged messages. The broker stops sending to the slow consumer when it hits the limit.
+- **Prefetch = 0:** Unlimited. The consumer receives all messages as fast as the broker can send. Danger — the consumer may run out of memory.
+
+### ACK Mode
+
+Controls when the broker considers a message delivered.
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| Automatic | Broker marks delivered when sent | At-most-once, high throughput |
+| Explicit (client ACK) | Consumer explicitly ACKs | At-least-once, standard |
+| Auto with NACK | Consumer ACKs or NACKs per-message | Strict error handling |
+
+### Retention Period
+
+How long the queue keeps messages after consumption. Beyond the retention period, the broker deletes messages even if unacknowledged.
+
+- **Transient queues:** Delete on broker restart. No retention policy needed.
+- **Durable queues:** Retain until acknowledged (default). Kafka retains for 7 days by default.
+- **Time-based retention:** Delete messages older than N hours. Example: logs retained for 30 days.
+- **Size-based retention:** Delete oldest messages when total log size exceeds N GB.
+
+### Dead-Letter Configuration
+
+| Parameter | Description | Typical Value |
+|-----------|-------------|---------------|
+| `max-delivery-count` | Times a message can be redelivered before DLQ | 3-5 |
+| `dlq-name` | Target queue for dead letters | `queue-name-dlq` |
+| `dlq-routing-key` | Routing key for DLQ routing | `dlq.` + original routing key |
+
+### Visibility Timeout
+
+The duration a message remains hidden from other consumers after delivery.
+
+- **Too short:** Messages time out during legitimate processing, causing duplicates.
+- **Too long:** Failed consumers delay recovery by the full timeout duration.
+- **Rule of thumb:** Set to 3-5x the p99 processing time. If processing takes 50ms, set timeout to 250ms. If processing takes 2 seconds, set timeout to 10 seconds.
+
+```python
+# Dynamic visibility timeout — extend if processing runs long
+def process_with_heartbeat(channel, message, process_fn, timeout_ms=30000):
+    delivery_tag = message.delivery_tag
+    try:
+        result = process_fn(message.body)
+        channel.basic_ack(delivery_tag=delivery_tag)
+        return result
+    except Exception:
+        # Extend visibility — the consumer is still alive but slow
+        channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+```
+
+This covers the internal mechanics of queue systems. The architecture section examines how these components scale across multiple machines.

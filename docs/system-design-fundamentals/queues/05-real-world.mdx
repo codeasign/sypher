@@ -1,0 +1,672 @@
+---
+id: queues-real-world
+sidebar_position: 5
+title: "Queues in Production"
+description: "How Uber, Discord, Amazon, and LinkedIn use queues in production, plus open-source systems and cloud providers."
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Case Study 1: Uber — Domain-Oriented Queues for Trip Processing
+
+Uber processes millions of trips daily across 10,000+ cities. Each trip generates over 50 events: request, driver-assigned, driver-arrived, trip-started, trip-completed, payment-processed, rating-submitted. In the early architecture, all events flowed through a single monolithic service.
+
+### The Problem
+
+The monolithic trip service handled both synchronous operations (matching riders with drivers, calculating surge pricing) and asynchronous operations (sending receipts, processing payments, updating driver earnings). When the asynchronous path slowed — a payment processor API timeout — the synchronous path also degraded because both shared the same thread pool and database connections.
+
+### The Solution: Domain-Oriented Queues
+
+Uber decomposed the trip processing into domain-specific queues. Each domain team owns its queue configuration, scaling, and recovery.
+
+<AsciiDiagram
+  id="queues/05-uber"
+  title="Uber Domain-Oriented Queue Architecture"
+  content={
+
+`┌────────────────────────────────────────────────────────────────────────────────┐
+│                   Uber Domain-Oriented Queue Architecture                        │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+                    ┌──────────────────────┐
+                    │  [Trip Service]       │
+                    │  (real-time matching) │
+                    └──────────┬───────────┘
+                               │
+                      trip.completed event
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │  Event Router         │
+                    │  (lightweight relay)  │
+                    └──────┬───────┬───────┘
+                           │       │
+               ┌───────────┘       └───────────┐
+               ▼                               ▼
+     ┌──────────────────────┐        ┌──────────────────────┐
+     │ < Payment Queue >     │        │ < Earnings Queue >   │
+     │ FIFO, DLQ enabled     │        │ FIFO, DLQ enabled    │
+     │ TTL: 30 min           │        │ TTL: 1 hour          │
+     └──────────┬───────────┘        └──────────┬───────────┘
+                │                               │
+                ▼                               ▼
+     ┌──────────────────────┐        ┌──────────────────────┐
+     │ [Payment Workers]    │        │ [Earnings Workers]   │
+     │ 50 instances          │        │ 20 instances          │
+     │ Prefetch: 5           │        │ Prefetch: 10         │
+     │ Process: 200ms/msg    │        │ Process: 50ms/msg    │
+     └──────────────────────┘        └──────────────────────┘
+
+     ┌──────────────────────┐        ┌──────────────────────┐
+     │ < Notification Q >   │        │ < Analytics Queue >  │
+     │ Priority: high        │        │ Batch: 10K msgs      │
+     │ TTL: 5 min            │        │ TTL: 24 hours        │
+     └──────────┬───────────┘        └──────────┬───────────┘
+                │                               │
+                ▼                               ▼
+     ┌──────────────────────┐        ┌──────────────────────┐
+     │ [Notification Wrkrs] │        │ [Analytics Workers]  │
+     │ 500 instances         │        │ 10 instances          │
+     │ (mobile push + SMS)   │        │ (batch to data lake) │
+     └──────────────────────┘        └──────────────────────┘
+
+ Key metrics:
+ ┌─────────────────────────────────────────────────────────┐
+ │ 50M+ events/day across 15+ domain queues                 │
+ │ Payment queue: p99 = 450ms (down from 3s in monolith)   │
+ │ Analytics queue: handles batch of 100K msgs/30s flush   │
+ │ Each queue independently auto-scales workers             │
+ │ Dead-letter queue catches ~1000 poison msgs/day          │
+ └─────────────────────────────────────────────────────────┘
+`
+  }
+  alt="Architecture diagram showing the trip service fanning out events to domain-specific queues for payments, notifications, analytics, earnings, and compliance"
+  caption="Uber routes each trip event to the appropriate domain queue, isolating failures and scaling independently"
+/>
+
+### Lessons from Uber
+
+**Isolation is worth the queue count overhead.** Fifteen queues create more operational surface area than one, but a payment queue slowdown no longer blocks notifications. The cost of queue infrastructure is negligible compared to the cost of a site-wide outage.
+
+**Right-size the prefetch.** The payment queue uses prefetch=5 because a single payment operation takes 200ms and involves an external API call. If a worker crashes, at most 5 messages are re-delivered. The analytics queue uses batch consumption: 10,000 messages per poll, processed in bulk and ACKed as a group.
+
+**Dead-letter queues are not optional.** Uber's DLQ catches approximately 1,000 poison messages per day across all queues. Without it, those messages would loop continuously, wasting worker resources and delaying legitimate messages.
+
+## Case Study 2: Discord — The Message Queue Challenge
+
+Discord sends real-time messages to millions of concurrent users. Every message a user types goes through a queue before reaching the recipient. The challenge: Discord requires ordering guarantees within a channel but processes billions of messages daily.
+
+### The Architecture
+
+Each Discord server (guild) has multiple channels. Messages within a channel must be delivered in order. Messages across different channels and servers have no ordering requirements.
+
+<AsciiDiagram
+  id="queues/05-discord"
+  title="Discord Message Queue Architecture"
+  content={
+
+`┌────────────────────────────────────────────────────────────────────────────────┐
+│                    Discord Per-Channel Message Queuing                            │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+  User types in #general channel of guild "Gaming"
+
+  ┌────────────┐
+  │ [API GW]   │
+  └─────┬──────┘
+        │
+        ▼
+  ┌──────────────────────────────────────────────┐
+  │ < Kafka >                                     │
+  │ Topic: "messages"                             │
+  │ Partition key: hash(channel_id)               │
+  │                                               │
+  │ Partition 0: channel #general (Guild ABC)     │  ◄── 1 writer
+  │ Partition 1: channel #random (Guild ABC)      │       per partition
+  │ Partition 2: channel #general (Guild XYZ)     │
+  │ Partition 3: channel #off-topic (Guild XYZ)   │
+  │ Partition 4: channel #general (Guild 123)     │
+  │ ...                                            │
+  │ (500+ partitions across 50 brokers)           │
+  └──────────────────────┬───────────────────────┘
+                         │
+                         ▼
+  ┌──────────────────────────────────────────────┐
+  │ [Consumer Group: message-receivers]          │
+  │ (one consumer per partition)                  │
+  │                                               │
+  │ Partition 0 ──> Consumer A (instance 1)       │
+  │ Partition 1 ──> Consumer B (instance 1)       │
+  │ Partition 2 ──> Consumer C (instance 2)       │
+  │ Partition 3 ──> Consumer D (instance 2)       │
+  │                                               │
+  │ Each consumer delivers to WebSocket clients   │
+  │ for that channel in FIFO order                │
+  └───────────────────────────────────────────────┘
+
+  Key numbers:
+  ┌─────────────────────────────────────────────────┐
+  │ Billions of messages/day                        │
+  │ 500+ Kafka partitions                           │
+  │ Per-channel ordering maintained                 │
+  │ Cross-channel parallelism: unlimited            │
+  │ Consumer rebalance: < 30 seconds                │
+  └─────────────────────────────────────────────────┘
+`
+  }
+  alt="Diagram showing messages partitioned by channel ID, each partition processed by a single consumer for ordering, with consumer groups across multiple instances"
+  caption="Discord partitions by channel ID to guarantee per-channel message ordering while scaling horizontally"
+/>
+
+### Lessons from Discord
+
+**Partition count matters.** With 500 partitions across 50 brokers, each broker handles 10 partitions. If a broker fails, its 10 partitions rebalance to the remaining 49 brokers. Each broker picks up approximately 0.2 additional partitions — a negligible load increase.
+
+**Consumer rebalancing is visible to users.** During a rebalance, message delivery to affected channels pauses. Discord optimized its rebalance protocol (cooperative rebalancing) to reduce the pause from minutes to under 30 seconds.
+
+**Write amplification is real.** At billions of messages per day with replication factor 3, Discord writes several terabytes of message data daily. Compaction and retention policies are not optional — they prevent the cluster from filling up.
+
+## Case Study 3: Amazon SQS — The Origin of Cloud Queuing
+
+Amazon Simple Queue Service launched in 2004, before AWS existed. It was Amazon's first cloud service, predating EC2 by two years and S3 by two years. It was born from a painful internal lesson.
+
+### The Problem
+
+Amazon's internal teams built distributed systems from scratch for every project. Each team wrote their own queue implementation — different libraries, different failure modes, different management tools. A bug in one team's custom queue caused a cascading failure that took down amazon.com for several hours in 2002.
+
+### The Insight
+
+Jeff Bezos issued the now-famous API mandate: "All teams will henceforth expose their data and functionality through service interfaces. No other form of inter-process communication is allowed." The queue team built SQS as a shared service: one message queue that every team could use, eliminating the need for custom implementations.
+
+### The Architecture
+
+SQS is a distributed queue system that stores messages across multiple AWS Availability Zones. Each message is replicated to 3 AZs by default. The service exposes a simple API: `SendMessage`, `ReceiveMessage`, `DeleteMessage`.
+
+```python
+# SQS standard queue — at-least-once, high throughput
+import boto3
+
+sqs = boto3.client('sqs')
+queue_url = 'https://sqs.us-east-1.amazonaws.com/123456789012/my-queue'
+
+# Send
+sqs.send_message(
+    QueueUrl=queue_url,
+    MessageBody='{"order_id": "abc123"}',
+    DelaySeconds=0,
+)
+
+# Receive (long poll)
+response = sqs.receive_message(
+    QueueUrl=queue_url,
+    MaxNumberOfMessages=10,
+    WaitTimeSeconds=20,  # long polling saves requests
+)
+
+# Delete
+for msg in response.get('Messages', []):
+    sqs.delete_message(
+        QueueUrl=queue_url,
+        ReceiptHandle=msg['ReceiptHandle'],
+    )
+```
+
+### Lessons from Amazon
+
+**Simplicity wins.** SQS has three main operations. Developers can learn the API in 5 minutes. The simplicity drove adoption: SQS became the backbone of nearly every Amazon service.
+
+**FIFO queues are an add-on.** SQS launched with standard (at-least-once) queues. FIFO queues came years later, in 2016. The trade-off was deliberate: standard queues offer 300x more throughput for most use cases.
+
+**Billing by request is customer-friendly.** SQS charges per million requests, not per message. Empty polls cost the same as message deliveries. This billing model incentivizes long polling (20-second wait) over short polling, which reduces the load on SQS's infrastructure.
+
+## Case Study 4: LinkedIn — The Birth of Kafka
+
+In 2010, LinkedIn needed a queue system that could handle their activity stream data. The existing pipeline used batch processing — data was collected in files and processed nightly. The batch window was 12+ hours, meaning LinkedIn's "real-time" feed was actually half a day behind.
+
+### The Problem
+
+LinkedIn's activity stream pipeline:
+
+```text
+User Action → Log File → (nightly batch) → Hadoop → Hive → (12 hours later) → Web Feed
+```
+
+The CTO wanted to show activity within 60 seconds. The batch pipeline could not deliver that. Existing message queues (ActiveMQ) failed at LinkedIn's scale: the broker ran out of memory, messages were lost during network partitions, and throughput topped out at 10,000 messages/second.
+
+### The Solution: Kafka
+
+Jay Kreps, Neha Narkhede, and Jun Rao built Kafka as a distributed commit log — a queue that could handle hundreds of thousands of messages per second with persistence and replay capability.
+
+<AsciiDiagram
+  id="queues/05-linkedin"
+  title="LinkedIn Kafka Pipeline Architecture"
+  content={
+
+`┌────────────────────────────────────────────────────────────────────────────────┐
+│                   LinkedIn Kafka Pipeline (2011 Architecture)                    │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+  500M+ users
+       │
+       ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │ [Web Servers]  x 10,000+ instances                                       │
+  │ Every user action: profile view, connect, message, like, share, comment    │
+  └──────────────────────────────────────┬───────────────────────────────────┘
+                                         │
+                                  publish to topic
+                                         │
+  ┌──────────────────────────────────────▼───────────────────────────────────┐
+  │                           < Apache Kafka >                                  │
+  │                                                                             │
+  │  Topics:                                                                    │
+  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  ┌──────────┐ │
+  │  │ page_views      │  │ user_actions   │  │ search_queries  │  │ messages │ │
+  │  │ 200K msgs/sec   │  │ 150K msgs/sec  │  │ 50K msgs/sec    │  │ 10K/sec  │ │
+  │  └────────────────┘  └────────────────┘  └────────────────┘  └──────────┘ │
+  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  ┌──────────┐ │
+  │  │ profile_updates │  │ connections     │  │ notifications   │  │ signals  │ │
+  │  │ 80K msgs/sec    │  │ 30K msgs/sec    │  │ 20K msgs/sec    │  │ 5K/sec   │ │
+  │  └────────────────┘  └────────────────┘  └────────────────┘  └──────────┘ │
+  │                                                                             │
+  │  70 brokers, 10K partitions, replication factor 2                           │
+  └──────────────────────────────────────────┬──────────────────────────────────┘
+                                             │
+              ┌──────────────────────────────┼──────────────────────────────┐
+              │                              │                              │
+              ▼                              ▼                              ▼
+  ┌──────────────────────┐      ┌──────────────────────┐      ┌──────────────────────┐
+  │ [Consumer Group:     │      │ [Consumer Group:     │      │ [Consumer Group:     │
+  │  real-time feed]     │      │  search index]       │      │  notifications]      │
+  │                      │      │                      │      │                      │
+  │ Reads page_views,    │      │ Reads user_actions,  │      │ Reads notifications  │
+  │ connections topics   │      │ profile_updates      │      │ topic                │
+  │ Builds in-memory    │      │ Updates Lucene       │      │ Sends email, SMS,    │
+  │ activity graph       │      │ indexes per user     │      │ push                 │
+  │                      │      │                      │      │                      │
+  │ Latency: < 5 sec    │      │ Latency: < 30 sec    │      │ Latency: < 60 sec   │
+  └──────────────────────┘      └──────────────────────┘      └──────────────────────┘
+
+  Result: Activity feed went from 12-hour batch to sub-60-second real-time
+`
+  }
+  alt="Diagram showing user actions feeding into Kafka topics, with multiple consumer groups reading from the same log for real-time feeds, search indexing, notifications, and analytics"
+  caption="LinkedIn's Kafka pipeline replaced a 12-hour batch process with sub-60-second real-time delivery"
+/>
+
+### Lessons from LinkedIn
+
+**Log-structured storage is the key to throughput.** Kafka stores messages as an append-only log on disk. Sequential disk reads are 10x faster than random reads. A magnetic hard disk achieves 200 MB/s for sequential reads but under 1 MB/s for random reads. Kafka's design exploits this hardware reality.
+
+**Replay capability is a superpower.** Because Kafka retains messages for a configurable period (default 7 days), consumers can re-read historical data. This enables bug fixes by reprocessing old events, backfilling a new consumer, and comparing consumer results during migration.
+
+**Pull-based consumption gives consumers control.** In RabbitMQ's push model, the broker decides how fast to send. In Kafka's pull model, the consumer controls the rate. Fast consumers pull frequently. Slow consumers pull less often. This prevents broker-side backpressure tracking and simplifies the broker implementation.
+
+## Open Source Queue Systems
+
+### RabbitMQ
+
+The most widely deployed open-source message broker. Written in Erlang, RabbitMQ implements the AMQP 0-9-1 protocol and supports MQTT, STOMP, and HTTP.
+
+| Feature | Detail |
+|---------|--------|
+| Protocol | AMQP 0-9-1, AMQP 1.0 |
+| Delivery | Push (consumer subscribes) |
+| Ordering | FIFO per queue |
+| Durability | Queues: durable/transient, Messages: persistent/transient |
+| Clustering | Active-passive mirrored queues, quorum queues (Raft-based) |
+| Max size | 200 MB per message (default), configurable |
+| Throughput | 50K messages/second per queue (persistent) |
+
+```python
+# RabbitMQ — basic publish and consume
+connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+channel = connection.channel()
+channel.queue_declare(queue='hello', durable=True)
+
+# Publish
+channel.basic_publish(
+    exchange='',
+    routing_key='hello',
+    body='Hello World!',
+    properties=pika.BasicProperties(delivery_mode=2)  # persistent
+)
+
+# Consume
+def callback(ch, method, properties, body):
+    print(f"Received: {body}")
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+channel.basic_consume(queue='hello', on_message_callback=callback)
+channel.start_consuming()
+```
+
+**Best for:** Applications that need flexible routing (topic, direct, fanout exchanges), multi-protocol support, and mature operational tooling.
+
+### Amazon SQS
+
+Fully managed, serverless queue service. No infrastructure to manage. Scales automatically to handle any throughput.
+
+| Feature | Standard | FIFO |
+|---------|----------|------|
+| Throughput | Unlimited | 3,000 messages/second |
+| Ordering | Best-effort | Strict FIFO |
+| At-least-once | Yes | Yes (exactly-once with dedup) |
+| Per-message delay | Up to 15 minutes | Up to 15 minutes |
+| Max message size | 256 KB | 256 KB |
+| Retention | 4-14 days | 4-14 days |
+| Price | $0.40/million requests | $0.50/million requests |
+
+**Best for:** AWS-native applications, serverless architectures, workloads that want zero operational overhead.
+
+### ActiveMQ
+
+The Apache Foundation's JMS-compliant message broker. Supports both queue and topic semantics. ActiveMQ Classic uses a file-based journal. ActiveMQ Artemis (the modern version) uses a disk-based journal similar to Kafka's.
+
+| Feature | Detail |
+|---------|--------|
+| Protocol | OpenWire, STOMP, AMQP, MQTT |
+| Delivery | Both poll (JMS) and push |
+| Clustering | Shared store (master/slave) or replication |
+| Persistence | KahaDB (default), JDBC, LevelDB |
+
+**Best for:** Java JEE applications, organizations already in the Apache ecosystem.
+
+### ZeroMQ
+
+Not a queue broker but a networking library that provides queue-like semantics. ZeroMQ embeds directly into the application process as a library. No broker process, no central point of failure.
+
+```python
+import zmq
+
+context = zmq.Context()
+socket = context.socket(zmq.PUSH)  # producer
+socket.connect("tcp://localhost:5555")
+
+socket.send_json({"action": "process", "data": [1, 2, 3]})
+```
+
+**Best for:** Low-latency, embedded messaging where a separate broker process adds unacceptable overhead. High-frequency trading, gaming servers, in-process microservices.
+
+### Redis Lists
+
+Redis supports list operations that provide queue semantics: `LPUSH` to add, `RPOP` to remove. With `BLPOP` (blocking pop), consumers wait for messages without polling.
+
+```python
+import redis
+
+r = redis.Redis(host='localhost', port=6379)
+
+# Producer
+r.lpush('queue:jobs', '{"task": "resize_image", "path": "/tmp/img.jpg"}')
+
+# Consumer (blocking, waits up to 30 seconds for a message)
+_, job = r.brpop('queue:jobs', timeout=30)
+```
+
+**Best for:** Simple, low-latency queues within a single process or small cluster. Not durable unless Redis persistence is configured.
+
+## Cloud Queue Providers
+
+| Provider | Service | Type | Unique Features |
+|----------|---------|------|-----------------|
+| AWS | SQS | Managed queue | Serverless, unlimited scale, DLQ, delay queues |
+| AWS | SQS FIFO | Ordered queue | Exactly-once, strict ordering, 3K/s |
+| AWS | Amazon MQ | Managed ActiveMQ/RabbitMQ | Lift-and-shift for existing brokers |
+| GCP | Cloud Tasks | Managed queue | HTTP-based tasks, built-in retry |
+| GCP | Cloud Pub/Sub | Pub-sub message bus | Pull and push, exactly-once (limited) |
+| Azure | Queue Storage | Managed queue | Azure-native, large messages (64 KB) |
+| Azure | Service Bus | Enterprise queue | Sessions, topics, dead-lettering, FIFO |
+| Confluent Cloud | Kafka-as-a-Service | Managed Kafka | Exactly-once, tiered storage, Schema Registry |
+
+## Lessons Learned from Production Deployments
+
+### Lesson 1: Size Your Partitions Before Going Live
+
+Changing the partition count after data exists is expensive. Kafka does not support partition splitting. To increase partitions, you must create a new topic with more partitions and migrate consumers. A one-time migration of 500 GB takes 6-12 hours depending on network bandwidth.
+
+Pick partitions with room to grow. If you expect 500 GB/day and need 100 partitions, double it to 200 for headroom. The overhead of extra partitions is negligible compared to the cost of a partition-count migration.
+
+### Lesson 2: Always Set Consumer Timeouts
+
+A consumer that hangs on a message blocks the entire partition. All subsequent messages in that partition wait. The consumer's heartbeat timeout should be aggressive: if the consumer does not respond to heartbeats in 6-10 seconds, the broker should revoke its partitions and reassign them.
+
+```properties
+# Kafka consumer configuration
+session.timeout.ms=10000
+heartbeat.interval.ms=3000
+max.poll.interval.ms=300000
+```
+
+### Lesson 3: Monitor Consumer Lag, Not Queue Depth
+
+Queue depth tells you how many messages are pending. Consumer lag tells you how far behind the consumer is in real time. A queue with 1 million messages is fine if the consumer processes 10,000/second (lag = 100 seconds). A queue with 10,000 messages is critical if the consumer processes 10/second (lag = 1,000 seconds).
+
+```python
+# Consumer lag monitoring (Kafka)
+from kafka import KafkaConsumer
+consumer = KafkaConsumer(bootstrap_servers=['broker:9092'])
+
+# Get end offsets (latest) and consumer offsets (current position)
+end_offsets = consumer.end_offsets(partitions)
+current_offsets = {p: consumer.position(p) for p in partitions}
+
+lag = {p: end_offsets[p] - current_offsets[p] for p in partitions}
+# Alert if any partition lag exceeds threshold
+```
+
+### Lesson 4: Test Your Failure Scenarios
+
+Every queue system behaves differently under network partitions, broker crashes, and consumer failures. Test these scenarios before production:
+
+```bash
+# Simulate a broker crash
+kill -9 <broker-pid>
+
+# Simulate network partition
+iptables -A INPUT -s <broker-ip> -j DROP
+
+# Simulate slow consumer
+# Run consumer with sleep(30) in the processing loop
+
+# Simulate poison message
+# Send a message that causes consumer to crash with NullPointerException
+```
+
+### Lesson 5: Have a Plan for Queue Draining
+
+When decommissioning a queue, you need to drain all pending messages before turning it off. A queue health endpoint should report:
+
+```json
+{
+  "queue_name": "user-signup",
+  "messages_ready": 0,
+  "messages_in_flight": 0,
+  "messages_dlq": 0,
+  "last_message_age_seconds": 600,
+  "consumer_count": 5,
+  "consumer_lag": 0,
+  "drain_status": "COMPLETE"
+}
+```
+
+Do not delete a queue until all messages are consumed and producers have been redirected.
+
+### Lesson 6: Network Partitions Are Not Optional — Plan for Them
+
+Every queue system experiences network partitions. In a 100-node cluster, a single switch failure isolates 10 brokers. The remaining 90 brokers see 10 brokers as offline. Leader elections trigger. If the isolated group contains partition leaders, writes to those partitions block until the partition heals and the leader rejoins the ISR.
+
+Standard mitigation: run Kafka with a minimum ISR count lower than the replication factor. If RF=3 and min.insync.replicas=2, a single broker failure leaves 2 ISRs — writes continue. Two broker failures in the same partition leave 1 ISR — writes block. This is the correct behavior: the system prefers consistency over availability for those partitions.
+
+### Lesson 7: Message Payloads Grow Over Time
+
+No team plans for message schema evolution. A queue initially carries `{"user_id": 123, "action": "login"}`. Six months later, the same queue carries `{"user_id": 123, "action": "login", "device": "iPhone 17", "ip": "203.0.113.42", "user_agent": "...", "session_duration_ms": 45000, "app_version": "4.2.1", "experiment_group": "treatment-B"}`. The payload grew from 60 bytes to 450 bytes. At 100 million messages/day, storage went from 6 GB/day to 45 GB/day.
+
+**Defense:** (1) Enforce a schema registry that requires approval for new fields. (2) Separate metadata from payload — put large blobs in object storage, pass only the reference in the queue. (3) Monitor average message size and alert on growth above 20% month-over-month.
+
+### Lesson 8: Batch Operations Are Not Atomic
+
+A consumer that fetches 10 messages from SQS, processes all 10, and deletes all 10 in a single batch risks partial failure. If messages 1-5 succeed and the delete call fails (network blip), messages 1-5 reappear and are reprocessed. If the operation is not idempotent, this causes data corruption.
+
+**Defense:** Either delete each message individually after processing it (safe but higher API cost), or include an idempotency key in each message and use it during processing to detect duplicates from batch failures.
+
+## Tools for Production Queue Operations
+
+Beyond the queue system itself, operations teams rely on these tools:
+
+**Offset management tools:** `kafka-consumer-groups` CLI for resetting consumer group offsets. The most common operation during incident recovery: resetting a consumer group to the earliest or latest offset to reprocess or skip messages.
+
+```bash
+# Reset consumer group to earliest offset (reprocess all messages)
+kafka-consumer-groups --bootstrap-server broker:9092 \
+  --group my-consumer-group \
+  --topic my-topic \
+  --reset-offsets --to-earliest --execute
+
+# Reset to latest offset (skip all pending messages, start fresh)
+kafka-consumer-groups --bootstrap-server broker:9092 \
+  --group my-consumer-group \
+  --topic my-topic \
+  --reset-offsets --to-latest --execute
+```
+
+**Drag-and-drop message inspection:** RabbitMQ Management UI provides per-queue message browsing. Operators can view the payload of the first N messages, re-queue messages from the DLQ, and manually publish test messages. This is invaluable during debugging — the alternative is writing throwaway consumer code.
+
+**Queue fencing:** A fence token prevents a partitioned consumer from continuing to write after the leader has revoked its partition. Kafka implements this through a monotonically increasing epoch number per partition. When a new leader is elected, it increments the epoch. Any producer or consumer with a stale epoch is rejected.
+
+**Load testing tools:** Apache JMeter with the Kafka plugin, or the `kafka-producer-perf-test.sh` and `kafka-consumer-perf-test.sh` scripts included with Kafka. These measure throughput and latency under controlled load.
+
+```bash
+# Producer performance test: 10M messages, 100 bytes each, acks=all
+kafka-producer-perf-test.sh \
+  --topic test-topic \
+  --num-records 10000000 \
+  --record-size 100 \
+  --throughput -1 \
+  --producer-props acks=all bootstrap.servers=broker:9092
+```
+
+### Lesson 9: Plan for Queue Drain During Incident Recovery
+
+When a consumer bug causes a backlog of 2 million messages, the fastest recovery is often to skip the backlog and process new messages. But skipping the backlog means losing those messages permanently. The standard playbook:
+
+```text
+Phase 1 — Stop the bleeding:
+  - Pause the consumer group committing offsets.
+  - Identify whether the backlogged messages are still valuable.
+  - If yes, copy them to a cold storage bucket for later replay.
+
+Phase 2 — Resume normal processing:
+  - Reset consumer group offsets to latest (skip the backlog).
+  - Verify message processing is working correctly on new messages.
+  - Monitor consumer lag and error rate.
+
+Phase 3 — Replay backlog:
+  - Create a new consumer group that reads from the earliest offset.
+  - Process backlogged messages in a separate worker pool.
+  - Merge results (if necessary) with messages processed during Phase 2.
+  - Verify parity: backlog messages processed equals backlog messages skipped.
+```
+
+This playbook assumes the consumer code is idempotent. If it is not, Phase 3 must deduplicate against the data produced during Phase 2.
+
+### Lesson 10: Noisy Neighbor Problem
+
+In a shared Kafka cluster, one team's high-throughput topic can degrade another team's latency. The noisy neighbor produces 500 MB/s of log data, saturating the broker's network bandwidth. Other teams see increased fetch latency because their fetch requests wait behind the noisy neighbor's data.
+
+**Mitigation strategies ranked by effectiveness:**
+
+1. **Client quotas (best for most clusters):** Set per-client produce and fetch throughput limits. Kafka enforces quotas by throttling the client's requests — the client sees increased latency but the broker stays balanced. Configure via `kafka-configs.sh`:
+
+```bash
+# Limit client "team-a" to 100 MB/s produce throughput
+kafka-configs.sh --bootstrap-server broker:9092 \
+  --alter --add-config 'producer_byte_rate=104857600' \
+  --entity-name team-a --entity-type clients
+```
+
+2. **Dedicated brokers for high-throughput teams:** Physically separate the noisy team onto their own brokers. This provides complete isolation but wastes capacity during the team's off-peak hours.
+
+3. **Separate cluster for data-intensive workloads:** The most expensive option but the cleanest isolation. The data lake team gets their own Kafka cluster. The serving team keeps their low-latency cluster. Cross-cluster replication (MirrorMaker) bridges the two if needed.
+
+### Lesson 11: Schema Evolution Failures
+
+A team adds a required field `customer_email` to the message schema. All producers are updated before the deployment. All consumers are updated during the same deployment window. But consumer instances are rolled out gradually over 10 minutes. For 10 minutes, new producers send messages with `customer_email`, and old consumers receive messages with the new field. The old consumers crash because their deserialization code does not handle the new field.
+
+The root cause: producer and consumer schema changes were not coordinated. The correct approach:
+
+```text
+Bad rollout:
+  T=0: All producers deploy with new schema  (crash)
+  T=0 to T=10: Old consumers crash on new messages  (outage)
+  T=10: All consumers finish rollout  (resolved)
+
+Correct rollout (backward-compatible change):
+  T=0: Deploy consumers to ignore unknown fields  (safe)
+  T=0 to T=30: Verify no consumer errors  (monitoring)
+  T=30: Deploy producers with new field  (safe)
+  T=60: Deploy consumers that USE the new field  (complete)
+```
+
+The rule: producers must never send fields that consumers cannot ignore. Use a schema registry with backward-compatibility checks. Avro and Protobuf both support this — a consumer that expects fields `{a, b}` can safely receive a message with fields `{a, b, c}` if the consumer is configured to ignore unknown fields.
+
+## Production Incident Timeline
+
+Here is a real incident timeline from a queue outage at a large tech company, reconstructed from public postmortems:
+
+```text
+14:02 — Automated deploy of consumer v2.1.0 begins.
+14:05 — Consumer instances start crashing with NullPointerException.
+         Root cause: v2.1.0 assumes a non-null field that
+         was null in 0.1% of messages.
+14:07 — Consumer group rebalancing triggers as crashed instances
+         drop out and Kubernetes restarts them.
+14:09 — Dead-letter queue receives 5,000 messages per second.
+14:11 — Restart loop: consumer starts, picks up message from
+         the pending queue, crashes on the null field, restarts.
+14:12 — 150 consumer instances are in a restart loop.
+14:13 — 2M messages accumulate in the queue.
+14:14 — On-call engineer gets paged (DLQ alert).
+14:16 — Engineer identifies the bad deployment and initiates rollback.
+14:18 — Rollback completes. Consumer v2.0.3 restarts cleanly.
+14:20 — Consumer group rebalances. Consumers begin processing backlog.
+14:25 — Backlog of 2M messages starts draining at 10K msg/s.
+14:55 — Backlog fully drained. Queue depth returns to normal.
+14:56 — Engineer moves 15,000 DLQ messages back to the main queue
+         for reprocessing (those were kill-off payments).
+15:10 — All payments processed. Incident resolved.
+
+Duration: 68 minutes (14:02 to 15:10)
+Messages lost: 0
+Payments delayed: 15,000
+Root cause: Missing null check in consumer v2.1.0
+Fix: Add null check, add test for null field scenario, add monitoring
+     on consumer crash rate with auto-rollback if crash rate exceeds 5%.
+
+### Lesson 12: Capacity Planning for Queue Growth
+
+Plan for 3x the current throughput, not 1.5x. Queue traffic tends to grow faster than other infrastructure because queues enable new asynchronous features. Teams that adopt a queue for one use case (email sending) discover new use cases (search indexing, notification delivery, data analytics, event streaming). Each use case adds throughput.
+
+A realistic growth trajectory:
+
+```text
+Year 1:  10K msgs/sec (initial: email sending only)
+Year 2:  50K msgs/sec (add: search indexing, notifications)
+Year 3: 200K msgs/sec (add: analytics pipeline, event streaming)
+```
+
+The queue system chosen in Year 1 must handle Year 3's throughput. Kafka handles this growth well — add brokers and partitions as throughput increases. SQS handles it transparently — no infrastructure changes needed. RabbitMQ requires careful partition planning and may need a cluster migration at 100K msgs/sec.
+
+Storage plan for Year 3 (200K msgs/sec, 2 KB each, RF=3, 7-day retention):
+
+```text
+Daily ingest: 200,000 * 2 KB * 86,400 = 34.6 TB/day
+With RF=3: 104 TB/day written to disk
+After compression (3:1): 34.6 TB/day
+7-day retention: 242 TB
+Brokers: 15, each with 16 TB storage (8 x 2 TB NVMe)
+Network: 34.6 TB/day = 3.2 Gbps — comfortable on 25 Gbps NICs
+```
+```
+
+Key takeaway: the DLQ prevented the poison messages from blocking the main queue. Without it, the restart loop would have continued indefinitely. The 15,000 DLQ messages were recovered by re-enqueuing them — a 10-line script that took 14 minutes to run.

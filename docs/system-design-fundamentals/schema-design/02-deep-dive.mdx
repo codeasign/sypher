@@ -1,0 +1,810 @@
+---
+id: schema-design-deep-dive
+title: Schema Design -- Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+Schema design is visible at the logical layer (tables, columns, constraints), but its impact runs all the way down to the physical storage layer. Understanding how the database stores schema-defined data explains why certain schema choices perform better than others.
+
+### Row Storage vs Columnar Storage
+
+The same schema can be stored in two fundamentally different ways.
+
+**Row-oriented storage** (PostgreSQL, MySQL, SQL Server): All columns of a row are stored contiguously on disk. Reading a single row is fast because the data is in one place. Reading a single column across many rows is slow because the database must skip past all the other columns to find the requested one.
+
+```
+Row-oriented:  [row1: col1 | col2 | col3][row2: col1 | col2 | col3][row3: ...]
+```
+
+**Columnar storage** (ClickHouse, Redshift, BigQuery): Each column is stored separately on disk. Reading a single column across many rows is fast because the data is contiguous. Reading an entire row is slow because the database must gather data from multiple column files.
+
+```
+Columnar:  [col1: row1 | row2 | row3 | ...][col2: row1 | row2 | row3 | ...]
+```
+
+<AsciiDiagram
+  id="schema-design/deep-dive-storage"
+  title="Row-oriented vs columnar storage layout for the same schema"
+  alt="Side-by-side comparison: left side shows row storage with three rows stored contiguously, right side shows columnar storage with each column stored as a separate block"
+  caption="Row storage (left) stores all columns together; columnar storage (right) stores each column separately"
+  content={`Row storage vs columnar storage
+
+  Schema: orders(order_id INT, customer_id INT, amount DECIMAL, status VARCHAR)
+
+  Row-oriented storage (InnoDB / PostgreSQL):
+  ┌────────────────────────────────────────────────────────┐
+  │ Page 1                                                   │
+  │ ┌─────────────────────────────────────────────────────┐  │
+  │ │ Row 1: [1 | 42 | 29.99 | 'shipped']                 │  │
+  │ │ Row 2: [2 | 17 | 149.50 | 'pending']                │  │
+  │ │ Row 3: [3 | 88 | 9.99 | 'delivered']                 │  │
+  │ │ Row 4: [4 | 42 | 499.00 | 'processing']              │  │
+  │ └─────────────────────────────────────────────────────┘  │
+  │ Read one row: 1 page access                              │
+  │ Sum amount across all rows: requires reading ALL columns │
+  └────────────────────────────────────────────────────────┘
+
+  Columnar storage (ClickHouse / Redshift):
+  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────────────┐
+  │ order_id    │  │ customer_id │  │ amount      │  │ status       │
+  ├─────────────┤  ├─────────────┤  ├─────────────┤  ├──────────────┤
+  │ 1           │  │ 42          │  │ 29.99       │  │ 'shipped'    │
+  │ 2           │  │ 17          │  │ 149.50      │  │ 'pending'    │
+  │ 3           │  │ 88          │  │ 9.99        │  │ 'delivered'  │
+  │ 4           │  │ 42          │  │ 499.00      │  │ 'processing' │
+  └─────────────┘  └─────────────┘  └─────────────┘  └──────────────┘
+  │ Sum amount: read 1 column only                           │
+  │ Read full row 3: read 4 column files, 4 page accesses    │
+  └────────────────────────────────────────────────────────┘
+
+  Row-storage wins: point lookups, OLTP, frequent INSERT/UPDATE
+  Columnar wins:   aggregations, OLAP, SELECT on few columns
+`}
+/>
+
+### Page Layouts
+
+Row-oriented databases organize data into pages (typically 8KB or 16KB blocks). The schema determines how many rows fit on a page, which directly affects cache efficiency and I/O.
+
+A table with `INT (4 bytes) + VARCHAR(255) (up to 255 bytes) + DECIMAL(10,2) (8 bytes)` has a narrow row. If the row is approximately 100 bytes on average, approximately 80 rows fit on an 8KB page. Scanning 1,000 rows requires reading 13 pages. The entire table might fit in the buffer pool.
+
+A table with `TEXT (up to 1GB) + JSONB + BYTEA` has wide rows. Each row might span multiple pages. Scanning 1,000 rows requires reading thousands of pages. The table spills to disk quickly.
+
+```sql
+-- Narrow schema: high row density per page
+CREATE TABLE fast_scan (
+    id        INT PRIMARY KEY,
+    status    CHAR(1) NOT NULL,
+    amount    DECIMAL(10,2) NOT NULL
+);
+-- Approximately 200 rows per 8KB page
+
+-- Wide schema: low row density per page
+CREATE TABLE slow_scan (
+    id        INT PRIMARY KEY,
+    raw_data  TEXT NOT NULL,
+    metadata  JSONB,
+    log_blob  BYTEA
+);
+-- 1-2 rows per 8KB page, possibly using TOAST for overflow
+```
+
+### TOAST for Large Values
+
+PostgreSQL and some other databases use TOAST (The Oversized-Attribute Storage Technique) to handle large column values that exceed the page size. When a row with a large value is stored, the large value is compressed, moved to a separate TOAST table, and replaced with a pointer in the original row.
+
+<AsciiDiagram
+  id="schema-design/deep-dive-toast"
+  title="TOAST storage: how large column values are stored separately from the main row"
+  alt="Diagram showing a main table row with a TOAST pointer, and a separate TOAST table storing the large value as chunks with compression; the SELECT that requests the large column follows the pointer to the TOAST table"
+  caption="TOAST moves large values to a separate storage area; queries that do not select TOAST columns avoid the extra I/O"
+  content={`TOAST (The Oversized-Attribute Storage Technique)
+
+  Main table page (8KB):
+  ┌────────────────────────────────────────────────────────┐
+  │  ┌─────────┬──────────┬──────────┬──────────────────┐  │
+  │  │ id (INT)│ name     │ price    │ description (TEXT)│  │
+  │  │         │ (VARCHAR)│ (DECIMAL)│                   │  │
+  │  ├─────────┼──────────┼──────────┼──────────────────┤  │
+  │  │    1    │ 'Widget' │  9.99    │ TOAST pointer    │  │
+  │  │    2    │ 'Gadget' │ 14.99    │ TOAST pointer    │  │
+  │  │    3    │ 'Doohick'│ 24.99    │ TOAST pointer    │  │
+  │  │    4    │ 'Thing'  │ 49.99    │ TOAST pointer    │  │
+  │  └─────────┴──────────┴──────────┴──────────────────┘  │
+  │  Main row stays small: 4 rows fit on 1 page             │
+  └────────────────────────────────────────────────────────┘
+         │
+         │  TOAST pointer chain
+         ▼
+  TOAST table (separate storage):
+  ┌────────────────────────────────────────────────────────┐
+  │  ┌────────────┬────────┬────────────────────────────┐  │
+  │  │ chunk_id   │ seq    │ chunk_data (compressed)     │  │
+  │  ├────────────┼────────┼────────────────────────────┤  │
+  │  │ row1_desc  │   0    │ "This widget is a high-qua… │  │
+  │  │ row1_desc  │   1    │ "lity device that does…"   │  │
+  │  │ row2_desc  │   0    │ "The latest gadget with…"  │  │
+  │  │ row3_desc  │   0    │ "A doohickey for all…"     │  │
+  │  └────────────┴────────┴────────────────────────────┘  │
+  │  Each chunk is typically 2000 bytes after compression   │
+  └────────────────────────────────────────────────────────┘
+
+  Query behavior:
+  SELECT id, name FROM products;
+  → Scans main table only. No TOAST access. 1 page read. 0.05ms.
+
+  SELECT id, name, description FROM products WHERE id = 1;
+  → Reads main row (1 page) + follows TOAST pointer (1 page)
+  → 2 pages read. 0.1ms — still fast for a single row.
+
+  SELECT description FROM products;
+  → Sequential scan of main table + TOAST table
+  → 1 main page + 1 TOAST page = 2 pages for 4 rows
+  → With 1M rows: 250K main pages + 250K TOAST pages = 500K total
+  → This is where TOAST hurts: scanning ALL descriptions is slow.
+`}
+/>
+
+Schema design determines which values trigger TOAST:
+
+- `VARCHAR(100)` with a 90-character string -- stays inline.
+- `VARCHAR(100)` with a 90-character string and a 10MB JSONB column -- the JSONB goes to TOAST.
+- `TEXT` with a 100KB document -- goes to TOAST.
+
+TOAST has performance implications. Reading a TOAST value requires an additional disk seek to the TOAST table. A query that selects 1,000 rows and accesses a TOAST column on each row issues 1,000 additional random I/O operations. If the query does not select the TOAST column, there is no penalty.
+
+```sql
+-- This query never touches TOAST -- fast sequential scan
+SELECT id, name FROM products;
+
+-- This query reads TOAST for every row -- slow per-row I/O
+SELECT id, name, description FROM products;
+```
+
+Designing the schema to minimize TOAST accesses on hot paths improves query performance significantly. Keep frequently accessed columns narrow. Move large infrequently-accessed columns (logs, raw data, images) to separate tables entirely.
+
+---
+
+## Data Structures and Algorithms
+
+### ER-to-Relational Mapping Algorithm
+
+Converting an ER diagram to a set of CREATE TABLE statements follows a deterministic algorithm.
+
+```
+Algorithm: ER-to-Relational Mapping
+
+Input:  ER diagram with entities E, relationships R, attributes A
+Output: Set of relational tables with columns, PKs, FKs, constraints
+
+For each entity E:
+    Create table T with columns for each attribute in E
+    Set PK = primary key attribute(s) of E
+    Add NOT NULL for mandatory attributes
+
+For each relationship R between entities E1 and E2:
+    Case 1: 1:1 relationship
+        Add FK in T1 pointing to T2 (or vice versa)
+        Add UNIQUE constraint on the FK
+
+    Case 2: 1:N relationship
+        Add FK in the table on the N-side
+        Example: Order has FK customer_id referencing Customer
+
+    Case 3: M:N relationship
+        Create junction table T_join
+        Add FKs referencing both T1 and T2
+        Composite PK = (FK1, FK2)
+
+For each weak entity E_w (depends on another entity):
+    Include the parent's PK as part of E_w's composite PK
+    Add FK with ON DELETE CASCADE
+
+For each multivalued attribute A_mv:
+    Create separate table with FK to parent entity
+    PK = (parent_PK, attribute_value)
+
+For each derived attribute A_d:
+    Omit or add as computed column (optional)
+```
+
+### Relationship Resolution Strategies
+
+**Junction tables** resolve many-to-many relationships. A junction table contains two foreign keys and zero or more additional attributes describing the relationship itself.
+
+```sql
+-- Many-to-many: Student <-> Course, with grade as relationship attribute
+CREATE TABLE Enrollment (
+    student_id  INTEGER REFERENCES Student(student_id),
+    course_id   INTEGER REFERENCES Course(course_id),
+    grade       CHAR(2),
+    enrolled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (student_id, course_id)
+);
+```
+
+**Foreign key patterns** for one-to-many relationships vary by cardinality and optionality.
+
+```sql
+-- Mandatory one-to-many: FK is NOT NULL
+-- Every order must belong to a customer
+CREATE TABLE Orders (
+    order_id    SERIAL PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES Customer(customer_id),
+    order_date  DATE NOT NULL
+);
+
+-- Optional one-to-many: FK is NULLable
+-- A product may or may not be assigned to a category
+CREATE TABLE Product (
+    product_id  SERIAL PRIMARY KEY,
+    category_id INTEGER REFERENCES Category(category_id),
+    name        VARCHAR(100) NOT NULL
+);
+```
+
+### Inheritance Mapping
+
+Object-oriented languages use inheritance. Relational databases do not. Three patterns map inheritance hierarchies to tables.
+
+**Single-table inheritance**: One table for the entire hierarchy. All attributes of all subclasses go into one table. Columns for attributes not present in a given row are NULL.
+
+```
+Table: Animal
+Columns: id, type, name, species, wing_span, fin_count, leg_count
+Row for bird:  type='Bird', wing_span=2.5, fin_count=NULL, leg_count=2
+Row for fish:  type='Fish', wing_span=NULL, fin_count=5, leg_count=NULL
+```
+
+Pro: Simple, no joins, easy to query across all types.
+Con: Many NULL columns. Table grows wide. Constraints are hard to enforce per subclass.
+
+**Class-table inheritance**: One table for the base class plus one table per subclass. Each subclass table references the base table.
+
+```
+Table: Animal (id, name, species)
+Table: Bird (id FK->Animal, wing_span, leg_count)
+Table: Fish (id FK->Animal, fin_count)
+```
+
+Pro: No wasted NULL columns. Schema matches the class hierarchy.
+Con: Requires JOIN for any query. More tables to manage.
+
+**Concrete-table inheritance**: One table per concrete subclass. No base table.
+
+```
+Table: Bird (id, name, species, wing_span, leg_count)
+Table: Fish (id, name, species, fin_count)
+```
+
+Pro: Fully normalized. No joins for single-type queries.
+Con: Duplicated columns across tables. Changing a base attribute requires updating all tables. No easy way to query across all types.
+
+<AsciiDiagram
+  id="schema-design/deep-dive-inheritance"
+  title="Three inheritance mapping strategies compared"
+  alt="Three tables showing the same Animal hierarchy: single-table puts all columns in one table with NULLs, class-table uses a base table plus subclass tables with FKs, concrete-table uses separate tables with duplicated columns"
+  caption="Three inheritance mapping patterns for the Animal hierarchy in a relational schema"
+  content={`Inheritance Mapping Patterns (Animal hierarchy)
+
+  1. Single-Table Inheritance (one table, many NULLs):
+  ┌───────────────────────────────────────────────────────────┐
+  │  id │ type  │ name  │ wing_span │ fin_count │ leg_count  │
+  ├───────────────────────────────────────────────────────────┤
+  │ 1   │ Bird  │ Eagle │ 2.5       │ NULL      │ 2          │
+  │ 2   │ Fish  │ Salmon│ NULL      │ 5         │ NULL       │
+  │ 3   │ Bird  │ Hawk  │ 1.2       │ NULL      │ 2          │
+  │ 4   │ Fish  │ Tuna  │ NULL      │ 3         │ NULL       │
+  └───────────────────────────────────────────────────────────┘
+  50% of cells are NULL -- wasted storage, confusing schema.
+
+  2. Class-Table Inheritance (base + sub tables):
+  ┌──────────────────┐  ┌───────────────────┐  ┌───────────────────┐
+  │ Animal (base)    │  │ Bird (subclass)   │  │ Fish (subclass)   │
+  ├──────────────────┤  ├───────────────────┤  ├───────────────────┤
+  │ id (PK)          │  │ id (FK->Animal)   │  │ id (FK->Animal)   │
+  │ name             │  │ wing_span         │  │ fin_count         │
+  │ species          │  │ leg_count         │  │                   │
+  └──────────────────┘  └───────────────────┘  └───────────────────┘
+  No NULLs. Need JOIN to query full data.
+
+  3. Concrete-Table Inheritance (separate tables):
+  ┌───────────────────┐  ┌───────────────────┐
+  │ Bird              │  │ Fish              │
+  ├───────────────────┤  ├───────────────────┤
+  │ id (PK)           │  │ id (PK)           │
+  │ name              │  │ name              │
+  │ species           │  │ species           │
+  │ wing_span         │  │ fin_count         │
+  │ leg_count         │  │                   │
+  └───────────────────┘  └───────────────────┘
+  No joins per type. But duplicated name/species columns.
+`}
+/>
+
+### Schema Migration Algorithms
+
+Schema changes alter the structure of existing tables. Safe migration requires understanding the database's locking behavior.
+
+```sql
+-- Migration 001: Add a column
+-- PostgreSQL: ALTER TABLE acquires ACCESS EXCLUSIVE lock (blocks all access)
+-- But adding a nullable column with no default is O(1) in PostgreSQL 11+
+-- Adding a column with a default rewrites the entire table (O(n))
+ALTER TABLE orders ADD COLUMN tracking_number VARCHAR(50);
+ALTER TABLE orders ADD COLUMN priority INTEGER DEFAULT 0; -- table rewrite!
+
+-- Migration 002: Change a column type
+-- Requires a full table rewrite (O(n)). Table is locked for writes.
+ALTER TABLE products ALTER COLUMN price TYPE NUMERIC(12,2);
+
+-- Migration 003: Add a NOT NULL constraint
+-- Fast if the column has no NULLs (PostgreSQL 11+).
+-- SLOW if there are NULLs -- must scan the table first to verify.
+ALTER TABLE customers ALTER COLUMN email SET NOT NULL;
+
+-- Migration 004: Add a foreign key
+-- PostgreSQL validates the FK in two phases:
+-- Phase 1: Add constraint as NOT VALID (no lock, no validation)
+-- Phase 2: VALIDATE CONSTRAINT (requires shared lock, scans both tables)
+ALTER TABLE orders ADD CONSTRAINT fk_customer
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT fk_customer;
+```
+
+The expand-migrate-contract pattern for zero-downtime migrations works in three phases:
+
+```
+Phase 1 (Expand): Add new columns/tables. Old code still works.
+Phase 2 (Migrate): Backfill data. Write to both old and new locations.
+Phase 3 (Contract): Remove old columns/tables. Only new code runs.
+```
+
+---
+
+## The Query Lifecycle
+
+Schema design affects every stage of query execution. Compare a well-designed schema against a poorly-designed one on the same query: find all orders for customer 42 placed in January 2024.
+
+### Well-Designed Schema
+
+```sql
+CREATE TABLE orders (
+    order_id    SERIAL PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customers(customer_id),
+    order_date  DATE NOT NULL,
+    total       DECIMAL(10,2) NOT NULL,
+    status      VARCHAR(20) NOT NULL
+);
+CREATE INDEX idx_orders_customer_date ON orders(customer_id, order_date);
+
+-- Query
+SELECT * FROM orders WHERE customer_id = 42 AND order_date >= '2024-01-01' AND order_date < '2024-02-01';
+```
+
+Execution plan: Index Scan on idx_orders_customer_date. Find the B-tree entry for (42, '2024-01-01'). Scan forward until customer_id changes or date exceeds January. Estimated 15 rows examined. Estimated cost: 0.03ms.
+
+### Poorly-Designed Schema
+
+```sql
+CREATE TABLE orders (
+    id          TEXT PRIMARY KEY,  -- UUID as TEXT! No auto-increment
+    customer    VARCHAR(50),       -- No FK constraint
+    placed      VARCHAR(20),       -- Date stored as text!
+    amount      VARCHAR(20),       -- Amount stored as text!
+    info        TEXT               -- Everything else stuffed here
+);
+-- No index on customer or placed
+
+-- Query
+SELECT * FROM orders WHERE customer = '42' AND placed LIKE '2024-01%';
+```
+
+Execution plan: Sequential Scan on orders. For each row: cast customer to text comparison, parse `placed` string and compare prefix. Must scan 10 million rows. Estimated cost: 120,000ms.
+
+<AsciiDiagram
+  id="schema-design/deep-dive-query-lifecycle"
+  title="Query execution path: well-designed vs poorly-designed schema"
+  alt="Side-by-side execution plans: left shows an index seek on a composite B-tree touching 15 leaf pages, right shows a sequential scan of a full table touching all pages and performing string operations on each row"
+  caption="A well-designed schema enables index seeks (left); a poorly-designed schema forces full table scans (right)"
+  content={`Query lifecycle comparison
+
+  Query: "Find customer 42's orders from January 2024"
+
+  Well-designed schema (INT PK, DATE type, FK, composite index):
+
+  ┌─────────────────────────────────────────────────────┐
+  │  1. Parse query                                     │
+  │  2. Optimizer identifies index on (customer_id,     │
+  │     order_date)                                      │
+  │  3. B-tree lookup: seek to (42, '2024-01-01')       │
+  │  4. Scan forward: 12 rows match                     │
+  │  5. Fetch rows from heap (clustered index)           │
+  │  6. Filter: already satisfied by index              │
+  │  7. Return 12 rows                                  │
+  │                                                      │
+  │  Total I/O: 3 index pages + 2 heap pages            │
+  │  Total time: 0.08ms                                 │
+  └─────────────────────────────────────────────────────┘
+
+  Poorly-designed schema (TEXT PK, VARCHAR dates, no FKs):
+
+  ┌─────────────────────────────────────────────────────┐
+  │  1. Parse query                                     │
+  │  2. Optimizer: no usable index -- sequential scan    │
+  │  3. Start scanning data from first page              │
+  │  4. Load page 1: 80 rows                             │
+  │  5. For each row: compare customer = '42' (string)  │
+  │  6. For matches: parse placed date with LIKE         │
+  │  7. Load page 2: 80 rows                             │
+  │  8. ... (repeat for all 125,000 pages)              │
+  │                                                      │
+  │  Total I/O: 125,000 pages scanned                   │
+  │  Total time: 85,000ms (approximately 85 seconds)     │
+  └─────────────────────────────────────────────────────┘
+`}
+/>
+
+The ten stages of the query lifecycle show how schema choices cascade:
+
+1. **Parse**: The database parses the SQL text into a parse tree. Same cost for both schemas.
+2. **Bind**: The database resolves table and column names against the schema catalog. The well-designed schema has clear types; the poorly-designed schema requires implicit casts.
+3. **Optimize**: The optimizer calculates the cheapest execution plan. Well-designed schema: index scan available. Poorly-designed schema: only sequential scan.
+4. **Plan**: The plan is generated and stored (or cached). Well-designed: index scan of 3 pages. Poorly-designed: full table scan of 125,000 pages.
+5. **Execute -- locate**: For the index scan, navigate the B-tree in O(log n). For the sequential scan, start reading from the first data page.
+6. **Execute -- read**: For the index scan, read 3 index pages and 2 heap pages. For the sequential scan, read every page in the table.
+7. **Execute -- filter**: For the index scan, the index condition filters to exactly the matching rows. For the sequential scan, evaluate `customer = '42'` and `placed LIKE '2024-01%'` on every row.
+8. **Execute -- produce**: For the index scan, return fetched rows. For the sequential scan, return the 12 matching rows after discarding 9,999,988 non-matching rows.
+9. **Clean up**: Release locks, update buffer pool statistics.
+10. **Return**: Send result set to client.
+
+The well-designed schema completes in under 1 millisecond. The poorly-designed schema takes 85 seconds on a 10-million-row table. The same data. The same query. The only difference is the schema.
+
+---
+
+## Consistency and State
+
+### Schema Enforcement at DB Level vs Application Level
+
+Schema enforcement can happen at two layers, with dramatically different reliability.
+
+**Database-level enforcement**: The database rejects operations that violate constraints.
+
+```sql
+-- DB enforces: NOT NULL
+INSERT INTO customers (email) VALUES (NULL);
+-- ERROR: null value in column "email" violates NOT NULL constraint
+
+-- DB enforces: UNIQUE
+INSERT INTO products (sku) VALUES ('ABC-123');
+INSERT INTO products (sku) VALUES ('ABC-123');
+-- ERROR: duplicate key value violates unique constraint
+
+-- DB enforces: FOREIGN KEY
+INSERT INTO orders (customer_id) VALUES (99999);
+-- ERROR: insert or update violates foreign key constraint
+```
+
+**Application-level enforcement**: The application checks constraints before writing to the database.
+
+```python
+# App-level enforcement -- can fail in edge cases
+def create_order(customer_id, items):
+    customer = db.query("SELECT * FROM customers WHERE id = ?", customer_id)
+    if not customer:
+        return error("Customer does not exist")  # Check before write
+    
+    # Race condition: customer could be deleted between check and write
+    order_id = db.insert("INSERT INTO orders (customer_id) VALUES (?)", customer_id)
+    return order_id
+```
+
+Application-level enforcement has a race condition window between the check and the write. Two concurrent requests can both check that a customer exists, both see it, and both insert orders. If the customer is deleted between the check and the write, the database accepts the order because it has no FK constraint. The application now has an orphan order.
+
+Database-level enforcement closes this window. The FK constraint is checked atomically with the insert. There is no gap.
+
+**Rule of thumb:** Enforce every business-critical constraint at the database level. Use application-level validation for user-facing error messages and UX concerns. Never rely solely on application-level enforcement for data integrity.
+
+### Migration Rollbacks
+
+Schema changes are dangerous because they are hard to reverse. Rolling back a migration requires another migration.
+
+```sql
+-- Migration 001: Add column
+ALTER TABLE orders ADD COLUMN discount DECIMAL(5,2);
+-- Rollback 001
+ALTER TABLE orders DROP COLUMN discount;
+-- WARNING: DROP COLUMN permanently loses data. Cannot recover.
+
+-- Migration 002: Add NOT NULL
+ALTER TABLE orders ALTER COLUMN discount SET NOT NULL;
+-- Rollback 002
+ALTER TABLE orders ALTER COLUMN discount DROP NOT NULL;
+-- Safe: no data loss.
+
+-- Migration 003: Rename column
+ALTER TABLE orders RENAME COLUMN total TO total_amount;
+-- Rollback 003
+ALTER TABLE orders RENAME COLUMN total_amount TO total;
+-- WARNING: Any code referencing total_amount during rollback window breaks.
+```
+
+Blocking migrations (those that lock tables) require careful coordination with application deployments. The standard pattern: deploy the application change first (read and write to both old and new columns), then apply the migration, then deploy the cleanup.
+
+### Schema Versioning
+
+Each schema change should be versioned and tracked. Tools like Flyway, Liquibase, and Alembic maintain a `schema_version` table that records every migration.
+
+```
+schema_version table:
+┌────────────┬──────────────────┬──────────────────────┬──────────┐
+│ version    │ description      │ applied_at           │ checksum │
+├────────────┼──────────────────┼──────────────────────┼──────────┤
+│ 001        │ Create customers │ 2024-01-10 09:00:00  │ abc123   │
+│ 002        │ Create orders    │ 2024-01-10 09:01:15  │ def456   │
+│ 003        │ Add discount     │ 2024-01-15 14:30:00  │ ghi789   │
+│ 004        │ Add FK order-cust│ 2024-01-16 10:00:00  │ jkl012   │
+└────────────┴──────────────────┴──────────────────────┴──────────┘
+```
+
+The migration tool checks the checksum of each applied migration against the migration file on disk. If a migration file was modified after being applied, the tool refuses to proceed -- it detects schema drift.
+
+### Schema Drift
+
+Schema drift occurs when the actual database schema differs from the expected schema defined in version control. Causes include:
+
+- Hotfix applied directly to production (bypassing migration system).
+- Migration partially failed (some statements succeeded, others did not).
+- Two migrations ran out of order.
+- A migration was applied to one database but not another (staging vs production).
+
+Detection: Run `diff` between the database schema and the migration artifacts.
+
+```bash
+# Compare database schema to migration SQL
+pg_dump --schema-only mydb > current_schema.sql
+diff current_schema.sql expected_schema.sql
+# Any differences are schema drift -- investigate before deploying
+```
+
+---
+
+## Performance Characteristics
+
+### Data Type Impact on Storage
+
+Choosing the right data type saves storage and improves performance. The difference between INT and VARCHAR for an ID column is dramatic.
+
+| Data Type | Storage Size | Range / Capacity |
+|---|---|---|
+| `INT` | 4 bytes | -2^31 to 2^31-1 (2 billion) |
+| `BIGINT` | 8 bytes | -2^63 to 2^63-1 (9 quintillion) |
+| `SMALLINT` | 2 bytes | -32,768 to 32,767 |
+| `VARCHAR(10)` | 10 bytes + 1 byte length | 10 characters |
+| `VARCHAR(36)` (UUID as text) | 36 bytes + 1 byte length | 36 characters |
+| `UUID` (native type) | 16 bytes | 2^128 |
+| `DECIMAL(10,2)` | 5-9 bytes (variable) | Up to 10 digits, 2 decimal |
+| `FLOAT` | 4 bytes | Approximate, 7 digits precision |
+| `DOUBLE` | 8 bytes | Approximate, 15 digits precision |
+| `BOOLEAN` | 1 byte | true/false |
+| `DATE` | 4 bytes | 4713 BC to 5874897 AD |
+| `TIMESTAMP` | 8 bytes | Microsecond precision |
+| `TEXT` | Variable + TOAST | Up to 1GB |
+
+<AsciiDiagram
+  id="schema-design/deep-dive-type-sizes"
+  title="Storage size comparison of common data types"
+  alt="Bar chart showing relative storage sizes: UUID-as-text is 37 bytes while native UUID is 16 bytes; INT is 4 bytes; BIGINT is 8 bytes; VARCHAR is variable with overhead"
+  caption="Choosing native data types over text representations saves storage and improves query performance"
+  content={`Data type storage comparison
+
+  Storage per million rows:
+  ┌────────────────────────────────────────────────────────┐
+  │ Type              │ Bytes/row │ Size for 1M rows       │
+  ├────────────────────────────────────────────────────────┤
+  │ INT               │    4      │    4 MB                 │
+  │ BIGINT            │    8      │    8 MB                 │
+  │ UUID (native)     │   16      │   16 MB                 │
+  │ UUID (TEXT)       │   37      │   37 MB                 │
+  │ VARCHAR(255) avg  │   20      │   20 MB                 │
+  │ DECIMAL(10,2)     │    6      │    6 MB                 │
+  │ TIMESTAMP         │    8      │    8 MB                 │
+  │ BOOLEAN           │    1      │    1 MB                 │
+  │ TEXT (100 chars)  │  100+     │  100+ MB                │
+  └────────────────────────────────────────────────────────┘
+
+  Cost of using TEXT for UUID primary key:
+  - 2.3x more storage for the PK itself
+  - FK columns that reference it also use 2.3x more storage
+  - Index on the PK is 2.3x larger
+  - Each index level holds fewer entries -- deeper B-tree
+  - More pages to read per index scan
+
+  A 3-table schema with TEXT UUID PKs vs INT PKs:
+  Table      │ INT model │ TEXT UUID model │ Difference
+  ───────────┼───────────┼─────────────────┼───────────
+  customers  │   12 MB    │       44 MB      │  3.7x
+  orders     │   18 MB    │       67 MB      │  3.7x
+  products   │    8 MB    │       30 MB      │  3.8x
+  Total      │   38 MB    │      141 MB      │  3.7x
+`}
+/>
+
+### Nullable Column Overhead
+
+NULLable columns have storage overhead. In PostgreSQL, a bitmap at the beginning of each row records which columns are NULL. Every NULLable column adds one bit to this bitmap, regardless of whether the value is NULL or not. A table with 32 NULLable columns adds 4 bytes of overhead per row.
+
+Wider tables with many NULLable columns push more rows per page, reducing cache efficiency. If a table has 40 columns and 20 of them are always NULL in practice, the NULL bitmap wastes 20 bits (3 bytes) per row for no benefit. The schema should be restructured: split the always-NULL columns into a separate optional table.
+
+### PK Type Impact
+
+**Auto-increment INT**: Sequential, 4 bytes, fast for B-tree insertion (new rows go to the rightmost page). Minimizes page splits. Best for OLTP workloads.
+
+**UUID**: Random, 16 bytes, slow for B-tree insertion (new rows go to random pages, causing page splits). Wastes space in B-tree internal nodes. Required for distributed systems where sequential IDs are impossible.
+
+```sql
+-- Auto-increment PK: sequential insertion pattern
+INSERT INTO customers (name) VALUES ('Alice');  -- PK=1, goes to page 1
+INSERT INTO customers (name) VALUES ('Bob');    -- PK=2, goes to page 1
+-- All inserts go to the same rightmost page. No page splits.
+
+-- UUID PK: random insertion pattern
+INSERT INTO customers (id, name) VALUES ('a1b2c3d4-...', 'Alice');
+INSERT INTO customers (id, name) VALUES ('e5f6g7h8-...', 'Bob');
+-- Inserts go to random pages. Causes B-tree splits. Write amplification.
+```
+
+**UUID v7**: Time-ordered UUID. Sequential like auto-increment but globally unique. Available in PostgreSQL 17+. Best of both worlds for distributed systems.
+
+### Constraint Checking Cost
+
+Constraints add overhead on every write. The overhead depends on the constraint type:
+
+- **NOT NULL**: Free (metadata check, no data lookup).
+- **CHECK**: Evaluates the expression on the new value. O(1) for simple expressions.
+- **UNIQUE**: Requires index lookup. O(log n) for B-tree index. Significant for high-write tables.
+- **FOREIGN KEY**: Requires index lookup on the referenced table. O(log n) in the referenced table's PK index. The referenced column must be indexed!
+
+A table with 5 unique indexes and 3 foreign keys has 8 index operations per insert. At 10,000 inserts per second, that is 80,000 index operations per second. If the referenced tables are large, the index lookups are fast (B-tree depth of 3-5). If the referenced tables are small or the FK columns are not indexed, each insert triggers a sequential scan on the referenced table, destroying write throughput.
+
+```sql
+-- Expensive FK: no index on the FK column in the referencing table
+-- Every insert to order_items scans products for the product_id
+ALTER TABLE order_items ADD FOREIGN KEY (product_id) REFERENCES products(product_id);
+-- Products table has 100K rows. Sequential scan per insert = 100K row reads.
+
+-- Cheap FK: index on the FK column
+CREATE INDEX idx_order_items_product ON order_items(product_id);
+ALTER TABLE order_items ADD FOREIGN KEY (product_id) REFERENCES products(product_id);
+-- B-tree lookup on products PK: 3-4 pages read per insert.
+```
+
+---
+
+## Configuration and Tuning
+
+### Storage Engine Selection
+
+The database storage engine determines how schema design choices translate to physical storage.
+
+**InnoDB (MySQL)**: Clustered index organization. The primary key determines the physical order of rows. Secondary indexes store the primary key value, not a physical pointer. This means a wide primary key (UUID as text) bloats every secondary index.
+
+```
+InnoDB row layout: [PK | Row data ...]
+Secondary index:   [Index column | PK]
+If PK is TEXT UUID (37 bytes), every secondary index has 37 extra bytes per entry.
+If PK is INT (4 bytes), every secondary index has 4 extra bytes per entry.
+```
+
+**MyRocks (MySQL with RocksDB)**: LSM-tree organization. Writes are buffered and flushed sequentially. Better for write-heavy workloads. Compression is built in. Schema design still matters, but random inserts (UUID PK) have less impact because of LSM-tree's buffered writes.
+
+**PostgreSQL heap**: Rows are stored in a heap, unordered. Indexes store physical pointers (CTID). Primary key type does not bloat secondary indexes. But the heap itself is not ordered, so range scans on non-indexed columns require full sequential scans regardless of the primary key.
+
+### Charset and Collation Impact
+
+Character set and collation settings affect string column storage and comparison performance.
+
+```sql
+-- UTF-8 (variable width per character)
+-- 'Hello' = 5 bytes. 'Cafe' with accented e = 5 bytes.
+-- Asian characters: 3-4 bytes per character
+CREATE TABLE utf8_table (
+    name VARCHAR(100) CHARACTER SET utf8mb4  -- Up to 400 bytes
+);
+
+-- Latin-1 (1 byte per character, limited charset)
+-- 'Hello' = 5 bytes. 'Cafe' = 5 bytes (no accented e support).
+CREATE TABLE latin1_table (
+    name VARCHAR(100) CHARACTER SET latin1  -- Up to 100 bytes
+);
+
+-- Collation affects comparison performance
+-- utf8mb4_unicode_ci: case-insensitive, Unicode-aware. Slower comparisons.
+-- utf8mb4_bin: binary comparison. Fast but case-sensitive.
+-- utf8mb4_0900_ai_ci: MySQL 8.0 default. Fast, Unicode 9.0 aware.
+```
+
+Choosing the right charset and collation saves storage and speeds up string operations. If the data is ASCII-only (email, SKU, internal codes), use `latin1` or `ascii` for the smallest storage. If international text is required, use `utf8mb4` with the fastest available collation.
+
+### Column Ordering for Row-Based Storage
+
+In databases that support column ordering (MySQL InnoDB), the order of columns in the CREATE TABLE statement affects physical row layout and therefore performance.
+
+```sql
+-- Optimal column ordering: fixed-size columns first, variable last
+CREATE TABLE optimized (
+    id          INT NOT NULL,          -- 4 bytes, fixed
+    created_at  TIMESTAMP NOT NULL,    -- 8 bytes, fixed
+    status      CHAR(1) NOT NULL,      -- 1 byte, fixed
+    amount      DECIMAL(10,2),         -- 6 bytes, fixed
+    email       VARCHAR(255),           -- variable, last
+    notes       TEXT                    -- variable, last
+);
+
+-- Suboptimal column ordering
+CREATE TABLE suboptimal (
+    notes       TEXT,                   -- variable first = alignment padding
+    id          INT NOT NULL,
+    email       VARCHAR(255),
+    created_at  TIMESTAMP NOT NULL,
+    status      CHAR(1) NOT NULL,
+    amount      DECIMAL(10,2)
+);
+```
+
+Fixed-size columns placed first allow the database to calculate row offsets efficiently. Variable-size columns placed last minimize alignment padding. The difference per row is small (1-5 bytes) but multiplies across millions of rows.
+
+<AsciiDiagram
+  id="schema-design/deep-dive-column-ordering"
+  title="Column ordering impact on row storage layout"
+  alt="Two row layouts side-by-side: optimized layout packs fixed-width columns contiguously with variable columns at the end; suboptimal layout has gaps due to alignment padding between TEXT and INT columns"
+  caption="Putting fixed-size columns first and variable columns last minimizes wasted alignment padding"
+  content={`Column ordering and alignment padding
+
+  Optimized ordering (fixed first, variable last):
+  ┌────────────────────────────────────────────────────────┐
+  │ INT(4) │ TIMESTAMP(8) │ CHAR(1) │ DEC(6) │ VARCHAR    │
+  │        │              │ +3 pad  │        │            │
+  │   id   │  created_at  │ status  │ amount │ email      │
+  └────────────────────────────────────────────────────────┘
+  Total: 4 + 8 + 1 + 3 + 6 + variable = 22 + variable bytes
+  3 bytes wasted for alignment
+
+  Suboptimal ordering (variable first, fixed mixed):
+  ┌────────────────────────────────────────────────────────┐
+  │ TEXT      │ INT(4) │ VARCHAR   │ TIMEST(8) │ CHAR(1)  │
+  │           │ +4 pad │           │ +4 pad    │ +7 pad   │
+  │  notes    │  id    │  email    │ created_at│ status   │
+  └────────────────────────────────────────────────────────┘
+  Total: variable + 4 + variable + 4 + 8 + 1 + 7 = 24 + 2*variable bytes
+  15 bytes wasted for alignment
+
+  Over 10 million rows, optimal ordering saves:
+  (15 - 3) * 10,000,000 = 120 MB of storage
+  Plus: fewer pages to scan = faster sequential reads
+`}
+/>
+
+---
+
+## Key Takeaways
+
+- Row-oriented storage packs all columns together for fast point lookups; columnar storage separates columns for fast aggregation. Schema design should match the storage engine.
+- Narrow rows pack more rows per page, improving cache efficiency and reducing I/O for sequential scans.
+- TOAST moves large values to a separate table. Queries that do not select TOAST columns avoid the I/O penalty entirely.
+- The ER-to-relational mapping algorithm converts entities, relationships, and attributes into tables, primary keys, foreign keys, and constraints.
+- Three inheritance mapping patterns exist: single-table (simple, NULL-heavy), class-table (normalized, JOIN-heavy), concrete-table (duplicated columns, no cross-type queries).
+- Schema design cascades through every stage of query execution -- from parse to return. A well-designed schema can make a query 100,000x faster than a poorly-designed one.
+- Database-level enforcement of constraints is atomic and race-condition-free. Application-level enforcement is fragile.
+- Schema migrations should be versioned, tracked, and deployed with the expand-migrate-contract pattern for zero downtime.
+- Data type choice directly affects storage size and query performance. A TEXT UUID PK costs 2.3x more storage than a native UUID and 4x more than INT.
+- UUID v7 provides the distribution benefits of UUID with the insertion efficiency of sequential integers.
+- Column ordering in row-based databases matters: fixed-size columns first, variable columns last.
+- Character set and collation choices affect both storage size and string comparison performance.
+
+These internals prepare you for the architecture section, where these principles are applied to design production-grade schema layers for OLTP, OLAP, caching, and event-driven systems.

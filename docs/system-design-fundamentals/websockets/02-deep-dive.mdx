@@ -1,0 +1,525 @@
+---
+id: websockets-deep-dive
+title: WebSockets — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A WebSocket server is not a single component. It is a pipeline of layers, each responsible for a specific phase of the connection lifecycle. Understanding each layer's data structures and algorithms determines whether your server handles 10,000 connections or crashes at 1,000.
+
+<AsciiDiagram id="websockets/internal-architecture" title="WebSocket Server Internal Architecture">{` 
+┌─────────────────────────────────────────────────────────────────────┐
+│                   WEBSOCKET SERVER INTERNAL STACK                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  Application Layer    │                                    │    │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────────┐    │    │
+│  │  │ Route Handler│ │ Pub/Sub Bus  │ │ Business Logic   │    │    │
+│  │  └──────────────┘ └──────────────┘ └──────────────────┘    │    │
+│  ├─────────────────────────────────────────────────────────────┤    │
+│  │  Subprotocol Layer                                          │    │
+│  │  ┌──────────────────────┐ ┌────────────────────────────┐   │    │
+│  │  │ MQTT / WAMP / Custom │ │ Message Serializer         │   │    │
+│  │  │ (JSON, MsgPack, CBOR) │ │ (text ↔ binary)           │   │    │
+│  │  └──────────────────────┘ └────────────────────────────┘   │    │
+│  ├─────────────────────────────────────────────────────────────┤    │
+│  │  Extension Layer                                            │    │
+│  │  ┌──────────────────────┐ ┌────────────────────────────┐   │    │
+│  │  │ Permessage-deflate   │ │ Compression Dictionary     │   │    │
+│  │  │ (compress/decompress) │ │ (per-connection context)  │   │    │
+│  │  └──────────────────────┘ └────────────────────────────┘   │    │
+│  ├─────────────────────────────────────────────────────────────┤    │
+│  │  Framing Layer                                              │    │
+│  │  ┌──────────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │    │
+│  │  │ Frame Parser │ │Fragment  │ │ Masking  │ │ Write    │  │    │
+│  │  │ (state mach) │ │Reassembler│ │ Unmask   │ │ Buffer   │  │    │
+│  │  └──────────────┘ └──────────┘ └──────────┘ └──────────┘  │    │
+│  ├─────────────────────────────────────────────────────────────┤    │
+│  │  Transport Layer                                            │    │
+│  │  ┌──────────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │    │
+│  │  │ TCP Socket   │ │ TLS/SSL  │ │ Read     │ │ Write    │  │    │
+│  │  │ (per conn)   │ │ (WSS)    │ │ Buffer   │ │ Buffer   │  │    │
+│  │  └──────────────┘ └──────────┘ └──────────┘ └──────────┘  │    │
+│  ├─────────────────────────────────────────────────────────────┤    │
+│  │  I/O Event Loop                                             │    │
+│  │  ┌──────────────┐ ┌────────────┐ ┌──────────┐ ┌────────┐  │    │
+│  │  │ epoll / kq    │ │ Connection │ │ Timer    │ │ Task   │  │    │
+│  │  │ (ready list)  │ │ Manager    │ │ Wheel    │ │ Queue  │  │    │
+│  │  └──────────────┘ └────────────┘ └──────────┘ └────────┘  │    │
+│  ├─────────────────────────────────────────────────────────────┤    │
+│  │  OS Kernel                                                  │    │
+│  │  ┌──────────────┐ ┌────────────┐ ┌──────────┐ ┌────────┐  │    │
+│  │  │ TCP/IP Stack │ │ Socket FD  │ │ Send/    │ │ NIC    │  │    │
+│  │  │              │ │ Table      │ │ Recv Buf │ │ Driver │  │    │
+│  │  └──────────────┘ └────────────┘ └──────────┘ └────────┘  │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                     │
+│  Legend: Each layer processes data bidirectionally.                 │
+│  Path: Recv → TCP → TLS → Framing → Extensions → App               │
+│  Path: App → Extensions → Framing → TLS → TCP → Send               │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+## Data Structures and Algorithms
+
+### Connection Table: Hash Map
+
+**What it stores:** A mapping from connection ID (opaque 64-bit integer or UUID) to a connection object containing socket file descriptor, read buffer, write buffer, mask key, extension state, and subprotocol state.
+
+**Why hash map:** Connection lookup by ID must be O(1). You will iterate connections for broadcast, but that is a secondary operation. The primary access pattern is lookup-by-ID when a frame arrives on a specific file descriptor.
+
+**Time complexity:** O(1) for insert, lookup, delete. O(N) for broadcast iteration.
+
+**Space complexity:** O(N) where N is number of connections. Each entry is approximately 200-500 bytes depending on buffer sizes.
+
+### Frame Parser: State Machine
+
+**What it tracks:** The frame parser is a deterministic finite automaton (DFA) with these states: WAITING_FOR_FIRST_2_BYTES, READING_PAYLOAD_LENGTH, READING_EXTENDED_LENGTH, READING_MASK_KEY, READING_PAYLOAD, FRAME_COMPLETE.
+
+**Why state machine:** WebSocket frames arrive as a stream of bytes over TCP. TCP is a stream protocol — frames can be split across read boundaries. A state machine handles partial reads without buffering the entire stream.
+
+<AsciiDiagram id="websockets/frame-parser" title="Frame Parsing State Machine">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│                   FRAME PARSING STATE MACHINE                     │
+│                                                                  │
+│  ┌────────────┐   read 2 bytes   ┌────────────────────┐        │
+│  │  WAITING   │ ───────────────▶ │  HAS_HEADER        │        │
+│  │  FOR 2     │                  │  (FIN, RSV, Opcode, │        │
+│  │  BYTES     │                  │   MASK, PayloadLen) │        │
+│  └────────────┘                  └────────────────────┘        │
+│       ▲                                  │                     │
+│       │                                  │ payload_len=126    │
+│       │                                  ▼                     │
+│       │                         ┌────────────────────┐        │
+│       │                         │  EXTENDED_LEN_16   │        │
+│       │                         │  (read 2 more)     │        │
+│       │                         └────────────────────┘        │
+│       │                                  │                     │
+│       │                                  │ payload_len=127    │
+│       │                                  ▼                     │
+│       │                         ┌────────────────────┐        │
+│       │                         │  EXTENDED_LEN_64   │        │
+│       │                         │  (read 8 more)     │        │
+│       │                         └────────────────────┘        │
+│       │                                  │                     │
+│       │                                  ▼                     │
+│       │                         ┌────────────────────┐        │
+│       │                         │  HAS_LENGTH        │        │
+│       │                         └────────────────────┘        │
+│       │                                  │                     │
+│       │                                  │ MASK=1             │
+│       │                                  ▼                     │
+│       │                         ┌────────────────────┐        │
+│       │                         │  READING_MASK_KEY  │        │
+│       │                         │  (read 4 bytes)    │        │
+│       │                         └────────────────────┘        │
+│       │                                  │                     │
+│       │                                  ▼                     │
+│       │                         ┌────────────────────┐        │
+│       │                  ┌────▶│  READING_PAYLOAD   │        │
+│       │                  │     │  (read N bytes)    │        │
+│       │                  │     └────────────────────┘        │
+│       │                  │               │                   │
+│       │                  │               ▼                   │
+│       │                  │     ┌────────────────────┐        │
+│       │                  │     │  FRAME_COMPLETE   │        │
+│       │                  │     │  (dispatch, reset) │        │
+│       │                  │     └────────────────────┘        │
+│       │◀─────────────────┘              │                    │
+│       │  (back to header for           │                    │
+│       │   next frame in stream)        │                    │
+│       │                                │                    │
+│       │           Control frame?       │                    │
+│       │           Process immediately, │                    │
+│       │           reset to WAITING     │                    │
+│       │           (doesn't advance     │                    │
+│       │            data frame state)   │                    │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Read Buffer: Ring Buffer
+
+**What it stores:** Incoming bytes from the TCP socket before frame parsing. A ring buffer (circular buffer) of fixed size, typically 64 KB to 256 KB per connection.
+
+**Why ring buffer:** Ring buffers avoid memory fragmentation from repeated malloc/free cycles. The read head advances as bytes are consumed by the frame parser. The write head advances as new bytes arrive from the socket. If the ring buffer fills up, backpressure stops reading from the socket.
+
+**Time complexity:** O(1) for read and write. O(1) for peek (inspect bytes without consuming).
+
+**Space complexity:** Fixed O(N) where N is the configured buffer size (64 KB typical). No heap fragmentation.
+
+### Write Buffer: Linked List of Chunks
+
+**What it stores:** Outgoing frames queued for writing. Each chunk is a reference-counted buffer segment. The list allows the application to queue writes without blocking, while the I/O loop sends data as the socket becomes writable.
+
+**Why linked list:** Individual frames vary in size. A linked list lets you prepend control frames (Ping, Close) at the head while data frames append at the tail. Each chunk is sent when the socket's send buffer has space. The list naturally handles partial writes — if write() sends only half a chunk, the remaining half stays in the list.
+
+**Time complexity:** O(1) for append (data), O(1) for prepend (control). O(1) for removing a completed chunk.
+
+**Space complexity:** O(K) where K is the number of queued chunks. Each chunk header is ~40 bytes. Under normal load, K is 0-3. Under backpressure, K can grow to thousands.
+
+### Timer Wheel: Hashed Timing Wheel
+
+**What it stores:** Connection timeout timers for heartbeat (Ping/Pong monitoring) and idle disconnection.
+
+**Why timing wheel:** Millions of connections each needing a per-connection timer is a classic problem. A simple per-timer approach (one timerfd per connection) does not scale beyond 10,000 connections — the kernel cannot manage that many timer file descriptors. A hashed timing wheel batches expirations into time slots (typically 100ms granularity) and only checks the current slot each tick.
+
+**Time complexity:** O(1) for add, remove, expire. O(S) where S is number of slots (typically 100-1000) for tick — amortized O(1) per connection.
+
+**Space complexity:** O(S + N) where S is slot count and N is active timers.
+
+<AsciiDiagram id="websockets/timer-wheel" title="Hashed Timing Wheel for Connection Heartbeats">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│               HASHED TIMING WHEEL (100ms slots)                   │
+│                                                                  │
+│  Slot   0      1      2      3      4      5      6      7       │
+│       ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐  │
+│       │      │      │      │      │      │      │      │      │  │
+│ Tick ▶│ C100 │ C043 │ C201 │ C099 │      │ C050 │ C188 │      │  │
+│       │ C012 │ C077 │      │ C102 │      │      │ C003 │      │  │
+│       │      │ C121 │      │      │      │      │      │      │  │
+│       └──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┘  │
+│          │                              │                         │
+│          ▼                              ▼                         │
+│     Current tick               Will expire in 400ms              │
+│     (connections due for       (connections whose timer          │
+│      heartbeat check)          fires in 400ms)                   │
+│                                                                  │
+│  ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬── ──┐ │
+│  │ 0  │ 1  │ 2  │ 3  │... │ 97 │ 98 │ 99 │100 │101 │102 │ ... │ │
+│  └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴── ──┘ │
+│  └─────────────────── 100 slots ────────────────────────┘       │
+│  Each slot = 100ms. Full wheel cycle = 10 seconds                │
+│                                                                  │
+│  Adding a timer for 3.5 seconds from now:                        │
+│  3500ms / 100ms = 35 slots ahead → slot 35                      │
+│  O(1) insertion — just append to slot 35's linked list          │
+│                                                                  │
+│  At each tick:                                                   │
+│  1. Walk current slot's list                                     │
+│  2. For each connection: send Ping if heartbeat due              │
+│  3. If Pong was missed (10s timeout): close connection           │
+│  4. For surviving connections: re-add timer to future slot       │
+│                                                                  │
+│  Total work per tick: O(connections_in_slot) ~ O(N / S)         │
+│  At 100K connections, 100 slots → ~1000 checks per tick         │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Connection Acceptance: epoll + SO_REUSEPORT
+
+**What it does:** Accepts new TCP connections and distributes them across worker threads. Modern servers use SO_REUSEPORT to let the kernel load-balance new connections across worker processes, with each process having its own epoll fd.
+
+**Why this pattern:** A single accept() thread becomes a bottleneck beyond 50,000 connections/second. SO_REUSEPORT lets the kernel's RSS (Receive Side Scaling) distribute connections across CPU cores, eliminating the thundering herd problem where a wake-up of a single listener wakes all workers.
+
+## The Request/Write/Read Lifecycle
+
+### Connection Lifecycle — 12 Steps
+
+**Step 1: DNS Resolution**
+
+The client resolves wss://example.com to an IP address. DNS round-robin or DNS-based load balancing selects a front-end server. DNS TTLs for WebSocket services are typically short (30-60 seconds) to allow fast failover.
+
+**Step 2: TCP Connect**
+
+The client opens a TCP connection to the resolved IP on port 443 (WSS). The three-way handshake takes one round trip. TCP options like keepalive (idle timeout 2 hours default) are set early.
+
+**Step 3: TLS Handshake (WSS)**
+
+Client and server negotiate TLS version, cipher suite, and exchange certificates. This adds 2-3 round trips and 2-5 KB of handshake data. Session resumption (TLS 1.3 0-RTT) can reduce this to 1 round trip for reconnecting clients.
+
+**Step 4: HTTP Upgrade Request**
+
+The client sends the HTTP Upgrade request over the established TLS tunnel.
+
+**Step 5: Server Validates and Responds**
+
+The server validates: the Upgrade header must be "websocket", the Connection header must be "Upgrade", and Sec-WebSocket-Version must be 13. The server computes the expected Sec-WebSocket-Accept value using SHA-1 and Base64.
+
+**Step 6: Connection Object Creation**
+
+The server creates a connection object: allocates read buffer (64 KB), write buffer (64 KB), initializes frame parser state machine, creates compression context if permessage-deflate was negotiated, adds the connection to the connection table, and registers the file descriptor with the event loop.
+
+<AsciiDiagram id="websockets/connection-init" title="Connection Initialization Sequence">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│                CONNECTION INITIALIZATION                          │
+│                                                                  │
+│  Event Loop       Connection Mgr      Frame Parser     App       │
+│      │                  │                  │            │        │
+│      │────accept()─────▶│                  │            │        │
+│      │                  │                  │            │        │
+│      │           ┌──────┴──────┐           │            │        │
+│      │           │ Alloc Conn  │           │            │        │
+│      │           │ Object:     │           │            │        │
+│      │           │ • FD=47     │           │            │        │
+│      │           │ • ReadBuf   │           │            │        │
+│      │           │ • WriteBuf  │           │            │        │
+│      │           │ • State=INIT│           │            │        │
+│      │           │ • TimerSlot │           │            │        │
+│      │           └──────┬──────┘           │            │        │
+│      │                  │                  │            │        │
+│      │◀────conn_handle──│                  │            │        │
+│      │                  │                  │            │        │
+│      │────req_handshake──────────────────▶│            │        │
+│      │                  │     parse upgrade│            │        │
+│      │◀────verify_ok────│──────────────────│            │        │
+│      │                  │                  │            │        │
+│      │          send 101 response          │            │        │
+│      │────────────────────────────────────────────────▶│        │
+│      │                  │                  │    on_open(conn)   │
+│      │                  │                  │            │        │
+│      │          ┌───────┴────────┐         │            │        │
+│      │          │ State=OPEN     │         │            │        │
+│      │          │ Timer=60s ping │         │            │        │
+│      │          └────────────────┘         │            │        │
+│      │                  │                  │            │        │
+│      │    Event Loop resumes (awaiting data)             │        │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+**Step 7: Data Arrives — Socket Readable**
+
+The event loop detects that a file descriptor has data available. For each ready FD, it reads as many bytes as possible in a single read() call (typically up to 64 KB). The bytes go into the connection's read ring buffer.
+
+**Step 8: Frame Parsing**
+
+The frame parser reads bytes from the ring buffer through its state machine. Each complete frame triggers a dispatch:
+
+- Opcode 0x1 (text): Frame payload is delivered to the extension layer or directly to the application
+- Opcode 0x2 (binary): Same as text, but payload is raw bytes
+- Opcode 0x8 (close): Close handshake initiated
+- Opcode 0x9 (ping): Respond with a Pong frame immediately
+- Opcode 0xA (pong): Heartbeat response received, reset timer
+
+**Step 9: Extension Processing**
+
+If permessage-deflate is enabled, the payload is decompressed using zlib's inflate. The decompression context is per-connection and persists across messages. After decompression, the message is delivered to the subprotocol layer or application.
+
+**Step 10: Application Processing**
+
+The application receives the decoded message. This is where your business logic runs: route to handler, update state, broadcast to other clients, store to database.
+
+**Step 11: Write Path — Queuing Output**
+
+When the application sends a message, the message passes through the extension layer (compression if enabled), the masking layer (server-to-client is never masked, but the frame header is still constructed), and the frame is appended to the write buffer's linked list. The event loop marks the socket as wanting a write event.
+
+**Step 12: Write Path — Socket Writable**
+
+When the socket's send buffer has space, the event loop calls the write handler. It walks the write buffer linked list, calling writev() to write multiple chunks in a single syscall. After each write, it checks if the socket buffer is full. If so, it stops writing and waits for the next writable event.
+
+<AsciiDiagram id="websockets/write-path" title="Write Path — From Application to Wire">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│                       WRITE PATH PIPELINE                        │
+│                                                                  │
+│  Application                                                     │
+│      │                                                           │
+│      │  send("Hello")                                            │
+│      ▼                                                           │
+│  ┌──────────────────┐                                            │
+│  │ Extension Layer  │  compress "Hello" → deflate("Hello")       │
+│  │ (permessage-def) │  → compressed bytes                        │
+│  └──────────────────┘                                            │
+│      │                                                           │
+│      ▼                                                           │
+│  ┌──────────────────┐                                            │
+│  │ Frame Builder    │  FIN=1, opcode=0x1, MASK=0                │
+│  │                  │  Payload length=N                          │
+│  │                  │  Extended length if N&gt;125                  │
+│  └──────────────────┘                                            │
+│      │                                                           │
+│      ▼                                                           │
+│  ┌──────────────────┐                                            │
+│  │ Write Buffer     │  Append chunk to linked list               │
+│  │ (chunk linked    │  Mark socket for writable event            │
+│  │  list)           │                                            │
+│  └──────────────────┘                                            │
+│      │                                                           │
+│      ▼                                                           │
+│  ┌──────────────────┐                                            │
+│  │ I/O Event Loop   │  epoll_wait returns EPOLLOUT               │
+│  │ epoll            │  Calls writev(fd, chunks, count)           │
+│  └──────────────────┘                                            │
+│      │                                                           │
+│      ▼                                                           │
+│  ┌──────────────────┐                                            │
+│  │ Kernel TCP Stack │  Copies to send buffer                     │
+│  │                  │  Congestion control                        │
+│  │                  │  Segments and sends                        │
+│  └──────────────────┘                                            │
+│      │                                                           │
+│      ▼                                                           │
+│  ┌──────────────────┐                                            │
+│  │ Network          │  IP packets → remote client                │
+│  │ (NIC → Internet) │                                            │
+│  └──────────────────┘                                            │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+## Consistency and State
+
+### Crash: Server Process Dies
+
+**Scenario:** The WebSocket server process is killed by SIGKILL (OOM killer, manual kill -9).
+
+**What happens:** The OS kernel closes all file descriptors. TCP FIN packets are sent for each connection. Clients receive a Close frame with status 1006 (Abnormal Closure). Any messages in flight on the wire or in send buffers are lost.
+
+**Mitigation:** Clients must implement reconnection with exponential backoff. In-flight messages must be recoverable from a persistent queue (Redis, Kafka) with a message ID for deduplication. The server should cleanly shut down on SIGTERM: stop accepting new connections, drain write buffers for 5-10 seconds, then send Close frames before exiting.
+
+### Partition: Network Split Between Client and Server
+
+**Scenario:** A network switch fails, cutting the path between client and server. TCP does not detect the failure immediately — it may take 10-30 minutes for TCP keepalive to trigger.
+
+**What happens:** Both sides believe the connection is open. The server sees no data and no TCP FIN. The client sees no data and no TCP FIN. This is a half-open connection. Both sides continue holding resources. The client's messages queue in the local TCP buffer infinitely.
+
+**Mitigation:** Application-level heartbeats (Ping/Pong) on a 30-second timer with a 10-second timeout. If no Pong arrives within 10 seconds, close the connection and notify the application layer. On the client side, start reconnection immediately.
+
+<AsciiDiagram id="websockets/partition-scenario" title="Network Partition — Half-Open Connection">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│                  NETWORK PARTITION — HALF-OPEN                   │
+│                                                                  │
+│  Normal State:                                                   │
+│  ┌────────┐       ┌──────────┐       ┌────────┐                 │
+│  │ Client │◀══════▶│ Network  │◀══════▶│ Server │                 │
+│  │        │  data  │          │  data  │        │                 │
+│  └────────┘       └──────────┘       └────────┘                 │
+│                                                                  │
+│  Partition Event: switch failure                                 │
+│  ┌────────┐       ┌──────────┐       ┌────────┐                 │
+│  │ Client │──X────│  NETWORK │──X────│ Server │                 │
+│  │        │  CUT  │  CUT     │  CUT  │        │                 │
+│  └────────┘       └──────────┘       └────────┘                 │
+│                                                                  │
+│  Client sees:          Server sees:                              │
+│  • TCP ESTABLISHED     • TCP ESTABLISHED                         │
+│  • No data from server • No data from client                     │
+│  • No RST or FIN       • No RST or FIN                           │
+│  • Messages queue in   • Messages queue in                       │
+│    local send buffer     local send buffer                       │
+│                                                                  │
+│  TCP Keepalive timeout: 2 hours (default on Linux)               │
+│  Application heartbeat: 30 seconds → detection in 40s max       │
+│                                                                  │
+│  Detection timeline:                                             │
+│  T=0s   Connection drops (silent)                                │
+│  T=30s  Server sends Ping (no Pong received)                    │
+│  T=40s  Server retries Ping                                     │
+│  T=40s  Server declares connection dead, closes fd              │
+│  T=40s  Server sends Close on close (never arrives)             │
+│  T=40s  Server frees connection object                          │
+│  T=41s  Client detects missing Ping, starts reconnect           │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Concurrent Writes: Two Threads Send to Same Connection
+
+**Scenario:** Two event loop threads both have data to send to the same connection. Without synchronization, they could both write to the write buffer simultaneously, corrupting the linked list.
+
+**Solution:** Each connection has a single-owner design. The event loop thread that owns the connection (determined by consistent hashing of connection ID) is the only thread that writes to the connection's write buffer. Application threads that need to send a message to a connection enqueue a "send task" to the owning thread's task queue. The owning thread picks up the task and appends to the write buffer.
+
+**Alternative:** Use a per-connection mutex that wraps the write buffer append operation. Both approaches work; the task-queue approach avoids lock contention and is preferred at scale.
+
+### Stale Reads: Messages Arrive After Close
+
+**Scenario:** Client sends Close frame, server acknowledges, connection is closed. But a message that was in-flight before the Close arrives at the server after the Close handshake completes.
+
+**What happens:** The server must ignore data received after a valid Close sequence. TCP guarantees ordering within a connection, but the Close frame and a data frame sent simultaneously on different paths (rare) could arrive in any order.
+
+**Mitigation:** The server maintains a connection state machine: OPEN → CLOSING (received Close, sent Close, waiting for TCP FIN) → CLOSED. Any data frames received in CLOSING or CLOSED state are silently discarded. The client must not send data after sending a Close frame.
+
+## Performance Characteristics
+
+### Throughput — Single Connection
+
+| Metric | Value | Conditions |
+|--------|-------|------------|
+| Max throughput | 1-2 Gbps | Loopback, 64 KB frames, no compression |
+| Max messages/sec | 150,000-300,000 | Small frames (100 bytes), local network |
+| Latency (p50) | 0.5-2 ms | Same datacenter, no TLS |
+| Latency (p99) | 5-15 ms | Cross-region, TLS, 1 KB payload |
+| TLS handshake | 5-15 ms | TLS 1.3, no 0-RTT |
+| TLS handshake (0-RTT) | 1-5 ms | Resumed session |
+
+### Throughput — Server Scaling
+
+| Metric | Value | Conditions |
+|--------|-------|------------|
+| Max connections per server | 500,000-1,000,000 | 16 GB RAM, epoll, large maxfiles |
+| Memory per idle connection | 10-20 KB | Read/Write buffer allocated but unused |
+| Memory per active connection | 64-128 KB | Buffers in use, compression context |
+| CPU per 100K connections idle | 1-3% | Heartbeat processing only |
+| CPU per 100K connections active | 20-40% | 100 messages/sec per connection |
+| Max new connections/sec (accept) | 30,000-50,000 | SO_REUSEPORT, 8 workers |
+
+### Performance Bottlenecks by Component
+
+**CPU-bound bottlenecks:**
+- Permessage-deflate compression for large payloads: 5-20 microseconds per 1 KB message
+- JSON serialization/deserialization: 2-10 microseconds per small message
+- Broadcasting to N connections: N times the send path cost
+- TLS encryption for each write: 1-3 microseconds per 1 KB
+
+**Memory-bound bottlenecks:**
+- Connection table scan for broadcast: cache misses at scale
+- Large write buffer growth under backpressure: GC or allocator pressure
+- Fragment reassembly buffer for large messages: can hold partial data
+
+**I/O-bound bottlenecks:**
+- Single-threaded accept() under 50,000 connections/second
+- Network bandwidth limits at 1-10 Gbps per NIC
+- TLS handshake rate (limited by CPU for asymmetric crypto)
+
+## Configuration and Tuning
+
+### Linux Kernel Parameters
+
+| Setting | Default | Tuned | What It Controls |
+|---------|---------|-------|-------------------|
+| fs.file-max | varies | 2,000,000 | Maximum file descriptors system-wide. Must be at least (max_connections + 10000) |
+| net.core.somaxconn | 128 | 65536 | Maximum length of the listen backlog queue. Too low causes connection refused when accept rate can't keep up |
+| net.ipv4.tcp_fin_timeout | 60 | 10 | Seconds to keep socket in FIN-WAIT-2 state. Lower value recycles ports faster |
+| net.ipv4.tcp_tw_reuse | 0 | 1 | Allows reuse of TIME_WAIT sockets for new connections. Critical for high connection churn |
+| net.ipv4.tcp_keepalive_time | 7200 | 300 | Seconds before TCP sends first keepalive probe. Lower value detects dead peers faster |
+| net.core.rmem_max | 212992 | 8388608 | Maximum receive socket buffer size. Higher value handles bursty traffic |
+| net.core.wmem_max | 212992 | 8388608 | Maximum send socket buffer size. Higher value improves throughput on fat pipes |
+
+### Application-Level Tuning
+
+| Setting | Default | Description | When to Change |
+|---------|---------|-------------|----------------|
+| max_payload_size | 1 MB | Maximum single message size. Larger messages are rejected with 1009 Close. | Your application sends binary blobs. Raise to 10 MB but implement chunking. |
+| heartbeat_interval | 30 s | How often to send Ping frames. | Behind a proxy with a 60-second timeout, set to 25 seconds. |
+| heartbeat_timeout | 10 s | How long to wait for Pong before closing. | High-latency satellite links: raise to 30 seconds. |
+| max_fragments | 16 | Maximum fragmented frames per message. | Streaming large files: raise to 256. |
+| compression_level | 6 | zlib compression level 0-9. Level 9 saves ~3 percent more space than 6 but takes 4x the CPU. | CPU-bound: lower to 3. Bandwidth-bound: raise to 9. |
+| write_buffer_size | 64 KB | Initial write buffer allocation per connection. | Messages average over 10 KB: raise to 256 KB. |
+| read_buffer_size | 64 KB | Initial read buffer allocation per connection. | Messages average over 10 KB: raise to 256 KB. |
+| max_buffer_pool | 512 MB | Total memory all connections can hold in buffers before refusing new allocations. | Constrain memory on shared hosts: lower to 128 MB. |
+| compression_context_window | 15 KB | Memory per connection for deflate state. Higher window (15 bits) compresses better. | Million-connection server at 15 KB each: 15 GB just for compression context. |
+
+### What Breaks When You Tune Wrong
+
+**Setting heartbeat_timeout too low (under 3 seconds):** False positives. Clients on mobile networks with intermittent packet loss get disconnected during normal cell tower handoffs. Users see random disconnections every few minutes.
+
+**Setting heartbeat_interval too high (over 120 seconds):** Half-open connections persist for 120+ seconds. If a client's network fails, the server holds resources for 2+ minutes before detecting the failure. At 100,000 connections with a 5 percent daily failure rate, you leak 5,000 dead connections per day.
+
+**Setting max_payload_size too high (over 10 MB):** Memory amplification. An attacker sends a 10 MB frame header claiming the payload is 10 MB. The server allocates a 10 MB buffer. A single connection can force your server to allocate 100+ MB in fragment buffers. Always cap max_payload_size and close connections that exceed it.
+
+**Setting write_buffer_size too high (over 1 MB per connection):** At 500,000 connections, a 1 MB write buffer per connection is 500 GB of committed memory. The OS actually allocates physical pages only when data is buffered, but virtual address space is exhausted, and the OOM killer terminates your process.
+
+The next page shows how to build a WebSocket infrastructure that handles 10 million concurrent connections across multiple regions, including load balancing, sticky sessions, and horizontal scaling.

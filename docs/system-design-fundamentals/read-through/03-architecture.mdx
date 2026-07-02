@@ -1,0 +1,793 @@
+---
+id: read-through-architecture
+title: Read-Through at Scale
+position: 3
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest read-through cache embeds the cache logic directly in the application process. Your application binary contains the hash table, the loader registry, and the eviction policy all in one heap.
+
+<AsciiDiagram
+  id="read-through/naive-impl"
+  title="Naive single-server read-through cache architecture"
+  alt="Diagram showing a single application server with an embedded in-process read-through cache talking directly to a database"
+  caption="The naive implementation embeds the cache in the application process — simple but fragile."
+>
+{`
+  ┌────────────────────────────────────────────────────────┐
+  │              [Application Server]                       │
+  │                                                         │
+  │  ┌─────────────────────────────────────────────────┐   │
+  │  │  {In-Process Read-Through Cache}                 │   │
+  │  │  ┌───────────┐  ┌────────────┐  ┌───────────┐  │   │
+  │  │  │ HashTable │  │ Loader     │  │ LRU       │  │   │
+  │  │  │ (memory)  │  │ Registry   │  │ Eviction  │  │   │
+  │  │  └───────────┘  └─────┬──────┘  └───────────┘  │   │
+  │  └───────────────────────┼─────────────────────────┘   │
+  │                          │                              │
+  │  ┌───────────────────────┼─────────────────────────┐   │
+  │  │  [Application Logic]  │                         │   │
+  │  │  cache.get("key")     │                         │   │
+  │  └───────────────────────┼─────────────────────────┘   │
+  └──────────────────────────┼─────────────────────────────┘
+                             │ loader() calls
+                             ▼
+                      ┌──────────────┐
+                      │  ((Database))│
+                      └──────────────┘
+`}
+</AsciiDiagram>
+
+### Why this breaks
+
+This architecture breaks at three distinct scales:
+
+**At 1,000 requests per second** — memory becomes the bottleneck. Each application server has its own cache. If you have ten servers, you have ten copies of the same data — ten times the memory usage for the same hit ratio. A 1GB cache per server becomes 10GB across the fleet, and each server caches different subsets of data based on what requests it receives.
+
+**At 100,000 requests per second** — loader contention becomes the bottleneck. When a cache miss occurs, the loader queries the database. With ten servers, a cold start triggers ten simultaneous queries for the same key — ten times the database load. The thundering-herd problem is amplified by the number of servers.
+
+**At 10,000,000 requests per second** — everything breaks. Cache stampede: a popular key expires simultaneously across all servers, and every server tries to reload it at once. The database is overwhelmed. The cache hit ratio collapses because the cache is too small. There is no single point of failure — every server is a single point of failure for its own cache.
+
+## Production-Grade Architecture
+
+A production-grade read-through cache separates the cache from the application. The cache runs as a distributed service that all application servers share.
+
+<AsciiDiagram
+  id="read-through/production-arch"
+  title="Production-grade distributed read-through cache architecture"
+  alt="Architecture diagram showing application servers connecting to a distributed read-through cache cluster with a loader service and database replicas"
+  caption="The production architecture separates the cache into a distributed service with dedicated loader infrastructure."
+>
+{`
+  ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
+  │  [App Server 1]  │   │  [App Server 2]  │   │  [App Server N]  │
+  │  cache.get(key)  │   │  cache.get(key)  │   │  cache.get(key)  │
+  └────────┬─────────┘   └────────┬─────────┘   └────────┬─────────┘
+           │                      │                      │
+           └──────────────────────┼──────────────────────┘
+                                  │
+                                  ▼
+           ┌──────────────────────────────────────────────────┐
+           │            {Distributed Read-Through Cache}       │
+           │                                                  │
+           │  ┌────────────┐  ┌────────────┐  ┌────────────┐ │
+           │  │ Cache Node │  │ Cache Node │  │ Cache Node │ │
+           │  │  (shard 1) │  │  (shard 2) │  │  (shard 3) │ │
+           │  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘ │
+           │        │               │               │        │
+           │  ┌─────┴───────────────┴───────────────┴─────┐  │
+           │  │         [Loader Service]                    │  │
+           │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐ │  │
+           │  │  │ Dedup    │  │ Circuit  │  │ Batch    │ │  │
+           │  │  │ Gate     │  │ Breaker  │  │ Loader   │ │  │
+           │  │  └──────────┘  └──────────┘  └──────────┘ │  │
+           │  └───────────────────┬────────────────────────┘  │
+           └──────────────────────┼───────────────────────────┘
+                                  │
+                         ┌────────┴────────┐
+                         │                 │
+                  ┌──────────────┐  ┌──────────────┐
+                  │ ((DB Primary))│  │ ((DB Replica))│
+                  └──────────────┘  └──────────────┘
+`}
+</AsciiDiagram>
+
+### Key architectural decisions
+
+**Separate cache nodes from application servers** — the cache cluster runs on dedicated nodes with high memory-to-CPU ratios. Application servers are stateless and can scale independently. A cache node failure does not affect application logic.
+
+**Shared-nothing sharding** — each cache node owns a subset of keys based on consistent hashing. Adding or removing nodes causes minimal redistribution. The application does not need to know which node holds which key — the client library handles routing.
+
+**Dedicated loader service** — the loader service is a separate deployment that handles all database interactions for the cache. It can be scaled independently of both the cache nodes and the application servers. The loader service owns:
+
+- **Deduplication**: a centralized dedup gate that prevents concurrent misses for the same key across all cache nodes
+- **Circuit breaking**: if the database is slow or failing, the loader service opens the circuit before the cache nodes
+- **Batching**: the loader service collects concurrent misses for related keys and batch-loads them from the database
+- **Rate limiting**: the loader service limits the rate of database queries to protect the database from cache stampedes
+
+### Loader deduplication across nodes
+
+In a distributed read-through cache, deduplication must work across all cache nodes. The naive approach deduplicates only within a single process. If ten app servers each have their own cache, a miss on one does not prevent a miss on another.
+
+The production solution uses a distributed dedup gate, typically implemented with Redis or ZooKeeper:
+
+```javascript
+class DistributedDedupGate {
+  constructor(redisClient) {
+    this.redis = redisClient;
+    this.lockTTL = 5000; // 5 second lock TTL
+  }
+
+  async tryAcquire(key) {
+    // Redis SET NX — atomic lock acquisition
+    const lockKey = `dedup:${key}`;
+    const acquired = await this.redis.set(
+      lockKey,
+      'loading',
+      'NX',
+      'PX',
+      this.lockTTL
+    );
+    return acquired !== null;
+  }
+
+  async release(key) {
+    await this.redis.del(`dedup:${key}`);
+  }
+
+  async waitForCompletion(key) {
+    // Subscribe to a Redis pub-sub channel for this key
+    // or poll the lock key until it disappears
+    return new Promise((resolve) => {
+      const subscriber = this.redis.duplicate();
+      subscriber.subscribe(`dedup:complete:${key}`, (message) => {
+        subscriber.unsubscribe();
+        subscriber.quit();
+        resolve(JSON.parse(message));
+      });
+    });
+  }
+
+  async notifyCompletion(key, value) {
+    await this.redis.publish(
+      `dedup:complete:${key}`,
+      JSON.stringify(value)
+    );
+  }
+}
+```
+
+## Integration Patterns
+
+### With SQL Database
+
+The most common integration. The loader function executes a SQL query against a relational database.
+
+<AsciiDiagram
+  id="read-through/integration-sql"
+  title="Read-through cache integrated with a SQL database"
+  alt="Architecture showing read-through cache with SQL database, including loader executing SQL queries"
+  caption="SQL integration is the most common read-through pattern — the loader runs a SQL query on miss."
+>
+{`
+  ┌────────────────────────────────────────────────────────────┐
+  │  {Cache}                                                   │
+  │                                                            │
+  │  miss("user:42")                                           │
+  │       │                                                    │
+  │       ▼                                                    │
+  │  ┌──────────────────────┐                                  │
+  │  │  Loader:             │                                  │
+  │  │  SELECT * FROM users │                                  │
+  │  │  WHERE id = 42       │─────────────────┐                │
+  │  └──────────────────────┘                 │                │
+  │                                            ▼               │
+  │                                     ┌──────────────┐       │
+  │                                     │ ((PostgreSQL))│       │
+  │                                     │  users table  │       │
+  │                                     └──────────────┘       │
+  │                                            │                │
+  │  ┌──────────────────────┐                 │                │
+  │  │  Store result with   │◄────────────────┘                │
+  │  │  TTL=300s            │                                  │
+  │  └──────────────────────┘                                  │
+  │                                                            │
+  │  Return to application                                     │
+  └────────────────────────────────────────────────────────────┘
+
+  Best practices:
+  - Use read replicas for the loader to reduce primary load
+  - Use prepared statements to avoid query parsing overhead
+  - Set statement_timeout on the database side
+  - Index the columns used in loader queries
+`}
+</AsciiDiagram>
+
+### With NoSQL Database
+
+NoSQL databases like DynamoDB, MongoDB, or Cassandra have different read patterns. The loader function uses the NoSQL API instead of SQL.
+
+```javascript
+// MongoDB loader
+async function mongoLoader(key) {
+  const [collection, id] = key.split(':');
+  return db.collection(collection).findOne({ _id: id });
+}
+
+// DynamoDB loader
+async function dynamoLoader(key) {
+  const params = {
+    TableName: 'Users',
+    Key: { userId: { S: key } }
+  };
+  return dynamoClient.getItem(params).promise();
+}
+
+// Cassandra loader
+async function cassandraLoader(key) {
+  const query = 'SELECT * FROM users WHERE id = ?';
+  return cassandraClient.execute(query, [key], { prepare: true });
+}
+```
+
+<AsciiDiagram
+  id="read-through/integration-nosql"
+  title="Read-through cache integrated with a NoSQL database"
+  alt="Architecture showing read-through cache with a NoSQL database using a different loader pattern"
+  caption="NoSQL integration uses the database API directly in the loader, with batch-get for multiple keys."
+>
+{`
+  ┌────────────────────────────────────────────────────────────┐
+  │  {Cache}                                                   │
+  │                                                            │
+  │  miss("user:42") and miss("user:99") arrive simultaneously │
+  │       │                                │                   │
+  │       └──────────────┬─────────────────┘                   │
+  │                      │                                     │
+  │                      ▼                                     │
+  │  ┌──────────────────────────────────────┐                  │
+  │  │  Batch Loader:                        │                 │
+  │  │  db.batchGet([                       │                 │
+  │  │    "user:42", "user:99"              │                 │
+  │  │  ])                                   │                 │
+  │  └───────────────────┬──────────────────┘                  │
+  │                      │                                     │
+  │                      ▼                                     │
+  │               ┌──────────────────────┐                     │
+  │               │  ((DynamoDB))        │                     │
+  │               │  BatchGetItem API    │                     │
+  │               └──────────────────────┘                     │
+  │                      │                                     │
+  │  ┌───────────────────┴──────────────────┐                  │
+  │  │  Store both results individually     │                  │
+  │  │  "user:42" -> {...}  TTL=300        │                  │
+  │  │  "user:99" -> {...}  TTL=300        │                  │
+  │  └──────────────────────────────────────┘                  │
+  │                                                            │
+  │  Return to application                                     │
+  └────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### With External API
+
+Read-through can also cache responses from external APIs. The loader makes an HTTP request instead of a database query.
+
+<AsciiDiagram
+  id="read-through/integration-api"
+  title="Read-through cache integrated with an external API"
+  alt="Architecture showing read-through cache loading from an external REST API instead of a database"
+  caption="The loader can fetch from any source — including external APIs, with rate limiting and retry logic."
+>
+{`
+  ┌────────────────────────────────────────────────────────────┐
+  │  {Cache}                                                   │
+  │                                                            │
+  │  miss("weather:nyc")                                       │
+  │       │                                                    │
+  │       ▼                                                    │
+  │  ┌──────────────────────────────────────────────────────┐  │
+  │  │  Loader: HTTP GET weather-api.com/v1/nyc             │  │
+  │  │  ┌────────────────────┐  ┌────────────────────────┐ │  │
+  │  │  │ Rate Limiter       │  │ Retry (3 attempts)     │ │  │
+  │  │  │ 10 req/s per API   │  │ 100ms, 500ms, 2500ms  │ │  │
+  │  │  └────────────────────┘  └────────────────────────┘ │  │
+  │  └───────────────────────┬──────────────────────────────┘  │
+  │                          │                                  │
+  │                          ▼                                  │
+  │                   ┌──────────────┐                         │
+  │                   │ [External    │                         │
+  │                   │  Weather API]│                         │
+  │                   └──────────────┘                         │
+  │                          │                                  │
+  │  ┌───────────────────────┴──────────────────────────────┐  │
+  │  │  Store response with TTL=60 (short TTL for weather)  │  │
+  │  │  Return to application                               │  │
+  │  └──────────────────────────────────────────────────────┘  │
+  │                                                            │
+  └────────────────────────────────────────────────────────────┘
+
+  Critical considerations:
+  - Rate limit the loader to avoid hitting external API quotas
+  - Use short TTLs for time-sensitive data
+  - Handle 4xx/5xx responses — cache 4xx as errors, retry 5xx
+  - Set a timeout on the HTTP request (under 5s)
+`}
+</AsciiDiagram>
+
+### With Batch Processing
+
+For analytics or reporting workloads, the loader may execute a complex query or computation. Batch loading is essential here.
+
+```javascript
+// Batch loader for analytics
+async function batchAnalyticsLoader(keys) {
+  // keys = ["report:daily:2024-01-01", "report:daily:2024-01-02", ...]
+  const dates = keys.map(k => k.split(':').pop());
+
+  // Single query for all dates
+  const rows = await db.query(`
+    SELECT date, metric, value
+    FROM daily_metrics
+    WHERE date = ANY($1)
+  `, [dates]);
+
+  // Group results by key
+  const resultMap = {};
+  for (const row of rows) {
+    const key = `report:daily:${row.date}`;
+    if (!resultMap[key]) resultMap[key] = [];
+    resultMap[key].push(row);
+  }
+
+  return resultMap; // { "report:daily:2024-01-01": [...], ... }
+}
+```
+
+## Multi-Region Architecture
+
+Global applications need read-through caches in every region, each loading from a local database replica.
+
+<AsciiDiagram
+  id="read-through/multi-region"
+  title="Multi-region read-through cache deployment"
+  alt="Architecture diagram showing three regions (US, EU, ASIA) each with their own read-through cache and database replicas"
+  caption="Multi-region read-through places a cache-and-replica pair in each region, with cross-region replication for data consistency."
+>
+{`
+  ┌────────────────────────────────────────────────────────────────┐
+  │  Region: US-East                                                │
+  │  ┌─────────────────┐   ┌─────────────────┐   ┌──────────────┐ │
+  │  │  [App Servers]  │──>│  {Cache Cluster} │──>│((DB Replica))│ │
+  │  └─────────────────┘   └─────────────────┘   └──────┬───────┘ │
+  └──────────────────────────────────────────────────────┼─────────┘
+                                                         │
+                                                         │ cross-region
+                                                         │ replication
+  ┌──────────────────────────────────────────────────────┼─────────┐
+  │  Region: EU-West                                      │         │
+  │  ┌─────────────────┐   ┌─────────────────┐   ┌──────┴───────┐ │
+  │  │  [App Servers]  │──>│  {Cache Cluster} │──>│((DB Replica))│ │
+  │  └─────────────────┘   └─────────────────┘   └──────────────┘ │
+  └────────────────────────────────────────────────────────────────┘
+
+  Key design points:
+  - Each region has its own cache cluster (local reads, low latency)
+  - Each region has its own DB replica (local loader, no cross-region queries)
+  - Cross-region replication is async (eventual consistency)
+  - Writes go to the primary region and replicate to replicas
+  - Cache invalidation on write: broadcast to all regions
+`}
+</AsciiDiagram>
+
+### Cross-region cache invalidation
+
+When a write occurs in one region, all regions must invalidate their cached copy. The standard approach is a publish-subscribe channel for invalidation events:
+
+```javascript
+// Invalidation event format
+const invalidationEvent = {
+  key: 'user:42',
+  timestamp: 1719876543,
+  region: 'us-east',
+  reason: 'update'
+};
+
+// When a write happens in any region:
+// 1. Write to the local database replica
+// 2. Publish invalidation event to cross-region channel (SNS, Kafka, Redis Pub/Sub)
+// 3. All regions receive the invalidation event
+// 4. Each region removes the key from its local cache
+// 5. Next read in any region triggers a miss and reloads fresh data
+```
+
+## Capacity Planning
+
+### Estimating for 10 million DAU
+
+Assume each user generates 20 read requests per day for cacheable data. This gives:
+
+- **Total daily reads**: 10M users x 20 reads = 200,000,000 reads/day
+- **Peak read QPS**: assume 10x ratio of peak to average, average = 200M / 86400 = 2315 QPS, peak = 23,150 QPS
+- **Miss rate**: assume 5% miss rate (95% hit ratio) after warmup
+- **Miss QPS**: 23,150 x 0.05 = 1,158 miss QPS
+- **Loader query QPS**: 1,158 queries per second against the database
+
+### Loader capacity
+
+Each miss triggers a loader query. The database must handle 1,158 QPS of loader queries on top of write traffic. For a typical SQL database:
+
+- **Single replica capacity**: 5,000-10,000 read QPS for simple indexed queries
+- **Loader replica requirement**: 1 replica is sufficient for the loader, but use 2 for redundancy
+- **Connection pool**: 100-200 connections per loader instance
+
+### Cache memory
+
+Estimate the number of unique keys accessed within the TTL window:
+
+- **Unique users per day**: 10M
+- **Unique keys per user**: 10 (profile, feed, settings, etc.)
+- **Total unique keys**: 100M
+- **Average entry size**: 2KB (serialized JSON)
+- **Total memory**: 100M x 2KB = 200GB
+- **With 3x replication in Redis cluster**: 600GB total
+- **Number of cache nodes**: 12 nodes at 64GB each, or 24 nodes at 32GB each
+
+### Memory cost breakdown
+
+| Component | Per entry | 100M entries |
+|-----------|-----------|--------------|
+| Serialized value | 2KB | 200GB |
+| Key string | 50 bytes | 5GB |
+| Metadata (TTL, timestamps) | 64 bytes | 6.4GB |
+| Hash table overhead | 24 bytes | 2.4GB |
+| LRU tracking | 16 bytes | 1.6GB |
+| **Total** | **~2.15KB** | **~215GB** |
+
+## Deployment
+
+### Zero-downtime deployment
+
+Deploying a new version of the cache or the loader service must not drop cache entries or cause a thundering-herd against the database.
+
+**Rolling deployment strategy for cache nodes**:
+
+1. Add new cache nodes to the cluster (they start empty)
+2. Update the consistent hashing ring to include the new nodes
+3. Gradually shift traffic from old nodes to new nodes (use virtual nodes for fine-grained control)
+4. Once old nodes have zero traffic, remove them from the cluster
+5. The cache is warm on the new nodes within one TTL window
+
+**Rolling deployment strategy for loader service**:
+
+1. Deploy new loader instances alongside existing instances
+2. Register new instances with the service discovery system
+3. The cache routes loader requests to new instances
+4. Old instances drain their in-flight requests
+5. Remove old instances
+
+### Monitoring
+
+Every read-through cache deployment must monitor these metrics:
+
+| Metric | Alert threshold | Why it matters |
+|--------|----------------|----------------|
+| Cache hit ratio | under 90% | Low hit ratio means the cache is not effective |
+| Loader p99 latency | over 500ms | Slow loaders mean slow responses for every miss |
+| Loader error rate | over 1% | Errors reduce availability and may indicate database issues |
+| Memory usage | over 80% | High memory usage triggers eviction, reducing hit ratio |
+| Eviction rate | over 100/sec | High eviction rate means the cache is too small |
+| Loader QPS | over 80% of capacity | The database may become overloaded |
+| Circuit breaker state | open | Open circuit means the loader is failing |
+| Dedup gate in-flight | over 500 | Many concurrent misses may indicate a stampede |
+
+### Alerting runbook
+
+**Cache hit ratio drops below 90%**:
+1. Check for recent deployments that may have changed key patterns
+2. Check memory usage — the cache may need more capacity
+3. Check for increased traffic volume
+4. Check for a cache node failure (reduced cluster size)
+5. Consider pre-warming the cache with expected keys
+
+**Loader latency spikes**:
+1. Check database CPU and connection count
+2. Check for slow queries in the database query log
+3. Check for network issues between cache and database
+4. Check for database replication lag (if using replicas)
+5. Consider adding read replicas or increasing connection pool size
+
+**Circuit breaker opens**:
+1. Do NOT restart the circuit breaker manually — let it recover
+2. Check the database for availability
+3. Check for network partitions
+4. Once the database recovers, the circuit breaker half-opens automatically
+5. Monitor the stale data serving — verify stale data is acceptable
+
+<AsciiDiagram
+  id="read-through/monitoring-dashboard"
+  title="Read-through cache monitoring dashboard"
+  alt="Dashboard layout showing key metrics: hit ratio gauge, latency graph, memory usage, eviction rate, error rate"
+  caption="A production dashboard tracks hit ratio, latency, memory, and error rate in real time."
+>
+{`
+  ┌────────────────────────────────────────────────────────────┐
+  │  Read-Through Cache Dashboard ── Prod ── us-east-1         │
+  ├────────────────────────────────────────────────────────────┤
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+  │  │ Hit Ratio     │  │ Miss Latency │  │ Memory       │    │
+  │  │               │  │              │  │              │    │
+  │  │    [97%]      │  │  p50:  12ms  │  │  68% used    │    │
+  │  │   ████████    │  │  p95:  45ms  │  │  ██████░░    │    │
+  │  │   target 90%  │  │  p99: 120ms  │  │  of 64GB     │    │
+  │  └──────────────┘  └──────────────┘  └──────────────┘    │
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+  │  │ Eviction Rate │  │ Loader QPS   │  │ Error Rate   │    │
+  │  │               │  │              │  │              │    │
+  │  │    12/sec     │  │   1,158 rps  │  │   0.02%      │    │
+  │  │   target 100  │  │  target 5000 │  │   target 1%  │    │
+  │  └──────────────┘  └──────────────┘  └──────────────┘    │
+  ├────────────────────────────────────────────────────────────┤
+  │  Last 24 hours: Hit Ratio                                 │
+  │  100% ┤███████████████████████████████████████████████    │
+  │   90% ┤███████████████████████████████████████████████    │
+  │   80% ┤███████████████████████████████████████████████    │
+  │   70% ┤███████████████████████████████████████████████    │
+  │       └───────────────────────────────────────────────    │
+  │         Mon 12  Tue 13  Wed 14  Thu 15  Fri 16  Sat 17   │
+  └────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Upgrades
+
+**Cache cluster version upgrade**:
+1. Add a new node running the new version to the cluster
+2. Mark the old node as draining (stop accepting new keys)
+3. Wait for existing keys to expire or be evicted from the old node
+4. Remove the old node
+5. Repeat for each node in the cluster
+
+**Loader service version upgrade**:
+1. Deploy new loader instances
+2. Redirect a small percentage of loader traffic to new instances (canary)
+3. Monitor error rate and latency for 5-10 minutes
+4. Gradually increase the percentage
+5. When all traffic is on new instances, remove old instances
+
+### Disaster recovery
+
+A production read-through cache deployment must have a disaster recovery plan for three scenarios:
+
+**Scenario 1: Entire cache cluster fails (all nodes down)**:
+1. Route all reads directly to the database (bypass the cache).
+2. Application latency increases from sub-millisecond (cache hit) to 10-50ms (database read).
+3. Deploy a new cache cluster from the backup configuration.
+4. Warm the cache by running a pre-warming script that loads the top 10% most-frequently-accessed keys.
+5. Once the cache hit ratio reaches 80%, route reads back through the cache.
+
+**Scenario 2: Partial cache cluster failure (some nodes down)**:
+1. Consistent hashing redistributes keys from failed nodes to remaining nodes.
+2. The remaining cache nodes serve hits for their existing keys and generate misses for redistributed keys.
+3. The loader service handles the increased miss rate — ensure the loader has headroom for this scenario.
+4. Replace the failed nodes and rebalance the consistent hashing ring.
+5. Monitor the hit ratio — it will drop and gradually recover as the new nodes warm up.
+
+**Scenario 3: Data corruption (buggy code stores corrupted values)**:
+1. Detect corrupted entries via monitoring (deserialization errors spike).
+2. Invalidate all cache entries matching the affected key pattern.
+3. The loader re-fetches fresh data from the database on the next miss.
+4. If the corruption persists, the loader itself may be corrupted — roll back the loader service.
+5. After the rollback, invalidate the cache again to clear corrupted entries.
+
+### Load testing and benchmarking
+
+Before deploying a read-through cache to production, benchmark its behavior under realistic load:
+
+**Benchmark metrics**:
+
+| Metric | Target | How to measure |
+|--------|--------|---------------|
+| Hit latency (p50) | under 2ms | Load test with 100% hit rate |
+| Hit latency (p99) | under 5ms | Load test with 100% hit rate |
+| Miss latency (p50) | under 50ms | Load test with 100% miss rate (cold cache) |
+| Miss latency (p99) | under 200ms | Load test with 100% miss rate + slow database |
+| Max throughput | 2x expected peak | Ramp up QPS until latency exceeds target |
+| Cache fill rate | Under 60s to 80% hit | Cold start test with production traffic pattern |
+
+**Load testing scenarios**:
+
+1. **Cold start scenario**: start with an empty cache and simulate peak traffic. Measure how long it takes for the hit ratio to reach 80%. The database must survive the initial miss storm.
+
+2. **Stampede scenario**: expire a single hot key and measure the load on the database. Verify the dedup gate prevents more than one loader invocation.
+
+3. **Node failure scenario**: kill one cache node and verify that the remaining nodes handle the redistributed keys without exceeding memory or CPU.
+
+4. **Loader degradation scenario**: inject 200ms latency into the loader and verify the circuit breaker opens correctly. Measure the stale data fallback behavior.
+
+### Observability
+
+A read-through cache deployment needs observability at three levels:
+
+**Level 1: Cache client metrics (every application instance)**:
+- Number of `get()` calls per second
+- Cache hit count and hit ratio
+- Cache miss count
+- Average hit and miss latency
+- Number of loader invocations
+- Number of dedup wait events
+
+**Level 2: Cache node metrics (every cache server)**:
+- Memory usage (used, max, eviction rate)
+- CPU usage
+- Network bandwidth (in/out)
+- Number of connected clients
+- Command throughput (get/set/delete per second)
+- Number of expired keys per second
+- Number of evicted keys per second
+
+**Level 3: Loader service metrics (every loader instance)**:
+- Loader invocations per second
+- Loader success rate
+- Loader latency (p50, p95, p99)
+- Database connection pool utilization
+- Circuit breaker state (closed, open, half-open)
+- Number of stale fallback responses
+- Number of timeout errors
+
+### Data consistency verification
+
+Because read-through cache is eventually consistent, you should periodically verify that the cache and database are in sync:
+
+**Reconciliation process**:
+1. Sample N random keys from the cache.
+2. For each sampled key, query the database directly (bypassing the cache).
+3. Compare the cached value with the database value.
+4. If a mismatch is found, log the discrepancy and invalidate the cache entry.
+5. Track the mismatch rate over time — a rising mismatch rate may indicate a bug in the write path or a TTL that is too long.
+
+**Reconciliation frequency**: run once per hour at low traffic. Sample 0.01% of cache entries. For a 100M-entry cache, this is 10,000 entries per hour, or under 3 per second — negligible overhead.
+
+### Security considerations
+
+- **Authentication**: the cache cluster must require authentication. Redis supports `requirepass` and ACL-based access control. Memcached has SASL authentication.
+- **Encryption in transit**: use TLS between application servers and cache nodes. Redis supports TLS natively. Memcached requires a TLS proxy.
+- **Network isolation**: place the cache cluster in a private subnet. Only application servers and the loader service should have network access to the cache nodes.
+- **Rate limiting**: the loader service should rate-limit requests to the database. Configure a maximum QPS per loader instance to prevent accidental database overload.
+- **Input validation**: the loader function should validate key patterns. A malicious key like `../../../etc/passwd` should not reach the database query.
+
+### Cache node sizing
+
+Choosing the right cache node size is critical for cost and performance. There are two strategies:
+
+**Many small nodes**:
+- 16 nodes at 32GB each = 512GB total
+- Pros: finer granularity for scaling (add 1 node at a time), lower blast radius (one node failure loses only 1/16 of the data)
+- Cons: more nodes to manage, more network overhead, consistent hashing redistribution is more complex
+- Best for: workloads with predictable growth and many small keys
+
+**Few large nodes**:
+- 4 nodes at 128GB each = 512GB total
+- Pros: fewer nodes to manage, simpler network topology, higher per-node throughput
+- Cons: larger blast radius (one node failure loses 1/4 of the data), more expensive per-node, harder to scale gradually
+- Best for: workloads with large keys and high throughput requirements
+
+**Recommendation**: start with 4-8 nodes and scale as needed. Use virtual nodes (160 per physical node) for balanced distribution. Monitor per-node memory usage and add nodes when any node exceeds 70% memory utilization.
+
+### Dedicated loader service architecture
+
+The loader service is a stateless HTTP or gRPC service that the cache cluster calls on a miss. It has its own deployment, scaling, and monitoring.
+
+```yaml
+# Sample loader service deployment (Kubernetes)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache-loader
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: cache-loader
+  template:
+    metadata:
+      labels:
+        app: cache-loader
+    spec:
+      containers:
+      - name: loader
+        image: cache-loader:1.2.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DB_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: connection-string
+        - name: DB_MAX_CONNECTIONS
+          value: "50"
+        - name: LOADER_TIMEOUT_MS
+          value: "5000"
+        - name: CIRCUIT_BREAKER_THRESHOLD
+          value: "10"
+        - name: CIRCUIT_BREAKER_WINDOW_MS
+          value: "60000"
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cache-loader-service
+spec:
+  selector:
+    app: cache-loader
+  ports:
+  - port: 8080
+    targetPort: 8080
+```
+
+### The cache key design
+
+Key design is a critical architectural decision. The key format determines how the cache is partitioned, how loaders are matched, and how invalidation works.
+
+**Good key patterns**:
+
+```
+# Namespace:entity:id
+user:42
+post:abc123
+feed:user:42
+
+# Hierarchical for batch loading
+region:us-east:zone:1a
+org:acme:team:engineering:member:42
+
+# Versioned for schema evolution
+v2:user:42
+```
+
+**Bad key patterns**:
+
+```
+# Too generic — no namespace (collision risk)
+42
+abc123
+
+# Too specific — includes timestamps (every entry is unique, no cache reuse)
+user:42:2024-01-01T12:00:00Z
+
+# Too long — wastes memory
+user:42:profile:personal:name:first:last:email:phone:address
+
+# Includes query parameters (different keys for same data)
+user:42?fields=name,email
+user:42?fields=name,email,phone
+```
+
+**Key design rules**:
+1. Always use a namespace prefix (`user:`, `post:`, `feed:`).
+2. Use the natural identifier (database ID, UUID, slug).
+3. Do not include timestamps, version numbers, or request-specific parameters.
+4. Keep keys short — under 100 characters.
+5. Use colon-separated segments for readability and pattern matching.

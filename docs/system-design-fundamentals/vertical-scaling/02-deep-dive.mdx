@@ -1,0 +1,637 @@
+---
+id: vertical-scaling-deep-dive
+title: Vertical Scaling — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Vertical Scaling — Under the Hood
+
+Vertical scaling appears deceptively simple — swap a smaller instance for a larger one — but the internal mechanics involve the operating system scheduler, the memory hierarchy, NUMA topology, kernel I/O stacks, and hypervisor resource allocation. Understanding these internals determines whether your upgrade delivers 2x performance or 1.2x performance.
+
+## Internal Architecture
+
+A vertically scaled system consists of the same logical components as any single-server deployment, but at larger resource scales the physical layout of these components matters.
+
+<AsciiDiagram
+  id="vertical-scaling/deep-dive-internal-arch"
+  title="Internal Architecture of a Vertically Scaled Server"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│                    Operating System (Linux)                     │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Process Scheduler (CFS — Completely Fair Scheduler)     │  │
+│  │  - Schedules threads onto available CPU cores             │  │
+│  │  - Load balancing across NUMA nodes                       │  │
+│  │  - Nice values / cgroups for priority                     │  │
+│  └────────────────────────┬──────────────────────────────────┘  │
+│                           │                                      │
+├───────────────────────────┼──────────────────────────────────────┤
+│  Socket 0          Socket 1         Socket 2       Socket 3     │
+│  ┌────┬────┬─┐  ┌────┬────┬─┐  ┌────┬────┬─┐  ┌────┬────┬─┐  │
+│  │ C0 │ C1 │C2│  │ C8 │ C9 │C10│ │C16 │C17 │C18│ │C24 │C25 │C26││
+│  │ C3 │ C4 │C5│  │C11 │C12 │C13│ │C19 │C20 │C21│ │C27 │C28 │C29││
+│  │ C6 │ C7 │  │  │C14 │C15 │   │  │C22 │C23 │   │  │C30 │C31 │  ││
+│  └────┴────┴──┘  └────┴────┴──┘  └────┴────┴──┘  └────┴────┴──┘│
+│  ┌───────────┐   ┌───────────┐   ┌───────────┐   ┌───────────┐ │
+│  │ Local RAM │   │ Local RAM │   │ Local RAM │   │ Local RAM │ │
+│  │ 64 GB     │   │ 64 GB     │   │ 64 GB     │   │ 64 GB     │ │
+│  └─────┬─────┘   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘ │
+│        │               │               │               │       │
+│        └───────────────┴───────┬───────┴───────────────┘       │
+│                                │                                │
+│                         Unified Memory Access                  │
+│                         (NUMA — non-uniform latency)           │
+│                         Local socket: 100ns                    │
+│                         Remote socket: 150-200ns               │
+│                         Cross-socket: 250-350ns                │
+└─────────────────────────────────────────────────────────────────┘
+
+Storage Layer:
+  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐
+  │ NVMe 0     │  │ NVMe 1     │  │ EBS Volume │  │ EBS Volume │
+  │ 3.5 GB/s   │  │ 3.5 GB/s   │  │ 1 GB/s     │  │ 1 GB/s     │
+  │ 1 TB       │  │ 1 TB       │  │ 4 TB       │  │ 4 TB       │
+  └────────────┘  └────────────┘  └────────────┘  └────────────┘
+  `}
+  alt="Internal architecture of a multi-socket server with 4 NUMA nodes, each with local RAM, showing the process scheduler, NUMA topology with latency values, and storage layer with NVMe and EBS volumes"
+  caption="A 32-core, 256 GB server has NUMA topology that affects memory access latency — not all memory is equally fast"
+/>
+
+### Key Internal Components
+
+**Process Scheduler (CFS)**: The Linux Completely Fair Scheduler distributes CPU time among runnable threads. It runs a red-black tree of tasks, always selecting the one with the smallest `vruntime` (virtual runtime). On a 32-core system, the scheduler load-balances threads across cores every 1-10 milliseconds. When a thread migrates from core 0 to core 16 (a different NUMA node), its cached memory in L1/L2 becomes invalid — this costs approximately 50 microseconds of stall time.
+
+**NUMA topology**: Modern servers with more than 16 cores typically use multiple CPU sockets. Each socket has its own memory controller connected to local RAM banks. Accessing local RAM takes approximately 100 nanoseconds. Accessing RAM on another socket takes 150-350 nanoseconds depending on whether the data must traverse one inter-socket link (QPI/UPI) or two. A 50% memory access penalty for remote reads means database workloads can suffer a 20-30% throughput loss on a poorly-configured NUMA system.
+
+**Memory hierarchy**: Data travels from the CPU register through L1 cache (0.5ns, 32 KB per core), L2 cache (3ns, 512 KB per core), L3 cache (10ns, 16-32 MB shared per socket), local memory (100ns), remote memory (200ns+), and finally to disk (5,000,000ns for NVMe, 10,000,000ns for EBS). Vertical scaling often means fitting the working set into a higher level of this hierarchy — ideally entirely in RAM, avoiding disk entirely.
+
+**Kernel I/O stack**: Block device requests go through the virtual file system (VFS), page cache, block layer (with I/O schedulers like BFQ or none), and NVMe driver before reaching the physical device. Each layer adds 1-5 microseconds of overhead per I/O operation. On large instances with high IOPS, the kernel's block layer itself can become a bottleneck — Linux `blk-mq` (multi-queue block layer) was introduced specifically to scale I/O processing across many cores.
+
+## Data Structures and Algorithms
+
+### NUMA-Aware Memory Allocation
+
+**What structure**: The kernel maintains a per-node memory allocator with a buddy allocator for contiguous pages and slab allocators for small kernel objects.
+
+**Why this structure**: On a NUMA system, allocating memory from the local node is faster than allocating from a remote node. The kernel's `numa_membind` API lets processes specify which nodes to allocate from. The `mbind()` system call sets a memory policy: `MPOL_BIND` (allocate only from specified nodes), `MPOL_PREFERRED` (prefer specified nodes, fall back to others), `MPOL_INTERLEAVE` (round-robin across specified nodes).
+
+**Time complexity**: Memory allocation from the buddy allocator is O(log N) where N is the number of free page blocks. Allocation with `GFP_KERNEL` flags typically completes in 0.5-3 microseconds. On a contended NUMA node with memory pressure and reclaim, allocation can take milliseconds.
+
+**Space complexity**: Each memory page (4 KB on x86_64) has a `struct page` entry — 64 bytes per page, or approximately 1.6% overhead for a 256 GB system (approximately 4 GB kernel memory for page tracking).
+
+<AsciiDiagram
+  id="vertical-scaling/deep-dide-numa-alloc"
+  title="NUMA Memory Allocation Path"
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│                 NUMA Memory Allocation Flow                   │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Process requests memory                                   │
+│       │                                                     │
+│       ▼                                                     │
+│  Check memory policy (mbind/cgroup)                        │
+│       │                                                     │
+│       ▼                                                     │
+│  ┌─────────────────────────────────────────────┐          │
+│  │  Step 1: Allocate from LOCAL NUMA node       │ 100ns   │
+│  │  (fast path — succeeds if free pages exist) │          │
+│  └─────────────────────┬───────────────────────┘          │
+│                        │                                   │
+│           Free pages available?                            │
+│              │            │                                 │
+│             YES           NO                                │
+│              │            │                                 │
+│              ▼            ▼                                 │
+│         Return      ┌────────────────────────────┐        │
+│         address     │ Step 2: Remote NUMA node   │         │
+│                     │ (next nearest socket)      │ 150-    │
+│                     │                            │ 350ns   │
+│                     └─────────────┬──────────────┘         │
+│                                   │                         │
+│                      Free pages on any remote node?         │
+│                           │              │                  │
+│                          YES             NO                 │
+│                           │              │                  │
+│                           ▼              ▼                  │
+│                      Return        ┌──────────────────┐    │
+│                      address       │ Step 3: Reclaim  │     │
+│                                    │ (kswapd / direct │    │
+│                                    │  reclaim)        │    │
+│                                    │ 1-100ms penalty  │    │
+│                                    └──────────────────┘    │
+│                                         │                   │
+│                                         ▼                   │
+│                                    OOM killer if            │
+│                                    reclaim fails            │
+│                                                               │
+│  Performance tip: pin application to NUMA node 0             │
+│  with numactl --cpunodebind=0 --membind=0 for               │
+│  consistent local-memory access latency                      │
+└───────────────────────────────────────────────────────────────┘
+  `}
+  alt="NUMA memory allocation flow showing local node allocation as the fast path, remote node allocation as a secondary path, and memory reclaim as the slow fallback with OOM killer as final resort"
+  caption="NUMA-aware allocation prioritizes local memory (100ns) over remote memory (150-350ns) — process pinning avoids cross-socket penalties"
+/>
+
+### Linux Completely Fair Scheduler (CFS)
+
+**What structure**: A red-black tree of runnable tasks, keyed by `vruntime` (virtual runtime — actual runtime normalized by task priority).
+
+**Why this structure**: The red-black tree provides O(log N) insertion and deletion of tasks, with O(1) minimum-value lookup. CFS selects the leftmost node in the tree (the task with the smallest vruntime) as the next task to run. This ensures fairness: tasks that have run less get scheduled sooner.
+
+**Time complexity**: 
+- Task enqueue/dequeue: O(log N) where N is the number of runnable tasks
+- Task selection: O(1) (leftmost node of the tree)
+- Load balancing between cores: O(M) where M is the number of cores in the scheduling domain
+
+**Space complexity**: O(N) for the red-black tree of runnable tasks. On a 32-core system with 500 runnable threads, approximately 50 KB for the scheduler data structures.
+
+### Multi-Queue Block Layer (blk-mq)
+
+**What structure**: Per-core submission queues feeding into a shared dispatch queue. Each CPU core has its own software staging queue, which feeds into hardware dispatch queues (one per NVMe device).
+
+**Why this structure**: Before blk-mq (Linux 3.13, 2014), the block layer had a single request queue protected by a global lock. On 32-core systems, lock contention on this single queue caused I/O throughput to plateau at approximately 500,000 IOPS regardless of the underlying device. blk-mq gives each core its own queue, eliminating the lock contention.
+
+**Time complexity**: 
+- I/O submission: O(1) per core (no lock, write to per-CPU queue)
+- I/O completion: O(1) per core (softirq on the submitting core)
+- Dispatch: O(N) where N is the number of software queues
+
+**Space complexity**: Approximately 4 KB per queue per device. For a 32-core system with 2 NVMe devices: 32 CPU queues x 2 devices x 4 KB = 256 KB overhead.
+
+## The Request Lifecycle
+
+A single database query on a vertically scaled server travels through 12+ distinct stages. Each stage has a different latency cost depending on cache state and resource contention.
+
+<AsciiDiagram
+  id="vertical-scaling/deep-dive-lifecycle-1"
+  title="Request Lifecycle — Steps 1-6: Network to Query Parsing"
+  content={`
+Step 1: Network Receive
+  Client request arrives at NIC (Network Interface Card)
+  ┌──────────────┐
+  │ NIC receives  │──> DMA transfer to kernel ring buffer
+  │ packet        │    Latency: 0.1-1 microseconds
+  └──────┬───────┘    (depends on packet size and link speed)
+         │
+         ▼
+Step 2: IRQ / Softirq
+  ┌──────────────┐
+  │ NIC raises    │──> CPU core (pinned by RPS/irqbalance):
+  │ IRQ           │    1. Acknowledge interrupt
+  └──────┬───────┘    2. Raise softirq (NET_RX_SOFTIRQ)
+                      3. Return from interrupt
+         │             Latency: 2-5 microseconds
+         ▼
+Step 3: Network Stack
+  ┌──────────────┐
+  │ Kernel TCP/IP │──> 1. IP routing table lookup
+  │ processing    │    2. TCP reassembly (if fragmented)
+  └──────┬───────┘    3. Socket lookup (find the listening process)
+                      4. Copy data to userspace buffer
+                      Latency: 5-20 microseconds
+         │
+         ▼
+Step 4: Application Accept
+  ┌──────────────┐
+  │ PostgreSQL    │──> 1. accept() returns new fd
+  │ read / write  │    2. Read query bytes from socket
+  │ system call   │    3. Parse query string (lexer + parser)
+  └──────┬───────┘    4. Abstract syntax tree built
+                      Latency: 2-10 microseconds (parse)
+         │
+         ▼
+Step 5: Query Planning
+  ┌──────────────┐
+  │ Query Planner │──> 1. Check pg_statistic (table stats)
+  │ (PostgreSQL)  │    2. Estimate row counts for each join plan
+  └──────┬───────┘    3. Choose cheapest plan by cost estimate
+                      4. Generate plan tree
+                      Latency: 10-100 microseconds (simple)
+                              5-50ms (complex join)
+         │
+         ▼
+Step 6: Lock Acquisition
+  ┌──────────────┐
+  │ Lock Manager  │──> 1. Acquire RowExclusiveLock on table
+  │ (PostgreSQL)  │    2. Acquire RowShareLock on index pages
+  └──────┬───────┘    3. Wait if conflicting lock held
+                      Latency: 0.5-5 microseconds (no contention)
+                              1ms-60s (contention — blocked)
+  `}
+  alt="Request lifecycle steps 1-6 showing NIC receive, IRQ/softirq handling, kernel TCP/IP processing, PostgreSQL query parsing, query planning, and lock acquisition with latency values at each stage"
+  caption="Steps 1-6: A query traverses the network stack, kernel, and database engine before accessing any data"
+/>
+
+<AsciiDiagram
+  id="vertical-scaling/deep-dive-lifecycle-2"
+  title="Request Lifecycle — Steps 7-12: Buffer Cache to Response"
+  content={`
+Step 7: Buffer Cache Lookup
+  ┌──────────────────┐
+  │ PostgreSQL        │──> Check shared_buffers for data pages
+  │ shared_buffers    │    Cache HIT:  read from RAM (0.1ms)
+  │ (kernel + PG)     │    Cache MISS: schedule disk I/O (10ms)
+  └──────┬───────────┘
+         │
+         ▼
+Step 8: Data Page Read (on cache miss)
+  ┌──────────────────┐
+  │ Block Layer       │──> 1. Page cache check (kernel)
+  │ (blk-mq)         │    2. If also miss in page cache:
+  └──────┬───────────┘       request goes to NVMe driver
+         │                   3. DMA transfer from NVMe to RAM
+         ▼                   4. PG shared_buffers populated
+  ┌──────────────────┐       Latency: 10-100 microseconds (NVMe)
+  │ NVMe Driver       │               >1ms (EBS — network RTT)
+  │ + NVMe Device     │
+  └──────────────────┘
+         │
+         ▼
+Step 9: Data Processing
+  ┌──────────────────┐
+  │ Query Executor   │──> 1. Process qualifying rows
+  │ (PostgreSQL)     │    2. Apply WHERE clause filter
+  └──────┬───────────┘    3. Apply ORDER BY / GROUP BY
+                          4. Join rows (nested loop / hash / merge)
+                          Latency: 10 nanoseconds per row (filter)
+                                  1-100 microseconds per page (join)
+         │
+         ▼
+Step 10: WAL Write (for write queries)
+  ┌──────────────────┐
+  │ Write-Ahead Log   │──> 1. Append transaction to WAL buffer
+  │ (PostgreSQL WAL) │    2. WAL writer flushes to disk
+  └──────┬───────────┘    3. fsync() call (kernel page cache flush)
+                          4. Return success to client
+                          Latency: 0.5-5ms (WAL write to NVMe)
+                                  2-10ms (WAL write to EBS)
+         │
+         ▼
+Step 11: Response Encoding
+  ┌──────────────────┐
+  │ Response Encoding │──> 1. Format result rows as protocol buffer
+  │ (PostgreSQL)     │    2. Copy to socket send buffer
+  └──────┬───────────┘    3. Trigger TCP send
+                          Latency: 1-10 microseconds per row
+         │
+         ▼
+Step 12: Network Send
+  ┌──────────────────┐
+  │ NIC Transmit      │──> 1. TCP segmentation / GSO
+  │                   │    2. Checksum offload (checksum to NIC)
+  └──────────────────┘    3. DMA from kernel buffer to NIC
+                          Latency: 0.5-2 microseconds
+
+End-to-end latency breakdown (read, cache HIT):
+  Network receive:    ~3 microseconds
+  TCP/IP processing:  ~10 microseconds
+  Query parsing:      ~5 microseconds
+  Plan + locks:       ~15 microseconds
+  Buffer cache read:  ~100 microseconds
+  Data processing:    ~10 microseconds
+  Response send:      ~5 microseconds
+  ─────────────────────────────────────────
+  Total:              ~150 microseconds
+  `}
+  alt="Request lifecycle steps 7-12 showing buffer cache lookup (hit or miss), NVMe driver read, PostgreSQL query execution with WHERE/JOIN/ORDER BY processing, WAL write for mutations, response encoding, and NIC transmit — with microsecond-level latency for each stage"
+  caption="Steps 7-12: Data access, processing, and response — a cache hit completes in approximately 150 microseconds"
+/>
+
+### Full lifecycle on a vertically scaled instance
+
+For a read query on a 32-core, 256 GB server with the working set in memory:
+
+```
+Read query (SELECT * FROM orders WHERE id = 12345):
+  Network + parse:       ~20 microseconds
+  Plan + lock:           ~15 microseconds
+  Cache hit (no disk):   ~100 microseconds (buffer cache read)
+  Row processing:        ~10 microseconds
+  Response:              ~5 microseconds
+  ──────────────────────────────────────
+  Total P50:             150 microseconds
+
+  On a 4-core, 16 GB server with working set > RAM:
+  Cache miss (disk):     ~10,000 microseconds (10ms)
+  Total P50:             ~10,150 microseconds (10.15ms)
+  ──> 67x slower due to cache miss
+
+Write query (INSERT INTO orders ...):
+  Network + parse:       ~20 microseconds
+  Plan + lock:           ~20 microseconds (RowExclusiveLock)
+  Buffer cache modify:   ~50 microseconds
+  WAL write + fsync:     ~2,000 microseconds (2ms — NVMe)
+  Response:              ~5 microseconds
+  ──────────────────────────────────────
+  Total P50:              ~2,095 microseconds (2.1ms)
+```
+
+The difference between a cache hit and a cache miss is the difference between 150 microseconds and 10 milliseconds — a 67x penalty. This is why vertical scaling for memory is the most impactful upgrade for database workloads.
+
+## Consistency and State
+
+Vertical scaling keeps all state on a single machine, which avoids many distributed consistency problems but introduces others specific to large single-node systems.
+
+### Crash Recovery
+
+When a vertically scaled server crashes, the recovery time scales with the data size. For a PostgreSQL database with 2 TB of data, recovery can take 30-60 minutes.
+
+<AsciiDiagram
+  id="vertical-scaling/deep-dive-crash"
+  title="Crash Recovery Timeline on a Large Server"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                  PostgreSQL Crash Recovery Timeline                  │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Time: T=0ms                     T+30 min                T+60 min  │
+│         │                          │                       │        │
+│  Crash ─┤                          │                       │        │
+│         ▼                          │                       │        │
+│  ┌──────────────┐                  │                       │        │
+│  │ Instance     │  ~3 min          │                       │        │
+│  │ restarts     │────────────────> │                       │        │
+│  └──────────────┘                  │                       │        │
+│         │                          │                       │        │
+│         ▼                          │                       │        │
+│  ┌──────────────┐                  │                       │        │
+│  │ WAL replay    │  2 TB data      │                       │        │
+│  │ (recovery)    │─────────────────────────────────────>  │        │
+│  │ CentOS NVMe   │  ~50 min        │                       │        │
+│  └──────────────┘                  │                       │        │
+│         │                          │                       │        │
+│         ▼                          │                       │        │
+│  ┌──────────────┐                  │                       │        │
+│  │ Connection   │  ~1 min          │                       │        │
+│  │ pool warm-up │────>             │                       │        │
+│  └──────────────┘                  │                       │        │
+│         │                          │                       │        │
+│         ▼                          │                       ▼        │
+│    Ready to serve                  │                    Ready      │
+│                                                                     │
+│  Recovery time for 4-core / 16 GB: ~5 minutes                      │
+│  Recovery time for 32-core / 256 GB: ~55 minutes  (11x more data) │
+│                                                                     │
+│  Mitigation:                                                       │
+│    - Replica + failover (standby takes over in seconds)            │
+│    - Regular checkpoint tuning (spread WAL flush over time)        │
+│    - Faster storage (NVMe reduces WAL replay from 50min to 15min) │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+  alt="Crash recovery timeline for a large vertically scaled PostgreSQL server showing 3 minutes for instance restart, 50 minutes for WAL replay of 2 TB data, and 1 minute for connection pool warm-up — totaling approximately 55 minutes of downtime"
+  caption="Crash recovery scales with data size — a 2 TB PostgreSQL instance on a large server can take 55+ minutes to recover"
+/>
+
+### Partition Tolerance (Single Node)
+
+On a single machine, there is no network partition — the machine either runs or it does not. This eliminates the CAP theorem's partition tolerance trade-off because there is no distributed system. However, resource partitions within the machine create analogous failure modes.
+
+<AsciiDiagram
+  id="vertical-scaling/deep-dive-partition"
+  title="Resource Partition Failures on a Single Node"
+  content={`
+┌─────────────────────────────────────────────────────────────┐
+│              Single-Node Resource Partition Failures          │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Scenario 1: CPU Overcommit                                   │
+│    ┌──────────────────────────────────────────────────────┐  │
+│    │ CPU allocation:                                      │  │
+│    │   Web server:  4 cores (50% of 8 cores)              │  │
+│    │   Database:    3 cores (37.5%)                       │  │
+│    │   Background:  1 core (12.5%)                        │  │
+│    │                                                      │  │
+│    │ Problem: Web server spawns 50 threads — all 4 cores  │  │
+│    │         busy. Database CPU starved. Queries queue.   │  │
+│    │                                                      │  │
+│    │ Resolution: cgroup CPU limits (cpu.shares / cpu.cfs) │  │
+│    └──────────────────────────────────────────────────────┘  │
+│                                                               │
+│  Scenario 2: Memory Hog                                        │
+│    ┌──────────────────────────────────────────────────────┐  │
+│    │ Redis maxmemory = 60 GB (of 128 GB total)            │  │
+│    │ PostgreSQL shared_buffers = 32 GB                    │  │
+│    │ OS page cache = varies                               │  │
+│    │                                                      │  │
+│    │ Problem: ETL process allocates 50 GB for temp sort   │  │
+│    │         Total: 60+32+50+cache = close to 128 GB      │  │
+│    │         OOM killer selects largest consumer (Redis)  │  │
+│    │                                                      │  │
+│    │ Resolution: cgroup memory limits (memory.max)        │  │
+│    │             mlock() for critical processes            │  │
+│    └──────────────────────────────────────────────────────┘  │
+│                                                               │
+│  Scenario 3: I/O Throttling                                    │
+│    ┌──────────────────────────────────────────────────────┐  │
+│    │ EBS gp3 volume: 16,000 IOPS max                      │  │
+│    │                                                      │  │
+│    │ Problem: pg_dump backup reads at 12,000 IOPS         │  │
+│    │         Production queries get 4,000 IOPS left       │  │
+│    │         Query latency jumps from 5ms to 50ms         │  │
+│    │                                                      │  │
+│    │ Resolution: ionice (scheduling priority)             │  │
+│    │             cgroup io.max limits                      │  │
+│    └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+  `}
+  alt="Three single-node resource partition failure scenarios: CPU overcommit where web server starves the database, memory hog where OOM killer terminates Redis, and I/O throttling where backup saturates EBS IOPS and degrades production queries"
+  caption="Even on a single machine, resource contention between processes creates partition-like failures — cgroups provide isolation"
+/>
+
+### Concurrent Write Contention
+
+On a single-node database, concurrent writes contend for the same resources — CPU, memory, and disk — in a way that distributed writes do not. The write throughput on a single node is ultimately bounded by:
+
+```
+PostgreSQL maximum write throughput (single node, NVMe):
+  - WAL flush rate:        ~500 MB/s (NVMe sequential write)
+  - TPS (transactions/sec) at 1 KB WAL per transaction: ~500,000 TPS
+  - TPS at 100 KB per transaction: ~5,000 TPS
+  - TPS at 1 MB per transaction (large inserts): ~500 TPS
+
+  Each transaction requires:
+    1. WAL write + fsync()        ~2ms
+    2. Data page modification      ~0.1ms (in shared_buffers)
+    3. Lock acquire/release        ~0.005ms
+    4. Transaction commit log       ~0.01ms
+
+  Total per transaction overhead:  ~2.2ms
+  Theoretical max TPS:             ~450 TPS (non-batched)
+  With batching (group commit):    ~50,000 TPS
+```
+
+Vertical scaling increases the ceiling by adding more cores and more RAM (fewer cache misses, less I/O wait), but the single-threaded WAL write process means write throughput scale
+s less than linearly with cores. Going from 4 to 32 cores might improve write throughput by 3x, not 8x.
+
+### Stale Reads (Replica Lag)
+
+On a single-node setup with no replicas, there is no replication lag — all reads see the latest committed data because they read from the same storage. This is a strong consistency guarantee that horizontal scaling sacrifices.
+
+However, if the application uses a local cache (Redis on the same node, or in-process cache), stale reads can occur:
+
+```
+Scenario: Local cache on single node
+  1. App writes new value to PostgreSQL (committed)
+  2. App invalidates local cache entry
+  3. Another thread reads the cache key
+  4. Cache entry is being rebuilt — thread sees empty cache
+  5. Thread falls through to database, reads fresh value
+  6. Race: if step 5 starts before step 2, thread reads stale data
+
+Resolution:
+  - Use read-through cache with TTL (stale tolerated for TTL duration)
+  - Use Redis on the same node with exclusive cache-aside pattern
+  - Disable local caching if strong consistency is required
+```
+
+## Performance Characteristics
+
+These are concrete numbers for a vertically scaled database server. All figures assume PostgreSQL 16 on AWS `r7g.8xlarge` (32 vCPU, 256 GB RAM, gp3 16,000 IOPS) with a 50 GB working set.
+
+```
+Read performance (cache hit):
+  P50 latency:         150 microseconds
+  P99 latency:         500 microseconds
+  P999 latency:        2 milliseconds
+  Throughput:          50,000 queries/second (single connection)
+                       200,000 queries/second (100 connections)
+
+Read performance (cache miss — disk):
+  P50 latency:         8 milliseconds
+  P99 latency:         25 milliseconds
+  P999 latency:        150 milliseconds
+  Throughput:          2,000 queries/second (single connection)
+                       15,000 queries/second (100 connections)
+                       (I/O bound at 16,000 IOPS)
+
+Write performance:
+  P50 latency:         2 milliseconds
+  P99 latency:         8 milliseconds
+  P999 latency:        50 milliseconds
+  Throughput:          5,000 transactions/second (single connection)
+                       50,000 transactions/second (batch commit, 10 per group)
+
+Resource utilization at 50,000 TPS:
+  CPU:                 60% (30 of 32 cores active)
+  RAM:                 80 GB used (50 GB working set + 30 GB overhead)
+  I/O (write):         8,000 IOPS (write WAL)
+  I/O (read):          2,000 IOPS (occasional cache misses)
+  Network:             1.2 Gbps ingress, 4.8 Gbps egress
+```
+
+### Scaling Efficiency by Component
+
+```
+Efficiency of adding cores for different workload types on single node:
+  (Efficiency = actual throughput gain / ideal linear gain)
+
+  Workload           4→8 core   8→16 core   16→32 core   32→64 core
+  ─────────────────────────────────────────────────────────────────
+  CPU-bound (Go):    0.90       0.85        0.80         0.70
+  CPU-bound (Python):0.60       0.40        0.25         0.15
+  Memory-bound (PG): 0.95       0.90        0.85         0.75
+  I/O-bound:         0.30       0.15        0.08         0.04
+  Mixed:             0.80       0.70        0.60         0.45
+
+  Key: PostgreSQL on a 32-core server gets approximately 85%
+  of linear scaling when memory-bound. Once the workload shifts
+  to I/O-bound (working set exceeds RAM), scaling efficiency
+  collapses.
+```
+
+## Configuration and Tuning
+
+These settings must be adjusted when vertically scaling the database server.
+
+### PostgreSQL Tuning per Instance Size
+
+| Parameter | 4 core/16 GB | 8 core/32 GB | 16 core/64 GB | 32 core/256 GB | Effect of wrong value |
+|---|---|---|---|---|---|
+| max_connections | 100 | 200 | 400 | 800 | Too low: connection errors. Too high: memory exhaustion from connection overhead |
+| shared_buffers | 4 GB | 8 GB | 16 GB | 64 GB | Too low: poor cache hit ratio. Too high: OS page cache starved |
+| effective_cache_size | 12 GB | 24 GB | 48 GB | 192 GB | Too low: planner chooses sequential scans over index scans |
+| work_mem | 32 MB | 64 MB | 128 MB | 256 MB | Too low: disk sorts. Too high: memory exhaustion with many concurrent sorts |
+| maintenance_work_mem | 512 MB | 1 GB | 2 GB | 4 GB | Too low: slow VACUUM and index creation |
+| wal_buffers | 16 MB | 16 MB | 64 MB | 256 MB | Too low: WAL write contention under high write load |
+| max_worker_processes | 8 | 16 | 32 | 64 | Too low: parallel query not used. Too high: unnecessary process overhead |
+| random_page_cost | 1.1 | 1.1 | 1.1 | 1.1 (SSD) | Too high: planner avoids index scans even when beneficial |
+
+### NUMA Tuning
+
+For multi-socket servers, NUMA configuration can make a 30% difference in throughput:
+
+```
+NUMA configuration checklist:
+
+1. Check NUMA topology:
+   numactl --hardware
+
+2. Pin database to local NUMA node:
+   numactl --cpunodebind=0 --membind=0 postgres -D /data
+
+3. Disable NUMA balancing (can cause page migration overhead):
+   echo 0 > /proc/sys/kernel/numa_balancing
+
+4. Configure PostgreSQL to disable NUMA:
+   In postgresql.conf: numa_memory = off (default since PG 16)
+
+5. For Java applications on NUMA:
+   -XX:+UseNUMA   (enables NUMA-aware allocation in JVM)
+
+6. Monitor cross-socket memory access:
+   numastat -p postgres
+   If "other_node" accesses > 20% of total, NUMA tuning needed
+```
+
+### I/O Scheduler Tuning
+
+```
+NVMe devices should use the "none" I/O scheduler:
+  echo none > /sys/block/nvme0n1/queue/scheduler
+
+EBS volumes should use "none" or "mq-deadline":
+  echo none > /sys/block/xvd*/queue/scheduler
+
+Tuning for latency vs throughput:
+  Latency-sensitive:  queue/depth = 32  (lower queue depth = lower latency)
+  Throughput-focused:  queue/depth = 128 (higher throughput, higher P99 latency)
+
+  PostgreSQL checkpoint tuning to reduce I/O spikes:
+    checkpoint_completion_target = 0.9   # spread writes over checkpoint window
+    checkpoint_timeout = 15min           # reduce checkpoint frequency
+    max_wal_size = 8 GB                  # absorb write bursts without checkpoint
+```
+
+### Linux Kernel Tuning
+
+For high-throughput database workloads on large instances:
+
+```
+sysctl settings for 32-core / 256 GB server:
+
+# Network
+net.core.somaxconn = 65535              # Connection backlog
+net.ipv4.tcp_tw_reuse = 1               # Reuse TIME_WAIT sockets
+net.ipv4.tcp_fin_timeout = 15            # Faster connection teardown
+net.core.netdev_max_backlog = 50000     # NIC backlog
+net.core.rmem_max = 16777216             # Max receive buffer
+net.core.wmem_max = 16777216             # Max send buffer
+
+# Memory
+vm.swappiness = 1                        # Almost never swap
+vm.dirty_ratio = 30                      # Allow 30% dirty pages before blocking writers
+vm.dirty_background_ratio = 5            # Start background writeout at 5% dirty
+vm.vfs_cache_pressure = 200              # Reclaim dentries/inodes more aggressively
+vm.zone_reclaim_mode = 1                 # Reclaim local zone before remote (NUMA)
+
+# Kernel
+kernel.sched_migration_cost_ns = 5000000 # Reduce context switch overhead
+kernel.numa_balancing = 0                # Disable NUMA page migration
+```
+
+This internal architecture — the NUMA topology, memory hierarchy, kernel schedulers, and application tuning — determines whether a vertical scale-up delivers 2x or 1.2x the performance. The architecture patterns that build on this foundation are covered in the next article.

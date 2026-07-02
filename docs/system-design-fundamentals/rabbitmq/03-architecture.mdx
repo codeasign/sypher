@@ -1,0 +1,746 @@
+---
+id: rabbitmq-architecture
+sidebar_position: 3
+title: "RabbitMQ at Scale"
+description: "Architecture patterns for RabbitMQ — from single node to multi-region production clusters"
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## From Single Node to Production Cluster
+
+RabbitMQ starts as a single process on a single machine. That is fine for development and low-volume workloads — a single node handles approximately 50,000 messages per second with persistent delivery.
+
+Production requirements go beyond what one node provides:
+
+- **Availability**: If the single node goes down, all messaging stops. Production systems need zero-downtime failover.
+- **Throughput**: A single node has one CPU, one disk, one network interface. At scale, any of these becomes a bottleneck.
+- **Capacity**: Queue depth and message storage are limited by available RAM and disk. A single node can hold millions of messages, but not billions.
+
+This section covers five architecture patterns: naive, production clustered, integrated, multi-region, and capacity planning.
+
+## Architecture 1 — Naive Single Node
+
+<AsciiDiagram
+  id="rabbitmq/03-architecture-naive"
+  title="Naive Single-Node RabbitMQ Architecture"
+  content={
+
+`┌────────────────────────────────────────────────────────┐
+│                   Single Server                         │
+│                                                        │
+│  ┌──────────────┐     ┌──────────────────────────┐     │
+│  │  Publisher   │────>│   RabbitMQ Node 1         │     │
+│  │  Service     │     │  ┌─────┐ ┌─────┐ ┌─────┐ │     │
+│  └──────────────┘     │  │ Q1  │ │ Q2  │ │ Q3  │ │     │
+│                       │  └─────┘ └─────┘ └─────┘ │     │
+│  ┌──────────────┐     │  ┌──────────────────┐    │     │
+│  │  Consumer 1  │<────│  │    Mnesia DB      │    │     │
+│  └──────────────┘     │  │  (metadata local)  │    │     │
+│                       │  └──────────────────┘    │     │
+│  ┌──────────────┐     │  ┌──────────────────┐    │     │
+│  │  Consumer 2  │<────│  │   Message Store   │    │     │
+│  └──────────────┘     │  │  (local disk)     │    │     │
+│                       │  └──────────────────┘    │     │
+│  ┌──────────────┐     └──────────────────────────┘     │
+│  │  Consumer 3  │<────                                  │
+│  └──────────────┘                                       │
+└────────────────────────────────────────────────────────┘
+`
+  }
+  alt="Diagram showing a single RabbitMQ node handling all publish and consume operations"
+/>
+
+**Characteristics**:
+- One RabbitMQ node, one server.
+- All exchanges, queues, bindings on one node.
+- No replication. All queues are classic queues (single copy).
+- Mnesia metadata stored locally.
+- Message store on local disk.
+
+**Failure modes**: Node failure means complete messaging outage. Any queue with unacknowledged messages loses those messages on unclean shutdown. Persistent messages on committed segment files survive if the disk is intact, but all in-memory alpha-segment messages are lost.
+
+**When to use**: Development, local testing, low-volume staging environments with throughput under 20,000 messages/second and tolerance for downtime.
+
+**When to upgrade**: When the team relies on RabbitMQ for production workflows and cannot tolerate extended downtime, or when throughput exceeds the capacity of a single server (approximately 50,000 messages/second with persistence).
+
+## Architecture 2 — Production Clustered
+
+<AsciiDiagram
+  id="rabbitmq/03-architecture-cluster"
+  title="Production RabbitMQ Cluster with Load Balancer"
+  content={
+
+                      `┌─────────────────────┐
+                      │   Load Balancer      │
+                      │  (HAProxy / ALB)     │
+                      └────┬────┬────┬───────┘
+                           │    │    │
+              ┌────────────┘    │    └────────────┐
+              │                 │                 │
+         ┌────┴────┐      ┌────┴────┐      ┌────┴────┐
+         │ Node 1  │<────>│ Node 2  │<────>│ Node 3  │
+         │ (Seed)  │      │         │      │         │
+         └────┬────┘      └────┬────┘      └────┬────┘
+              │                │                 │
+              └────────────────┼─────────────────┘
+                               │
+              ┌────────────────┴─────────────────┐
+              │         Mnesia Cluster            │
+              │  (metadata replicated to all)     │
+              └──────────────────────────────────┘
+`
+  }
+  alt="Diagram showing a 3-node RabbitMQ cluster behind a load balancer with publishers and consumers connected through it"
+/>
+
+### Cluster Formation
+
+A RabbitMQ cluster connects multiple nodes into a single logical broker. Nodes share:
+
+- **Exchange definitions**: All nodes know about all exchanges. Creating an exchange on node 1 makes it visible on node 2.
+- **Queue definitions**: All nodes know about all queues. But the queue process (and its messages) live on the node where the queue was declared.
+- **Bindings**: Same — known cluster-wide, but bindings are evaluated on the node receiving the publish.
+- **Metadata**: Mnesia replicates configuration data across all nodes using a distributed database with eventual consistency.
+
+Cluster formation command:
+
+```bash
+# On node 2, join node 1's cluster
+rabbitmqctl stop_app
+rabbitmqctl reset
+rabbitmqctl join_cluster rabbit@node1
+rabbitmqctl start_app
+```
+
+### Queue Distribution
+
+By default, queues are not automatically distributed. A queue declared on node 1 stays only on node 1. If node 1 fails, messages in that queue are unavailable until node 1 returns.
+
+**Manual distribution**: Place queues on specific nodes by connecting directly to that node:
+
+```python
+# Connect to node 2 and declare queue there
+params = pika.ConnectionParameters(host='node2')
+connection = pika.BlockingConnection(params)
+channel = connection.channel()
+channel.queue_declare(queue='risk-engine', durable=True)
+```
+
+**Quorum queues**: RabbitMQ 3.8+ provides quorum queues that are automatically distributed. A quorum queue with 3 nodes replicates the Raft log across all cluster members. Leader election ensures availability if one node fails.
+
+```bash
+# Declare a quorum queue — automatically distributed
+rabbitmqadmin declare queue name=orders-queue queue_type=quorum
+```
+
+### Load Balancer
+
+A TCP load balancer (HAProxy, NGINX, AWS NLB) distributes connections across cluster nodes:
+
+```haproxy
+# HAProxy configuration for RabbitMQ clustering
+frontend rabbitmq
+    bind *:5672
+    default_backend rabbitmq_nodes
+
+backend rabbitmq_nodes
+    balance leastconn
+    server node1 10.0.1.10:5672 check inter 5000
+    server node2 10.0.1.11:5672 check inter 5000
+    server node3 10.0.1.12:5672 check inter 5000
+```
+
+Use `leastconn` balancing — RabbitMQ connections are long-lived, and round-robin would create uneven loads if connection durations vary. TCP health checks confirm the node is accepting connections.
+
+### Quorum Queue Write Path
+
+When a publisher sends a persistent message to the cluster:
+
+1. Load balancer forwards the TCP connection to a cluster node (the **handling node**).
+2. The message arrives at the queue leader (which may be on a different node).
+3. The leader appends the message to its Raft log.
+4. The leader sends `AppendEntries` to follower nodes.
+5. Followers write the entry to their Raft logs and acknowledge.
+6. When the leader has acknowledgments from a majority (2 out of 3 for a 3-node cluster), it commits the entry.
+7. The leader sends `Basic.Ack` back through the handling node to the publisher.
+
+This path involves 2-5 inter-node TCP round trips per message. Latency is approximately 1-5ms depending on network latency between nodes.
+
+## Architecture 3 — Integrated Service Architecture
+
+<AsciiDiagram
+  id="rabbitmq/03-architecture-integrated"
+  title="Integrated Service Architecture with RabbitMQ"
+  content={
+
+`┌──────────────────────────────────────────────────────────────────┐
+│                   Service Architecture                            │
+│                                                                  │
+│   ┌────────────┐   ┌────────────┐   ┌────────────┐             │
+│   │ API Gateway│   │ Auth       │   │ Order      │             │
+│   │ Service    │   │ Service    │   │ Service    │             │
+│   └──────┬─────┘   └──────┬─────┘   └──────┬─────┘             │
+│          │                │                │                     │
+│          └────────────────┼────────────────┘                     │
+│                           │                                      │
+│          ┌────────────────┴────────────────┐                     │
+│          │       RabbitMQ Cluster          │                     │
+│          │  ┌─────┐ ┌─────┐ ┌─────┐       │                     │
+│          │  │ N1  │ │ N2  │ │ N3  │       │                     │
+│          │  └──┬──┘ └──┬──┘ └──┬──┘       │                     │
+│          │     │        │        │          │                     │
+│          │  ┌──┴────────┴────────┴──┐      │                     │
+│          │  │   Quorum Queues:      │      │                     │
+│          │  │   orders, payments,   │      │                     │
+│          │  │   notifications       │      │                     │
+│          │  └───────────────────────┘      │                     │
+│          └────────────────┬────────────────┘                     │
+│                           │                                      │
+│          ┌────────────────┴────────────────┐                     │
+│     ┌────┴────┐   ┌────┴────┐   ┌─────────┴──┐                 │
+│     │ Notif.  │   │Analytics│   │ Audit Log   │                 │
+│     │ Service │   │ Pipeline│   │ Service     │                 │
+│     └─────────┘   └─────────┘   └─────────────┘                 │
+│                                                                  │
+│   ┌────────────────────────────────────────┐                     │
+│   │   Dead Letter Queues (inspect & retry) │                     │
+│   └────────────────────────────────────────┘                     │
+└──────────────────────────────────────────────────────────────────┘
+`
+  }
+  alt="Diagram showing RabbitMQ integrated with microservices including API gateway, auth service, order service, notification service, and analytics pipeline"
+/>
+
+### Architecture Rules
+
+In this pattern, RabbitMQ serves as the backbone for asynchronous communication between microservices.
+
+**Rule 1 — Each service owns its queue**: Services do not read from other services' queues. Each queue has exactly one consumer service. This prevents coupling and allows independent scaling.
+
+**Rule 2 — Fanout for broadcast, topic for event streams**: Use fanout exchanges for cache invalidation, configuration changes, or other broadcast events. Use topic exchanges for business events like `order.created`, `payment.processed`, `shipping.labeled`.
+
+**Rule 3 — Dead-letter everything**: Every queue has a dead-letter exchange. Unprocessable messages are not silently dropped — they land in a dead-letter queue for operator inspection and replay.
+
+**Rule 4 — Prefetch based on processing time**: Set prefetch to match the consumer's processing capacity. If a notification service sends 10 HTTP requests per second and each takes 100ms, a prefetch of 10 keeps it saturated.
+
+```python
+# Notification service consumer
+channel.basic_qos(prefetch_count=10)
+
+def callback(ch, method, properties, body):
+    notification = json.loads(body)
+    send_email(notification['email'], notification['template'])
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+channel.basic_consume(queue='notifications', on_message_callback=callback)
+```
+
+## Architecture 4 — Multi-Region Deployment
+
+<AsciiDiagram
+  id="rabbitmq/03-architecture-multi-region"
+  title="Multi-Region RabbitMQ Deployment with Federation"
+  content={
+
+      `┌──────── US-East-1 ────────┐       ┌──────── EU-West-1 ───────┐
+      │                           │       │                          │
+      │  ┌─────────────────────┐  │       │  ┌─────────────────────┐ │
+      │  │  RabbitMQ Cluster   │  │       │  │  RabbitMQ Cluster   │ │
+      │  │  ┌───┐ ┌───┐ ┌───┐ │  │       │  │  ┌───┐ ┌───┐ ┌───┐ │ │
+      │  │  │ N1│ │ N2│ │ N3│ │  │       │  │  │ N1│ │ N2│ │ N3│ │ │
+      │  │  └───┘ └───┘ └───┘ │  │       │  │  └───┘ └───┘ └───┘ │ │
+      │  └─────────┬───────────┘  │       │  └─────────┬───────────┘ │
+      │            │              │       │            │             │
+      │            │  Federation  │       │            │             │
+      │            │◄═════════════╪═══════╪════════════╪═►            │
+      │            │              │       │            │             │
+      │  ┌─────────┴───────────┐  │       │  ┌─────────┴───────────┐ │
+      │  │  US-East Producers  │  │       │  │  EU-West Producers  │ │
+      │  └─────────────────────┘  │       │  └─────────────────────┘ │
+      └───────────────────────────┘       └──────────────────────────┘
+`
+  }
+  alt="Diagram showing two RabbitMQ clusters in separate AWS regions connected via federation links for cross-region message replication"
+/>
+
+### Federation Plugin
+
+RabbitMQ's Federation plugin connects separate clusters. Messages published in one cluster are forwarded to the other. Federation works at the exchange level — you federate an exchange and messages are forwarded to downstream clusters.
+
+```bash
+# Configure federation upstream
+rabbitmqctl set_parameter federation-upstream eu-cluster \
+    '{"uri": "amqp://user:pass@eu-cluster.example.com:5672", "max-hops": 1}'
+
+# Configure a federated exchange
+rabbitmqctl set_policy federate-orders \
+    "^orders\." '{"federation-upstream-set": "all"}' \
+    --apply-to exchanges
+```
+
+**Important properties**:
+- **Asynchronous**: Upstream clusters do not wait for downstream acknowledgment. Messages are forwarded with best-effort delivery.
+- **Disconnected tolerant**: If the link goes down, RabbitMQ queues messages in a buffer. On reconnection, the buffer drains. Buffer memory is limited — set `max-hops` to prevent infinite loops.
+- **One-way by default**: Configure two federation links for bidirectional replication.
+- **No cross-cluster quorum**: Federation does not use Raft across regions. Each cluster operates independently with eventual consistency between them.
+
+### Shovel Plugin
+
+Shovel is an alternative to federation for specific queue-to-queue or exchange-to-exchange forwarding:
+
+```bash
+# Configure a shovel to forward from US cluster to EU cluster
+rabbitmqctl set_parameter shovel order-replication \
+    '{"src-uri": "amqp://localhost", "src-queue": "orders",
+      "dest-uri": "amqp://eu-cluster:5672", "dest-queue": "orders",
+      "prefetch-count": 100}'
+```
+
+Shovel creates a consumer in the source cluster and a publisher in the destination cluster. It moves messages reliably with acknowledgments.
+
+**Shovel vs Federation**: Shovel is simpler (source-to-destination, no routing logic) but less flexible. Federation provides exchange-level routing. Use Shovel when you need to move messages from a specific queue to another specific queue. Use Federation when you need full exchange routing with filtering.
+
+## Architecture 5 — Capacity Planning
+
+### Throughput Requirements
+
+Estimate required throughput:
+
+```
+Total throughput = (messages per second) x (average message size in KB)
+
+Example:
+- 10,000 messages/second
+- Average message size: 2 KB
+- Total throughput: 20 MB/second
+```
+
+Each RabbitMQ node handles approximately:
+- 50,000 persistent messages/second (with publisher confirms)
+- 150,000 non-persistent messages/second (without persistence)
+- 30 MB/second sustained disk write throughput (persistent messages)
+
+### Memory Requirements
+
+RabbitMQ memory usage depends on queue depth and message sizes:
+
+```
+Memory = queue_count x (queue_overhead + index_memory)
+       + connection_count x (connection_overhead + channel_overhead x channels_per_connection)
+       + total_unconsumed_messages x message_metadata_overhead
+       + messages_in_alpha_segment
+
+Where:
+- queue_overhead: ~2 KB per queue
+- connection_overhead: ~100 KB per connection
+- channel_overhead: ~4 KB per channel
+- message_metadata_overhead: ~250 bytes per message (for the index entry)
+```
+
+**Example calculation**: 1,000 queues, 500 connections (2 channels each), 100,000 unconsumed messages:
+
+```
+= 1,000 x 2 KB + 500 x (100 KB + 2 x 4 KB) + 100,000 x 250 bytes
+= 2 MB + 54 MB + 25 MB
+= 81 MB (before message body storage)
+```
+
+Message bodies in the alpha segment are not counted above. A 2 KB message body stored in memory adds approximately 2 KB per message.
+
+**Memory limit**: Set the high watermark to 0.4-0.5 of available RAM. RabbitMQ blocks publishers when memory exceeds this threshold.
+
+```bash
+rabbitmqctl set_vm_memory_high_watermark 0.5
+```
+
+Leave the other 50% of RAM for the operating system, disk cache, and message bodies.
+
+### Disk Requirements
+
+Persistent messages need disk space:
+
+```
+Disk = total_persistent_messages x average_message_size
+     + segment_file_overhead (~10% for compaction runway)
+     + Mnesia metadata (~1 MB per 10,000 queues/exchanges)
+```
+
+For a system with 5 million persistent messages averaging 2 KB each:
+
+```
+= 5,000,000 x 2 KB + 10% = ~11 GB
+```
+
+Use SSD storage. RabbitMQ's segment file writes are sequential, but compaction reads and writes are random — SSD handles random I/O orders of magnitude better than spinning disks. Provision at least 20 GB of SSD per node for message storage.
+
+### Node Count Decision
+
+| Cluster Size | Tolerated Failures | Quorum Queue Safety | Typical Use Case |
+|---|---|---|---|
+| 1 node | 0 | Not available | Dev / testing |
+| 3 nodes | 1 node | Full redundancy | Production standard |
+| 5 nodes | 2 nodes | Higher fault tolerance | Mission-critical production |
+| 7+ nodes | 3+ nodes | Rarely needed | Global deployments |
+
+Three-node clusters are the standard production configuration. Use five nodes when you need to survive dual-node failures (e.g., during rolling upgrades where one node is intentionally down and another fails accidentally).
+
+## Deployment Patterns
+
+### Kubernetes Deployment
+
+RabbitMQ on Kubernetes uses the Cluster Operator from the RabbitMQ team:
+
+```yaml
+# rabbitmq-cluster.yaml
+apiVersion: rabbitmq.com/v1beta1
+kind: RabbitmqCluster
+metadata:
+  name: production-rabbit
+spec:
+  replicas: 3
+  resources:
+    requests:
+      cpu: 2
+      memory: 4Gi
+    limits:
+      cpu: 4
+      memory: 8Gi
+  rabbitmq:
+    additionalPlugins:
+      - rabbitmq_federation
+      - rabbitmq_shovel
+      - rabbitmq_management
+    additionalConfig: |
+      vm_memory_high_watermark.relative = 0.5
+      disk_free_limit.absolute = 2GB
+  persistence:
+    storageClassName: ssd
+    storage: 50Gi
+```
+
+Key Kubernetes considerations:
+- Use `StatefulSet` (the Operator handles this) — RabbitMQ needs stable identities.
+- Use SSD-backed persistent volumes.
+- Set `podManagementPolicy: OrderedReady` for safe rolling upgrades.
+- Configure `readinessProbe` to check the management API — pods that lose cluster quorum should not receive traffic.
+
+### Docker Compose (Production Testing)
+
+```yaml
+version: '3.8'
+services:
+  rabbitmq-node1:
+    image: rabbitmq:3.13-management
+    hostname: rabbit1
+    environment:
+      - RABBITMQ_ERLANG_COOKIE=SECRET_COOKIE_VALUE
+    volumes:
+      - rabbit1-data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  rabbitmq-node2:
+    image: rabbitmq:3.13-management
+    hostname: rabbit2
+    environment:
+      - RABBITMQ_ERLANG_COOKIE=SECRET_COOKIE_VALUE
+    volumes:
+      - rabbit2-data:/var/lib/rabbitmq
+    depends_on:
+      - rabbitmq-node1
+    command: >
+      sh -c "rabbitmqctl wait /var/lib/rabbitmq/mnesia/rabbit@rabbit1.pid
+      && rabbitmqctl stop_app
+      && rabbitmqctl reset
+      && rabbitmqctl join_cluster rabbit@rabbit1
+      && rabbitmqctl start_app"
+
+volumes:
+  rabbit1-data:
+  rabbit2-data:
+```
+
+This creates a two-node cluster for staging. Note the identical Erlang cookie — this is the cluster authentication secret. Never commit this to source control.
+
+### Monitoring Configuration
+
+Production RabbitMQ requires active monitoring:
+
+```bash
+# Collect essential metrics every 60 seconds
+rabbitmqctl list_queues name messages consumers memory
+rabbitmqctl list_connections
+rabbitmqctl list_channels
+rabbitmqctl list_exchanges
+
+# Management API for detailed metrics (replace password)
+curl -u guest:guest http://localhost:15672/api/queues | jq '
+  .[] | {name: .name, messages: .messages_ready,
+         consumers: .consumers, memory: .memory}'
+```
+
+**Critical thresholds**:
+- Queue depth exceeding 3x normal peak
+- Connection count approaching file descriptor limit
+- Memory percentage over 70% of high watermark
+- Disk space under 2 GB
+- `run_queue` (Erlang scheduler backlog) over 100
+
+These thresholds should trigger alerts in your monitoring system (Prometheus, Datadog, or the built-in management UI). RabbitMQ exposes metrics through the Prometheus plugin (`rabbitmq_prometheus`).
+
+## Auto-Scaling Consumers Based on Queue Depth
+
+A common production pattern is to auto-scale consumer instances based on queue depth. When the queue grows, add more consumers. When it shrinks, remove them.
+
+### Kubernetes HPA with RabbitMQ Metrics
+
+```yaml
+# Deploy the RabbitMQ Prometheus exporter
+# Then create an HPA that scales consumer pods based on queue depth
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-processor-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-processor
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Object
+      object:
+        metric:
+          name: rabbitmq_queue_messages_ready
+        describedObject:
+          apiVersion: v1
+          kind: Service
+          name: rabbitmq
+        target:
+          type: Value
+          value: 5000
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+```
+
+The HPA scales up when the queue depth exceeds 5,000 messages, adding up to 4 pods every 30 seconds. It waits 2 minutes before scaling down to avoid thrashing during short traffic bursts.
+
+### Custom Auto-Scaler
+
+For non-Kubernetes environments, a lightweight auto-scaler can poll the management API:
+
+```python
+import requests
+import subprocess
+import time
+
+RABBITMQ_API = "http://localhost:15672/api/queues/%2F/order-processing"
+CONSUMER_COMMAND = ["python", "order_consumer.py"]
+
+def get_queue_depth():
+    resp = requests.get(RABBITMQ_API, auth=("user", "pass"))
+    data = resp.json()
+    return data.get("messages_ready", 0)
+
+def scale_consumers(target_count):
+    current = len(subprocess.check_output(["pgrep", "-f", "order_consumer.py"]).split())
+    if current < target_count:
+        for _ in range(target_count - current):
+            subprocess.Popen(CONSUMER_COMMAND)
+    elif current > target_count:
+        for pid in subprocess.check_output(["pgrep", "-f", "order_consumer.py"]).split()[:current - target_count]:
+            subprocess.run(["kill", pid])
+
+while True:
+    depth = get_queue_depth()
+    target = max(2, min(20, depth // 1000))
+    scale_consumers(target)
+    time.sleep(30)
+```
+
+## Disaster Recovery and Backup
+
+A RabbitMQ cluster is a stateful system. Losing a cluster means losing all unconsumed messages. Backup strategies depend on recovery point objectives (RPO).
+
+### Strategy 1 — Export Queue Definitions Only (Config Backup)
+
+Backup exchange, queue, and binding definitions. Messages are not backed up.
+
+```bash
+# Export definitions (exchanges, queues, bindings, users, vhosts)
+rabbitmqadmin export rabbitmq.definitions.json
+
+# Restore on a new cluster
+rabbitmqadmin import rabbitmq.definitions.json
+```
+
+**RPO**: Messages since last export are lost. RTO: 30 minutes (time to provision new cluster and import definitions).
+
+**When to use**: Development, staging, or production workloads where message loss is acceptable for short windows.
+
+### Strategy 2 — Disk Snapshot Backup
+
+Take filesystem-level snapshots of the RabbitMQ data directory.
+
+```bash
+# On AWS: snapshot the EBS volume
+aws ec2 create-snapshot \
+    --volume-id vol-abc123 \
+    --description "RabbitMQ backup $(date +%Y-%m-%d)"
+
+# Before taking a snapshot, flush messages to disk:
+rabbitmqctl eval 'rabbit_msg_store:force_write()'
+```
+
+**RPO**: Last snapshot time (typically 1 hour). RTO: 1-2 hours (restore volume, start RabbitMQ, wait for segment file check).
+
+**Limitations**: Full cluster recovery requires consistent snapshots across all nodes. A quorum queue with 3 nodes needs all 3 snapshots from the same point in time — otherwise the Raft log may be inconsistent.
+
+### Strategy 3 — Federated Replica
+
+Run a separate RabbitMQ cluster in a different region that receives all messages via federation. This cluster acts as a warm standby.
+
+```bash
+# On the backup cluster, configure federation from primary
+rabbitmqctl set_parameter federation-upstream primary \
+    '{"uri": "amqps://user:pass@primary-cluster:5671",
+      "ack-mode": "on-confirm",
+      "reconnect-delay": 5}'
+
+# Federate all exchanges
+rabbitmqctl set_policy federate-all \
+    ".*" '{"federation-upstream-set": "all"}' \
+    --apply-to exchanges
+```
+
+**RPO**: Seconds (messages are forwarded with `on-confirm` ack mode). RTO: Minutes (re-point DNS or load balancer to backup cluster).
+
+**Trade-off**: A second cluster doubles infrastructure costs. Federation adds cross-region data transfer costs.
+
+## Monitoring Dashboard (Prometheus + Grafana)
+
+RabbitMQ exposes metrics via the Prometheus plugin:
+
+```bash
+# Enable Prometheus plugin
+rabbitmq-plugins enable rabbitmq_prometheus
+
+# Metrics available at
+# GET http://localhost:15692/metrics
+```
+
+### Essential Grafana Panels
+
+A production RabbitMQ monitoring dashboard should include:
+
+1. **Queue depth (top-N by depth)**: Bar chart of the 10 deepest queues. Color-coded: green (under 1,000), yellow (1,000-10,000), red (over 10,000).
+
+2. **Message rates**: Two time-series — publish rate (msg/s) and deliver rate (msg/s). When publish exceeds deliver for more than 5 minutes, the queue is growing.
+
+3. **Erlang VM memory**: Memory usage by category — queues, connections, channels, ETS tables, binary heap, code, system. A growing binary heap indicates messages accumulating.
+
+4. **File descriptor usage**: Percentage of file descriptors in use. Flat line under 80% is healthy. Approaching 100% means connection limits are near.
+
+5. **Consumer count per queue**: Shows sudden drops — a drop from 8 to 1 is the leading indicator of a consumer crash, visible 8 minutes before the queue depth alert fires.
+
+6. **GC metrics**: Minor and major garbage collection counts per node. Spikes indicate message processing churn. Percentage of time spent in GC over 5% indicates the Erlang VM is spending too much time collecting garbage.
+
+7. **Connection churn rate**: New connections per minute. Spikes above normal indicate a misconfigured client creating a new connection per message.
+
+### Prometheus Queries
+
+```promql
+# Queue depth for a specific queue
+rabbitmq_queue_messages_ready{queue="order-processing"}
+
+# Top 5 queues by depth
+topk(5, rabbitmq_queue_messages_ready)
+
+# Message delivery rate
+rate(rabbitmq_queue_messages_delivered_total[1m])
+
+# Memory usage by category
+rabbitmq_process_resident_memory_bytes
+
+# Erlang run queue length (CPU saturation)
+rabbitmq_erlang_processes_run_queue
+
+# Publish rate per exchange
+rate(rabbitmq_exchange_messages_published_total[1m])
+```
+
+## Rolling Upgrades
+
+A RabbitMQ cluster must be upgraded without downtime. The procedure depends on whether you use quorum queues or classic queues.
+
+### Quorum Queue Rolling Upgrade
+
+Quorum queues handle rolling upgrades gracefully because the Raft group elects a new leader when a node goes down.
+
+```bash
+# Step 1: Stop a single node
+ssh rabbit@node1 "rabbitmqctl stop_app"
+
+# Step 2: Upgrade the RabbitMQ package on that node
+ssh rabbit@node1 "sudo apt-get update && sudo apt-get install rabbitmq-server"
+
+# Step 3: Start the node
+ssh rabbit@node1 "rabbitmqctl start_app"
+
+# Step 4: Verify the node rejoined and quorum queues rebalanced
+ssh rabbit@node1 "rabbitmqctl cluster_status"
+
+# Step 5: Wait 30 seconds for Raft leader re-election to stabilize
+
+# Step 6: Repeat for each node
+```
+
+During a rolling upgrade:
+- Each node is down for approximately 2-5 minutes (stop, upgrade, start, verify).
+- Quorum queues lose their leader when that node stops. A new leader is elected after the election timeout (approximately 4 seconds). Production throughput is reduced while the leader election completes but does not stop.
+- Classic queues on the stopped node become unavailable. Consumers connected to that node must reconnect to another node. Unconsumed messages in classic queues on the stopped node are unavailable until the node returns.
+
+### Upgrade Compatibility
+
+Always check the RabbitMQ upgrade guides. Key compatibility rules:
+
+- RabbitMQ 3.12 to 3.13: Direct upgrade supported. No breaking changes to AMQP 0-9-1.
+- RabbitMQ 3.11 to 3.13: Requires intermediate step through 3.12.
+- Erlang version: RabbitMQ 3.13 requires OTP 26 or later. Upgrading Erlang requires stopping the node — cannot hot-swap Erlang VM versions.
+- Client libraries: Older clients (pika 1.0, amqplib 0.x) may not work with newer RabbitMQ versions. Test your client library compatibility before upgrading the cluster.
+
+### Pre-Upgrade Checklist
+
+```bash
+# Before upgrading:
+# 1. Backup definitions
+rabbitmqadmin export /tmp/pre-upgrade-defs.json
+
+# 2. Verify cluster health
+rabbitmqctl cluster_status
+rabbitmqctl list_queues name messages_ready consumers | head -20
+
+# 3. Check for pending queue synchronizations
+rabbitmqctl list_queues name synchronised_slave_pids_pending
+
+# 4. Check message store integrity (read-only)
+rabbitmqctl eval 'rabbit_msg_store:check().'
+
+# 5. Verify the Erlang version matches the target RabbitMQ version
+rabbitmqctl status | grep erlang_version
+```

@@ -1,0 +1,554 @@
+---
+id: indexing-deep-dive
+title: Indexing — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture of a B+Tree Index
+
+A B+Tree index is organized into three tiers of pages: root, internal, and leaf. Each page is a fixed-size block on disk, typically 8KB in PostgreSQL and 16KB in MySQL InnoDB. The tree is balanced — every leaf page is at the same depth.
+
+### Page Organization Detail
+
+Each B+Tree page is a fixed-size disk block with a specific internal layout:
+
+| Component | Size | Description |
+|---|---|---|
+| Page Header | ~100B | Page type (root/internal/leaf), LSN (Log Sequence Number for crash recovery), checksum, free space pointer, level in tree, number of items, special flags |
+| ItemId Array | 4B each | Array of (offset, length) pairs pointing to actual data items. This indirection allows items within a page to be resorted without moving data — only the pointer array is rearranged |
+| Free Space | variable | The gap between the growing ItemId array (from the top) and the growing item data (from the bottom) |
+| Item Data | variable | Actual key-pointer pairs (leaf) or key-child-pointer triples (internal). Variable-length depending on key width |
+| Special Space | variable | Page-type-specific data. For B+Trees, this includes the rightmost pointer for high-concurrency algorithms |
+
+### Tree Depth and Fanout
+
+The depth of a B+Tree determines how many page reads are needed for a single lookup. Depth depends on the fanout — the number of child pointers each internal node can hold. Fanout is determined by page size and key width.
+
+**Fanout calculation for an 8KB page, 8-byte keys**:
+```
+page_useful = 8192 - 120 (header) ≈ 8072 bytes
+fanout = 8072 / (8 + 8) = 504 pointers per internal node
+```
+
+| Rows | Depth with 8B key, 8KB page | Depth with 16B key, 8KB page |
+|---|---|---|
+| 10,000 | 2 | 2 |
+| 1,000,000 | 3 | 3 |
+| 100,000,000 | 4 | 4 |
+| 10,000,000,000 | 5 | 5 |
+
+Even at 10 billion rows, the tree is only 5 levels deep. This is the defining advantage of B+Trees over binary trees, which would require 34 levels for the same data.
+
+<AsciiDiagram
+  id="indexing/bplustree-architecture"
+  title="Full B+Tree index architecture showing root page, internal pages, leaf pages with sibling pointers, and heap reference"
+  alt="Three-tier B+Tree diagram: root page at top with separator keys; middle tier of internal pages fanning out; bottom tier of leaf pages linked left-to-right via next pointers, each leaf pointing to a heap data page containing actual row data"
+  caption="B+Tree index — three levels connect 50 million rows with at most 3 page reads"
+  content={`B+Tree Index Architecture (3 levels)
+
+                          ┌──────────────────────┐
+                          │    Root Page (level 2)│
+                          │                      │
+                          │  "d"    "h"    "l"   │
+                          │  "p"    "t"          │
+                          │                      │
+                          │  [p1] [p2] [p3] [p4] │
+                          └───┬────┬────┬────┬───┘
+                              │    │    │    │
+                ┌─────────────┘    │    │    └─────────────┐
+                │                  │    │                  │
+                ▼                  ▼    ▼                  ▼
+       ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────┐
+       │ Internal L1 (a-d)│  │ Internal L1 (e-h)│  │ Internal L1 (i-l)
+       │                 │  │                  │  │                 │
+       │ "ab" "ac" "al"  │  │ "ea" "ed" "eg" │  │ "ia" "il" "ip"  │
+       │ "am" "an"       │  │ "el" "er"       │  │ "it"            │
+       │                 │  │                  │  │                 │
+       │ [p1][p2][p3][p4]│  │ [p5][p6][p7][p8]│  │ [p9][p10][p11]  │
+       └──┬──┬──┬──┬────┘  └──┬──┬──┬──┬──────┘  └──┬──┬──┬───────┘
+          │  │  │  │          │  │  │  │             │  │  │
+          ▼  ▼  ▼  ▼          ▼  ▼  ▼  ▼             ▼  ▼  ▼
+       ┌─────────────────────────────────────────────────────────────┐
+       │  Leaf Pages (level 0)  —  each page holds ~200 key-pointer  │
+       │  pairs, linked left-to-right via "next" page pointers       │
+       │                                                             │
+       │  ┌─────────┐  next─▶ ┌─────────┐  next─▶ ┌─────────┐       │
+       │  │ Page A  │────────▶│ Page B  │────────▶│ Page C  │─▶...  │
+       │  │         │         │         │         │         │       │
+       │  │ aaa→row1│         │ aba→row9│         │ aca→row17│      │
+       │  │ aab→row2│         │ abb→row10│        │ acb→row18│      │
+       │  │ aac→row3│         │ abc→row11│        │ acc→row19│      │
+       │  │ ...     │         │ ...     │         │ ...     │       │
+       │  └────┬────┘         └────┬────┘         └────┬────┘       │
+       │       │                  │                   │            │
+       └───────┼──────────────────┼───────────────────┼────────────┘
+               │                  │                   │
+               ▼                  ▼                   ▼
+       ┌─────────────────────────────────────────────────────────────┐
+       │  Heap Pages (data)  —  actual table rows, unordered         │
+       │  ┌─────────┐        ┌─────────┐        ┌─────────┐         │
+       │  │row1┐row2│        │row9┐row10│        │row17┐row18│      │
+       │  │row3┐row4│        │row11┐row12│       │row19┐row20│      │
+       │  └─────────┘        └─────────┘        └─────────┘         │
+       └─────────────────────────────────────────────────────────────┘
+`}
+/>
+
+### The Rightmost-Edge Hotspot Problem
+
+When inserting rows with monotonically increasing keys (auto-increment IDs, timestamps), all inserts target the rightmost leaf page simultaneously. This creates a write hotspot where concurrent sessions contend for locks on the same page. Under high concurrency (thousands of inserts per second), this contention becomes a bottleneck.
+
+**Solutions**:
+- Use hash-partitioned or random primary keys (UUID v4) to distribute writes across pages.
+- Use reverse indexes for timestamp columns to avoid the rightmost edge.
+- Reduce fill factor on the index to absorb bursts without splitting.
+- Use an application-level sequence that distributes values (hi-lo algorithm, snowflake IDs).
+
+---
+
+## Data Structures and Algorithms
+
+### B+Tree Insert Algorithm
+
+When a new row is inserted and the index must accommodate its key, the B+Tree performs the following sequence:
+
+1. **Locate leaf**: Traverse from root to leaf, comparing the new key with separators at each level. The traversal begins at the root page, performs a binary search on the separator keys, and follows the matching pointer. This repeats at each internal level until a leaf page is reached.
+
+2. **Check capacity**: Read the leaf page's free space pointer. If remaining space is sufficient (accounting for the fill factor), proceed to insertion. If not, a page split is required.
+
+3. **Insert into leaf**: If room exists, insert the key-pointer pair into the sorted position on the leaf page. Existing entries to the right must be shifted by one position. The ItemId array is updated to reflect the new entry. The free space pointer is decremented.
+
+4. **Page split** (when the leaf page is full):
+   a. Allocate a new leaf page from the database's free space map.
+   b. Copy the page header and special space to the new page.
+   c. Distribute the keys evenly: typically the lower half stays on the original page, the upper half moves to the new page. The median key is the split point.
+   d. Promote the median key to the parent internal page.
+   e. Add a pointer from the parent to the new page.
+   f. Update the sibling pointer chain: the original page now points to the new page as its next sibling.
+
+5. **Cascade split**: If the parent internal page is also full, repeat the split procedure at the parent level. The promoted median key becomes a separator in the parent, and a split at the parent level promotes a new separator to the grandparent.
+
+6. **Root split**: If the root page itself splits, create a new root page with two child pointers. The tree height increases by one. This is the only time the tree grows taller.
+
+### B+Tree Delete Algorithm
+
+1. **Locate leaf**: Same traversal as insert — follow separators from root to the leaf page that contains (or would contain) the target key.
+
+2. **Remove entry**: Remove the key-pointer pair from the sorted leaf page. Shift remaining entries left to close the gap. Update the ItemId array and free space pointer.
+
+3. **Check occupancy**: If the leaf page occupancy drops below the threshold (typically 50 percent, sometimes configurable via MERGE_THRESHOLD in InnoDB), attempt to borrow entries from a sibling page (redistribution) or merge with a sibling.
+
+4. **Redistribution**: If the sibling has more entries than the threshold, move some entries from the sibling to the underfull page without merging. Update the parent separator to reflect the new boundary.
+
+5. **Merge**: If neither sibling has enough entries to redistribute, merge the underfull page with a sibling. Copy all entries to one page, free the other page, remove the separator from the parent, and update the sibling chain.
+
+6. **Parent underflow**: Removing the separator from the parent may cause the parent to become underfull. Repeat the merge/redistribution check at the parent level. This can cascade to the root.
+
+7. **Root demotion**: If the root page has only one child after merging, demote that child to become the new root. The old root page is freed. The tree height decreases by one.
+
+### B-Tree vs B+Tree Comparison
+
+| Property | B-Tree | B+Tree |
+|---|---|---|
+| Data pointers in internal nodes | Yes — each node contains data pointers | No — internal nodes contain only keys and child pointers |
+| Data pointer location | Every node | Leaf nodes only |
+| Leaf node linking | Not linked | Linked left-to-right for sequential access (sibling pointers) |
+| Range scan performance | Must traverse back up to parent for each boundary, then down to find the next matching node | Scans leaf chain forward from the first match — no upward traversal needed |
+| Space efficiency of internal nodes | Lower — data pointers consume space that could hold more routing keys | Higher — more keys per internal node for the same page size |
+| Depth for 1 billion rows | 5-6 levels (lower fanout) | 3-4 levels (higher fanout from key-only internal nodes) |
+| Page utilization | Variable — internal nodes waste space on data pointers | Higher — leaves hold data, internals hold only routing |
+| Common databases | MongoDB WiredTiger, LMDB, Couchbase | PostgreSQL, MySQL InnoDB, SQLite, Oracle, SQL Server |
+
+<AsciiDiagram
+  id="indexing/btree-vs-bplustree"
+  title="Comparison of B-Tree and B+Tree structures showing where data pointers are stored in each"
+  alt="Side by side diagrams: B-Tree has data pointers in every node including internal nodes; B+Tree has data pointers only in leaf nodes with leaf-to-leaf sibling links for range scans"
+  caption="B-Tree (left) vs B+Tree (right) — the key difference is where data pointers live"
+  content={`B-Tree vs B+Tree
+
+  B-Tree (data in all nodes)         B+Tree (data only in leaves)
+
+       ┌──────────┐                    ┌──────────┐
+       │  root    │                    │  root    │
+       │ k1 k2    │                    │ k1 k2    │
+       │ d1 d2    │  ← data here      │          │  ← no data
+       └──┬───┬───┘                    └──┬───┬───┘
+          │   │                          │   │
+       ┌──┴┐ ┌┴──┐                   ┌──┴┐ ┌┴──┐
+       │i1 │ │i2 │                   │i1 │ │i2 │
+       │k3 │ │k4 │                   │k3 │ │k4 │
+       │d3 │ │d4 │  ← data here      │   │ │   │  ← no data
+       └───┘ └───┘                   └───┘ └───┘
+                                        │     │
+                                     ┌──┘ ┌───┘
+                                     ▼    ▼
+                                  ┌───────────────────┐
+                                  │ leaf pages        │
+                                  │ k3→d3  k4→d4     │  ← data here
+                                  │ ├──────┼────────▶│  ← sibling ptr
+                                  └───────────────────┘
+`}
+/>
+
+### Hash Index Collision Handling
+
+Hash indexes map keys to buckets via a hash function. The ideal hash function distributes keys uniformly across buckets. In practice, collisions occur and must be resolved.
+
+**Separate chaining**: Each bucket is a linked list. When two keys hash to the same bucket, the new entry is appended to the list. Lookups compute the hash, locate the bucket, and scan the linked list for the matching key. Performance degrades as chains grow — a well-tuned hash index maintains chains of fewer than 3 entries on average. PostgreSQL's hash index uses overflow pages as the linked-list mechanism.
+
+**Linear probing**: When a collision occurs, the algorithm probes the next bucket in sequence until it finds an empty slot or the matching key. Lookups start at the hashed bucket and scan forward. Deletions require special tombstone markers to avoid breaking probe chains. The probe sequence length increases as the hash table fills — performance degrades rapidly once the table passes 70-80 percent occupancy.
+
+**Cuckoo hashing**: Uses two hash functions. On collision, the existing entry is evicted to its alternative position, and the new entry takes its place. If the evicted entry also causes a collision, the process continues. Guarantees O(1) worst-case lookup time. Used in some modern database index implementations.
+
+PostgreSQL's hash index uses a dynamic scheme with overflow buckets. When a bucket becomes overfull, it is split into two buckets. The bucket array grows dynamically. Average chain length is maintained at approximately 2.5 entries under typical operation.
+
+### LSM-Tree (Log-Structured Merge-Tree)
+
+LSM-Trees are write-optimized index structures used by LevelDB, RocksDB, Cassandra, and ScyllaDB. They are the standard choice for high-write-throughput workloads where B+Tree page-split overhead is unacceptable.
+
+**Write path**: Writes go to an in-memory data structure (memtable, typically a sorted tree or skip list). When the memtable reaches a size threshold, it is flushed to disk as an immutable SSTable (Sorted String Table). Each SSTable is a sorted list of key-value pairs.
+
+**Read path**: A read must check the memtable (most recent), then the most recent SSTable level, then older levels. Multiple SSTables may contain versions of the same key. The read returns the most recent version. Bloom filters on each SSTable avoid unnecessary lookups: if the Bloom filter reports the key is absent, the SSTable is skipped entirely.
+
+**Compaction**: Background compaction merges SSTables to maintain read performance. Overlapping SSTables at the same level are merged into a single sorted SSTable. Old versions (tombstones) are discarded during compaction. The compaction strategy determines the read-write-space trade-off:
+
+| Strategy | Write Amplification | Read Amplification | Space Amplification |
+|---|---|---|---|
+| Leveled (RocksDB default) | 10-30x | Low (1 Bloom filter per level) | Low (10-20 percent) |
+| Tiered (Cassandra) | 4-10x | High (must check all SSTables) | High (30-50 percent) |
+| FIFO | 0x (no compaction) | Highest | Low |
+
+<AsciiDiagram
+  id="indexing/lsm-tree-architecture"
+  title="LSM-Tree write path: memtable in memory flushes to immutable SSTables on disk, with compaction merging levels"
+  alt="Data flows from application writes into an in-memory memtable (sorted); once full, the memtable is flushed to an SSTable file at level 0; background compaction merges level 0 SSTables with level 1, producing new level 1 files and discarding tombstones"
+  caption="LSM-Tree write path — memory-first, flush-to-disk, compact-in-background"
+  content={`LSM-Tree write path
+
+  Application writes
+         │
+         ▼
+  ┌──────────────────────┐
+  │  In-memory memtable   │  Sorted, mutable, backed by skip list
+  │  [k1:v1, k3:v3, ...] │
+  └──────────┬───────────┘
+             │ flush when full (64MB default)
+             ▼
+  ┌──────────────────────────────┐
+  │  Level 0 SSTable (immutable) │  On disk, sorted key-value blocks
+  │  [k1:v1, k3:v3, k7:v7]      │  Bloom filter attached
+  └──────────┬───────────────────┘
+             │ compaction triggers
+             ▼
+  ┌──────────────────────────────┐
+  │  Level 1 SSTable             │  Merged from L0, globally sorted
+  │  [k1:v_new, k2:v2, k3:v_new]│  Removes duplicate keys
+  └──────────┬───────────────────┘
+             │ further compaction
+             ▼
+  ┌──────────────────────────────┐
+  │  Level 2 SSTable             │  Base data, no overlap
+  │  [k1...k10000]               │  Size ratio: 10x per level
+  └──────────────────────────────┘
+`}
+/>
+
+**LSM-Tree trade-offs in detail**:
+- **Writes**: 10x to 100x faster than B+Tree for random inserts. Every write is a sequential append to the memtable, then a sequential flush to disk. No random page writes, no page splits.
+- **Reads**: Slower than B+Tree — may need to check the memtable, 3-5 L0 SSTables, and 1 SSTable per deeper level. Bloom filters help but add CPU overhead. A B+Tree needs exactly 3-4 page reads for any lookup.
+- **Write amplification**: Each piece of data is written multiple times during its lifetime (memtable flush + compaction rewriting). High write amplification reduces SSD lifespan and consumes I/O bandwidth.
+- **Space amplification**: Multiple copies of keys at different levels exist until compaction merges them. Typical space amplification is 10-30 percent in steady state.
+
+---
+
+## The Query Lifecycle: Detailed Execution
+
+The following 15-step sequence traces a query against a 100-million-row table. The query is:
+
+```sql
+SELECT first_name, last_name, email
+FROM customers
+WHERE last_name = 'Smith'
+ORDER BY first_name;
+```
+
+### Without an Index on `last_name`
+
+1. **Parser**: The SQL text is tokenized into tokens: SELECT, first_name, last_name, email, FROM, customers, WHERE, last_name, =, 'Smith', ORDER, BY, first_name. The parser validates the grammar and produces an abstract syntax tree (AST).
+
+2. **Analysis**: The analyzer resolves `customers` to the table's OID in `pg_class`. It checks that `first_name`, `last_name`, and `email` are valid columns. It determines that `last_name` is text type and the comparison operator '=' is valid for text.
+
+3. **Rewriting**: The query rewriter checks for views, rules, and CTEs. None exist for this simple query, so the analyzed tree passes through unchanged.
+
+4. **Optimization**: The optimizer generates candidate plans. It checks `pg_stat_user_indexes` — no index exists on `last_name`. The only viable plan is a sequential scan on `customers` followed by a sort of matching rows.
+
+5. **Cost estimation**: Sequential scan cost = `relpages * seq_page_cost + reltuples * cpu_tuple_cost`. With 500,000 pages at seq_page_cost=1.0 and 100 million tuples at cpu_tuple_cost=0.01: cost = 500,000 + 1,000,000 = 1,500,000. Sort cost = `rows * log(rows) * cpu_operator_cost`. Estimated 12,000 matches: sort cost = 12,000 * 14 * 0.0025 ≈ 420.
+
+6. **Plan selection**: No viable alternative exists. The optimizer selects the sequential scan + sort plan.
+
+7. **Executor start**: The executor opens the `customers` heap relation. An explicit `EXPLAIN` would show: `Seq Scan on customers (cost=0.00..1500000.00 rows=12000 width=72)`.
+
+8. **Buffer manager interaction**: The executor requests page 0 from the buffer manager. The buffer manager checks the shared buffer hash table. On a cold cache, this is a miss. The buffer manager allocates a buffer slot and issues a disk read request.
+
+9. **Disk read**: The OS receives the read request for the database file at offset 0, size 8KB. On an SSD, this takes approximately 100 microseconds. On a HDD, 4-8 milliseconds. The I/O scheduler may batch multiple pending requests.
+
+10. **Page processing**: The page is read into the buffer. The executor iterates through the page's ItemId array to locate each row. For each row, it extracts the `last_name` field and compares it to 'Smith'. No match on page 0.
+
+11. **Buffer eviction**: After processing page 0, the buffer manager may keep it or evict it depending on the buffer replacement policy (clock sweep in PostgreSQL). Pages at the beginning of a sequential scan are unlikely to be referenced again and are quickly evicted.
+
+12. **Scan progress**: The executor repeats for all 500,000 pages. Match found at page 350,000. Scan continues through page 500,000 because there is no UNIQUE constraint on `last_name`.
+
+13. **Result collection**: 12,000 matching rows are collected into a temporary buffer. Each row is projected to the three requested columns.
+
+14. **Sort**: The temporary buffer is sorted by `first_name`. If the buffer fits in `work_mem` (default 4MB), an in-memory quicksort is used. If not, a disk-based external merge sort spills to temporary files.
+
+15. **Result**: The sorted rows are streamed to the client. Total I/O: 500,000 page reads. Total time: 30-60 seconds.
+
+### With an Index on `last_name`
+
+1. Same parser, analyzer, and rewriter steps.
+
+2. **Optimization**: The optimizer now sees `idx_customers_last_name` in the available indexes on `customers`. It generates two plans: sequential scan (cost 1,500,000) and index scan (cost: index traversal + matching row heap fetches + sort).
+
+3. **Index scan cost estimation**:
+   - Index traversal: 3-4 random page reads at random_page_cost=4.0 = 12-16 cost units.
+   - Matching rows: Estimated 12,000 rows, each requiring a random heap page read at 4.0 = 48,000 cost units.
+   - Sort: 12,000 rows sorted by first_name: approximately 420 cost units.
+   - Total index plan cost: approximately 48,436 — much cheaper than 1,500,000.
+
+4. **Plan selection**: Index scan plan chosen. If a composite index `(last_name, first_name)` existed, the sort cost would be eliminated entirely (rows already in order).
+
+5. **Executor**: Calls the index access method with `key = 'Smith'`.
+
+6. **Root page**: The root page is read from the buffer pool (likely cached). Contains 400 separator values. Binary search on the separators finds that 'Smith' falls between 'Sal' and 'Spa'. Follows the pointer.
+
+7. **Internal page**: Level 1 internal page is read. Contains 400 more separator values. Binary search finds 'Smith' between 'Smi' and 'Smo'. Follows pointer to leaf page.
+
+8. **Leaf page**: The leaf page contains 200 entries in sorted order. Binary search finds the first entry with key = 'Smith'.
+
+9. **Leaf chain scan**: The executor follows the `next` pointer on the leaf page to the next leaf page. Continues scanning until a key greater than 'Smith' is encountered.
+
+10. **Row fetch**: For each matching entry (12,000 total), the TID points to a heap page. The executor fetches each heap page. If rows are scattered across the table, each is a random I/O.
+
+11. **Buffer cache prefetching**: PostgreSQL's `effective_io_concurrency` parameter controls asynchronous prefetching. With a value of 2, the executor issues 2 prefetch requests ahead of the current scan position, overlapping I/O with CPU processing.
+
+12. **Visibility check**: For each row, PostgreSQL checks the visibility map. If the row is visible to the current transaction, it is included. If not, the MVCC snapshot is checked. In a covering index scenario, the visibility map determines whether the index entry can serve the query without heap access.
+
+13. **Projection**: Matching rows are projected to `first_name, last_name, email`. The `email` column is not in the index — it must come from the heap. If a covering index included `email`, this heap fetch would be eliminated.
+
+14. **Sort**: The rows are already in `last_name, first_name` order if a composite index `(last_name, first_name)` exists. If only a single-column index on `last_name` exists, the rows are in `last_name` order only — sorting by `first_name` is still required.
+
+15. **Result**: Rows are returned to the client. Total time: 200-500ms. The dominant cost is the 12,000 random heap page reads.
+
+---
+
+## Consistency and State
+
+### Index Maintenance During Concurrent Writes
+
+When multiple transactions insert or delete rows concurrently, the index must stay consistent with the table data. Databases use a combination of locking, logging, and visibility techniques.
+
+**Page-level locking**: In PostgreSQL, the B-link-tree algorithm (Lehman and Yao) uses latch coupling: the traversal holds a read latch on the parent page while acquiring a read latch on the child page, then releases the parent latch. This allows concurrent readers to traverse the tree without blocking each other. Write operations (inserts, splits, merges) acquire exclusive page latches on the pages they modify.
+
+**Write-Ahead Logging (WAL)**: Every index modification generates WAL records before the page change is applied. The WAL record contains enough information to replay the change (redo) or undo it (rollback). On crash recovery, PostgreSQL replays WAL from the last checkpoint, applying all committed changes and rolling back uncommitted ones. The index is guaranteed consistent with the heap because both use the same WAL stream.
+
+**HOT updates**: PostgreSQL's Heap-Only Tuple optimization avoids index maintenance when a row is updated and no indexed column changes. If the new row version fits on the same heap page, a chain pointer connects the old and new versions. The index entry still points to the old version, which redirects to the new version via the chain. This eliminates index insertions for updates that touch only non-indexed columns — a significant performance gain for tables with many indexes.
+
+### Page Splits Under Load
+
+A page split is one of the most expensive single operations in a B+Tree:
+
+1. The leaf page reaches its fill factor threshold after an insert. The free space check returns "insufficient room."
+
+2. The database acquires an exclusive latch on the leaf page. All concurrent reads and writes to this page must wait.
+
+3. A new page is allocated from the free space map. If no pages are available, the database file extends (expensive).
+
+4. Half the keys (typically the upper half) are copied to the new page. The item pointer arrays are rebuilt on both pages.
+
+5. A separator key (the median key of the original page) is inserted into the parent page, along with a pointer to the new child page.
+
+6. If the parent page is also full, the split cascades upward. A cascade split at the root level increases tree height.
+
+7. WAL records are written for the modified page, the new page, and the modified parent page. The WAL flush forces these records to disk before acknowledging the original insert transaction.
+
+8. Under high concurrency, multiple sessions may trigger simultaneous splits. The resulting lock contention and WAL pressure cause measurable latency spikes. Monitoring `pg_stat_bgwriter` buffers_alloc can reveal split frequency.
+
+<AsciiDiagram
+  id="indexing/page-split-sequence"
+  title="Sequence of operations during a B+Tree page split: full leaf page splits into two, median key promoted to parent"
+  alt="Four-panel sequence: panel 1 shows a full leaf page with 200 entries; panel 2 shows a new page being allocated; panel 3 shows keys redistributed across old and new pages with median key 'm' promoted upward; panel 4 shows the parent page with 'm' as a new separator pointing to the new leaf page"
+  caption="Page split — the critical B+Tree maintenance operation during write-heavy workloads"
+  content={`B+Tree page split sequence
+
+  Step 1: Leaf page full               Step 2: Allocate new page
+
+  ┌──────────────────────┐             ┌──────────────────────┐
+  │ Leaf Page A          │             │ Leaf Page A  (full)  │
+  │ [a,b,c,d,e,f,g,h,i, │             │ [a,b,c,d,e,f,g,h,i, │
+  │  j,k,l,m,n,o,p,q,r, │             │  j,k,l,m,n,o,p,q,r, │
+  │  s,t,u,v,w,x,y,z]   │             │  s,t,u,v,w,x,y,z]   │
+  │ ← FULL — no room     │             │                      │
+  └──────────────────────┘             └──────────────────────┘
+                                                   │
+                                                   ▼
+                                        ┌──────────────────────┐
+                                        │ Leaf Page B (new)    │
+                                        │ [empty]              │
+                                        └──────────────────────┘
+
+  Step 3: Redistribute keys             Step 4: Promote median
+
+  ┌──────────────────────┐             ┌──────────────────────┐
+  │ Leaf Page A          │             │ Internal Parent      │
+  │ [a,b,c,d,e,f,g,h,i, │             │ ["m" added here]     │
+  │  j,k,l]              │             │ [p1] [p2]            │
+  └──────────────────────┘             └──┬───────────────────┘
+  ┌──────────────────────┐                │                   │
+  │ Leaf Page B          │                ▼                   ▼
+  │ [m,n,o,p,q,r,s,t,u,  │          ┌──────────┐      ┌──────────┐
+  │  v,w,x,y,z]          │          │ Leaf A  │      │ Leaf B  │
+  └──────────────────────┘          └──────────┘      └──────────┘
+`}
+/>
+
+---
+
+## Performance Characteristics
+
+### B+Tree Search Complexity
+
+Search in a B+Tree is O(log_f n) where `f` is the fanout. Typical fanout is 200-500 for 8KB pages with small keys. The base of the logarithm is the fanout, not 2 (as in binary search). This is why B+Trees are so shallow.
+
+### Page Size Impact on Fanout
+
+| Page Size | Keys per internal node (8B key + 8B pointer) | Max rows with 3 levels | Max rows with 4 levels | Wasted I/O per lookup |
+|---|---|---|---|---|
+| 4KB | 255 | 16M | 4.2B | 4KB — 4 bytes consumed out of 4KB read |
+| 8KB | 511 | 130M | 66B | 8KB — 8 bytes consumed |
+| 16KB | 1023 | 1.0B | 1.0T | 16KB — 16 bytes consumed |
+
+Larger pages increase fanout and reduce tree depth, but each page read transfers more data than needed. A 4-level index on 16KB pages reads 64KB for a single-key lookup, of which fewer than 100 bytes are relevant. The optimal page size depends on the key width and the access pattern.
+
+### Index Storage Calculation
+
+Index storage for a B+Tree can be calculated precisely:
+
+```
+leaf_pages    = ceil(N / entries_per_leaf_page)
+internal_L1   = ceil(leaf_pages / fanout)
+internal_L2   = ceil(internal_L1 / fanout)
+...
+root          = 1 (when internal pages collapse to 1)
+
+total_pages   = leaf_pages + internal_L1 + internal_L2 + ... + 1
+total_size    = total_pages * page_size
+```
+
+**Example**: 100M rows, 8B key, 6B TID, 8KB pages, fill factor 90:
+- Entry size: 8 + 6 + 4 (item pointer overhead) = 18 bytes
+- Available per page: 8192 - 120 = 8072 * 0.9 = 7265 bytes
+- Entries per leaf: 7265 / 18 = 403
+- Leaf pages: 100,000,000 / 403 = 248,139 pages (1.98GB)
+- Internal fanout: 7265 / 16 = 454 pointers per page
+- L1 internal: 248,139 / 454 = 547 pages
+- L2 internal: 547 / 454 = 2 pages
+- Root: 1 page
+- Total: 248,139 + 547 + 2 + 1 = 248,689 pages (1.99GB)
+
+### Index Fragmentation and Bloat
+
+Over time, page splits and deletions cause index pages to become less than optimally filled. An index that started with a fill factor of 90 may drop to 50 percent occupancy after months of random inserts and deletes. This is fragmentation.
+
+**Measurement**: PostgreSQL's `pgstatindex` extension reports:
+- `avg_leaf_density`: Percentage of leaf page space occupied by live entries. Below 70 indicates significant bloat.
+- `leaf_fragmentation`: Percentage of leaf pages that are not physically contiguous with their neighbors.
+
+**Recovery**: `REINDEX INDEX` rebuilds the index from scratch, restoring fill factor to the configured value. `REINDEX CONCURRENTLY` does this without blocking writes. For SQL Server, `ALTER INDEX REBUILD` provides similar functionality.
+
+---
+
+## Configuration and Tuning
+
+### Fill Factor
+
+Controls how full each B+Tree page is on creation or rebuild. The trade-off is between space utilization and split frequency.
+
+| Fill Factor | Space Wasted | Split Frequency | Best For |
+|---|---|---|---|
+| 50 | High | Very low — 50 percent headroom for inserts | Tables with heavy random insert workload |
+| 70 | Medium | Low — 30 percent headroom | General OLTP with moderate insert rate |
+| 90 | Low | Moderate — 10 percent headroom | Read-mostly tables, append-only inserts |
+| 100 | None | High — any insert on a full page triggers a split | Static tables (never inserted into after load) |
+
+For unique indexes on auto-increment columns, the fill factor does not matter much — new inserts always go to the rightmost page, and old pages never change. A fill factor of 90 (default) wastes 10 percent of space with no benefit.
+
+### maintenance_work_mem (PostgreSQL)
+
+Controls the memory budget for index creation, REINDEX, and VACUUM operations. Creating a large index requires sorting the key-pointer pairs before building the B+Tree. If the sort cannot fit in `maintenance_work_mem`, it spills to disk in multiple merge passes, dramatically slowing index creation.
+
+**Tuning**: Set `maintenance_work_mem` to 1GB per concurrent maintenance operation for tables over 100GB. Monitor `EXPLAIN ANALYZE` output on CREATE INDEX for "external merge" steps — these indicate disk spills and a need for more memory.
+
+### Vacuum Configuration
+
+PostgreSQL's MVCC architecture means dead index entries accumulate until VACUUM reclaims them. Index bloat grows when autovacuum cannot keep pace with write volume.
+
+**Key parameters**:
+- `autovacuum_vacuum_scale_factor`: Default 0.2. For a 100M row table, vacuum triggers after 20M dead tuples. This is too slow for high-write tables. Production recommendation: 0.01 for large tables.
+- `autovacuum_vacuum_threshold`: Default 50. Minimum dead tuples before vacuum runs. For high-write tables, set to 1000 to avoid unnecessary vacuum cycles on small changes.
+- `autovacuum_naptime`: Default 60 seconds. Minimum delay between autovacuum runs on a database. Reducing to 30 seconds helps keep up with high-write workloads.
+- `autovacuum_vacuum_cost_limit`: Default 200. Throttles vacuum I/O. Increase to 2000 for SSD-backed databases.
+
+### Buffer Pool Size
+
+The single most impactful parameter for index performance. The buffer pool caches recently used pages.
+
+**Sizing guidance**:
+- Root pages of hot indexes should always fit in the buffer pool.
+- For OLTP workloads, aim for a buffer pool large enough to cache the entire working set of frequently accessed indexes and tables.
+- Monitor `pg_buffercache` to see which indexes are consuming buffer pool space.
+- The `cache hit ratio` metric (buffer hits / (buffer hits + buffer misses)) should be above 99 percent for OLTP.
+
+<AsciiDiagram
+  id="indexing/buffer-pool-impact"
+  title="Impact of buffer pool size on index lookup performance — warm vs cold cache behavior"
+  alt="Comparison chart: buffer pool larger than index (warm) shows 3 page reads from memory at under 1 microsecond each; buffer pool smaller than working set (cold) shows 3 page reads from SSD at 100 microseconds each or from HDD at 8 milliseconds each, with the bar chart showing exponential latency increase as cache miss rate rises"
+  caption="Buffer pool sizing determines whether index lookups hit memory or require disk I/O"
+  content={`Buffer pool impact on index lookup latency
+
+  Warm index (fits in buffer pool)    Cold index (must read from disk)
+
+   ┌──────────────┐                    ┌──────────────┐
+   │ Root page    │  in memory         │ Root page    │  in memory
+   │ (cached)     │  < 1 microsecond   │ (cached)     │  < 1 microsecond
+   └──────────────┘                    └──────────────┘
+         │                                   │
+         ▼                                   ▼
+   ┌──────────────┐                    ┌──────────────┐
+   │ Internal pg  │  in memory         │ Internal pg  │  DISK READ
+   │ (cached)     │  < 1 microsecond   │ (not cached) │  ~100 microseconds
+   └──────────────┘                    └──────────────┘
+         │                                   │
+         ▼                                   ▼
+   ┌──────────────┐                    ┌──────────────┐
+   │ Leaf page    │  in memory         │ Leaf page    │  DISK READ
+   │ (cached)     │  < 1 microsecond   │ (not cached) │  ~100 microseconds
+   └──────────────┘                    └──────────────┘
+         │                                   │
+         ▼                                   ▼
+   ┌──────────────┐                    ┌──────────────┐
+   │ Total: ~2ms  │                    │ Total: ~200ms │
+   └──────────────┘                    └──────────────┘
+
+   With HDD storage: cold index → 4-8ms per page read → total ~24ms per lookup
+`}
+/>
+
+---
+
+## Bridge to Architecture
+
+The internal data structures and algorithms of B+Tree indexes — page splits, fill factors, buffer cache behavior, concurrent index maintenance, LSM-Tree alternatives — directly inform how to design an indexing strategy at production scale. The architecture section applies these fundamentals to real deployment scenarios: choosing clustered versus secondary indexes for specific read patterns, designing covering indexes for hot queries, planning capacity for index storage, and implementing zero-downtime index maintenance in production systems.

@@ -1,0 +1,567 @@
+---
+id: memcached-deep-dive
+title: Memcached — Under the Hood
+position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+Memcached's internal architecture is a masterpiece of minimalism. Every component exists because it is strictly necessary for performance, and nothing exists for convenience or features. The architecture has four layers: network I/O, worker threads, the slab allocator, and the hash table with per-class LRU lists.
+
+<AsciiDiagram
+  id="memcached/deep-dive-internal-arch"
+  title="Memcached Internal Architecture"
+  alt="Stacked diagram showing four layers: libevent network I/O at bottom, worker threads above, then slab allocator, then hash table and LRU lists at top"
+  caption="The four-layer internal architecture of Memcached"
+>{`
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Hash Table (global, chained buckets)                                  │
+│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐    │
+│  │  *  │ │ nil │ │  *  │ │  *  │ │ nil │ │  *  │ │ nil │ │  *  │ │  │
+│  └──┬──┘ └─────┘ └──┬──┘ └──┬──┘ └─────┘ └──┬──┘ └─────┘ └──┬──┘    │
+│     ▼               ▼       ▼                 ▼               ▼       │
+│  [item]─►[item]  [item]  [item]─►[item]   [item]─►[item]─►[item]    │
+│    key:A  key:B   key:C   key:D  key:E     key:F  key:G   key:H      │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  LRU Lists (one per slab class)                                        │
+│                                                                         │
+│  Slab Class 1 (96B)  ┌──►[i1]◄──►[i2]◄──►[i3]◄──►[i4]──► NULL       │
+│                      │   head          (LRU order)          tail       │
+│  Slab Class 2 (120B) └──►[i5]◄──►[i6]◄──►[i7]──► NULL                 │
+│                      │   head                           tail            │
+│  Slab Class 3 (152B) └──►[i8]◄──►[i9]──► NULL                          │
+│                          head              tail                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Slab Allocator (memory pages → chunks per class)                      │
+│                                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                  │
+│  │ page (1 MB)  │  │ page (1 MB)  │  │ page (1 MB)  │  ...            │
+│  │ class 1      │  │ class 2      │  │ class 5      │                  │
+│  │ ┌──┬──┬──┐  │  │ ┌──┬──┬──┐  │  │ ┌──┬──┬──┐  │                  │
+│  │ │c0│c1│c2│  │  │ │c0│c1│c2│  │  │ │c0│c1│c2│  │                  │
+│  │ │..│..│..│  │  │ │..│..│..│  │  │ │..│..│..│  │                  │
+│  │ └──┴──┴──┘  │  │ └──┴──┴──┘  │  │ └──┴──┴──┘  │                  │
+│  └──────────────┘  └──────────────┘  └──────────────┘                  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Network I/O (libevent with epoll/kqueue)                              │
+│                                                                         │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
+│  │ worker 0 │  │ worker 1 │  │ worker 2 │  │ worker 3 │  ...          │
+│  │ conns    │  │ conns    │  │ conns    │  │ conns    │               │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘               │
+│       ▲              ▲              ▲              ▲                   │
+│       │              │              │              │                   │
+│       └──────────────┴──────────────┴──────────────┘                   │
+│                          libevent dispatch                              │
+│                     (epoll on Linux, kqueue on BSD)                    │
+└─────────────────────────────────────────────────────────────────────────┘
+`}</AsciiDiagram>
+
+### Network I/O: libevent
+
+Memcached uses libevent, an asynchronous event notification library, to handle network I/O. On Linux this maps to epoll; on BSD/macOS to kqueue. The event loop is the heartbeat of the server — it monitors all open connections for readability (incoming commands) and writability (outgoing responses).
+
+The server uses a **multi-threaded** event loop design. A main thread accepts new connections and distributes them to worker threads using a round-robin strategy. Each worker thread has its own event loop and set of connections. This spreads the CPU cost of parsing commands and managing connections across available cores.
+
+You configure the number of worker threads with the `-t` flag. The sweet spot is typically 4-8 threads, matching the number of physical cores available.
+
+### Worker Threads
+
+Each worker thread:
+1. Maintains its own set of client connections (assigned by the main thread).
+2. Receives data from connections, parses commands (ASCII or binary protocol).
+3. Performs hash table lookups or modifications (with a global lock, but held very briefly).
+4. Manages LRU list operations (also with a brief global lock).
+5. Sends responses back to clients.
+
+The global lock (a single mutex protecting the hash table and LRU lists) is Memcached's biggest scalability bottleneck. The lock is held for microseconds at a time, but under extreme load (hundreds of thousands of QPS), contention on this lock caps throughput. This is why Memcached scales well to 4-8 cores but shows diminishing returns beyond that.
+
+## Data Structures
+
+### Hash Table (Global)
+
+The hash table maps keys to items. It is a standard chained hash table: an array of buckets, each bucket holding a linked list of items that hash to that bucket.
+
+```c
+// Simplified from memcached.c
+struct hash_table {
+    struct item **buckets;   // array of pointers to item chains
+    int bucket_count;        // power of 2
+    int item_count;          // total items in table
+    int expand_threshold;    // when to rehash
+};
+```
+
+The hash function is a modified version of Jenkins' hash (one-at-a-time hash), chosen for its speed and good distribution properties.
+
+**Rehashing.** When the item count exceeds the bucket count (load factor > 1), the hash table is expanded to the next power of 2. Rehashing is performed incrementally — a small number of buckets are rehashed per request to avoid latency spikes. This is called incremental rehashing and is the same technique used in Redis.
+
+### Slab Allocator
+
+The slab allocator is Memcached's answer to memory fragmentation. Every caching system that uses malloc/free for variable-size allocations eventually fragment the heap. Memcached avoids this entirely by dividing memory into slabs with fixed-size chunks.
+
+```c
+// Simplified slab allocator structures
+#define POWER_SMALLEST 1      // smallest slab class ID
+#define POWER_LARGEST  256    // largest slab class ID (1 MB)
+#define CHUNK_ALIGN_BYTES 8
+
+struct slabclass_t {
+    unsigned int size;        // chunk size for this class
+    unsigned int perslab;     // chunks per slab page
+    void **slots;             // free chunks list (LIFO)
+    unsigned int sl_curr;     // total free chunks
+    unsigned int slabs;       // how many slab pages allocated
+    void **slab_list;         // array of slab page pointers
+    unsigned int list_size;   // size of slab_list
+    unsigned int killing;     // used for slab reassignment
+};
+```
+
+**Slab classes and chunk sizes.** Memcached starts with a minimum chunk size (default 56 bytes, configurable with `-n`) and grows by a factor of 1.25x (configurable with `-f`) for each subsequent class. The formula is:
+
+```
+chunk_size[n] = max(settings.item_size_min, chunk_size[n-1] * settings.factor)
+```
+
+This creates approximately 42-48 slab classes between the minimum and 1 MB.
+
+<AsciiDiagram
+  id="memcached/deep-dive-slab-classes"
+  title="Slab Class Sizing"
+  alt="Table showing slab class numbers with their chunk sizes, items per page, and growth factor of 1.25x"
+  caption="Slab class sizes grow geometrically at factor 1.25"
+>{`
+┌─────────┬─────────────┬──────────────┬──────────────────────────────────┐
+│ Class   │ Chunk Size  │ Items per    │  Memory usage per item           │
+│         │  (bytes)    │ 1MB slab     │  (chunk waste shown as ░)       │
+├─────────┼─────────────┼──────────────┼──────────────────────────────────┤
+│ 1       │      96     │   10,922     │ ████████░░░░░░░░  (8B item waste)│
+│ 2       │     120     │    8,738     │ ██████████░░░░░░  (same)         │
+│ 3       │     152     │    6,898     │ ████████████░░░░                 │
+│ 4       │     192     │    5,461     │ ██████████████░░                 │
+│ 5       │     240     │    4,369     │ ████████████████░                 │
+│ 6       │     304     │    3,449     │ ██████████████████               │
+│ 7       │     384     │    2,730     │ (waste shrinks as item           │
+│ 8       │     480     │    2,184     │  size approaches chunk)          │
+│ 9       │     600     │    1,747     │                                   │
+│ 10      │     752     │    1,394     │                                   │
+│ ...     │     ...     │      ...     │                                   │
+│ 42      │ 1,048,576  │        1     │ ████████████████████████████████  │
+└─────────┴─────────────┴──────────────┴──────────────────────────────────┘
+
+  Memory waste is the gap between item actual size and chunk size.
+  At 1.25x growth, worst-case waste is ~20% per chunk.
+  Average waste across all items: ~8-12%.
+  This is the price of fragmentation-free operation.
+`}</AsciiDiagram>
+
+### LRU Linked List (Per Slab Class)
+
+Each slab class maintains a doubly-linked list of items in LRU order. The head is the most recently used item; the tail is the least recently used item and the first candidate for eviction.
+
+```c
+// Each item is a node in the LRU list
+struct item {
+    struct _stritem *next;   // next in hash chain
+    struct _stritem *prev;   // prev in hash chain
+    struct _stritem *h_next; // next in hash table bucket chain
+    rel_time_t      time;    // last access time (seconds since startup)
+    rel_time_t      exptime; // expiry time (same epoch)
+    int             nbytes;  // value size in bytes
+    unsigned short  refcount; // active references (prevents eviction)
+    uint8_t         slabs_clsid; // which slab class
+    uint8_t         flags;   // item flags
+    uint8_t         nkey;    // key length
+    uint64_t        cas_id;  // CAS identifier
+    // key and value data follow immediately in memory
+};
+```
+
+**Refcount and concurrency.** The `refcount` field prevents an item from being evicted while a worker thread is sending it to a client. When a GET matches an item, the refcount is incremented. After the response is sent, it is decremented. An item with refcount > 0 cannot be evicted. This prevents the dreaded "use-after-free" race condition.
+
+**Touch on read.** Every GET that hits an item moves it to the head of the LRU list. This is an O(1) operation — the item is unlinked from its current position and re-linked at the head. This ensures that frequently accessed items stay in cache.
+
+## Request Lifecycle
+
+### GET Request — Detailed Step-by-Step
+
+<AsciiDiagram
+  id="memcached/deep-dive-get-lifecycle"
+  title="Complete GET Request Lifecycle"
+  alt="Flowchart from client connection through libevent event loop, command parsing, hash table lookup, LRU touch, to response"
+  caption="Every step of a GET request through Memcached internals"
+>{`
+Client                    Memcached Server
+  │                              │
+  │  TCP connect                 │
+  │─────────────────────────────>│  1. main thread accepts
+  │                              │     dispatches to worker 2
+  │                              │
+  │  "get user:1234\\r\\n"          │
+  │─────────────────────────────>│  2. libevent: EPOLLIN on conn
+  │                              │     worker 2 event loop wakes
+  │                              │
+  │                              │  3. Read buffer: "get user:1234\\r\\n"
+  │                              │     try_read_command() called
+  │                              │
+  │                              │  4. Parse command: cmd=GET
+  │                              │     key="user:1234"
+  │                              │     nkey=10
+  │                              │
+  │                              │  5. Acquire global cache lock
+  │                              │     (pthread_mutex_lock)
+  │                              │
+  │                              │  6. Hash key "user:1234"
+  │                              │     jenkins_hash() → bucket index
+  │                              │
+  │                              │  7. Walk bucket chain:
+  │                              │     for each item in bucket:
+  │                              │       if item.nkey == nkey
+  │                              │       && memcmp(item.key, key) == 0:
+  │                              │         → FOUND
+  │                              │
+  │                              │  8. Check expiry:
+  │                              │     if item.exptime != 0
+  │                              │     && item.exptime < current_time:
+  │                              │       → EXPIRED, treat as miss
+  │                              │       lazy eviction (don't free yet)
+  │                              │
+  │                              │  9. If valid: item.refcount++
+  │                              │
+  │                              │ 10. Move to LRU head:
+  │                              │     do_item_update(item)
+  │                              │     unlink from current LRU position
+  │                              │     link at head of slab class LRU
+  │                              │
+  │                              │ 11. Release global cache lock
+  │                              │
+  │                              │ 12. Build response:
+  │                              │     "VALUE user:1234 0 45\\r\\n"
+  │                              │     + value bytes + "\\r\\nEND\\r\\n"
+  │                              │
+  │                              │ 13. Add to write buffer
+  │                              │     register EPOLLOUT event
+  │                              │
+  │                              │ 14. libevent: EPOLLOUT fires
+  │                              │     write buffer to socket
+  │                              │
+  │    "VALUE user:1234 0 45\\r\\n"│
+  │    "{json}\\r\\nEND\\r\\n"       │
+  │<─────────────────────────────│ 15. Client receives response
+  │                              │
+  │                              │ 16. item.refcount-- (when
+  │                              │     response fully sent)
+`}</AsciiDiagram>
+
+### SET Request — Detailed Step-by-Step
+
+<AsciiDiagram
+  id="memcached/deep-dive-set-lifecycle"
+  title="Complete SET Request Lifecycle"
+  alt="Flowchart showing SET command: parsing key/value/flags/exptime, slab class selection, chunk allocation or eviction, item storage, hash table insert, and response"
+  caption="Every step of a SET request through Memcached internals"
+>{`
+Client                    Memcached Server
+  │                              │
+  │  "set user:1234 0 3600 45"  │
+  │  "{json of 45 bytes}\\r\\n"   │
+  │─────────────────────────────>│  1-4: Same as GET through parsing
+  │                              │
+  │                              │  5. Compute total item size:
+  │                              │     key_size  = 10 (user:1234)
+  │                              │     value_size = 45
+  │                              │     metadata   = 56
+  │                              │     total      = 111 bytes
+  │                              │
+  │                              │  6. Select slab class:
+  │                              │     slab class 5 (chunk size 240)
+  │                              │     111 < 240 → fits in class 5
+  │                              │
+  │                              │  7. Acquire global cache lock
+  │                              │
+  │                              │  8. Try to allocate from slab class:
+  │                              │     if free list non-empty:
+  │                              │       pop chunk from slots[]
+  │                              │     else if unallocated pages remain:
+  │                              │       grow_slab_table()
+  │                              │       mmap new page, divide into chunks
+  │                              │       add to free list, pop one
+  │                              │     else:
+  │                              │       LRU eviction:
+  │                              │       pop tail item from class 5 LRU
+  │                              │       free its chunk
+  │                              │       reuse for new item
+  │                              │
+  │                              │  9. If key already exists:
+  │                              │     delete old item from hash table
+  │                              │     free old chunk
+  │                              │
+  │                              │ 10. Write item data into chunk:
+  │                              │     item.key = "user:1234"
+  │                              │     item.flags = 0
+  │                              │     item.exptime = current_time + 3600
+  │                              │     item.nbytes = 45
+  │                              │     item.cas_id = next_cas++
+  │                              │     memcpy(value_data, json_blob, 45)
+  │                              │
+  │                              │ 11. Insert into hash table:
+  │                              │     hash key → bucket
+  │                              │     link item at bucket chain head
+  │                              │
+  │                              │ 12. Link at head of slab class 5 LRU
+  │                              │
+  │                              │ 13. Release global cache lock
+  │                              │
+  │                              │ 14. Send "STORED\\r\\n"
+  │                              │
+  │    "STORED\\r\\n"              │
+  │<─────────────────────────────│
+`}</AsciiDiagram>
+
+### Multiple-Key GET (mget) Optimization
+
+The ASCII protocol sends each GET as a separate command, which requires a round trip per key. The binary protocol and many smart clients support pipelining: sending multiple commands without waiting for responses. This is critical for performance.
+
+```python
+# Inefficient: one round trip per key
+val1 = client.get('user:1234')
+val2 = client.get('user:5678')
+val3 = client.get('user:9012')
+
+# Efficient: pipeline or multi-get
+# ASCII protocol multi-get:
+# get user:1234 user:5678 user:9012
+# pymemcache batch:
+vals = client.get_many(['user:1234', 'user:5678', 'user:9012'])
+```
+
+At the server level, a multi-get (`get key1 key2 key3`) loops through the keys, performing the hash lookup and LRU touch for each, and sends all results back in one response stream:
+
+```
+VALUE user:1234 0 45
+{json for 1234}
+VALUE user:5674 0 52
+{json for 5678}
+VALUE user:9012 0 48
+{json for 9012}
+END
+```
+
+## Consistency and State
+
+### Node Crash — Complete Data Loss
+
+When a Memcached node crashes, every item it held is gone. This is by design — no fsync, no write-ahead log, no replication. The application must handle this at the client layer through the cache-aside pattern.
+
+```python
+def get_user_profile(user_id):
+    key = f"user:{user_id}"
+    data = client.get(key)
+
+    if data is None:
+        # Cache miss (node down, expired, evicted, never stored)
+        data = db.query("SELECT * FROM users WHERE id = ?", user_id)
+        client.set(key, data, expire=3600)
+
+    return data
+```
+
+The client library handles node failures transparently. When a connection fails or times out, the client marks the node as dead and removes it from the consistent hash ring. Requests that would have hit the dead node now distribute across remaining nodes. After a configurable period, the client attempts to reconnect.
+
+### CAS Collision — Optimistic Concurrency
+
+<AsciiDiagram
+  id="memcached/deep-dive-cas-collision"
+  title="CAS Collision Scenario"
+  alt="Sequence diagram showing two concurrent clients reading the same value, both attempting to write, and the second write rejected due to CAS mismatch"
+  caption="CAS prevents lost updates when two clients write concurrently"
+>{`
+Client A                    Memcached                    Client B
+  │                            │                            │
+  │ GET user:1234              │                            │
+  │ cas=100                    │                            │
+  │───────────────────────────>│                            │
+  │<───────────────────────────│                            │
+  │                            │                            │
+  │ (Client A reads data)      │    GET user:1234           │
+  │                            │    cas=100                 │
+  │                            │<───────────────────────────│
+  │                            │───────────────────────────>│
+  │                            │<───────────────────────────│
+  │                            │                            │
+  │ CAS user:1234 0 3600 45   │                            │
+  │ cas=100  (same read)       │                            │
+  │───────────────────────────>│                            │
+  │                            │  CAS check: stored cas=100 │
+  │                            │  matches → STORED          │
+  │                            │  new cas=101               │
+  │                            │                            │
+  │ STORED                     │                            │
+  │<───────────────────────────│                            │
+  │                            │                            │
+  │                            │  CAS user:1234 0 3600 52  │
+  │                            │  cas=100 (stale!)         │
+  │                            │<───────────────────────────│
+  │                            │                            │
+  │                            │  CAS check: stored cas=101 │
+  │                            │  100 != 101 → EXISTS      │
+  │                            │  (rejected)               │
+  │                            │                            │
+  │                            │  EXISTS (try again)       │
+  │                            │───────────────────────────>│
+  │                            │                            │
+  │  Client B must re-read     │                            │
+  │  and retry.                │                            │
+`}</AsciiDiagram>
+
+CAS collisions are not errors — they are the intended mechanism for safe concurrent updates. Your application must handle EXISTS responses by re-reading the value, merging changes, and retrying the CAS operation.
+
+### Slab Rebalancing (Facebook Extension)
+
+Standard Memcached does not rebalance memory across slab classes. If you store many small items, slab class 1 claims all the pages and slab class 5 (for medium items) gets none. This is the **slab imbalance** problem.
+
+Facebook's mcrouter and the Facebook Memcached fork add automatic slab rebalancing: slab pages are moved from underutilized classes to overutilized ones based on eviction rates. This is not available in the vanilla version.
+
+<AsciiDiagram
+  id="memcached/deep-dive-slab-imbalance"
+  title="Slab Imbalance Problem"
+  alt="Two diagrams showing before and after: first shows class 1 at 100% usage with LRU evictions and class 5 at 10% usage; second shows rebalanced memory"
+  caption="Slab imbalance occurs when one class fills while another underutilizes its pages"
+>{`
+BEFORE:  (slab class 1 is thrashing, class 5 is barely used)
+
+  Class 1 (96B)  ████████████████████████████████  100% full  EVICTING!
+  Class 2 (120B) ████████████████░░░░░░░░░░░░░░░░   55% full
+  Class 3 (152B) ██████████░░░░░░░░░░░░░░░░░░░░░░   40% full
+  Class 4 (192B) █████████░░░░░░░░░░░░░░░░░░░░░░░░  35% full
+  Class 5 (240B) ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   10% full
+  Class 6 (304B) ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   10% full
+
+AFTER:  (mcrouter rebalanced — one page moved from class 5 to class 1)
+
+  Class 1 (96B)  ████████████████████████████████░  98% full  OK
+  Class 2 (120B) ████████████████░░░░░░░░░░░░░░░░   55% full
+  Class 3 (152B) ██████████░░░░░░░░░░░░░░░░░░░░░░   40% full
+  Class 4 (192B) █████████░░░░░░░░░░░░░░░░░░░░░░░░  35% full
+  Class 5 (240B) ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    8% full  (lost 1 page)
+  Class 6 (304B) ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   10% full
+`}</AsciiDiagram>
+
+### Hot Keys
+
+A hot key is a single key that receives a disproportionate share of requests. For example, a celebrity's user profile page or a viral video's metadata. Since Memcached is stateless at the server level (no replication), the hot key overloads a single node.
+
+<AsciiDiagram
+  id="memcached/deep-dive-hot-keys"
+  title="Hot Key Overload"
+  alt="Diagram showing one Memcached node receiving 90% of traffic for a single hot key while other nodes are idle"
+  caption="A hot key concentrates traffic on a single node, creating a bottleneck"
+>{`
+Request stream:  90% for key "celebrity:12345"
+                 10% for all other keys
+
+  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │ App 1    │    │ App 2    │    │ App 3    │    │ App 4    │
+  └────┬─────┘    └────┬─────┘    └────┬─────┘    └────┬─────┘
+       │               │               │               │
+       │     ┌─────────┴───────────────┴─────┐         │
+       │     │   consistent hashing          │         │
+       │     │   key:celebrity:12345 → node 3│         │
+       │     └─────────┬───────────────┬─────┘         │
+       │               │               │               │
+  ┌────▼────┐    ┌────▼────┐    ┌────▼────┐    ┌───────▼──┐
+  │ mc-1    │    │ mc-2    │    │ mc-3    │    │ mc-4     │
+  │ 2% CPU  │    │ 3% CPU  │    │ 95% CPU │    │ 2% CPU   │
+  │ idle    │    │ idle    │    │ 🔥HOT   │    │ idle     │
+  │         │    │         │    │ overload│    │          │
+  └─────────┘    └─────────┘    └─────────┘    └──────────┘
+
+  Solutions:
+  - Client-side: replicate hot key to multiple nodes (read from any)
+  - Local cache: cache hot key in application memory
+  - Proxy: mcrouter fan-out with replication
+`}</AsciiDiagram>
+
+Hot keys are a client-side problem. Memcached does nothing to help — it treats every key equally. Your options:
+
+1. **Local L1 cache.** Cache the hot key in application memory for a few seconds. This absorbs the spike at the application layer.
+2. **Replicate the hot key.** Store it on multiple Memcached nodes. The client randomly selects one replica to read from.
+3. **Use mcrouter.** Facebook's mcrouter can replicate specific keys or patterns automatically.
+
+## Performance
+
+### Raw Throughput
+
+A single Memcached node on modern hardware (8 cores, 64 GB RAM, 10 Gbps NIC) can handle 100,000 to 500,000 queries per second for small objects (under 1 KB). This varies based on:
+
+- **Object size:** Larger objects consume more memory bandwidth. A 10 KB object reduces throughput by roughly 30% compared to a 100-byte object.
+- **Protocol:** The binary protocol is 15-25% faster than ASCII due to lower parsing overhead.
+- **Network latency:** Client-server round-trip time dominates at high QPS. Co-location on the same LAN (sub-millisecond latency) is critical.
+- **Worker threads:** 4-8 threads is optimal. Beyond 8, the global lock creates contention and throughput plateaus.
+
+### Latency
+
+| Percentile | In-memory hit | Network + server (LAN) |
+|---|---|---|
+| p50 | 0.1 ms | 0.5-1 ms |
+| p95 | 0.3 ms | 2-3 ms |
+| p99 | 1 ms | 3-5 ms |
+| p99.9 | 5 ms | 10 ms |
+
+The p99.9 tail is dominated by: global lock contention under heavy load, network packet loss retransmission, and server CPU scheduling jitter.
+
+### Memory Overhead
+
+Each item stored in Memcached has a ~56-byte metadata overhead (the `item` struct fields: key pointer, value pointer, flags, exptime, cas_id, refcount, etc.). On top of this, slab internal fragmentation wastes 8-12% of allocated memory on average (the gap between item size and chunk size).
+
+Example: A 100-byte value with a 10-byte key:
+- Item data: 110 bytes (key + value)
+- Metadata: 56 bytes
+- Minimum total: 166 bytes
+- After slab alignment (chunk size 192 in class 4): 192 bytes
+- Effective waste: 26 bytes (13.5%)
+
+This overhead is the price of fragmentation-free operation. Memcached's memory efficiency is still significantly better than a general-purpose malloc implementation for the same workload.
+
+## Configuration Reference
+
+Memcached has a deliberately small configuration surface. These are the flags you will use in production:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-m` | 64 MB | Maximum memory to use for item storage. Set this to 80-90% of available RAM. Leave the rest for OS, TCP buffers, and overhead. |
+| `-c` | 1024 | Maximum simultaneous connections. Each connection consumes a file descriptor and a small buffer. For high-QPS workloads, set to 50000+ or remove the limit with `-o modern`. |
+| `-n` | 56 bytes | Minimum chunk size (slab class 1). The item structure is 56 bytes, so the minimum chunk must be at least that. Increase if you store only larger items to avoid wasted slab class 1. |
+| `-f` | 1.25 | Growth factor between slab classes. Lower values (1.10) create more classes with finer granularity (less waste) but more LRU list overhead. Higher values (2.0) create fewer classes with more waste. |
+| `-L` | off | Use large memory pages (hugepages or superpages). Reduces TLB misses for large working sets. Requires OS configuration to enable hugepages. Can improve performance by 5-15%. |
+| `-I` | 1 MB | Maximum item size. Increasing this changes slab class sizing — the largest class matches this value. In production, keep at 1 MB unless you have a strong reason to increase it. |
+| `-o modern` | off | Enables a set of modern defaults: higher connection limits, improved memory management, and better handling of modern workloads. Recommended for all new deployments. |
+| `-t` | 4 | Number of worker threads. Match to physical cores. More threads than cores causes context switching overhead. |
+| `-R` | 20 | Maximum number of requests per event loop iteration. Higher values improve throughput under high QPS but can increase latency for individual connections. |
+
+### Production Startup
+
+```bash
+# Production-quality Memcached startup
+memcached \
+  -m 65536 \          # 64 GB
+  -c 100000 \         # 100K connections
+  -t 8 \              # 8 worker threads
+  -o modern \         # modern defaults
+  -L \                # hugepages (if configured)
+  -R 100 \            # 100 requests per event
+  -l 0.0.0.0 \        # listen on all interfaces
+  -p 11211            # default port
+```

@@ -1,0 +1,731 @@
+---
+id: durability-deep-dive
+title: Durability Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Durability Deep Dive
+
+Durability seems simple — write data to disk and you are done. The reality involves operating system buffering races, storage controller behavior variances, atomic page write guarantees, and complex crash recovery algorithms. This page covers the internals that determine whether your data survives when things break.
+
+---
+
+## WAL Internals: The Heart of Crash Recovery
+
+Every major database that cares about durability uses a write-ahead log. Before any change touches the data files, the change is appended to a sequential log on stable storage. If the server crashes, the database replays the WAL during recovery to reconstruct any committed transactions that had not yet been flushed to the data files.
+
+### WAL Record Structure
+
+A WAL record typically contains:
+
+```
+WAL Record:
+┌─────────────────────────────────────────┐
+│ LSN (8 bytes)          Log Sequence #   │
+│ Prev LSN (8 bytes)     Previous record  │
+│ Transaction ID (4 bytes)                │
+│ Resource Manager ID (2 bytes)           │
+│ Operation Code (2 bytes)                │
+│ Payload Length (4 bytes)                │
+│ ┌─────────────────────────────────┐     │
+│ │ Payload:                        │     │
+│ │ - Page ID (table + page number) │     │
+│ │ - Redo image (bytes to reapply) │     │
+│ │ - Undo image (bytes to revert)  │     │
+│ │ - Checksum (CRC32 of payload)   │     │
+│ └─────────────────────────────────┘     │
+│ Checksum (CRC32 of entire record)       │
+└─────────────────────────────────────────┘
+Total overhead: ~40 bytes per record
+Payload: scales with operation size
+```
+
+<AsciiDiagram
+  title="WAL Record Format and Recovery"
+  content={`
+┌──────────────────────────────────────────────────────────────────┐
+│  WAL Segment File (typically 16MB per segment)                    │
+│                                                                    │
+│  ┌─────────┬─────────┬─────────┬─────────┬─────────┐            │
+│  │ Record  │ Record  │ Record  │ Record  │ Record  │            │
+│  │ LSN=0   │ LSN=80  │ LSN=240 │ LSN=400 │ LSN=600 │            │
+│  │ BEGIN   │ INSERT  │ INSERT  │ PREPARE │ COMMIT  │            │
+│  └─────────┴─────────┴─────────┴─────────┴─────────┘            │
+│           │         │         │         │         │              │
+│           ▼         ▼         ▼         ▼         ▼              │
+│  Recovery reads from last checkpoint LSN to end                  │
+│                                                                    │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ Recovery Scan:                                               │ │
+│  │ 1. Find last checkpoint record                               │ │
+│  │ 2. Scan forward from checkpoint LSN                          │ │
+│  │ 3. Build transaction table (active/inactive)                  │ │
+│  │ 4. REDO all committed transactions                           │ │
+│  │ 5. UNDO all uncommitted transactions                         │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+  `}
+  alt="WAL segment file showing records with LSNs for BEGIN, INSERT, PREPARE, and COMMIT, with recovery process description from checkpoint scan through REDO and UNDO phases"
+  caption="The WAL is divided into fixed-size segments. Recovery scans from the last checkpoint forward."
+/>
+
+### PostgreSQL WAL vs MySQL InnoDB Redo Log
+
+Two dominant WAL implementations exist in the open-source world. They solve the same problem differently.
+
+**PostgreSQL WAL:**
+- Default segment size: 16MB
+- Written in 8KB blocks (matching data page size)
+- Each WAL record includes full page images for the first modification of a page after a checkpoint (full-page writes)
+- Replication slots prevent WAL deletion until all replicas have consumed the data
+- `wal_level = replica` (minimal) or `logical` (for change data capture)
+
+**MySQL InnoDB Redo Log:**
+- Circular log with two or more files (default: `ib_logfile0`, `ib_logfile1`)
+- Default size: 48MB per file (MySQL 8 defaults to 512MB each)
+- Written in 512-byte blocks (matching disk sector size)
+- Uses mini-transactions (mtr) within InnoDB for atomic page writes
+- `innodb_flush_log_at_trx_commit` controls fsync behavior:
+  - 1 (default): fsync every commit — safest, 50-200 writes/sec per connection
+  - 2: fsync once per second — slight durability gap, 10x more throughput
+  - 0: no fsync — OS flushes when it wants, up to 1 second of data loss
+
+### WAL Sizing Impact
+
+WAL size affects three things: recovery time, write throughput on checkpoints, and disk space usage.
+
+```
+WAL size        Recovery time   Max throughput   Disk usage
+────────────────────────────────────────────────────────────────
+64MB            1-3 seconds     10,000 writes/s  128MB
+512MB           5-15 seconds    50,000 writes/s  1GB
+4GB             1-3 minutes     200,000 writes/s 8GB
+16GB            5-15 minutes    500,000 writes/s 32GB
+
+Rule of thumb: WAL size should be 10-30 minutes of write capacity.
+Larger WAL = faster checkpoints, slower crash recovery.
+```
+
+---
+
+## fsync: The System Call Everyone Depends On
+
+fsync is the operating system primitive that guarantees data has reached physical storage. Your database's durability is only as trustworthy as fsync's implementation on your hardware.
+
+### The Buffer Cache Problem
+
+When you call `write()`, the operating system does not immediately write to disk. It copies data into the page cache — a region of RAM managed by the kernel. Writes to the page cache complete in microseconds. The kernel flushes dirty pages to disk asynchronously, usually within 30 seconds by default.
+
+If a power failure occurs before the kernel flushes, those writes vanish. The application called write(), got a success return code, and the data never touched a disk platter or NAND cell.
+
+```python
+# Unsafe: write only -- data may live in OS cache
+with open("data.db", "ab") as f:
+    f.write(record)       # Returns instantly, data in page cache
+    # Power loss here loses the write
+    f.close()             # Flushes to disk (but may return before completion)
+```
+
+```python
+# Durable: write + fsync
+with open("wal.log", "ab") as f:
+    f.write(record)       # Copies to page cache
+    os.fsync(f.fileno())  # BLOCKS until storage confirms durable write
+    # Power loss here is safe -- data is on physical media
+```
+
+### Hardware Lies: Battery-Backed Caches
+
+Many storage devices have write-back caches that report "written" to the OS before data is actually on persistent media. The OS calls fsync, the controller says "done," and the data sits in volatile controller RAM. Power fails. Data vanishes.
+
+The fix: battery-backed write cache (BBWC) or capacitor-backed cache. These components have enough stored energy to flush the cache to persistent storage during a power loss. Enterprise RAID controllers (LSI, Adaptec) and enterprise SSDs (Intel Optane, Samsung PM-series) have this protection. Consumer SSDs may not.
+
+<AsciiDiagram
+  title="fsync: Honest vs Dishonest Hardware"
+  content={`
+┌──────────────────────────────────────────────────────────────────┐
+│  Honest Hardware (enterprise SSD with power-loss protection)      │
+│                                                                    │
+│  write() ──> OS page cache ──> fsync() ──> SSD controller cache  │
+│                                             (capacitor-backed)     │
+│                                                   │                │
+│                                              ┌────┴────┐          │
+│                                              │  NAND   │          │
+│                                              │  flash  │          │
+│                                              └─────────┘          │
+│                                                                    │
+│  On power loss: capacitor holds charge long enough to flush        │
+│  cache to NAND. fsync returns true data-on-media guarantee.        │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│  Dishonest Hardware (consumer SSD without power-loss protection) │
+│                                                                    │
+│  write() ──> OS page cache ──> fsync() ──> SSD controller cache  │
+│                                             (DRAM, unprotected)   │
+│                                                   │                │
+│  fsync returns SUCCESS                           │                │
+│  But data is still in volatile DRAM               │                │
+│                                                   │                │
+│  On power loss: DRAM contents vanish.             │                │
+│  fsync lied. Data is lost.                        │                │
+│  ──────────────────────────────────────           │                │
+│  The write was supposed to be durable.            │                │
+│  The hardware could not keep that promise.        │                │
+└──────────────────────────────────────────────────────────────────┘
+  `}
+  alt="Side-by-side comparison of honest enterprise SSD with capacitor-backed cache that honors fsync vs dishonest consumer SSD that returns fsync success with data still in volatile DRAM"
+  caption="Enterprise SSDs with power-loss protection make fsync trustworthy. Consumer drives may lie."
+/>
+
+### fsync Performance Impact
+
+fsync is expensive because it forces the storage device to drain its write cache and confirm persistence.
+
+```
+Operation           Latency
+──────────────────────────────────
+write() to page cache    1-5 microseconds (no disk I/O)
+fsync() on HDD           5-15 milliseconds
+fsync() on SSD           0.5-5 milliseconds
+fsync() on NVMe          0.1-1 milliseconds
+
+Ratio: fsync is 100-10,000x slower than write()
+```
+
+Databases batch fsync calls to amortize the cost. Instead of fsyncing each transaction individually, they accumulate multiple WAL writes and fsync once per batch.
+
+### Group Commit
+
+Group commit is the optimization where the database collects multiple transactions that arrive between fsync calls and flushes them together in one fsync.
+
+```
+Without Group Commit:
+  T1: write WAL -> fsync (5ms) -> commit
+  T2: write WAL -> fsync (5ms) -> commit
+  T3: write WAL -> fsync (5ms) -> commit
+  Total: 15ms for 3 transactions (5 tx/sec)
+
+With Group Commit:
+  T1 arrives: write WAL -> wait for group
+  T2 arrives: write WAL -> wait for group
+  T3 arrives: write WAL -> wait for group
+                fsync (5ms) for all 3 -> T1,T2,T3 commit together
+  Total: 5ms for 3 transactions (600 tx/sec)
+```
+
+Group commit increases throughput by 100x at the cost of slightly delaying each transaction (the wait time for the group to form, typically sub-millisecond).
+
+---
+
+## Crash Recovery Algorithms
+
+When a database restarts after a crash, it must determine which transactions committed and which did not. The WAL makes this possible.
+
+### ARIES Recovery Algorithm
+
+ARIES (Algorithm for Recovery and Isolation Exploiting Semantics) is the most widely used crash recovery algorithm. Used by PostgreSQL, IBM DB2, Microsoft SQL Server, and many others.
+
+**Three phases:**
+
+**Phase 1 — Analysis:** Scan the WAL from the last checkpoint to build a table of active transactions at the time of crash. Determine the redo point (oldest LSN that might need redo).
+
+**Phase 2 — REDO:** Replay all changes from the redo point forward. Apply every operation that was in a committed or preparing transaction. This brings the database to the exact state it was at the moment of the crash.
+
+**Phase 3 — UNDO:** Roll back all transactions that were active but not committed at the time of the crash. The undo information is stored in the WAL records themselves.
+
+<AsciiDiagram
+  title="ARIES Crash Recovery Three Phase Process"
+  content={`
+Timeline:        Checkpoint ───────────────────── Crash ──────────►
+                      │                             │
+                      ▼                             ▼
+              ┌────────────────────────────────────────────┐
+WAL content:  │CP│T1│T1│T2│T2│CP│T3│T3│T1│T3│T2│    │    │
+              │B │I1│I2│B │I1│  │B │I1│U1│C │P │    │    │
+              └────────────────────────────────────────────┘
+                                                      │
+                                                      ▼
+              ┌─────────────────────────────────────────────────┐
+Phase 1:      │ ANALYSIS: Active TIDs at crash = {T2}          │
+ANALYSIS      │ T1 committed (commit record exists after CP)   │
+              │ T2 prepared but not committed                   │
+              │ T3 committed (commit record exists)             │
+              │ REDO point = last checkpoint LSN               │
+              └─────────────────────────────────────────────────┘
+                                                      │
+                                                      ▼
+              ┌─────────────────────────────────────────────────┐
+Phase 2:      │ REDO: Apply all operations from REDO point      │
+REDO          │ Replay T1 INSERTs, T3 INSERTs, T2 INSERTs       │
+              │ (Bring database to crash-time state)            │
+              └─────────────────────────────────────────────────┘
+                                                      │
+                                                      ▼
+              ┌─────────────────────────────────────────────────┐
+Phase 3:      │ UNDO: Roll back uncommitted transactions        │
+UNDO          │ For T2: undo the INSERT done at LSN=...         │
+              │ Write CLR (Compensation Log Record) to WAL      │
+              │ (CLR ensures undo is not re-done if recovery    │
+              │  itself crashes)                                │
+              └─────────────────────────────────────────────────┘
+
+  `}
+  alt="ARIES crash recovery timeline showing WAL content with checkpoints and transaction records, with three phases: ANALYSIS identifying active/committed transactions, REDO replaying all operations, and UNDO rolling back uncommitted work"
+  caption="ARIES three-phase recovery: analysis, REDO, and UNDO. The CLR ensures idempotent recovery."
+/>
+
+### LSM-Tree Crash Recovery
+
+Log-Structured Merge (LSM) trees, used by LevelDB, RocksDB, Cassandra, and ScyllaDB, have a different recovery model.
+
+The LSM tree is an append-only structure. Writes go into a memtable (in-memory sorted structure), which is periodically flushed to disk as an SSTable (Sorted String Table) file. The write-ahead log protects the memtable.
+
+```
+LSM Crash Recovery:
+1. On startup, scan WAL directory for log files
+2. Read WAL entries from the last known checkpoint
+3. Rebuild memtable by replaying WAL entries
+4. Discard WAL entries older than the oldest live SSTable
+
+Key difference from ARIES: LSM recovery only replays the
+in-memory state. On-disk SSTables are immutable and never
+need redo. Recovery is faster: typically under 1 second.
+```
+
+---
+
+### WAL Implementation Comparison Across Databases
+
+Different databases implement the WAL concept with slightly different structures and tradeoffs.
+
+<AsciiDiagram
+  title="WAL Implementation Comparison Across Four Major Databases"
+  content={`
+│ Database    │ WAL Name     │ Segment Size  │ Default fsync│ Recovery     │
+│             │              │               │ behavior      │ Time (1TB)   │
+├─────────────┼──────────────┼───────────────┼──────────────┼──────────────┤
+│ PostgreSQL  │ WAL (pg_wal) │ 16MB          │ per commit   │ 5-15 min     │
+│             │              │ (configurable) │ (sync=on)    │              │
+│ MySQL       │ Redo Log     │ 512MB         │ per commit   │ 5-10 min     │
+│ (InnoDB)    │ ib_logfile0  │ (circular)    │ (log=1)      │              │
+│ SQLite      │ WAL journal  │ DB pages x N  │ per page     │ under 1 sec      │
+│             │              │ (variable)     │ group        │ (single-file)│
+│ Kafka       │ Partition    │ 1GB           │ per N msgs   │ under 1 sec      │
+│             │ log (.log)   │ (configurable) │ or N sec     │ (sequential) │
+│ RocksDB     │ WAL (MANIFEST│ 4MB-256MB     │ per write    │ under 1 sec      │
+│ /LevelDB    │ -000xxx.log) │ (configurable) │ group        │ (memtable)   │
+│             │              │               │              │              │
+└─────────────┴──────────────┴───────────────┴──────────────┴──────────────┘
+
+Detailed internals:
+
+PostgreSQL WAL (pg_wal):
+  - Each segment is a sequential file, named by timeline + LSN
+  - WAL records contain full page images (full_page_writes = on)
+  - WAL is archived by archive_command (cp to S3, NFS, etc.)
+  - WAL is cleaned up by checkpoints + wal_keep_segments
+  - Replication slots prevent deletion until all consumers have read
+
+MySQL InnoDB Redo Log (ib_logfile):
+  - Circular buffer: when log reaches end, wraps to beginning
+  - Checkpoint advances the "free" pointer, allowing overwrite
+  - If checkpoint is too slow, the log fills up and writes block
+  - Redo log entries are smaller (redo-only, no undo info)
+  - Undo is stored separately in the undo tablespace
+
+SQLite WAL mode:
+  - Separate WAL file alongside the main database file
+  - WAL grows until checkpoint triggers merge
+  - Readers can read from the WAL while writing is happening
+  - Checkpoint = copy WAL pages back to main database
+  - Simpler structure, but no replication or distributed support
+  - fsync is called on both WAL and main database on checkpoint
+
+Kafka Partition Log:
+  - Each log segment is a file with .log extension
+  - Messages are appended to the active segment
+  - Segments are closed and new ones created on size or time
+  - Log compaction removes old records for the same key
+  - Index files (.index, .timeindex) map offsets to positions
+  - Topic configuration: cleanup.policy=delete or compact
+
+RocksDB WAL:
+  - WAL is written per column family group
+  - On flush (memtable to SSTable), old WAL is deleted
+  - WAL recycling reuses old WAL files to reduce file creation
+  - fsync is configurable per-write or per-group (default: group)
+  - WAL recovery re-populates the memtable from the last checkpoint
+`}
+  alt="Table comparing WAL implementations across PostgreSQL, MySQL, SQLite, Kafka, and RocksDB with segment sizes, fsync behavior, and recovery times"
+  caption="Every durable database has a write-ahead log. Implementation details vary, but the core principle is the same."
+/>
+
+### Advanced WAL Features
+
+**WAL Compression**: PostgreSQL 15+ supports WAL compression using LZ4 or ZSTD. Compressed WAL reduces disk I/O by 30-50% on write-heavy workloads. Tradeoff: 5-10% additional CPU per WAL write.
+
+```
+Without compression: 100GB WAL in 30 minutes (3.3GB/min write rate)
+With ZSTD (level 1): 70GB WAL in 28 minutes (2.5GB/min + CPU overhead)
+Recovery time: compressed WAL requires decompression during recovery
+  PostgreSQL: decompression adds ~10% recovery time
+```
+
+**WAL Encryption**: PostgreSQL supports Transparent Data Encryption (TDE) for WAL in the enterprise edition. Each WAL record is encrypted before being written to disk. Decryption happens during recovery.
+
+**WAL Parallelism**: PostgreSQL 15+ supports parallel WAL writes. Multiple WAL writer processes can write to separate WAL buffers, reducing contention on systems with high write concurrency.
+
+## Consistency During Crashes: Torn Pages and Partial Writes
+
+A disk page is typically 4KB, 8KB, or 16KB. Disk sectors are 512 bytes or 4KB (advanced format). When the database writes a 16KB page and the power fails after only 4KB has been written, the page contains a mix of old and new data. This is a torn page.
+
+### Torn Page Consequences
+
+A torn page can corrupt the database's internal structures:
+- An index page might have a half-updated pointer that references a non-existent child page
+- A table page might have a partially applied row update, with the row length indicating more data than actually exists
+- A page checksum computed against complete data will fail on torn data
+
+### Preventing Torn Pages
+
+**Method 1 — Double-Write Buffer (InnoDB):**
+
+Before writing a data page in place, InnoDB writes a full copy to a double-write buffer on disk. The buffer is a dedicated area of 128 pages (2MB). If the in-place write is interrupted, InnoDB recovers using the intact copy in the double-write buffer.
+
+```
+Write flow with double-write buffer:
+1. Copy dirty page to double-write buffer (sequential write)
+2. fsync double-write buffer
+3. Write page to actual location (random write)
+4. fsync actual location
+
+On crash during step 3:
+- Double-write buffer has the complete page
+- Recovery copies it from buffer to the correct location
+- Page is restored to its consistent state
+```
+
+**Method 2 — Full Page Writes (PostgreSQL):**
+
+After every checkpoint, the first modification to each page writes the entire page image to the WAL. If a page is torn during the checkpoint, the WAL contains the complete page for recovery to reapply.
+
+**Method 3 — Atomic Writes (modern storage):**
+
+Some storage systems support atomic write operations — a write of any size either completely succeeds or completely fails. NVMe with atomic write unit (AWU) support can make 16KB page writes atomic natively, eliminating torn pages.
+
+<AsciiDiagram
+  title="Torn Page and Double-Write Buffer Recovery"
+  content={`
+┌──────────────────────────────────────────────────────────────────┐
+│  Normal Write (no crash):                                        │
+│                                                                    │
+│  Dirty Page ──> Double-Write Buffer ──> fsync ──> Data Page     │
+│  (16KB)           (16KB copy)            ✓      (16KB written)   │
+│                                                                    │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│  Torn Page (crash during write to data page):                     │
+│                                                                    │
+│  Dirty Page ──> Double-Write Buffer ──> fsync ──> Data Page     │
+│  (16KB)           (16KB copy)            ✓      (8KB written    │
+│                                                   → CRASH)       │
+│                                                                    │
+│  Data page now contains:                                          │
+│  ┌─────────────────────────────────────────────┐                 │
+│  │ Bytes 0-8191:  NEW data (written before      │                 │
+│  │               crash)                         │                 │
+│  │ Bytes 8192-16383: OLD data (never written)   │                 │
+│  │                   or GARBAGE                  │                 │
+│  └─────────────────────────────────────────────┘                 │
+│                                                                    │
+│  Recovery:                                                        │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ 1. Detect: checksum mismatch on data page                  │ │
+│  │ 2. Find intact copy in double-write buffer                 │ │
+│  │ 3. Overwrite corrupted page with buffer copy               │ │
+│  │ 4. Page is now consistent                                  │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+  `}
+  alt="Two panels showing normal write flow through double-write buffer and the torn page scenario where a crash during data page write leaves a half-written page that is recovered by restoring from the intact double-write buffer copy"
+  caption="The double-write buffer prevents torn pages by keeping a pristine copy before the risky in-place write"
+/>
+
+---
+
+## Checksum Trees: Detecting Silent Corruption
+
+Writing data is only half the durability equation. The other half is detecting when stored data has silently changed. A disk can return corrupted data without reporting any error. This is called silent data corruption.
+
+### Checksum Strategies
+
+**Page-level checksums (PostgreSQL):** Every 8KB data page ends with a checksum. When the page is read, the checksum is verified. If it does not match, a page corruption is detected.
+
+```
+PostgreSQL checksum:
+- CRC32C (Castagnoli) of page contents, stored in page header
+- Computed on write, verified on read
+- Impact: ~3% CPU overhead for reads and writes
+- Detection: database logs error, returns error to query
+```
+
+**File-level checksums (ZFS):** The filesystem stores checksums separately from data, in a Merkle tree. Each block's checksum is stored in its parent block pointer, all the way up to the root.
+
+**Application-level checksums:** The application computes and stores a checksum alongside each record. When the record is read, the checksum is verified. This catches corruption anywhere in the stack — disk, controller, cable, OS, library.
+
+### Bit Rot and Scrubbing
+
+Bit rot (also called data decay) is the gradual change of stored bits due to physical media degradation. On a hard disk, magnetic domains lose their orientation over years. On NAND flash, electrons leak from floating gates. Each technology has a characteristic bit error rate.
+
+```
+Media type       Bit error rate (BER)   Uncorrectable after
+────────────────────────────────────────────────────────────────
+Consumer HDD     1 in 10^14 bits read   ~12 TB read
+Enterprise HDD   1 in 10^15 bits read   ~125 TB read
+Consumer SSD     1 in 10^15 bits read   ~125 TB read
+Enterprise SSD   1 in 10^16 bits read   ~1.25 PB read
+NVDIMM           1 in 10^18 bits read   ~125 PB read
+
+For a 10TB database read once per week:
+- Consumer HDD: 1 error every 12 weeks
+- Enterprise SSD: 1 error every 125 weeks
+- With checksums: errors are detected and corrected
+- Without checksums: errors silently produce wrong query results
+```
+
+Scrubbing (also called patrol read or data integrity scan) reads all data periodically and verifies checksums. This detects bit rot before the corrupted data is read during normal operation.
+
+```
+Scrubbing strategy:
+- Read every data page once per N days
+- Verify checksum on each page
+- If checksum fails: repair from replica or backup
+- Log any unrecoverable pages for operator attention
+
+Typical configuration:
+- Scrubbing interval: 7-30 days
+- I/O throttle: 20% of available disk bandwidth
+- Priority: low, does not impact production performance
+```
+
+<AsciiDiagram
+  title="Checksum Tree and Scrubbing"
+  content={`
+┌──────────────────────────────────────────────────────────────────┐
+│  ZFS Merkle Tree of Checksums                                    │
+│                                                                    │
+│                         ┌─────────┐                               │
+│                         │  Uber    │                               │
+│                         │  Block   │                               │
+│                         └────┬────┘                               │
+│                              │                                      │
+│                 ┌────────────┼────────────┐                        │
+│                 │            │            │                         │
+│           ┌─────┴─────┐ ┌───┴───┐ ┌─────┴─────┐                   │
+│           │  Metadata │ │  Meta │ │  Metadata │                   │
+│           │  Block 0  │ │Block 1│ │  Block 2  │                   │
+│           │   (hash)  │ │(hash) │ │   (hash)  │                   │
+│           └─────┬─────┘ └───┬───┘ └─────┬─────┘                   │
+│                 │            │            │                         │
+│        ┌────────┼─────┐     │      ┌─────┼─────────┐              │
+│        │        │     │     │      │     │         │              │
+│   ┌────┴───┐┌───┴┐┌───┴──┐┌──┴──┐┌──┴──┐┌──┴──┐┌───┴───┐        │
+│   │Data 0  ││D1  ││D2   ││D3   ││D4  ││D5  ││D6   ││D7    │        │
+│   │(hash)  ││hash││hash ││hash ││hash││hash││hash ││hash  │        │
+│   └────────┘└────┘└─────┘└─────┘└────┘└────┘└─────┘└──────┘        │
+│                                                                    │
+│  Scrub process:                                                    │
+│  1. Walk tree from root                                            │
+│  2. Read each data block                                           │
+│  3. Compute hash and compare with stored hash                     │
+│  4. Mismatch = corruption detected                                 │
+│  5. Repair from parity (RAID) or replica (distributed)            │
+└──────────────────────────────────────────────────────────────────┘
+  `}
+  alt="ZFS Merkle tree of checksums with metadata blocks pointing to data blocks each containing a hash, and the scrub process description showing how corruption is detected and repaired"
+  caption="Checksum trees detect silent corruption. Scrubbing proactively finds bit rot before it reaches queries."
+/>
+
+---
+
+## Performance: Sync vs Async Writes
+
+The fundamental tension in durability is speed vs safety. Every durability mechanism costs latency and throughput.
+
+### Configurable Durability Levels
+
+Most databases let you tune durability at the session or transaction level.
+
+```
+PostgreSQL synchronous_commit:
+┌───────────────────┬──────────┬──────────┬──────────────────────┐
+│ Setting           │ Latency  │ Data loss│ Use case              │
+│                   │ per write │ window   │                       │
+├───────────────────┼──────────┼──────────┼──────────────────────┤
+│ on (default)      │ 1-5ms    │ 0        │ Financial data        │
+│ remote_write      │ 2-10ms   │ 0        │ WAL sent to replica   │
+│ remote_apply      │ 3-15ms   │ 0        │ Replica applied it    │
+│ off               │ 0.1ms    │ 0.5s     │ High-throughput logs  │
+└───────────────────┴──────────┴──────────┴──────────────────────┘
+
+MySQL innodb_flush_log_at_trx_commit:
+┌───────────────────┬──────────┬──────────┬──────────────────────┐
+│ Setting           │ Latency  │ Data loss│ Use case              │
+│                   │ per write │ window   │                       │
+├───────────────────┼──────────┼──────────┼──────────────────────┤
+│ 1 (default)       │ 1-5ms    │ 0        │ Transactional data    │
+│ 2                 │ 0.1ms    │ 1s       │ Analytics, reporting  │
+│ 0                 │ 0.05ms   │ 1s+      │ Bulk load, staging    │
+└───────────────────┴──────────┴──────────┴──────────────────────┘
+```
+
+### Batch Writes and Throughput
+
+Batching multiple writes into one fsync dramatically improves throughput.
+
+```
+Write rate (single connection, synchronous commit):
+────────────────────────────────────────────────────
+Individual writes:   200 writes/sec
+Batch of 10:       1,800 writes/sec  (9x improvement)
+Batch of 100:     10,000 writes/sec  (50x improvement)
+Batch of 1000:    20,000 writes/sec  (100x improvement)
+
+Diminishing returns beyond batch size ~500 due to
+WAL write contention and memory pressure.
+```
+
+### SSD vs HDD for Durability
+
+```
+Property             HDD               SATA SSD            NVMe SSD
+─────────────────────────────────────────────────────────────────────────
+Random write IOPS   100-200           10,000-50,000      500,000-1M
+fsync latency        5-15ms           1-5ms               0.1-1ms
+Sequential write    150-250 MB/s      300-500 MB/s        2,000-7,000 MB/s
+Power-loss cache     Battery-backed   Capacitor-backed    Capacitor-backed
+  protection         (enterprise)     (enterprise only)   (enterprise only)
+Torn page risk       High (512B       Low (4KB sector     Very low (atomic
+                     sectors)         alignment)          write support)
+BER                  1 in 10^14       1 in 10^15          1 in 10^16
+Price/TB             USD 15-25         USD 60-120          USD 100-200
+Wear from writes     None              Limited (TBW)      Limited (higher TBW)
+```
+
+<AsciiDiagram
+  title="Durability Performance Tradeoff Spectrum"
+  content={`
+Latency (microseconds)
+  10,000 ┤
+         │                       (HDD fsync)
+   1,000 ┤
+         │            (SSD fsync)
+     100 ┤
+         │  (NVMe fsync)
+      10 ┤
+         │     (write to page cache)
+       1 ┤
+         └───────────────────────────────────
+          0%        50%       100%
+          Durability confidence (fsync fraction)
+
+Throughput (writes/sec)
+  100,000 ┤
+          │   (async commit, group commit)
+   10,000 ┤
+          │       (sync commit, batch=100)
+    1,000 ┤
+          │                 (sync commit, single)
+      100 ┤
+          └───────────────────────────────────
+          0%        50%       100%
+          Durability confidence (fsync fraction)
+
+Every 9x reduction in fsync frequency
+yields approximately 10x more write throughput
+  `}
+  alt="Two charts showing latency and throughput as a function of durability confidence — as fsync fraction increases, latency rises from microseconds to milliseconds and throughput drops from 100K to 100 writes per second"
+  caption="The durability-performance tradeoff: every additional fsync adds 1-15ms of latency and cuts throughput proportionally"
+/>
+
+---
+
+## Configuration Reference
+
+### PostgreSQL Durability Settings
+
+```
+# postgresql.conf — durability-related settings
+
+# Flush WAL to disk before acknowledging commit
+synchronous_commit = on          # on, remote_write, remote_apply, off
+
+# WAL segment size (affects recovery time)
+wal_segment_size = 16MB          # 1MB, 4MB, 8MB, 16MB, 32MB, 64MB
+
+# Number of WAL buffers (reduce WAL write contention)
+wal_buffers = 16MB               # default: -1 (auto, 1/32 of shared_buffers)
+
+# Maximum WAL size (triggers checkpoint)
+max_wal_size = 4GB               # default: 1GB
+min_wal_size = 1GB               # default: 80MB
+
+# Checkpoint frequency
+checkpoint_timeout = 15min       # default: 5min
+checkpoint_completion_target = 0.9  # spread checkpoint writes over 90% of interval
+
+# Full page writes (prevent torn pages after checkpoint)
+full_page_writes = on            # on by default, critical for crash safety
+
+# Data checksums (detect disk corruption)
+data_checksums = on              # requires initdb with --data-checksums
+```
+
+### MySQL InnoDB Durability Settings
+
+```
+# my.cnf — durability-related settings
+
+# WAL flush behavior
+innodb_flush_log_at_trx_commit = 1  # 1=safest, 2=1s loss window, 0=OS flush
+
+# Double-write buffer (prevents torn pages)
+innodb_doublewrite = ON             # ON by default
+
+# Log file size (affects recovery time)
+innodb_log_file_size = 512M         # default in MySQL 8: 512MB
+
+# Log buffer size
+innodb_log_buffer_size = 64M        # default: 16MB
+
+# Flush method (controls how InnoDB writes to disk)
+innodb_flush_method = O_DIRECT      # O_DIRECT bypasses OS page cache
+
+# Checksums for redo log pages
+innodb_log_checksums = ON           # ON by default
+```
+
+### Recommended Configurations
+
+```
+Use case            PostgreSQL                     MySQL
+────────────────────────────────────────────────────────────────
+Transactional       synchronous_commit = on        innodb_flush_log_at_trx_commit = 1
+(finance, orders)   full_page_writes = on          innodb_doublewrite = ON
+                    data_checksums = on            innodb_flush_method = O_DIRECT
+                    wal_buffers = 64MB             innodb_log_file_size = 2GB
+
+Analytics           synchronous_commit = off       innodb_flush_log_at_trx_commit = 2
+(reporting, dash)   wal_buffers = 16MB             innodb_log_file_size = 1GB
+                    max_wal_size = 16GB            innodb_flush_log_at_trx_commit = 2
+
+Bulk load           synchronous_commit = off       innodb_flush_log_at_trx_commit = 0
+(ETL, migrations)   max_wal_size = 64GB            innodb_doublewrite = OFF*
+                    checkpoint_timeout = 60min       *only if you accept risk during load
+```
+
+The internals you have seen — WAL structure, fsync behavior, crash recovery algorithms, checksum verification, and performance tradeoffs — form the engineering foundation that every durable storage system builds on. The next page shows how these mechanisms compose into production architectures spanning clusters, regions, and cloud services.

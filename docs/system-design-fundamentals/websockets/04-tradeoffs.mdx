@@ -1,0 +1,380 @@
+---
+id: websockets-tradeoffs
+title: WebSockets — Trade-offs & Failure Modes
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Core Tension
+
+The fundamental trade-off in WebSocket systems is **stateful persistence versus stateless scalability**. Each WebSocket connection is a long-lived, stateful binding between a client and a specific server process. This gives you real-time bidirectional communication with sub-10ms latency. But it prevents the stateless horizontal scaling that makes HTTP services easy to operate: any HTTP request can go to any server, while a WebSocket message must reach the exact server holding that connection's state. Every benefit — low latency, push capability, minimal overhead — comes at the cost of operational complexity in routing, failover, and state management.
+
+## Decision Matrix
+
+| Decision | Option A | Option B | Choose A | Choose B |
+|----------|----------|----------|----------|----------|
+| **Transport** | Raw WebSocket (ws://) | Secure WebSocket (wss://) | Local development only, internal networks | Every production deployment, any external client |
+| **Framing** | Text (JSON) | Binary (MsgPack, CBOR, Protobuf) | Simple APIs, debugging ease, browser-native | High throughput, bandwidth-constrained, binary data |
+| **Compression** | permessage-deflate | No compression | Large payloads (over 1 KB), mobile clients, metered | Small payloads (under 256 bytes), CPU-bound, real-time audio |
+| **Broadcast** | Direct process broadcast | Redis/Sidecar pub/sub | Single-server deployment, under 10K connections | Multi-server deployment, any scale |
+| **Session affinity** | Sticky sessions (LB cookie) | Connection migration (state handoff) | Simple infrastructure, ALB/NLB already in place | Zero-downtime deploys, elastic scaling, serverless |
+| **Reconnection** | Full reconnect (new handshake) | Session resume (resume token) | Simple clients, short reconnections, no state | Expensive handshake, long-lived state, mobile clients |
+| **State storage** | In-memory only | External state store (Redis) | Single process, loss-acceptable (chat) | Durable state, crash recovery, multi-server |
+| **Subprotocol** | None (raw WebSocket) | MQTT / WAMP | Simple request-reply, custom protocol | Pub/sub, IoT, QoS guarantees |
+
+## CAP Theorem Positioning
+
+WebSocket is **not a storage system** — it is a communication channel. But the infrastructure that routes WebSocket messages sits squarely in the CAP triangle. The question is: when the network between your WebSocket servers partitions, do you continue delivering messages (AP) or stop delivering to guarantee ordering (CP)?
+
+<AsciiDiagram id="websockets/cap-positioning" title="WebSocket Infrastructure and the CAP Theorem">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│               CAP THEOREM — WEBSOCKET INFRASTRUCTURE             │
+│                                                                  │
+│                          ┌──────┐                               │
+│                          │ C    │  Consistency                    │
+│                          │ (all │  All servers agree on           │
+│                          │ nodes│  message order                  │
+│                          │ see  │  Example: Kafka + exactly-once │
+│                          │ same)│                               │
+│                          └──────┘                               │
+│                         /        \\                              │
+│                        /  CP      \\  AP                         │
+│                       /  (stop      (available                  │
+│                      /    to        even if                    │
+│                     /     be         out of                   │
+│                    /      right)      sync)                   │
+│                   /                    \\                       │
+│          ┌───────┐                      ┌───────┐               │
+│          │       │                      │       │               │
+│          │ Redis │                      │  Raw  │               │
+│          │ Pub/  │                      │  Web- │               │
+│          │ Sub   │                      │ Socket│               │
+│          │(CP:   │                      │ (AP:  │               │
+│          │ par-  │                      │ best  │               │
+│          │ tition│                      │ effort│               │
+│          │ drops│                      │ deliv │               │
+│          │ msgs)│                      │ )     │               │
+│          └───────┘                      └───────┘               │
+│                                                                  │
+│     WebSocket transport is AP:                                   │
+│     - A partition between Server A and Server B means            │
+│       Server A's clients still talk to Server A (available)      │
+│     - Server B does not see Server A's messages during partition │
+│       (inconsistent)                                             │
+│     - After partition heals, messages may be replayed or lost    │
+│                                                                  │
+│     To move toward CP, add a strongly consistent message log     │
+│     (Kafka, Pulsar) between the WebSocket servers and the        │
+│     clients. The log holds the authoritative ordering.           │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Partition Scenario — Redis Pub/Sub
+
+Redis Pub/Sub has no message backlog. When a server subscribes to a channel, it receives messages published from that moment forward. If the server disconnects from Redis (network partition), messages published during the disconnection are lost permanently. This is AP behavior: the system stays available (servers still deliver to their local clients), but delivered messages are inconsistent (Server B never received the messages Server A published during the partition).
+
+**Mitigation:** Use Redis Streams or Kafka instead of Redis Pub/Sub for production systems. These provide persistent message logs. The WebSocket server reads from its last acknowledged offset on reconnect, replaying missed messages.
+
+## Failure Modes
+
+### Failure Mode 1: Thundering Herd on Server Restart
+
+**What happens:** A WebSocket server with 50,000 connections crashes or restarts. All 50,000 clients detect the disconnection simultaneously and reconnect at the same instant. The load balancer distributes the 50,000 new handshake requests across the remaining servers. Each handshake requires a TLS negotiation (2-3 round trips) and an HTTP upgrade. The servers receive 50,000 connection requests within 1-2 seconds — 10-20x the normal connection rate.
+
+**Root cause:** Clients implement reconnection with no delay or fixed short delay (500ms). When the server comes back up, every client reconnects at nearly the same time.
+
+**Blast radius:** The remaining servers' CPUs spike to 100% handling TLS handshakes. New connection accept() calls consume epoll slots. Existing connections experience latency spikes because the event loop spends cycles on handshake processing instead of data delivery. If the connection rate exceeds the accept capacity, some clients see "Connection refused." They retry immediately, making the problem worse.
+
+<AsciiDiagram id="websockets/thundering-herd" title="Thundering Herd — Cascading Failure">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│                  THUNDERING HERD CASCADE                          │
+│                                                                  │
+│  Time     Server A (50K conns)    Server B (50K conns)           │
+│  ────     ────────────────────    ────────────────────           │
+│                                                                  │
+│  T=0s    ┌──────────────┐        ┌──────────────┐               │
+│          │ Healthy      │        │ Healthy      │               │
+│          │ 50K conns    │        │ 50K conns    │               │
+│          └──────────────┘        └──────────────┘               │
+│                                                                  │
+│  T=1s    CRASH!                  50K clients reconnect            │
+│          No longer accepting     ┌──────────────────┐            │
+│          connections             │ Accept storm:     │            │
+│                                  │ Handle 50K new   │            │
+│                                  │ TLS handshakes   │            │
+│                                  │ CPU at 100%      │            │
+│                                  └──────────────────┘            │
+│                                                                  │
+│  T=2s                            50K reconnections still trying  │
+│                                  Existing 50K conns:             │
+│                                  latency spikes to 5+ seconds    │
+│                                  Some time out                   │
+│                                                                  │
+│  T=3s                           30K more from timeout chain      │
+│                                  Total CPU still 100%            │
+│                                  Queue depth growing             │
+│                                                                  │
+│  T=5s    Server A restarts       Server B nearing capacity       │
+│          50K more clients now                                     │
+│          reconnect to both A+B                                    │
+│                                                                  │
+│  T=10s   Both servers struggling — degraded service               │
+│          Recovery takes 60-120s                                   │
+│                                                                  │
+│  Mitigation:                                                     │
+│  • Exponential backoff: 1s, 2s, 4s, 8s, ... max 60s             │
+│  • Jitter: ± random 0-1000ms                                     │
+│  • Server-side: rate-limit accepts, shed load with 503           │
+│  • Staggered restart: reboot servers one at a time               │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+**Detection:** Alert on connection-rate spikes exceeding 5x the baseline 95th percentile.
+
+**Recovery:** The remaining servers survive if connection capacity has headroom. Apply rate limiting on the load balancer: `max_new_connections_per_second = total_capacity / 10`. Rejected clients back off and retry, spreading the load.
+
+### Failure Mode 2: Broadcast Amplification
+
+**What happens:** A single user sends a message that triggers a broadcast to 500,000 connections. Each send() call takes 5 microseconds of CPU. Broadcasting to 500,000 connections takes 2.5 seconds of sequential CPU. The event loop blocks for 2.5 seconds. During that time, no other connection's data is processed, no heartbeats are handled, and no new connections are accepted.
+
+**Root cause:** Synchronous fan-out in the broadcast path. The server iterates over all connections and calls send() for each one, all in a single thread.
+
+**Blast radius:** All 500,000 connections experience 2+ seconds of latency. Heartbeat timeouts fire, causing 500,000 simultaneous reconnection attempts (a secondary thundering herd). Clients perceive the server as dead.
+
+**Detection:** Alert on broadcast latency over 200ms p99.
+
+**Recovery:** Implement batched broadcast. Break the 500,000 connections into batches of 1,000. Write each batch with writev() (scatter-gather I/O) to minimize syscalls. Yield to the event loop between batches:
+
+```javascript
+async function broadcast(message) {
+  const connections = [...connectionSet]; // snapshot
+  const batchSize = 1000;
+  
+  for (let i = 0; i < connections.length; i += batchSize) {
+    const batch = connections.slice(i, i + batchSize);
+    for (const conn of batch) {
+      if (conn.readyState === WebSocket.OPEN) {
+        conn.send(message);
+      }
+    }
+    // Yield to event loop every 1000 connections
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+```
+
+### Failure Mode 3: Slow Consumer Starvation
+
+**What happens:** One client connects over a slow mobile network with limited bandwidth. The server's write buffer grows because the kernel send buffer fills up faster than the client consumes data. The write buffer grows to megabytes. The server process's memory increases. Eventually, the OOM killer terminates the process, dropping all other connections.
+
+**Root cause:** No per-connection write buffer limit. A single slow client can consume all available memory.
+
+**Blast radius:** All connections on the same server are dropped when the process dies. In a worst case, all servers run similar code, and the same scenario repeats on every server.
+
+<AsciiDiagram id="websockets/slow-consumer" title="Slow Consumer Starvation">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│                  SLOW CONSUMER STARVATION                         │
+│                                                                  │
+│  Server (fast 10 Gbps)         Client A (WiFi, 50 Mbps)          │
+│  ┌──────────────────┐          ┌──────────────────────┐          │
+│  │ Send buffer:     │          │ Recv buffer: 64 KB   │          │
+│  │ Client A: 128 MB │    ──▶   │ Processing: 5 ms/msg │          │
+│  │   (growing)      │          │ Can't keep up        │          │
+│  │ Client B: 4 KB   │          └──────────────────────┘          │
+│  │ Client C: 4 KB   │                                            │
+│  └──────────────────┘          Client B (good network)            │
+│       │                        ┌──────────────────────┐          │
+│       │   Total memory: 128 MB │ Send buffer: 4 KB     │          │
+│       │   │                    │ No issues             │          │
+│       │   │                    └──────────────────────┘          │
+│       │   │                                                      │
+│       ▼   ▼                OOM at 256 MB total                    │
+│  ┌────────────────────┐    ┌──────────────────────────────┐      │
+│  │ Process OOM killed │    │ All 50,000 connections lost   │      │
+│  │ Rss: 280 MB        │    │ No clients can send/receive  │      │
+│  └────────────────────┘    └──────────────────────────────┘      │
+│                                                                  │
+│  Timeline:                                                      │
+│  T=0    Client A connects, starts receiving high-volume stream   │
+│  T=30s  Write buffer reaches 64 MB                              │
+│  T=60s  Write buffer reaches 128 MB                              │
+│  T=90s  Write buffer reaches 200 MB — near limit                │
+│  T=95s  Process OOM killed, all connections lost                │
+│  T=96s  All clients reconnect                                   │
+│  T=190s Same server restarted, same client reconnects, repeat   │
+│                                                                  │
+│  Prevention:                                                     │
+│  • maxWriteBufferPerConnection = 2 MB                            │
+│  • Close connection when buffer exceeds limit (1009)             │
+│  • Negotiate flow control (backpressure signal to sender)        │
+│  • Use adaptive compression for slow consumers                   │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+**Detection:** Alert on per-connection write buffer size exceeding 1 MB.
+
+**Recovery:** Close the offending connection with status code 1009 (Message Too Big) or 1011 (Internal Error). The client can reconnect and request a lower-bandwidth mode. Alternatively, apply per-connection rate limiting and drop messages for that connection only.
+
+### Failure Mode 4: Stale State After Reconnect
+
+**What happens:** A client disconnects briefly and reconnects to a different server (the load balancer uses round-robin, not sticky sessions). The new server has no knowledge of the client's previous state — room memberships, subscriptions, authentication tokens, or message cursors. The client appears as a brand-new connection.
+
+**Root cause:** State is stored only in the old server's memory. No external state store was implemented.
+
+**Blast radius:** The affected client loses its application state. It may miss messages, appear offline to other users, or receive duplicate messages. If the reconnect is frequent (mobile network handoffs), the user experiences repeated state loss.
+
+**Detection:** Users report missing messages. Monitoring shows high rates of "new session" creation relative to "session resumed."
+
+**Recovery:** Store session state in Redis with a TTL of 24 hours. On reconnect, the client sends a session token. The server looks up the session in Redis. If found, it restores the client's previous state (room memberships, cursor positions). If not found, the client starts fresh and the application reconciles gaps through message history.
+
+### Failure Mode 5: Load Balancer Connection Leak
+
+**What happens:** The load balancer's connection table fills up because the load balancer tracks each WebSocket connection in an in-memory table. The ALB/NLB has a finite connection capacity (typically 1-3 million per ALB, higher for NLB). When the table fills, new connections are rejected even though the backend servers have capacity.
+
+**Root cause:** The load balancer was dimensioned for HTTP connection rates, not WebSocket connection persistence. HTTP connections open and close quickly; WebSocket connections stay open for hours, accumulating in the load balancer's table.
+
+**Detection:** Load balancer CloudWatch metrics show "RejectedConnectionCount" nonzero. "ActiveConnectionCount" approaches the ALB limit.
+
+**Recovery:** Switch to Network Load Balancer (NLB) which has higher connection limits (millions per NLC). NLB does not terminate TLS — it passes traffic through — so it uses fewer resources per connection than ALB. Or implement multiple ALBs behind DNS round-robin.
+
+<AsciiDiagram id="websockets/lb-connection-leak" title="Load Balancer Connection Table Exhaustion">{` 
+┌──────────────────────────────────────────────────────────────────┐
+│              LOAD BALANCER CONNECTION TABLE EXHAUSTION            │
+│                                                                  │
+│  Normal HTTP: connections open and close quickly                 │
+│  ┌──────────────────────────┐                                    │
+│  │ ALB Connection Table     │  Capacity: 3,000,000               │
+│  │ ┌────┐ ┌────┐ ┌────┐    │                                    │
+│  │ │C1  │ │C2  │ │C3  │    │  Open: ~50,000 at any time         │
+│  │ │    │ │    │ │    │    │  Churn: 10,000/sec                 │
+│  │ └────┘ └────┘ └────┘    │                                    │
+│  └──────────────────────────┘                                    │
+│                                                                  │
+│  WebSocket: connections persist for hours                        │
+│  ┌──────────────────────────┐                                    │
+│  │ ALB Connection Table     │  Capacity: 3,000,000               │
+│  │ ┌────┐ ┌────┐ ┌────┐    │  But each WebSocket connection     │
+│  │ │C1  │ │C2  │ │C3  │    │  stays for 6+ hours                │
+│  │ │    │ │    │ │    │    │                                    │
+│  │ │... │ │... │ │... │    │  After 6 hours of growth:           │
+│  │ │100K│ │100K│ │100K│    │  1,000,000 connections              │
+│  │ └────┘ └────┘ └────┘    │  33% of ALB capacity consumed      │
+│  └──────────────────────────┘                                    │
+│                                                                  │
+│  Timeline to exhaustion (at 500 conns/sec):                      │
+│  T=0     Start with 0 WebSocket connections                      │
+│  T=1hr   1.8M connections (60% of ALB capacity)                  │
+│  T=1.5hr 2.7M connections (90% of ALB capacity)                  │
+│  T=1.67hr 3M connections — ALB FULL                              │
+│  T=1.67hr New connections → 503 Service Unavailable              │
+│           (backend servers are healthy, but ALB can't accept)    │
+│                                                                  │
+│  Fix: Use NLB (100M+ connection capacity) or split across        │
+│       multiple ALBs with DNS load balancing                       │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+## Anti-Patterns Hall of Shame
+
+### Anti-Pattern 1: HTTP Polling Wrapped as WebSocket
+
+**Mistake:** Exposing an HTTP REST API behind a WebSocket by wrapping every request-response in a WebSocket message with a correlation ID. "WebSocket is just HTTP without the overhead, right?"
+
+**Why it seems reasonable:** You already have an HTTP API. Wrapping it in WebSocket is a simple proxy.
+
+**Production impact:** You lose all the benefits of HTTP: caching (ETag, If-Modified-Since), content negotiation, status codes, idempotent retries, intermediate proxies, CDNs. You gain only the connection persistence, which you do not need for request-response patterns.
+
+**Correct pattern:** Use WebSocket only for server-initiated push. Keep HTTP for request-response. Use a message format that separates push events from request-response calls. If 90 percent of your traffic is request-response, use HTTP.
+
+### Anti-Pattern 2: WebSocket for Everything
+
+**Mistake:** Using WebSocket for every client-server interaction, including file uploads, static data fetches, and search queries.
+
+**Why it seems reasonable:** A single persistent connection is simpler than managing HTTP and WebSocket separately. Just one code path.
+
+**Production impact:** File uploads over WebSocket lack HTTP's range-request support (resumable uploads), progress headers, and multipart parsing. You reimplement these in WebSocket framing. Static data fetches block the connection for other users. Search queries cannot benefit from CDN caching.
+
+**Correct pattern:** Use WebSocket for real-time events only. Use HTTP for everything else. Two code paths is fine — each is simpler and more reliable than a unified WebSocket that tries to be everything.
+
+### Anti-Pattern 3: No Heartbeat, Rely on TCP Keepalive
+
+**Mistake:** "TCP keepalive already detects dead connections. Why do I need Ping/Pong at the application layer?"
+
+**Why it seems reasonable:** TCP keepalive is built into the kernel. It must be reliable.
+
+**Production impact:** TCP keepalive defaults on Linux to 2 hours before the first probe, with 75-second intervals between 9 probes — up to 2 hours 11 minutes to detect a dead connection. Meanwhile, the server holds resources for dead connections. At 100K connections, this leaks hundreds of MB of memory per hour.
+
+**Correct pattern:** Application-level Ping/Pong at 30-second intervals with a 10-second timeout. TCP keepalive is a secondary defense with a 10-second idle time.
+
+### Anti-Pattern 4: Synchronous Broadcast Without Backpressure
+
+**Mistake:** Broadcasting a message to all connections in a single for loop with no backpressure handling.
+
+**Why it seems reasonable:** It works at small scale. The broadcast is fast enough.
+
+**Production impact:** At 50,000+ connections, the event loop blocks for hundreds of milliseconds. Slow consumers grow the write buffer unboundedly. A single broadcast can cascade into memory exhaustion.
+
+**Correct pattern:** Batch writes with yield points between batches. Cap per-connection write buffers. Implement a token bucket for rate limiting. Use writev() for efficient multi-buffer writes.
+
+### Anti-Pattern 5: Ignoring Frame Fragmentation
+
+**Mistake:** Assuming every read from the socket produces exactly one complete frame, and every write sends exactly one frame.
+
+**Why it seems reasonable:** On localhost, reads and writes almost always align with frame boundaries.
+
+**Production impact:** Over the internet, TCP segments frames across packet boundaries. A single frame can arrive in 2-10 read events. A partial frame causes parse errors unless the parser handles incomplete data. Buffering the entire message before processing adds latency for large messages.
+
+**Correct pattern:** Use a state machine parser that handles partial reads. Process messages incrementally if the subprotocol allows streaming. Avoid accumulating the entire message if you can start processing partial data.
+
+### Anti-Pattern 6: Storing Sessions Only In Memory
+
+**Mistake:** Keeping all WebSocket session data (authentication, room membership, user preferences) in the server process's memory. No external state store.
+
+**Why it seems reasonable:** Accessing memory is faster than Redis. It works fine with one server.
+
+**Production impact:** Any server restart drops all sessions. Rolling deployments disconnect all users. Adding a second server breaks cross-server communication. Each server has a partial view of the system.
+
+**Correct pattern:** Store session metadata in Redis or MemoryDB. Keep only the socket file descriptor and buffer state in process memory. On restart or reconnect, restore session from the external store.
+
+## When NOT to Use This
+
+### Over-Engineering Signals
+
+You do not need WebSocket if:
+
+- Your data changes less than once per 10 seconds. Short polling at 10-second intervals is simpler, uses minimal bandwidth, and works through every firewall and proxy.
+- Your application is request-response only. You send a query and get an answer. There is no server-initiated push.
+- You need broad compatibility with legacy systems. WebSocket requires HTTP/1.1 or higher. Some corporate proxies block WebSocket upgrades.
+- Your message rate is under 1 message per minute per connection. HTTP polling once per minute costs negligible bandwidth and avoids the complexity of persistent connection management.
+
+### Simpler Alternatives
+
+| Pattern | When to Choose | Complexity |
+|---------|---------------|------------|
+| HTTP Short Polling | Update interval over 10s, simple dashboard, under 1K users | Low |
+| HTTP Long Polling | Up to 10K users, moderate real-time needs, behind restrictive proxies | Medium |
+| Server-Sent Events (SSE) | One-directional server-to-client, no client-to-server messages, HTTP/2 | Medium |
+| WebSocket | Full duplex, under 100ms latency requirement, high message rate | High |
+| WebTransport | Sub-10ms latency, HTTP/3, QUIC, game streaming | Very High |
+
+### Scale Thresholds
+
+| Scale | Threshold | Break Points |
+|-------|-----------|-------------|
+| Tiny | Under 1K concurrent | No special architecture needed. Single process with in-memory state works. |
+| Small | 1K-10K concurrent | Add Redis for pub/sub. Use sticky sessions on a single load balancer. |
+| Medium | 10K-100K concurrent | Multiple server instances. Redis cluster. Connection pooling. Rate limiting. |
+| Large | 100K-1M concurrent | Dedicated WebSocket server pool. Kafka for cross-node messaging. Auto-scaling. |
+| Massive | Over 1M concurrent | Multi-region. Global state store. Connection migration. Custom transport optimization. |
+
+The next page examines how companies operating at these massive scale thresholds — Netflix, Discord, Uber, and others — actually implement WebSocket in production, the specific problems they encountered, and the open-source tools they built to solve them.

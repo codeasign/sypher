@@ -1,0 +1,509 @@
+---
+id: object-storage-deep-dive
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Object Storage — Under the Hood
+
+## Internal Architecture
+
+The metadata plane and the data plane operate independently. The metadata plane handles object keys, permissions, and location mappings. The data plane stores and retrieves raw bytes. This separation is what allows each plane to scale independently — you can add storage nodes without touching the metadata servers.
+
+<AsciiDiagram
+  id="object-storage/deep-internal-arch"
+  title="Internal System Architecture"
+  alt="Complex diagram showing the metadata plane (request router, metadata store, transaction log) and data plane (storage nodes, placement groups, repair daemon)"
+  caption="The system is divided into an eventually-consistent metadata plane and a highly-available data plane">
+{`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        OBJECT STORAGE INTERNAL ARCHITECTURE                  │
+│                                                                             │
+│  ┌─────────────────── METADATA PLANE ──────────────────────────────────┐   │
+│  │                                                                     │   │
+│  │  ┌────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐          │   │
+│  │  │Request │──>│ Metadata │──>│ Metadata │──>│ Location │          │   │
+│  │  │ Router │   │ Server   │   │ Store    │   │ Manager  │          │   │
+│  │  └────────┘   │ (Leader) │   │ ((DB))   │   │ (In-mem) │          │   │
+│  │               └──────────┘   └──────────┘   └──────────┘          │   │
+│  │                      │                                            │   │
+│  │               ┌──────────┐    ┌──────────────────┐                │   │
+│  │               │ Metadata │    │  Transaction     │                │   │
+│  │               │ Server   │    │  Log (WAL)       │                │   │
+│  │               │ (Follower)│    │  ((Paxos/raft))  │                │   │
+│  │               └──────────┘    └──────────────────┘                │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+│  ┌──────────────────── DATA PLANE ──────────────────────────────────┐    │
+│  │                                                                   │   │
+│  │  ┌──────────────────────────────────────────────────────┐        │   │
+│  │  │                Storage Node Pool                     │        │   │
+│  │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐│        │   │
+│  │  │  │ Node 01  │ │ Node 02  │ │ Node 03  │ │ Node 04  ││        │   │
+│  │  │  │ 12 x 16TB│ │ 12 x 16TB│ │ 12 x 16TB│ │ 12 x 16TB││        │   │
+│  │  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘│        │   │
+│  │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐│        │   │
+│  │  │  │ Node 05  │ │ Node 06  │ │ Node 07  │ │ Node 08  ││        │   │
+│  │  │  │ 12 x 16TB│ │ 12 x 16TB│ │ 12 x 16TB│ │ 12 x 16TB││        │   │
+│  │  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘│        │   │
+│  │  └──────────────────────────────────────────────────────┘        │   │
+│  │                                                                   │   │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │   │
+│  │  │ Placement│  │ Scrubber │  │ GC       │  │ Repair   │        │   │
+│  │  │ Engine   │  │ Daemon   │  │ Daemon   │  │ Daemon   │        │   │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │   │
+│  │                                                                   │   │
+│  │  Legend: [Service] ((Database)) {Cache} <Queue>                   │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Component Responsibilities
+
+**Request Router** — The load balancer and protocol adapter. It terminates HTTPS connections, validates AWS Signature V4 authentication, enforces rate limits (default 3,500 PUT/copy/post/delete requests per second per prefix), and forwards valid requests to the metadata server leader.
+
+**Metadata Server (Leader)** — The single authority for all metadata operations in a partition. It serializes writes to the metadata store, assigns chunk locations, and handles bucket configuration changes. It uses a consensus protocol (Paxos or Raft) to elect a leader and maintain a write-ahead log (WAL) for crash recovery.
+
+**Metadata Store (Database)** — A distributed key-value database that maps object keys to their metadata. This database must handle millions of reads and writes per second. Amazon S3 uses a custom database called ShardStore (based on Dynamo principles) internally. The metadata store does not store the object data — only the references (chunk hashes and locations).
+
+**Location Manager** — An in-memory service that maintains the current mapping of chunk hashes to physical disk locations. It is updated whenever chunks are written, moved, or repaired. Because this data changes frequently and must be accessed at very low latency, it lives in memory backed by a persistent log.
+
+**Placement Engine** — The algorithm that decides which disks receive which chunk replicas. It must satisfy constraints: no two replicas on the same device, no two in the same failure domain (rack/zone), balanced disk utilization across the cluster, and minimized cross-rack traffic.
+
+**Scrubber Daemon** — A background process that reads each chunk on every disk, recomputes its checksum, and compares it to the stored checksum. It runs continuously with a low priority to avoid impacting production traffic. A typical scrubber verifies about 10,000 chunks per second per storage node.
+
+**GC Daemon** — The garbage collector that deletes unreferenced chunks. When you DELETE an object, the metadata entry is removed, but the chunks remain on disk. The GC daemon scans for chunks not referenced by any metadata entry and securely erases them after a retention period.
+
+**Repair Daemon** — Monitors the cluster for under-replicated chunks. When a disk fails, the repair daemon identifies all chunks that lost a replica and schedules rebuild operations to restore the replication factor. It prioritizes chunks with the fewest remaining replicas.
+
+## Data Structures and Algorithms
+
+### Consistent Hashing Ring
+
+Object storage uses consistent hashing to distribute objects across storage nodes without requiring a full rebalance when nodes are added or removed. Each node is assigned multiple positions (virtual nodes) on a hash ring. The object key is hashed and the closest clockwise virtual node determines placement.
+
+<AsciiDiagram
+  id="object-storage/consistent-hashing"
+  title="Consistent Hashing Ring for Object Placement"
+  alt="Diagram of a circular hash ring with virtual nodes for multiple storage nodes and object key hash positions"
+  caption="Consistent hashing distributes objects across nodes. When Node 03 is removed, only objects in its arc are redistributed (roughly 1/N of total)">
+{`
+                         ┌──────────┐
+                     ┌───│  Node 01  │───┐
+                     │   │ vnode A7  │   │
+                     │   └──────────┘   │
+                     │                  │
+              ┌───────┐                ┌───────┐
+              │ Node 02│ obj "cat.jpg"  │ Node 01│
+              │ vnode  │───────┐       │ vnode  │
+              │  B3    │       │       │  A1    │
+              └───────┘       ▼       └───────┘
+                  │     ┌──────────┐      │
+                  │     │ Object   │      │
+                  │     │ Hash Ring│      │
+                  │     │          │      │
+              ┌───────┐└──────────┘┌───────┐
+              │ Node 03│            │ Node 01│
+              │ vnode  │            │ vnode  │
+              │  C1    │            │  A5    │
+              └───────┘            └───────┘
+                     │                  │
+                     │   ┌──────────┐   │
+                     └───│  Node 03  │───┘
+                         │ vnode C7  │
+                         └──────────┘
+
+  Object "cat.jpg" → hash("cat.jpg") = 0x9A3B → lands between B3 and C1 → Node 03
+  Adding Node 04: only objects in C1→B3 arc redistribute
+`}
+</AsciiDiagram>
+
+### Merkle Tree for Integrity Verification
+
+Each storage node organizes chunk checksums into a Merkle tree. The root hash represents the checksum of all chunks on that node. When two nodes claim to have the same chunk, comparing Merkle roots quickly identifies whether they agree. If they disagree, the tree structure allows binary-search descent to find the exact divergent chunk.
+
+<AsciiDiagram
+  id="object-storage/merkle-tree"
+  title="Merkle Tree for Chunk Integrity Verification"
+  alt="Binary Merkle tree showing leaves as chunk hashes, internal nodes as combined hashes, and root as the integrity anchor"
+  caption="A Merkle tree enables O(log N) comparison of chunk sets between nodes. A mismatch at the root descends to find exactly which chunk differs">
+{`
+                        ┌──────────┐
+                        │  Root    │
+                        │ H(AB|CD) │
+                        └────┬─────┘
+                            / \\
+                          /     \\
+                ┌──────────┐    ┌──────────┐
+                │  H(AB)  │    │  H(CD)   │
+                │ H(A|B)  │    │ H(C|D)   │
+                └────┬────┘    └────┬─────┘
+                    / \\            / \\
+                  /     \\        /     \\
+          ┌──────────┐ ┌───┐ ┌──────────┐ ┌───┐
+          │ H(Chunk0)│ │H1 │ │ H(Chunk2)│ │H3 │
+          │ "a3f1..."│ │   │ │ "d5e7..."│ │   │
+          └──────────┘ └───┘ └──────────┘ └───┘
+
+  H(Chunk0) = SHA256(chunk0_data)
+  H(AB) = SHA256(H(Chunk0) + H(Chunk1))
+  Root = SHA256(H(AB) + H(CD))
+`}
+</AsciiDiagram>
+
+### Bloom Filters for Object Existence Checks
+
+Before querying the metadata database, the system checks a Bloom filter to determine whether an object key might exist. A Bloom filter is a space-efficient probabilistic data structure that can say "definitely not present" or "possibly present." This avoids unnecessary database lookups for non-existent keys (common in LIST operations with prefixes that do not match).
+
+<AsciiDiagram
+  id="object-storage/bloom-filter"
+  title="Bloom Filter for Fast Existence Checks"
+  alt="Bit array with three hash functions adding bits for each inserted key, showing a negative lookup bypassing the database"
+  caption="A Bloom filter with 3 hash functions and a 1M-bit array can represent 100,000 keys with a 5% false positive rate using only 125 KB of memory">
+{`
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  Bloom Filter (1024 Kbit array, 3 hash functions)                  │
+  │                                                                    │
+  │  Bits: 0 0 1 0 1 1 0 0 1 0 0 1 1 0 0 1 0 0 0 1 0 1 1 0 0 0 1 0│
+  │        ^       ^     ^           ^   ^         ^     ^            │
+  │        │       │     │           │   │         │     │            │
+  │  "cat.jpg" ────┼─────┼───────────┼───┼─────────┘     │            │
+  │  h1→bit 2      │     │           │   │              │            │
+  │  h2→bit 5      ┘     │           │   │              │            │
+  │  h3→bit 19           │           │   │              │            │
+  │                       │           │   │              │            │
+  │  "dog.png" ──────────┼───────────┼───┼──────────────┘            │
+  │  h1→bit 5            │           │   │                           │
+  │  h2→bit 12           ┘           │   │                           │
+  │  h3→bit 28                       │   │                           │
+  │                                   │   │                           │
+  │  "zzz.txt" ──────────────────────┘   │                           │
+  │  h1→bit 12                            │                           │
+  │  h2→bit 18 ───────────────────────────┘                           │
+  │  h3→bit 5                                                         │
+  │                                                                    │
+  │  Check "cat.jpg": bits[2]=1, bits[5]=1, bits[19]=1 → EXISTS      │
+  │  Check "alien.dat": bits[3]=0 → DEFINITELY NOT EXISTS (skip DB)  │
+  └────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Write-Ahead Log (WAL)
+
+Every mutation to the metadata store is first appended to a sequential log on durable storage before the metadata record is updated. This ensures crash recovery: if the metadata server crashes mid-write, on restart it replays the WAL to reconstruct any committed operations that had not yet been reflected in the metadata store.
+
+<AsciiDiagram
+  id="object-storage/wal-log"
+  title="Write-Ahead Log Entry Structure"
+  alt="Diagram showing a WAL entry with sequence number, operation type, key, timestamp, and checksum"
+  caption="Each WAL entry is a self-contained record. The metadata server replays the log from the last known-good checkpoint on recovery">
+{`
+┌──────────────────────────────────────────────────────────────────┐
+│  WAL Entry Format                                                │
+│                                                                  │
+│  ┌────────┬──────────┬────────┬──────────┬─────────┬──────────┐ │
+│  │ LSN:   │ Op: PUT  │ Key:   │ Size:    │ Chunks: │ Checksum │ │
+│  │ 883742 │          │ photos/│ 500MB    │ [8 refs] │ 0xFE3A  │ │
+│  │        │          │ beach  │          │         │          │ │
+│  └────────┴──────────┴────────┴──────────┴─────────┴──────────┘ │
+│                                                                  │
+│  LSN = Log Sequence Number (monotonic, per partition)            │
+│  Op = PUT | DELETE | COPY | MULTIPART_INIT | MULTIPART_COMPLETE │
+│  Checksum = CRC32C of entire entry                               │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│  WAL Recovery Process                                            │
+│                                                                  │
+│  1. Read checkpoint: "last flushed LSN = 883700"                │
+│  2. Read entries 883701 through 883742 from WAL                 │
+│  3. For each entry:                                              │
+│     a. Validate checksum → skip if corrupted                    │
+│     b. Check if already applied to metadata store               │
+│     c. If not applied → apply the operation                     │
+│  4. Write new checkpoint at LSN 883742                           │
+│  5. Signal ready: "recovery complete, 3 operations replayed"     │
+│                                                                  │
+│  Typical recovery time: under 10 seconds for 100,000 entries     │
+└──────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+## Request Lifecycle — Detailed Walkthrough
+
+### Write Path (10 Steps)
+
+<AsciiDiagram
+  id="object-storage/write-path"
+  title="Complete Write Path — 10 Steps"
+  alt="End-to-end diagram showing all 10 steps of a PUT request from client to acknowledgment"
+  caption="The write path involves 10 distinct steps. Steps 1-4 are in the request path; steps 5-7 are parallelized; steps 8-10 confirm and respond">
+{`
+┌──────────┐    ┌────────────┐    ┌────────────┐    ┌────────────┐
+│  Client  │    │  Request   │    │  Metadata  │    │  Storage   │
+│          │    │  Router    │    │  Server    │    │  Nodes     │
+└────┬─────┘    └─────┬──────┘    └──────┬─────┘    └──────┬─────┘
+     │                │                  │                 │
+     │ 1. PUT req     │                  │                 │
+     │────────────────>                  │                 │
+     │                2. Validate auth   │                 │
+     │                3. Rate limit check│                 │
+     │                │                  │                 │
+     │                4. Forward to      │                 │
+     │                 metadata leader   │                 │
+     │                │──────────────────>                 │
+     │                │                  │                 │
+     │                │    5. Assign chunk hashes          │
+     │                │    6. Allocate placement           │
+     │                │    7. Write WAL entry              │
+     │                │                  │                 │
+     │                │    8. Send chunks to storage       │
+     │                │                  │─────────────────>
+     │                │                  │                 │
+     │                │                  │    9. Write to  │
+     │                │                  │     disk, ACK   │
+     │                │                  │<────────────────
+     │                │                  │                 │
+     │                │    10. Confirm metadata write      │
+     │                │<─────────────────│                 │
+     │ 11. HTTP 200   │                  │                 │
+     │<────────────────│                 │                 │
+     │                │                  │                 │
+"───>
+  Control/data flow
+" - - - >
+  Background (after response sent)
+`}
+</AsciiDiagram>
+
+### Read Path (8 Steps)
+
+<AsciiDiagram
+  id="object-storage/read-path"
+  title="Complete Read Path — 8 Steps"
+  alt="End-to-end diagram showing all 8 steps of a GET request from client to data delivery"
+  caption="The read path fetches metadata first, then retrieves chunks in parallel from the closest available replicas">
+{`
+┌──────────┐    ┌────────────┐    ┌────────────┐    ┌────────────┐
+│  Client  │    │  Request   │    │  Metadata  │    │  Storage   │
+│          │    │  Router    │    │  Server    │    │  Nodes     │
+└────┬─────┘    └─────┬──────┘    └──────┬─────┘    └──────┬─────┘
+     │                │                  │                 │
+     │ 1. GET /key    │                  │                 │
+     │────────────────>                  │                 │
+     │                2. Auth + check    │                 │
+     │                 Bloom filter      │                 │
+     │                │                  │                 │
+     │                3. Query metadata  │                 │
+     │                │──────────────────>                 │
+     │                │                  │                 │
+     │                │    4. Return chunk locations       │
+     │                │<─────────────────│                 │
+     │                │                  │                 │
+     │                │    5. Select best replica per chunk│
+     │                │     (closest AZ, lowest load)      │
+     │                │                  │                 │
+     │                │    6. Fetch chunks in parallel     │
+     │                │                  │─────────────────>
+     │                │                  │                 │
+     │                │                  │    7. Send data │
+     │                │                  │<────────────────
+     │                │                  │                 │
+     │                │    8. Assemble + stream to client │
+     │  <─────────────│──────────────────│                 │
+     │  HTTP 200      │                  │                 │
+     │  + object body │                  │                 │
+     │                │                  │                 │
+     Typical latency: 15-50ms for a 100KB object           │
+`}
+</AsciiDiagram>
+
+## Consistency and State Handling
+
+### Strong Read-After-Write Consistency
+
+Modern object storage (S3 since December 2020) provides strong read-after-write consistency. Once you receive a 200 OK for a PUT, any subsequent GET always returns the latest data. This is achieved by routing all requests for a given key through a single metadata server that serializes operations using the WAL.
+
+### Crash Recovery
+
+<AsciiDiagram
+  id="object-storage/crash-recovery"
+  title="Metadata Server Crash Recovery Sequence"
+  alt="Three-panel diagram showing the timeline: normal operation, crash, leader election, WAL replay, and resumption"
+  caption="Crash recovery takes 10-30 seconds during which the partition is unavailable. The WAL ensures no committed writes are lost">
+{`
+Panel 1: Normal Operation
+┌──────────────────────────────────────────────────────────────────┐
+│  Leader (Node A)           Follower (Node B)    Follower (Node C)│
+│  ┌──────────────────────┐  ┌───────────────┐   ┌───────────────┐│
+│  │ WAL: LSN 1001-1050  │  │ WAL: LSN 1001-│   │ WAL: LSN 1001-││
+│  │ Handling writes     │  │ 1048 (lagging) │   │ 1050          ││
+│  │ Active              │  │ Replicating    │   │ Replicating   ││
+│  └──────────────────────┘  └───────────────┘   └───────────────┘│
+└──────────────────────────────────────────────────────────────────┘
+
+Panel 2: Crash + Detection
+┌──────────────────────────────────────────────────────────────────┐
+│  ┌──────────────────────┐  ┌───────────────┐   ┌───────────────┐│
+│  │ CRASHED!             │  │ Node B says:  │   │ Node C says:  ││
+│  │ WAL on disk (safe)   │  │ "I propose    │   │ "I second B"  ││
+│  │                      │  │  myself as    │   │               ││
+│  │                      │  │  leader"      │   │               ││
+│  │  Heartbeat timeout   │  │  LSN=1048     │   │  LSN=1050     ││
+│  │  ~5 seconds          │  └───────────────┘   └───────────────┘│
+└──────────────────────────────────────────────────────────────────┘
+
+Panel 3: Recovery + Resume
+┌──────────────────────────────────────────────────────────────────┐
+│  New Leader (Node B)                                             │
+│  ┌──────────────────────────────────────────────────┐            │
+│  │ 1. Read checkpoint: LSN 1000                     │            │
+│  │ 2. Replay WAL 1001-1050 from Node A's WAL       │            │
+│  │    (copied from surviving disk)                  │            │
+│  │ 3. Apply entries 1049, 1050 (missed during lag) │            │
+│  │ 4. Verify metadata store is consistent           │            │
+│  │ 5. Write checkpoint at LSN 1050                  │            │
+│  │ 6. Accept new writes                             │            │
+│  │ Recovery time: 8 seconds                         │            │
+│  └──────────────────────────────────────────────────┘            │
+└──────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Concurrent Write Handling
+
+When two clients write to the same key simultaneously, the system serializes the writes through the metadata leader. The last WAL entry to be committed wins. The losing write's data chunks become orphaned and are cleaned up by the GC daemon. There is no locking or atomic compare-and-swap for object writes (though S3 does offer conditional writes via If-Match / If-None-Match headers).
+
+<AsciiDiagram
+  id="object-storage/concurrent-write"
+  title="Concurrent Write Resolution"
+  alt="Timeline showing two PUT requests arriving at nearly the same time, with the metadata serializing and one winning"
+  caption="Concurrent PUTs to the same key are serialized at the metadata leader. The second to commit wins; the first's chunks become garbage">
+{`
+Time  ┌────────────────────────────────────────────────────────────────┐
+  │   │ Client A: PUT /bucket/key "version 1"                         │
+  │   │ Client B: PUT /bucket/key "version 2" (arrives 2ms later)    │
+  │   │                                                               │
+  │   │  Metadata Leader                                              │
+  │   │  ┌────────────────────────────────────────────────────┐       │
+  │+0  │  │ Receive A's request                                │       │
+  │+1  │  │ WAL: LSN 5001 — PUT /bucket/key → chunks [C1-C8] │       │
+  │+2  │  │ Receive B's request                                │       │
+  │+3  │  │ WAL: LSN 5002 — PUT /bucket/key → chunks [D1-D8] │       │
+  │+4  │  │ Commit LSN 5001 to metadata store                  │       │
+  │+5  │  │ Commit LSN 5002 to metadata store (overwrites!)   │       │
+  │+6  │  │ Confirm to Client B: HTTP 200                      │       │
+  │+7  │  │ Confirm to Client A: HTTP 200                      │       │
+  │    │  │                                                    │       │
+  │+10 │  │ GC Daemon: chunks C1-C8 have 0 references → delete│       │
+  │    │  └────────────────────────────────────────────────────┘       │
+  │   │                                                               │
+  │   │  Client A sees HTTP 200 but its data was overwritten!        │
+  │   │  (This is why you use conditional writes or versioning)       │
+  └──────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Stale Read Prevention
+
+To prevent stale reads, the request router checks the metadata server's current term (epoch) before serving reads. If a metadata server has been partitioned from the leader and missed updates, it cannot serve read requests until it catches up. This is enforced by the consensus protocol — a server with a stale term is rejected by clients.
+
+## Performance Characteristics
+
+### Latency by Object Size
+
+| Object Size | p50 Latency | p99 Latency | p999 Latency |
+|-------------|-------------|-------------|--------------|
+| 1 KB        | 5 ms        | 20 ms       | 80 ms        |
+| 100 KB      | 10 ms       | 35 ms       | 120 ms       |
+| 1 MB        | 25 ms       | 80 ms       | 250 ms       |
+| 10 MB       | 80 ms       | 250 ms      | 800 ms       |
+| 100 MB      | 400 ms      | 1,200 ms    | 3,500 ms     |
+| 1 GB        | 2,500 ms    | 7,000 ms    | 18,000 ms    |
+
+These numbers assume a single PUT or GET with standard network bandwidth (1 Gbps). Multi-Part Upload can improve large-object latency by parallelizing the transfer.
+
+### Throughput Limits
+
+A single prefix (path prefix within a bucket) supports at least 3,500 PUT/COPY/POST/DELETE or 5,500 GET/HEAD requests per second. To achieve higher throughput, you distribute objects across multiple prefixes. The system achieves this by partitioning the metadata store by key hash prefix — each partition handles its own request rate.
+
+### Memory Footprint
+
+- **Metadata server**: ~2 GB per million objects for in-memory location cache
+- **Storage node**: ~500 MB for Merkle tree root nodes (regardless of data volume)
+- **Bloom filter**: ~12.5 MB per 10 million keys (at 1% false positive rate)
+- **WAL buffer**: ~64 MB per partition
+
+## Configuration and Tuning
+
+### Key Knobs
+
+**Replication Factor** — Controls how many copies of each chunk are maintained. Default: 3. Minimum: 1 (single-copy, no durability guarantee). Maximum: 10+ (in some systems). Higher factor increases durability at the cost of storage cost per GB.
+
+**Write Quorum** — Number of replicas that must acknowledge a write before it is confirmed. Default: W=2 (for RF=3). Setting W=3 provides stronger durability but adds latency proportional to the slowest replica.
+
+**Read Quorum** — Number of replicas contacted during a read to verify the latest version. Default: R=1 (read from fastest replica). Setting R=3 provides read-your-writes consistency for multi-datacenter configurations at the cost of latency.
+
+**Chunk Size** — The target size for data chunks. Default: 64 MB. Smaller chunks (8-16 MB) reduce latency for partial reads and improve parallelism for large objects. Larger chunks (128-256 MB) reduce metadata overhead for archive workloads.
+
+**Scrub Interval** — How often the scrubber verifies each chunk. Default: every 30 days. More aggressive: every 7 days. The scrubber runs at low I/O priority, so aggressive intervals do not significantly impact production traffic.
+
+### Aggressive Settings for High Performance
+
+| Setting | Default | Aggressive | Impact |
+|---------|---------|------------|--------|
+| Chunk size | 64 MB | 8 MB | 8x more metadata entries, faster partial reads |
+| Max concurrent part uploads | 4 | 25 | Higher throughput for large objects, more connections |
+| Metadata cache TTL | 300s | 0s | Always consistent, higher metadata load |
+| Storage node connections | 100 | 500 | Higher throughput, more memory for sockets |
+| Read-ahead | 1 chunk | 4 chunks | Faster sequential reads, wasted I/O for random reads |
+
+<AsciiDiagram
+  id="object-storage/tuning-tradeoff"
+  title="Chunk Size Tuning Trade-Off"
+  alt="Graph showing the trade-off between chunk size, metadata overhead, and read latency for partial reads"
+  caption="Smaller chunks reduce partial-read latency but increase metadata overhead. The sweet spot for general-purpose workloads is 16-64 MB">
+{`
+                     Chunk Size Trade-Offs
+  ┌────────────────────────────────────────────────────────────┐
+  │  100% │                                             │      │
+  │       │                    ■ Chunk=64MB              │      │
+  │       │              ■                              │      │
+  │  75%  │        ■                                    │      │
+  │       │  ■  Chunk=8MB                               │      │
+  │       │                                             │      │
+  │  50%  │ ── Metadata size (lower is better)          │      │
+  │       │                                             │      │
+  │       │ ■■■■■■■■■  Partial read latency             │      │
+  │  25%  │ ■■■■■ (lower is better)                    │      │
+  │       │ ■■■                                        │      │
+  │       │ ■                                          │      │
+  │  0%   └────────────────────────────────────────────┘      │
+  │       8MB   16MB   32MB   64MB   128MB  256MB              │
+  │                         Chunk Size                        │
+  └────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Resource Allocation for a 100-TB Cluster
+
+| Resource | Provisioned | Purpose |
+|----------|-------------|---------|
+| Storage nodes | 10 nodes, 12x 16TB HDD each | Raw capacity for data + 3x replication overhead |
+| Metadata servers | 3 (1 leader + 2 followers) | Consensus for metadata operations |
+| Metadata DB | 3 nodes, 64 GB RAM, 4 TB NVMe | Key-value store for object metadata |
+| Request routers | 2 (active-active behind ELB) | TLS termination, auth, rate limiting |
+| Network | 10 Gbps per node | Data transfer for reads and writes |
+
+### Monitoring Key Indicators
+
+| Metric | Warning | Critical | Meaning |
+|--------|---------|----------|---------|
+| Write latency p99 | above 200 ms | above 500 ms | Metadata contention or slow disks |
+| Read latency p99 | above 100 ms | above 300 ms | Network congestion or overloaded nodes |
+| Replication lag | above 5 seconds | above 30 seconds | Follower falling behind, risk of data loss |
+| Under-replicated chunks | above 0.1% | above 1% | Disk or node failures need investigation |
+| Scrubber errors | above 0.001% | above 0.01% | Silent data corruption or hardware issues |
+| GC backlog | above 10 TB | above 50 TB | Cleanup not keeping up with deletes |

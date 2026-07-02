@@ -1,0 +1,552 @@
+---
+id: sharding-deep-dive
+title: Sharding — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A sharded database system has six distinct layers between the application and physical storage. Each layer handles a specific concern: connection management, query parsing, routing, execution, coordination, and persistence.
+
+<AsciiDiagram
+  id="sharding/deepdive-internal-architecture"
+  title="Six-layer internal architecture of a sharded database system from application to physical storage"
+  alt="Stacked architecture diagram: Application -> Connection Proxy -> Query Parser -> Routing Engine -> Shard Coordinator -> Shard Instance (with: Buffer Pool, WAL, Executor, Storage Engine) -> Physical Disk. Each layer has labeled responsibilities"
+  caption="Six-layer architecture of a sharded database system — each layer adds routing, coordination, or execution capability"
+  content={`
+Layer 1: ┌──────────────────────────────────┐
+          │  Application Servers              │
+          │  Web servers, API gateways, jobs  │
+          └──────────────┬───────────────────┘
+                         │ TCP connections
+Layer 2: ┌──────────────▼───────────────────┐
+          │  Connection Proxy                 │
+          │  ProxySQL / pgBouncer / HAProxy   │
+          │  - Connection pooling             │
+          │  - Auth / TLS termination         │
+          │  - Read/write splitting           │
+          └──────────────┬───────────────────┘
+                         │ Pooled connections
+Layer 3: ┌──────────────▼───────────────────┐
+          │  Query Parser                     │
+          │  - SQL lexing and parsing         │
+          │  - Extract shard key from WHERE   │
+          │  - Classify: single-shard vs      │
+          │    multi-shard query              │
+          └──────────────┬───────────────────┘
+                         │ Parsed query + key
+Layer 4: ┌──────────────▼───────────────────┐
+          │  Routing Engine                   │
+          │  - Hash/shard key computation     │
+          │  - Routing table lookup           │
+          │  - Connection pool per shard      │
+          │  - Circuit breaker per shard      │
+          └──────────────┬───────────────────┘
+                         │ Route: shard_id
+Layer 5: ┌──────────────▼───────────────────┐
+          │  Shard Coordinator (cross-shard)  │
+          │  - Scatter-gather engine          │
+          │  - Merge-sort for ORDER BY        │
+          │  - Two-phase commit coordinator   │
+          │  - Result aggregation             │
+          └──────────────┬───────────────────┘
+                         │ Partial results
+Layer 6: ┌──────────────▼───────────────────┐
+          │  Shard Instance                   │
+          │  ┌────────────────────────────┐  │
+          │  │  Local Database Engine     │  │
+          │  │  - Buffer pool (LRU)       │  │
+          │  │  - Write-ahead log (WAL)   │  │
+          │  │  - Query executor          │  │
+          │  │  - Transaction manager     │  │
+          │  └────────────────────────────┘  │
+          │  ┌────────────────────────────┐  │
+          │  │  Storage Engine            │  │
+          │  │  - B+Tree indexes          │  │
+          │  │  - Data pages on disk      │  │
+          │  └────────────────────────────┘  │
+          └──────────────────────────────────┘
+`}
+/>
+
+### Layer-by-Layer Responsibilities
+
+**Layer 1 (Application Servers)** generate database queries with the shard key in the WHERE clause. Each application server connects to the proxy layer using standard database drivers (psycopg2, mysql-connector, JDBC). The application does not know the shard topology.
+
+**Layer 2 (Connection Proxy)** manages the connection lifecycle. ProxySQL maintains a pool of 50-200 connections to the parser layer. When an application opens a database connection, the proxy assigns it a slot from the pool. This eliminates the overhead of creating a new TCP connection for every query (1-5ms of connection setup time saved per query). The proxy also handles TLS termination and authentication, offloading certificate management from the lower layers.
+
+**Layer 3 (Query Parser)** inspects every query before routing. Parsing is the cheapest operation in the stack — a simple SQL parser processes 50,000-100,000 queries per second per core. The parser identifies the shard key column and its value from the WHERE clause. If the shard key is missing, the query is tagged for scatter-gather execution.
+
+**Layer 4 (Routing Engine)** maintains the routing table — an in-memory hash map or binary search tree that maps shard key values to shard addresses. The routing table is the single source of truth for data placement. In Vitess, the routing table is managed by the top-level metadata server (etcd) and pushed to all VTGate instances.
+
+**Layer 5 (Shard Coordinator)** handles cross-shard queries. For single-shard queries, this layer is a pass-through — the query goes directly from the routing engine to the target shard. For multi-shard queries, the coordinator fans out, collects, and merges. The coordinator is the most resource-intensive component during scatter-gather operations.
+
+**Layer 6 (Shard Instance)** is a standard database engine (PostgreSQL, MySQL, Cassandra) running on its own server. Each shard has its own buffer pool, WAL, transaction manager, and storage engine. Shard instances are completely independent — a crash in one shard has zero impact on other shards.
+
+---
+
+## Data Structures and Algorithms
+
+Sharded systems rely on five core data structures and algorithms. Each solves a specific problem in the routing, distribution, or recovery path.
+
+### 1. Consistent Hash Ring
+
+The consistent hash ring maps shard key values to physical shards with minimal re-mapping during topology changes.
+
+**What it is:** A circular key space (0 to 2^64 - 1) where each shard is assigned multiple positions (virtual nodes) around the ring. A key is hashed to a position on the ring and assigned to the nearest clockwise shard position.
+
+**Why this structure:** A standard hash modulo N (`hash(key) % N`) requires rehashing every key when N changes. Changing from N=8 to N=16 moves approximately 50 percent of keys. Consistent hashing limits movement to keys whose position falls between the new node's vnodes and the nearest existing vnodes — approximately 1/N of keys.
+
+**Time complexity:** O(log V) where V is the total number of virtual nodes. Each vnode is stored in a sorted array or balanced BST. Finding the nearest clockwise neighbor is a binary search. With 1024 vnodes across 16 physical shards: 10 comparisons per lookup.
+
+**Space complexity:** O(V) where V is the number of virtual nodes. Each vnode entry stores a 64-bit hash position, the physical shard ID, and a version number. With 1024 vnodes: approximately 24 KB of memory.
+
+<AsciiDiagram
+  id="sharding/deepdive-consistent-hash-ring"
+  title="Consistent hash ring with 4 shards and 16 virtual nodes showing key lookup path and virtual node ownership"
+  alt="A circular hash ring with labeled virtual node positions (S0_v0 through S3_v3). A key hash is shown hitting position 42 on the ring, and the nearest clockwise vnode is S2_v1 which is owned by physical shard 2"
+  caption="The consistent hash ring: keys are assigned to the nearest clockwise virtual node, and each physical shard owns multiple vnodes"
+  content={`
+  Consistent Hash Ring: 16 vnodes across 4 shards
+
+                     ┌─────┐
+                     │S0_v0│
+                     │     │
+              S3_v3 ─┤     ├─ S3_v0
+                │    │     │     │
+              S2_v3 ─┤     ├─ S1_v0
+                │    │     │     │
+              S0_v3 ─┤     ├─ S2_v0
+                │    └──┬──┘     │
+              S1_v3     │      S3_v1
+                │       │        │
+              S3_v2 ────┤        ├─ S0_v1
+                │       │        │
+              S2_v2 ────┤        ├─ S1_v1
+                │       │        │
+              S1_v2 ────┴─────── S2_v1
+                │                 │
+                │    Key K ───────┘
+                │    hash=142
+                │    nearest vnode = S2_v1
+                │    physical shard = Shard 2
+                └─────────────────────────
+
+  Adding S4: S4 gets 4 vnodes inserted; only S4's neighbors
+  transfer data (approx 1/4 of keys reassigned)
+`}
+/>
+
+### 2. Routing Table (Sorted Range Map)
+
+The routing table maps shard key ranges to shard addresses.
+
+**What it is:** A sorted array or balanced BST of entries where each entry stores a range start, range end, and shard address (host:port string). For hash-based sharding, the range is in hash space.
+
+**Why this structure:** Range lookups ("find the shard containing key X") require a search structure. A sorted array enables binary search (O(log N)). A hash map enables direct lookup (O(1)) but does not support range queries.
+
+**Time complexity:** O(log S) for binary search across S shards. For 256 shards: 8 comparisons. For 1024 shards: 10 comparisons.
+
+**Space complexity:** O(S) entries. Each entry is approximately 100 bytes (range start, range end, 4 shard identifiers for primary + replicas). For 256 shards: approximately 25 KB.
+
+### 3. Scatter-Gather Engine
+
+The scatter-gather fan-out and merge algorithm.
+
+**What it is:** A coordinator that sends the same query to M shards in parallel, collects partial results, and merges them according to query semantics.
+
+**Algorithm:**
+1. Determine the set of target shards (all S shards, or a subset for range queries).
+2. Open M connections from the pool (one per shard).
+3. Send the query to all M shards simultaneously using async I/O.
+4. Collect results as they arrive. The overall latency is `max(latency_i)` across all shards.
+5. For COUNT/SUM: add partial results. For ORDER BY ... LIMIT N: merge-sort the top N from each shard (each shard returns its top N, coordinator merges). For GROUP BY: hash-aggregate partial results per group.
+
+**Time complexity:** Query latency = max(execution_time across M shards) + network_latency + merge_time. Merge time for ORDER BY ... LIMIT N with M shards: O(M * N log N) worst case.
+
+**Space complexity:** O(M * N) for buffering partial results.
+
+### 4. Two-Phase Commit (2PC) Coordinator
+
+The 2PC coordinator manages transactions that span multiple shards.
+
+**Algorithm phases:**
+- **Prepare phase:** Coordinator sends "prepare" to all participant shards. Each shard acquires locks, writes prepare records to its WAL, and responds "ready" or "abort."
+- **Commit phase:** If all participants respond "ready," the coordinator logs a commit decision to its own WAL and sends "commit" to all participants. Each participant commits the transaction and releases locks. If any participant responds "abort," the coordinator sends "abort" to all participants.
+
+**Time complexity:** 1 round trip (prepare) + 1 round trip (commit) = 2 RTT for the happy path. Each RTT is 1-10ms depending on network distance. Coordinator log write = 2-5ms.
+
+**Failure mode:** If the coordinator crashes after the prepare phase but before the commit phase, participants hold locks until a timeout (30-60 seconds by default). The coordinator recovers by reading its WAL and continuing the commit or abort.
+
+### 5. Rebalancing Scheduler
+
+The rebalancing scheduler moves data between shards when the topology changes.
+
+**Algorithm:**
+1. Compute the new assignment for each key range using the new topology.
+2. Identify which key ranges need to move: `new_assignment(key) != old_assignment(key)`.
+3. For each moving range, initiate a streaming transfer from the source shard to the destination shard.
+4. During transfer, dual-write: new writes go to both source and destination shards.
+5. Once the transfer of a range completes, verify consistency via checksum comparison.
+6. Atomically update the routing table to point to the new shard for the range.
+7. Remove the old data from the source shard.
+
+**Time complexity:** O(data_to_move / bandwidth). Moving 500 GB at 100 MB/s = 5,000 seconds (approximately 83 minutes).
+
+---
+
+## The Query Lifecycle: Read, Write, and Cross-Shard
+
+### Single-Shard Read Query
+
+A read query that includes the shard key follows an optimized path through the system.
+
+<AsciiDiagram
+  id="sharding/deepdive-single-shard-read"
+  title="Timeline of a single-shard read query showing each step and wall-clock time: 10 steps completed in 8ms"
+  alt="Sequence diagram showing 10 steps: App sends query (T+0), Proxy authenticates (T+0.5ms), Parser extracts shard key (T+1ms), Router looks up shard 2 (T+1.5ms), Router borrows connection (T+2ms), Shard 2 parses SQL (T+3ms), Buffer pool hit (T+4ms), Row returned (T+5ms), Router streams (T+6ms), App receives (T+8ms)"
+  caption="Single-shard read latency: 8ms from app to app — buffer pool hit avoids disk I/O entirely"
+  content={`
+  Single-Shard Read: SELECT * FROM posts WHERE user_id=48192 AND created_at > '2024-01-01'
+
+  App          Proxy        Parser        Router        Shard 2
+   │             │             │             │             │
+   │────SQL─────>│             │             │             │
+   │             │────SQL─────>│             │             │
+   │             │             │────SQL─────>│             │
+   │             │             │             │───SQL──────>│
+   │             │             │             │             │ Parse
+   │             │             │             │             │ Buffer hit
+   │             │             │             │             │ 4 pages read
+   │             │             │             │<───rows────│
+   │             │             │<────rows───│             │
+   │             │<───rows────│             │             │
+   │<───rows────│             │             │             │
+   │             │             │             │             │
+  └8ms──────────┴────────────┴────────────┴─────────────┘
+
+  Latency breakdown:
+    Network:    2ms (4 hops at 500us each)
+    Parsing:    1ms
+    Routing:    1ms
+    Execution:  4ms (buffer pool hit)
+    Total:      8ms
+`}
+/>
+
+**Step-by-step walkthrough:**
+
+1. Application opens a pooled connection through the proxy (T+0).
+2. Proxy authenticates and assigns a parser slot (T+0.5ms).
+3. Parser extracts `user_id = 48192` from the WHERE clause (T+1ms).
+4. Router computes `hash(48192) % N` or looks up the range, identifies shard 2 (T+1.5ms).
+5. Router borrows a connection from shard 2's pool (T+2ms).
+6. Shard 2's SQL executor parses and optimizes the query (T+3ms).
+7. Shard 2 checks its buffer pool: pages for user 48192 are in cache (buffer pool hit). Reads 4 pages from the buffer pool, not from disk (T+4ms).
+8. Shard 2 returns 15 matching rows to the router (T+5ms).
+9. Router streams results back through the proxy (T+6ms).
+10. Application receives the result set (T+8ms).
+
+### Single-Shard Write Query
+
+A write query must go through additional steps for durability and consistency.
+
+<AsciiDiagram
+  id="sharding/deepdive-single-shard-write"
+  title="Timeline of a single-shard write showing WAL flush, buffer pool update, and replica propagation"
+  alt="Write path sequence: App sends INSERT, router routes to shard 2 primary, primary acquires row lock, writes to WAL buffer, fsyncs WAL, updates buffer pool, sends to replica 2A via streaming replication, replica acknowledges, primary returns success"
+  caption="Single-shard write adds 5ms for WAL fsync and replica acknowledgment — durability ensures no data loss on crash"
+  content={`
+  Single-Shard Write: INSERT INTO posts VALUES (48192, ...)
+
+  App          Router        Shard 2       Shard 2       Shard 2
+                             Primary       WAL           Replica A
+   │             │             │             │             │
+   │───INSERT───>│             │             │             │
+   │             │───INSERT───>│             │             │
+   │             │             │ Lock row     │             │
+   │             │             │ Write WAL───>│             │
+   │             │             │<─WAL ok────│             │
+   │             │             │ fsync()─────>│             │
+   │             │             │<─fsync ok──│             │
+   │             │             │ Update buf   │             │
+   │             │             │ Send repl───┼────────────>│
+   │             │             │             │             │<ack
+   │             │             │<────ack────│             │
+   │             │             │ Unlock row   │             │
+   │             │<───OK──────│             │             │
+   │<───OK──────│             │             │             │
+  └12ms─────────┴────────────┴────────────┴─────────────┘
+`}
+/>
+
+**Step-by-step walkthrough:**
+
+1. Application sends INSERT to the proxy. Router identifies target shard (shard 2) from the shard key in the VALUES clause (T+0).
+2. Router opens a connection to shard 2's primary (T+1ms).
+3. Shard 2's transaction manager acquires a row-level lock (T+2ms).
+4. Shard 2 writes the INSERT to its WAL buffer in memory (T+2.5ms).
+5. Shard 2 calls `fsync()` to flush the WAL buffer to disk. This is the slowest single step: typically 2-10ms depending on disk hardware and WAL volume (T+5ms typical).
+6. Shard 2 updates its buffer pool with the new row (T+5.5ms).
+7. Shard 2's WAL sender process streams the WAL record to replica A over the network. Replica A applies the WAL and sends an acknowledgment (T+9ms).
+8. If the write requires synchronous replication, the primary waits for the replica acknowledgment before returning success (T+10ms).
+9. Shard 2 releases the row lock (T+10.5ms).
+10. Success acknowledgment flows back through the router and proxy to the application (T+12ms).
+
+**Total write latency:** 12ms for a synchronous write with one replica acknowledgment. Asynchronous replication is faster (approximately 5ms) but risks data loss on primary failure.
+
+### Cross-Shard Scatter-Gather Query
+
+A query without the shard key follows a radically different path.
+
+<AsciiDiagram
+  id="sharding/deepdive-cross-shard-query"
+  title="Cross-shard scatter-gather query timeline: fan-out to all 4 shards, merge-sort, return — slowest shard determines latency"
+  alt="Sequence diagram: App sends SELECT COUNT(*) without shard key. Router fans out to shards 0-3. Shard 0 returns in 50ms, shard 1 in 45ms, shard 2 in 120ms (slow), shard 3 in 55ms. Coordinator waits for shard 2 (120ms total), adds results, returns"
+  caption="Cross-shard latency is dominated by the slowest shard — a single straggler increases p99 latency from 55ms to 120ms"
+  content={`
+  Cross-Shard Read: SELECT COUNT(*) FROM posts WHERE created_at > '2024-01-01'
+
+  App          Router        Shard 0       Shard 1       Shard 2       Shard 3
+   │             │             │             │             │             │
+   │───SQL──────>│  No shard   │             │             │             │
+   │             │  key found  │             │             │             │
+   │             │             │             │             │             │
+   │             │────SQL─────>│             │             │             │
+   │             │────SQL───────────────────>│             │             │
+   │             │────SQL─────────────────────────────────>│             │
+   │             │────SQL──────────────────────────────────────────────>│
+   │             │             │  50ms       │  45ms       │             │
+   │             │<───N=2.1M───│             │             │  120ms      │
+   │             │<───N=1.9M────────────────│             │  (straggler)│
+   │             │             │             │             │             │
+   │             │             │             │             │<───N=2.2M──│
+   │             │<───N=2.4M──────────────────────────────│             │
+   │             │             │             │             │             │
+   │             │  Merge: 2.1+1.9+2.4+2.2  │             │             │
+   │             │  = 8.6M rows             │             │             │
+   │<───8.6M────│             │             │             │             │
+  └120ms────────┴────────────┴────────────┴────────────┴──────────────┘
+`}
+/>
+
+---
+
+## Consistency and State
+
+Sharded systems must handle six consistency challenges that do not exist in single-node databases.
+
+### Challenge 1: Stale Reads from Replica Lag
+
+When read queries are routed to replicas (for read scaling), a write to the primary may not have propagated to the replica yet.
+
+<AsciiDiagram
+  id="sharding/deepdive-stale-reads"
+  title="Stale read scenario: user writes a post, then reads from replica that has not received the WAL update yet"
+  alt="Timeline showing: User A writes 'Hello' to shard 2 primary at T=0. Primary WAL fsyncs at T=2ms. User A reads at T=3ms, but the router routes the read to replica A which has not received the WAL yet. Replica A returns old data without the new post. WAL arrives at replica A at T=6ms"
+  caption="Stale reads occur when read-after-write requests land on a replica that has not yet received the WAL update"
+  content={`
+  Stale Read Race Condition
+
+  User A         Router         Shard 2        Shard 2
+                                Primary        Replica A
+   │               │               │             │
+   │───INSERT──────>│               │             │
+   │  "Hello"      │───INSERT─────>│             │
+   │               │               │ WAL fsync   │
+   │               │               │ at T=2ms    │
+   │               │   T=3ms       │             │
+   │───SELECT──────>│               │             │
+   │  (read own    │  Route to     │             │
+   │   write)      │  replica?     │             │
+   │               │───────────────┼────────────>│
+   │               │               │             │ No WAL yet!
+   │               │               │             │ Returns old
+   │               │<──────────────┼────────────│ state
+   │<── (no post)─│               │             │
+   │               │               │ WAL arrives │
+   │               │               │ at T=6ms    │
+   │               │               │             │ Now has post
+   │               │               │             │
+`}
+/>
+
+**Resolution:** Use read-your-writes consistency. Route reads from the same session to the shard's primary for a configurable period (10-30 seconds) after a write. Or use consistent prefix reads in Cassandra. Or use session-level consistency in Vitess with the `read-after-write` flag.
+
+### Challenge 2: Concurrent Writes to the Same Shard Key
+
+Two concurrent transactions updating the same row on the same shard.
+
+**Resolution:** Standard row-level locking on the shard. The shard's local database (PostgreSQL, MySQL) handles concurrent writes using MVCC or pessimistic locking. The first writer acquires the lock; the second waits. This is identical to single-node database behavior — sharding does not introduce new concurrency problems within a single shard.
+
+### Challenge 3: Cross-Shard Transaction Failure
+
+A transaction that updates shard 0 and shard 1 — shard 0 commits but shard 1 fails during the prepare phase.
+
+<AsciiDiagram
+  id="sharding/deepdive-cross-shard-2pc"
+  title="Two-phase commit across 2 shards: prepare phase succeeds, commit phase succeeds — happy path for cross-shard transactions"
+  alt="Sequence diagram: Coordinator sends prepare to shard 0 (ready) and shard 1 (ready). Coordinator logs commit decision. Coordinator sends commit to shard 0 (ok) and shard 1 (ok). All locks released"
+  caption="Two-phase commit coordinates cross-shard transactions — the prepare phase guarantees all shards can commit before any shard actually commits"
+  content={`
+  Two-Phase Commit (Happy Path)
+
+  Coordinator     Shard 0         Shard 1
+       │              │              │
+       │──PREPARE─────>│              │
+       │──PREPARE────────────────────>│
+       │              │              │
+       │              │ Acquire locks │
+       │              │ Write prepare │
+       │              │ to WAL        │
+       │<──READY─────│              │
+       │<──READY─────────────────────│
+       │                               Both ready
+       │  Coordinator logs commit      │
+       │  decision to its WAL          │
+       │                               │
+       │──COMMIT──────>│              │
+       │──COMMIT──────────────────────>│
+       │              │              │
+       │              │ Commit txn   │
+       │              │ Release locks│
+       │<──COMMITTED──│              │
+       │              │              │
+       │<──COMMITTED─────────────────│
+       │              │              │
+       │  Coordinator logs done      │
+       │  Transaction complete       │
+`}
+/>
+
+**Resolution:** The coordinator detects the failure during the prepare phase and sends ABORT to shard 0, which rolls back the prepared transaction. If the coordinator crashes after the prepare phase, the participants hold locks until a configurable timeout (default 60 seconds). On recovery, the coordinator reads its WAL and continues the transaction.
+
+### Challenge 4: Shard Failure During a Query
+
+A shard crashes while a query is in flight. The router's connection pool detects the failure (TCP connection reset) and marks the shard as unhealthy.
+
+**Resolution:** The router has a circuit breaker per shard. After N consecutive failures (default 5), the router stops routing to that shard and returns a "shard unavailable" error to the application. The application should retry with exponential backoff. The shard's replicas are promoted if automatic failover is configured (Patroni for PostgreSQL, Orchestrator for MySQL).
+
+### Challenge 5: Network Partition
+
+The router loses connectivity to a subset of shards. The shards are still running, but the routing layer cannot reach them.
+
+<AsciiDiagram
+  id="sharding/deepdive-network-partition"
+  title="Network partition scenario: router can reach shards 0 and 1 but cannot reach shards 2 and 3 due to a network switch failure"
+  alt="Architecture diagram: Router has connectivity to shards 0 and 1 (green lines) but no connectivity to shards 2 and 3 (red X through network switch). Shards 2 and 3 are running but unreachable. An etcd metadata store holds the authoritative routing table"
+  caption="Network partition: the router marks unreachable shards as unhealthy and serves degraded results from reachable shards only"
+  content={`
+  Network Partition Scenario
+
+                    ┌──────────────┐
+                    │   Router      │
+                    └──────┬───────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+         ┌────▼───┐  ┌────▼───┐  ┌────▼───┐
+         │ Switch  │  │ Switch │  │ Switch │
+         │  A      │  │  B (X) │  │  C (X) │   X = failed
+         └────┬───┘  └────┬───┘  └────┬───┘
+              │           │           │
+         ┌────▼───┐  ┌────▼───┐  ┌────▼───┐
+         │ Shard 0│  │ Shard 2│  │ Shard 3│
+         │   OK   │  │ UNREACH│  │ UNREACH│
+         ├────────┤  ├────────┤  ├────────┤
+         │ Shard 1│  │        │  │        │
+         │   OK   │  │        │  │        │
+         └────────┘  └────────┘  └────────┘
+
+    Effect: Queries for keys on shards 0,1 succeed.
+            Queries for keys on shards 2,3 fail.
+            Scatter-gather reads return partial results.
+            Writes to unreachable shards are rejected.
+            etd watch detects partition, alerts operator.
+`}
+/>
+
+**Resolution:** The router marks the unreachable shards as unhealthy and returns errors for queries targeting those shards. The operator must restore network connectivity to the switches. If the partition persists, the operator may promote replicas in a different availability zone to replace the unreachable primaries.
+
+---
+
+## Performance Characteristics
+
+The following numbers are realistic for a sharded PostgreSQL or MySQL deployment running on modern hardware (16 vCPU, 64 GB RAM, NVMe SSD, 10 Gbps network).
+
+### Latency (Single-Shard, Buffer Pool Hit)
+
+| Operation | p50 | p95 | p999 | Notes |
+|---|---|---|---|---|
+| Read by shard key | 2ms | 8ms | 25ms | Single row, buffer pool hit |
+| Read by shard key (buffer miss) | 12ms | 35ms | 120ms | Single row, disk read |
+| INSERT (async replication) | 5ms | 15ms | 50ms | WAL fsync only |
+| INSERT (sync replication) | 12ms | 30ms | 100ms | WAL fsync + replica ack |
+| UPDATE by shard key | 8ms | 25ms | 75ms | Index lookup + WAL + buffer |
+| Scatter-gather (4 shards, COUNT) | 15ms | 50ms | 200ms | Slowest shard dominates |
+| Cross-shard transaction (2 shards) | 30ms | 80ms | 300ms | 2PC overhead |
+
+### Throughput
+
+| Setup | Max Writes/s | Max Reads/s | Bottleneck |
+|---|---|---|---|
+| Single node | 15,000 | 60,000 | WAL fsync, connections |
+| 4 shards | 60,000 | 240,000 | Router CPU |
+| 16 shards | 240,000 | 960,000 | Network bandwidth |
+| 64 shards | 960,000 | 3,840,000 | Routing table memory |
+| 256 shards (theoretical) | 3,840,000 | 15,360,000 | Coordination overhead |
+
+### Memory Per Shard
+
+| Component | Memory | Notes |
+|---|---|---|
+| Buffer pool (default) | 16 GB | 25 percent of total RAM |
+| WAL buffers | 256 MB | 16 MB * 16 buffers |
+| Connection pool (200 connections) | 2 GB | 10 MB per connection |
+| OS + filesystem cache | 8 GB | Page cache |
+| Routing table (256 shards) | 50 KB | Negligible |
+| Monitoring agent | 256 MB | Prometheus exporter, etc. |
+| **Total per shard** | **26.5 GB** | Leaves 3.5 GB headroom |
+
+---
+
+## Configuration and Tuning
+
+Twelve configuration knobs that determine performance, consistency, and operational behavior in sharded systems.
+
+### Router Configuration
+
+**`routing_table_refresh_ms`** — How often the router refreshes its routing table from the metadata service. Default: 10000ms (10 seconds). Lower this to 1000ms during rebalancing to converge faster on the new topology. Too low: increased load on the metadata service.
+
+**`connection_pool_per_shard`** — Number of pooled connections per shard. Default: 50. Calculate as: (peak_queries_per_second * avg_query_latency_seconds) / shard_count. For 50,000 QPS with 10ms latency across 16 shards: 50,000 * 0.01 / 16 = 31 connections. Set to 50 for headroom.
+
+**`circuit_breaker_threshold`** — Number of consecutive failures before a shard is marked unhealthy. Default: 5. Lower thresholds detect failures faster but may trigger false positives during transient network blips. Set to 10 for workloads with occasional 1-2 second network pauses.
+
+**`scatter_gather_timeout_ms`** — Maximum time to wait for all shards to respond in a scatter-gather query. Default: 30000ms. Queries taking longer than this return partial results. Set based on the slowest shard's p999 latency: typically 3x the p999.
+
+### Shard Instance Configuration
+
+**`max_connections`** — Maximum database connections allowed on each shard. Default: 100 per shard. Calculate as: router_instances * pool_per_shard + monitoring_connections + admin_connections. For 4 routers x 50 pool = 200, plus 10 monitoring = 210. Set to 250 for headroom.
+
+**`shared_buffers`** (PostgreSQL) or **`innodb_buffer_pool_size`** (MySQL) — Memory allocated for caching data pages. Default: 25 percent of system RAM. For a 64 GB shard: 16 GB. Too high: OS page cache starves. Too low: more disk reads.
+
+**`wal_buffers`** — Memory for WAL before fsync. Default: 16 MB. For write-heavy workloads: 64 MB. Larger buffers allow more WAL to accumulate before fsync, reducing write amplification but increasing potential data loss on crash.
+
+**`checkpoint_completion_target`** — Fraction of checkpoint interval to spread checkpoint writes. Default: 0.5. Increase to 0.9 to smooth out write spikes from checkpoints at the cost of slightly longer crash recovery.
+
+### Rebalancing Configuration
+
+**`rebalance_bandwidth_mbps`** — Maximum network bandwidth used for data movement during rebalancing. Default: 100 Mbps. Set based on available network headroom. Too high: impacts production query latency. Too low: rebalancing takes too long.
+
+**`rebalance_chunk_size_mb`** — Size of each data chunk moved during rebalancing. Default: 256 MB. Smaller chunks give finer-grained progress but more overhead. Larger chunks move data faster but require more memory.
+
+**`dual_write_timeout_seconds`** — Maximum time to maintain dual writes during rebalancing. Default: 86400 (24 hours). After this, if the cutover has not happened, the migration is considered failed and rolls back.
+
+**`consistency_checksum_verify`** — Whether to run a full checksum comparison between source and destination after rebalancing. Default: true. Disabling saves time but risks silent data corruption.
+
+---
+
+This concludes the Deep Dive section. The next page, Sharding at Scale, explores production-grade architectures, integration patterns, multi-region deployment, capacity planning, and operational runbooks.

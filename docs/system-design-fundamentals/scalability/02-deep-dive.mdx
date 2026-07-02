@@ -1,0 +1,1487 @@
+---
+id: scalability-deep-dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Scalability Deep Dive
+
+## Internal Architecture of Scaled Systems
+
+Scalability mechanisms are not magic. Each one has a precise internal architecture that governs how it works, where it breaks, and how to tune it.
+
+### Load Balancer Internals
+
+A load balancer is a reverse proxy that maintains a list of healthy backend servers and distributes requests according to a scheduling algorithm.
+
+<AsciiDiagram
+  title="Load Balancer Internal Architecture"
+  content={`
+┌──────────────────────────────────────────┐
+│              Load Balancer               │
+│                                          │
+│  ┌────────────┐    ┌────────────────┐   │
+│  │ Health     │    │ Scheduler      │   │
+│  │ Checker    │    │ (Round Robin)  │   │
+│  │            │    │                │   │
+│  │ Pings every│    │ Server Pool:  │   │
+│  │ 5 seconds  │    │  ┌─ App 1 (ok)│   │
+│  │ /health    │    │  ├─ App 2 (ok)│   │
+│  │            │    │  ├─ App 3 (ok)│   │
+│  │ Removes    │    │  └─ App 4 (ok)│   │
+│  │ failures   │    └────────────────┘   │
+│  └────────────┘                         │
+│                                          │
+│  ┌────────────────────────────────────┐ │
+│  │ Connection Tracking                │ │
+│  │ Client IP ─> Server: sticky if    │ │
+│  │ session cookie present             │ │
+│  └────────────────────────────────────┘ │
+│                                          │
+│  ┌────────────────────────────────────┐ │
+│  │ Rate Limiting                      │ │
+│  │ 1000 requests/sec per client IP   │ │
+│  └────────────────────────────────────┘ │
+└──────────────────────────────────────────┘
+  `}
+  alt="Internal architecture of a load balancer showing health checker, round-robin scheduler, server pool, connection tracking, and rate limiting modules"
+  caption="A load balancer is a reverse proxy with health checking, scheduling, and connection tracking"
+/>
+
+**Scheduling algorithms:**
+
+| Algorithm | Behavior | Best for |
+|-----------|----------|----------|
+| Round robin | Distributes sequentially | Equal-capacity servers |
+| Least connections | Sends to server with fewest active connections | Variable-length requests |
+| IP hash | Same client IP goes to same server | Stateful apps without shared session store |
+| Weighted round robin | Servers with higher weight get more requests | Heterogeneous server capacities |
+| Random | Random selection | Testing, very large pools |
+
+### Connection Pool Internals
+
+A connection pool maintains a set of persistent database connections that application threads borrow and return.
+
+```
+Application thread ──> Borrow connection ──> Execute query ──> Return to pool
+
+Pool configuration:
+  min_size = 5        # Connections always kept open (warm pool)
+  max_size = 20       # Hard limit (prevents database overload)
+  max_idle = 300      # seconds before idle connection is closed
+  timeout = 30        # seconds to wait for a connection before error
+  max_lifetime = 3600 # seconds before recycling a connection
+
+When all connections are busy:
+  New request queues in the pool buffer (up to timeout seconds)
+  If buffer fills: "Connection pool exhausted" error returned to client
+```
+
+A connection pool of 20 connections on each of 10 app servers means 200 concurrent database connections. PostgreSQL default `max_connections` is 100. You would exhaust the database before you filled the pool.
+
+**The connection math:**
+
+```
+PostgreSQL max_connections = 100
+App servers = 10
+Pool size per server = 20
+Total potential connections = 200 (exceeds limit by 2x)
+```
+
+Solution: Either increase `max_connections` on PostgreSQL (RAM cost: ~2MB per connection) or reduce pool sizes. The standard formula: `pool_size = (max_connections - 10) / number_of_app_servers`.
+
+### Thread Pool Internals
+
+Each application server has a thread pool that processes incoming requests concurrently.
+
+<AsciiDiagram
+  title="Thread Pool Architecture"
+  content={`
+┌──────────────────────────────────────────┐
+│             Application Server          │
+│                                          │
+│  Incoming Requests (HTTP)                │
+│       │    │    │    │                   │
+│       ▼    ▼    ▼    ▼                   │
+│  ┌────────────────────────────┐          │
+│  │     Request Queue          │          │
+│  │  (Bounded: max 1000 items) │          │
+│  └───────────┬────────────────┘          │
+│              │                           │
+│  ┌───────────┴────────────────────┐     │
+│  │        Thread Pool            │     │
+│  │  ┌────┐ ┌────┐ ┌────┐ ┌────┐ │     │
+│  │  │ T1 │ │ T2 │ │ T3 │ │ T4 │ │     │
+│  │  └────┘ └────┘ └────┘ └────┘ │     │
+│  │  core = 4, max = 10          │     │
+│  └───────────────────────────────┘     │
+│         │       │       │              │
+│         ▼       ▼       ▼              │
+│  ┌────────────────────────────┐        │
+│  │    Database Connection     │        │
+│  │    Pool (max 20 conns)     │        │
+│  └────────────────────────────┘        │
+└──────────────────────────────────────────┘
+
+Thread pool saturation:
+  All threads busy ──> Request queued ──> Queue full ──> 503 Service Unavailable
+  `}
+  alt="Application server internals showing request queue feeding into a thread pool of worker threads that share database connections"
+  caption="Thread pools prevent resource exhaustion by bounding concurrent work"
+/>
+
+**Thread pool sizing:**
+
+```
+Formula: threads = cores * (1 + wait_time / compute_time)
+
+CPU-bound (compute_time >> wait_time): threads = cores
+  Example: image processing, video encoding
+
+IO-bound (wait_time >> compute_time): threads = cores * 10 to 50
+  Example: web serving, database queries
+
+Default (balanced):
+  Tomcat default: 200
+  Gunicorn: 4-12 per worker
+  Node.js: single thread with event loop (async I/O)
+```
+
+### Queue Internals
+
+A message queue decouples producers from consumers. The producer enqueues a message and returns immediately. The consumer processes the message whenever capacity is available.
+
+<AsciiDiagram
+  title="Queue Architecture - Kafka Partition Model"
+  content={`
+┌───────────────────────────────────────┐
+│            Kafka Cluster              │
+│                                       │
+│  Topic: "order_events"               │
+│    ┌──────────┐ ┌──────────┐ ┌──────┐│
+│    │Partition │ │Partition │ │Part  ││
+│    │ 0        │ │ 1        │ │ 2    ││
+│    │ ┌──┐     │ │ ┌──┐     │ │┌──┐  ││
+│    │ │M1│     │ │ │M2│     │ ││M6│  ││
+│    │ │M4│     │ │ │M3│     │ ││  │  ││
+│    │ │M7│     │ │ │M5│     │ ││  │  ││
+│    │ └──┘     │ │ └──┘     │ │└──┘  ││
+│    └──────────┘ └──────────┘ └──────┘│
+│         │              │        │     │
+│         ▼              ▼        ▼     │
+│    ┌──────────┐ ┌──────────┐ ┌──────┐│
+│    │Consumer  │ │Consumer  │ │Con   ││
+│    │Group A-1 │ │Group A-2 │ │A-3   ││
+│    └──────────┘ └──────────┘ └──────┘│
+│         Consumer Group A              │
+└───────────────────────────────────────┘
+
+Key properties:
+  - Each partition is ordered (FIFO within partition)
+  - Each partition maps to one consumer (within a group)
+  - Partitions = max parallelism for a topic
+  - Messages persist for configurable retention (default 7 days)
+  `}
+  alt="Kafka cluster architecture showing a topic with 3 partitions, each with ordered messages, consumed by a consumer group with 3 members"
+  caption="Kafka partitions enable horizontal scaling of message processing"
+/>
+
+## Data Structures for Scalability
+
+### Consistent Hashing Ring
+
+Traditional `hash(key) % N` breaks when N changes (adding or removing a server). Every key remaps to a different server, causing massive cache misses or data migration. Consistent hashing solves this.
+
+<AsciiDiagram
+  title="Consistent Hashing Ring"
+  content={`
+                  Hash Ring
+          ┌───────────────────┐
+          │   Node A          │
+          │   ┌───────┐       │
+          │   │ Keys  │       │
+          │   │ 1-10  │       │
+          │   └───────┘       │
+          │                   │
+   Node D ─┤                   ├─ Node B
+   ┌─────┐ │                   │ ┌─────┐
+   │Keys │ │                   │ │Keys │
+   │31-40│─┤                   ├─│11-20│
+   └─────┘ │                   │ └─────┘
+           │     ┌───────┐     │
+           │     │ Keys  │     │
+           │     │21-30  │     │
+           │     └───────┘     │
+           │   Node C          │
+           └───────────────────┘
+
+Adding Node E:
+  Key range redistributed only from neighbors
+  Keys 26-30 move from C to E
+  All other keys stay put
+
+Changing N in hash % N:
+  Every key maps to a different node ──> Full cache invalidation
+  `}
+  alt="Consistent hashing ring with 4 nodes each owning a key range and showing that adding a 5th node only affects adjacent key ranges"
+  caption="Consistent hashing: adding a node only redistributes keys from neighbors, not the entire ring"
+/>
+
+**How it works:**
+
+```
+1. Hash each server node to a position on a circular ring (0 to 2^32 - 1)
+2. Hash each key to a position on the same ring
+3. Walk clockwise from the key's position to find the nearest server
+4. When a server is added: only keys between its position and the next server remap
+5. When a server is removed: only its keys remap to the next server clockwise
+```
+
+**Virtual nodes** improve distribution. Each physical server maps to 100-200 virtual positions on the ring. This prevents hot spots when nodes have different capacities.
+
+**Real-world usage:**
+- Amazon DynamoDB
+- Discord (for data sharding)
+- Cassandra and Riak
+- Akamai CDN
+
+### Distributed Hash Table (DHT)
+
+A DHT extends consistent hashing with peer-to-peer routing. Each node maintains a routing table of `O(log N)` other nodes, enabling key lookup in `O(log N)` hops.
+
+```
+Node routing table (for N=10,000 nodes, 14-hop lookup):
+  ┌──────────────────────────────────────┐
+  │ Finger Table for Node 100            │
+  ├──────────┬───────────────┬───────────┤
+  │ Interval │ Successor     │ Distance  │
+  ├──────────┼───────────────┼───────────┤
+  │ 100-200  │ Node 150      │ 50        │
+  │ 200-400  │ Node 350      │ 250       │
+  │ 400-800  │ Node 720      │ 620       │
+  │ 800-1600 │ Node 1400     │ 1300      │
+  │ ...      │ ...           │ ...       │
+  │ 50000+   │ Node 50       │ 65536     │
+  └──────────┴───────────────┴───────────┘
+```
+
+Each hop halves the distance to the target. A 10,000-node cluster resolves any key in 14 hops or fewer. Used by Cassandra, Dynamo, and BitTorrent.
+
+### B-Trees for Sharded Databases
+
+A B-Tree is the standard index structure in relational databases. Each node holds `k` keys and `k+1` pointers to child nodes. The tree maintains balance automatically.
+
+```
+For a PostgreSQL table with 10 million rows:
+  - Each B-Tree node fits in one 8KB page
+  - Each node holds ~200 keys (with 12-byte key + 8-byte pointer)
+  - Tree depth = log_200(10,000,000) = 3 levels
+  - Any row lookup: 3 index reads + 1 heap read = 4 disk reads
+
+For a sharded table (4 shards, 2.5M rows each):
+  - Tree depth per shard = log_200(2,500,000) = 3 levels (still)
+  - But each shard runs on separate hardware
+  - 4 parallel lookups complete in the time of 1 unsharded lookup
+```
+
+Sharding reduces the data volume per node, which means each node's B-Tree stays shallow. Write throughput also increases because writes distribute across nodes.
+
+## Request Lifecycle Through a Scaled System
+
+A single user request traverses 15 components in a scaled system. Each one is a potential scalability bottleneck.
+
+<AsciiDiagram
+  title="Steps 1-4: DNS to Rate-Limited Load Balancer"
+  content={`
+Step 1: DNS Resolution
+  User types "dishfind.com"
+  DNS returns IP of CDN (if cached) or load balancer
+
+Step 2: CDN Check and Miss Handling
+  ┌──────────┐
+  │ User     │──> Request for /static/logo.png
+  └──────────┘     │
+               ┌───┴──────────────┐
+               │ CDN Edge Node    │
+               │ (Tokyo)          │
+               │                  │
+               │ Cache hit ──> Return image (5ms)
+               │ Cache miss ──> Origin fetch queued
+               │                CloudFront/S3 origin
+               │                POP routes to nearest
+               │                origin shield
+               └──────────────────┘
+
+  CDN miss flow:
+    1. Edge node checks local cache ─> miss
+    2. Request routed to origin shield (regional cache)
+    3. Origin shield checks its cache ─> hit or miss
+    4. On miss: shield fetches from origin (S3/app server)
+    5. Response cached at shield and edge for future requests
+    6. TTFB: 50-200ms on miss vs 1-5ms on hit
+
+Step 3: Rate Limiting at Load Balancer
+  ┌──────────┐    ┌────────────────────────────┐
+  │ CDN miss │───>│ Load Balancer (AWS ALB)    │
+  └──────────┘    │                            │
+                  │ 1. Terminate TLS           │
+                  │ 2. Parse request path      │
+                  │ 3. Extract client IP from  │
+                  │    X-Forwarded-For header  │
+                  │ 4. Rate limit check:       │
+                  │    Token bucket per IP     │
+                  │    Rate: 1000 req/s        │
+                  │    Burst: 2000             │
+                  │    ┌─ Tokens available ─> forward │
+                  │    └─ Tokens exhausted ─> 429 Too │
+                  │       Many Requests, Retry-After  │
+                  │ 5. Select backend:          │
+                  │    least_connections(app_pool)    │
+                  │ 6. Forward request          │
+                  └────────────────────────────┘
+
+Step 4: Distributed Tracing Context Propagation
+  ┌──────────────┐    ┌──────────────────────────┐
+  │ Load Balancer│───>│ App Server                │
+  └──────────────┘    │                           │
+                      │ 1. Extract traceparent    │
+                      │    header (W3C TraceContext)│
+                      │    trace_id: abc123...    │
+                      │    span_id: def456...     │
+                      │ 2. Create child span      │
+                      │    span_id: xyz789...     │
+                      │ 3. Inject into outgoing   │
+                      │    requests (DB, cache,   │
+                      │    queue)                 │
+                      │ 4. Sampled? Check         │
+                      │    head-based sampling    │
+                      │    rate: 5% of requests   │
+                      │    Store in context:      │
+                      │    sampled=true           │
+                      └──────────────────────────┘
+  `}
+  alt="Request lifecycle steps 1-4 showing DNS resolution, CDN miss handling with origin shield, rate limiting with token bucket, and distributed tracing context propagation"
+  caption="Steps 1-4: DNS routing, CDN miss handling, rate limiting, and trace context propagation"
+/>
+
+<AsciiDiagram
+  title="Steps 5-9: Authentication, Cache, Circuit Breaker, Database"
+  content={`
+Step 5: Application Server Entry
+  ┌────────────┐
+  │ App Server │──> Request: GET /api/restaurants?lat=X&lon=Y
+  │ (Node 14)  │
+  └────────────┘
+
+Step 6: Authentication Cache Check
+  ┌────────────┐    ┌──────────────────────┐
+  │ App Server │───>│ Session Cache (Redis) │
+  │            │    │                      │
+  │ Key:       │    │ TTL: 900 seconds    │
+  │ session:   │    │ (15 min idle)       │
+  │ token_hash │    │                      │
+  │            │    │ Cache hit ──> User    │
+  │ Parse JWT  │    │   object returned    │
+  │ Extract    │    │   (no DB query, 2ms) │
+  │ session_id │    │                      │
+  └────────────┘    │ Cache miss ──> Query  │
+                    │   user DB (20ms)     │
+                    │   Write result to    │
+                    │   cache              │
+                    └──────────────────────┘
+
+Step 7: Cache Check (Business Data)
+  ┌────────────┐    ┌──────────────────────┐
+  │ App Server │───>│ Redis Cluster        │
+  │            │    │                      │
+  │ Key:       │    │ TTL: 60 seconds     │
+  │ restaurants:│    │ Size: ~12KB per entry│
+  │ lat:35.6   │    │                      │
+  │ lon:139.7  │    │ Cache hit ──> Return (2ms)
+  └────────────┘    │ Cache miss ──> Continue │
+                    └──────────────────────┘
+
+Step 8: Circuit Breaker Evaluation
+  ┌────────────┐    ┌──────────────────────┐
+  │ App Server │───>│ Circuit Breaker      │
+  │            │    │ (Hystrix/resilience4j)│
+  │ Check      │    │                      │
+  │ dependency:│    │ State: CLOSED        │
+  │ DB-READ   │    │   (normal operation) │
+  │            │    │ Error rate: 2%       │
+  │            │    │ Threshold: 50%       │
+  │            │    │                      │
+  │            │    │ State: OPEN when     │
+  │            │    │   >50% errors in 10s │
+  │            │    │   window             │
+  │            │    │                      │
+  │            │    │ State: HALF_OPEN     │
+  │            │    │   after 30s timeout  │
+  │            │    │   trial request      │
+  │            │    │   passes ──> CLOSED  │
+  │            │    │   fails ──> OPEN     │
+  └────────────┘    └──────────────────────┘
+
+Step 9: Cache Miss — Database Query
+  ┌────────────┐    ┌──────────────────────┐
+  │ App Server │───>│ Database (Read Replica)│
+  │            │    │                      │
+  │ SQL:       │    │ SELECT id, name,     │
+  │ SELECT ... │    │   lat, lon           │
+  │ WHERE      │    │ FROM restaurants     │
+  │ lat BETWEEN│    │ WHERE lat BETWEEN X  │
+  │ X AND Y    │    │   AND Y              │
+  └────────────┘    │   AND lon BETWEEN Z  │
+                    │   AND W              │
+                    └──────────────────────┘
+
+  Circuit breaker metrics in CLOSED state:
+    Tracked: last 100 requests
+    Successes: 98     Failures: 2
+    Rolling error rate: 2% (threshold: 50%)
+    Latency p99: 45ms (threshold: 500ms)
+    Status: Healthy, bypass circuit
+  `}
+  alt="Request lifecycle steps 5-9 showing authentication cache check, business data cache check, circuit breaker evaluation in CLOSED state, and database query on read replica"
+  caption="Steps 5-9: Authentication, caching, circuit breaker, and database access"
+/>
+
+<AsciiDiagram
+  title="Steps 10-15: Write Path, Queue, Tracing, and Response"
+  content={`
+Step 10: Write Request (POST /api/review)
+  App Server routes to primary database (not replica)
+  ┌────────────┐    ┌──────────────────┐
+  │ App Server │───>│ Primary Database │
+  │            │    │ (Write node)     │
+  │ INSERT INTO│    │                  │
+  │ reviews    │    │ INSERT complete  │
+  └────────────┘    └──────────────────┘
+
+Step 11: Invalidate Related Cache Entries
+  ┌────────────┐    ┌──────────────┐
+  │ App Server │───>│ Redis        │
+  │            │    │              │
+  │ DEL        │    │ DELETE       │
+  │ restaurant:│    │ restaurant: │
+  │ 42:reviews │    │ 42:reviews   │
+  └────────────┘    └──────────────┘
+
+Step 12: Enqueue Background Job
+  ┌────────────┐    ┌──────────────────┐
+  │ App Server │───>│ Kafka Topic:     │
+  │            │    │ "review_events"  │
+  │ Produce    │    │ Partition:       │
+  │ message:   │    │ restaurant_id % 4│
+  │ {"id": 42, │    └──────────────────┘
+  │  "type":   │
+  │ "new_review"}   ┌──────────────────┐
+  └────────────┘    │ Consumer (Worker)│
+                     │ - Update avg     │
+                     │   rating        │
+                     │ - Send push     │
+                     │   notification  │
+                     │ - Check for     │
+                     │   spam          │
+                     └──────────────────┘
+
+Step 13: Propagate Trace Context to Async Path
+  ┌────────────┐
+  │ App Server │──> Kafka message headers:
+  │            │     traceparent: 00-abc123-xyz789-01
+  │ Inject     │     baggage: user_id=42,restaurant_id=7
+  │ trace      │
+  │ context    │──> Worker reads traceparent header
+  │ into       │     Creates child span for each
+  │ message    │     async operation (rating update,
+  │ headers    │     push notification, spam check)
+  └────────────┘     All spans share same trace_id
+
+Step 14: Circuit Breaker Status Update
+  ┌────────────┐
+  │ App Server │──> Update circuit breaker metrics:
+  │            │     - Record write success/failure
+  │ On each    │     - Update rolling window
+  │ operation: │     - Check health of dependencies
+  │            │     DB-WRITE: CLOSED (error rate: 1.2%)
+  │            │     KAFKA: CLOSED (error rate: 0.3%)
+  │            │     REDIS: CLOSED (error rate: 0.1%)
+  └────────────┘
+
+Step 15: Response Assembly and Return
+  1. Worker confirms async processing
+  2. Enrich response with trace_id for debugging
+  3. Response assembled as JSON
+  4. Returned through load balancer
+  5. Response headers include:
+     X-Trace-Id: abc123def456
+     X-Cache: miss (from step 7)
+     X-RateLimit-Remaining: 987
+     X-Circuit-Breaker-Status: closed
+  6. Total: 45-200ms (write path is slower than read)
+  `}
+  alt="Write request lifecycle steps 10-15 showing primary database insert, cache invalidation, Kafka queue, trace context propagation to async workers, circuit breaker metrics update, and response assembly with observability headers"
+  caption="Steps 10-15: Write path, async processing with trace propagation, and response assembly"
+/>
+
+## Consistency During Scaling Events
+
+### Adding Nodes Mid-Operation
+
+Adding a database node while production traffic is flowing requires careful handling. There are three approaches:
+
+**Approach 1: Read-only node (safest)**
+```
+1. Provision new database instance with replicated schema
+2. Add it as a read replica (starts syncing from primary)
+3. Wait for replication lag to reach zero (monitor seconds_behind_master)
+4. Update connection pool config to include new replica
+5. Traffic gradually shifts to new node
+6. Zero errors, zero downtime
+```
+
+**Approach 2: Resharding (most complex)**
+
+When you need to change the number of shards (e.g., from 4 to 8), data must migrate. Consistent hashing minimizes the migration, but it still happens.
+
+<AsciiDiagram
+  title="Resharding: 4 Shards to 8 Shards"
+  content={`
+Before (4 shards):
+  Shard 0: users 0-25%     Shard 1: users 25-50%
+  Shard 2: users 50-75%    Shard 3: users 75-100%
+
+Migration process:
+  Phase 1: Add 4 new shards (4 to 8)
+    All data stays on old shards, new shards are empty
+    Write path: dual-write to old + new shard
+    Read path: read from old shard
+
+  Phase 2: Backfill new shards
+    Background job copies data from old to new shard
+    Monitored by comparing row counts and checksums
+
+  Phase 3: Switch reads to new shards
+    Read path: read from new shard, fall back to old on miss
+    Validate data integrity (sampling 1% of reads)
+
+  Phase 4: Remove old shards
+    Write path: new shard only
+    Read path: new shard only
+    Old shards decommissioned
+
+After (8 shards):
+  Shard 0: users 0-12.5%   Shard 1: 12.5-25%
+  ... through Shard 7
+  Total time: 72 hours for 10TB data
+  `}
+  alt="Four-phase resharding process from 4 to 8 shards showing dual-write, backfill, read switch, and old shard removal"
+  caption="Resharding is a multi-phase process that maintains data consistency throughout"
+/>
+
+**Approach 3: Auto-scaling cache nodes**
+
+Redis Cluster handles node addition automatically:
+```
+CLUSTER MEET <ip> <port>    # Joins new node to cluster
+CLUSTER ADDSLOTS <slot...>  # Assign hash slots to new node
+# Cluster automatically migrates keys from existing nodes
+# Migrations happen in batches of 10 keys
+# Client handles MOVED redirects transparently
+```
+
+### Hot Spots
+
+A hot spot occurs when one shard, partition, or node receives disproportionate traffic. Common causes:
+
+```
+Hot spot scenarios:
+  1. Celebrity effect: 1 user generates 10,000x normal traffic
+  2. Time-based: All users active at the same hour
+  3. Range-based: Keys sorted by creation date, all writes to latest shard
+  4. Hash collision: Multiple high-traffic keys map to same partition
+
+Detection:
+  - Per-shard latency monitoring (one shard has 5x latency)
+  - Partition request count distribution (standard deviation > 3x)
+  - Connection pool exhaustion on specific nodes
+
+Solutions:
+  - Split hot partition further (sub-partitioning)
+  - Add read replicas for hot data
+  - Cache aggressively for celebrity content
+  - Use write-ahead log (WAL) to batch writes to hot shards
+```
+
+## Performance: Concrete Numbers
+
+### Connection Limits
+
+| Database | Default max_connections | RAM per connection | Practical limit |
+|----------|------------------------|--------------------|-----------------|
+| PostgreSQL | 100 | ~2MB | 200-500 (with tuning) |
+| MySQL | 151 | ~500KB | 1000+ |
+| Redis | 10,000 | Negligible | 10,000 (file descriptor limit) |
+| MongoDB | 1000 | ~1MB | 2000 |
+
+### Throughput per Node
+
+| Component | Throughput (single node) | Bottleneck |
+|-----------|------------------------|------------|
+| Nginx reverse proxy | 50,000 RPS | Network bandwidth |
+| Express.js app server | 5,000-10,000 RPS | V8 event loop |
+| Python (Gunicorn) app server | 500-2,000 RPS | GIL, interpreter overhead |
+| PostgreSQL (read replica) | 5,000 QPS | Disk I/O |
+| PostgreSQL (primary, writes) | 1,000-5,000 QPS | WAL flush |
+| Redis (single node) | 100,000 ops/sec | Single-threaded CPU |
+| Kafka partition | 10,000-50,000 msg/sec | Disk throughput |
+| HAProxy | 1M+ RPS | Kernel socket handling |
+
+### Scaling Efficiency
+
+Not every additional node gives 100% throughput gain. There is always overhead from coordination, networking, and data distribution.
+
+**Amdahl's Law in depth:**
+
+The law states that the maximum speedup of a system is limited by the portion of work that cannot be parallelized.
+
+```
+Amdahl's Law:
+  Speedup = 1 / ((1 - P) + P/N)
+
+  Where:
+    P = proportion of work that can be parallelized
+    N = number of nodes
+```
+
+**Worked examples at different parallelization ratios:**
+
+```
+Example A: 50% parallelizable (P = 0.50)
+  2 nodes:   speedup = 1 / (0.50 + 0.50/2) = 1 / 0.75   = 1.33x
+  4 nodes:   speedup = 1 / (0.50 + 0.50/4) = 1 / 0.625  = 1.60x
+  10 nodes:  speedup = 1 / (0.50 + 0.50/10) = 1 / 0.55  = 1.82x
+  100 nodes: speedup = 1 / (0.50 + 0.50/100) = 1 / 0.505 = 1.98x
+  Max: 2x speedup (limited by 50% serial work)
+
+Example B: 90% parallelizable (P = 0.90)
+  2 nodes:   speedup = 1 / (0.10 + 0.90/2) = 1 / 0.55   = 1.82x
+  4 nodes:   speedup = 1 / (0.10 + 0.90/4) = 1 / 0.325  = 3.08x
+  10 nodes:  speedup = 1 / (0.10 + 0.90/10) = 1 / 0.19  = 5.26x
+  100 nodes: speedup = 1 / (0.10 + 0.90/100) = 1 / 0.109 = 9.17x
+  Max: 10x speedup (limited by 10% serial work)
+
+Example C: 95% parallelizable (P = 0.95)
+  2 nodes:   speedup = 1 / (0.05 + 0.95/2) = 1 / 0.525  = 1.90x
+  5 nodes:   speedup = 1 / (0.05 + 0.95/5) = 1 / 0.24   = 4.17x
+  10 nodes:  speedup = 1 / (0.05 + 0.95/10) = 1 / 0.145 = 6.90x
+  20 nodes:  speedup = 1 / (0.05 + 0.95/20) = 1 / 0.0975 = 10.26x
+  100 nodes: speedup = 1 / (0.05 + 0.95/100) = 1 / 0.0595 = 16.81x
+  Max: 20x speedup (limited by 5% serial work)
+```
+
+**Practical insight:** Doubling your nodes rarely doubles your throughput. At 95% parallelizability, moving from 10 nodes to 100 nodes (10x increase) only gives a 2.4x speedup gain. The serial 5% dominates at scale. To improve scaling efficiency, identify and reduce serial bottlenecks before adding more nodes.
+
+```
+Diminishing returns illustrated:
+  95% parallelizable:
+    Nodes:    1    2    5    10    20    50    100
+    Speedup:  1x  1.9x 4.2x 6.9x 10.3x 14.7x 16.8x
+    Gain per node: -  0.9x 0.8x 0.5x  0.3x  0.1x  0.04x
+
+  Each additional node contributes less than the previous one.
+```
+
+**Real-world efficiency factors:**
+
+- Network overhead: 0.5-2ms per inter-node call
+- Data consistency overhead: 10-30% write throughput penalty for synchronous replication
+- Load balancer overhead: 0.1-0.5ms per request
+- Serialization/deserialization: varies by format (JSON: ~0.5ms, Protobuf: ~0.1ms, Avro: ~0.15ms)
+- Lock contention: each mutex/ lock adds 0.1-1ms of serial wait time
+
+## Configuration
+
+### Autoscaling Thresholds
+
+| Metric | Scale-out threshold | Scale-in threshold | Cool-down |
+|--------|--------------------|--------------------|-----------|
+| CPU utilization | over 70% for 3 minutes | under 30% for 10 minutes | 60 seconds |
+| Memory utilization | over 80% for 5 minutes | under 50% for 15 minutes | 120 seconds |
+| Request queue depth | over 1,000 for 2 minutes | under 100 for 5 minutes | 60 seconds |
+| Average response time | over 500ms for 3 minutes | under 150ms for 10 minutes | 60 seconds |
+| Concurrent connections | over 80% of max for 5 min | under 40% of max for 10 min | 120 seconds |
+
+### Instance Configuration
+
+```
+Minimum instances: 2 (keep at least N+1 for availability)
+Maximum instances: 20 (or budget cap)
+Default instance count: 3
+
+Scaling step size:
+  - CPU-based: add 2 instances per breach
+  - Time-based: pre-warm 5 instances before peak hours (11:00, 18:00)
+
+Cool-down periods:
+  After scale-out: 180 seconds (let metrics stabilize before another decision)
+  After scale-in: 300 seconds (prevent rapid flapping)
+
+Warm-up time for new instances:
+  Container startup: 5-15 seconds
+  App initialization: 10-30 seconds
+  Connection pool warm-up: 5-10 seconds
+  Total: 20-55 seconds before instance serves traffic
+```
+
+### Connection Pool Sizing Formula
+
+```
+For an application server with 8 cores:
+  - Max concurrent worker threads: 8 * 4 = 32 (assumes IO-bound)
+  - Each thread needs 1 database connection at peak
+  - Connection pool: min(32, max_connections / app_servers)
+
+For 10 app servers with PostgreSQL max_connections = 200:
+  - Each pool: 200 / 10 = 20 max
+  - Subtract 5 for admin connections: 195 / 10 = 19 max per server
+  - Actual: 15 per server (leaves buffer for reporting tools)
+```
+
+### Connection Pool Tuning Scenarios
+
+Different workloads demand different pool configurations. The one-size-fits-all formula from above is a starting point, not an end state.
+
+<AsciiDiagram
+  id="scalability/deep-dive-extra1"
+  title="Connection Pool Tuning by Workload Type"
+  content={`
+┌────────────────────────────────────────────────────┐
+│           Connection Pool Tuning Matrix            │
+├────────────┬──────────┬──────────┬─────────────────┤
+│ Workload   │ Pool Min │ Pool Max │ Query Duration  │
+├────────────┼──────────┼──────────┼─────────────────┤
+│ OLTP       │    5     │   15     │  1-10ms         │
+│ (web API)  │          │          │                 │
+├────────────┼──────────┼──────────┼─────────────────┤
+│ Analytics  │   10     │   30     │  100ms-5s       │
+│ (reporting)│          │          │                 │
+├────────────┼──────────┼──────────┼─────────────────┤
+│ Batch      │   20     │   50     │  10ms-30s       │
+│ (ETL)      │          │          │                 │
+├────────────┼──────────┼──────────┼─────────────────┤
+│ Mixed      │    8     │   20     │  Variable       │
+│ (default)  │          │          │                 │
+└────────────┴──────────┴──────────┴─────────────────┘
+
+                ┌──────────────────────┐
+                │  Connection Wait     │
+                │  Time (timeout)      │
+                │                      │
+                │  OLTP:      500ms    │
+                │  Analytics: 5s       │
+                │  Batch:     30s      │
+                │  Mixed:     2s       │
+                └──────────────────────┘
+  `}
+  alt="Connection pool tuning matrix showing different min, max, and timeout values for OLTP, analytics, batch, and mixed workloads"
+  caption="Pool configuration must match your workload profile — OLTP needs small pools, batch needs large pools"
+/>
+
+**Scenario 1: OLTP web API (high concurrency, fast queries)**
+
+```
+Workload: 5000 req/s, each query takes 2-5ms
+Pool config:
+  min_size: 5           # enough for baseline traffic
+  max_size: 15          # 15 concurrent queries saturates a PG replica
+  max_idle: 60          # short idle: traffic is constant
+  timeout: 500ms        # fail fast: don't queue, return 503
+  max_lifetime: 1800    # recycle every 30 minutes to avoid connection bloat
+  queue_size: 50        # small buffer for micro-bursts
+
+Key constraint: DB max_connections / app_servers
+  If 200 connections / 10 servers = 20 max per pool
+  Setting max_size = 15 leaves headroom for admin connections
+```
+
+**Scenario 2: Analytics dashboard (slow queries, few users)**
+
+```
+Workload: 50 concurrent dashboards, each query takes 500ms-5s
+Pool config:
+  min_size: 10          # dashboards always connected
+  max_size: 30          # 30 concurrent slow queries
+  max_idle: 600         # keep warm during idle periods
+  timeout: 5000ms       # analytics users expect slower responses
+  max_lifetime: 3600    # standard 1-hour recycle
+
+Key risk: Long-running queries starve the pool
+  Mitigation: statement_timeout = 30s in PostgreSQL
+  Mitigation: separate read replica for analytics traffic
+```
+
+**Scenario 3: Batch ETL pipeline (throughput critical)**
+
+```
+Workload: 10 concurrent workers, each runs 50 queries per batch
+Pool config:
+  min_size: 20          # pre-warm for batch window
+  max_size: 50          # aggressive parallelism for speed
+  max_idle: 120         # batch is time-bounded, recycle quickly
+  timeout: 30000ms      # batch queries can be slow
+  max_lifetime: 900     # recycle every 15 minutes during batch
+
+Key risk: Pool exhaustion blocks entire pipeline
+  Mitigation: connection_should_create = lazy
+  Mitigation: exponential backoff on pool acquisition failure
+```
+
+**Shared configuration for all scenarios:**
+
+```
+Connection validation:
+  test_on_borrow: true
+  test_query: SELECT 1
+  test_while_idle: true
+  idle_test_interval: 120
+
+Health monitoring:
+  log_exhausted: true
+  metrics_exporter: prometheus
+  pool_usage_labels:
+    - active_connections
+    - idle_connections
+    - pending_requests
+    - connection_create_count
+    - connection_destroy_count
+```
+
+### Real Configuration Files
+
+You need concrete configs you can deploy, not abstract formulas. Here are production-ready configurations for the three most critical components.
+
+**PostgreSQL (postgresql.conf — tuned for web workload, 8GB RAM, 4 vCPUs)**
+
+```
+# Connection settings
+max_connections = 200
+superuser_reserved_connections = 10
+
+# Memory
+shared_buffers = 2GB              # 25% of total RAM
+effective_cache_size = 6GB        # 75% of total RAM
+work_mem = 32MB                   # per-operation sort memory
+maintenance_work_mem = 512MB      # for VACUUM, index creation
+wal_buffers = 16MB
+
+# Write-ahead log
+wal_level = replica               # enables streaming replication
+wal_buffers = 16MB
+max_wal_size = 4GB
+min_wal_size = 1GB
+checkpoint_timeout = 15min
+checkpoint_completion_target = 0.9
+
+# Query tuning
+random_page_cost = 1.1            # for SSD (default 4.0 for HDD)
+effective_io_concurrency = 200    # SSDs can handle concurrent I/O
+default_statistics_target = 100   # improve query planner accuracy
+
+# Connection pool awareness
+tcp_keepalives_idle = 60
+tcp_keepalives_interval = 10
+tcp_keepalives_count = 6
+statement_timeout = 30000         # 30 seconds max query time
+idle_in_transaction_session_timeout = 60000
+```
+
+**Redis (redis.conf — cache workload, 4GB maxmemory)**
+
+```
+# Memory management
+maxmemory 4gb
+maxmemory-policy allkeys-lru      # evict least-recently-used keys
+maxmemory-samples 10              # accuracy of LRU sampling
+
+# Persistence (minimal — cache can be rebuilt)
+save ""                           # disable RDB snapshots
+appendonly no                     # disable AOF
+
+# Network
+tcp-backlog 511
+timeout 300
+tcp-keepalive 300
+
+# Connection
+maxclients 10000
+
+# Performance tuning
+hz 10                             # frequency of key expiry checks
+lazyfree-lazy-eviction yes        # async eviction — no latency spike
+lazyfree-lazy-expire yes
+activedefrag yes                  # online defragmentation
+active-defrag-threshold-lower 10
+active-defrag-threshold-upper 100
+active-defrag-cycle-min 5
+active-defrag-cycle-max 75
+
+# Slow log
+slowlog-log-slower-than 10000     # log queries over 10ms
+slowlog-max-len 128
+```
+
+**Nginx (nginx.conf — reverse proxy, 16 worker processes)**
+
+```
+worker_processes 16;
+worker_rlimit_nofile 65535;
+
+events {
+    worker_connections 10240;      # connections per worker
+    use epoll;                     # efficient event loop on Linux
+    multi_accept on;               # accept all new connections at once
+}
+
+http {
+    # Basic
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    keepalive_requests 1000;
+    types_hash_max_size 2048;
+
+    # Buffer tuning (prevent slow-client DoS)
+    client_body_buffer_size 128k;
+    client_max_body_size 10m;
+    client_header_buffer_size 1k;
+    large_client_header_buffers 4 8k;
+    output_buffers 32 32k;
+    postpone_output 1460;
+
+    # Timeouts
+    client_body_timeout 12;
+    client_header_timeout 12;
+    send_timeout 10;
+
+    # Upstream (app servers)
+    upstream app_backend {
+        least_conn;                # or ip_hash, or default (round-robin)
+        server 10.0.1.10:3000 max_fails=3 fail_timeout=30s;
+        server 10.0.1.11:3000 max_fails=3 fail_timeout=30s;
+        server 10.0.1.12:3000 max_fails=3 fail_timeout=30s;
+        keepalive 256;             # connection reuse to backends
+    }
+
+    # Compression
+    gzip on;
+    gzip_vary on;
+    gzip_types text/plain text/css application/json;
+    gzip_min_length 1000;
+    gzip_proxied any;
+
+    # Rate limiting
+    limit_req_zone $binary_remote_addr zone=api:10m rate=1000r/s;
+    limit_req zone=api burst=2000 nodelay;
+
+    # Logging (JSON for log aggregation)
+    log_format json_analytics escape=json
+        '{'
+            '"time_local":"$time_local",'
+            '"remote_addr":"$remote_addr",'
+            '"request":"$request",'
+            '"status":$status,'
+            '"body_bytes_sent":$body_bytes_sent,'
+            '"request_time":$request_time,'
+            '"upstream_response_time":"$upstream_response_time",'
+            '"http_referrer":"$http_referer",'
+            '"http_user_agent":"$http_user_agent"'
+        '}';
+    access_log /var/log/nginx/access.log json_analytics buffer=32k flush=5s;
+}
+```
+
+## Scalability Testing
+
+Theoretical scaling models are useful, but you must validate them with real traffic patterns. Testing reveals where your system breaks before production users find it.
+
+<AsciiDiagram
+  id="scalability/deep-dive-extra2"
+  title="Scalability Testing Spectrum"
+  content={`
+┌─────────────────────────────────────────────────────────┐
+│              Scalability Testing Spectrum               │
+├──────────────┬──────────────┬───────────┬───────────────┤
+│  Load Test   │  Stress Test │ Spike Test│  Soak Test    │
+├──────────────┼──────────────┼───────────┼───────────────┤
+│ Gradual      │ Beyond       │ Sudden    │ Sustained     │
+│ increase to  │ breaking     │ massive   │ moderate      │
+│ target       │ point        │ surge     │ load          │
+│ throughput   │              │           │               │
+├──────────────┼──────────────┼───────────┼───────────────┤
+│ "Can it      │ "Where does  │ "Does     │ "Does it      │
+│  handle      │  it break?"  │  auto-    │  degrade      │
+│  10K req/s?" │              │  scaling  │  over 24h?"   │
+│              │              │  recover?"│               │
+├──────────────┼──────────────┼───────────┼───────────────┤
+│ Duration:    │ Duration:    │ Duration: │ Duration:     │
+│ 15-30 min    │ 5-10 min     │ 1-5 min   │ 24-72 hours   │
+│              │              │           │               │
+│ Ramp-up:     │ Ramp-up:     │ Spike:    │ Ramp-up:      │
+│ linear 5 min │ fast 1-2 min │ instant   │ linear 10 min │
+└──────────────┴──────────────┴───────────┴───────────────┘
+
+Scale threshold markers:
+  10K req/s ─────> Load balancer CPU reaches 60%
+  20K req/s ─────> App server connection pool saturates
+  30K req/s ─────> Database read replica hits 90% CPU
+  50K req/s ─────> Backend services return 503 consistently
+  `}
+  alt="Scalability testing spectrum showing four test types: load, stress, spike, and soak with their durations, ramp patterns, and breakpoint markers"
+  caption="Each test type validates a different aspect of system scalability"
+/>
+
+### Load Testing
+
+Load testing answers: can the system handle the expected traffic within acceptable latency?
+
+**Target metrics for a web API:**
+
+```
+P99 latency: under 500ms at target throughput
+P95 latency: under 200ms at target throughput
+Error rate: <0.1% at target throughput
+Throughput degradation: under 10% across load steps
+```
+
+**k6 example script:**
+
+```javascript
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '5m', target: 1000 },  // ramp up to 1000 VUs
+    { duration: '10m', target: 1000 }, // hold
+    { duration: '5m', target: 0 },     // ramp down
+  ],
+  thresholds: {
+    http_req_duration: ['p(95)under 200', 'p(99)under 500'],
+    http_req_failed: ['rateunder 0.001'],
+  },
+};
+
+export default function () {
+  const res = http.get('https://api.dishfind.com/restaurants?lat=35.6&lon=139.7');
+  check(res, { 'status was 200': (r) => r.status === 200 });
+  sleep(1);
+}
+```
+
+**Locust equivalent:**
+
+```python
+from locust import HttpUser, task, between
+
+class RestaurantUser(HttpUser):
+    wait_time = between(0.5, 2.0)
+
+    @task
+    def get_restaurants(self):
+        self.client.get(
+            "/restaurants?lat=35.6&lon=139.7",
+            headers={"Authorization": "Bearer test-token"},
+            name="/restaurants"
+        )
+```
+
+### Stress Testing
+
+Stress testing answers: where does the system break and how does it fail?
+
+**wrk2 example (focused throughput test):**
+
+```bash
+# Push to 20,000 req/s for 60 seconds with 100 connections
+wrk2 -t 10 -c 100 -d 60s -R 20000 \
+  --latency \
+  https://api.dishfind.com/restaurants?lat=35.6&lon=139.7
+```
+
+**What to observe during stress:**
+```
+Metric                     Warning      Critical     Action
+─────────────────────────────────────────────────────────
+Response time P99           >500ms       >2s          Scale out
+Error rate (5xx)            >1%          >5%          Rollback or shed load
+Connection pool wait        >100ms       >1s          Increase pool or limit concurrency
+CPU (app server)            >80%         >95%         Scale out
+CPU (database)              >70%         >90%         Add read replica
+Memory                      >80%         >95%         Investigate leak or scale
+Queue depth (app)           >1000        >5000        Scale out or rate-limit
+```
+
+### Spike Testing
+
+Spike testing answers: does the system survive sudden traffic surges without crashing?
+
+**Common spike scenarios:**
+```
+1. Flash sale: 100x normal traffic in 30 seconds
+   Test: ramp from 100 to 10,000 VUs in 10 seconds
+   Watch: auto-scaling lag, cache stampede, DB connection surge
+
+2. Post-event surge: users all refresh after a live event
+   Test: drop load to 50% for 5 min, then surge back to 200%
+   Watch: cache warming, connection pool re-establishment
+
+3. Dependency recovery: upstream service comes back online
+   Test: fail a dependency for 2 min, then restore it
+   Watch: thundering herd, queue backlog drain rate
+```
+
+**Spike test in k6:**
+
+```javascript
+export const options = {
+  scenarios: {
+    spike: {
+      executor: 'ramping-vus',
+      stages: [
+        { duration: '2m', target: 100 },    // steady
+        { duration: '10s', target: 5000 },   // spike
+        { duration: '3m', target: 5000 },    // hold at peak
+        { duration: '2m', target: 100 },     // recovery
+      ],
+    },
+  },
+};
+```
+
+### Soak Testing
+
+Soak testing answers: does performance degrade over extended periods? Memory leaks, connection leaks, and slow resource exhaustion only appear with time.
+
+```
+Soak test profile:
+  Duration: 24-72 hours
+  Load level: 60-80% of peak expected throughput
+  Monitoring cadence: every 5 minutes
+
+Key metrics to track over time:
+  Metric               Expected          Warning
+  ───────────────────────────────────────────────
+  Response time drift  under 5% over 24h     >20% increase
+  Memory growth        under 100MB over 24h  >500MB increase
+  Connection count     Stable (under 10%)    >25% increase
+  Error rate           <0.01%           >0.1%
+  GC pause time        under 50ms avg        >200ms avg
+  DB connection count  Stable           Creeping up (leak)
+```
+
+## Monitoring Scalability
+
+You cannot tune what you do not measure. A scaled system needs layered observability — metrics at every hop.
+
+<AsciiDiagram
+  id="scalability/deep-dive-extra3"
+  title="Monitoring Layers in a Scaled System"
+  content={`
+┌──────────────────────────────────────────────────┐
+│              Monitoring by Layer                 │
+├──────────────┬───────────────────┬───────────────┤
+│    Layer     │   Key Metrics    │   Threshold   │
+├──────────────┼───────────────────┼───────────────┤
+│              │ Active connections│               │
+│   Load      │ Requests per sec  │ <80% of max   │
+│   Balancer  │ Error rate (5xx)  │ <0.1%         │
+│              │ Latency P99       │ under 500ms        │
+│              │ Connection queue  │ under 100          │
+├──────────────┼───────────────────┼───────────────┤
+│              │ CPU utilization   │ <70%          │
+│   App        │ Memory usage      │ <80%          │
+│   Server     │ GC pause time     │ under 100ms        │
+│              │ Thread pool usage │ <80%          │
+│              │ Request queue     │ under 1000         │
+├──────────────┼───────────────────┼───────────────┤
+│              │ Hit ratio         │ >90%          │
+│   Cache      │ Eviction rate     │ <1% of total  │
+│   (Redis)    │ Memory usage      │ <80% of max   │
+│              │ Command latency   │ under 5ms P99      │
+│              │ Keyspace misses   │ under 10% of gets  │
+├──────────────┼───────────────────┼───────────────┤
+│              │ Connections       │ <80% of max   │
+│   Database   │ Active queries    │ <pool_size    │
+│   (PG)       │ Replication lag   │ under 5 seconds    │
+│              │ Cache hit ratio   │ >99% (shared) │
+│              │ Disk IO wait      │ under 10ms avg     │
+├──────────────┼───────────────────┼───────────────┤
+│              │ Queue depth       │ under 1000         │
+│   Queue      │ Consumer lag      │ under 10,000 msg   │
+│   (Kafka)    │ Message rate      │ <75% of max   │
+│              │ Partition skew    │ under 20%          │
+│              │ Under-replicated  │ 0             │
+└──────────────┴───────────────────┴───────────────┘
+
+Alert routing:
+  P0 (Critical):   Page on-call (SLA breach imminent)
+  P1 (Warning):    Slack notification (investigate within 1h)
+  P2 (Info):       Dashboard annotation (post-mortem reference)
+  `}
+  alt="Monitoring layers table showing key metrics and thresholds for load balancer, app server, cache, database, and queue layers with severity-based alert routing"
+  caption="Each layer of the stack has distinct metrics and thresholds — monitor them all"
+/>
+
+### Load Balancer Monitoring
+
+```
+Key metrics (from ALB/NGINX metrics):
+  active_connections  Gauge     Currently open connections
+  request_count       Rate      req/s over 1-minute window
+  target_response_time Histogram P50, P95, P99 of backend latency
+  error_5xx_count     Rate      Upstream server errors
+  rejected_count      Rate      Rate-limited requests (429)
+
+Alert: response_time_p99 > 1s for 5 minutes  ──> P1
+Alert: error_5xx_rate > 1% for 3 minutes     ──> P0
+Alert: rejected_count > 10% of total traffic  ──> P1
+```
+
+### Application Server Monitoring
+
+```
+Key metrics (from Prometheus + app instrumentation):
+  http_requests_total          Rate     req/s by route and method
+  http_request_duration_seconds Histogram Latency by percentile
+  go_goroutines / node_eventloop_lag  Gauge  Runtime health
+  db_connection_pool_usage     Gauge    active / idle / waiting
+  cache_hit_ratio              Rate     hits / (hits + misses)
+  circuit_breaker_state        Gauge    0=closed, 1=half, 2=open
+
+Alert: p99_latency > 500ms for 5 minutes         ──> P1
+Alert: pool_usage > 80% for 3 minutes            ──> P1
+Alert: circuit_breaker_state == 2 for any service  ──> P0
+Alert: error_rate > 1% for 2 minutes              ──> P0
+```
+
+### Cache Monitoring
+
+```
+Key metrics (Redis INFO command + Prometheus exporter):
+  redis_keyspace_hits          Rate     Successful cache lookups
+  redis_keyspace_misses        Rate     Cache misses
+  redis_memory_used_bytes      Gauge    Current memory usage
+  redis_connected_clients      Gauge    Active client connections
+  redis_evicted_keys           Rate     Keys evicted due to maxmemory
+
+Alert: hit_ratio < 80% for 10 minutes          ──> P1
+Alert: memory_usage > 85% of maxmemory         ──> P1
+Alert: eviction_rate > 100/sec for 5 minutes   ──> P1
+```
+
+### Database Monitoring
+
+```
+Key metrics (pg_stat_* + pg_stat_replication):
+  pg_active_connections           Gauge     Connections executing queries
+  pg_waiting_connections          Gauge     Connections waiting on lock
+  pg_cache_hit_ratio              Rate      (shared_hits * 100) / total
+  pg_replication_lag_bytes        Gauge     Bytes behind primary
+  pg_transaction_duration_seconds Histogram Query latency
+  pg_index_bloat_ratio            Gauge     Percentage of wasted index space
+
+Alert: cache_hit_ratio < 95% for 15 minutes        ──> P0
+Alert: replication_lag > 30 seconds                 ──> P0
+Alert: waiting_connections > 10 for 5 minutes       ──> P1
+Alert: active_connections > 80% of max_connections   ──> P0
+```
+
+### Queue Monitoring
+
+```
+Key metrics (Kafka JMX / consumer metrics):
+  kafka_log_end_offset              Gauge    Latest message offset per partition
+  kafka_consumer_lag                Gauge    Offset lag per consumer group
+  kafka_messages_in_rate            Rate     Messages produced per second
+  kafka_request_handler_avg_idle    Gauge    Broker capacity (high is good)
+  kafka_partition_under_replicated  Gauge    Partitions missing replicas
+
+Alert: consumer_lag > 10000 for 5 minutes     ──> P1
+Alert: under_replicated > 0 for 2 minutes     ──> P0
+Alert: handler_idle under 20% for 5 minutes       ──> P1
+```
+
+## Thundering Herd Prevention
+
+A thundering herd occurs when a cache miss or resource recovery triggers a stampede of concurrent requests to the same backend. This can cascade into a full outage.
+
+<AsciiDiagram
+  id="scalability/deep-dive-extra4"
+  title="Thundering Herd: Before and After Prevention"
+  content={`
+Before prevention (cache miss cascade):
+  Time ────────────────────────────────────>
+  100 reqs ──> Cache key expired ──> All 100 hit DB
+  100 reqs ──> DB CPU jumps to 95%
+  100 reqs ──> New requests queue up
+  100 reqs ──> Connection pool exhausted
+  100 reqs ──> 503 errors returned to clients
+
+After prevention:
+  Time ────────────────────────────────────>
+  100 reqs ──> Cache key expired
+  1st req  ──> Re-compute value ──> DB query (20ms)
+  99 reqs  ──> Wait on lock or stale cache
+  99 reqs  ──> Read stale value or mutex wait
+  1st req  ──> Writes new cache entry
+  99 reqs  ──> Read fresh cache value (2ms)
+  Traffic normalizes ──> DB stays at 10% CPU
+  `}
+  alt="Comparison of thundering herd behavior before and after prevention showing 100 concurrent requests cascading to database failure versus a single request computing the value while others wait"
+  caption="Thundering herd prevention transforms a stampede into a single computation" />
+
+
+### Strategy 1: Mutex-Based Cache Recompute
+
+Use a distributed lock so only one process recomputes the cached value. Others either wait or serve stale data.
+
+```python
+import redis
+import time
+
+r = redis.Redis(host="cache-cluster", decode_responses=True)
+
+def get_restaurants(lat, lon):
+    cache_key = f"restaurants:{lat}:{lon}"
+    lock_key = f"lock:{cache_key}"
+
+    # Attempt cache read
+    cached = r.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Acquire distributed lock (10 second TTL prevents deadlock)
+    lock_acquired = r.set(lock_key, "locked", nx=True, ex=10)
+    if lock_acquired:
+        try:
+            # Double-check cache (another process may have written it)
+            cached = r.get(cache_key)
+            if cached is not None:
+                return cached
+
+            # Expensive computation — only one process runs this
+            result = query_database(lat, lon)
+            r.setex(cache_key, 60, result)
+            return result
+        finally:
+            r.delete(lock_key)
+    else:
+        # Lock held by another process — wait and retry
+        time.sleep(0.050)  # 50ms backoff
+        cached = r.get(cache_key)
+        if cached is not None:
+            return cached
+        # Fallback: compute anyway after waiting
+        return query_database(lat, lon)
+```
+
+### Strategy 2: Stale-While-Revalidate
+
+Serve stale data immediately while asynchronously refreshing the cache. This eliminates waiting entirely. Cloudflare, Varnish, and Fastly all support this pattern.
+
+```python
+def get_restaurants_swr(lat, lon):
+    cache_key = f"restaurants:{lat}:{lon}"
+    stale_key = f"stale:{cache_key}"
+
+    # Try fresh cache first
+    cached = r.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Serve stale data immediately
+    stale = r.get(stale_key)
+    if stale is not None:
+        # Trigger async refresh in background
+        r.lpush("cache_refresh_queue", cache_key)
+        return stale
+
+    # No cache at all — must compute synchronously
+    result = query_database(lat, lon)
+    r.setex(cache_key, 60, result)
+    r.setex(stale_key, 300, result)  # stale lives 5 minutes
+    return result
+```
+
+### Strategy 3: Probabilistic Early Expiration
+
+Randomize cache expiry to prevent all keys from expiring simultaneously. This is the simplest prevention and works well for bulk key expiration.
+
+```python
+import random
+
+def compute_ttl(base_ttl=60, jitter_range=0.2):
+    """
+    Returns a TTL with +-20% jitter applied.
+    base_ttl=60 returns values between 48 and 72 seconds.
+    """
+    jitter = base_ttl * jitter_range
+    return base_ttl + random.uniform(-jitter, jitter)
+
+# Usage:
+# r.setex(cache_key, compute_ttl(60, 0.2), result)
+```
+
+### Strategy 4: Request Coalescing
+
+Batch concurrent requests for the same resource into a single backend call. This is effective for API gateways and BFF (Backend for Frontend) layers.
+
+```python
+import asyncio
+from collections import defaultdict
+
+class RequestCoalescer:
+    def __init__(self):
+        self._pending = defaultdict(list)
+
+    async def get_or_compute(self, key, compute_fn):
+        # Fast path: already computing?
+        future = asyncio.get_event_loop().create_future()
+
+        if key not in self._pending:
+            # First request — start computation
+            self._pending[key] = [future]
+            try:
+                result = await compute_fn()
+                for waiter in self._pending[key]:
+                    waiter.set_result(result)
+            except Exception as e:
+                for waiter in self._pending[key]:
+                    waiter.set_exception(e)
+                raise
+            finally:
+                del self._pending[key]
+        else:
+            # Subsequent request — join existing computation
+            self._pending[key].append(future)
+
+        return await future
+```
+
+### Production Checklist for Thundering Herd Prevention
+
+```
+1. Distributed locking:              Redis SET NX or Redlock
+2. Stale-while-revalidate:           Serve old data, refresh async
+3. TTL jitter:                       Randomize expiration times
+4. Request coalescing:               Batch identical requests
+5. Cache warming:                    Pre-compute hot keys on deploy
+6. Circuit breaker on cache miss:    Limit concurrent recompute ops
+7. Rate-limit recompute operations:  Separate throttle for cache fills
+8. Graceful degradation:             Serve degraded response on miss
+```
+
+The mechanisms described here — consistent hashing, connection pools, thread pools, queues, replication, circuit breakers, distributed tracing, and thundering herd prevention — are the building blocks that compose into production architectures. The next article walks through a complete architecture diagram and traces a request end-to-end through a real-world scaled system.

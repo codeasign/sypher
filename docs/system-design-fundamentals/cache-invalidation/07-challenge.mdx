@@ -1,0 +1,265 @@
+---
+id: cache-invalidation-challenge
+title: "Cache Invalidation — Challenges"
+position: 7
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Tier 1: Core Understanding
+
+### Challenge 1.1: TTL vs Event-Driven
+
+You are designing the caching layer for a news website. Articles are published and then rarely updated. A correction to a published article happens approximately once per 1,000 articles. Readers should see corrections within 30 seconds.
+
+**Your task.** Design the invalidation strategy. Compare a TTL-only approach with an event-driven approach. Which do you choose and why? Include the TTL value you would use and explain how the staleness window behaves.
+
+**Model answer.**
+
+For this use case, a hybrid approach works best: event-driven invalidation as the primary mechanism with a TTL safety net.
+
+The event-driven approach works as follows: when a correction is published, the publishing system emits an invalidation event (for example, "article:42 corrected"). The invalidation consumer receives the event and deletes the article's cache key. The next read misses, queries the database, and gets the corrected content. The staleness window is the event propagation time (typically under 100ms) plus the cache miss time.
+
+The TTL safety net is set to 300 seconds. If the event pipeline fails (for example, the consumer crashes), articles are still refreshed within 5 minutes. This is acceptable because corrections are rare.
+
+With TTL-only invalidation, a 30-second staleness requirement forces a 30-second TTL. This means every article is re-read from the database every 30 seconds, even if no correction was published. For a site with 10,000 articles and 100,000 reads per second, a 30-second TTL means approximately 3,300 cache misses per second, all hitting the database. This is wasteful when 99.9% of articles are never corrected.
+
+The event-driven approach adds complexity (a CDC or event pipeline) but dramatically reduces database load. The cost of the pipeline is justified because corrections are rare but time-sensitive.
+
+### Challenge 1.2: Cache Invalidation in a Monolith
+
+You are building a monolithic application that uses a single Redis cache. The application has one writer process and ten reader processes. Data changes every 30 seconds on average. The application should never serve data older than 10 seconds.
+
+**Your task.** Design the simplest invalidation strategy that meets the freshness requirement. No event bus, no CDC, no additional infrastructure.
+
+**Model answer.**
+
+Use explicit invalidation from the writer process. After the writer updates the database, it publishes an invalidation message through Redis pub/sub. All reader processes subscribe to the invalidation channel and delete the affected cache keys from their local cache (or from the shared Redis cache).
+
+```python
+# Writer process
+def update_product(product_id, new_data):
+    db.update(product_id, new_data)
+    redis.publish("cache:invalidation", product_id)
+
+# Reader process (subscribes on startup)
+def on_invalidation_message(channel, product_id):
+    cache_key = f"product:{product_id}"
+    redis.delete(cache_key)
+
+def get_product(product_id):
+    cache_key = f"product:{product_id}"
+    result = redis.get(cache_key)
+    if result is None:
+        result = db.query(product_id)
+        redis.setex(cache_key, 300, result)  # TTL safety net
+    return result
+```
+
+Add a TTL of 300 seconds as a safety net. If the pub/sub message is lost, the stale entry persists for at most 300 seconds, which violates the 10-second freshness requirement. To compensate, use a shorter TTL (10 seconds) as a stricter safety net. This means every entry is refreshed every 10 seconds even without invalidation, but the cache miss rate is acceptable for a single-writer system.
+
+The combination of explicit invalidation (sub-second staleness for most updates) and a 10-second TTL (catches missed invalidations) meets the requirement with minimal infrastructure.
+
+### Challenge 1.3: Invalidating Aggregate Data
+
+Your application caches aggregate queries: "total sales for this month," "average order value," "number of active users." These aggregates are computed from thousands of individual records. When a single order is placed, the "total sales" and "average order value" aggregates become stale.
+
+**Your task.** Design the invalidation strategy for these aggregates. Invalidation events are triggered by individual order placements (10,000 per second), but the aggregates are read 100,000 times per second.
+
+**Model answer.**
+
+Invalidating aggregates on every individual data change is the wrong approach. With 10,000 writes per second, each invalidating the aggregates, the aggregates would be permanently invalid. Every read would miss and recompute the aggregate from scratch, defeating the purpose of caching.
+
+Instead, use time-based invalidation (TTL only) for aggregates. Set the TTL to the acceptable staleness for the business. For example:
+
+- "Total sales this month": 60-second TTL. Sales totals change slowly relative to the total; a 60-second delay is acceptable.
+- "Average order value": 300-second TTL. This metric is used for trend analysis; a 5-minute delay is acceptable.
+- "Active users": 30-second TTL. This is a near-real-time metric; a 30-second delay is acceptable.
+
+For critical aggregates that must be fresh (for example, "current inventory count"), avoid caching the aggregate entirely. Use a database query that runs in under 10ms with proper indexing. Some data is too hot to cache safely.
+
+If you must cache an aggregate and trigger it from individual writes, use a batching approach: buffer invalidation events for 1-2 seconds, then recompute the aggregate once. This reduces the invalidation rate from 10,000/s to 1/s.
+
+## Tier 2: Applied Design
+
+### Challenge 2.1: The Hot-Key Invalidation Problem
+
+A popular product on your e-commerce site receives 50,000 reads per second. The product's inventory count is updated 100 times per second (each sale decrements inventory). The cache entry has a 10-second TTL. Because the key is so hot, every cache node in the cluster holds a copy.
+
+Each inventory update triggers a write-invalidate, which must be broadcast to all nodes. The invalidation storm causes 100 invalidations per second across 10 cache nodes, each invalidating the same key. Between invalidations, the key is re-populated by the next read, which all 50,000 readers compete for.
+
+**Your task.** Redesign the invalidation strategy for this hot key. The inventory must never be more than 5 seconds stale. The system should not create a thundering herd on the database.
+
+**Model answer.**
+
+Replace write-invalidate with write-update for this hot key. Instead of deleting the cache entry and causing a cache miss, send the new value directly to the cache.
+
+```python
+# Instead of:
+redis.delete("product:42:inventory")
+
+# Use:
+redis.set("product:42:inventory", new_count, ex=5)
+```
+
+Write-update avoids the cache miss entirely. Every read of the inventory count is served from the cache. The cache is always fresh because the value is pushed on every update.
+
+The concern is bandwidth: sending the new value 100 times per second to 10 nodes = 1,000 writes/s. Each value is a small integer (4 bytes plus key overhead). Total bandwidth is under 1 MB/s — negligible.
+
+Set the TTL to 5 seconds as a safety net. If the write-update fails (for example, the cache node is unreachable), the TTL ensures the value is refreshed within 5 seconds.
+
+For even higher throughput, batch inventory updates: aggregate 10 updates into a single write-update every 100ms. This reduces the write rate from 100/s to 10/s while keeping staleness under 100ms.
+
+### Challenge 2.2: Cross-Service Invalidation
+
+You have three microservices that each cache different views of the same user data:
+
+- **Profile service**: caches user profile (name, bio, avatar URL).
+- **Feed service**: caches posts authored by the user.
+- **Search service**: caches the user document for search indexing.
+
+When a user updates their avatar, only the profile service is directly involved. The feed service and search service also cache data that references the avatar, but they do not know about the update.
+
+**Your task.** Design an invalidation system that ensures all three services invalidate their affected cache entries when a user updates their avatar. You cannot modify the feed or search services to check the avatar on every read (too expensive).
+
+**Model answer.**
+
+Use tag-based invalidation with a shared event bus.
+
+1. The profile service publishes an invalidation event to the shared event bus: `{"type": "user.avatar.updated", "user_id": 123, "tags": ["user:123"]}`.
+2. All three services subscribe to the event bus and maintain a tag registry mapping tags to their local cache keys.
+3. When the event arrives, each service looks up its tag registry for tag "user:123":
+   - Profile service: `["profile:user:123"]` → deletes this key.
+   - Feed service: `["feed:user:123:posts", "feed:all:avatar_thumbnails"]` → deletes these keys.
+   - Search service: `["search:doc:user:123"]` → deletes this key.
+4. Each service invalidates only the keys in its own cache. There is no shared cache cluster.
+
+The tag registry is maintained locally by each service. When a cache entry is created, the service registers its tags. When a cache entry is deleted or evicted, the service removes its tags. The tag registry must stay consistent with the cache contents.
+
+If the event bus is unavailable, the TTL safety net on each service's cache ensures eventual recovery. Each service should set TTL values based on its staleness requirements: profile service (60 seconds), feed service (300 seconds), search service (600 seconds).
+
+### Challenge 2.3: Cache Invalidation with Database Replicas
+
+Your application uses a database with a primary (write) node and two read replicas. The cache sits in front of the read replicas. Writes go to the primary. Reads go to the replicas (through the cache).
+
+The problem: a write goes to the primary, which triggers cache invalidation. The cache is invalidated and the next read is a miss. The read goes to a replica. But the replica has not yet received the write from the primary (replication lag of 50-100ms). The replica returns the old data. The cache populates with the old data. The 'invalidation' has made things worse: instead of serving stale data from the cache, you are now serving stale data from the database.
+
+**Your task.** Design a solution to this read-after-write inconsistency problem.
+
+**Model answer.**
+
+This is a well-known problem in database-cache-coherence. Multiple solutions exist, each with different trade-offs.
+
+**Solution A: Read-Your-Writes Consistency.** After a write, the writer stores a marker in the cache: `"user:123:write_marker" = timestamp`. For a configurable period (for example, 1 second), any read for `user:123` must go to the primary database, not the replica. After the period expires (by which point replication should have completed), reads can go to replicas.
+
+```python
+def write_user(user_id, data):
+    primary_db.update(user_id, data)
+    # Invalidate cache and set write marker
+    redis.delete(f"user:{user_id}")
+    redis.setex(f"user:{user_id}:write_marker", 1, time.now())
+
+def read_user(user_id):
+    # Check if there was a recent write
+    if redis.exists(f"user:{user_id}:write_marker"):
+        # Go to primary to ensure freshness
+        return primary_db.query(user_id)
+    # Normal cache-aside with replica
+    result = cache.get(f"user:{user_id}")
+    if result is None:
+        result = replica_db.query(user_id)
+        cache.setex(f"user:{user_id}", 300, result)
+    return result
+```
+
+**Solution B: Write-Cache Update.** After writing to the primary, write the new value directly to the cache (write-update). Cache reads always return the latest value, regardless of replica state. The cache becomes the source of truth for the most recent writes.
+
+```python
+def write_user(user_id, data):
+    primary_db.update(user_id, data)
+    # Write through to cache immediately
+    cache.set(f"user:{user_id}", data, ex=300)
+```
+
+**Solution C: Stale-While-Revalidate.** Serve the stale cached value while asynchronously refreshing from a replica. If the replica returns stale data, the next refresh will fix it. The staleness window is bounded by the refresh interval (100ms-1s).
+
+**Recommendation.** For this use case, Solution B (write-cache update) is the simplest and most effective. The writer already has the new value; sending it to the cache is trivial. The cache is always fresh, bypassing the replica lag problem entirely.
+
+## Tier 3: Complex Systems
+
+### Challenge 3.1: Multi-Region Invalidation with Global Writes
+
+Your application serves users in three regions. Writes can originate from any region (not just a single primary). Each region has its own cache cluster and its own database instance. Database writes are replicated to all regions asynchronously.
+
+A user in EU-West updates their profile. The write goes to the EU-West database. The EU-West cache is invalidated immediately. But a user in AP-Southeast still sees the old profile because:
+
+1. The AP-Southeast cache has the old value and has not been invalidated.
+2. The AP-Southeast database has not received the replication from EU-West.
+
+**Your task.** Design a cache invalidation system that ensures global cache consistency within 5 seconds, with writes originating from any region.
+
+**Model answer.**
+
+This is one of the hardest cache invalidation problems because it combines cross-region latency (speed of light: 100ms EU to AP, 60ms US to EU) with asynchronous database replication (variable delay, up to seconds under load).
+
+**Architecture.** Global invalidation bus with region-local cache clusters.
+
+```
+Global Kafka topic (cross-region mirrored):
+  ┌──────────┐     ┌──────────┐     ┌──────────┐
+  │  US-East │◄───►│  EU-West │◄───►│ AP-SE    │
+  │  Kafka   │     │  Kafka   │     │  Kafka   │
+  └────┬─────┘     └────┬─────┘     └────┬─────┘
+       │                │                │
+  ┌────┴─────┐     ┌────┴─────┐     ┌────┴─────┐
+  │  Cache   │     │  Cache   │     │  Cache   │
+  │  Cluster │     │  Cluster │     │  Cluster │
+  │  {Redis} │     │  {Redis} │     │  {Redis} │
+  └──────────┘     └──────────┘     └──────────┘
+```
+
+**Flow for a write in EU-West:**
+
+1. EU-West database receives the write.
+2. EU-West publishes an invalidation event to the local Kafka topic with a global timestamp.
+3. EU-West consumer invalidates the local cache immediately.
+4. Global Kafka mirroring replicates the event to US-East and AP-SE topics (100-200ms).
+5. US-East and AP-SE consumers receive the event and invalidate their local caches.
+6. Database replication eventually delivers the write to US-East and AP-SE databases.
+
+**Staleness analysis.** The global staleness window is dominated by the slowest replication path: EU-West to AP-SE. This is approximately 200ms (Kafka mirror) + 10ms (local processing) = 210ms. Database replication could take longer (500ms to 5 seconds), but the cache is invalidated before the database replication completes. Reads that fall through the cache (due to invalidation) will go to the local database, which may not yet have the write. This yields stale data from the database, not from the cache.
+
+**Mitigation.** After cache invalidation, serve a "refresh" page that shows stale data with a loading indicator while the fresh data is fetched from the primary region. Or, for critical data, route reads to the primary region's database (at the cost of cross-region latency).
+
+### Challenge 3.2: Invalidation in a Distributed Graph Database
+
+Your application uses a graph database. A node (user) is connected to thousands of other nodes (friends, followers, groups). When the user updates their profile, the cached views of all connected nodes should reflect the change.
+
+Invalidating by individual key is impractical because one user update affects potentially millions of cache entries (for example, the user's avatar appears in the feed of every follower).
+
+**Your task.** Design an invalidation strategy for this graph-structured data. The system must handle users with up to 10 million followers.
+
+**Model answer.**
+
+Two strategies are applicable here: hierarchical TTL and versioned cache with lazy invalidation.
+
+**Strategy A: Hierarchical TTL.** Use different TTLs for different levels of the graph. The user's own data has a short TTL (60 seconds). The user's recent followers have a medium TTL (300 seconds). The user's distant followers have a long TTL (3600 seconds). The avatar change propagates quickly to close connections and slowly to distant ones.
+
+This is a pragmatic approach because distant followers are less likely to interact with the user's content immediately. The staleness is bounded per level, and the system avoids a massive invalidation wave.
+
+**Strategy B: Versioned Cache with Lazy Invalidation.** Each cache entry includes the version number of the source data it depends on. When data changes, the version is incremented. Readers check the version before serving cached data.
+
+```
+Cache entry for follower's feed:
+{
+  "feed": [...posts...],
+  "dependencies": {
+    "user:123:avatar": 42,  # source user avatar version
+    "user:456": 17,         # another source
+  }
+}
+```
+
+On a read of the feed, the cache checks whether `user:123:avatar` is still at version 42. If the avatar was updated and version is now 43, the cache entry is stale and must be refreshed. The version check can use a Bloom filter for efficiency: if the filter says "no versions changed since T," serve the cached entry without further checks.
+
+**Recommendation.** Use hierarchical TTL as the primary strategy for graph-connected data. It is simpler, predictable, and avoids the complexity of version tracking at scale. For users with under 100,000 followers, use event-driven invalidation (more precise). For users with millions of followers, fall back to hierarchical TTL (the invalidation wave would overwhelm the system). Monitor the staleness window for each tier and adjust TTLs based on observed user behavior.

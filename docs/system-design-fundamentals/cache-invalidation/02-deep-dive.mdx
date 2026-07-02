@@ -1,0 +1,509 @@
+---
+id: cache-invalidation-deep-dive
+title: "Cache Invalidation — Under the Hood"
+position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A cache invalidation system is not a single component but a set of collaborating subsystems. Understanding how these subsystems fit together is essential for designing, debugging, and tuning invalidation at scale.
+
+<AsciiDiagram
+  id="cache-invalidation/deep-dive-internal-architecture"
+  title="Internal Architecture of a Cache Invalidation System"
+  alt="Block diagram showing invalidation manager, TTL scheduler, event bus, purge queue, tag registry, consistency checker, and invalidation log"
+>
+{`┌────────────── Cache Invalidation System ──────────────────┐
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │                     Event Bus                           │  │
+│  │     <invalidation events flow through here>             │  │
+│  └────────┬──────────┬──────────┬──────────┬───────────────┘  │
+│           │          │          │          │                  │
+│           ▼          ▼          ▼          ▼                  │
+│  ┌────────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐    │
+│  │ Invalidation│ │   TTL    │ │  Purge   │ │   Tag      │    │
+│  │  Manager   │ │ Scheduler│ │  Queue   │ │  Registry  │    │
+│  │            │ │          │ │          │ │            │    │
+│  │ resolves   │ │ fires TTL│ │ batches  │ │ maps tags  │    │
+│  │ keys,      │ │ expired  │ │ purge    │ │ to keys    │    │
+│  │ coordinates│ │ entries  │ │ requests │ │            │    │
+│  └──────┬─────┘ └────┬─────┘ └────┬─────┘ └──────┬─────┘    │
+│         │            │            │               │          │
+│         ▼            ▼            ▼               ▼          │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │                Cache Data Store                         │  │
+│  │   { key, value, ttl, tags, version, stale_flag }       │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │            Consistency Checker                          │  │
+│  │   periodic verification, gossip sync, repair            │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │            Invalidation Log                             │  │
+│  │   append-only record of all invalidation events        │  │
+│  │   used for replay, audit, recovery                     │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Event Bus
+
+The event bus is the nervous system of the invalidation system. It carries invalidation events from producers (writers, CDC pipelines, triggers) to consumers (invalidation managers, cache nodes).
+
+Characteristics of a good invalidation event bus:
+
+- **At-least-once delivery**: events should not be lost. Duplicates are acceptable if invalidation is idempotent.
+- **Ordering within a partition**: events for the same key should arrive in order. This prevents a stale invalidation from undoing a fresh one.
+- **Low latency**: the staleness window starts when the event is produced, so the bus should deliver in milliseconds.
+- **Backpressure**: if consumers fall behind, the bus should not drop events or lose messages.
+
+In small systems (under 10 cache nodes), a simple internal queue or Redis pub/sub may be sufficient. At scale, a proper message broker like Kafka or RabbitMQ provides the durability, ordering, and replay capabilities needed.
+
+### Invalidation Manager
+
+The invalidation manager is the core logic component. It receives events from the bus and translates them into cache operations.
+
+Its responsibilities include:
+
+- **Event parsing**: extract the source object ID, type of change, and optional payload from the raw event.
+- **Key resolution**: determine which cache keys or tags are affected by the source change.
+- **Policy evaluation**: check whether the event should trigger invalidation based on configuration (for example, ignore updates to non-cached fields).
+- **Dispatch**: send the appropriate invalidation commands (delete, mark stale, or overwrite) to the cache data store.
+- **Coordination**: if the cache has multiple nodes, ensure all nodes receive the invalidation.
+
+### TTL Scheduler
+
+The TTL scheduler manages time-based expiry of cache entries. It uses a timer data structure to efficiently determine which entries have expired.
+
+The TTL scheduler runs continuously, checking for expired entries and either removing them or marking them as stale. It is separate from the invalidation manager because it operates on a different signal (time) rather than external events.
+
+### Purge Queue
+
+The purge queue handles bulk invalidation requests. When a large dataset changes (for example, a full product catalog rebuild), the invalidation manager may produce thousands or millions of invalidation commands. These should not be executed synchronously because they would overwhelm the cache.
+
+The purge queue batches these commands and executes them at a controlled rate, providing backpressure and observability.
+
+### Tag Registry
+
+The tag registry maintains the mapping from tags to set of cache keys. When an invalidation event arrives with a tag (for example, "user:123 profile updated"), the tag registry returns all keys that have that tag, and those keys are invalidated.
+
+The tag registry must be kept in sync with the cache data store. If a key is added or removed, its tags must be updated in the registry. This synchronization is a source of complexity and potential inconsistency.
+
+### Consistency Checker
+
+The consistency checker is a background process that periodically verifies that the cache data matches the source of truth. It samples cache entries, queries the source database, and compares the values.
+
+If a mismatch is found (a stale entry that was not invalidated), the consistency checker either logs the discrepancy for manual investigation or automatically invalidates the stale entry.
+
+The consistency checker is an essential safety net for detecting silent invalidation failures.
+
+### Invalidation Log
+
+The invalidation log is an append-only record of every invalidation event processed by the system. It serves multiple purposes:
+
+- **Audit trail**: who invalidated what and when.
+- **Replay**: if a cache node was down and missed invalidations, it can replay the log.
+- **Debugging**: when investigating a stale data incident, the log shows exactly what invalidations occurred and in what order.
+- **Metrics**: the log feeds into monitoring systems that track invalidation rates, latencies, and failure rates.
+
+## Data Structures
+
+The performance and reliability of the invalidation system depend on the data structures underlying each component.
+
+### TTL Timer Wheel
+
+A timer wheel is a circular buffer of time slots. Each slot represents a time interval and holds a list of entries that expire during that interval. A pointer advances through the slots at the interval rate. When the pointer reaches a slot, all entries in that slot are expired.
+
+<AsciiDiagram
+  id="cache-invalidation/deep-dive-timer-wheel"
+  title="TTL Timer Wheel Data Structure"
+  alt="Diagram showing a circular timer wheel with slots representing time intervals and expiring entries"
+>
+{`┌──────────────────── Hierarchical Timer Wheel ───────────────┐
+│                                                              │
+│  Level 1 (1ms resolution, 256 slots = 256ms coverage)       │
+│                                                              │
+│     ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐      │
+│     │ 0│ 1│ 2│ 3│ 4│ 5│..│..│..│..│..│..│..│..│..│255│      │
+│     ├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤      │
+│     │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │      │
+│     └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘      │
+│         ▲                                                     │
+│         │ pointer (current time)                              │
+│                                                              │
+│  Level 2 (256ms resolution, 256 slots = ~65s coverage)       │
+│                                                              │
+│     ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐      │
+│     │ 0│ 1│ 2│ 3│ 4│ 5│..│..│..│..│..│..│..│..│..│255│      │
+│     ├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤      │
+│     │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │      │
+│     └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘      │
+│                                                              │
+│  Level 3 (65s resolution, 256 slots = ~4.6hr coverage)       │
+│                                                              │
+│  Entries with TTL = 500ms → Level 1, slot 5                  │
+│  Entries with TTL = 30s    → Level 2, slot ~117              │
+│  Entries with TTL = 1hr    → Level 3, slot ~55               │
+│                                                              │
+│  When a slot is popped, entries cascade to next level.       │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+The timer wheel is efficient because:
+
+- Insert is O(1): compute the target slot based on expiry time and current pointer.
+- Tick is O(1) amortized: the pointer advances, and all entries in the current slot are processed.
+- Cascading entries (moving from a higher level to a lower level for finer-grained expiry) happens rarely in practice.
+
+### Invalidation Queue
+
+The invalidation queue holds pending invalidation commands that have not yet been applied to the cache. It acts as a buffer between the invalidation manager and the cache data store.
+
+The queue is typically implemented as a ring buffer or a linked list of batches. Each entry in the queue contains:
+
+- The cache key to invalidate.
+- The invalidation action (delete, mark stale, overwrite).
+- The new value (for overwrite actions).
+- A version number or timestamp for ordering.
+- Metadata for observability (source, cause).
+
+The queue supports priorities: high-priority invalidations (for example, security-related, payment-related) bypass the regular queue and are processed immediately.
+
+### Tag-Key Mapping Index
+
+The tag-key mapping index is the core data structure for tag-based invalidation. It is a reverse index: given a tag, find all keys with that tag.
+
+The index is implemented as a series of hash sets:
+
+```
+tag:user:123  →  { profile:user:123, settings:user:123, avatar:user:123 }
+tag:org:456   →  { profile:user:123, profile:user:456, org:456:members }
+tag:feed:home →  { feed:home:posts, feed:home:suggestions }
+```
+
+Each tag maps to a set of keys. The set supports O(1) add and remove operations. When a key is invalidated or evicted, it must be removed from all tag sets it belongs to. When a key is updated with new tags, the old tag set must be updated.
+
+The index must be consistent with the cache data store. If a key exists in the index but not in the cache, it is a harmless memory leak. If a key exists in the cache but not in the index, it will never be invalidated by tag-based events.
+
+### Bloom Filter for Stale Detection
+
+A Bloom filter is a probabilistic data structure used to quickly test whether an entry might have been invalidated. It is a compact bit array that trades space for a small probability of false positives (claiming an entry is stale when it is not).
+
+The Bloom filter is checked on every cache read. If the filter says "definitely not invalidated", the cache entry is served directly. If the filter says "possibly invalidated", the cache must check a definitive invalidation log or query the database.
+
+This approach avoids the cost of checking a centralized invalidation store on every read. The false positive rate is configurable; a 1% false positive rate requires approximately 10 bits per entry.
+
+### Invalidation Log
+
+The invalidation log is an append-only structure, typically backed by a distributed log like Kafka or a local write-ahead log (WAL). Each entry contains:
+
+```json
+{
+  "event_id": "inv_abc123",
+  "timestamp": 1700000000123,
+  "source": "user-service",
+  "source_object": "user:123",
+  "cache_keys": ["profile:user:123", "settings:user:123"],
+  "action": "delete",
+  "reason": "profile_update",
+  "status": "completed"
+}
+```
+
+The log supports:
+
+- **Sequential reads** for replay: consumers start from a given offset and process events in order.
+- **Random access by event_id** for debugging: look up a specific invalidation event.
+- **Time-range queries** for monitoring: count invalidations per minute, track latency percentiles.
+- **Compaction**: old entries are compacted away after a retention period (typically 7 to 30 days).
+
+## Invalidation Lifecycle
+
+The invalidation lifecycle encompasses everything from the moment data changes to the moment the cache reflects the change. This lifecycle involves multiple asynchronous steps that must be coordinated correctly.
+
+<AsciiDiagram
+  id="cache-invalidation/deep-dive-lifecycle-complete"
+  title="Complete Invalidation Lifecycle"
+  alt="Sequence diagram showing the 12-step invalidation lifecycle from data change to cache consistency"
+>
+{`┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│  Source   │   │  CDC/    │   │ Inval.   │   │  Cache   │
+│  Data     │   │  Trigger │   │ Manager  │   │  Nodes   │
+└─────┬────┘   └─────┬────┘   └─────┬────┘   └─────┬────┘
+      │               │              │               │
+ 1.   │  UPDATE       │              │               │
+      │──────────────►│              │               │
+      │               │              │               │
+ 2.   │  Confirm      │              │               │
+      │◄──────────────│              │               │
+      │               │              │               │
+ 3.   │               │ Event emit   │               │
+      │               │─────────────►│               │
+      │               │              │               │
+ 4.   │               │              │ Parse event   │
+      │               │              │ Resolve keys  │
+      │               │              │               │
+ 5.   │               │              │ Mark pending  │
+      │               │              │ (log: start)  │
+      │               │              │               │
+ 6.   │               │              │ Dispatch      │
+      │               │              │──────────────►│
+      │               │              │               │
+ 7.   │               │              │               │ Remove from
+      │               │              │               │ hash table
+      │               │              │               │
+ 8.   │               │              │               │ Broadcast to
+      │               │              │               │ replicas
+      │               │              │               │
+ 9.   │               │              │               │ Confirm
+      │               │              │◄──────────────│
+      │               │              │               │
+10.   │               │              │ Log: completed │
+      │               │              │               │
+11.   │               │              │ Next read     │
+      │               │              │ (cache miss)  │
+      │               │              │               │
+12.   │               │              │ DB query,     │
+      │               │              │ repopulate    │
+      │               │              │               │
+`}
+</AsciiDiagram>
+
+### Step-by-Step Breakdown
+
+**Step 1: Source data changes.** A writer performs a mutation on the source database. This could be an application service, a batch job, or a direct database operation.
+
+**Step 2: Change captured.** A change data capture (CDC) mechanism or database trigger detects the mutation. CDC is preferable because it does not require changes to the application code. Database triggers are simpler but add latency to the write path.
+
+**Step 3: Event emitted.** The CDC component publishes an invalidation event to the event bus. The event includes the source object ID, the type of change (insert, update, delete), and optionally the old and new values.
+
+**Step 4: Event received and resolved.** The invalidation manager reads the event from the bus. It parses the event and resolves the affected cache keys using the tag registry or key mapping.
+
+**Step 5: Invalidation initiated.** The manager records the start of the invalidation in the invalidation log with a status of "pending". This ensures that if the manager crashes mid-invalidation, the operation can be recovered.
+
+**Step 6: Dispatch to cache nodes.** The manager sends invalidation commands to the relevant cache nodes. For a distributed cache, the manager determines which nodes hold the affected keys and sends targeted commands.
+
+**Step 7: Entry removed.** The cache node performs the invalidation action on its local data store. The entry is either deleted from the hash table or marked as stale.
+
+**Step 8: Broadcast to replicas.** If the cache uses replication, the invalidation must be broadcast to all replicas to prevent stale reads on standby nodes.
+
+**Step 9: Confirmation received.** The cache nodes confirm the invalidation. The manager waits for confirmations from all nodes that should have received the command.
+
+**Step 10: Invalidation completed.** The manager records the completion in the invalidation log, including the latency from event receipt to confirmation.
+
+**Steps 11–12: Next read misses, fresh data loaded.** A client makes a read request, experiences a cache miss, queries the database, and repopulates the cache with fresh data.
+
+## Consistency and State
+
+Cache invalidation operates in a concurrent, distributed environment where timing and failures create edge cases. Understanding these edge cases is critical for building a robust invalidation system.
+
+### Scenario 1: Concurrent Update During Invalidation
+
+Consider this sequence: a cache entry for `product:999` has a stale value. The invalidation manager sends a DELETE for `product:999`. At the same moment, a reader makes a request for `product:999`, misses, queries the database, and populates the cache with a fresh value. Both operations happen within the same millisecond.
+
+There are two possible outcomes:
+
+- **Delete after populate**: the new fresh value is deleted by the late-arriving invalidation. The next read misses again. This is wasteful but not incorrect: the next read will fetch the fresh value again.
+- **Populate after delete**: the invalidation removes the old entry, and the new value is set. This is correct.
+
+The system must handle both cases. The simplest approach is to include a version number or timestamp with both the cache entry and the invalidation command. If the invalidation has an older timestamp than the cached value, the invalidation is ignored (it is ordering of outdated information).
+
+<AsciiDiagram
+  id="cache-invalidation/deep-dive-concurrent-update"
+  title="Concurrent Update During Invalidation"
+  alt="Timeline diagram showing race condition when a cache read and invalidation message arrive simultaneously"
+>
+{`┌─────────────────── Race: Read vs Invalidation ──────────────┐
+│                                                              │
+│  Timeline (t=0: stale entry exists)                          │
+│                                                              │
+│  t=0:  Cache contains stale value for key "product:999"     │
+│                                                              │
+│  t=1:  Invalidation DELETE sent         Reader gets cache hit│
+│        (old value targeted)             (stale value)        │
+│              │                                │              │
+│  t=2:  DELETE arrives at cache        Reader gets stale      │
+│        Entry removed                   value, returns it     │
+│              │                                │              │
+│  t=3:  [cache empty]                   Reader miss, queries  │
+│              │                          DB, gets fresh value │
+│  t=4:  [cache empty]                   Writer sets fresh     │
+│              │                          value in cache       │
+│              │                                │              │
+│  Result: Correct! Cache has fresh value.                     │
+│                                                              │
+│  ─ ─ ─ Alternate: Reader arrives BEFORE invalidation ─ ─ ─  │
+│                                                              │
+│  t=1:  Reader gets stale cache hit     Invalidation sent     │
+│        Returns stale value to client                         │
+│              │                                │              │
+│  t=2:  Reader does NOT query DB        Invalidation arrives, │
+│        (hit, not miss)                  removes stale entry  │
+│              │                                │              │
+│  t=3:  ──────────────────────────────►  Cache empty          │
+│                                                              │
+│  Result: Client saw stale data, but cache is now consistent. │
+│          Staleness window ~ 1-2ms.                           │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Scenario 2: Invalidation Message Lost
+
+The event bus guarantees at-least-once delivery, but "at least once" can fail if the network is partitioned, the broker crashes, or the consumer acknowledges before processing.
+
+If an invalidation message is lost:
+
+1. The cache entry remains in its current state (stale, if it was already invalidated; or fresh, if it was never invalidated).
+2. If the entry was fresh (not yet invalidated), it will continue serving stale data.
+3. The staleness window is unbounded unless a TTL safety net is in place.
+
+Recovery mechanisms:
+
+- **TTL safety net**: even if the message is lost, the entry will expire and be refreshed. The maximum staleness is TTL.
+- **Persistent invalidation log**: the event remains in the log. A background reconciler scans for unreconciled events and retries them.
+- **Consistency checker**: periodic sampling detects stale entries and triggers re-fresh.
+
+### Scenario 3: Partial Invalidation in a Multi-Key Transaction
+
+A transaction on the source database may update multiple rows. For example, transferring money between accounts updates the balance in both accounts. The cache may have entries for both balances.
+
+The invalidation must be atomic across all affected keys. If only one key is invalidated and the other is not, the cached data becomes inconsistent: one account shows the new balance, the other shows the old balance.
+
+The solution is transactional invalidation: either all affected keys are invalidated, or none are. This requires the invalidation manager to support multi-key transactions, typically by grouping invalidation commands into a batch and committing them atomically.
+
+<AsciiDiagram
+  id="cache-invalidation/deep-dive-partial-invalidation"
+  title="Partial Invalidation in Multi-Key Transaction"
+  alt="Diagram showing the risk of partial invalidation when a database transaction updates multiple cached keys"
+>
+{`┌─────────── Partial Invalidation Risk ───────────────────────┐
+│                                                              │
+│  Database Transaction: transfer $50 from A to B              │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  BEGIN TRANSACTION                                    │    │
+│  │  UPDATE account A SET balance = 100  (was 150)       │    │
+│  │  UPDATE account B SET balance = 200  (was 150)       │    │
+│  │  COMMIT                                              │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                                                              │
+│  Cache has entries:                                          │
+│  ┌────────────────────┐  ┌────────────────────┐             │
+│  │  account:123 = 150 │  │  account:456 = 150 │             │
+│  └────────────────────┘  └────────────────────┘             │
+│                                                              │
+│  Invalidation events:                                       │
+│  ┌────────────────────┐  ┌────────────────────┐             │
+│  │  DELETE account:123│  │  DELETE account:456│             │
+│  └─────────┬──────────┘  └──────────┬─────────┘             │
+│            │                        │                        │
+│            ▼                        │                        │
+│     entry deleted                   │                        │
+│     (account:123 fresh on next read) │                       │
+│                                     ▼                        │
+│                              **MESSAGE LOST**                │
+│                              account:456 still shows 150    │
+│                                                              │
+│  Result: Account A shows 100, Account B shows 150.           │
+│  $50 has disappeared from the user's view.                   │
+│                                                              │
+│  Fix: use atomic invalidation batch                          │
+│  ┌─────────────────────────────────────────────────────┐     │
+│  │  BATCH DELETE [account:123, account:456]            │     │
+│  │  Atomic: all or nothing                             │     │
+│  └─────────────────────────────────────────────────────┘     │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Scenario 4: Race Between Read and Invalidation
+
+A reader queries the database at the same instant the database is being updated. The reader sees the old value and stores it in the cache. The invalidation event arrives at the cache moments later and deletes the entry. The next read misses again, fetches the fresh value, and stores it.
+
+This is a benign race: the stale value was only cached for a few milliseconds, and the next read fixes it. The user who performed the original read saw stale data, but that is unavoidable without database-level locks.
+
+The race becomes problematic only if the cache's write-after-delete scenario removes the fresh value. This is handled by the version-check mechanism described earlier.
+
+### Scenario 5: Network Partition Delaying Invalidation
+
+A network partition separates the invalidation manager from a subset of cache nodes. During the partition, source data changes but the invalidation messages cannot reach the partitioned nodes.
+
+The partitioned nodes continue serving stale data. When the partition heals, the invalidation messages must be delivered or replayed, and the nodes must catch up.
+
+Recovery during partition:
+
+- The consistency checker detects the partitioned nodes (they have high staleness or failed heartbeats) and marks them as offline.
+- Invalidation events are buffered in the invalidation log.
+- When the partition heals, the nodes replay the missed events from the log.
+
+## Performance Characteristics
+
+Understanding the performance profile of invalidation operations helps you make informed design decisions.
+
+### Invalidation Latency
+
+- **Local invalidation** (single node, same process): 0.1 to 1 millisecond. This is a hash map delete operation. The TTL scheduler runs separately and adds negligible overhead.
+- **Distributed single-node invalidation** (same datacenter, separate cache node): 1 to 5 milliseconds. Network round trip plus hash map delete.
+- **Distributed multi-node invalidation** (same datacenter, multiple cache nodes): 5 to 20 milliseconds. Serial or parallel dispatch to all nodes holding the key.
+- **Event-based distributed invalidation** (CDC + broker + cache): 10 to 100 milliseconds. Event bus latency plus processing time.
+
+### TTL Overhead
+
+TTL processing adds constant overhead per cache entry:
+
+- Memory per entry: 8 bytes for the expiry timestamp (or 4 bytes for a relative TTL in seconds).
+- Timer wheel insertion: O(1), approximately 50 nanoseconds.
+- Timer wheel tick: O(1) amortized, approximately 100 nanoseconds per expired entry.
+
+The total overhead is negligible for typical workloads (up to millions of entries).
+
+### Staleness Window
+
+The staleness window is the time between source data change and cache invalidation.
+
+- **TTL-based**: 0 to TTL. The bound is deterministic and configurable, but the window can be the full TTL.
+- **Event-based**: event propagation time. This includes CDC capture latency (typically 1 to 10 milliseconds), broker queuing latency (0 to 100 milliseconds under load), and cache operation latency (1 to 5 milliseconds).
+- **Hybrid (event + TTL)**: min(event propagation, TTL). The event provides fast invalidation, and the TTL provides a safety net.
+
+### Throughput Considerations
+
+Invalidation throughput is limited by:
+
+- **Event bus throughput**: number of invalidation events the bus can sustain. Kafka can handle hundreds of thousands of events per second on moderate hardware.
+- **Cache node write capacity**: each invalidation is a write operation on the cache. If the cache is already write-bound, invalidation traffic adds load.
+- **Tag registry throughput**: tag-based invalidation requires a lookup in the tag index. If the index is large, this lookup can become a bottleneck.
+
+## Configuration Parameters
+
+The following parameters govern the behavior of the invalidation system.
+
+| Parameter | Description | Default | Production Range |
+|---|---|---|---|
+| `default_ttl` | Default TTL for entries without explicit TTL | 300s | 60s to 3600s |
+| `max_ttl` | Maximum TTL for any entry | 86400s | 3600s to 604800s |
+| `invalidation_queue_size` | Maximum pending invalidation commands | 10000 | 1000 to 1000000 |
+| `event_retry_count` | Number of retries for failed invalidation | 3 | 2 to 10 |
+| `event_retry_backoff` | Exponential backoff base for retries | 100ms | 50ms to 1000ms |
+| `batch_purge_size` | Maximum keys per batch purge operation | 1000 | 100 to 10000 |
+| `tag_granularity` | Level of tag detail (coarse, medium, fine) | medium | configurable per data type |
+| `consumer_group_size` | Number of parallel invalidation consumers | 1 | 1 to 16 |
+| `consistency_check_interval` | How often the consistency checker runs | 300s | 60s to 3600s |
+| `invalidation_log_retention` | Days to retain invalidation log entries | 7 days | 1 to 90 days |
+| `bloom_filter_false_positive` | Target false positive rate for stale filter | 0.01 | 0.001 to 0.1 |
+| `partition_timeout_ms` | Max wait for partitioned node acknowledgement | 5000ms | 1000ms to 30000ms |
+
+These parameters should be tuned based on your workload characteristics: read-to-write ratio, acceptable staleness, cache size, and network topology.
+
+The most impactful parameter is `default_ttl`. Setting it too low increases the cache miss rate (defeating the purpose of caching). Setting it too high increases the maximum staleness window. Start with a value that matches your business requirements for staleness, then tune based on observed cache hit rates and staleness measurements.

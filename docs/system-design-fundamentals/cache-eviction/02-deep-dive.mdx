@@ -1,0 +1,623 @@
+---
+id: cache-eviction-deep-dive
+title: Cache Eviction — Under the Hood
+sidebar_label: Under the Hood
+position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A production-grade cache with eviction support is not a simple hash table. It is a composition of several data structures that work together to provide fast lookups, fast eviction, and low memory overhead.
+
+<AsciiDiagram
+  id="cache-eviction/internal-architecture"
+  title="Cache Eviction Internal Architecture"
+  alt="Cache engine internal architecture showing hash table for O(1) lookup, LRU doubly-linked list, LFU frequency counter, eviction policy selector, and memory monitor"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Cache Engine Internals                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌────────────────────────────────────────────┐                     │
+│  │           Hash Table (O(1) lookup)          │                     │
+│  │  ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐ │                     │
+│  │  │ key_A │ │ key_B │ │ key_C │ │ key_D │ │                     │
+│  │  │ ──► A │ │ ──► B │ │ ──► C │ │ ──► D │ │                     │
+│  │  └───────┘ └───────┘ └───────┘ └───────┘ │                     │
+│  └─────────────────┬──────────────────────────┘                     │
+│                    │                                                │
+│                    ▼                                                │
+│  ┌────────────────────────────────────────────┐                     │
+│  │         LRU Doubly-Linked List              │                     │
+│  │  head ──► A ◄──► B ◄──► C ◄──► D ──► tail │                     │
+│  │         MRU                          LRU    │                     │
+│  └────────────────────────────────────────────┘                     │
+│                    │                                                │
+│  ┌─────────────────▼──────────────────────────┐                     │
+│  │        LFU Frequency Counters               │                     │
+│  │  ┌──────┬──────┬──────┬──────┬──────┐      │                     │
+│  │  │  A:3 │  B:1 │  C:5 │  D:2 │  E:1 │      │                     │
+│  │  └──────┴──────┴──────┴──────┴──────┘      │                     │
+│  └────────────────────────────────────────────┘                     │
+│                    │                                                │
+│  ┌─────────────────▼──────────────────────────┐                     │
+│  │         Eviction Policy Selector             │                     │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐       │                     │
+│  │  │  LRU    │ │  LFU    │ │  FIFO   │       │                     │
+│  │  └─────────┘ └─────────┘ └─────────┘       │                     │
+│  └────────────────────────────────────────────┘                     │
+│                    │                                                │
+│  ┌─────────────────▼──────────────────────────┐                     │
+│  │           Memory Monitor                     │                     │
+│  │  Current: 3.8 GB    Limit: 4.0 GB           │                     │
+│  │  Status: 95% full   Watermark: 90%          │                     │
+│  └────────────────────────────────────────────┘                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+  Data flow:
+  SET key ──> Hash table stores key->entry mapping
+          ──> Entry added to LRU list head
+          ──> Entry added to LFU bucket (freq=1)
+          ──> Memory monitor checks limit
+          ──> If full, policy selector chooses victim
+          ──> Victim removed from all structures
+  `}
+/>
+
+### Component Responsibilities
+
+**Hash table.** Provides O(1) lookup by key. Maps each key to an entry node that contains the value, metadata (size, insertion time, last access time), and pointers into the other structures (list pointers for LRU, bucket pointers for LFU).
+
+**LRU doubly-linked list.** Maintains entries in access-time order. The head is the most recently accessed entry. The tail is the least recently accessed entry. On eviction with LRU policy, the tail is removed. On access, the entry is moved to the head. Both operations are O(1) with the doubly-linked list.
+
+**LFU frequency structure.** Maintains frequency buckets for LFU eviction. Each bucket holds all entries with the same access count. On access, the entry's count is incremented and it moves to the next bucket. On eviction, the least-frequently-used bucket is selected, and an entry from that bucket (usually the LRU within that bucket) is removed.
+
+**Eviction policy selector.** The switchboard that selects which eviction algorithm to run. Common implementations use a function pointer or strategy pattern. The selector reads the configured policy and calls the corresponding evict function.
+
+**Memory monitor.** Tracks total memory usage and triggers eviction when the limit is reached. Most implementations use atomic counters for thread safety. The monitor runs on every write (synchronous) or on a periodic timer (asynchronous).
+
+## Data Structures
+
+Each eviction policy uses specific data structures to achieve its performance guarantees. Understanding these data structures is essential for implementing your own cache or tuning an existing one.
+
+### LRU: Doubly-Linked List + Hash Map
+
+<AsciiDiagram
+  id="cache-eviction/lru-data-structure"
+  title="LRU Data Structure: Doubly-Linked List + Hash Map"
+  alt="LRU data structure showing hash map pointing to nodes in a doubly-linked list with head and tail pointers"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                     LRU Data Structure                               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Hash Map (O(1) lookup by key)                                      │
+│  ┌──────────────────────────────────────────────┐                   │
+│  │  key_A ──► Node_A                            │                   │
+│  │  key_B ──► Node_B                            │                   │
+│  │  key_C ──► Node_C                            │                   │
+│  │  key_D ──► Node_D                            │                   │
+│  └──────────────────────────────────────────────┘                   │
+│                                                                     │
+│  Doubly-Linked List (O(1) eviction)                                 │
+│                                                                     │
+│  ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐                      │
+│  │  A   │◄──►│  B   │◄──►│  C   │◄──►│  D   │                      │
+│  └──┬───┘    └──┬───┘    └──┬───┘    └──┬───┘                      │
+│     │           │           │           │                            │
+│  prev=A     prev=B      prev=C      prev=D                          │
+│  next=B     next=C      next=D      next=null                       │
+│                                                                     │
+│  head ──► A                                              tail ──► D │
+│  (MRU)                                                    (LRU)    │
+│                                                                     │
+│  Memory per entry:                                                  │
+│  - Key pointer:        8 bytes (64-bit)                             │
+│  - Value pointer:      8 bytes                                      │
+│  - Prev pointer:       8 bytes                                      │
+│  - Next pointer:       8 bytes                                      │
+│  - Hash table entry:   8 bytes                                      │
+│  - Size/length:        4 bytes                                      │
+│  - Last access time:   8 bytes (optional)                           │
+│  Total overhead:       ~52 bytes per entry                          │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+The doubly-linked list is the heart of LRU. Each entry node has `prev` and `next` pointers. When an entry is accessed:
+
+1. Remove the node from its current position (O(1) pointer updates).
+2. Insert the node at the head (O(1) pointer updates).
+3. Update the `head` pointer to the new node.
+
+When eviction is needed:
+
+1. The tail node is the victim (least recently used).
+2. Remove the tail node from the list (O(1) pointer updates).
+3. Remove the entry from the hash map (O(1)).
+4. Free the memory.
+
+The hash map provides the mapping from key to node. Without it, finding an entry by key would require O(n) list traversal. With it, every operation is O(1).
+
+### LFU: Min-Heap of Frequency Buckets
+
+<AsciiDiagram
+  id="cache-eviction/lfu-data-structure"
+  title="LFU Data Structure: Frequency Buckets"
+  alt="LFU data structure showing frequency buckets organized as a min-heap with hash map for O(1) entry lookup"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                     LFU Data Structure                               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Hash Map (O(1) lookup by key)                                      │
+│  ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐                           │
+│  │ key_A │ │ key_B │ │ key_C │ │ key_D │                           │
+│  │ ──► A │ │ ──► B │ │ ──► C │ │ ──► D │                           │
+│  └───────┘ └───────┘ └───────┘ └───────┘                           │
+│                                                                     │
+│  Min-Heap of Frequency Buckets                                      │
+│  (heap property: min frequency at root)                             │
+│                                                                     │
+│              ┌───────────┐                                          │
+│              │  Freq=1   │  <-- root (minimum frequency)            │
+│              │ ┌───────┐ │                                          │
+│              │ │ B  F  │ │                                          │
+│              │ └───────┘ │                                          │
+│              └─────┬─────┘                                          │
+│             /              \                                        │
+│   ┌────────▼───┐     ┌────▼────────┐                               │
+│   │  Freq=2    │     │  Freq=3     │                                │
+│   │ ┌───────┐  │     │ ┌───────┐   │                                │
+│   │ │ D  E  │  │     │ │ A     │   │                                │
+│   │ └───────┘  │     │ └───────┘   │                                │
+│   └────────────┘     └─────────────┘                                │
+│                                                                     │
+│  On eviction: pop root (freq=1 bucket), select entry from it        │
+│  On access: increment frequency, move entry to next bucket          │
+│  On frequency change: sift bucket up/down in heap                   │
+│                                                                     │
+│  Naive LFU: O(log n) per access (heap operations)                  │
+│  Optimized LFU: O(1) with frequency partitioning                    │
+│    - Array of doubly-linked lists indexed by frequency              │
+│    - Min frequency pointer maintained incrementally                 │
+│                                                                     │
+│  Memory per entry:                                                  │
+│  - Same as LRU: ~52 bytes                                           │
+│  - Plus frequency counter: 4 bytes                                  │
+│  - Plus heap index: 4 bytes (naive implementation)                  │
+│  Total overhead: ~60 bytes per entry                                │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+The naive LFU implementation uses a min-heap keyed by frequency. On every access, the entry's frequency is incremented and the heap is sifted. On eviction, the root of the heap (lowest frequency) is removed. This gives O(log n) per operation.
+
+The optimized implementation uses frequency partitioning: an array of doubly-linked lists, where index i holds all entries with frequency i. A `minFreq` pointer tracks the current minimum frequency. On eviction, the entry at `minFreq` is removed. On access, the entry is moved to the `freq+1` list, and `minFreq` may be updated. This gives O(1) per operation.
+
+### ARC: Dual LRU Lists + Ghost Entries
+
+ARC uses two LRU lists and two ghost lists. The ghost lists store metadata (keys, timestamps) of recently evicted entries, not the actual data. This allows ARC to detect access pattern changes and adapt.
+
+```
+ARC Structure:
+  ┌─────────────────────────────────────────────────────┐
+  │ T1 (Recent, size p)    T2 (Frequent, size 2c-p)    │
+  │ ┌──────┬──────┬──────┐ ┌──────┬──────┬──────┐      │
+  │ │  A   │  B   │  C   │ │  D   │  E   │  F   │      │
+  │ └──────┴──────┴──────┘ └──────┴──────┴──────┘      │
+  │                                                     │
+  │ B1 (Ghost Recent)       B2 (Ghost Frequent)         │
+  │ ┌──────┬──────┐         ┌──────┬──────┐             │
+  │ │  G   │  H   │         │  I   │  J   │             │
+  │ └──────┴──────┘         └──────┴──────┘             │
+  └─────────────────────────────────────────────────────┘
+```
+
+Where:
+- T1: LRU list of recently accessed entries (captures recency)
+- T2: LRU list of frequently accessed entries (captures frequency)
+- B1: Ghost list of recently evicted entries from T1
+- B2: Ghost list of recently evicted entries from T2
+- c: Total cache capacity
+- p: Adaptive target size for T1 (0 \<= p \<= c)
+
+When a ghost entry is hit (a key was evicted but is now requested again), ARC adjusts the target size `p` toward the list that produced the ghost. This adapts the cache to the current access pattern.
+
+### Clock Algorithm: Circular Buffer with Reference Bits
+
+<AsciiDiagram
+  id="cache-eviction/clock-algorithm"
+  title="Clock Algorithm: Circular Buffer with Reference Bits"
+  alt="Circular buffer with clock hand sweeping through entries checking reference bits for eviction"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Clock Algorithm (Second Chance)                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Circular Buffer with Reference Bits (R=reference bit)              │
+│                                                                     │
+│           ┌────────────────────────────────────┐                    │
+│           │          ┌──────┐                   │                    │
+│           │     ┌───►│  A   │◄────┐             │                    │
+│           │     │    │ R=1  │     │             │                    │
+│           │     │    └──────┘     │             │                    │
+│           │     │                 │             │                    │
+│           │  ┌──┴───┐          ┌──┴───┐        │                    │
+│           │  │  H   │          │  B   │        │                    │
+│           │  │ R=1  │          │ R=0  │        │                    │
+│           │  └──────┘          └──────┘        │                    │
+│           │     │                 ▲            │                    │
+│           │     │    ┌──────┐    │            │                    │
+│           │     └───►│  G   │────┘            │                    │
+│           │          │ R=0  │    Clock hand    │                    │
+│           │          └──────┘    direction ──► │                    │
+│           │             │                      │                    │
+│           │  ┌──────┐  │   ┌──────┐           │                    │
+│           │  │  F   │◄─┘   │  C   │           │                    │
+│           │  │ R=0  │      │ R=1  │           │                    │
+│           │  └──────┘      └──────┘           │                    │
+│           │     │                 ▲            │                    │
+│           │  ┌──┴───┐          ┌──┴───┐        │                    │
+│           │  │  E   │─────────►│  D   │        │                    │
+│           │  │ R=1  │          │ R=1  │        │                    │
+│           │  └──────┘          └──────┘        │                    │
+│           └────────────────────────────────────┘                    │
+│                                                                     │
+│  Eviction process:                                                  │
+│  1. Clock hand starts at current position                           │
+│  2. If R=1: set R=0, advance hand (second chance)                  │
+│  3. If R=0: evict this entry                                       │
+│  4. Repeat until an evictable entry is found                        │
+│                                                                     │
+│  Hand may make full rotation before evicting anything                │
+│  In worst case: all entries have R=1 (full scan + reset = 2 scans) │
+│                                                                     │
+│  Memory per entry: 1 bit (reference bit) + overhead of linked list  │
+│  Typically 10-20 bytes per entry total                              │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+The clock algorithm provides an approximation of LRU with minimal overhead. Instead of maintaining a sorted list, it uses a circular buffer and reference bits. Each entry has one reference bit that is set to 1 on access. The clock hand sweeps through the buffer: entries with R=1 get a second chance (R is cleared and the hand advances), entries with R=0 are evicted.
+
+## Eviction Lifecycle
+
+The eviction lifecycle differs by policy. This section shows the exact steps for LRU, LFU, and ARC side by side.
+
+### LRU Eviction Lifecycle
+
+1. **Write received.** `SET key="user:42" value="{...}"`. The cache engine receives the write command.
+
+2. **Hash table lookup.** The engine checks whether the key already exists. If it does, this is an update rather than an insert.
+
+3. **Memory check.** The engine adds the new entry's size to the current memory usage. If the total exceeds `maxmemory`, eviction begins.
+
+4. **Find LRU tail.** The engine reads the `tail` pointer of the doubly-linked list. This is the least recently used entry.
+
+5. **Remove from list.** The tail entry is unlinked from the doubly-linked list. Its `prev` entry becomes the new tail.
+
+6. **Remove from hash table.** The engine deletes the key from the hash table. The memory for the key and value is freed.
+
+7. **Update counters.** The memory usage counter is decremented by the evicted entry's size. The eviction counter is incremented.
+
+8. **Post-eviction check.** If memory is still above the limit, steps 4-7 are repeated until memory drops below the watermark.
+
+9. **Insert new entry.** The new entry is created, inserted into the hash table, and added to the head of the linked list.
+
+10. **Response.** The cache returns OK to the caller.
+
+### LFU Eviction Lifecycle
+
+1. **Write received.** Same as LRU.
+
+2. **Hash table lookup.** Same as LRU.
+
+3. **Memory check.** Same as LRU.
+
+4. **Find minimum frequency.** The engine checks the `minFreq` pointer (in optimized implementation) or peeks at the heap root. The minimum frequency bucket is identified.
+
+5. **Select victim within bucket.** If multiple entries share the minimum frequency, a tiebreaker is applied. Common tiebreakers: LRU within the bucket (evict the entry accessed longest ago within the same frequency group), or random selection.
+
+6. **Remove from frequency bucket.** The victim is unlinked from its frequency bucket's doubly-linked list.
+
+7. **Remove from hash table.** The entry is deleted from the hash table.
+
+8. **Update minFreq.** If the frequency bucket is now empty, `minFreq` is incremented to the next non-empty bucket. If `minFreq` was the only bucket, it may need to be recalculated by scanning all buckets.
+
+9. **Insert new entry.** The new entry is created with frequency=1 and inserted into the freq=1 bucket. If no freq=1 bucket exists, it is created. `minFreq` is set to 1.
+
+10. **Response.** The engine returns OK.
+
+### ARC Eviction Lifecycle
+
+1. **Write received.** Same as LRU.
+
+2. **Hash table lookup.** The engine checks all four lists (T1, T2, B1, B2) for the key. If found in a ghost list, a ghost hit is recorded.
+
+3. **Ghost hit adaptation.** If the key is found in B1 (recent ghost), the target size `p` is adjusted upward (more room for recent entries). If in B2 (frequent ghost), `p` is adjusted downward.
+
+4. **Memory check.** Same as LRU.
+
+5. **Eviction decision.** If T1 (recent list) exceeds target size `p`, evict from T1. Otherwise, evict from T2.
+
+6. **Move to ghost.** The evicted entry's key and metadata are moved to the appropriate ghost list (B1 for T1 evictions, B2 for B2 evictions).
+
+7. **Ghost list pruning.** If the ghost list exceeds capacity, the oldest ghost entry is removed (the ghost list should be bounded, typically to the same size as the cache).
+
+8. **Insert new entry.** The new entry is inserted into T1 (recent list) at the MRU position.
+
+9. **Response.** The engine returns OK.
+
+## Consistency and State
+
+Cache eviction becomes significantly more complex in concurrent and distributed environments. This section covers the failure modes that appear under real-world conditions.
+
+### Concurrent Access During Eviction
+
+When multiple threads can read and write the cache simultaneously, eviction must be thread-safe. Consider this scenario:
+
+- Thread A reads entry X. X is hot, accessed frequently.
+- Thread B writes entry Y. The cache is full, so B triggers eviction.
+- Thread B selects entry X as the victim (LRU policy, X is at the tail).
+- Thread A is still reading X's value.
+- Thread B frees X's memory.
+
+Thread A now has a dangling pointer. The next read crashes the application (segfault) or reads corrupted data.
+
+**Solutions:**
+
+- **Read-copy-update (RCU).** Readers do not lock. Writers create a new copy of the entry, update pointers atomically, and defer the free until all readers have finished. Used in the Linux kernel.
+
+- **Reference counting.** Each entry has a reference count. Readers increment the count before reading and decrement after. Eviction skips entries with non-zero reference counts. This prevents freeing memory that is in use, but it can delay eviction under high concurrency.
+
+- **Sharded locking.** The cache is divided into shards, each with its own lock. Eviction operates on one shard at a time. This provides fine-grained concurrency without a global lock.
+
+### Priority Inversion: Frequency vs Recency
+
+Priority inversion occurs when a policy optimizes for the wrong dimension:
+
+- LFU retains the frequency-3 entry that was last accessed 5 minutes ago (it is still "frequently used").
+- LFU evicts the frequency-2 entry that was accessed 1 second ago (it is trending but has not accumulated enough frequency).
+- The frequency-2 entry was the future popular content. The cache now misses on it.
+
+This is LFU's fundamental weakness: it cannot distinguish between a entry that was popular yesterday and a entry that is popular today. The frequency counter is a lagging indicator.
+
+**Mitigation:** Use time-decayed frequency (LFU with aging). Periodically halve all frequency counters, or use a sliding window that considers only accesses within the last N minutes. Redis implements this with its `lfu-log-factor` parameter.
+
+### Scan Attacks: Polluting LRU
+
+A scan attack floods the cache with one-hit-wonders, intentionally evicting the hot set.
+
+```
+Scenario:
+  - Cache holds 100 entries (the hot set).
+  - Attacker sends 100 sequential requests for 100 new unique keys.
+  - Each new key is inserted, evicting one hot entry.
+  - After 100 requests, the entire hot set is replaced with one-hit-wonder data.
+  - All subsequent requests for the hot set miss and hit the database.
+```
+
+**Mitigation:** Scan-resistant policies (ARC, 2Q, SLRU). With 2Q, an attacker's sequential scan fills the FIFO queue but never promotes to the LRU queue. The hot entries in the LRU queue are protected.
+
+### Memory Pressure Cascade
+
+When the cache runs out of memory and eviction cannot keep up, the system enters a pressure cascade:
+
+1. Eviction falls behind (too many writes, too few evictions).
+2. Memory usage exceeds `maxmemory`.
+3. The engine triggers aggressive eviction, evicting multiple entries per write.
+4. High eviction rate causes cache miss rate to spike.
+5. Missed requests hit the database, increasing database load.
+6. Database response time increases.
+7. Application threads block waiting for database responses.
+8. Application thread pool saturates.
+9. New requests queue up, increasing latency.
+10. Health checks fail, load balancer marks the instance as unhealthy.
+11. Traffic is redirected to remaining instances, which also hit the cascade.
+
+<AsciiDiagram
+  id="cache-eviction/pressure-cascade"
+  title="Memory Pressure Cascade Sequence"
+  alt="Sequence diagram showing the cascade from high eviction rate through database overload to application failure"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                  Memory Pressure Cascade                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Time ───────────────────────────────────────────────────────────► │
+│                                                                     │
+│  ┌────────┐   ┌──────────┐   ┌─────────┐   ┌────────┐   ┌──────┐  │
+│  │ Evict  │   │ Miss     │   │ DB      │   │ Thread │   │ OOM  │  │
+│  │ Storm  │──►│ Spike    │──►│ Overload│──►│ Saturation│──►│ Kill │  │
+│  └────────┘   └──────────┘   └─────────┘   └────────┘   └──────┘  │
+│       │            │              │             │            │       │
+│       ▼            ▼              ▼             ▼            ▼       │
+│  500 evict/s   80% miss      DB CPU=95%     Threads=200   Mem=0   │
+│  200 evict/s   50% miss      DB CPU=70%     Threads=100   OK     │
+│   50 evict/s   10% miss      DB CPU=30%     Threads=50    OK     │
+│                                                                     │
+│  Recovery: reduce write rate or add memory                          │
+│  Prevention: monitor eviction rate and alert before cascade         │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+## Performance
+
+### Eviction Complexity
+
+| Policy | Eviction | Access | Insert | Notes |
+|--------|----------|--------|--------|-------|
+| LRU    | O(1)     | O(1)   | O(1)   | Doubly-linked list + hash map |
+| LFU (naive) | O(log n) | O(log n) | O(log n) | Min-heap per access |
+| LFU (optimized) | O(1) | O(1) | O(1) | Frequency partitioning |
+| FIFO   | O(1)     | O(1)   | O(1)   | Simple queue |
+| MRU    | O(1)     | O(1)   | O(1)   | Same as LRU, reverse direction |
+| Random | O(1)     | O(1)   | O(1)   | Random selection |
+| ARC    | O(1)     | O(1)   | O(1)   | Dual lists + ghost management |
+| Clock  | O(n)*    | O(1)   | O(1)   | *Worst-case full rotation |
+| 2Q     | O(1)     | O(1)   | O(1)   | Two queues + promotion logic |
+| SLRU   | O(1)     | O(1)   | O(1)   | Two segments + promotion |
+
+The clock algorithm has O(1) amortized eviction but O(n) worst-case when all reference bits are set and the hand must sweep the entire buffer.
+
+### Memory Overhead
+
+<AsciiDiagram
+  id="cache-eviction/memory-overhead-comparison"
+  title="Memory Overhead Comparison Across Policies"
+  alt="Bar chart comparing memory overhead per entry for LRU, LFU, FIFO, ARC, and Clock policies"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                  Per-Entry Memory Overhead                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Policy      Overhead per entry (bytes)                             │
+│  ──────      ─────────────────────────                              │
+│                                                                     │
+│  No eviction     8 bytes  (hash table only)                         │
+│                  ████████                                           │
+│                                                                     │
+│  FIFO           16 bytes  (insertion timestamp + hash entry)        │
+│                  ████████████████                                   │
+│                                                                     │
+│  Random          8 bytes  (no metadata needed)                      │
+│                  ████████                                           │
+│                                                                     │
+│  LRU            52 bytes  (prev/next ptrs + hash + metadata)        │
+│                  ██████████████████████████████████████████████████  │
+│                                                                     │
+│  LFU            56 bytes  (LRU + frequency counter)                 │
+│                  ████████████████████████████████████████████████████│
+│                                                                     │
+│  Clock         16 bytes  (pointer + reference bit in struct)        │
+│                  ████████████████                                   │
+│                                                                     │
+│  ARC           104 bytes (dual lists + ghost entry metadata)        │
+│                  ██████████████████████████████████████████████████  │
+│                  ██████████████████████████████████████████████████  │
+│                                                                     │
+│  Ghost only     32 bytes (key hash + timestamp)                     │
+│                  ██████████████████████████████████                  │
+│                                                                     │
+│  Notes:                                                             │
+│  - Values assume 64-bit pointers, 8-byte aligned                   │
+│  - Actual overhead depends on allocator, alignment, language        │
+│  - Redis uses jemalloc, which adds 4-16 bytes per allocation        │
+│  - In C, struct packing can reduce overhead                         │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+## Configuration
+
+### Memory Limits
+
+Every production cache requires a configured memory limit. Common configuration parameters:
+
+**maxmemory.** The absolute memory limit for the cache. When total memory usage exceeds this value, eviction is triggered. In Redis: `maxmemory 4gb`. In Memcached: `-m 4096` (megabytes).
+
+**Eviction policy selection**. The algorithm to use when evicting. In Redis: `maxmemory-policy allkeys-lru`. Six options across three categories:
+- `allkeys-*`: evicts from all keys (no TTL filter)
+- `volatile-*`: evicts only keys with TTL set
+- `*-lru`: LRU eviction
+- `*-lfu`: LFU eviction
+- `*-ttl`: Evict keys with shortest TTL
+- `*-random`: Random eviction
+- `noeviction`: Return errors when memory is full (writes fail)
+
+**Sample size (for approximate LRU).** Redis uses an approximate LRU that samples N keys and evicts the oldest among them. Larger samples produce more accurate LRU behavior but cost more CPU per eviction. Default: 5 entries. Increasing to 10 improves accuracy by approximately 5% at the cost of doubling eviction CPU time.
+
+```
+eviction-policy-samples: 5    # Recommended for most workloads
+eviction-policy-samples: 10   # For high hit-ratio requirements
+eviction-policy-samples: 20   # For maximum accuracy, higher CPU cost
+```
+
+**Watermark thresholds.** Some caches use two thresholds: a high watermark (trigger eviction) and a low watermark (stop eviction). This prevents eviction thrashing around the memory limit.
+
+```
+maxmemory: 4gb
+eviction-high-watermark: 0.95  # Trigger at 3.8 GB
+eviction-low-watermark: 0.85   # Stop at 3.4 GB
+```
+
+**Eviction batch size.** The number of entries to evict per eviction cycle. Higher batch sizes free memory faster but increase latency per write.
+
+```
+eviction-batch-size: 1    # Conservative: 1 entry per eviction
+eviction-batch-size: 10   # Aggressive: 10 entries per eviction
+eviction-batch-size: 100  # Emergency: used when maxmemory is breached
+```
+
+**Maxmemory-samples (Redis).** Controls the size of the sample pool for approximate LRU/LFU/TTL eviction. The engine samples N random keys and applies the policy to select the victim. Larger samples improve accuracy.
+
+```
+maxmemory-samples 5    # Default
+maxmemory-samples 10   # Better accuracy, slightly higher CPU
+```
+
+**LFU configuration (Redis).** Two parameters control LFU behavior:
+
+- `lfu-log-factor`: Logarithmic counter factor. Reduces the rate at which the frequency counter increments. Higher values make the counter grow more slowly, favoring older entries. Default: 10.
+
+- `lfu-decay-time`: The number of minutes between counter halvings. Higher values make the counter decay more slowly, favoring entries with sustained popularity. Default: 1 (halve the counter every minute).
+
+<AsciiDiagram
+  id="cache-eviction/configuration-flow"
+  title="Cache Configuration and Eviction Flow"
+  alt="Flow diagram showing configuration parameters feeding into the eviction engine, from memory limit to policy selection to eviction execution"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                  Cache Configuration Pipeline                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────────┐                                               │
+│  │  maxmemory: 4GB  │─────► Memory Monitor                         │
+│  └──────────────────┘        │                                       │
+│                              │                                       │
+│  ┌──────────────────┐        ▼                                       │
+│  │  maxmemory-policy│─────► Policy Selector                         │
+│  │  allkeys-lru     │        │                                       │
+│  └──────────────────┘        │                                       │
+│                              │                                       │
+│  ┌──────────────────┐        ▼                                       │
+│  │  maxmemory-      │─────► Eviction Engine                         │
+│  │  samples: 5      │        │                                       │
+│  └──────────────────┘        │                                       │
+│                              │                                       │
+│  ┌──────────────────┐        ▼                                       │
+│  │  eviction-batch  │─────► Batch Size                              │
+│  │  size: 1         │        │                                       │
+│  └──────────────────┘        │                                       │
+│                              │                                       │
+│  ┌──────────────────┐        ▼                                       │
+│  │  lfu-log-factor  │─────► LFU Aging                               │
+│  │  : 10            │        │                                       │
+│  └──────────────────┘        │                                       │
+│                              │                                       │
+│  ┌──────────────────┐        ▼                                       │
+│  │  lfu-decay-time  │─────► LFU Decay                               │
+│  │  : 1 (minute)    │        │                                       │
+│  └──────────────────┘        │                                       │
+│                              ▼                                       │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │             Eviction Execution                                │   │
+│  │  Sample N keys -> Apply policy -> Remove victim -> Recheck  │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Tuning for Different Workloads
+
+**Session cache (high temporal locality, fixed TTL).** Use `allkeys-lru` in Redis. Session data has strong recency: active sessions are accessed frequently, inactive sessions age out naturally. Set TTL equal to the session timeout (30-60 minutes). The LRU policy handles eviction when memory fills, while TTL handles expiration.
+
+**Database query cache (mixed access, moderate locality).** Use `allkeys-lfu` if query patterns are stable (most queries target a small set of popular rows). Use `allkeys-lru` if the workload is dynamic. The choice depends on whether query popularity is stable or changing.
+
+**API response cache (bursty, high one-hit-wonder rate).** Use `volatile-lru` with TTL set to the API response's cache-control max-age. The TTL handles most eviction; LRU handles overflow. Consider adding 2Q or SLRU for scan resistance.
+
+**Static content cache (CDN, moderate object lifetime).** Use `allkeys-lfu` for content with stable popularity (most-visited pages, popular images). Use `allkeys-lru` for content with temporal bursts (news articles, trending videos). Monitor the eviction rate and switch policies if the hit ratio drops below 80%.

@@ -1,0 +1,334 @@
+---
+id: grpc-tradeoffs
+title: "gRPC - Trade-offs &amp; Failure Modes"
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# gRPC  Trade-offs & Failure Modes
+
+## The Core Tension
+
+**gRPC trades browser compatibility and human-readability for raw performance and strong typing, and it trades simple request-response semantics for complex streaming lifecycle management.**
+
+Every advantage of gRPC  binary serialization, HTTP/2 multiplexing, typed contracts, streaming  comes with a corresponding cost. Binary protobuf is fast and small but opaque to debugging tools. HTTP/2 multiplexing eliminates head-of-line blocking but introduces stream-level flow control complexity. The `.proto` contract guarantees consistency but creates a schema evolution burden. Streaming enables real-time patterns but makes error handling, retries, and load balancing significantly harder.
+
+---
+
+## Decision Matrix
+
+| Decision | Option A | Option B | Choose A | Choose B |
+|----------|----------|----------|----------|----------|
+| **Serialization** | Protobuf (binary) | JSON (text) | Low latency, high throughput, small payloads | Debugging ease, browser clients, human-readable logs |
+| **Transport** | HTTP/2 (gRPC) | HTTP/1.1 (REST) | High concurrency, streaming, low latency | Simple infrastructure, all clients support it |
+| **Contract** | .proto (strict) | OpenAPI (documentation) | Auto-generated code, cross-language type safety | Flexibility, gradual API evolution, wider tooling |
+| **Streaming** | Bidirectional streaming | Polling / WebSockets | Real-time bidirectional data exchange | Simpler monitoring, debugging, and error handling |
+| **Load Balancing** | Client-side (gRPC-LB) | Proxy-side (Envoy/NGINX) | Reduced latency, no proxy hop | Centralized control, simpler client config |
+| **Browser Support** | gRPC-Web (proxy required) | REST directly | Unify backend on gRPC, gateway pattern | No additional infrastructure, direct browser access |
+| **Error Handling** | Status codes + details | HTTP status codes | Richer error semantics (typed, retryable) | Universal understanding, simpler client code |
+| **Schema Evolution** | Field tags + reserved | JSON (accept unknown fields) | Backward compatible without coordination | Forgiving parsers, no field tag management |
+
+---
+
+## CAP Theorem Positioning
+
+gRPC is a communication protocol, not a data store, so CAP theorem applies to the services that use it rather than the protocol itself. However, the streaming and deadline features of gRPC influence how you build **CP** (consistent, partition-tolerant) vs **AP** (available, partition-tolerant) systems.
+
+<AsciiDiagram
+  id="grpc/cap-positioning"
+  title="gRPC in CAP Theorem Context"
+  alt="Diagram showing how gRPC services position themselves differently in CP vs AP configurations"
+  caption="gRPC supports both CP and AP services through different retry and deadline configurations"
+
+content={`
+?' - s  gRPC in the CAP Theorem Landscape  ??s
+?" - ¤
+??s  ??s
+??s  ?' - s
+??s  ??s  Network Partition  ??s  ??s
+??s  ??s  (link down 10s)  ??s  ??s
+??s  - o  ??s
+??s  ??s  ??s
+??s  ?' - ´ - s
+??s  ?"¼  ?"¼  ??s
+??s  ?' - ' - s
+??s  ??s  CP Service  ??s  ??s  AP Service  ??s  ??s
+??s  ??s  (banking)  ??s  ??s  (social feed)  ??s  ??s
+??s  ?" - ¤  ?" - ¤  ??s
+??s  ??s  gRPC config:  ??s  ??s  gRPC config:  ??s  ??s
+??s  ??s  Deadline: 3s  ??s  ??s  Deadline: 10s  ??s  ??s
+??s  ??s  Retry: disabled  ??s  ??s  Retry: 3 attempt ??s  ??s
+??s  ??s  Behavior:  ??s  ??s  Behavior:  ??s  ??s
+??s  ??s  Reject on  ??s  ??s  Serve stale  ??s  ??s
+??s  ??s  uncertainty  ??s  ??s  cache, retry  ??s  ??s
+??s  ??s  Return ABORTED  ??s  ??s  Return OK with  ??s  ??s
+??s  ??s  on conflict  ??s  ??s  eventually-  ??s  ??s
+??s  ??s  ??s  ??s  consistent data  ??s  ??s
+??s  - o  - o  ??s
+??s  ??s
+??s  Partition behavior:  ??s
+??s  CP: 58,000 RPS ??T all fail (0 served)  vs  AP: 58,000 RPS ??T 55,000 stale ??s
+ - o
+  `
+}/>
+
+### Partition Scenario
+
+A network partition isolates the gRPC client from the server for 10 seconds:
+
+- **CP service** (e.g., payment processing): The gRPC client's deadline expires after 3 seconds. All RPCs fail with DEADLINE_EXCEEDED. The client retries (if configured), each call fails. Zero inconsistent state is created. The system is consistent but unavailable.
+- **AP service** (e.g., news feed): The gRPC client reads from a local cache when the server is unreachable. After 10 seconds the partition heals, and the client reconnects. Events that occurred during the partition are eventually synced. The system is available but may show stale data.
+
+---
+
+## Failure Modes
+
+### Failure 1: gRPC Connection Black Hole
+
+**Scenario**: A load balancer accepts TCP connections but immediately resets them. The gRPC client connects, sends a HEADERS frame, and receives RST_STREAM.
+
+**Root cause**: The load balancer's connection pool is full (default 100 per backend). When all slots are occupied, new connections are immediately dropped.
+
+**Blast radius**: All clients targeting this load balancer. New connections fail. Existing connections on the same channel continue working until they are closed.
+
+**Detection**: `grpc_client_connectivity_state` metric shows `TRANSIENT_FAILURE` for affected channels. `grpc_client_handled_total{grpc_code="UNAVAILABLE"}` spikes.
+
+**Recovery**: 
+1. Increase load balancer's `max_connections_per_backend` from 100 to 1000+.
+2. Add connection pre-creation to warm the pool during deployment.
+3. Implement connection retry with backoff in the gRPC client.
+
+```yaml
+# Envoy config: increase connection pool
+clusters:
+- name: user_service
+  connect_timeout: 5s
+  max_requests_per_connection: 0  # Unlimited
+  circuit_breakers:
+  thresholds:
+  - priority: DEFAULT
+  max_connections: 10000  # From default 100
+```
+
+### Failure 2: Server Streaming Memory Exhaustion
+
+**Scenario**: A server streaming RPC (`ListOrders`) returns 10 million orders. The client's receive buffer fills up faster than the client application reads from the stream.
+
+**Root cause**: The server produces data faster than the consumer can process. The HTTP/2 flow control window prevents network buffer overflow, but the application-level buffer continues to grow.
+
+**Blast radius**: The specific client's memory grows unbounded. On shared-thread gRPC servers (Python, Ruby), one slow consumer can block other RPCs.
+
+<AsciiDiagram
+  id="grpc/backpressure"
+  title="gRPC Backpressure Failure Mode"
+  alt="Diagram showing how a fast server producer overwhelms a slow client consumer through a stream"
+  caption="Without backpressure handling, a fast producer can exhaust memory in a slow consumer"
+
+content={`
+?' - s  Streaming Backpressure Failure  ??s
+?" - ¤
+??s  ??s
+??s  Server (fast)  HTTP/2 Stream  Client (slow)  ??s
+??s  ?' - ' - s
+??s  ??s Produces 10,000 ??s  ??s Processes 100  ??s  ??s
+??s  ??s msgs/second  ??s - Buffer - "º  ??s msgs/second  ??s  ??s
+??s  ??s  ??s  ~1 MB queued  ??s  ??s  ??s
+??s  ??s  ??s  in HTTP/2 flow  ??s Application  ??s  ??s
+??s  ??s  ??s  control window  ??s buffer grows  ??s  ??s
+??s  ??s  ??s  ??s 8 MB... 64 MB  ??s  ??s
+??s  ??s  ??s  ??s ... 512 MB  ??s  ??s
+??s  ??s  ??s  ??s  OOM  ??s  ??s
+??s  - o  - o  ??s
+??s  ??s
+??s  Solution: Client sets FlowControlWindow to limit server push rate  ??s
+??s  Or: Client uses a bounded channel (e.g., Go chan with cap)  ??s
+ - o
+  `
+}/>
+
+**Detection**: Client process memory climbs. `grpc_server_sent_messages_total` grows far faster than `grpc_client_received_messages_total`.
+
+**Recovery**:
+1. Client sets a bounded read buffer and applies backpressure by not reading from the stream until ready.
+2. Server uses flow-control-aware writes (check return value of `Send()`).
+3. Use pagination instead of unbounded streaming for large result sets.
+
+### Failure 3: Deadline Propagation Cascade
+
+**Scenario**: Service A calls Service B with a 5-second deadline. Service B calls Service C. Service C hangs (DB query stuck on a lock).
+
+**Root cause**: Service A's deadline is not propagated to Service C. Service C has no deadline. Service B's gRPC call to C hangs indefinitely. Service B's thread is consumed. Eventually Service B's thread pool exhausts.
+
+<AsciiDiagram
+  id="grpc/deadline-cascade"
+  title="Deadline Propagation Cascade Failure"
+  alt="Diagram showing how a missing deadline at one service level causes thread pool exhaustion up the chain"
+  caption="Missing deadline propagation causes cascading resource exhaustion across the call chain"
+
+content={`
+?' - s  Deadline Propagation Cascade  ??s
+?" - ¤
+??s  ??s
+??s  Service A  Service B  Service C  Database  ??s
+??s  deadline: 5s  deadline:  - deadline:  - ??s
+??s  ??s  ??s  ??s  ??s  ??s
+??s  ??s - RPC  - "º??s  ??s  ??s  ??s
+??s  ??s  (ctx=5s)  ??s  ??s  ??s  ??s
+??s  ??s  ??s - RPC  - "º??s  ??s  ??s
+??s  ??s  ??s  (ctx=NONE!)  ??s  ??s  ??s
+??s  ??s  ??s  ??s - Query  - "º??s  LOCK HELD  ??s
+??s  ??s  ??s  ??s  ??s  ??s
+??s  ??s  ??s  ??s.... waits .... ??s  ??s
+??s  ??s  5s later:  ??s  ??s.... waits .... ??s  ??s
+??s  ??s  A times out  ??s  ??s.... waits .... ??s  ??s
+??s  ??s  cancels ctx  ??s  ??s.... waits .... ??s  ??s
+??s  ??s - CANCEL - "º??s  ??s.... waits .... ??s  ??s
+??s  ??s  ??s  B's thread  ??s.... waits .... ??s  ??s
+??s  ??s  ??s  to C blocks  ??s.... waits .... ??s  ??s
+??s  ??s  ??s  indefinitely ??s  ??s  ??s
+??s  ??s  ??s  Thread pool  ??s  ??s  ??s
+??s  ??s  ??s  exhausted  ??s  ??s  ??s
+??s  ??s  ??s  after N such ??s  ??s  ??s
+??s  ??s  ??s  calls  ??s  ??s  ??s
+??s  ??s  ??s  B crashes  ??s  ??s  ??s
+??s  ??s  ??s  ??s  ??s  ??s
+??s  ??s  Result: Service A and B both down. C is fine (it was waiting)  ??s
+ - o
+  `
+}/>
+
+**Detection**: Service B has error `CANCELLED` or `DEADLINE_EXCEEDED` on outbound RPCs. Thread pool queue depth grows. `grpc_server_started_total` drops as new RPCs are rejected.
+
+**Recovery**: Always propagate the context `ctx` from incoming to outgoing RPCs. In Go: `client.GetUser(ctx, req)` where `ctx` is the original context. In Python: `await stub.GetUser(request, timeout=context.timeout())`.
+
+### Failure 4: Protobuf Schema Evolution Breakage
+
+**Scenario**: The team adds a new `email_verified` boolean field to the `User` message, tagging it field number 4. An old client (not redeployed) sends a `GetUserRequest` that omits this field. The new server receives it and defaults `email_verified` to `false`. The server returns the response. Weeks later, old clients are decommissioned. Someone reuses field tag 4 for a different field `phone_verified`. Now old clients (if any remain) will deserialize `phone_verified` as `email_verified`.
+
+**Root cause**: Protobuf field tags must never be reused once defined. The `reserved` keyword was not used when the field was removed.
+
+**Blast radius**: Data corruption in any service that still has old code. Silent  no error is raised because protobuf just maps the tag number.
+
+**Detection**: Only discovered through manual data audit or unit tests.
+
+**Recovery**:
+```protobuf
+message User {
+  reserved 4;  // was email_verified, removed in v2.3
+  reserved "email_verified";
+
+  string user_id = 1;
+  string name = 2;
+  string email = 3;
+  bool phone_verified = 5;  // new field, safe tag
+}
+```
+
+### Failure 5: gRPC Reflection Enabled in Production
+
+**Scenario**: A production gRPC server has reflection enabled. An attacker discovers the server, lists all services, and calls `AdminService/DeleteUser` using `grpcurl`.
+
+**Root cause**: Reflection is intended for development and debugging but was left enabled in production without authentication.
+
+**Blast radius**: Total compromise of all gRPC methods. Data exfiltration, deletion, or modification.
+
+**Detection**: Audit logs show calls to `grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo`. Unusual RPC patterns.
+
+**Recovery**: Disable reflection in production. Use mTLS authentication on all gRPC servers. Implement per-RPC authorization.
+
+---
+
+## Anti-Patterns Hall of Shame
+
+### Anti-Pattern 1: Using gRPC for Browser-to-Server Communication
+
+**Mistake**: Exposing native gRPC (HTTP/2 with protobuf) directly to browser clients.
+
+**Why it seemed reasonable**: "gRPC is fast, so our frontend will be faster."
+
+**Production impact**: Browsers cannot send or receive raw HTTP/2 frames from JavaScript. gRPC-Web (the browser-compatible wrapper) has limited support for streaming and no support for trailers. The gRPC-Web proxy adds latency and operational overhead.
+
+**Correct pattern**: Use gRPC-Gateway to auto-generate a REST/JSON proxy. The browser talks REST; the backend talks gRPC. Or use gRPC-Web with Envoy's gRPC-Web filter if you need streaming.
+
+### Anti-Pattern 2: Giant Monolithic .proto Files
+
+**Mistake**: Defining all services and messages for an entire system in one `everything.proto` file.
+
+**Why it seemed reasonable**: "Easier to share types across services. One file to rule them all."
+
+**Production impact**: Every service depends on the same proto file. Changing any field requires rebuilding every service. Build times go from seconds to minutes. Merge conflicts on the proto file become daily occurrences. Teams block each other.
+
+**Correct pattern**: One `.proto` file per service domain. Share common types (timestamps, money, pagination) in a separate `common.proto`. Use `import` to reference types across files.
+
+### Anti-Pattern 3: No Deadline on Any RPC
+
+**Mistake**: Calling gRPC methods without setting a deadline or timeout.
+
+**Why it seemed reasonable**: "The server is fast. Deadlines are for unreliable systems."
+
+**Production impact**: When the server hangs (deadlock, DB lock, OOM), the client hangs too  forever. The default TCP timeout is 2 hours. The client's thread/goroutine is consumed for that entire duration. Thread pool exhaustion follows. The service becomes unavailable without any deployed code changing.
+
+**Correct pattern**: Always set a deadline. In Go: `ctx, cancel := context.WithTimeout(ctx, 5*time.Second)`. In Python: `stub.GetUser(request, timeout=5)`.
+
+### Anti-Pattern 4: Using gRPC for Short-Lived CLI Tools
+
+**Mistake**: Building a CLI tool that makes gRPC calls to a server when the tool runs once and exits.
+
+**Why it seemed reasonable**: "gRPC is modern. We use it everywhere else."
+
+**Production impact**: The gRPC setup (channel creation, HTTP/2 handshake, TLS negotiation) takes 50-200ms. The actual data transfer takes 5ms. You spent 90% of the time on connection overhead. A simple HTTP/REST call with connection reuse would complete in 10ms.
+
+**Correct pattern**: Use REST/JSON for CLI tools, scripts, and one-shot operations. Reserve gRPC for high-throughput, long-lived service-to-service communication.
+
+### Anti-Pattern 5: Over-Engineering with Bidirectional Streaming
+
+**Mistake**: Using bidirectional streaming for what is fundamentally a request-response pattern.
+
+**Why it seemed reasonable**: "Bidirectional streaming is more powerful. We might need it later."
+
+**Production impact**: Bidirectional streams are harder to debug, harder to load balance (L7 proxies handle them poorly), harder to retry (how do you replay messages in a stream?), and harder to monitor (latency per message, not per RPC). The team spends 40% more development time on streaming code than they would on unary RPCs, and the feature they thought they would need never materializes.
+
+**Correct pattern**: Start with unary RPCs. Move to server streaming only when the client needs real-time updates. Use bidirectional streaming only when both sides produce messages independently and asynchronously (chat, gaming, live collaboration). Profile before optimizing.
+
+---
+
+## When NOT to Use gRPC
+
+### Over-Engineering Signals
+
+Choose a simpler alternative (REST/JSON over HTTP/1.1 or HTTP/2) when:
+
+- **Total request volume is under 1,000 RPS**: The serialization and multiplexing benefits of gRPC are marginal at this scale. The operational overhead of protobuf tooling, code generation, and debugging will outweigh the performance gains.
+- **You have fewer than 3 microservices**: If your system is a monolith or has only 2-3 services, the contract-management overhead of proto files is not justified. REST with OpenAPI provides adequate documentation and type safety.
+- **Your primary consumers are browsers**: Unless you invest in gRPC-Web infrastructure, browser clients cannot use gRPC directly. REST/JSON is universally supported.
+- **Your team has no experience with protobuf or HTTP/2**: gRPC has a steep learning curve. Protobuf schema evolution, field tag management, streaming error handling, and HTTP/2 flow control all have subtle failure modes that experienced users navigate intuitively. A team learning these while debugging production outages will have a bad experience.
+- **Your latency requirements are under 200ms p99 and currently met**: If your REST API handles current traffic within SLOs, gRPC's performance gains (reducing latency from 200ms to 50ms) may not justify the migration cost.
+
+### Simpler Alternatives
+
+| Scenario | Alternative | Why |
+|----------|-------------|-----|
+| Browser client | REST/JSON (or GraphQL) | Universal browser support, no proxy needed |
+| CLI tools | REST/JSON | Connection overhead of HTTP/2 is wasted |
+| Internal scripts | REST/JSON | No code generation setup needed |
+| Mobile app > REST | REST/JSON (or gRPC-Web) | gRPC-Web still evolving on mobile |
+| Real-time notifications | WebSockets | Simpler than bidirectional streaming for most cases |
+| Cross-DC replication | Kafka / Event Bus | gRPC streaming requires custom reconnect logic |
+
+### Scale Thresholds
+
+Organizations typically adopt gRPC at these scale points:
+
+- **10K RPS internal traffic**: Serialization CPU savings justify the migration.
+- **50+ microservices**: Proto contract enforcement reduces cross-team integration bugs.
+- **Multi-language polyglot (3+ languages)**: Protobuf code generation ensures type safety across language boundaries.
+- **Streaming data (event > 100KB)**: Binary protobuf's wire size advantage becomes significant.
+- **Sub-10ms p99 latency requirement**: gRPC's overhead (0.5ms) vs REST's overhead (3-5ms) matters at this level.
+
+If you do not meet at least two of these thresholds, start with REST and migrate to gRPC only when metrics justify it.
+
+---
+
+Bridge: Theory and trade-offs are essential, but the real learning comes from seeing gRPC in production at massive scale. The next page examines how Netflix, Uber, Google, Discord, and Dropbox deploy gRPC  including the specific decisions that made their architectures work.

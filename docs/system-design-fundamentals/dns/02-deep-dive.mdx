@@ -1,0 +1,421 @@
+---
+id: dns-deep-dive
+title: DNS — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+A recursive DNS resolver processes each query through four subsystems arranged in a pipeline. Understanding each subsystem explains why a cache miss costs 50 milliseconds while a cache hit costs under 1 millisecond.
+<AsciiDiagram
+  id="dns/deep-arch"
+  title="Recursive Resolver Internal Architecture"
+  content={`
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │                  Recursive Resolver Internal Architecture                     │
+  │              Processing a single query from arrival to response              │
+  └─────────────────────────────────────────────────────────────────────────────┘
+                         ┌──────────────┐
+                         │   Network    │
+                         │   Listener   │
+                         │  (UDP 53)    │
+                         └──────┬───────┘
+                                │ Raw packet arrives
+                                ▼
+  ┌───────────────────────────────────────────────────────────────────────────┐
+  │                        Query Pipeline                                      │
+  │                                                                           │
+  │  ┌────────────┐    ┌────────────┐    ┌────────────┐    ┌────────────┐    │
+  │  │  Parse &   │    │  Cache     │    │  Query     │    │  Rate      │    │
+  │  │  Validate  │───>│  Lookup    │───>│  Router    │───>│  Limiter   │    │
+  │  │            │    │            │    │            │    │            │    │
+  │  │ Check:     │    │ Check:     │    │ Pick:      │    │ Check:     │    │
+  │  │ QR flag    │    │ LRU cache  │    │ root       │    │ per-client │    │
+  │  │ opcode     │    │ negative   │    │ TLD        │    │ per-domain │    │
+  │  │ query type │    │ cache      │    │ auth NS    │    │ total QPS  │    │
+  │  │ recursion  │    │            │    │            │    │            │    │
+  │  │ desired    │    │            │    │            │    │            │    │
+  └──┴────────────┘    └────────────┘    └────────────┘    └────────────┘    │
+                                                                           │
+  ┌───────────────────────────────────────────────────────────────────────────┐
+  │                      Outbound Fetcher Pool                                 │
+  │                                                                           │
+  │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐         │
+  │  │  UDP       │  │  TCP       │  │  TLS/DoT  │  │  HTTP/DoH  │         │
+  │  │  Fetcher   │  │  Fetcher   │  │  Fetcher   │  │  Fetcher   │         │
+  │  │            │  │            │  │            │  │            │         │
+  │  │ epoll/kqueue│  │ connection │  │ encrypted  │  │ HTTPS to   │         │
+  │  │ async I/O  │  │ pool       │  │ query      │  │ DoH server │         │
+  └──┴────────────┘  └────────────┘  └────────────┘  └────────────┘         │
+                                                                           │
+  ┌───────────────────────────────────────────────────────────────────────────┐
+  │                      Response Processing                                  │
+  │                                                                           │
+  │  ┌────────────┐    ┌────────────┐    ┌────────────┐    ┌────────────┐    │
+  │  │  Validate  │───>│  Cache     │───>│  Assemble  │───>│  Send      │    │
+  │  │  Response  │    │  Insert    │    │  Response  │    │  Response  │    │
+  │  │            │    │            │    │            │    │            │    │
+  │  │ Check:     │    │ Store with │    │ Add auth   │    │ UDP/tcp    │    │
+  │  │ DNSSEC     │    │ TTL expiry │    │ section    │    │ response   │    │
+  │  │ truncation │    │                 │ Add glue   │    │ back to    │    │
+  │  │ format     │    │                 │ Filter     │    │ client     │    │
+  └──┴────────────┘    └────────────┘    └────────────┘    └────────────┘    │
+  └───────────────────────────────────────────────────────────────────────────┘
+  4 subsystems, 12 stages. Total internal pipeline latency: under 0.1ms on cache hit.
+  `}
+/>
+### The Cache Subsystem
+The cache is the most performance-critical component. A recursive resolver that handles 100,000 queries per second sees a cache hit rate of 80-95% depending on the client workload. Each cache miss triggers outbound fetches to 3-4 upstream servers, each adding 10-50 milliseconds.
+### The Query Router
+The query router maintains an internal database of root hints (the 13 root server IPs), current TLD server addresses (fetched from root), and learned authoritative server addresses. This database is built dynamically as queries are resolved — the resolver learns which servers are authoritative for which zones through referrals.
+## Data Structures and Algorithms
+### DNS Message Format: Wire Format Binary Protocol
+DNS messages use a compact binary format defined in RFC 1035. A query fits in 512 bytes (or up to 4096 bytes with EDNS0). The message has five sections: header, question, answer, authority, and additional.
+```
+DNS Message Wire Format (hex view of a query for www.example.com):
+Header:   01 00 00 01 00 00 00 00 00 00
+          ├─ ID=0x0100
+          │  └─ Flags: query, recursion desired
+          └─ Counts: 1 question, 0 answer, 0 auth, 0 addl
+Question: 03 77 77 77 07 65 78 61 6d 70 6c 65 03 63 6f 6d 00
+          │  ├─ "www"  (length-prefixed: 0x03 = 3 bytes)
+          │  │  └─ "example" (0x07 = 7 bytes)
+          │  │     └─ "com" (0x03 = 3 bytes)
+          │  └─ Root terminator (0x00)
+          00 01 00 01
+          ├─ QTYPE = A (0x0001)
+          └─ QCLASS = IN (0x0001)
+```
+The length-prefixed label format (3www7example3com0) supports compression: if a label appears multiple times (e.g., repeated domain suffixes), it is replaced with a 2-byte pointer to the earlier occurrence. This compression reduces response sizes by 30-50%.
+### Cache Eviction: LRU with TTL Priority
+The caching algorithm is a Least-Recently-Used (LRU) map augmented with TTL expiry. Every record has two expiration dimensions: the DNS TTL (hard expiry after which the record is invalid) and the cache pressure (how recently the record was accessed).
+<AsciiDiagram
+  id="dns/cache-eviction"
+  title="Cache Eviction Policy"
+  content={`
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │              Cache Eviction: LRU-2Q with TTL Priority                 │
+  └──────────────────────────────────────────────────────────────────────┘
+  Incoming Record
+        │
+        ▼
+  ┌─────────────────────────────────────────────────────┐
+  │  TTL Check                                           │
+  │  TTL == 0?  ──> Don't cache (pass through)          │
+  │  TTL < 60?   ──> Cache in short-lived area          │
+  │  TTL >= 60?  ──> Cache in main area                 │
+  └─────────────────────────────────────────────────────┘
+        │
+        ▼
+  ┌──────────────────────────────────────────────┐
+  │  Main Cache (80% of memory budget)            │
+  │  Eviction: LRU within each TTL bucket         │
+  │                                               │
+  │  ┌──────┬──────┬──────┬──────┬──────┐        │
+  │  │ 60s  │ 300s │ 900s │ 3600s│86400s│  ...   │
+  │  └──────┴──────┴──────┴──────┴──────┘        │
+  └──────────────────────────────────────────────┘
+        │
+        ▼
+  ┌──────────────────────────────────────────────┐
+  │  Negative Cache (5% of memory budget)         │
+  │  Stores NXDOMAIN responses to avoid           │
+  │  re-querying for nonexistent names            │
+  │  TTL: 300-3600 seconds (SOA minimum field)    │
+  └──────────────────────────────────────────────┘
+        │
+        ▼
+  ┌──────────────────────────────────────────────┐
+  │  Prefetch Queue (15% of memory budget)        │
+  │  Records with TTL below 10% of original       │
+  │  Re-fetches before expiry to avoid latency    │
+  └──────────────────────────────────────────────┘
+  Time complexity: O(1) insert, O(1) lookup, O(1) eviction
+  (hash table + doubly-linked list for LRU ordering)
+  `}
+/>
+**Structure**: Hash map (domain name -> cache entry) with a doubly-linked list maintaining access order. TTL expiry is checked on lookup: expired entries are lazily evicted.
+**Why this structure**: DNS workloads exhibit strong temporal locality — 90% of queries are for 10% of domains. LRU captures this. The TTL dimension is essential because DNS records have explicit expiry: a record should never be served past its TTL even if LRU would keep it.
+**Complexity**:
+- Lookup: O(1) average, O(n) worst-case on hash collision
+- Insert: O(1) average
+- Eviction: O(1) — remove from tail of LRU list
+- Memory: O(n) where n = number of cached records
+### Name Compression via Label Encoding
+Domain names are encoded as length-prefixed labels with pointer compression for repeated suffixes. This is a simple prefix trie implemented via pointer offsets in the wire format.
+```
+Without compression:
+  "www.example.com" -> 3www7example3com0  (17 bytes)
+  "api.example.com" -> 3api7example3com0  (16 bytes)
+  Total: 33 bytes
+With compression:
+  "www.example.com" -> 3www7example3com0  (17 bytes)
+  "api.example.com" -> 3api\xc0\x0c      (5 bytes, pointer to offset 0x0c)
+  Total: 22 bytes  (33% savings)
+```
+The pointer uses the two high bits (0xC000 mask) to distinguish it from a label length byte. This gives a maximum compression chain of 16,383 bytes — more than enough for any DNS message (max 4096 bytes with EDNS0).
+### Query Scheduling: Least-Recently-Queried (LRQ)
+For queries to upstream servers, the resolver uses a Least-Recently-Queried scheduling algorithm. Given multiple authoritative servers for a zone (typically 2-4), it sends the next query to the server that was queried the longest time ago.
+**Complexity**: O(1) per query using a circular buffer.
+## The DNS Query Lifecycle
+A single recursive resolution involves the resolver, root, TLD, and authoritative servers. Here is the complete lifecycle with the state at each step.
+<AsciiDiagram
+  id="dns/lifecycle-start"
+  title="Lifecycle: Query Arrives at Resolver"
+  content={`
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                Lifecycle: Query Arrives at Resolver                   │
+  └──────────────────────────────────────────────────────────────────────┘
+  State BEFORE query: Cache has 85,342 entries, 71% hit rate this minute
+  Step 1: UDP packet arrives on port 53
+          Source: 192.168.1.100:54321
+          Destination: 10.0.0.53:53
+          Size: 44 bytes (header + question)
+  Step 2: Parse header
+          ├── ID: 0x4A7F (matches request to response)
+          ├── Flags: query, recursion desired (RD=1)
+          ├── Questions: 1
+          ├── Answer RRs: 0
+          └── Authority RRs: 0
+  Step 3: Parse question
+          └── Name: api.example.com
+              Type: A (host address)
+              Class: IN (Internet)
+  Step 4: Cache lookup
+          └── Key: "api.example.com" + "A" + "IN"
+              Result: MISS (not in cache)
+  State AFTER query: Cache miss triggers outbound resolution
+  `}
+/>
+<AsciiDiagram
+  id="dns/lifecycle-walk"
+  title="Lifecycle: Walking the Hierarchy"
+  content={`
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │              Lifecycle: Walking the DNS Hierarchy                     │
+  └──────────────────────────────────────────────────────────────────────┘
+  Query: api.example.com A
+  Resolver Cache State: [api.example.com: MISS]
+  Step 5: Resolver picks closest known delegation
+          Knows root hints from configuration
+          Selects: 198.41.0.4 (a.root-servers.net)
+  Step 6: Sends to root server
+          ┌──────────────┐    Query: api.example.com A   ┌──────────────┐
+          │  Resolver    │  ──────────────────────────>   │  Root (.)    │
+          │              │    src_port: 43521             │  198.41.0.4  │
+          │              │  <──────────────────────────   │              │
+          │              │    Referral:                    │              │
+          │              │    .com NS a.gtld-servers.net  │              │
+          │              │    a.gtld-servers.net A 192.0. │              │
+          │              │    34.164                      │              │
+          └──────────────┘                                └──────────────┘
+  Step 7: Cache the .com delegation (TTL: 172800 sec = 48 hours)
+  Step 8: Sends to TLD server
+          ┌──────────────┐    Query: api.example.com A   ┌──────────────┐
+          │  Resolver    │  ──────────────────────────>   │  TLD (.com)  │
+          │              │    src_port: 43522             │  192.0.34.164│
+          │              │  <──────────────────────────   │              │
+          │              │    Referral:                    │              │
+          │              │    example.com NS ns1.example  │              │
+          │              │    .com                        │              │
+          │              │    ns1.example.com A 203.0.113 │              │
+          │              │    .10 (glue record)           │              │
+          └──────────────┘                                └──────────────┘
+  Step 9: Cache the example.com delegation (TTL: 86400 sec = 24 hours)
+  Step 10: Sends to authoritative server
+          ┌──────────────┐    Query: api.example.com A   ┌──────────────┐
+          │  Resolver    │  ──────────────────────────>   │  Auth NS     │
+          │              │    src_port: 43523             │  203.0.113.10│
+          │              │  <──────────────────────────   │              │
+          │              │    Answer:                     │              │
+          │              │    api.example.com A 93.184.   │              │
+          │              │    216.34                      │              │
+          │              │    TTL: 300                    │              │
+          └──────────────┘                                └──────────────┘
+  `}
+/>
+<AsciiDiagram
+  id="dns/lifecycle-response"
+  title="Lifecycle: Response and Cache Insert"
+  content={`
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │           Lifecycle: Response Received, Cache Updated                 │
+  └──────────────────────────────────────────────────────────────────────┘
+  Step 11: Validate response
+           ├── QR flag set (response, not query)
+           ├── RCODE = 0 (no error)
+           ├── Answer section present, not truncated
+           ├── Question matches our query
+           ├── AA flag set (authoritative answer)
+           └── [If DNSSEC: verify RRSIG, DNSKEY chain]
+  Step 12: Insert into cache
+           ├── Key: api.example.com + A + IN
+           ├── Value: 93.184.216.34
+           ├── TTL: 300 seconds
+           ├── Insertion time: <current epoch>
+           └── Expiry time: insertion + 300
+           Cache state after insert:
+           ├── api.example.com   A    93.184.216.34    [TTL: 298s remaining]
+           ├── www.example.com   A    93.184.216.34    [TTL: 127s remaining]
+           ├── .com NS           ...                    [TTL: 172790s remaining]
+           └── example.com NS    ...                    [TTL: 86392s remaining]
+  Step 13: Assemble response
+           ├── Header: QR=1, AA=0 (not authoritative, we're a resolver)
+           ├── Question: api.example.com A IN
+           ├── Answer: api.example.com A 93.184.216.34 TTL 300
+           ├── Authority: (none needed — included from auth)
+           └── Additional: (none)
+  Step 14: Send response
+           ┌──────────────┐    UDP packet (76 bytes)    ┌──────────────┐
+           │  Resolver    │  ─────────────────────────>  │  Client      │
+           │              │    src: 10.0.0.53:53        │  192.168.1.  │
+           │              │    dst: 192.168.1.100:54321 │  100         │
+           │              │    ID: 0x4A7F (matches      │              │
+           │              │    original query)          │              │
+           └──────────────┘                             └──────────────┘
+  Total lifecycle time: 47 milliseconds
+  Cache insert: under 0.05 ms
+  Validation: under 0.01 ms
+  Network transit (4 RTTs): ~45 ms
+  `} />
+## Consistency and State
+DNS is an **eventually consistent** system. There is no distributed consensus, no leader election, no transaction log. Consistency emerges from two mechanisms: authoritative delegation and TTL expiry.
+### Crash: Authoritative Nameserver Failure
+**Scenario**: The primary authoritative nameserver for `example.com` crashes. A secondary nameserver on a different network segment remains healthy.
+<AsciiDiagram
+  id="dns/crash-scenario"
+  title="Consistency: Authoritative Nameserver Crash"
+  content={`
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │              Consistency Scenario: Authoritative Crash                │
+  └──────────────────────────────────────────────────────────────────────┘
+  Timeline:
+  T=0s     Primary NS (ns1.example.com) crashes
+  T=0-300s Recursive resolvers still have cached records (TTL=300s)
+           Clients continue to receive valid IP addresses from cache
+  T=300s   Cache expires. Queries fall through to resolver
+           Resolver tries ns1.example.com: no response (RTO + 3 retries = 12s)
+           Resolver tries ns2.example.com (secondary): success
+  T=312s   All clients resolving again through secondary NS
+  T=360s   ns2 serves records. Partial service restored
+  T=10min  ns1 restarted. Zone transfer from ns2 triggers
+           ns2 is now the source of truth for the zone
+  T=11min  Both servers serving. Full redundancy restored
+  Impact: 12-second window where new clients (uncached) see resolution failures
+  Blast radius: Only clients whose cache expired in that 12-second window
+  Mitigation: TTL under 60 seconds makes this window invisible to most users
+  `}
+/>
+### Partition: Network Split Between Resolver and Authoritative
+**Scenario**: A network partition isolates the recursive resolver from the authoritative nameserver. The resolver cannot fetch fresh records.
+DNS behavior during a partition is governed by the SOA record fields. The resolver uses stale records if the partition resolves within the SOA expire field (typically 1-14 days). If the partition outlasts the expire field, the resolver must return SERVFAIL.
+**Stale read window**: The resolver can serve stale data for up to SOA expire seconds (typically 1,209,600 seconds = 14 days). During this window, clients see potentially outdated IP addresses.
+**Recovery**: When the partition heals, the resolver immediately attempts to refresh. A successful refresh resets the timer.
+### Concurrent Writes: Zone Transfer Race
+DNS zones are updated through zone transfers (AXFR for full, IXFR for incremental). If two operators concurrently update the same zone file, the last zone transfer to propagate to secondaries wins — last-writer-wins semantics.
+**Scenario**: Operator A adds an A record for `api.example.com` pointing to `10.0.1.10`. Operator B, working from a stale copy, adds an A record for `api.example.com` pointing to `10.0.1.20`. Both update the serial number. The secondary that receives B's transfer last overwrites A's record.
+**No conflict detection**: DNS has no mechanism to detect or report conflicting updates. The zone file merely records serial numbers — there is no vector clock, no CRDT, no consensus.
+**Mitigation**: DNS update APIs (like RFC 2136 dynamic updates) are restricted by TSIG signatures to a single authorized operator. Most domains avoid concurrent writes entirely.
+### Stale Reads from Caching
+Stale reads are the most common consistency anomaly in DNS. A resolver caches a record with a 3600-second TTL. During that hour, the authoritative data changes. The resolver continues to serve the stale record until the TTL expires.
+<AsciiDiagram
+  id="dns/stale-reads"
+  title="Consistency: Stale Reads from Caching"
+  content={`
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │              Consistency: Stale Reads from Caching                    │
+  └──────────────────────────────────────────────────────────────────────┘
+  Timeline:
+  T=0s     Record published: www.example.com A 93.184.216.34 (TTL=3600s)
+  T=1800s  Record updated to: www.example.com A 198.51.100.10
+           ──── authoritative change ────
+  T=1800s  Resolver A: cached record has 1800s remaining
+           Returns: 93.184.216.34 (STALE)
+  T=1800s  Resolver B: no cache (just restarted)
+           Resolves fresh: 198.51.100.10 (CORRECT)
+  T=3600s  Resolver A: cache expires, re-resolves
+           Returns: 198.51.100.10 (CORRECT)
+  T=5400s  All resolvers consistent
+  Duration of inconsistency: 30 minutes (depends on when each resolver cached)
+  Stale reads served: 100% of queries to Resolver A during T=1800-3600
+  Resolution: TTL expiry
+  Client impact:
+  ├── Browser: gets wrong IP, connects to old server
+  │   └── If old server redirects, user eventually reaches correct destination
+  ├── API client: gets wrong IP, connection timeout (10-30 seconds)
+  │   └── Service is unreachable for up to 30 minutes
+  └── Mobile app: cached NSURL result persists in app-level DNS cache
+      └── App restart required to clear
+  `}
+/>
+## Performance Characteristics
+### Latency by Component
+| Component | p50 | p99 | p999 |
+|---|---|---|---|
+| Browser cache hit | 0.01 ms | 0.05 ms | 0.1 ms |
+| OS cache hit | 0.03 ms | 0.1 ms | 0.5 ms |
+| Recursive resolver cache hit | 0.1 ms | 0.5 ms | 2 ms |
+| Full recursive resolve (hot) | 25 ms | 150 ms | 500 ms |
+| Full recursive resolve (cold) | 50 ms | 300 ms | 2000 ms |
+| DNSSEC validation added | +5 ms | +50 ms | +200 ms |
+| TCP fallback (truncated UDP) | +10 ms | +100 ms | +500 ms |
+### Throughput
+A single recursive resolver instance on modern hardware:
+- 100,000-500,000 queries per second (QPS) for cached responses
+- 10,000-50,000 QPS for uncached/resolved responses
+- Maximum UDP throughput limited by source port availability (~64K ports per upstream IP)
+- With TCP/epoll: limited by connection pool size and upstream latency
+### Memory
+Cache memory for a typical recursive resolver:
+- 1 GB cache holds approximately 2-4 million DNS records
+- Each record: 60-200 bytes depending on RDATA size (A record: 4 bytes; AAAA: 16 bytes; CNAME target: variable)
+- Overhead: hash table bucket, LRU pointers, TTL metadata: ~40 bytes per entry
+- Total: ~100-250 bytes per cached record
+**Cache sizing rule**: For 100,000 QPS with 80% hit rate, a resolver needs to cache approximately 500,000 unique domain-name/TYPE combinations per hour of unique traffic. A 2 GB cache handles 8-16 million records, enough for 16-32 hours of unique names without eviction.
+### CPU
+CPU cost per query:
+- Cache hit: ~500 CPU cycles (hash lookup + TTL check)
+- Cache miss: ~5,000-50,000 CPU cycles (message parsing, upstream I/O, validation, cache insert)
+- DNSSEC: ~100,000-500,000 CPU cycles per signature verification
+## Configuration and Tuning
+### TTL Settings
+| Setting | What it controls | Safe default | When to change | What breaks |
+|---|---|---|---|---|
+| TTL on A/AAAA records | How long resolvers cache IP mappings | 300 s (production) 60 s (migration) | During planned IP changes: reduce to 60s 48 hours before | Set too high: slow rollback. Set too low: 10x query load on auth NS |
+| TTL on NS records | How long resolver caches delegation | 86400 s (24 h) | Rarely. Only if migrating nameservers | TTL under 3600: increases root/TLD query load |
+| SOA minimum TTL | Negative caching TTL for NXDOMAIN | 3600 s (1 h) | Reduce if clients frequently query non-existent subdomains | Set too low: increased query load for non-existent names |
+| SOA expire | How long secondaries serve without refresh | 1,209,600 s (14 d) | Reduce to 24h if zone changes are frequent | Set too low: secondaries drop zone during maintenance windows |
+### Resolver Configuration
+| Setting | What it controls | Safe default | When to change |
+|---|---|---|---|
+| `max-cache-ttl` | Maximum TTL the resolver accepts | 86400 s (24 h) | Reduce to 3600 for services that change IPs frequently |
+| `max-ncache-ttl` | Maximum negative cache TTL | 10800 s (3 h) | Reduce to 300 if clients need fast propagation of new records |
+| `edns-buffer-size` | Max UDP response size | 1232 bytes | Increase to 4096 only if all upstream servers support large EDNS |
+| `fetch-quota-params` | Rate limit for queries to one upstream | 100/0.5 (100 queries per 500ms) | Reduce if upstream servers show rate-limit errors |
+| `qname-minimization` | Enable QNAME minimization (RFC 7816) | yes | Disable only if compatibility issues with legacy DNS |
+| `aggressive-nsec` | Cache NSEC records for NXDOMAIN proofs | yes | Disable if memory is constrained (increases cache size 5-10%) |
+### Authoritative Server Configuration
+| Setting | What it controls | Safe default | When to change |
+|---|---|---|---|
+| `notify` | Send NOTIFY to secondaries on zone change | yes | Disable in anycast setups where NOTIFY causes unnecessary transfers |
+| `allow-transfer` | Which IPs can initiate zone transfer | `{ secondaries; }` | Restrict to specific IPs of secondary nameservers |
+| `rate-limit` | Max queries per second from a single source | 1000 QPS | Reduce to 100 if under DDoS; increase to 10000 for high-traffic zones |
+| `serial-format` | Zone serial number format | YYYYMMDDNN | Auto-increment only. Never manually set backward |
+### Tuning Example: High-Traffic E-Commerce
+For a site with 10 million daily visitors and 10 backend IP changes per month:
+```
+Tuning for rapid propagation:
+  A/AAAA TTL:         60 seconds
+  NS TTL:            86400 seconds (stick to what root/TLD servers set)
+  max-cache-ttl:     300 seconds (resolver will respect max)
+  SOA minimum TTL:   300 seconds
+  SOA expire:       86400 seconds
+Expected query load on authoritative NS:
+  10M daily visitors * 3 subdomains * (86400/60) requests per day
+  = 10M * 3 / 1440 = ~20,800 QPS average
+  Peak (2x): ~41,600 QPS
+  Each response: ~100 bytes UDP
+  Bandwidth: ~33 Mbps sustained
+```
+**Next**: The architecture section explores how to build a DNS system that handles 10 million queries per second across global regions with six-nines availability.

@@ -1,0 +1,778 @@
+---
+id: event-sourcing-deep-dive
+sidebar_position: 2
+title: Event Sourcing — Under the Hood
+description: Explore the internal architecture of event sourcing — event store internals, data structures, consistency models, performance tuning, and configuration.
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+To build production event-sourced systems, you need to understand how the internal components work together. The event store is the centerpiece, but it is surrounded by supporting infrastructure that handles snapshots, projections, and schema evolution.
+
+<AsciiDiagram id="event-sourcing/02-deep-dive/internal-architecture" title="Internal Architecture Overview" content={`
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                     Event Sourcing Internal Architecture             │
+  │                                                                      │
+  │  ┌─────────────────────┐    ┌─────────────────────────────────────┐  │
+  │  │   Command Handler   │    │         Event Store                 │  │
+  │  │                     │    │                                     │  │
+  │  │ 1. Load aggregate   │───>│  ┌───────────────────────────────┐  │  │
+  │  │ 2. Validate command │    │  │  Append-Only Log              │  │  │
+  │  │ 3. Emit events      │    │  │  Position │ Type │ Data       │  │  │
+  │  │ 4. Store events     │    │  ├───────────────────────────────┤  │  │
+  │  └─────────────────────┘    │  │     1     │  A   │ {...}      │  │  │
+  │                             │  │     2     │  B   │ {...}      │  │  │
+  │  ┌─────────────────────┐    │  │    ...    │ ...  │ ...        │  │  │
+  │  │   Snapshot Store     │    │  └───────────────────────────────┘  │  │
+  │  │   (periodic state    │    └─────────────────────────────────────┘  │
+  │  │    checkpoints)      │               │                             │
+  │  └─────────────────────┘               │                             │
+  │                                         ▼                             │
+  │                              ┌──────────────────────────┐            │
+  │                              │    Event Bus / Publisher  │            │
+  │                              │  (subscribers:           │            │
+  │                              │   projections,           │            │
+  │                              │   event handlers,        │            │
+  │                              │   integration adapters)  │            │
+  │                              └──────────────────────────┘            │
+  │                                         │                             │
+  │                                         ▼                             │
+  │                              ┌──────────────────────────┐            │
+  │                              │   Projection Engine       │            │
+  │                              │  (runs projection         │            │
+  │                              │   functions, updates      │            │
+  │                              │   read models)            │            │
+  │                              └──────────────────────────┘            │
+  └──────────────────────────────────────────────────────────────────────┘
+`} caption='The internal components of an event-sourced system and how they interact.' />
+
+### Event Store Internals
+
+The event store is a specialized database designed for one job: storing events and returning them in order. Unlike a general-purpose database, an event store makes specific guarantees:
+
+- **Append-only writes.** You can only add events to the end of a stream. You cannot update or delete events.
+- **Ordered reads.** When you read a stream, you get events in the exact order they were appended.
+- **Optimistic concurrency.** When appending, you specify the expected version of the stream. If the stream has been modified since you read it, the append fails.
+- **Global ordering (optional).** Some event stores assign a global position to every event, enabling cross-stream ordered reads.
+
+<AsciiDiagram id="event-sourcing/02-deep-dive/event-store-internals" title="Event Store Internals" content={`
+  Event Store Physical Layout (append-only log file):
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Byte offset  │  Content                                            │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │  00000000     │  HEADER: magic=0x4556, version=1, page_size=4096   │
+  │  00000020     │  INDEX ROOT (B-tree root page pointer)              │
+  │  00001000     │  PAGE 1: Stream index                               │
+  │               │  stream: "acct:A" → stream_metadata_page            │
+  │               │  stream: "acct:B" → stream_metadata_page            │
+  │  00002000     │  STREAM METADATA: "acct:A"                         │
+  │               │  current_version: 42, snapshot_version: 40          │
+  │               │  first_event_page: 8                                │
+  │               │  last_event_page: 15                                │
+  │  00003000     │  EVENT PAGE 8 (seq 1-100)                          │
+  │               │  [event_1] [event_2] ... [event_100]               │
+  │  00004000     │  EVENT PAGE 9 (seq 101-200)                        │
+  │               │  [event_101] [event_102] ... [event_200]           │
+  │  ...          │  ...                                                │
+  │                                                                     │
+  │  Each event page:                                                   │
+  │  ┌─────────────────────────────────────────────────────────────┐    │
+  │  │ PageHeader (4 bytes: stream_id, page_seq, event_count)      │    │
+  │  │ EventRecord (variable):                                     │    │
+  │  │   - event_type (string)      "FundsDebited"                 │    │
+  │  │   - data_length (4 bytes)     152                           │    │
+  │  │   - data (JSON/Protobuf)      {"amount":200,...}            │    │
+  │  │   - timestamp (8 bytes)       1720000000000                 │    │
+  │  │   - version (8 bytes)         4                             │    │
+  │  └─────────────────────────────────────────────────────────────┘    │
+  └─────────────────────────────────────────────────────────────────────┘
+`} caption='Physical layout of an event store append-only log file.' />
+
+### Append-Only Log
+
+The core data structure is an append-only log. Every new event is written to the end of the log. This gives exceptional write performance because:
+
+- Writes are sequential, not random. Sequential writes to SSD can achieve 500,000 to 1,000,000 writes per second.
+- No locks on existing data. Writes do not block reads of earlier data.
+- No fragmentation. The log grows in a linear fashion with no page splits or rebalancing.
+
+The trade-off is that reads can be slower — to find events for a specific stream, the store must either scan the log or maintain a separate index. Most event stores use a B-tree or LSM-tree index that maps stream IDs to log positions.
+
+```python
+class AppendOnlyLog:
+    """Simplified append-only log for an event store."""
+
+    def __init__(self, storage_path: str):
+        self.storage_path = storage_path
+        self.index: dict[str, StreamMetadata] = {}
+        self._load_index()
+
+    def append(self, stream_id: str, expected_version: int,
+               events: list[EventRecord]) -> list[AppendResult]:
+        """Append events to the log with optimistic concurrency control."""
+
+        # Load stream metadata
+        metadata = self.index.get(stream_id)
+        if metadata is None:
+            # New stream: expected_version must be 0
+            if expected_version != 0:
+                raise WrongExpectedVersion(stream_id, 0, expected_version)
+            metadata = StreamMetadata(stream_id=stream_id, version=0)
+            self.index[stream_id] = metadata
+        else:
+            if metadata.version != expected_version:
+                raise WrongExpectedVersion(
+                    stream_id, metadata.version, expected_version
+                )
+
+        # Assign sequence numbers and append to log
+        results = []
+        with open(self.storage_path, 'ab') as log:
+            for event in events:
+                metadata.version += 1
+                event.version = metadata.version
+                record_bytes = event.serialize()
+                position = log.tell()
+                log.write(record_bytes)
+                log.flush()  # fsync on every append for durability
+                results.append(AppendResult(
+                    stream_id=stream_id,
+                    version=event.version,
+                    global_position=position
+                ))
+
+        # Update index
+        self.index[stream_id] = metadata
+        return results
+
+    def read_stream(self, stream_id: str,
+                    from_version: int = 0) -> list[EventRecord]:
+        """Read all events for a stream starting at from_version."""
+        # This is simplified. A real implementation would use
+        # the index to jump directly to the right log position.
+        events = []
+        with open(self.storage_path, 'rb') as log:
+            while True:
+                record = EventRecord.deserialize(log)
+                if record is None:
+                    break
+                if record.stream_id == stream_id and record.version >= from_version:
+                    events.append(record)
+        return events
+```
+
+### Snapshot Store
+
+The snapshot store is a separate data store that holds periodic snapshots of aggregate state. It can be a relational database, a key-value store (Redis, DynamoDB, FoundationDB), or a simple file store.
+
+<AsciiDiagram id="event-sourcing/02-deep-dive/snapshot-flow" title="Snapshot Flow" content={`
+  Command processing flow with snapshots:
+
+  1. Load aggregate
+     ┌────────────────────────────────────────────────────────┐
+     │  SnapshotStore.get(id) ──> exists?                     │
+     │    YES: deserialize snapshot, replay events after it   │
+     │    NO:  create empty aggregate, replay all events      │
+     └────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  2. Process command (validate + emit events)
+                              │
+                              ▼
+  3. Store events in event store
+                              │
+                              ▼
+  4. Save snapshot (if threshold reached)
+     ┌────────────────────────────────────────────────────────┐
+     │  If aggregate.version % SNAPSHOT_INTERVAL == 0:       │
+     │    snapshot_store.put(id, {                            │
+     │      version: aggregate.version,                       │
+     │      state: aggregate.serialize(),                     │
+     │      timestamp: now()                                  │
+     │    })                                                  │
+     └────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  5. Publish events to projections
+
+  Snapshot record layout (in key-value store):
+  Key:   "snapshot:acct:A"
+  Value: {
+           "version": 40,
+           "timestamp": "2026-07-02T10:00:00Z",
+           "state": {
+             "balance": 5000,
+             "owner": "Alice",
+             "is_closed": false,
+             "pending_holds": []
+           }
+         }
+`} caption='How snapshots are loaded, updated, and stored during command processing.' />
+
+## Data Structures
+
+Beyond the append-only log, an event-sourced system uses several key data structures.
+
+### Event Log (Global Stream)
+
+The global event log assigns a monotonically increasing position to every event across all streams. This enables cross-stream processing — building projections that need events from multiple aggregates in order.
+
+```protobuf
+message GlobalEventLogEntry {
+    int64  global_position   = 1;  // Monotonically increasing
+    string stream_id         = 2;  // e.g. "acct:A"
+    int64  stream_version    = 3;  // Sequence number within stream
+    string event_type        = 4;  // e.g. "FundsDebited"
+    bytes  data              = 5;  // Serialized event payload
+    int64  timestamp         = 6;  // Unix millis
+    string correlation_id    = 7;  // Links events from same command
+    string causation_id      = 8;  // Links to the event that caused this
+}
+```
+
+The `correlation_id` and `causation_id` fields are critical for debugging. When a command produces multiple events (like our bank transfer), all resulting events share the same `correlation_id`, and each event tracks which prior event caused it. This produces a complete causality graph.
+
+<AsciiDiagram id="event-sourcing/02-deep-dive/causality-chain" title="Causality Chain" content={`
+  Causality chain for the bank transfer:
+
+  TransferFunds(cmd_1)
+       │ causation: "client:alice"
+       │ correlation: "transfer_42"
+       ▼
+  FundsDebited(event_4)
+       │ causation: "cmd_1"
+       │ correlation: "transfer_42"
+       ▼
+  FundsCredited(event_7)
+       │ causation: "event_4"
+       │ correlation: "transfer_42"
+
+  Querying by correlation_id("transfer_42") returns all 2 events.
+  This is the complete trace of the transfer operation.
+`} caption='Correlation IDs and causation IDs trace event chains across aggregate boundaries.' />
+
+### Aggregate Streams
+
+Each aggregate has its own event stream — an ordered sequence of events specific to that aggregate. The stream is identified by the aggregate ID (e.g., `acct:UUID`).
+
+```python
+@dataclass
+class EventStream:
+    stream_id: str
+    events: list[EventRecord]
+    version: int  # Latest version
+
+    def append(self, expected_version: int,
+               new_events: list[EventRecord]) -> None:
+        if self.version != expected_version:
+            raise ConcurrencyError(
+                f"Expected version {expected_version}, "
+                f"current version {self.version}"
+            )
+        for event in new_events:
+            self.version += 1
+            event.version = self.version
+            self.events.append(event)
+
+    def replay_from(self, from_version: int) -> list[EventRecord]:
+        return [e for e in self.events if e.version >= from_version]
+```
+
+### Snapshot Records
+
+Snapshots are not events — they are materialized state. A snapshot record contains a copy of the aggregate state at a specific version.
+
+```python
+@dataclass
+class SnapshotRecord:
+    aggregate_id: str
+    version: int  # Aggregate version this snapshot covers
+    state: bytes  # Serialized aggregate (JSON, Protobuf, etc.)
+    timestamp: datetime
+
+class SnapshotRepository:
+    def __init__(self, snapshot_interval: int = 100):
+        self.interval = snapshot_interval
+        self.store: dict[str, SnapshotRecord] = {}
+
+    def should_snapshot(self, aggregate_version: int) -> bool:
+        return aggregate_version % self.interval == 0
+
+    def save(self, aggregate_id: str, version: int, state: bytes):
+        record = SnapshotRecord(
+            aggregate_id=aggregate_id,
+            version=version,
+            state=state,
+            timestamp=datetime.utcnow()
+        )
+        self.store[aggregate_id] = record
+
+    def load(self, aggregate_id: str) -> SnapshotRecord | None:
+        return self.store.get(aggregate_id)
+```
+
+## Lifecycle: Command to Query in Detail
+
+The complete lifecycle of a command through the system involves 12+ distinct steps.
+
+<AsciiDiagram id="event-sourcing/02-deep-dive/complete-lifecycle" title="Complete Lifecycle" content={`
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                   Complete Command-to-Query Lifecycle              │
+  │                                                                     │
+  │  Step  Command Path                                  Data Flow     │
+  │  ───── ────────────────────────────────────────────  ────────────  │
+  │   1    Client sends command                          JSON/HTTP     │
+  │   2    Command handler deserializes and validates     Middleware    │
+  │   3    Load aggregate (snapshot + events)            Event Store   │
+  │   4    Aggregate validates command against state      In-memory    │
+  │   5    Aggregate emits new events                    In-memory     │
+  │   6    Store events atomically (optimistic concurrency) Event Store│
+  │   7    Save snapshot if threshold reached            Snapshot Store│
+  │   8    Publish events to event bus                   Event Bus     │
+  │                                                                     │
+  │  Step  Projection Path                              Data Flow     │
+  │  ───── ────────────────────────────────────────────  ────────────  │
+  │   9    Projection subscribes to event                Event Bus     │
+  │   10   Projection reads event data                   In-memory     │
+  │   11   Projection updates read model                 Read Model DB │
+  │                                                                     │
+  │  Step  Query Path                                  Data Flow      │
+  │  ───── ────────────────────────────────────────────  ────────────  │
+  │   12   Client sends query                            HTTP          │
+  │   13   Query handler reads from read model           Read Model DB │
+  │   14   Return response                               JSON/HTTP     │
+  └─────────────────────────────────────────────────────────────────────┘
+`} caption='The complete 14-step lifecycle from command submission to query response.' />
+
+### Step Detail: Load Aggregate
+
+```python
+def load_aggregate(aggregate_id: str) -> BankAccount:
+    # Step 1: Try to load snapshot
+    snapshot = snapshot_store.load(aggregate_id)
+
+    if snapshot:
+        # Step 2: Deserialize snapshot state
+        account = BankAccount.deserialize(snapshot.state)
+        from_version = snapshot.version + 1
+    else:
+        # Step 3: Start fresh
+        account = BankAccount()
+        from_version = 0
+
+    # Step 4: Replay events after snapshot
+    events = event_store.read_stream(aggregate_id, from_version=from_version)
+    for event in events:
+        account.apply(event)
+
+    # Step 5: Return loaded aggregate
+    return account
+```
+
+### Step Detail: Validate and Emit
+
+```python
+def process_command(account: BankAccount, command: TransferFunds) -> list[EventRecord]:
+    # The aggregate validates the command against its current state
+    if account.balance < command.amount:
+        raise InsufficientFundsError(
+            f"Balance {account.balance} < {command.amount}"
+        )
+
+    # If valid, the aggregate emits events (does NOT modify state yet)
+    events = [
+        FundsDebited(
+            account=command.from_account,
+            amount=command.amount,
+            remaining=account.balance - command.amount
+        ),
+        FundsCredited(
+            account=command.to_account,
+            amount=command.amount,
+            source=command.from_account
+        )
+    ]
+    return events
+```
+
+### Step Detail: Store with Optimistic Concurrency
+
+```python
+def store_events(stream_id: str, expected_version: int,
+                 events: list[EventRecord]) -> list[AppendResult]:
+    try:
+        results = event_store.append(
+            stream_id=stream_id,
+            expected_version=expected_version,
+            events=events
+        )
+        return results
+    except WrongExpectedVersion:
+        # Someone else modified the aggregate between load and store
+        # Load again, re-validate, and retry
+        raise ConcurrencyError("Retry the command")
+```
+
+### Step Detail: Publish to Projections
+
+```python
+def publish_events(results: list[AppendResult]):
+    for result in results:
+        event = event_store.read_event(result.global_position)
+        event_bus.publish(
+            EventEnvelope(
+                event_type=event.event_type,
+                stream_id=event.stream_id,
+                version=event.version,
+                data=event.data,
+                global_position=result.global_position,
+                timestamp=event.timestamp
+            )
+        )
+```
+
+## Consistency
+
+Event sourcing achieves consistency through optimistic concurrency control, not locks. Each event carries the version of the aggregate that produced it, and the event store rejects appends with incorrect versions.
+
+### Optimistic Concurrency
+
+The protocol is simple:
+
+1. Read the current version of the aggregate stream.
+2. Process the command and produce events, recording the version.
+3. Append the events to the stream, specifying the expected version.
+4. If the version has changed since step 1, the append fails — retry from step 1.
+
+```python
+class EventStore:
+    def append_to_stream(
+        self,
+        stream_id: str,
+        expected_version: int,
+        events: list[EventRecord]
+    ) -> None:
+        with self.lock(stream_id):
+            current_version = self.get_stream_version(stream_id)
+            if current_version != expected_version:
+                raise WrongExpectedVersion(
+                    stream_id=stream_id,
+                    expected=expected_version,
+                    actual=current_version
+                )
+            for event in events:
+                current_version += 1
+                event.version = current_version
+                self._write_event(stream_id, current_version, event)
+```
+
+<AsciiDiagram id="event-sourcing/02-deep-dive/optimistic-concurrency" title="Optimistic Concurrency" content={`
+  Two clients try to withdraw from the same account simultaneously:
+
+  Client A                          Client B
+  │                                 │
+  ├── Read stream (v=5)            ├── Read stream (v=5)
+  │    balance = $500              │    balance = $500
+  │                                 │
+  ├── Withdraw($400)               ├── Withdraw($200)
+  │    emit WithdrawalEvent        │    emit WithdrawalEvent
+  │    with expected_version=5     │    with expected_version=5
+  │                                 │
+  ├── Append to stream             ├── Append to stream
+  │    expected_version: 5         │    expected_version: 5
+  │    ───────────────────────>    │
+  │    ✓ SUCCESS: v=5 matches      │    ───────────────────────>
+  │    Stream now at version 6     │    ✗ FAIL: stream is at v=6
+  │                                 │    expected v=5 but got v=6
+  │                                 │
+  │                                 ├── Retry: read stream (v=6)
+  │                                 │    balance = $100
+  │                                 ├── Withdraw($200)? NO
+  │                                 │    Insufficient funds ($100)
+  │                                 └── Return error to client
+`} caption='Optimistic concurrency ensures only one concurrent modification succeeds.' />
+
+### Expected Version Strategies
+
+You have three strategies for choosing the expected version:
+
+**Exact version.** You specify the exact version you last read. This provides the strongest consistency guarantee. Use this when the aggregate has a low contention rate (few concurrent operations on the same aggregate).
+
+**Any version (append only).** You set expected version to `any`, which appends regardless of the current version. This is useful for events that are purely informational — logs, metrics, or append-only streams that never conflict.
+
+**Stream does not exist.** You set expected version to `stream_not_exists` to ensure a stream is created exactly once. This prevents duplicate creation in distributed systems.
+
+```python
+# Exact version (strong consistency)
+store.append(stream_id, expected_version=5, events=[...])
+
+# Any version (no consistency check)
+store.append(stream_id, expected_version=ANY, events=[...])
+
+# Stream must not exist (create once)
+store.append(stream_id, expected_version=STREAM_NOT_EXISTS, events=[...])
+```
+
+### Idempotency
+
+Event sourcing systems must handle the case where the same command is delivered twice. If a client sends `Withdraw($100)` and the first attempt succeeds but the response is lost, the client retries. Without idempotency, the second attempt would withdraw another $100.
+
+**Idempotency key approach:** Each command carries a unique idempotency key (typically a UUID). The event store records idempotency keys and rejects duplicates.
+
+```python
+class IdempotentEventStore(EventStore):
+    def __init__(self):
+        self.idempotency_keys: dict[str, list[AppendResult]] = {}
+
+    def append(self, stream_id: str, expected_version: int,
+               events: list[EventRecord],
+               idempotency_key: str | None = None) -> list[AppendResult]:
+
+        if idempotency_key and idempotency_key in self.idempotency_keys:
+            # Return previous result without appending
+            return self.idempotency_keys[idempotency_key]
+
+        result = super().append(stream_id, expected_version, events)
+
+        if idempotency_key:
+            self.idempotency_keys[idempotency_key] = result
+
+        return result
+```
+
+**Idempotency key scope:** The idempotency key must be scoped to the aggregate. A key that is valid for account A should not affect account B. A common approach is to compose the key as `aggregate_id + command_id`.
+
+## Performance
+
+Event sourcing performance depends on three factors: write throughput, read latency, and rebuild time.
+
+### Sequential Writes
+
+The append-only log provides exceptional write performance because all writes are sequential. On modern SSDs, a single-threaded sequential write can achieve 500,000 to 1,000,000 1 KB writes per second. Random writes (which CRUD databases do when updating records) are limited to about 50,000 to 100,000 per second on the same hardware.
+
+| Operation | SSD Throughput | Latency p99 |
+|-----------|---------------|-------------|
+| Sequential write (1 KB) | 800,000 ops/sec | 1.2 ms |
+| Random write (4 KB) | 60,000 ops/sec | 15 ms |
+| Sequential read (1 KB) | 500,000 ops/sec | 2 ms |
+| Random read (4 KB) | 200,000 ops/sec | 5 ms |
+
+The trade-off is that the log grows without bound. A system processing 10,000 events per second with an average event size of 512 bytes produces about 5 MB of data per second, or about 432 GB per day. This growth must be managed through retention policies, archiving, and compaction.
+
+### Snapshot Frequency Trade-off
+
+The snapshot interval determines the performance profile of aggregate loading:
+
+| Snapshot Interval | Write Amplification | Replay Cost (10M events) |
+|------------------|--------------------|--------------------------|
+| Every 1 event | 2x (event + snapshot) | 0 events (instant) |
+| Every 10 events | 1.1x | 9 events |
+| Every 100 events | 1.01x | 90 events |
+| Every 1,000 events | 1.001x | 900 events |
+| Never (pure ES) | 1x | 10,000,000 events |
+
+The optimal interval depends on your workload. If aggregates are loaded frequently (high read-to-write ratio), take snapshots more often. If aggregates are loaded rarely (write-heavy with infrequent queries), take snapshots less often.
+
+```python
+def configure_snapshot_interval(
+    load_frequency: int,       # Times per hour aggregate is loaded
+    write_frequency: int,      # Events per hour for this aggregate
+    target_replay_time_ms: int # Max acceptable replay time
+) -> int:
+    """
+    Calculate optimal snapshot interval based on workload.
+    """
+    # Time to replay one event (measurement in ms)
+    time_per_event_ms = 0.05
+
+    max_events_per_load = target_replay_time_ms / time_per_event_ms
+    hours_between_writes = write_frequency / load_frequency if load_frequency > 0 else 1
+    interval = max(10, int(max_events_per_load / hours_between_writes))
+    return interval
+```
+
+### Event Store Throughput
+
+Event store throughput is determined by:
+
+1. **Batch size.** Writing events one at a time is slow. Batching 100-1,000 events per write operation can increase throughput by 10x to 50x compared to single-event writes.
+
+2. **Durability setting.** Some event stores allow you to control fsync frequency. Writing with `fsync=always` (every write forces a disk sync) reduces throughput but guarantees durability. Writing with `fsync=periodic` (sync every 100 ms) increases throughput at the cost of losing up to 100 ms of events on a crash.
+
+3. **Index maintenance.** Every write may update the stream index. The index structure (B-tree vs LSM-tree) affects write amplification. LSM-tree indexes are generally faster for append-heavy workloads.
+
+```python
+# Batch writing
+events = []
+for i in range(1000):
+    events.append(create_event())
+
+# One append call for 1000 events instead of 1000 append calls
+results = event_store.append(
+    stream_id="acct:A",
+    expected_version=current_version,
+    events=events  # Single batch
+)
+```
+
+## Configuration
+
+Production event-sourced systems require careful configuration of several parameters.
+
+### Snapshot Interval
+
+Controls how frequently aggregate state is persisted as snapshots.
+
+```yaml
+snapshot:
+  # Take snapshot every N events
+  interval: 100
+
+  # Alternative: take snapshot if replay time exceeds threshold
+  max_replay_time_ms: 10
+
+  # Snapshot store type: "sql", "kv", "file"
+  store_type: "sql"
+
+  # Connection string for snapshot store
+  connection_string: "postgresql://localhost:5432/snapshots"
+```
+
+**Recommendation:** Start with an interval of 100. Measure average aggregate load time. If load time exceeds 20 ms, reduce the interval to 50 or 20. If write amplification or snapshot storage costs are too high for rarely-changed aggregates (typical for historical reference entities created months ago and queried today without modification), increase the interval to 500 or 1000.
+
+### Event Retention
+
+Controls how long events are kept in the primary event store. Events older than the retention period may be archived to cheaper storage or deleted.
+
+```yaml
+retention:
+  # Events younger than this are in the hot store
+  hot_period_days: 90
+
+  # Events older than this are archived
+  archive_period_days: 365
+
+  # Archive storage type
+  archive_type: "s3"
+
+  # Events older than this may be deleted
+  hard_delete_period_days: 2555  # 7 years
+```
+
+**Important:** If you delete or archive events, you must also archive or maintain snapshots that cover the deleted period. Without overlapping snapshots, you cannot rebuild the state from archived events.
+
+### Projection Rebuild Strategy
+
+Controls how projections are rebuilt when code or schema changes.
+
+```yaml
+projection:
+  # Rebuild mode
+  # "in_place": rebuild on the same database (requires locking)
+  # "shadow": rebuild in a separate table, then swap
+  rebuild_mode: "shadow"
+
+  # Maximum time allowed for a projection rebuild
+  rebuild_timeout_minutes: 60
+
+  # Number of parallel rebuild workers
+  parallel_workers: 4
+
+  # Batch size for reading events during rebuild
+  batch_size: 5000
+
+  # Pause new events during rebuild? (blocks writes)
+  pause_writes_during_rebuild: false
+```
+
+**Shadow rebuild** is the recommended approach for production. It creates a new projection table alongside the current one, replays all events into the shadow table, and then atomically swaps the table pointer. During the rebuild, live traffic continues using the old projection. When the shadow is ready, the swap happens in under a second.
+
+<AsciiDiagram id="event-sourcing/02-deep-dive/shadow-rebuild" title="Shadow Rebuild" content={`
+  Before rebuild:
+  ┌────────────────────┐     ┌────────────────────┐
+  │  Event Store       │     │  Live Read Model   │
+  │  (all events)      │ ──> │  (active, serving  │
+  │                    │     │   queries)          │
+  └────────────────────┘     └────────────────────┘
+
+  During rebuild:
+  ┌────────────────────┐     ┌────────────────────┐
+  │  Event Store       │     │  Live Read Model   │
+  │  (all events)      │ ──> │  (still serving)   │
+  │                    │     └────────────────────┘
+  │                    │
+  │                    │     ┌────────────────────┐
+  │                    │ ──> │  Shadow Read Model │
+  │                    │     │  (building from    │
+  │                    │     │   scratch)          │
+  └────────────────────┘     └────────────────────┘
+
+  After swap:
+  ┌────────────────────┐     ┌────────────────────┐
+  │  Event Store       │     │  Shadow → Live     │
+  │  (all events)      │ ──> │  (now serving)     │
+  │                    │     └────────────────────┘
+  │                    │     ┌────────────────────┐
+  │                    │     │  Old Read Model    │
+  │                    │     │  (dropped)         │
+  └────────────────────┘     └────────────────────┘
+`} caption='Shadow rebuild creates a new read model alongside the live one, then atomically swaps.' />
+
+### Event Schema Evolution
+
+```yaml
+schema_evolution:
+  # Upcasters are run in order by version
+  upcasters:
+    - from_version: 0  # Initial schema
+      to_version: 1
+      class: "upcasters.V0ToV1"
+
+    - from_version: 1
+      to_version: 2
+      class: "upcasters.V1ToV2"
+
+  # Migration mode: "upcast" (runtime transform) or "migrate" (rewrite)
+  mode: "upcast"
+
+  # On event type not found: "throw" or "skip"
+  unknown_event_behavior: "throw"
+```
+
+### Operational Checks
+
+```yaml
+monitoring:
+  # Alert if projection lag exceeds this duration
+  max_projection_lag_seconds: 10
+
+  # Check event store health every N seconds
+  health_check_interval_seconds: 30
+
+  # Alert if event store disk usage exceeds this
+  disk_usage_alert_percent: 85
+
+  # Compare aggregate balance from snapshot vs replay
+  # to detect snapshot corruption
+  periodic_consistency_check: true
+
+  # Run consistency check every N events
+  consistency_check_interval: 10000
+```
+
+## Summary
+
+The internal architecture of event sourcing centers on the append-only log, which provides exceptional write performance and a complete historical record. Supporting components — the snapshot store, projection engine, and event bus — extend this core capability for production use.
+
+Key configuration decisions affect performance and operational overhead:
+
+- Snapshot interval trades write amplification for read speed.
+- Batch size and durability settings control write throughput.
+- Shadow rebuilds enable zero-downtime projection updates.
+- Idempotency keys prevent duplicate command processing.
+- Upcasting provides schema evolution without modifying stored events.
+
+In the next section, we examine how these components scale to production systems handling millions of events per day.

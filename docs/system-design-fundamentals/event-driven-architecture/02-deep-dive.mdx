@@ -1,0 +1,488 @@
+﻿---
+id: event-driven-architecture-deep-dive
+title: Event-Driven Architecture — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+The previous section built the mental model for event-driven architecture. This section opens the box and examines the internal machinery: event pipeline stages, processing patterns, event lifecycle, consistency models, error handling, performance characteristics, and schema management.
+
+## Internal Architecture: The Event Pipeline
+
+An event-driven system processes events through a pipeline of stages. Each stage transforms or routes the event. Understanding the pipeline helps you design for performance, reliability, and debuggability.
+
+<AsciiDiagram
+  id="event-driven-architecture/event-pipeline"
+  title="Event Pipeline Stages"
+  alt="Event flows through pipeline: producer emits, channel buffers, broker routes, consumer processes, response emits. Each stage has specific characteristics"
+  content={`
+  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+  │  Event   │   │   Chan-  │   │  Broker  │   │ Consu-   │   │  Res-    │
+  │ Creation │──▶│   nel    │──▶│  Routing │──▶│  mer     │──▶│  ponse   │
+  │          │   │          │   │          │   │  Fetch   │   │  Emit    │
+  └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘
+
+        │              │              │              │              │
+        ▼              ▼              ▼              ▼              ▼
+   Serialize      Buffer/       Match to      Deserialize    Produce new
+   + validate     Partition     consumer      + process      event or
+                                subscription                 write result
+
+  Latency per stage (Kafka at P99):
+    0.5-2ms       0.1-1ms       0.1-0.5ms     1-50ms        0.5-2ms
+
+    Total end-to-end latency (producer emit to consumer complete):
+    Same partition: 5-50ms  │  Cross-partition: 10-100ms
+  `}
+  caption="The event pipeline stages with typical Kafka latency ranges."
+/>
+
+### Stage 1: Event Creation
+
+When the producer detects an occurrence — an order placed, a payment processed — it creates an event object. This involves:
+
+1. **Validation**: Check required fields, data types, and schema conformance.
+2. **Enrichment**: Add metadata — event ID, timestamp, producer identity, correlation ID.
+3. **Serialization**: Convert the event object to bytes using a serialization format.
+4. **Partition assignment**: Determine which partition the event belongs to for ordering guarantees.
+
+The producer should fail fast and loud if validation fails. A malformed event that reaches the broker wastes resources and may crash consumers downstream.
+
+```typescript
+function createEvent(eventType: string, payload: object): Buffer {
+  const schema = schemaRegistry.getSchema(eventType);
+  const validation = schema.validate(payload);
+  if (!validation.valid) {
+    throw new Error(`Invalid event: ${validation.errors}`);
+  }
+
+  const enriched = {
+    event_id: uuidv4(),
+    event_type: eventType,
+    timestamp: Date.now(),
+    producer: process.env.SERVICE_NAME,
+    correlation_id: getCurrentCorrelationId(),
+    payload
+  };
+
+  return schema.serialize(enriched);
+}
+```
+
+### Stage 2: Channel Buffering
+
+The producer sends the serialized event to the channel. The channel buffers the event in memory and on disk. Buffering serves three purposes:
+
+- **Throughput smoothing**: Producers produce in bursts. The buffer absorbs spikes and delivers events at a steady rate to consumers.
+- **Backpressure absorption**: When consumers are slow, the buffer grows instead of rejecting the producer.
+- **Durability**: Events are written to disk before being acknowledged to the producer. This ensures events survive a broker crash.
+
+Kafka buffers events in a page cache (memory) and flushes to disk. The flush interval trades durability for latency: acks=1 waits for the partition leader to write to its log, acks=all waits for all in-sync replicas to acknowledge.
+
+### Stage 3: Broker Routing
+
+The broker maintains a routing table mapping event types to consumer subscriptions. When a new event arrives, the broker matches it against subscriptions and determines which consumers should receive it.
+
+Routing strategies:
+
+- **Topic-based**: Consumers subscribe to topics. Events published to a topic go to all subscribers. Simple and widely used.
+- **Content-based**: Consumers subscribe based on event content. The broker evaluates predicates against the event payload. More flexible but computationally expensive.
+- **Tag-based**: Events have tags. Consumers subscribe to tag patterns. A middle ground between topic and content-based.
+
+### Stage 4: Consumer Fetch
+
+Consumers poll the broker for new events. The consumer maintains an offset — the position in the partition it has read up to. When it fetches, it receives all events from its current offset onward.
+
+The consumer processes events and commits the offset. If the consumer crashes before committing, it re-reads from the last committed offset when it restarts. This is at-least-once delivery — events may be processed more than once but are never lost.
+
+### Stage 5: Response Emission
+
+After processing an event, the consumer often emits a new event or writes the result to a database. This stage produces new events that flow through the pipeline again, potentially to different consumers.
+
+## Patterns
+
+### Event Notification
+
+The simplest pattern. Producers emit lightweight events. Consumers receive notifications and may fetch additional data.
+
+**When to use**: When events are small and frequent, and the additional data is rarely needed. Example: a heartbeat monitor that emits "ServerDown" events — the consumer fetches server details only when needed.
+
+**Trade-offs**: Consumers depend on the producer API for full data. If the producer is unavailable or under load, consumers cannot get the data they need.
+
+### Event-Carried State Transfer
+
+The event includes all the data a consumer needs. The consumer processes the event without making any synchronous calls back to the producer.
+
+**When to use**: Almost always. This is the default pattern for most event-driven systems. Example: an `OrderPlaced` event includes order items, customer info, and pricing — the inventory service has everything it needs.
+
+**Trade-offs**: Larger events, data duplication across events, and more complex schema evolution. But the decoupling benefits far outweigh these costs.
+
+<AsciiDiagram
+  id="event-driven-architecture/notification-vs-carried"
+  title="Event Notification vs Event-Carried State Transfer"
+  alt="Side-by-side comparison: notification sends only an ID, carried state sends the full payload"
+  content={`
+  Event Notification:
+
+  Producer        Event Bus         Consumer
+  ┌──────┐        ┌──────────┐      ┌──────┐
+  │Order │──ID───▶│          │──ID──▶│Inv  │
+  │Svc   │        │          │       │Svc  │
+  └──────┘        │          │       └──┬───┘
+       ▲──────────│──────────│──────────┘
+       │  GET /orders/42    │
+       │  (synchronous)     │
+       └────────────────────┘
+
+  Event-Carried State Transfer:
+
+  Producer        Event Bus         Consumer
+  ┌──────┐        ┌──────────┐      ┌──────┐
+  │Order │─full──▶│          │─full─▶│Inv  │
+  │Svc   │ data   │          │ data  │Svc  │
+  └──────┘        └──────────┘      └──────┘
+
+    No synchronous calls needed.
+    Consumer has everything it needs.
+  `}
+  caption="Event notification requires a synchronous fetch. Event-carried state transfer does not."
+/>
+
+### Event Sourcing
+
+Every state change is stored as an immutable event. The current state of an entity is derived by replaying all its events. This is a fundamentally different approach to persistence.
+
+**When to use**: When you need a complete audit trail, temporal queries (what was the state at any point in time?), or the ability to reconstruct past states for debugging or compliance.
+
+**Trade-offs**: Event stores grow unboundedly. Replaying events for long-lived entities can be slow. Snapshotting (periodically saving the current state) mitigates this but adds complexity.
+
+```typescript
+// Event-sourced order aggregate
+class Order {
+  private events: Event[] = [];
+  private state: OrderState = { status: "pending", items: [] };
+
+  constructor(events: Event[]) {
+    this.events = events;
+    this.replay();
+  }
+
+  private replay(): void {
+    this.state = { status: "pending", items: [] };
+    for (const event of this.events) {
+      this.apply(event);
+    }
+  }
+
+  private apply(event: Event): void {
+    switch (event.event_type) {
+      case "OrderPlaced":
+        this.state.status = "placed";
+        this.state.items = event.payload.items;
+        break;
+      case "PaymentCaptured":
+        this.state.status = "paid";
+        break;
+      case "Shipped":
+        this.state.status = "shipped";
+        break;
+    }
+  }
+}
+```
+
+## Event Lifecycle
+
+Every event goes through a predictable lifecycle from creation to archival:
+
+1. **Created**: The producer constructs the event object.
+2. **Serialized**: The event is converted to bytes using a schema-aware serializer.
+3. **Published**: The producer sends the event to the broker.
+4. **Routed**: The broker matches the event to consumer subscriptions.
+5. **Delivered**: The broker sends the event to the consumer.
+6. **Deserialized**: The consumer converts the bytes back to an object.
+7. **Processed**: The consumer executes the event handler.
+8. **Acknowledged**: The consumer commits the offset or acknowledges the message.
+9. **Archived**: After retention period, the event is deleted or moved to long-term storage.
+
+<AsciiDiagram
+  id="event-driven-architecture/event-lifecycle"
+  title="Full Event Lifecycle"
+  alt="Event flows through 9 stages: Created, Serialized, Published, Routed, Delivered, Deserialized, Processed, Acknowledged, Archived"
+  content={`
+    Created ──▶ Serialized ──▶ Published ──▶ Routed
+                                                │
+        ┌────────────────────────────────────────┘
+        │
+        ▼
+    Delivered ──▶ Deserialized ──▶ Processed ──▶ Acknowledged
+                                                      │
+                                                      ▼
+                                                  Archived
+
+    Typical durations:
+    Created → Published:      0.5-2ms
+    Published → Delivered:    1-10ms (same partition)
+                              10-100ms (cross-partition)
+    Delivered → Acked:        1-50ms (in-memory)
+                              10-500ms (with DB write)
+    Retention:                7 days (default Kafka)
+                              30-90 days (production)
+                              Infinite (event sourcing)
+  `}
+  caption="Every event passes through 9 stages. Understanding each stage helps diagnose bottlenecks and reliability issues."
+/>
+
+## Consistency Models
+
+### Eventual Consistency
+
+Event-driven systems are eventually consistent by nature. When a producer emits an event, the consumer processes it at some point in the future. The system is not consistent immediately, but it converges over time.
+
+For an order system: when an order is placed, the inventory count is not decremented immediately. The inventory consumer receives the event and decrements the count within a few milliseconds. During that window, the inventory count is stale.
+
+Eventual consistency is acceptable for most use cases. The key question is **how eventual**. A notification email that arrives 2 seconds late is fine. An overdraft check that runs 2 seconds late could cause a financial loss.
+
+The window of inconsistency depends on:
+- Broker latency
+- Consumer processing time
+- Number of hops in the event chain
+- Consumer backpressure and lag
+
+### Exactly-Once Processing
+
+Exactly-once processing is the holy grail of event-driven systems. Most brokers guarantee at-least-once delivery. Achieving exactly-once requires **idempotent consumers** and **transactional output**.
+
+Exactly-once in Kafka works like this:
+
+1. The consumer reads events from a partition.
+2. The consumer processes the event and writes the result to an output system.
+3. The consumer commits the offset and commits the output transaction **atomically**.
+
+If the consumer crashes between steps 2 and 3, the offset is not committed. On restart, it re-reads the same events and re-processes them. If the consumer is idempotent, re-processing produces the same result. The output transaction ensures the result is written exactly once.
+
+```typescript
+// Exactly-once consumer
+async function processExactlyOnce(event: Event): Promise<void> {
+  const transaction = await database.beginTransaction();
+  try {
+    // Check if already processed (idempotency)
+    const processed = await transaction.query(
+      "SELECT 1 FROM processed_events WHERE event_id = ?",
+      [event.event_id]
+    );
+    if (processed.length === 0) {
+      // Process the event
+      await transaction.query(
+        "UPDATE inventory SET quantity = quantity - 1 WHERE sku = ?",
+        [event.payload.sku]
+      );
+      // Record the event as processed
+      await transaction.query(
+        "INSERT INTO processed_events (event_id) VALUES (?)",
+        [event.event_id]
+      );
+    }
+    await transaction.commit();
+    await consumer.commitOffset();
+  } catch (error) {
+    await transaction.rollback();
+    throw error; // Trigger retry
+  }
+}
+```
+## Error Handling
+
+### Dead Letter Queues
+
+A Dead Letter Queue (DLQ) is a separate topic or queue where events are sent after repeated processing failures. Without a DLQ, a poisoned event — one that causes the consumer to crash — blocks the consumer from making progress. The consumer reads the event, crashes, restarts, re-reads the same event, and crashes again in an infinite retry loop.
+
+The DLQ breaks this loop. After N retry attempts (typically 3-5), the event is moved to the DLQ. The consumer skips the poisoned event and continues processing healthy events.
+
+DLQ events require manual inspection. An operational runbook should define:
+
+1. Who monitors the DLQ
+2. How to inspect DLQ events
+3. How to fix the underlying issue (schema mismatch, data corruption)
+4. How to replay fixed events back into the main stream
+
+### Retry Policies
+
+Retry policies define how the system handles transient failures — database deadlocks, network timeouts, temporary service unavailability.
+
+- **Fixed retry**: Retry every N seconds. Simple but causes thundering herd when all consumers retry simultaneously.
+- **Exponential backoff**: Retry at increasing intervals. 1s, 2s, 4s, 8s, 16s, 32s. Absorbs load spikes.
+- **Exponential backoff with jitter**: Add random noise to the interval. Prevents consumer thundering herd.
+- **Circuit breaker**: After N failures on the same dependency, stop trying for a cooldown period. Prevents cascading failures.
+
+```typescript
+async function processWithRetry(event: Event, attempt: number = 1): Promise<void> {
+  const MAX_RETRIES = 5;
+  const BASE_DELAY = 1000; // 1 second
+
+  try {
+    await processEvent(event);
+  } catch (error) {
+    if (attempt > MAX_RETRIES) {
+      await deadLetterQueue.send(event, {
+        reason: error.message,
+        attempted: attempt
+      });
+      return;
+    }
+
+    const delay = BASE_DELAY * Math.pow(2, attempt - 1) + Math.random() * 1000;
+    await sleep(delay);
+    await processWithRetry(event, attempt + 1);
+  }
+}
+```
+
+### Idempotency
+
+Idempotency ensures processing the same event multiple times produces the same result. This is essential because brokers guarantee at-least-once delivery.
+
+Common idempotency techniques:
+
+1. **Deduplication key**: Store processed event IDs. Before processing, check if the event ID exists. If yes, skip.
+2. **Idempotent operations**: Use operations that are naturally idempotent. Setting a status to "shipped" is idempotent. Incrementing a counter is not.
+3. **Upsert**: Use INSERT ... ON CONFLICT DO NOTHING or UPDATE ... SET ... WHERE. The result is the same whether the row existed or not.
+4. **Conditional writes**: Write with a version check. "UPDATE inventory SET count = count - 1 WHERE sku = ? AND version = 5." If another write already changed the version, retry.
+
+## Performance Characteristics
+
+### Throughput
+
+Event-driven systems achieve high throughput by decoupling producers and consumers. Each can scale independently.
+
+Kafka throughput benchmarks:
+- Single producer: 500,000 events/second (1KB events)
+- Single consumer: 300,000 events/second
+- 3-node cluster: 2 million events/second
+- 10-node cluster: 10 million events/second
+
+Throughput is constrained by:
+- **Network bandwidth**: Events must be transmitted from producer to broker and broker to consumer.
+- **Disk I/O**: The broker writes events to disk. SSDs are strongly recommended.
+- **Serialization**: CPU-bound serialization and deserialization.
+- **Consumer processing**: The slowest consumer in the chain sets the effective throughput.
+
+### Latency
+
+Latency is the time from producer emitting an event to consumer completing processing. Different brokers optimize differently:
+
+| Broker | P50 Latency | P99 Latency | P999 Latency |
+|---|---|---|---|
+| Kafka (acks=1) | 2-5ms | 10-20ms | 50ms |
+| Kafka (acks=all) | 5-15ms | 30-50ms | 100ms |
+| RabbitMQ | 0.5-2ms | 5-15ms | 30ms |
+| Pulsar | 2-8ms | 15-30ms | 80ms |
+| AWS EventBridge | 50-200ms | 500ms | 2s |
+
+Latency spikes occur when:
+- A consumer crashes and rebalances partitions
+- A broker node fails and leadership transfers
+- The system experiences a burst of events that saturates the network
+- A consumer's database has a slow query
+
+### Consumer Lag
+
+Consumer lag is the difference between the last event produced and the last event consumed. It measures how far behind a consumer is.
+
+```
+lag = producer_offset - consumer_offset
+```
+
+A healthy consumer has lag close to 0. A lag spike indicates the consumer cannot keep up. Causes:
+
+1. Consumer processing is too slow — optimize the handler
+2. Too few consumer instances — add more
+3. Too few partitions — partitions are the unit of parallelism
+4. Consumer is blocked on a slow external dependency — database, API call
+
+Monitor lag as a critical metric. Set alerts for lag exceeding thresholds. A consumer falling behind by hours means it will take hours to process the backlog, and in the meantime, the system is operating on stale data.
+
+## Schema Management
+
+### Schema Registry
+
+A schema registry is a centralized service that stores and validates event schemas. Every producer and consumer registers its schema with the registry. When a producer publishes an event, the registry validates that the event conforms to the registered schema.
+
+The registry enforces schema compatibility. If a producer tries to publish an event with a breaking schema change — removing a required field, changing a field type — the registry rejects it.
+
+### Schema Evolution
+
+Event schemas evolve as the business evolves. Producers add fields, deprecate old fields, and occasionally restructure payloads. Schema evolution rules prevent breaking consumers.
+
+**Backward compatibility**: A new consumer can read events produced by old producers.
+- Rules: You may add optional fields, but never remove or rename fields.
+- Example: Old event has `{name, price}`. New consumer expects `{name, price, discount}`. The discount field is optional, defaults to 0.
+
+**Forward compatibility**: An old consumer can read events produced by new producers.
+- Rules: Old consumers ignore unknown fields. Producers must not change the type of existing fields.
+- Example: New event has `{name, price, discount}`. Old consumer expects `{name, price}`. The old consumer ignores discount.
+
+**Full compatibility**: Both backward and forward compatible. The safest approach.
+- Rules: Combine both sets of rules. Only add optional fields. Never remove or rename fields.
+
+### Versioning Strategy
+
+Event schemas use explicit version numbers. Each event type has a version in its header. Consumers can inspect the version and handle different versions differently.
+
+```json
+{
+  "event_id": "evt_42",
+  "event_type": "OrderPlaced",
+  "event_version": 3,
+  "payload": {
+    "order_id": "ord_99",
+    "items": [],
+    "total_cents": 8997,
+    "currency": "USD",
+    "discount_cents": 1000
+  }
+}
+```
+
+When a consumer receives an event, it checks the version and routes to the appropriate handler:
+
+```typescript
+function handleOrderPlaced(event: Event): void {
+  switch (event.event_version) {
+    case 1:
+      handleV1(event);
+      break;
+    case 2:
+      handleV2(event);
+      break;
+    case 3:
+      handleV3(event);
+      break;
+    default:
+      throw new Error(`Unknown version: ${event.event_version}`);
+  }
+}
+```
+
+### Schema Format Comparison
+
+| Format | Schema Evolution | Performance | Ecosystem |
+|---|---|---|---|
+| Avro | Excellent | Fast (binary) | Kafka native, Schema Registry support |
+| Protobuf | Good | Fastest (binary) | gRPC integration, wide language support |
+| JSON Schema | Good | Slow (text) | HTTP APIs, serverless |
+| Thrift | Good | Fast (binary) | Legacy, decreasing adoption |
+
+Avro is the most common choice for Kafka-based event-driven systems because of its native schema registry integration and compact binary format. Protobuf is a strong alternative, especially in systems already using gRPC.
+
+### Schema Lifecycle
+
+1. **Registration**: The producer registers the initial schema in the registry.
+2. **Validation**: The registry validates the schema against compatibility rules.
+3. **Evolution**: The schema evolves over time through new versions.
+4. **Deprecation**: Old versions are marked deprecated but remain available for existing consumers.
+5. **Retirement**: Once all consumers have migrated, old versions can be removed.
+
+Maintain a deprecation window of at least 30 days before removing a schema version. This gives consumers time to migrate. Communication: send deprecation notices to all consumer teams with the migration deadline.

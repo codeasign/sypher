@@ -1,0 +1,767 @@
+---
+id: redis-challenge
+title: Redis — Challenges
+position: 7
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+<AsciiDiagram
+  id="redis/challenges-overview"
+  title="Redis Challenges Overview"
+  alt="A three-tier pyramid showing Core Concepts at the base, Architecture and Design in the middle, and Advanced Deep Dives at the top"
+  caption="The three tiers of Redis challenges increasing in complexity">
+{`
+                    ┌──────────────────┐
+                    │  Tier 3          │
+                    │  Advanced        │
+                    │  Deep Dives      │
+                    │                  │
+                    │  Incident Diag.  │
+                    │  Migration       │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+                    │  Tier 2          │
+                    │  Architecture    │
+                    │  & Design        │
+                    │                  │
+                    │  News Feed       │
+                    │  Counters        │
+                    │  Priority Queue  │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+                    │  Tier 1          │
+                    │  Core Concepts   │
+                    │                  │
+                    │  Session Store   │
+                    │  Rate Limiter    │
+                    │  Distributed Lock│
+                    └──────────────────┘
+`}
+</AsciiDiagram>
+
+## Tier 1: Core Concepts
+
+These challenges test your fundamental understanding of Redis data structures and commands.
+
+### Challenge 1: Implement a Session Store
+
+You are building a session store for a web application with 1M authenticated users. Each session stores user_id, role, last_access timestamp, and IP address. Sessions expire after 24 hours of inactivity.
+
+**Requirements**:
+- Each request reads and extends the session
+- Support 10K concurrent requests per second
+- P99 read latency under 5ms
+- After 24 hours of no activity, the session is automatically deleted
+- On a server restart, active sessions should be recoverable
+
+**Design the Redis data model and architecture.**
+
+<details>
+<summary><strong>Model Answer</strong></summary>
+
+**Data model**:
+
+```
+Key: session:<session_id>
+Type: Hash
+Fields:
+  - user_id: "1234"
+  - role: "admin"
+  - ip: "10.0.1.1"
+  - last_access: "1704067200"
+
+TTL: 86400 seconds (24 hours), refreshed on every access
+```
+
+**Operations**:
+```bash
+# Create session on login
+HMSET session:abc123 user_id 1234 role admin ip 10.0.1.1 last_access 1704067200
+EXPIRE session:abc123 86400
+
+# Read and extend on each request (pipelined)
+HGETALL session:abc123
+EXPIRE session:abc123 86400
+
+# Delete on logout
+DEL session:abc123
+```
+
+**Architecture**:
+- Redis Cluster with 3 primaries x 3 replicas for HA
+- AOF persistence with `appendfsync everysec` for crash recovery
+- `maxmemory-policy volatile-lru` (sessions have TTL, so only session data is evicted if memory fills)
+- Smart client with connection pooling (one pool per Redis node)
+- Client-side circuit breaker to handle Redis node failures gracefully
+
+**Capacity**:
+- 1M sessions x 500 bytes = 500MB (hash overhead + field values)
+- 10K requests/sec: negligible CPU (under 1% of a modern core)
+- If all 1M sessions are active simultaneously: 500MB + replication overhead = 1GB total cluster memory
+
+**Why hash over string (serialized JSON)**:
+- Hash supports partial updates: update only `last_access` without rewriting the entire session
+- Lower memory overhead for small objects (ziplist encoding)
+- Atomic field-level operations (HINCRBY for counters)
+</details>
+
+### Challenge 2: Implement a Rate Limiter
+
+You must implement a rate limiter for a public API. Each API key is allowed a maximum of 100 requests per 60-second sliding window.
+
+**Requirements**:
+- Sliding window (not fixed window) to avoid burst at window boundaries
+- Under 100 bytes of memory per active user
+- P99 latency under 1ms for check + record
+- Handle 100K API keys with 1000 requests/sec each at peak
+- Must be atomic — no race conditions between check and record
+- Must not fail open (if Redis is down, reject requests conservatively)
+
+<details>
+<summary><strong>Model Answer</strong></summary>
+
+**Solution 1: Sorted Set (most accurate, highest memory)**:
+
+```python
+import time
+import redis
+
+def check_rate_limit(client, api_key, max_requests=100, window_secs=60):
+    key = f"ratelimit:{api_key}"
+    now = int(time.time() * 1000)  # milliseconds
+    window_start = now - (window_secs * 1000)
+
+    # Lua script for atomic operation
+    script = """
+        local key = KEYS[1]
+        local now = tonumber(ARGV[1])
+        local window_start = tonumber(ARGV[2])
+        local max_req = tonumber(ARGV[3])
+
+        -- Remove old entries outside the window
+        redis.call('ZREMRANGEBYSCORE', key, 0, window_start)
+
+        -- Count remaining entries
+        local count = redis.call('ZCARD', key)
+
+        if count >= max_req then
+            return 0  -- Rate limited
+        end
+
+        -- Add current request
+        redis.call('ZADD', key, now, now)
+        redis.call('EXPIRE', key, window_secs)
+        return 1  -- Allowed
+    """
+
+    result = client.eval(script, 1, key, now, window_start, max_requests)
+    return result == 1
+```
+
+**Memory**: 100 entries per user x 80 bytes (member + score) = 8KB per user. 100K users = 800MB.
+
+**Solution 2: Fixed Window with Sub-Windows (lower memory, good accuracy)**:
+
+```python
+def check_rate_limit_fixed(client, api_key, max_requests=100, window_secs=60):
+    key = f"ratelimit:{api_key}:{int(time.time() / window_secs)}"
+
+    # Atomic increment
+    count = client.incr(key)
+
+    if count == 1:
+        # First request in this window — set TTL
+        client.expire(key, window_secs + 5)  # Extra margin
+
+    return count <= max_requests
+```
+
+**Memory**: 1 key per user per window = ~80 bytes per user per minute. 100K users = 8MB. Trade-off: edge-case bursts at window boundaries (up to 2x limit in the worst case).
+
+**Solution 3: Token Bucket with Lua** (best balance):
+
+```lua
+-- Token bucket rate limiter
+-- KEYS[1] = user key, KEYS[2] = rate key
+-- ARGV[1] = capacity, ARGV[2] = refill rate per sec, ARGV[3] = now
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+local tokens = redis.call('GET', key)
+local last_refill = redis.call('GET', key .. ':time')
+
+if not tokens then
+    tokens = capacity
+    last_refill = now
+end
+
+local elapsed = now - tonumber(last_refill)
+local new_tokens = tonumber(tokens) + (elapsed * rate)
+if new_tokens > capacity then new_tokens = capacity end
+
+if new_tokens >= 1 then
+    redis.call('SET', key, new_tokens - 1)
+    redis.call('SET', key .. ':time', now)
+    redis.call('EXPIRE', key, 60)
+    redis.call('EXPIRE', key .. ':time', 60)
+    return 1  -- Allowed
+else
+    return 0  -- Rate limited
+end
+```
+
+**Recommendation**: Start with the sorted set approach for accuracy, monitor memory. If memory is a concern, switch to the token bucket approach.
+</details>
+
+### Challenge 3: Implement Distributed Locking
+
+You need a distributed lock for coordinating access to a shared resource across 10 application instances. The lock must satisfy:
+
+- Only one client holds the lock at any time
+- The lock auto-releases after a timeout (safety net for crashed clients)
+- The lock is reentrant-safe (a client cannot re-acquire the same lock)
+- The lock tolerates partial Redis failures (up to 1 node failure)
+
+<details>
+<summary><strong>Model Answer</strong></summary>
+
+**Redlock implementation**:
+
+```python
+import os
+import time
+import hashlib
+
+class Redlock:
+    def __init__(self, redis_nodes):
+        """redis_nodes: list of 5 independent Redis connections"""
+        self.nodes = redis_nodes
+        self.quorum = len(redis_nodes) // 2 + 1
+        self.retry_delay = 0.2  # 200ms
+        self.ttl = 10000  # 10 seconds default
+
+    def acquire(self, resource, ttl_ms=None):
+        """Try to acquire a lock on the given resource."""
+        ttl = ttl_ms or self.ttl
+        lock_value = hashlib.sha256(
+            f"{os.urandom(16)}".encode()
+        ).hexdigest()
+
+        for attempt in range(3):  # Retry up to 3 times
+            acquired = 0
+            start_time = int(time.time() * 1000)
+
+            for node in self.nodes:
+                try:
+                    result = node.set(
+                        f"lock:{resource}",
+                        lock_value,
+                        nx=True,       # Only set if key does not exist
+                        px=ttl          # Millisecond TTL
+                    )
+                    if result == "OK":
+                        acquired += 1
+                except Exception:
+                    continue  # Node failure — ignore
+
+            elapsed = int(time.time() * 1000) - start_time
+
+            if acquired >= self.quorum and elapsed < ttl:
+                return lock_value  # Lock acquired
+
+            # Release partial lock
+            self.release(resource, lock_value)
+
+            # Wait before retry with random backoff
+            time.sleep(self.retry_delay * (1 + os.urandom(1)[0] / 255))
+
+        return None  # Lock acquisition failed
+
+    def release(self, resource, lock_value):
+        """Release the lock only if we still hold it (atomic)."""
+        script = """
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("DEL", KEYS[1])
+            else
+                return 0
+            end
+        """
+        for node in self.nodes:
+            try:
+                node.eval(script, 1, f"lock:{resource}", lock_value)
+            except Exception:
+                pass
+
+    def extend(self, resource, lock_value, additional_ttl_ms):
+        """Extend the lock by TTL if we still hold it."""
+        script = """
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+            else
+                return 0
+            end
+        """
+        for node in self.nodes:
+            try:
+                node.eval(script, 1, f"lock:{resource}", lock_value, additional_ttl_ms)
+            except Exception:
+                pass
+```
+
+**Usage pattern**:
+```python
+lock = redlock.acquire("order:123", ttl_ms=10000)
+if lock:
+    try:
+        process_order(123)
+    finally:
+        redlock.release("order:123", lock)
+else:
+    raise Exception("Could not acquire lock")
+```
+
+**Why 5 nodes**:
+- Redlock requires N / 2 + 1 majority to tolerate up to floor(N/2) failures
+- With 3 nodes: tolerate 1 failure. With 5 nodes: tolerate 2 failures.
+- 5 nodes is the standard recommendation for production deployments
+
+**Caveats to mention**:
+- Redlock assumes all nodes have roughly synchronized clocks (within milliseconds)
+- For critical workloads, add clock monitoring (NTP drift alerts)
+- If the client crashes after acquiring but before extending, the lock auto-releases after TTL
+- For long operations, extend the lock before TTL expiry using a background thread
+
+**Alternative**: For most applications, a single Redis instance with a simple SET NX PX approach is sufficient and much simpler. Redlock is only needed when you must tolerate multi-node failures.
+</details>
+
+## Tier 2: Architecture and Design
+
+These challenges test your system design skills with Redis.
+
+### Challenge 4: Design a Real-Time News Feed
+
+Design a system that delivers a personalized news feed to 50M daily active users. Each user follows an average of 200 accounts. New posts appear in followers' feeds within 5 seconds.
+
+**Requirements**:
+- P99 read latency for loading the feed under 100ms
+- Write latency for posting under 200ms
+- Feed shows the last 100 posts from followed accounts
+- Support peak load: 10K new posts/second, 500K feed views/second
+
+<details>
+<summary><strong>Model Answer</strong></summary>
+
+**Approach: Hybrid fanout on write + fanout on read**
+
+**Fanout on write (for regular users, under 5000 followers)**:
+When a user posts, push the post ID to each follower's timeline list.
+
+```
+Key: feed:<follower_id>
+Type: List (LPUSH for new posts)
+
+When user A (1000 followers) posts:
+  LPUSH feed:user_B post_id_1234
+  LPUSH feed:user_C post_id_1234
+  LTRIM feed:user_C 0 99  (keep only 100 recent posts)
+  ... repeat for all 1000 followers
+```
+
+**Fanout on read (for celebrities with 5000+ followers)**:
+Store the celebrity's recent posts in a separate sorted set. Merge at read time.
+
+```
+Key: celebrity_posts:<celebrity_id>
+Type: List (last 200 posts)
+
+When user sees feed:
+  1. LRANGE feed:<user_id> 0 99  (pre-computed posts from regular follows)
+  2. For each followed celebrity: LRANGE celebrity_posts:<id> 0 99
+  3. Merge and sort by timestamp in application
+```
+
+**Redis cluster sizing**:
+- 50M users x 100 entries x 20 bytes (post ID + score) = 100GB
+- Overhead per list (quicklist): ~10%, so ~110GB
+- Redis Cluster: 6 nodes (3 primaries x 3 replicas), each with 64GB RAM = 192GB total (sufficient with headroom)
+- Use hash tags `{feed:<user_id>}` to co-locate all feed data for a user on one shard
+
+**Performance numbers**:
+- LPUSH: O(1), ~0.5 microseconds
+- LRANGE 0 99: O(N) with N=100, ~5 microseconds
+- Fanout on write for 1000 followers: ~0.5ms (1000 LPUSH commands pipelined)
+- Total write latency: 5ms for a user with 10K followers (fanout = bottleneck)
+  - Mitigation: Async fanout via a work queue for users with many followers
+</details>
+
+### Challenge 5: Design a Global Counter System
+
+You need a real-time counter system for a large event. Every user action (view, like, share, comment) increments counters. Update latency under 100ms, and read latency under 10ms. The system must handle 1M events per second.
+
+**Requirements**:
+- Counters per event per type (e.g., `event:42:views`, `event:42:likes`)
+- Counters per user per event (e.g., `user:123:event:42:voted`)
+- Total counts must be accurate within 1% (approximate counters are acceptable)
+- Counters must persist across Redis restarts
+- 100K concurrent events
+
+<details>
+<summary><strong>Model Answer</strong></summary>
+
+**Two-tier architecture: In-memory buffer + Redis batch writes**
+
+**Tier 1: In-memory buffer** (on each application node):
+Each application server maintains a local map of counters. Every 1 second, it flushes the accumulated deltas to Redis using pipelined INCRBY commands.
+
+```python
+class CounterBuffer:
+    def __init__(self, redis, flush_interval=1.0):
+        self.redis = redis
+        self.buffer = {}
+        self.flush_interval = flush_interval
+
+    def increment(self, key, amount=1):
+        self.buffer[key] = self.buffer.get(key, 0) + amount
+
+    def flush(self):
+        if not self.buffer:
+            return
+        pipe = self.redis.pipeline()
+        for key, delta in self.buffer.items():
+            pipe.incrby(key, delta)
+        pipe.execute()
+        self.buffer = {}
+```
+
+**Tier 2: Redis Pipeline**:
+- Every second, each application server sends 100-1000 INCRBY commands in a single pipeline
+- 100 servers x 1000 INCRBY = 100K INCRBY/sec — well within a single Redis instance's 1M ops/sec capacity
+- Use a Redis Cluster if single-instance throughput is insufficient
+
+**Data model**:
+```
+# Event-level counters (high write frequency)
+event:{id}:views     -> Integer (INCRBY)
+event:{id}:likes     -> Integer (INCRBY)
+event:{id}:shares    -> Integer (INCRBY)
+
+# User action tracking (deduplication)
+event:{id}:users:vote -> Set (SADD, checks membership)
+  SISMEMBER to check if user already voted
+  SADD to record vote
+
+# User-level counters (read for personalization)
+user:{id}:events:voted -> Sorted Set (ZINCRBY)
+  Score = number of votes cast per event category
+```
+
+**Memory estimation**:
+- 100K events x 3 counter keys x 80 bytes = 24MB (negligible)
+- 50M unique user-event interactions = 50M set entries x 60 bytes = 3GB
+- Use HyperLogLog instead of Set if exact uniqueness is not required: 12KB per event regardless of cardinality
+
+**Uniqueness with HyperLogLog** (for approximate unique counts):
+```bash
+PFADD event:42:unique_viewers "user:123"
+PFCOUNT event:42:unique_viewers  → approx 50K (0.81% error)
+```
+
+**Persistence**: AOF with `appendfsync everysec`. The 1-second flush buffer means at most 1 second of counter data is lost on crash — acceptable for a counter system.
+</details>
+
+### Challenge 6: Design a Task Queue with Priority
+
+Build a queue system for processing background jobs. Jobs have priorities (high, medium, low) and should be processed in priority order. Within the same priority, jobs should be processed in FIFO order.
+
+**Requirements**:
+- Support up to 100K jobs per minute
+- At-least-once delivery (jobs must not be lost)
+- Graceful handling of worker crashes (in-flight jobs are retried)
+- Support job scheduling (delay execution by up to 24 hours)
+
+<details>
+<summary><strong>Model Answer</strong></summary>
+
+**Multi-level queue design using Redis lists and sorted sets**:
+
+**Priority queues**:
+```
+Key: queue:high:jobs    -> List (LPUSH to enqueue, BRPOP to dequeue)
+Key: queue:medium:jobs  -> List
+Key: queue:low:jobs     -> List
+```
+
+**Scheduled jobs**:
+```
+Key: queue:scheduled -> Sorted Set (score = scheduled timestamp)
+  Member: JSON payload with queue target
+```
+
+**In-flight tracking**:
+```
+Key: queue:inflight:<worker_id> -> Set (job IDs currently being processed)
+Key: queue:retry -> List (jobs that need retry)
+```
+
+**Worker flow**:
+
+```python
+import time
+import json
+import uuid
+import redis
+
+class PriorityQueueWorker:
+    def __init__(self, redis_client):
+        self.redis = redis_client
+        self.worker_id = str(uuid.uuid4())
+
+    def process_scheduled_jobs(self):
+        """Move scheduled jobs to their target queues."""
+        now = time.time()
+        # Find all scheduled jobs due now
+        jobs = self.redis.zrangebyscore(
+            "queue:scheduled", 0, now
+        )
+        for job_data in jobs:
+            job = json.loads(job_data)
+            target_queue = f"queue:{job['priority']}:jobs"
+            self.redis.lpush(target_queue, job['payload'])
+            self.redis.zrem("queue:scheduled", job_data)
+
+    def dequeue_with_retry(self, timeout=5):
+        """Dequeue from priority order: high first, then medium, then low."""
+        queues = [
+            ("queue:high:jobs", "high"),
+            ("queue:medium:jobs", "medium"),
+            ("queue:low:jobs", "low"),
+        ]
+
+        # Process scheduled jobs first
+        self.process_scheduled_jobs()
+
+        # Try BRPOP on all queues simultaneously
+        result = self.redis.brpop(
+            [q[0] for q in queues], timeout
+        )
+        if not result:
+            return None
+
+        queue_name, payload = result
+        job_id = str(uuid.uuid4())
+
+        # Track in-flight
+        self.redis.sadd(
+            f"queue:inflight:{self.worker_id}", job_id
+        )
+        self.redis.hset(
+            f"queue:job:{job_id}", "payload", payload
+        )
+        self.redis.hset(
+            f"queue:job:{job_id}", "queue", queue_name
+        )
+        self.redis.expire(
+            f"queue:inflight:{self.worker_id}", 3600
+        )
+
+        return job_id, payload, queue_name
+
+    def ack(self, job_id):
+        """Acknowledge job completion."""
+        self.redis.delete(f"queue:job:{job_id}")
+        # Worker in-flight set is cleaned periodically
+
+    def nack(self, job_id):
+        """Negative acknowledgment — return to queue."""
+        job_data = self.redis.hgetall(f"queue:job:{job_id}")
+        if job_data:
+            self.redis.lpush(job_data[b'queue'], job_data[b'payload'])
+            self.redis.delete(f"queue:job:{job_id}")
+
+    def retry_stalled_jobs(self, timeout_secs=300):
+        """Re-queue jobs from workers that have stopped heartbeating."""
+        workers = self.redis.keys("queue:inflight:*")
+        for worker_key in workers:
+            last_seen = self.redis.get(f"queue:heartbeat:{worker_key}")
+            if last_seen and time.time() - float(last_seen) > timeout_secs:
+                stale_jobs = self.redis.smembers(worker_key)
+                for job_id in stale_jobs:
+                    self.nack(job_id)
+                self.redis.delete(worker_key)
+```
+
+**Key design decisions**:
+- **BRPOP with multiple queues**: BRPOP checks all queues atomically. Since the argument order is [high, medium, low], the first non-empty queue wins. This gives priority ordering without separate polling.
+- **In-flight tracking**: Each worker tracks in-flight jobs in a Redis set. A separate retry worker re-queues jobs from workers that have not heartbeated for N minutes.
+- **Scheduled jobs**: Sorted set with timestamp as score. A daemon process moves due jobs to their target queues.
+- **At-least-once guarantee**: Jobs are only removed after explicit ACK. Worker crashes lead to automatic retry via the stalled-job detector.
+</details>
+
+## Tier 3: Advanced Deep Dives
+
+These challenges test expert-level Redis knowledge.
+
+### Challenge 7: Diagnose a Production Incident
+
+A production Redis instance is showing the following symptoms:
+
+- Memory RSS is 48GB, but maxmemory is set to 32GB
+- Evicted_keys is 0
+- The instance is responding slowly (p99 latency increased from 2ms to 150ms)
+- INFO command shows `used_memory: 28GB` and `used_memory_rss: 48GB`
+
+**What is happening and how do you fix it?**
+
+<details>
+<summary><strong>Model Answer</strong></summary>
+
+**Diagnosis: Memory fragmentation causing excessive RSS**
+
+The 20GB gap between `used_memory` (28GB) and `used_memory_rss` (48GB) indicates severe memory fragmentation. The fragmentation ratio is 48/28 = 1.71, which is significantly above the warning threshold of 1.5.
+
+**Root cause**: The workload has frequent key churn — many keys being created and deleted over time. The allocator (jemalloc) cannot return freed pages to the OS efficiently because small allocations create gaps that cannot be coalesced. This is common in cache-heavy workloads with variable TTLs.
+
+**Why evicted_keys is 0**: With `maxmemory-policy` set to something non-evicting (or not reaching maxmemory yet), Redis has not triggered eviction. The used_memory of 28GB is under maxmemory of 32GB, so no eviction occurs. However, the process itself is consuming 48GB of physical RAM because the allocator is holding freed-but-not-returned memory.
+
+**Why latency spiked**: At 48GB RSS, the machine may be running low on physical memory, causing the OS to swap. When `used_memory_rss` approaches the machine's total RAM, the kernel starts swapping Redis memory to disk. Swapping destroys Redis performance because the single-threaded event loop must wait for disk I/O on every memory access.
+
+**Mitigation steps**:
+
+1. **Immediate**: Restart the Redis instance during a maintenance window. A restart clears fragmentation (memory is re-allocated fresh). AOF or RDB recovery will re-create the dataset in a compact state.
+
+```
+redis-cli DEBUG SET-ACTIVE-EXPIRE 0    # Pause expirations
+redis-cli BGSAVE                         # Take snapshot
+redis-cli SHUTDOWN                       # Graceful shutdown
+# Restart Redis — it loads the RDB/AOF and starts fresh
+systemctl restart redis
+```
+
+2. **Short-term**: Enable automatic defragmentation:
+```bash
+CONFIG SET activedefrag yes
+CONFIG SET active-defrag-threshold-lower 10
+CONFIG SET active-defrag-threshold-upper 100
+CONFIG SET active-defrag-ignore-bytes 100mb
+CONFIG SET active-defrag-cycle-min 5
+CONFIG SET active-defrag-cycle-max 75
+```
+
+3. **Long-term**:
+- Monitor `mem_fragmentation_ratio` with alerts at 1.5 (warning) and 2.0 (critical)
+- Schedule periodic restarts during low-traffic periods if fragmentation tends to grow
+- Consider switching to the `jemalloc` arena allocator options for better memory reuse
+- If fragmentation persists, consider increasing `maxmemory` to account for the fragmentation overhead (set maxmemory to 60% of physical RAM instead of 80% to leave headroom for fragmentation)
+</details>
+
+### Challenge 8: Large-Scale Cache Migration
+
+You need to migrate a 500GB Redis cache from a self-hosted cluster (5 nodes x 100GB each) to a managed Redis service (ElastiCache) with zero downtime. The cache handles 500K requests/second for a latency-sensitive application.
+
+**What is your migration strategy?**
+
+<details>
+<summary><strong>Model Answer</strong></summary>
+
+**Strategy: Dual-write + gradual cutover**
+
+**Phase 1: Set up dual-write** (1 week before cutover):
+
+1. Deploy the ElastiCache cluster alongside the existing Redis cluster. Size it identically (5 nodes, 100GB each).
+2. Modify the application to write to both Redis clusters simultaneously:
+   ```python
+   def set_with_dual_write(key, value, ttl=None):
+       old_redis.set(key, value, ex=ttl)  # Existing cluster
+       new_redis.set(key, value, ex=ttl)  # New ElastiCache cluster
+       # Ignore errors from the new cluster — non-blocking
+   ```
+3. Reads continue to come from the old cluster exclusively:
+   ```python
+   def get_with_dual_write(key):
+       return old_redis.get(key)
+   ```
+4. Monitor: verify that writes succeed on both clusters (compare error rates, latency percentiles).
+
+**Phase 2: Backfill historical data** (parallel to Phase 1):
+
+Use SCAN + DUMP/RESTORE to copy existing data to the new cluster:
+
+```bash
+# Script to migrate keys
+redis-cli -h old-cluster --scan --pattern '*' | \
+while read key; do
+    ttl=$(redis-cli -h old-cluster TTL "$key")
+    if [ "$ttl" -gt 0 ] 2>/dev/null; then
+        value=$(redis-cli -h old-cluster DUMP "$key")
+        echo "RESTORE \"$key\" $ttl $value"
+    fi
+done | redis-cli -h new-cluster --pipe
+```
+
+**Key consideration**: During backfill, some keys will be overwritten by dual-writes. This is fine — the latest write wins.
+
+**Phase 3: Validate data consistency**:
+
+Run a sampling comparison:
+```python
+def validate_migration(sample_rate=0.001):
+    cursor = 0
+    checked = 0
+    mismatches = 0
+    while True:
+        cursor, keys = old_redis.scan(cursor, count=1000)
+        for key in keys:
+            if random.random() < sample_rate:
+                old_val = old_redis.dump(key)
+                new_val = new_redis.dump(key)
+                if old_val != new_val:
+                    mismatches += 1
+                checked += 1
+        if cursor == 0:
+            break
+    print(f"Checked: {checked}, Mismatches: {mismatches}")
+```
+
+**Phase 4: Gradual read cutover** (10% increments):
+
+1. Route 10% of read traffic to the new cluster:
+   ```python
+   def get_with_dual_write(key):
+       if hash(key) % 10 == 0:
+           return new_redis.get(key)
+       return old_redis.get(key)
+   ```
+2. Monitor for 24 hours. Check:
+   - Latency percentiles (p50, p95, p99, p99.9)
+   - Error rates (connection errors, timeouts)
+   - Cache hit ratio (should be similar to old cluster after dual-write period)
+   - Application-level errors (timeouts, stale data complaints)
+
+3. Increase to 25%, 50%, 75%, 100% with 24-hour monitoring windows between each step.
+
+**Phase 5: Decommission old cluster**:
+
+1. Once 100% of traffic is on the new cluster, keep the old cluster running for 7 days as a rollback target.
+2. After 7 days with no issues, shut down the old cluster.
+3. Update configuration to remove dual-write logic.
+4. Update monitoring dashboards and alerts to point to the new cluster.
+5. Run a post-migration review: confirm latency meets SLO, memory utilization is under target, and eviction rates are within expected range.
+
+**Rollback plan**:
+If any issue is detected during the cutover (Phase 4), immediately revert reads to the old cluster:
+```python
+# Quick rollback — change the routing to 100% old cluster
+route_pct = 0  # All traffic to old cluster
+```
+The old cluster has all the data (since dual-writes were active). No data loss on rollback.
+
+**Key success metrics**:
+- Zero errors during cutover
+- P99 latency within 10% of baseline
+- Cache hit ratio within 2% of baseline
+- No increase in database load
+</details>

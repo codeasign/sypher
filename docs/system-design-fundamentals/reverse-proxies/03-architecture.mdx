@@ -1,0 +1,546 @@
+---
+id: reverse-proxies-architecture
+title: Reverse Proxies at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Building It at Scale
+
+### Naive Implementation
+
+The simplest reverse proxy is a single Nginx instance running on one server. You configure an `upstream` block pointing to your backend servers and a `server` block listening on port 80, proxying to the upstream. This configuration takes five minutes to set up and works for small applications.
+
+```
+upstream backend {
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+}
+
+server {
+    listen 80;
+    location / {
+        proxy_pass http://backend;
+    }
+}
+```
+
+**What breaks at 1,000 users (100 requests/second):** Nothing. A single Nginx worker on a modest 2-core server handles 100 requests/second with 5-10 milliseconds of overhead. TLS termination adds CPU but the load is negligible. The naive setup holds.
+
+**What breaks at 100,000 users (10,000 requests/second):**
+
+First, the TLS bottleneck appears. A single server doing RSA 2048 handshakes for 10,000 requests per second needs approximately 5 CPU cores just for TLS. If your server has 4 cores, TLS consumes 80% of CPU, leaving 20% for proxying. Requests queue up, latency spikes to 500+ milliseconds, and connections timeout.
+
+Second, the connection pool becomes a bottleneck. With 10,000 concurrent connections and default `worker_connections=512`, workers cannot accept enough simultaneous connections. Clients see connection refused errors even though the backends are healthy.
+
+Third, rate limiting is per-worker. Without shared memory zones, each worker maintains its own rate-limit counter. A client sending 500 requests per second is limited to 100 per worker (with 4 workers), but the client can actually send 400 total (100 per worker). The rate limit is effectively N times higher than configured.
+
+Fourth, cache duplication. Without shared cache, each worker stores its own copy of cached responses. With 4 workers, cache memory efficiency drops to 25% of a shared cache. The effective hit rate drops from 90% to 30-40% because a request for the same resource landing on different workers misses each worker's private cache.
+
+**What breaks at 10,000,000 users (1,000,000 requests/second):**
+
+The single proxy server cannot physically handle the traffic. Even with optimal configuration and perfect hardware, a single machine has limits: network interface bandwidth (10 Gbps = ~1.2 GB/s), memory bus bandwidth (40-70 GB/s), and CPU cache thrashing. At 1 million requests per second, the proxy server's network card reaches its interrupt limit (40,000-80,000 interrupts per second per queue). The event loop spends more time handling interrupts than processing requests.
+
+The proxy itself becomes a single point of failure. If the server crashes, all traffic stops. DNS propagation to switch to a backup takes 60-300 seconds (TTL of the DNS record). During that window, the entire application is unreachable.
+
+### Production-Grade Architecture
+
+A production reverse proxy layer uses multiple proxy instances behind a network load balancer, with horizontal scaling, health checks, and failure isolation.
+
+<AsciiDiagram
+  id="reverse-proxies/production-architecture"
+  title="Production-Grade Reverse Proxy Architecture"
+  alt="Multi-tier architecture with DNS, network load balancer, reverse proxy pool, shared cache, and backend services"
+  caption="Multiple proxy instances behind a network load balancer provide horizontal scaling and fault tolerance"
+>{` 
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                        PRODUCTION-GRADE REVERSE PROXY LAYER                          │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│                                    DNS (Round-Robin)                                  │
+│                                   api.syphergame.com                                  │
+│                                   A records: 203.0.113.10                             │
+│                                             203.0.113.11                             │
+│                                             203.0.113.12                             │
+│                                         TTL: 30 seconds                              │
+│                                                                                       │
+│                       ┌────────────────────┼────────────────────┐                     │
+│                       │                    │                    │                     │
+│                       ▼                    ▼                    ▼                     │
+│              ┌────────────────┐  ┌────────────────┐  ┌────────────────┐              │
+│              │ Network LB (L4)│  │ Network LB (L4)│  │ Network LB (L4)│              │
+│              │ IP: 203.0.113 │  │ IP: 203.0.113 │  │ IP: 203.0.113 │              │
+│              │ .10            │  │ .11            │  │ .12            │              │
+│              │ AWS NLB / GCP  │  │ AWS NLB / GCP  │  │ AWS NLB / GCP  │              │
+│              │ TCP L4 Forward │  │ TCP L4 Forward  │  │ TCP L4 Forward  │             │
+│              └───────┬────────┘  └───────┬────────┘  └───────┬────────┘              │
+│                      │                   │                   │                        │
+│              ┌───────┼───────────────┬───┼───────────────┬───┼────────┐               │
+│              │       │               │   │               │   │        │               │
+│              ▼       ▼               ▼   ▼               ▼   ▼        ▼               │
+│        ┌────────┐┌────────┐    ┌────────┐┌────────┐    ┌────────┐┌────────┐          │
+│        │ Proxy  ││ Proxy  │    │ Proxy  ││ Proxy  │    │ Proxy  ││ Proxy  │          │
+│        │  A1    ││  A2    │    │  B1    ││  B2    │    │  C1    ││  C2    │          │
+│        │Nginx   ││Nginx   │... │Nginx   ││Nginx   │... │Nginx   ││Nginx   │...       │
+│        │4 vCPU  ││4 vCPU  │    │4 vCPU  ││4 vCPU  │    │4 vCPU  ││4 vCPU  │          │
+│        │8GB RAM ││8GB RAM │    │8GB RAM ││8GB RAM │    │8GB RAM ││8GB RAM │          │
+│        └───┬────┘└───┬────┘    └───┬────┘└───┬────┘    └───┬────┘└───┬────┘          │
+│            │         │             │         │             │         │                │
+│            └─────────┼─────────────┼─────────┼─────────────┼─────────┘                │
+│                      │             │         │             │                          │
+│              ┌───────┼─────────────┼─────────┼─────────────┼────────┐                 │
+│              │       │             │         │             │        │                 │
+│              │  ┌────▼─────────────▼─────────▼─────────────▼────┐  │                 │
+│              │  │           Elasticache Redis                   │  │                 │
+│              │  │   Shared Cache Layer (10 GB, 1M keys)        │  │                 │
+│              │  │   Replication: 1 primary + 2 replicas        │  │                 │
+│              │  └───────────────────────────────────────────────┘  │                 │
+│              │                                                     │                 │
+│              │              ┌──────────────┐                        │                 │
+│              └──────────────┤ Auto Scaling  ├───────────────────────┘                 │
+│                             │ Group         │                                        │
+│                             │ Min: 6        │                                        │
+│                             │ Max: 30       │                                        │
+│                             │ Metric: CPU   │                                        │
+│                             │ Threshold:     │                                        │
+│                             │ Scale up: &gt;70% │                                        │
+│                             │ Scale down:under 30%│                                       │
+│                             └──────┬───────┘                                        │
+│                                    │                                                  │
+│                                    ▼                                                  │
+│        ┌─────────────────────────────────────────────────────────────────────┐       │
+│        │                     BACKEND SERVICE MESH                              │       │
+│        │                                                                       │       │
+│        │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐              │       │
+│        │  │ Auth     │  │ User     │  │ Game     │  │ Leader-  │              │       │
+│        │  │ Service  │  │ Service  │  │ Service  │  │ board    │              │       │
+│        │  ├──────────┤  ├──────────┤  ├──────────┤  ├──────────┤              │       │
+│        │  │ 4 pods   │  │ 8 pods   │  │ 20 pods  │  │ 6 pods   │              │       │
+│        │  └──────────┘  └──────────┘  └──────────┘  └──────────┘              │       │
+│        │                                                                       │       │
+│        │  ┌──────────┐  ┌──────────┐  ┌──────────┐                           │       │
+│        │  │ Cache    │  │ Queue    │  │ DB       │                           │       │
+│        │  │ (Redis)  │  │ (Rabbit) │  │ (Postgres│                           │       │
+│        │  │ Cluster  │  │ Cluster  │  │ R/W      │                           │       │
+│        │  │ 3 nodes  │  │ 3 nodes  │  │ 2 nodes  │                           │       │
+│        │  └──────────┘  └──────────┘  └──────────┘                           │       │
+│        └─────────────────────────────────────────────────────────────────────┘       │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+The production architecture has five layers:
+
+**Layer 1: DNS Round-Robin.** Multiple A records point to different network load balancer IPs. TTL is set low (30 seconds) to allow fast failover. Clients randomly pick one IP on each DNS resolution, distributing initial connections.
+
+**Layer 2: Network Load Balancers (Layer 4).** Each NLB forwards TCP traffic to a pool of proxy instances. NLBs operate at Layer 4 (TCP/UDP), so they do not terminate TLS or inspect HTTP. They provide health checks (TCP ping every 5 seconds) and automatically remove unhealthy proxy instances. NLBs scale horizontally to handle arbitrary throughput. AWS NLB handles 10 million concurrent connections with 25 Gbps bandwidth per availability zone.
+
+**Layer 3: Proxy Instance Pool.** Each proxy instance is an Nginx (or HAProxy, Envoy, or Caddy) process running on a compute instance (EC2, container, or bare metal). Instances are grouped in an auto-scaling group. The auto-scaling policy adds instances when average CPU exceeds 70% and removes instances when CPU drops below 30%. Each instance handles 5,000 to 20,000 requests per second depending on configuration.
+
+**Layer 4: Shared Cache.** A Redis cluster (or Memcached) provides a shared cache layer accessible by all proxy instances. Cache keys include a cache tag for grouped invalidation. The shared cache improves hit rates from 30-40% (per-instance cache) to 85-95% (shared cache) because every proxy can serve any cached response.
+
+**Layer 5: Backend Service Mesh.** The backend itself is a microservice architecture with multiple services, each running multiple pods. The proxy routes requests to different services based on path, and each service has its own health checks, auto-scaling, and deployments.
+
+### Integration Patterns
+
+**Pattern 1: Reverse Proxy + Database Read Replicas**
+
+The proxy routes read queries to database read replicas and write queries to the primary. This separates read and write traffic at the proxy level without any application code changes.
+
+<AsciiDiagram
+  id="reverse-proxies/proxy-db-integration"
+  title="Reverse Proxy with Database Read/Write Splitting"
+  alt="Diagram showing proxy routing GET requests to read replicas and POST/PUT/DELETE to write primary"
+  caption="The proxy splits read and write traffic at the HTTP method level, routing to different database endpoints"
+>{` 
+┌─────────┐          ┌──────────────────────────────────────────┐
+│ Client  │          │            REVERSE PROXY                  │
+│         │          │                                            │
+│  GET    │─────────&gt;│  Method: GET                               │
+│  /users │          │  ┌────────────────────────────┐            │
+│         │          │  │ Route to Read Replicas     │            │
+└─────────┘          │  │ GET    -&gt; read-replica     │            │
+                     │  │ POST   -&gt; write-primary    │            │
+┌─────────┐          │  │ PUT    -&gt; write-primary    │            │
+│ Client  │          │  │ DELETE -&gt; write-primary    │            │
+│         │          │  │ PATCH  -&gt; write-primary    │            │
+│  POST   │─────────&gt;│  │ HEAD   -&gt; read-replica     │            │
+│  /users │          │  └────────────────────────────┘            │
+│         │          └────────────────────┬───────────────────────┘
+└─────────┘                               │
+                    ┌──────────────────────┼──────────────────────┐
+                    │                      │                      │
+                    ▼                      ▼                      ▼
+          ┌────────────────┐    ┌────────────────┐    ┌────────────────┐
+          │ PostgreSQL     │    │ PostgreSQL     │    │ PostgreSQL     │
+          │ PRIMARY        │    │ REPLICA 1      │    │ REPLICA 2      │
+          │ Write traffic  │    │ Read traffic   │    │ Read traffic   │
+          │ 10.0.1.10:5432 │    │ 10.0.1.11:5432 │    │ 10.0.1.12:5432 │
+          │ Streams WAL    │───&gt;│ Streaming      │───&gt;│ Streaming      │
+          │ to replicas    │    │ Replication    │    │ Replication    │
+          └────────────────┘    └────────────────┘    └────────────────┘
+ `}
+</AsciiDiagram>
+
+Implementation: The proxy checks `$request_method` and routes to different upstreams. Nginx configuration:
+
+```
+upstream write_backend { server 10.0.1.10:5432; }
+upstream read_backend {
+    server 10.0.1.11:5432 weight=2;
+    server 10.0.1.12:5432 weight=1;
+}
+
+server {
+    if ($request_method = POST)  { proxy_pass http://write_backend; }
+    if ($request_method = PUT)   { proxy_pass http://write_backend; }
+    if ($request_method = DELETE){ proxy_pass http://write_backend; }
+    proxy_pass http://read_backend;
+}
+```
+
+The proxy adds `X-Read-Replica: true` header on read requests so the application can log which replica handled the request for debugging. The proxy also rewrites the `Host` header to match the database host, preserving authentication context.
+
+**Pattern 2: Reverse Proxy + Cache-Aside (Redis)**
+
+The proxy implements a cache-aside pattern with Redis. On request, the proxy checks Redis for the cache key. On hit, serve from Redis. On miss, forward to backend, then write the response to Redis before returning it.
+
+<AsciiDiagram
+  id="reverse-proxies/cache-aside"
+  title="Cache-Aside Pattern with Reverse Proxy and Redis"
+  alt="Sequence diagram showing cache-aside flow: check Redis, miss, forward to backend, store in Redis, return to client"
+  caption="The proxy uses Redis as a shared cache, improving hit rates across all proxy instances"
+>{` 
+Client          Reverse Proxy              Redis                 Backend
+  │                    │                     │                      │
+  │   GET /leaderboard │                     │                      │
+  │───────────────────&gt;│                     │                      │
+  │                    │                     │                      │
+  │                    │  GET leaderboard:1  │                      │
+  │                    │────────────────────&gt;│                      │
+  │                    │                     │                      │
+  │                    │  CACHE MISS (nil)   │                      │
+  │                    │&lt;────────────────────│                      │
+  │                    │                     │                      │
+  │                    │                     │  GET /api/leaderboard │
+  │                    │                     │─────────────────────&gt;│
+  │                    │                     │                      │
+  │                    │                     │  200 OK + JSON       │
+  │                    │                     │&lt;─────────────────────│
+  │                    │                     │                      │
+  │                    │  SET leaderboard:1  │                      │
+  │                    │  EX 60 (TTL 60s)    │                      │
+  │                    │────────────────────&gt;│                      │
+  │                    │                     │                      │
+  │  200 OK + JSON     │                     │                      │
+  │&lt;───────────────────│                     │                      │
+  │                    │                     │                      │
+  │                    │    Subsequent requests:                     │
+  │                    │                     │                      │
+  │   GET /leaderboard │                     │                      │
+  │───────────────────&gt;│                     │                      │
+  │                    │  GET leaderboard:1  │                      │
+  │                    │────────────────────&gt;│                      │
+  │                    │                     │                      │
+  │                    │  CACHE HIT (JSON)   │                      │
+  │                    │&lt;────────────────────│                      │
+  │  200 OK + JSON     │                     │                      │
+  │&lt;───────────────────│                     │                      │
+  │                    │                     │                      │
+ `}
+</AsciiDiagram>
+
+Benefits over per-worker cache: Redis handles 100,000+ operations/second per node. The proxy uses the Redis `SET` command with TTL (`EX`) to expire stale entries. Cache invalidation is simple: `DEL leaderboard:1` on write operations. The proxy uses the `GET` and `SET` commands only — no Lua scripting needed.
+
+Cost: Each cache lookup adds a network round-trip (0.2-1 ms in the same datacenter, 1-5 ms across availability zones). Use Redis in the same availability zone as the proxy to minimize latency. With p50 Redis latency of 0.5 ms, the cache miss penalty is 1 ms (lookup + store). The cache hit saves 200-500 ms of backend time. The tradeoff is positive if hit rate exceeds 5%.
+
+**Pattern 3: Reverse Proxy + Message Queue for Request Throttling**
+
+The proxy forwards requests to a message queue instead of directly to backends. Backend workers consume from the queue at their own pace. This decouples request arrival rate from processing capacity.
+
+<AsciiDiagram
+  id="reverse-proxies/proxy-queue"
+  title="Reverse Proxy with Message Queue for Request Throttling"
+  alt="Diagram showing proxy publishing requests to RabbitMQ, with backend workers consuming at controlled rate"
+  caption="A message queue absorbs traffic spikes, preventing backend overload and providing request durability"
+>{` 
+                        Traffic Spike: 20,000 req/s                      
+                        Backend capacity: 5,000 req/s                     
+ 
+┌────────────────────────────────────────────────────────────────────┐
+│                        REVERSE PROXY                                │
+│                                                                      │
+│  For each incoming request:                                         │
+│    1. Parse and validate                                            │
+│    2. Enrich with client IP, timestamp, auth context                │
+│    3. Publish to RabbitMQ exchange "requests"                      │
+│    4. Return 202 Accepted immediately                               │
+│       (with tracking ID for status polling)                         │
+│                                                                      │
+│  Proxy never contacts backends directly                             │
+│  Proxy throughput: 20,000+ req/s (queue is fast)                   │
+└───────────────────────────┬────────────────────────────────────────┘
+                            │
+                            │  RabbitMQ Queue "game_requests"
+                            │  Queue depth: 15,000 messages
+                            │  (spike absorbed, no data loss)
+                            │
+                            ▼
+              ┌─────────────────────────────┐
+              │  Backend Workers (Kubernetes) │
+              │                             │
+              │  ┌────────┐ ┌────────┐     │
+              │  │Worker 1│ │Worker 2│ ...  │
+              │  │500 req │ │500 req │     │
+              │  │  /s    │ │  /s    │     │
+              │  └────────┘ └────────┘     │
+              │                             │
+              │  Total: 5,000 req/s        │
+              │  Queue drains at 5K/s      │
+              │  Full drain: 3 seconds     │
+              └─────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+When to use: workloads with bursty traffic patterns (flash sales, event ticket drops, live-stream chat), operations that tolerate asynchronous processing (email sending, analytics, image processing), and cases where data durability matters (server crash should not lose requests).
+
+Cost: Adds 2-10 ms of latency per request for queue publication and polling. Clients receive 202 Accepted immediately but must poll or receive a webhook callback for the result. Not suitable for synchronous request-response patterns (user login, payment processing).
+
+**Pattern 4: Reverse Proxy + External API Aggregation**
+
+The proxy acts as an API gateway that calls multiple external APIs, aggregates their responses, and returns a single response to the client. This pattern hides external API complexity from clients and reduces client-side network calls.
+
+Implementation: The proxy uses a sub-request mechanism (Nginx's `ngx_http_auth_request_module` or a Lua script via `ngx_lua`) to call multiple upstreams concurrently. The proxy receives all upstream responses, merges them into a single JSON response, and returns it to the client. The aggregation logic is configurable: sum of numeric fields, concatenation of arrays, merge of object keys.
+
+```
+# Nginx + Lua for API aggregation
+location = /order-details {
+    access_by_lua_block {
+        local res1 = ngx.location.capture("/internal/users/123")
+        local res2 = ngx.location.capture("/internal/payments/order/456")
+        local res3 = ngx.location.capture("/internal/shipment/order/456")
+        
+        local response = {
+            user = cjson.decode(res1.body),
+            payment = cjson.decode(res2.body),
+            shipment = cjson.decode(res3.body)
+        }
+        ngx.say(cjson.encode(response))
+    }
+}
+```
+
+The sub-requests run in parallel (Nginx concurrently reads from all three upstreams). The total latency equals the slowest upstream call (max of three, not sum). If each upstream takes 50 ms, 100 ms, and 150 ms, the aggregate latency is 150 ms, not 300 ms.
+
+**Pattern 5: Reverse Proxy + CDN**
+
+A CDN (Content Delivery Network) sits in front of the reverse proxy for static assets and cacheable responses. The CDN caches responses at edge locations close to users (100+ locations globally). The reverse proxy handles dynamic requests that the CDN cannot cache.
+
+```
+Client -> CDN Edge (e.g., CloudFront) -> Reverse Proxy -> Backend
+            Cache HIT: 95% of static      Cache: API responses
+            assets served from edge        Cache MISS: forward to backend
+            No backend hit at all          MISS rate: 10-20%
+```
+
+The CDN and reverse proxy form a two-level cache. The CDN serves static assets (images, CSS, JS) with global distribution and 95%+ hit rates. The reverse proxy caches dynamic API responses (10-20% miss rate). The CDN shields the reverse proxy from 80-90% of total traffic, reducing proxy instances needed by 5-10x.
+
+### Multi-Region and Global Scale
+
+At global scale, a single-region reverse proxy layer cannot serve users worldwide with acceptable latency. The speed of light imposes a hard limit: a round trip from Sydney to us-east-1 takes 200+ milliseconds regardless of bandwidth. Multiple proxy layers in multiple regions solve this.
+
+<AsciiDiagram
+  id="reverse-proxies/global-topology"
+  title="Multi-Region Global Reverse Proxy Topology"
+  alt="World map diagram showing proxy layers in US-East, US-West, EU-West, Asia-Pacific with Anycast DNS and cross-region failover"
+  caption="Global deployments use region-local proxy layers with geo-aware DNS routing and cross-region health checks"
+>{` 
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                      GLOBAL REVERSE PROXY TOPOLOGY                                   │
+│                                                                                       │
+│                                       DNS (Route53 Latency-Based)                     │
+│                                             api.syphergame.com                        │
+│                                                 │                                      │
+│                ┌────────────────────────────────┼────────────────────────────┐        │
+│                │                                │                            │        │
+│          ┌─────▼──────┐                  ┌──────▼──────┐            ┌───────▼─────┐  │
+│          │ US-EAST-1  │                  │ EU-WEST-2   │            │ AP-SOUTHEAST │  │
+│          │ (Virginia) │                  │ (London)    │            │ -1 (Sydney)  │  │
+│          │            │                  │             │            │              │  │
+│          │ Anycast IP:│                  │ Anycast IP: │            │ Anycast IP:  │  │
+│          │ 1.2.3.4    │                  │ 1.2.3.5     │            │ 1.2.3.6      │  │
+│          └─────┬──────┘                  └──────┬──────┘            └──────┬───────┘  │
+│                │                               │                         │           │
+│          ┌─────▼──────┐                  ┌──────▼──────┐            ┌──────▼───────┐ │
+│          │ NLB +      │                  │ NLB +       │            │ NLB +         │ │
+│          │ Proxy Pool │                  │ Proxy Pool  │            │ Proxy Pool    │ │
+│          │ 6 instances │                  │ 4 instances  │            │ 3 instances   │ │
+│          └─────┬──────┘                  └──────┬──────┘            └──────┬───────┘ │
+│                │                               │                         │           │
+│                ├───────────────────────────────┼─────────────────────────┤           │
+│                │                               │                         │           │
+│                ▼                               ▼                         ▼           │
+│          ┌──────────────────────────────────────────────────────────────────┐        │
+│          │              GLOBAL BACKEND (Active-Active)                      │        │
+│          │                                                                   │        │
+│          │  ┌───────────┐       ┌───────────┐       ┌───────────┐          │        │
+│          │  │ US-EAST   │&lt;─────&gt;│ EU-WEST   │&lt;─────&gt;│ AP-SOUTHEAST│         │        │
+│          │  │ DB Primary│       │ DB Replica│       │ DB Replica  │         │        │
+│          │  └───────────┘       └───────────┘       └───────────┘          │        │
+│          │                                                                   │        │
+│          │  ┌──────────────────────────────────────────────────┐            │        │
+│          │  │ Global Redis (Cross-Region Replication)          │            │        │
+│          │  │ US-EAST: Primary  │  EU-WEST: Replica            │            │        │
+│          │  │ AP-SOUTHEAST: Replica                            │            │        │
+│          │  │ Replication lag: ~50ms cross-Atlantic            │            │        │
+│          │  │                  ~150ms US-to-Australia          │            │        │
+│          └──────────────────────────────────────────────────────────────────┘        │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+**Global Request Routing.** DNS-based routing directs users to the nearest region. Three approaches:
+
+- Latency-based routing (AWS Route53): DNS resolver measures latency to each region's health check endpoint and returns the lowest-latency IP. Users in London get the EU-West proxy. Changes propagate within 30 seconds (DNS TTL).
+
+- Geo-proximity routing: DNS returns the proxy IP closest to the user's geographic location. No measurement needed. Works even for first-time visitors. Less adaptive to regional outages.
+
+- Anycast routing: Multiple regions announce the same IP via BGP. The internet routing protocol directs traffic to the nearest region automatically. Fast convergence (30-60 seconds) and no DNS dependency. Requires your own IP space and BGP peers (Cloudflare, Google Cloud, and AWS Global Accelerator use this).
+
+**Cross-Region State.** The reverse proxy should be stateless within a region (no local state that cannot be recreated). All state shared across regions must handle replication lag. The proxy layer itself stores no state that requires cross-region consistency — it reads from a region-local Redis replica and writes invalidations to the local Redis. The invalidation propagates to other regions asynchronously.
+
+Cache invalidation across regions uses a publish-subscribe pattern. When a write occurs in one region, the proxy publishes a cache invalidation message to a cross-region message bus (Kafka, SQS, or Redis Pub/Sub). Other regions receive the invalidation and evict the stale key. The invalidation latency equals the cross-region network latency (50-150 ms).
+
+**Failover.** If an entire region fails (e.g., us-east-1 AWS outage), DNS routing directs traffic to the remaining regions. The proxy layer in the surviving region must handle the additional load. Capacity planning for failover: each region should have enough proxy instances to handle 2x its normal traffic (to absorb traffic from a failed region). With 4 regions, each region reserves 50% headroom, totaling 200% of normal capacity across all regions.
+
+### Capacity Planning
+
+Walk through capacity planning for a mobile game with 10 million daily active users.
+
+**Assumptions:**
+- 10 million DAU
+- Average 50 requests per user per day (game state sync, leaderboard, matchmaking)
+- Total daily requests: 500 million
+- Peak hour traffic: 10x average (common for games that spike after school/work hours)
+- Peak requests/second: 500,000,000 / 86,400 * 10 = ~57,870 req/s
+- Average response size: 2 KB (API JSON)
+- Peak response size: 50 KB (leaderboard snapshot)
+- Cacheable ratio: 70% (static assets, leaderboard snapshots, game configs)
+- Cache hit rate: 90% on cacheable endpoints
+
+**Proxy Layer Sizing:**
+
+Cache-miss requests hitting backends: 57,870 * (1 - 0.7*0.9) = 57,870 * 0.37 = 21,412 req/s
+
+Per proxy instance (Nginx, 4 vCPU, 8 GB RAM): 10,000 req/s with TLS + compression
+
+Instances needed: 57,870 / 10,000 = 5.8 -> 6 instances at peak
+
+Headroom for failover (N+1): 7 instances per region
+
+With 3 regions: 7 * 3 = 21 total proxy instances
+
+**Connection Pool Sizing:**
+
+Backend connections per proxy: `keepalive 64` * backends (4 microservices) = 256 connections per proxy
+
+Total backend connections: 21 proxies * 256 = 5,376 connections
+
+Backend instances needed (assuming 500 concurrent connections per pod): 5,376 / 500 = 11 backend pods minimum
+
+**Memory:**
+
+Per proxy instance: 7,000 concurrent connections * 43 KB = 301 MB for connection state
+Plus 2 GB for cache (shared memory with 256 MB for keys, 1.75 GB for data)
+Total per instance: ~2.5 GB, leaving 5.5 GB for OS and spikes
+
+**Network Bandwidth:**
+
+Peak inbound traffic: 57,870 req/s * 1 KB (avg request) = 57.9 MB/s = 463 Mbps
+Peak outbound traffic: 57,870 req/s * 2 KB (avg response, compressed) = 115.7 MB/s = 926 Mbps
+
+With 7 instances per region: 926 / 7 = 132 Mbps per instance (well within 1 Gbps NIC)
+
+**Redis Cache:**
+
+Cache keys: 100,000 unique API endpoints and user-specific keys
+Key size: 100 bytes average, value size: 2 KB average
+Total cache data: 100,000 * 2.1 KB = 210 MB
+Redis memory overhead: 210 MB * 1.5 = 315 MB
+Configure Redis with 1 GB memory for headroom
+
+**Cost Estimate (AWS, us-east-1, on-demand):**
+- 21 x c5.large (2 vCPU, 4 GB, Nginx) = $0.085/hr * 24 * 30 * 21 = $1,285/month
+- 3 x NLB (simple L4) = ~$0.0225/hr * 24 * 30 * 3 = $48.60/month
+- 1 x Redis cache.m5.large (3 nodes) = ~$0.148/hr * 24 * 30 * 3 = $319/month
+- 3 x Route53 latency-based routing = ~$3/month
+- Total proxy layer: ~$1,655/month
+
+This is approximately 0.5-2% of total infrastructure cost for a 10M DAU game. The proxy layer cost is small relative to the cost savings from caching (reducing backend instances by 3-5x) and the value of DDoS protection (a single attack could cost $10,000+ in infrastructure burn).
+
+### Deployment and Operations
+
+**Zero-Downtime Configuration Reload**
+
+Nginx and HAProxy support reloading configuration without dropping connections. The master process starts new worker processes with the new configuration while old workers continue serving existing connections. Old workers shut down after their connections drain (up to `worker_shutdown_timeout`, default 10 seconds).
+
+```
+# Graceful reload (drops zero requests if well-behaved clients)
+nginx -s reload
+
+# Check config validity before reload
+nginx -t && nginx -s reload
+```
+
+For automated deployments, use a deployment script that:
+1. Validates configuration syntax (`-t`)
+2. Applies configuration to all instances in a rolling fashion
+3. Waits for health checks to pass before moving to the next instance
+4. Rolls back if health checks fail after 3 consecutive checks
+
+**Monitoring Metrics**
+
+Every reverse proxy should expose the following metrics to a monitoring system (Prometheus, Datadog, CloudWatch):
+
+| Metric | What it measures | Alert threshold |
+|--------|------------------|-----------------|
+| `nginx_http_requests_total` | Request rate by status code | 5xx rate > 1% of total |
+| `nginx_upstream_response_time` | Backend response latency p50/p99 | p99 > 500ms |
+| `nginx_connections_active` | Current active connections | > 80% of worker_connections |
+| `nginx_cache_hit_ratio` | Percentage of cache hits | under 50% (should be 85%+) |
+| `nginx_ssl_handshake_failures` | Failed TLS handshakes | > 1% of total handshakes |
+| `nginx_http_4xx` | Client error rate by path | Sudden spike > 100x baseline |
+| `nginx_upstream_health` | Backend health check pass/fail | Any backend DOWN for 2+ checks |
+| `cpu_utilization` | Proxy CPU usage | > 80% sustained |
+| `memory_usage` | Proxy memory (RSS) | > 80% of total RAM |
+| `network_bytes_in/out` | Network throughput | > 80% of NIC capacity |
+
+Each proxy instance should expose these on a `/metrics` or `/nginx_status` internal endpoint, protected from external access by firewall rules. A Prometheus server scrapes every 15 seconds.
+
+**Debugging Common Issues**
+
+Proxy returns 502 Bad Gateway: The backend is unreachable or refuses connections. Check: backend process running? Firewall rules allow proxy IP? Backend port correct? Health check is failing, mark backend as down.
+
+Proxy returns 504 Gateway Timeout: Backend accepted the connection but did not respond within `proxy_read_timeout`. Check: backend CPU at 100%? Database query too slow (no index)? Backend has thread starvation (all workers blocked)? Increase timeout temporarily, then fix the backend performance issue.
+
+Proxy returns 413 Request Entity Too Large: Request body exceeds `client_max_body_size`. Increase the limit for upload endpoints, or restructure the API to use chunked uploads.
+
+High CPU but low throughput (under 5,000 req/s): TLS handshake bottleneck. Check SSL session cache hit rate. If low, increase `ssl_session_cache`. Consider switching from RSA to ECDSA certificates. A single server doing 500 full RSA handshakes per second saturates 4 cores.
+
+Memory leak: Proxy RSS grows over time without returning memory. Check: `proxy_buffering` with large responses, long-lived keepalive connections holding buffers, or an upstream that sends chunked responses without proper termination. The fix is to set `proxy_buffer_size` and `proxy_buffers` to reasonable maximums and reload the proxy regularly (which nginx does gracefully).
+
+**Upgrade Strategy**
+
+Plan your Nginx/HAProxy/Envoy upgrades with this sequence:
+1. Deploy the new version on one instance in the staging environment
+2. Run synthetic traffic (100 req/s for 5 minutes) and verify no error rate increase
+3. Deploy to one production instance during low-traffic hours (2 AM)
+4. Monitor for 15 minutes: error rates, latency p50/p99, memory usage
+5. Roll out to 25% of instances, wait 30 minutes
+6. Roll out to 100% with a rolling restart (1 instance at a time)
+
+Avoid upgrading during known traffic peaks (product launches, marketing campaigns, seasonal spikes). If you must upgrade at peak, deploy 2 extra instances first, then roll one at a time, keeping the extra capacity.
+
+After upgrade, keep the previous binary available for 72 hours with the old configuration. If a bug emerges (regression in HTTP/2 handling, memory leak under load), you can revert by replacing the binary and reloading.

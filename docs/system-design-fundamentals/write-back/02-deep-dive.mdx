@@ -1,0 +1,640 @@
+---
+id: write-back-deep-dive
+title: "Write-Back -- Under the Hood"
+position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A production write-back cache is not just a hash map with a background thread. It is a system of coordinated components that manage state, persistence, concurrency, and failure recovery. Understanding these internals is what separates a design that works in a demo from one that survives production.
+
+<AsciiDiagram
+  id="write-back/internal-architecture"
+  alt="Internal architecture diagram of write-back cache showing dirty buffer, flush queue, WAL, flusher threads, retry queue, and circuit breaker"
+  title="Write-Back Internal Architecture"
+  caption="A production write-back cache has seven internal subsystems working together"
+  content={`┌─────────────────────────────────────────────────────────────────────┐
+│                 Write-Back Cache — Internal Architecture            │
+└─────────────────────────────────────────────────────────────────────┘
+                                                                      
+                          ┌──────────────────────┐                    
+                          │    Write-Ahead Log    │                    
+                          │    (WAL)              │                    
+                          │    ┌────────────────┐ │                    
+                          │    │ Append-only    │ │                    
+                          │    │ write log      │ │                    
+                          │    └────────────────┘ │                    
+                          └───────────┬──────────┘                    
+                                      │ replay on crash               
+                                      ▼                                
+  ┌────────┐  set(K,V)  ┌──────────────────────────────────────┐     
+  │        │───────────►│                                      │     
+  │  App   │            │   Write-Back Cache Engine            │     
+  │        │◄────ACK───┤│   ┌─────────────┐   ┌────────────┐  │     
+  └────────┘            │   │ Dirty Buffer │   │Flush Queue │  │     
+                        │   │ (HashMap)    │   │(Priority)  │  │     
+                        │   │ K1 → V1 (D) │   │ K2 → pri=1 │  │     
+                        │   │ K2 → V2 (D) │   │ K5 → pri=2 │  │     
+                        │   │ K3 → V3 (C) │   │ K7 → pri=1 │  │     
+                        │   └──────┬──────┘   └──────┬─────┘  │     
+                        │          │                  │         │     
+                        │          └──────┬───────────┘         │     
+                        │                 ▼                     │     
+                        │        ┌────────────────┐             │     
+                        │        │ Flusher Thread │             │     
+                        │        │ Pool           │             │     
+                        │        │ T1  T2  T3     │             │     
+                        │        └───┬────┬────┬──┘             │     
+                        │            │    │    │                 │     
+                        │            ▼    ▼    ▼                 │     
+                        │        ┌────────────────┐             │     
+                        │        │ Batch          │             │     
+                        │        │ Accumulator    │             │     
+                        │        └───────┬────────┘             │     
+                        │                │                       │     
+                        │                ▼                       │     
+                        │        ┌────────────────┐             │     
+                        │        │ Consistency    │             │     
+                        │        │ Checker        │             │     
+                        │        └───────┬────────┘             │     
+                        └────────────────┼──────────────────────┘     
+                                         │                            
+                                         ▼                            
+                                  ┌────────────┐                      
+                                  │  Database   │                      
+                                  └──────┬─────┘                      
+                                         │                            
+                              ┌──────────┴──────────┐               
+                              │                     │                
+                              ▼                     ▼                
+                        ┌──────────┐       ┌──────────────┐         
+                        │  Retry   │       │   Circuit    │         
+                        │  Queue   │◄──────│   Breaker    │         
+                        └──────────┘       └──────────────┘         `}
+/>
+
+### Dirty Buffer (HashMap)
+
+The dirty buffer is the core data structure. It is a concurrent hash map keyed by the cache key, with values that include the cached data, a dirty flag, a timestamp, and a version number. The map must support concurrent reads and writes from application threads while the flusher threads iterate over dirty entries.
+
+Implementation choices:
+- **Go**: `sync.Map` or a sharded `map` with `sync.RWMutex`
+- **Java**: `ConcurrentHashMap` with per-bucket locking
+- **Rust**: `DashMap` from the `dashmap` crate
+- **C++**: `folly::ConcurrentHashMap`
+
+### Flush Queue
+
+The flush queue tracks which dirty entries need to be flushed and in what order. It is separate from the dirty buffer because the flush order may differ from the insertion order. A priority queue allows critical writes (payment transactions) to flush before non-critical writes (analytics).
+
+The flush queue entries contain:
+- Cache key
+- Priority level
+- Dirty timestamp (when the entry was first dirtied)
+- Retry count
+- Expiration time
+
+### Write-Ahead Log (WAL)
+
+The WAL is the crash recovery mechanism. Every write that enters the dirty buffer is also appended to the WAL on disk. If the cache crashes, the WAL is replayed on restart to reconstruct the dirty buffer. The WAL makes the durability window much smaller -- from "until the next flush" to "until the WAL entry is written to disk."
+
+<AsciiDiagram
+  id="write-back/wal-role"
+  alt="Write-Ahead Log positioned between app writes and dirty buffer, with replay path on crash"
+  title="WAL Position in Write-Back"
+  caption="WAL sits between the app write and the dirty buffer, providing crash-recovery durability"
+  content={`┌──────────────────────────────────────────────────────────────────┐
+│                    WAL in the Write Path                          │
+└──────────────────────────────────────────────────────────────────┘
+                                                                  
+  Normal Write Path:                                               
+  ┌──────┐   set(K,V)   ┌──────────┐   append   ┌────────────┐   
+  │ App  │─────────────►│ WAL      │───────────►│ Disk       │   
+  │      │              │ (memory) │            │ (SSD/NVMe) │   
+  │      │              └──────────┘            └────────────┘   
+  │      │                  │                                      
+  │      │                  ▼                                      
+  │      │              ┌──────────────┐                           
+  │      │              │ Dirty Buffer │                           
+  │      │◄──── ACK ────┤              │                           
+  └──────┘              └──────────────┘                           
+                                                                  
+  Crash Recovery Path:                                             
+  ┌────────────┐   replay   ┌──────────────┐                      
+  │ Disk (WAL) │───────────►│ Dirty Buffer │                      
+  └────────────┘            └──────────────┘                      
+                                  │                                
+                                  ▼                                
+                           [Continue flushing]                     
+                                                                  
+  WAL Write Modes:                                                
+  ┌──────────────┬──────────┬───────────────────────────────────┐
+  │ Mode         │ Latency  │ Crash Safety                      │
+  ├──────────────┼──────────┼───────────────────────────────────┤
+  │ Async WAL    │ +0.1ms   │ May lose last 0.1ms of writes    │
+  │ Sync WAL     │ +1-5ms   │ No loss after fsync              │
+  │ Group Commit │ +0.5ms   │ Batches fsyncs, good balance     │
+  └──────────────┴──────────┴───────────────────────────────────┘`}
+/>
+
+### Flusher Thread Pool
+
+A single flusher thread is a bottleneck. Production systems use a pool of flusher threads, each responsible for a partition of the dirty buffer. The partition is determined by hashing the key. This allows parallel flushes to different database shards, different tables, or even different databases.
+
+### Consistency Checker
+
+After a flush completes, the consistency checker verifies that the database write succeeded and the cache marks are correct. It runs periodically as well, scanning a sample of dirty entries and comparing their cache values to database values. Discrepancies trigger a re-flush.
+
+### Retry Queue
+
+When a flush fails (database timeout, connection error, deadlock), the failed entries go to the retry queue. The retry queue uses exponential backoff: first retry after 100ms, then 500ms, then 2s, then 10s, up to a maximum of 5 retries. After exhausting retries, entries are moved to a dead-letter queue for human investigation.
+
+### Circuit Breaker
+
+If the database is consistently unavailable (error rate exceeds 50% over a 10-second window), the circuit breaker trips. The cache stops attempting flushes and enters "write-only" mode: it accepts writes into the dirty buffer and WAL but does not attempt database writes. When the database recovers (a health check succeeds), the circuit breaker resets and flushing resumes.
+
+<AsciiDiagram
+  id="write-back/circuit-breaker"
+  alt="Circuit breaker state machine for write-back cache failure handling"
+  title="Circuit Breaker States"
+  caption="Circuit breaker prevents cascading failures when the database is unavailable"
+  content={`┌──────────────────────────────────────────────────────────────────┐
+│                    Circuit Breaker States                          │
+└──────────────────────────────────────────────────────────────────┘
+                                                                  
+                     ┌─────────────┐                               
+          ┌──────────►│  Closed     │◄────────────┐                
+          │          │  (normal)    │              │                
+          │          └──────┬──────┘              │                
+          │                 │                      │                
+          │         error > 50%                    │                
+          │                 │                      │                
+          │                 ▼                      │                
+          │          ┌─────────────┐   timeout     │                
+          │          │   Open      │───────────────┤                
+          │          │  (reject)   │               │                
+          │          └──────┬──────┘               │                
+          │                 │                      │                
+          │            health OK                   │                
+          │                 │                      │                
+          │                 ▼                      │                
+          │          ┌─────────────┐   single      │                
+          │          │  Half-Open  │─── probe ────►│                
+          │          │ (testing)   │               │                
+          │          └──────┬──────┘               │                
+          │                 │                      │                
+          │            probe fails                 │                
+          └─────────────────┘                      │                
+                                                   │                
+  When Open:                                        │                
+  - No flushes attempted                            │                
+  - Writes still accepted into buffer + WAL         │                
+  - Dirty buffer backpressure still active          │                
+  - Monitoring alert fires                         │                
+                                                   │                
+  When Half-Open:                                   │                
+  - One flush probe is sent                         │                
+  - If it succeeds → Close                          │                
+  - If it fails → Open (reset timer)               │                
+  └─────────────────────────────────────────────────┘`}
+/>
+
+## Data Structures in Detail
+
+### Dirty Flag Bitmap
+
+For memory efficiency, the dirty flag can be stored as a bitmap rather than a boolean per entry. The bitmap has one bit per cache slot. If the bit is 1, the entry is dirty. The bitmap enables fast bulk operations: resetting all dirty flags after a flush is a single `memset` of the bitmap, rather than iterating over the hash map.
+
+```
+Cache Slots: [0]   [1]   [2]   [3]   [4]   [5]   [6]   [7]
+Dirty Bits:   0     1     1     0     0     1     0     0
+              ↑     ↑     ↑           ↑
+             clean dirty dirty        dirty
+```
+
+The bitmap is stored as a `uint64_t` array. Checking dirty status is a bit test. Setting dirty is a bit set. Bulk clear is a loop over the array. For a cache with 1 million slots, the bitmap is only 125 KB (1M bits = 125K bytes).
+
+### Flush Queue (FIFO or Priority)
+
+The flush queue determines the order of flushes. Two common implementations:
+
+**FIFO Queue**: A simple ring buffer or linked list. Entries are flushed in the order they were dirtied. This guarantees that older writes reach the database before newer writes. Simple to implement and reason about. The downside is that a flood of low-priority writes can delay high-priority writes.
+
+**Priority Queue**: A heap where each entry has a priority level. The flusher always pops the highest-priority entry. Priorities can be static (configured per key prefix) or dynamic (escalate priority for entries that have been dirty too long). The downside is higher overhead per operation (O(log n) insert and pop vs O(1) for FIFO).
+
+### Batch Accumulator
+
+The batch accumulator collects entries from the flush queue and assembles them into database batches. It has two configuration parameters: maximum batch size (number of entries) and maximum batch age (time since the first entry was added). The flush is triggered when either limit is reached.
+
+Internal structure:
+```
+Batch Accumulator State:
+┌──────────────────────────────────────────────┐
+│ batch_size: 250 / 1000                        │
+│ batch_age:  45ms / 100ms                      │
+│ entries: [K1, K5, K9, K12, ...]             │
+│ size_in_bytes: 45KB                           │
+│ target_db_shard: shard-3                      │
+│ status: ACCUMULATING                          │
+└──────────────────────────────────────────────┘
+```
+
+### Conflict Tracker
+
+In a distributed write-back cache, two different cache nodes may have dirty entries for the same key. The conflict tracker detects this situation and applies a conflict resolution strategy. Common strategies include last-write-wins (LWW), merge (for counters and sets), or version vectors.
+
+## Write Lifecycle in Detail
+
+Let us trace every step of a write through a production write-back cache. This is the complete twelve-step lifecycle.
+
+### Step 1: Application Issues Write
+
+The application calls the cache API. This is typically a `Set(key, value, ttl)` method. The cache SDK serializes the request and sends it to the cache node responsible for that key (determined by consistent hashing).
+
+<AsciiDiagram
+  id="write-back/lifecycle-1"
+  alt="Step 1: Application issues write to cache via serialized request"
+  title="Lifecycle Step 1 — App Write"
+  content={`┌──────────────────────────────────────────────────────────────────┐
+│              Stage 1: App Issues Write                             │
+└──────────────────────────────────────────────────────────────────┘
+                                                                  
+  ┌──────────┐                                                      
+  │  App     │                                                      
+  │          │                                                      
+  │  cache   │                                                      
+  │  .set(   │                                                      
+  │   "user  │                                                      
+  │   :42:   │                                                      
+  │   score",│                                                      
+  │   100)   │                                                      
+  └────┬─────┘                                                      
+       │                                                             
+       │  Serialize: "SET user:42:score 100"                        
+       │  Route: hash("user:42:score") → node-3                     
+       │  Protocol: Redis RESP or Memcached binary                  
+       │                                                             
+       ▼                                                             
+  ┌─────────────────────────────────────────────┐                   
+  │         Network Transport (TCP/UDP)          │                   
+  └─────────────────────────────────────────────┘`}
+/>
+
+### Step 2: WAL Append
+
+The cache node receives the write. Before doing anything else, it appends the write to the Write-Ahead Log on disk. The WAL entry contains: sequence number, key, value, timestamp, and operation type (SET/DELETE). The WAL write may be synchronous (fsync before proceeding) or asynchronous (buffered, periodic fsync).
+
+### Step 3: Dirty Buffer Insert
+
+After the WAL entry is written (or queued for async writes), the cache inserts the entry into the dirty buffer. The insert is a map operation: `dirtyBuffer[key] = {value, dirty: true, timestamp: now}`. If the key already exists, the value is overwritten and the dirty flag is set.
+
+### Step 4: Flush Queue Enqueue
+
+The cache enqueues the key into the flush queue. If the key is already in the flush queue (from a previous write that has not been flushed yet), no new entry is added -- the existing entry's priority may be updated.
+
+### Step 5: Immediate Acknowledgment
+
+The cache sends the ACK back to the application. The total time for steps 1-5 is typically 0.5-5ms depending on whether the WAL is sync or async.
+
+<AsciiDiagram
+  id="write-back/lifecycle-2"
+  alt="Steps 2-5: WAL append, dirty buffer insert, flush queue enqueue, ACK to app"
+  title="Lifecycle Steps 2-5 — Receive and ACK"
+  caption="WAL write is the bottleneck here; async WAL keeps latency under 1ms"
+  content={`┌──────────────────────────────────────────────────────────────────┐
+│              Stages 2-5: Receive and Acknowledge                  │
+└──────────────────────────────────────────────────────────────────┘
+                                                                  
+                              ┌─────────────────┐                  
+                        2.    │   Write-Ahead    │                 
+                              │   Log (WAL)      │                 
+                              │   append(K,V)    │                 
+                              └────────┬────────┘                  
+                                       │                           
+                                       ▼                           
+  ┌──────────┐   set(K,V)  ┌──────────────────────────────┐       
+  │  App     │────────────►│  Cache Engine                 │       
+  │          │             │                              │       
+  │          │             │  3. dirtyBuffer[K] = {V, D}  │       
+  │          │             │  4. flushQueue.push(K)       │       
+  │          │             │                              │       
+  │          │◄────ACK────┤  5. Return success            │       
+  └──────────┘             └──────────────────────────────┘       
+                                                                  
+  Timing:                                                          
+  ┌──────────────┬──────────────┬───────────────────────────────┐
+  │ Sub-step     │ Latency      │ Notes                          │
+  ├──────────────┼──────────────┼───────────────────────────────┤
+  │ 1. Serialize │ 0.01-0.05ms  │ Protocol encoding              │
+  │ 2. WAL async │ 0.1-0.3ms    │ Buffered write, no fsync      │
+  │ 2. WAL sync  │ 1.0-5.0ms    │ Includes fsync to disk        │
+  │ 3. Map write │ 0.01-0.05ms  │ ConcurrentHashMap.Put         │
+  │ 4. Queue push│ 0.01-0.02ms  │ Queue.push (priority heap)    │
+  │ 5. Serialize │ 0.01-0.05ms  │ Response encoding              │
+  ├──────────────┼──────────────┼───────────────────────────────┤
+  │ Total (async)│ 0.14-0.47ms │ Under 500μs                    │
+  │ Total (sync) │ 1.04-5.17ms │ Under 6ms                      │
+  └──────────────┴──────────────┴───────────────────────────────┘`}
+/>
+
+### Step 6: Flush Scheduler Picks Entry
+
+A background flusher thread wakes up (either on a timer or because the flush queue is non-empty). It checks the flush queue and pops one or more entries. The number of entries depends on the batch size configuration.
+
+### Step 7: Batch Accumulator
+
+The flusher adds the popped entries to the batch accumulator. The accumulator waits until either the batch is full (1000 entries) or the batch age exceeds the maximum (100ms). When either condition is met, the batch is ready for flushing.
+
+### Step 8: Conflict Check
+
+Before writing, the flusher checks for conflicts. If the same key was updated by a different cache node, the conflict tracker detects it and resolves it using the configured strategy (LWW, merge, version vector).
+
+### Step 9: Database Write
+
+The flusher opens a database connection (or borrows one from a pool) and sends the batch. For SQL databases, this is a multi-row INSERT or UPDATE with a WHERE clause. For NoSQL databases, this is a batch put operation.
+
+<AsciiDiagram
+  id="write-back/lifecycle-3"
+  alt="Steps 6-9: Flusher picks entries, batch accumulator, conflict check, database write"
+  title="Lifecycle Steps 6-9 — Flush and Write"
+  caption="Batch accumulator merges entries before the database round-trip"
+  content={`┌──────────────────────────────────────────────────────────────────┐
+│              Stages 6-9: Flush and Write                          │
+└──────────────────────────────────────────────────────────────────┘
+                                                                  
+  {Dirty Buffer}         [Flusher Thread]    ||  ((Database))       
+    │                          │             ||     │              
+    │  6. Pop from flush queue │             ||     │              
+    │─────────────────────────►│             ||     │              
+    │                          │             ||     │              
+    │                          │ 7. Batch    ||     │              
+    │                          │ Accumulator: ||     │              
+    │                          │ ┌─────────┐ ||     │              
+    │                          │ │K1, K5,  │ ||     │              
+    │                          │ │K9, K12  │ ||     │              
+    │                          │ │size: 250│ ||     │              
+    │                          │ └────┬────┘ ||     │              
+    │                          │      │       ||     │              
+    │                          │ 8. Conflict  ||     │              
+    │                          │ Check: OK   ||     │              
+    │                          │      │       ||     │              
+    │                          │ 9. Batch    ||     │              
+    │                          │ Write ──────||────►│              
+    │                          │ 250 entries ||     │  BEGIN;      
+    │                          │             ||     │  UPDATE ...  
+    │                          │             ||     │  UPDATE ...  
+    │                          │             ||     │  ...         
+    │                          │             ||     │  COMMIT;     
+    │                          │             ||     │              
+    │                          │             ||     │◄──── OK ─────
+    │                          │             ||     │  45ms        
+    │                          │             ||     │              
+    │ 10. Mark clean           │             ||     │              
+    │◄─────────────────────────┤             ||     │              
+    │                          │             ||     │              
+    │  ┌────┬────────┬──────┐  │             ||     │              
+    │  │ K1 │ clean  │  OK  │  │             ||     │              
+    │  │ K5 │ clean  │  OK  │  │             ||     │              
+    │  │ K9 │ clean  │  OK  │  │             ||     │              
+    │  └────┴────────┴──────┘  │             ||     │              
+    └──────────────────────────┘             ||     └──────────────`}
+/>
+
+### Step 10: Mark as Clean
+
+The database confirms the batch write. The flusher iterates over the batch entries and marks each one as clean in the dirty buffer. The dirty flag bitmap is updated: the bits for the flushed entries are set to 0.
+
+### Step 11: Post-Flush Processing
+
+The flusher updates metrics. The dirty counter is decremented. The flusher checks if the retry queue has entries that need retrying. If the dirty buffer still has entries above the threshold, the flusher begins another cycle immediately.
+
+### Step 12: Eviction Eligibility
+
+Now that the entries are clean, they are eligible for eviction. The cache's eviction policy (LRU, LFU, or hybrid) can evict these entries when the cache reaches capacity. The next time the application reads these keys, it will fetch them from the database on a miss.
+
+<AsciiDiagram
+  id="write-back/lifecycle-4"
+  alt="Steps 10-12: Mark clean, post-flush processing, eviction eligibility"
+  title="Lifecycle Steps 10-12 — Cleanup and Eviction"
+  caption="Clean entries are eviction-eligible; next read will fetch from DB on miss"
+  content={`┌──────────────────────────────────────────────────────────────────┐
+│              Stages 10-12: Cleanup and Eviction                    │
+└──────────────────────────────────────────────────────────────────┘
+                                                                  
+  ┌──────────────────────────────────────────────────────────────┐
+  │  After Flush:                                                 │
+  │                                                               │
+  │      Dirty Buffer State:                                      │
+  │      ┌──────┬───────┬──────────┬─────────────┐               │
+  │      │ Key  │ Value │ Dirty    │ Evictable   │               │
+  │      ├──────┼───────┼──────────┼─────────────┤               │
+  │      │ K1   │ V1    │ false ◄──│ YES         │               │
+  │      │ K5   │ V5    │ false ◄──│ YES         │               │
+  │      │ K9   │ V9    │ false ◄──│ YES         │               │
+  │      │ K12  │ V12   │ true     │ NO (dirty)  │               │
+  │      │ K15  │ V15   │ true     │ NO (dirty)  │               │
+  │      └──────┴───────┴──────────┴─────────────┘               │
+  │                                                               │
+  │  11. Post-flush:                                              │
+  │      - Dirty count: 5 → 2                                     │
+  │      - Retry queue: 0 pending                                 │
+  │      - Metrics updated: flushed=250, duration=45ms            │
+  │      - Dirty ratio: 2/1000 = 0.2% (ok)                        │
+  │                                                               │
+  │  12. Eviction:                                                │
+  │      - LRU evicts K1 (clean, least recently used)             │
+  │      - K12 cannot be evicted (dirty)                          │
+  │      - K12 triggers priority flush if selected for eviction   │
+  └──────────────────────────────────────────────────────────────┘
+
+  Eviction Decision Tree:
+  ┌────────────┐
+  │ Evict?     │
+  └─────┬──────┘
+        │
+        ▼
+  ┌────────────┐   Yes   ┌────────────────┐
+  │ Is clean?  │────────►│ Evict normally  │
+  └─────┬──────┘         └────────────────┘
+        │ No
+        ▼
+  ┌────────────────┐
+  │ Option A:      │  Immediate flush, then evict
+  │ Option B:      │  Skip, evict next clean entry
+  │ Option C:      │  Block until flush completes
+  └────────────────┘`}
+/>
+
+## Consistency and State
+
+Write-back caching introduces several consistency challenges that you must understand to design a robust system.
+
+### Scenario 1: Cache Crash Before Flush
+
+The application writes data. The cache stores it in the dirty buffer. Before the flusher can write to the database, the cache server crashes. The dirty data is lost.
+
+**Without WAL**: The data is permanently lost. The application thinks the write succeeded, but the database never received it. This is why write-back caching is not suitable for financial transactions without additional safeguards.
+
+**With WAL**: On restart, the cache reads the WAL and reconstructs the dirty buffer. Flushing resumes from where it left off. No data is lost (assuming the WAL is on durable storage).
+
+### Scenario 2: Database Unavailable
+
+The flusher tries to write a batch, but the database is down. The entries go to the retry queue. The retry queue grows. If the database stays down, the retry queue fills up and the system must apply backpressure.
+
+**Detection**: Flush failures are detected by timeout or error response. The circuit breaker tracks the error rate.
+
+**Recovery**: When the database comes back, the retry queue is drained. Entries are re-flushed in order. The circuit breaker transitions from Open → Half-Open → Closed.
+
+### Scenario 3: Concurrent Writes to the Same Key
+
+Two application servers write to the same key simultaneously. Both writes hit the same cache node (consistent hashing ensures this). The dirty buffer is updated twice. Only the latest value matters for the database write (write coalescing).
+
+**Problem**: If the cache is distributed and two different cache nodes own the same key (due to rebalancing), both nodes may have dirty entries for the same key. The conflict tracker resolves this.
+
+### Scenario 4: Flush Order
+
+If the application writes K1 then K2, does the flusher write K1 before K2? With a FIFO queue, yes. With a priority queue, possibly not. If K2 has higher priority, it may flush before K1.
+
+**Problem**: If the database enforces foreign key constraints or causal dependencies (K2 references K1), flushing out of order causes constraint violations.
+
+**Solution**: Causal dependencies are tracked explicitly. If K2 depends on K1, both entries must be in the same batch, or K1 must flush before K2. The flush queue supports batch grouping for dependent entries.
+
+<AsciiDiagram
+  id="write-back/consistency-scenarios"
+  alt="Three consistency scenarios: cache crash, DB unavailable, concurrent writes"
+  title="Consistency Scenarios"
+  caption="Each scenario requires a specific recovery mechanism"
+  content={`┌─────────────────────────────────────────────────────────────────────┐
+│                 Consistency Scenarios                                │
+└─────────────────────────────────────────────────────────────────────┘
+                                                                      
+  Scenario 1: Cache Crash Before Flush                                
+  ┌──────┐  ACK!  {Cache} [CRASH]  ((DB))  → Data lost!              
+  │ App  │───────►│ Write OK  │  xxxx  │     → WAL replay recovers   
+  └──────┘        └──────────┘                → Without WAL: lost     
+                                                                      
+  Scenario 2: Database Unavailable                                    
+  ┌──────┐        {Cache}        ((DB))                               
+  │ App  │──write─►│ flush batch ───►│ DOWN                          
+  │      │        │ retry_queue ◄────┘                               
+  │      │        │   ┌─────────┐     │                              
+  │      │        │   │ K1, K2  │     │  5 retries → Dead Letter Queue
+  │      │        │   └─────────┘     │                              
+  └──────┘        └──────────────────┘                              
+                                                                      
+  Scenario 3: Same Key, Two Nodes                                     
+  [App A] ──write K1──► {Cache Node 1: dirty(K1)}                    
+  [App B] ──write K1──► {Cache Node 2: dirty(K1)}                    
+                          │                                           
+                     Conflict Resolution:                             
+                     ┌────────┬──────────┬──────────┐                
+                     │ LWW    │ Merge     │ Vector    │               
+                     │        │ (counters)│ Clocks    │               
+                     └────────┴──────────┴──────────┘                
+                                                                      
+  Scenario 4: Flush Order                                             
+  [App] writes K1, then K2  (K2 references K1)                       
+  Priority queue flushes K2 first → Constraint violation!             
+  Solution: Batch group {K1, K2} → flush together                     
+                                                                      
+  Crash Recovery: WAL Replay                                          
+  ┌────────────┐           ┌──────────────┐          ┌──────────────┐
+  │ Disk (WAL) │──replay──►│ Dirty Buffer │──flush──►│ Database     │
+  │ seq=1: K1  │           │ K1: V1 (D)   │          │              │
+  │ seq=2: K2  │           │ K2: V2 (D)   │          │              │
+  │ seq=3: K3  │           │ K3: V3 (D)   │          │              │
+  │ seq=4: K4  │           │ K4: V4 (D)   │          │              │
+  └────────────┘           └──────────────┘          └──────────────┘`}
+/>
+
+### Crash Recovery in Detail
+
+When a write-back cache restarts after a crash, it must recover dirty data from the WAL. The recovery process has four phases:
+
+1. **WAL Scan**: Read all WAL entries from disk. This is a sequential scan, which is fast on SSDs. For a WAL with 1 million entries (at 100 bytes each), this takes about 100ms to read, assuming 1 GB/s read speed.
+
+2. **Deduplication**: Multiple WAL entries may refer to the same key. Only the latest entry for each key matters. The recovery process builds a map, keeping only the latest value per key.
+
+3. **Dirty Buffer Reconstruction**: The deduplicated entries are inserted into the dirty buffer with dirty=true. The flush queue is populated.
+
+4. **Flush Resume**: The flusher threads resume normal operation, flushing the recovered dirty entries to the database.
+
+```
+Recovery Timeline:
+[0ms]    [10ms]   [50ms]   [100ms]  [120ms]  [200ms]
+  │        │        │         │        │        │
+  Crash    Restart  WAL       Dedup    Buffer   First flush
+  occurs   process  scan      1M→200K  ready    completes
+           starts   500MB     entries  flushing
+```
+
+## Performance Characteristics
+
+### Write Latency
+
+The application-perceived write latency is the time to step 5 (ACK). This is dominated by the WAL write.
+
+- **Async WAL (buffered)**: 0.1-1ms. The WAL entry is written to the OS page cache, not flushed to disk. Fast but risks losing the last few milliseconds of writes on crash.
+- **Sync WAL (fsync)**: 1-5ms. The WAL entry is flushed to disk before the ACK is sent. Slower but safe up to the last ACK.
+- **Group Commit WAL**: 0.5-2ms. Multiple WAL entries are batched into a single fsync. Good balance of safety and performance.
+
+### Database Flush Latency
+
+The flusher's database write latency depends on batch size and database type.
+
+- **Batch of 10**: 5-15ms. Small batches are fast but provide limited throughput improvement.
+- **Batch of 100**: 10-30ms. Good balance for most workloads.
+- **Batch of 1000**: 30-100ms. Maximum throughput but adds latency to individual entries.
+
+### Throughput
+
+Write-back cache throughput is 10x to 100x higher than write-through for write-heavy workloads.
+
+| Metric | Write-Through | Write-Back | Improvement |
+|--------|---------------|------------|-------------|
+| Max writes/sec (single node) | 1,000 | 50,000 | 50x |
+| P99 write latency | 22ms | 1ms | 22x |
+| DB writes/sec | 50,000 | 500 (coalesced) | 100x reduction |
+| Network round-trips per write | 4 | 0.02 (amortized) | 200x |
+
+## Configuration Parameters
+
+A production write-back cache has many knobs. Getting them wrong causes either data loss or poor performance.
+
+### Flush Interval (100ms - 10s)
+
+How often the flusher checks for dirty entries. Lower values reduce the durability window but increase database load. Higher values improve batching efficiency but extend the durability window.
+
+**Setting**: Start at 500ms. Decrease if data loss risk is unacceptable. Increase if database write capacity is the bottleneck.
+
+### Batch Size (10 - 10,000)
+
+How many dirty entries are flushed in a single database operation. Larger batches are more efficient but introduce more latency for the oldest entry in the batch.
+
+**Setting**: Start at 500. Tune based on database batch capabilities. PostgreSQL handles batches of 1000 well. Some NoSQL databases prefer 100.
+
+### Dirty Ratio Threshold (10% - 50%)
+
+The ratio of dirty entries to total cache capacity. When this threshold is exceeded, the flusher runs urgently to prevent the dirty buffer from consuming too much cache memory.
+
+**Setting**: Start at 25%. Lower if your workload has large values (less room for dirty buffer). Higher if writes are infrequent.
+
+### WAL Mode (async, sync, group-commit)
+
+Controls the durability of the WAL. Async is fast but risks data loss. Sync is safe but adds latency. Group commit is the best of both worlds for high-throughput systems.
+
+**Setting**: Use group commit for most systems. Use async when throughput is more important than durability (analytics, counters). Use sync when data loss is unacceptable.
+
+### Retry Policy (count, backoff, max)
+
+How the system handles failed flushes. Count is the number of retries. Backoff is the delay multiplier. Max is the maximum delay between retries.
+
+**Setting**: 5 retries, exponential backoff (base 100ms), max delay 30s. After exhausting retries, move to dead-letter queue.
+
+### Thread Pool Size (1 - 32)
+
+How many flusher threads run concurrently. More threads can flush to more database shards in parallel but increase database connection load.
+
+**Setting**: Start at 4. Increase until the database becomes the bottleneck. For multi-shard databases, one thread per shard is reasonable.

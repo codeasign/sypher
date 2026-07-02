@@ -1,0 +1,496 @@
+---
+id: optimistic-vs-pessimistic-locking-real-world
+title: Locking in Production
+sidebar_label: Real World
+sidebar_position: 5
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Company Case Studies
+
+### Stripe: Optimistic Locking for Payment Intents
+
+Stripe's payment processing handles millions of concurrent payment intent updates. Each payment intent (a record representing a customer's intent to pay) transitions through states: `requires_payment_method` → `processing` → `succeeded` or `failed`. Multiple services can attempt to update the same payment intent simultaneously — the fraud service upgrades risk assessment, the payment method service attaches a new card, the webhook handler reports a status change.
+
+Stripe uses **optimistic locking with a version field** on the payment intent record. The version is a monotonically increasing integer that is incremented on every successful write.
+
+```sql
+-- Stripe's pattern (simplified)
+UPDATE payment_intents
+SET status = 'succeeded',
+    version = version + 1
+WHERE id = 'pi_abc123'
+  AND version = 5;
+-- If 0 rows affected: version conflict, retry needed
+```
+
+When a version conflict occurs, the service that "loses" the race automatically retries the operation. The retry involves:
+
+1. Re-reading the latest payment intent state (including the new version number).
+2. Re-computing any derived fields.
+3. Re-applying the update with the new version number.
+
+The retry logic uses exponential backoff with jitter, capped at 5 attempts. After 5 retries, the operation fails with an error that propagates to the caller (typically an HTTP 409 Conflict).
+
+**Why optimistic instead of pessimistic?** Payment intents are high-throughput resources. A pessimistic lock would require acquiring and releasing a lock on every update, adding milliseconds of latency to every operation. With optimistic locking, zero-latency reads are the norm, and retries (which add latency) happen only when conflicts actually occur — roughly 0.1% of the time under normal load.
+
+During flash sales or high-traffic events, collision rates on specific payment intents can spike to 5-10%. Stripe's architecture detects this and dynamically throttles retry rates, falling back to a queue-based approach for the hottest intents.
+
+<AsciiDiagram
+  id="optimistic-vs-pessimistic-locking/stripe-payment-flow"
+  title="Stripe Payment Intent Optimistic Locking"
+  alt="Flow diagram showing two concurrent payment intent updates both reading version 5, one succeeding with version 6 and the other detecting version conflict and retrying"
+  caption="Stripe uses optimistic locking on payment intents; conflicts trigger automatic retry"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│         Stripe Payment Intent: Optimistic Locking                 │
+│                                                                   │
+│    Fraud Service          Payment Intent        Webhook Handler  │
+│    ┌──────────┐          ┌─────────────┐        ┌──────────┐    │
+│    │          │          │  v=5        │        │          │    │
+│    │ READ     │─────────>│  status:    │<───────│ READ     │    │
+│    │ v=5      │          │  processing │        │ v=5      │    │
+│    └────┬─────┘          └─────────────┘        └────┬─────┘    │
+│         │                                            │          │
+│         │ UPDATE status='fraud_review', v=6          │          │
+│         │ WHERE id=X AND v=5 ──> 1 row affected      │          │
+│         │                                            │          │
+│         │ SUCCESS                                    │ UPDATE   │
+│         │                                            │ status=  │
+│         │                                            │ succeeded│
+│         │                                            │ WHERE    │
+│         │                                            │ v=5      │
+│         │                                            │ ──> 0    │
+│         │                                            │ rows     │
+│         │                                            │          │
+│         │                                            │ CONFLICT │
+│         │                                            │ RETRY    │
+│         │                                            └────┬─────┘
+│         │                                                 │
+│         │                                   READ v=6      │
+│         │                                   status=       │
+│         │                                   fraud_review  │
+│         │                                   ──>           │
+│         │                                   UPDATE        │
+│         │                                   status=       │
+│         │                                   succeeded     │
+│         │                                   WHERE v=6     │
+│         │                                   ──> 1 row     │
+│         │                                   affected      │
+│         │                                                 │
+│         │                                   SUCCESS       │
+└───────────────────────────────────────────────────────────────┘
+`}
+/>
+
+---
+
+### Uber: Pessimistic Locking for Driver Status Transitions
+
+Uber's dispatching system must guarantee that a single driver is never assigned to two overlapping trips. When a ride request arrives, the system locks the driver's status record before confirming the assignment.
+
+Uber uses `SELECT FOR UPDATE` (pessimistic row locking) on the driver's status transition:
+
+```sql
+BEGIN;
+-- Acquire exclusive lock on driver's current status
+SELECT status, version
+FROM driver_status
+WHERE driver_id = 4781
+  AND status = 'available'
+FOR UPDATE;
+
+-- If lock acquired and status is still 'available':
+-- Transition status to 'en_route_to_pickup'
+UPDATE driver_status
+SET status = 'en_route_to_pickup',
+    last_transition_at = NOW()
+WHERE driver_id = 4781
+  AND status = 'available';
+
+COMMIT;
+-- Lock released. Other dispatchers now see 'en_route_to_pickup'.
+```
+
+If two dispatchers attempt to assign the same driver simultaneously, the second `SELECT FOR UPDATE` blocks until the first transaction commits. The second dispatcher then reads the updated status (`en_route_to_pickup`) and knows not to assign this driver.
+
+**Why pessimistic instead of optimistic?** The cost of a conflict is extreme: a driver assigned to two riders simultaneously means at least one rider is stranded. Two drivers in a crash scenario (both told to go to the same pickup) damages trust in the platform. The conflict rate on popular drivers during surge hours is high — multiple dispatchers may race for the same driver within milliseconds.
+
+Uber also uses a **distributed lock** (based on Redis) for inter-region coordination. When a driver crosses a geographic region boundary, both regions' dispatch systems must coordinate on the driver's availability state. The distributed lock ensures only one region processes the driver at a time.
+
+<AsciiDiagram
+  id="optimistic-vs-pessimistic-locking/uber-dispatch-lock"
+  title="Uber Driver Dispatch Pessimistic Locking"
+  alt="Sequence diagram showing two dispatchers both attempting to lock the same driver record; first dispatcher acquires lock and assigns trip, second dispatcher waits and then sees driver is no longer available"
+  caption="Uber uses pessimistic locking to prevent double-booking drivers"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│            Uber Dispatch: Pessimistic Locking                     │
+│                                                                   │
+│  Dispatcher A              DB Locks              Dispatcher B    │
+│  ┌──────────┐          ┌──────────────┐         ┌──────────┐    │
+│  │          │          │              │         │          │    │
+│  │SELECT FOR│          │ driver 4781  │         │SELECT FOR│    │
+│  │UPDATE    │─────────>│ status=avail │<────────│UPDATE    │    │
+│  │driver 4781          │ LOCKED by A  │         │driver 4781    │
+│  │          │          │              │         │          │    │
+│  │LOCK      │          │ BLOCK        │         │ WAITING  │    │
+│  │GRANTED   │<─────────│              │         │          │    │
+│  │          │          │              │         │          │    │
+│  │UPDATE    │          │              │         │          │    │
+│  │status =  │─────────>│ status=      │         │          │    │
+│  │en_route  │          │ en_route     │         │          │    │
+│  │          │          │              │         │          │    │
+│  │COMMIT    │─────────>│ UNLOCKED     │         │          │    │
+│  │          │          │              │         │          │    │
+│  │ ASSIGNED │          │              │         │LOCK      │    │
+│  │          │          │              │<────────│GRANTED   │    │
+│  │          │          │              │         │          │    │
+│  │          │          │              │         │READS     │    │
+│  │          │          │              │         │status=   │    │
+│  │          │          │              │         │en_route  │    │
+│  │          │          │              │         │          │    │
+│  │          │          │              │         │ REJECTS  │    │
+│  │          │          │              │         │ assignment│    │
+│  └──────────┘          └──────────────┘         └──────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+---
+
+### Airbnb: Optimistic Locking for Booking Calendar
+
+Airbnb's booking system prevents double-booking of properties by checking calendar availability atomically. The core data structure is a set of individual date slots, each stored as a row with a version column.
+
+When a guest books a three-night stay, the system:
+
+1. Reads the current iteration number (version) of each date in the range.
+2. Attempts to mark all dates as booked with an atomic conditional update.
+3. If any date's version has changed (another booking grabbed it), the entire transaction retries.
+
+```sql
+-- Schema: each date is a row
+CREATE TABLE calendar_entries (
+    listing_id INTEGER NOT NULL,
+    date DATE NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'available',
+    iteration INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (listing_id, date)
+);
+
+-- Booking attempt: mark 3 nights
+BEGIN;
+-- First, read current state
+SELECT date, iteration
+FROM calendar_entries
+WHERE listing_id = 12345
+  AND date BETWEEN '2025-07-15' AND '2025-07-17'
+  AND status = 'available'
+FOR UPDATE;  -- Pessimistic lock on the date range
+
+-- If all 3 dates are available:
+UPDATE calendar_entries
+SET status = 'booked', iteration = iteration + 1
+WHERE listing_id = 12345
+  AND date BETWEEN '2025-07-15' AND '2025-07-17'
+  AND status = 'available';
+
+-- Check that exactly 3 rows were updated
+COMMIT;
+```
+
+Airbnb actually uses a hybrid: the read uses `SELECT FOR UPDATE` to pessimistically lock the date range for the duration of the booking transaction. This is necessary because the consequence of a double-booking (guest arrives to find the property occupied) is catastrophic for customer trust.
+
+However, for lower-contention operations like updating property descriptions or photos, Airbnb uses optimistic locking with version columns.
+
+**Key insight:** Airbnb maps operations to locking strategies based on the cost of conflict, not just the frequency. Calendar booking > high cost of conflict > pessimistic. Description update > low cost of conflict > optimistic.
+
+---
+
+### GitHub: Advisory Locks for Merge Queue
+
+GitHub's merge queue coordinates pull request merges across a repository. Multiple CI pipelines may complete simultaneously, each ready to merge their branch into main. Without coordination, two CI jobs could merge conflicting changes independently.
+
+GitHub uses PostgreSQL advisory locks (`pg_advisory_lock`) to serialize merge operations:
+
+```sql
+-- Each repository has a unique advisory lock key
+-- key = hash("merge-queue:" + repository_id)
+
+SELECT pg_advisory_lock(hash('merge-queue:repo_12345'));
+
+-- Perform the merge:
+-- 1. Check if the branch still passes CI
+-- 2. Fast-forward merge
+-- 3. Update branch protection rules
+
+SELECT pg_advisory_unlock(hash('merge-queue:repo_12345'));
+```
+
+Advisory locks are lighter than row locks because they do not involve MVCC overhead. They live entirely in the lock manager's hash table and have no row versioning cost. GitHub chose advisory locks over application-level distributed locks (Redis/ZooKeeper) because the merge queue runs in a single PostgreSQL instance and advisory locks are exactly the right abstraction — a named, application-defined lock that serializes access.
+
+For CI/CD pipeline state transitions (e.g., marking a check as passed or failed), GitHub uses optimistic locking with a version column. Multiple CI runners may report status for the same commit within milliseconds. Optimistic locking handles this gracefully without the overhead of per-status-row pessimistic locks.
+
+<AsciiDiagram
+  id="optimistic-vs-pessimistic-locking/github-merge-queue"
+  title="GitHub Merge Queue Advisory Locking"
+  alt="Timeline showing two CI jobs completing simultaneously; job A acquires the advisory lock first and merges, job B waits for the lock and then merges after"
+  caption="GitHub serializes merges using PostgreSQL advisory locks"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│           GitHub Merge Queue: Advisory Lock                       │
+│                                                                   │
+│  CI Job A (PR #42)        Advisory Lock          CI Job B (PR #43│
+│  ┌──────────────┐        ┌────────────┐         ┌──────────────┐│
+│  │              │        │            │         │              ││
+│  │ CI passes    │        │ key: merge │         │ CI passes    ││
+│  │              │        │ queue:     │         │              ││
+│  │ pg_try_      │        │ repo_12345 │         │ pg_try_      ││
+│  │ advisory_lock├───────>│            │<────────│ advisory_lock││
+│  │              │        │            │         │              ││
+│  │ true         │        │ LOCKED     │         │ false        ││
+│  │              │        │ by A       │         │ (already     ││
+│  │ MERGE        │        │            │         │  held)       ││
+│  │ PR #42       │        │            │         │              ││
+│  │ into main    │        │            │         │ WAIT         ││
+│  │              │        │            │         │ 100ms        ││
+│  │ pg_          │        │            │         │              ││
+│  │ advisory_    │        │            │         │ pg_try_again ││
+│  │ unlock       ├───────>│ UNLOCKED   │<────────│────> true    ││
+│  │              │        │            │         │              ││
+│  │ DONE         │        │            │         │ MERGE        ││
+│  │              │        │            │         │ PR #43       ││
+│  └──────────────┘        └────────────┘         └──────────────┘│
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+---
+
+## Open Source Implementations
+
+### PostgreSQL MVCC
+
+PostgreSQL's MVCC implementation is the gold standard for understanding multi-version concurrency. Key architectural decisions:
+
+- **No data overwrites:** UPDATE creates a new row version; the old version remains until VACUUM removes it.
+- **Visibility via xmin/xmax:** Each tuple stores the transaction ID that created it (`xmin`) and the transaction ID that invalidated it (`xmax`). A tuple is visible to a snapshot if `xmin` is committed and `xmax` is null or not yet committed.
+- **No read locks:** Readers never block writers; writers never block readers. This is the fundamental property of MVCC.
+- **Serializable Snapshot Isolation (SSI):** PostgreSQL's Serializable level goes beyond standard snapshot isolation by detecting serialization anomalies (write skew, read-write conflicts) using predicate locks.
+
+### Redis Redlock
+
+The Redlock algorithm (proposed by Redis creator Salvatore Sanfilippo in 2015) acquires locks from N independent Redis nodes (typically N=5). A lock is considered acquired if the client can write to a majority (N/2 + 1) of nodes within the lock's validity time.
+
+Strengths: Simple API, low latency (~1-5ms per node), good for cache-level locking.
+
+Weaknesses: Relies on bounded clock drift and no long GC pauses. In the presence of stop-the-world GC (Java/.NET), a process can hold a lock for longer than the TTL, and another process acquires the same lock concurrently. Fencing tokens mitigate this but require the protected resource to enforce them.
+
+### Apache ZooKeeper Locks
+
+ZooKeeper provides a robust locking primitive based on ephemeral sequential znodes. The lock recipe:
+
+1. Create an ephemeral sequential znode under a lock path (e.g., `/locks/resource/`).
+2. List all children of the lock path.
+3. If the created znode is the lowest sequence number, the lock is acquired.
+4. Otherwise, watch the next-lower znode for deletion.
+5. When that znode disappears (connection loss or explicit delete), re-check.
+
+ZooKeeper locks are linearizable (strong consistency via Zab protocol). The trade-off is higher latency (5-20ms) and the operational complexity of running a ZooKeeper ensemble.
+
+### etcd Concurrency Package
+
+etcd provides the `concurrency` package with a Mutex implementation similar to ZooKeeper's recipe but built on etcd's Raft-based linearizable key-value store. The mutex uses leases (similar to ZooKeeper sessions) to automatically release locks on client failure.
+
+```go
+// etcd concurrency package (simplified)
+cli, _ := clientv3.NewFromURL("http://localhost:2379")
+session, _ := concurrency.NewSession(cli)
+mux := concurrency.NewMutex(session, "/my-lock")
+mux.Lock(context.TODO())
+// critical section
+mux.Unlock(context.TODO())
+```
+
+### Hibernate / Rails Optimistic Locking
+
+Both major ORMs provide built-in optimistic locking with minimal configuration.
+
+**Hibernate:** Add `@Version` annotation on an integer or timestamp field. Hibernate includes the version in the UPDATE WHERE clause and throws `OptimisticLockException` on conflict.
+
+**Rails Active Record:** Add `lock_version` column (integer, default 0). Rails automatically increments and checks it on every update. Raises `ActiveRecord::StaleObjectError` on version mismatch. The column name is configurable via `locking_column`.
+
+---
+
+## Cloud Provider Implementations
+
+### AWS DynamoDB Optimistic Locking
+
+DynamoDB provides conditional updates that serve as optimistic locking:
+
+```python
+import boto3
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('Inventory')
+
+# Read item
+response = table.get_item(Key={'id': 42})
+item = response['Item']
+# item = {'id': 42, 'stock': 10, 'version': 3}
+
+# Try to update with optimistic locking
+try:
+    table.update_item(
+        Key={'id': 42},
+        UpdateExpression='SET stock = :new_stock, #v = #v + :inc',
+        ConditionExpression='#v = :current_version',
+        ExpressionAttributeNames={'#v': 'version'},
+        ExpressionAttributeValues={
+            ':new_stock': 9,
+            ':current_version': 3,
+            ':inc': 1
+        }
+    )
+except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+    # Version mismatch — retry
+    pass
+```
+
+DynamoDB also supports **transactions** (DynamoDB Transactions, introduced in 2018) which provide serializable isolation across up to 25 items. These use pessimistic locking under the hood — the transaction acquires locks on all items before committing.
+
+### Google Cloud Spanner
+
+Spanner provides **true serializable isolation** using a combination of pessimistic locking and TrueTime timestamps. It acquires read-write locks on rows during transactions (scope: partition). Lock conflicts cause the transaction to abort with error code `ABORTED`, which the client must retry.
+
+Spanner's key innovation: by using TrueTime (GPS + atomic clocks) to assign globally-ordered timestamps, Spanner avoids the need for distributed locking across partitions. Within a partition, standard two-phase locking applies.
+
+```python
+from google.cloud import spanner
+
+client = spanner.Client()
+instance = client.instance('my-instance')
+database = instance.database('my-db')
+
+def transfer(sender, recipient, amount):
+    with database.transaction() as transaction:
+        # Spanner acquires locks on these rows
+        sender_row = transaction.read_row('accounts', sender,
+                                          columns=['balance'])
+        recipient_row = transaction.read_row('accounts', recipient,
+                                              columns=['balance'])
+
+        new_sender_balance = sender_row.balance - amount
+        new_recipient_balance = recipient_row.balance + amount
+
+        transaction.update('accounts', {
+            'id': sender,
+            'balance': new_sender_balance
+        })
+        transaction.update('accounts', {
+            'id': recipient,
+            'balance': new_recipient_balance
+        })
+    # On commit, Spanner detects conflicts via timestamp ordering
+    # If another transaction modified same rows → ABORTED → retry
+```
+
+---
+
+## Lessons Learned
+
+### Start Optimistic, Add Pessimistic Surgically
+
+The default should be optimistic locking. It scales better under normal conditions and requires no infrastructure beyond a version column. Add pessimistic locking only when:
+
+- You have measured a collision rate above 5% and retry overhead is unacceptable.
+- The cost of a conflict is high enough to justify the throughput penalty (financial transactions, critical inventory).
+- Regulatory or audit requirements mandate strict serialization.
+
+### Measure Collision Rate Before Choosing
+
+Do not guess the collision rate. Instrument your application to track:
+
+```
+retry_count / total_write_attempts
+```
+
+If this ratio is below 1%, optimistic locking is working efficiently. If it exceeds 5%, consider switching the affected operation to pessimistic locking.
+
+### Start Optimistic, Add Pessimistic Surgically
+
+Already covered above — it bears repeating as a golden rule.
+
+### Timeouts Are Your Friend
+
+Every lock should have a timeout. Every transaction should have a timeout. Every connection should have a timeout. The absence of timeouts is the most common root cause of production locking incidents.
+
+```sql
+-- PostgreSQL settings for production
+SET lock_timeout = '5s';
+SET statement_timeout = '30s';
+SET idle_in_transaction_session_timeout = '60s';
+```
+
+### Always Have a Retry Strategy
+
+Optimistic locking without retry is a silent data loss bug. Pessimistic locking without retry on deadlock is a crash. Every locking strategy must specify:
+
+1. Maximum retries (3-5 is standard).
+2. Backoff (exponential with jitter, base 50-100ms).
+3. Fallback behavior after max retries (fail open, queue for async processing, return error to user).
+4. Circuit breaker to prevent retry storms.
+
+<AsciiDiagram
+  id="optimistic-vs-pessimistic-locking/lessons-learned"
+  title="Five Lessons from Production Locking Incidents"
+  alt="Five key lessons: start optimistic, measure collision rate, use timeouts, have retry strategy, and add pessimistic locking surgically"
+  caption="The five most important lessons from decades of production locking experience"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│              Five Lessons from Production Locking                 │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ 1. START OPTIMISTIC, ADD PESSIMISTIC SURGICALLY              │ │
+│  │    Default to version columns. Only use SELECT FOR UPDATE   │ │
+│  │    when collision rate > 5% or conflict cost is extreme.     │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ 2. MEASURE COLLISION RATE BEFORE CHOOSING                    │ │
+│  │    Deploy metrics: retry_count / total_writes.               │ │
+│  │    Below 1% = optimistic works. Above 5% = switch.           │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ 3. TIMEOUTS ARE YOUR FRIEND                                  │ │
+│  │    lock_timeout = 5s, statement_timeout = 30s,               │ │
+│  │    idle_in_transaction_session_timeout = 60s.                │ │
+│  │    No timeout = infinite wait = pool starvation.             │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ 4. ALWAYS HAVE A RETRY STRATEGY                              │ │
+│  │    Exponential backoff + jitter. Max 5 retries.              │ │
+│  │    Circuit breaker to prevent retry storms.                  │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ 5. MONITOR LOCK METRICS IN PRODUCTION                        │ │
+│  │    Track: deadlocks/s, lock wait time, retry rate,           │ │
+│  │    pool utilization, connection wait queue depth.            │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+---
+
+## Summary
+
+- Stripe uses optimistic locking for payment intents with automatic retry — high throughput, rare conflicts.
+- Uber uses pessimistic locking (SELECT FOR UPDATE) for driver dispatch — high conflict cost outweighs throughput.
+- Airbnb uses pessimistic locking for booking calendar dates — double-booking would destroy customer trust.
+- GitHub uses advisory locks for merge queue serialization and optimistic version checks for CI status updates — choosing the right tool per operation.
+- PostgreSQL MVCC, Redis Redlock, ZooKeeper locks, and etcd concurrency package are the major open source implementations.
+- AWS DynamoDB and Google Cloud Spanner provide managed locking abstractions with different trade-offs (conditional updates vs true serializable).
+- Five lessons hold across all systems: start optimistic, measure before choosing, use timeouts, always retry, and monitor lock metrics.
+
+The interview page transforms this knowledge into a structured interview prep guide — how FAANG interviewers evaluate locking knowledge from L3 to L7.

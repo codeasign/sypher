@@ -1,0 +1,949 @@
+---
+id: relational-databases-architecture
+title: Relational Databases at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Relational Databases at Scale
+
+A relational database that hums along for 100 users can collapse in seconds
+when traffic hits 100,000 users. You have seen the pattern: queries slow to a
+crawl, connection timeouts spike, and the pager goes off at 3 AM. This lesson
+walks you through the architectural shifts needed at each scale tier, from a
+single Postgres instance on a laptop to a multi-region global deployment.
+
+---
+
+## 1. Naive Implementation — The Single-Node Trap
+
+The simplest deployment is one database server running on a VM or bare-metal
+machine. All reads and writes hit the same process. This works fine for a
+prototype or an internal tool with fewer than a thousand users, but the cracks
+appear fast.
+
+<AsciiDiagram
+  id="relational-databases/naive-single-node"
+  title="Single-node database architecture"
+  alt="A single database server handling all application requests directly, with no replication or pooling."
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│                    Application Servers                       │
+│   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐        │
+│   │ App │   │ App │   │ App │   │ App │   │ App │   ...   │
+│   └──┬──┘   └──┬──┘   └──┬──┘   └──┬──┘   └──┬──┘        │
+│      │         │         │         │         │            │
+└──────┼─────────┼─────────┼─────────┼─────────┼────────────┘
+       │         │         │         │         │
+       │         │         │         │         │
+       ▼         ▼         ▼         ▼         ▼
+┌──────────────────────────────────────────────────────────────┐
+│                 Single Database Server                       │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │                  PostgreSQL / MySQL                   │   │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐    │   │
+│  │  │  CPU 100%  │  │  Memory    │  │   Disk     │    │   │
+│  │  │  (queries) │  │  90% used  │  │  I/O queue │    │   │
+│  │  └────────────┘  └────────────┘  └────────────┘    │   │
+│  └──────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### At 1,000 Users — Resource Contention
+
+At this scale the database handles the load without visible latency if you
+have decent indexing. However, a few problems begin to surface:
+
+- **Connection buildup.** Each app server opens its own TCP connection. With
+  10 app servers each holding 25 pooled connections, you consume 250 of the
+  default 100--300 connection slots. A single slow query blocks others behind
+  it.
+- **No isolation between workloads.** A heavy analytics query that scans a
+  million rows competes for CPU and I/O with the user-facing queries that
+  need sub-50 ms response times.
+- **Single point of failure.** If the machine crashes, the application is
+  completely offline until you restore from backup. Recovery time objective
+  (RTO) is measured in hours, not minutes.
+
+### At 100,000 Users — The Breaking Point
+
+This is where the single-node architecture fails decisively:
+
+- **Connection pool exhaustion.** Each application instance (now 50 or more
+  behind a load balancer) opens connections. Even with conservative pooling,
+  you easily exceed the default `max_connections` of 100--500. New requests
+  fail with `too many connections`.
+- **CPU saturation.** The single server processes every read, write, index
+  maintenance, and analytics query. CPU sits at 95 percent. Query planning
+  time alone doubles under contention.
+- **Memory pressure.** The database's buffer pool (cached data pages) is a
+  fixed size, say 4 GB. The working set of your active data now exceeds that
+  by a factor of ten. Every read misses the cache and hits disk, turning
+  sub-millisecond lookups into 5--20 ms disk seeks.
+- **Write contention.** Concurrent writes contend on the same WAL (write-ahead
+  log) and on shared B-tree pages. Lock waits become visible to users as
+  stalled transactions.
+
+### At 10,000,000 Users — Catastrophic Failure
+
+With 10 million users hitting the same single node, you face systemic failure:
+
+- **The thundering herd.** After any restart, every application server
+  reconnects simultaneously. The database cannot accept all connections, so
+  half fail, trigger retries, and compound the problem.
+- **Unrecoverable backup windows.** Creating a full backup of a multi-terabyte
+  database on a single node locks resources and may take hours. During that
+  window, write throughput drops by 50 percent or more.
+- **No horizontal scaling path.** A single node can only scale up (bigger CPU,
+  more RAM, faster SSD). You are stuck at the ceiling of the largest machine
+  your cloud provider offers. Costs grow super-linearly at that tier.
+
+**The lesson is clear:** single-node architecture has a hard ceiling.
+To go further, you need a production-grade distributed architecture.
+
+---
+
+## 2. Production-Grade Architecture
+
+A production relational database separates concerns across multiple nodes.
+The diagram below shows the canonical architecture used by companies serving
+millions of users.
+
+<AsciiDiagram
+  id="relational-databases/production-grade-arch"
+  title="Production-grade relational database architecture"
+  alt="A layered architecture showing DNS routing through a proxy to connection poolers, then to a primary with multiple read replicas, all monitored."
+  content={`
+                         ┌──────────────────┐
+                         │     DNS / CDN     │
+                         │  (Geo-routing)    │
+                         └────────┬─────────┘
+                                  │
+                         ┌────────▼─────────┐
+                         │   Load Balancer  │
+                         │  (HAProxy / NLB) │
+                         └────────┬─────────┘
+                                  │
+                         ┌────────▼─────────┐
+                         │ Connection Pooler│
+                         │  (PgBouncer /    │
+                         │    ProxySQL)     │
+                         └──┬──────────┬────┘
+                            │          │
+              ┌─────────────┤          ├──────────────┐
+              │             │          │              │
+       ┌──────▼──────┐ ┌───▼───┐ ┌───▼───┐ ┌──────▼──────┐
+       │   Primary   │ │ Read  │ │ Read  │ │   Read      │
+       │  (Leader)   │ │Replica│ │Replica│ │  Replica    │
+       │  RW + WAL   │ │  RO   │ │  RO   │ │    RO       │
+       └──────┬──────┘ └───┬───┘ └───┬───┘ └──────┬──────┘
+              │             │         │             │
+              ▼             ▼         ▼             ▼
+       ┌────────────────────────────────────────────────┐
+       │         Monitoring & Observability Stack       │
+       │  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ │
+       │  │Prometheus││Grafana ││PagerDuty││  Loki   │ │
+       │  └────────┘ └────────┘ └────────┘ └────────┘ │
+       └────────────────────────────────────────────────┘
+  `}
+/>
+
+### 2.1 Connection Pooler
+
+Before any query reaches the database, it passes through a connection pooler
+such as **PgBouncer** (PostgreSQL) or **ProxySQL** (MySQL). The pooler:
+
+- Maintains a small, fixed number of persistent connections to the database
+  (for example, 50 connections instead of 1000).
+- Forwards client queries over these pre-established connections.
+- Queues excess requests rather than opening new connections.
+- Detects and drains dead connections, preventing connection leaks.
+
+The pooler transforms the connection model from N clients to M connections,
+where M is configurable and typically 2--5 times your CPU core count.
+
+### 2.2 Leader (Primary)
+
+The leader, also called the primary or master node, is the only node that
+accepts write queries. It also writes every transaction to the **write-ahead
+log (WAL)** before applying it to the data files. The WAL serves two critical
+roles:
+
+1. **Crash recovery.** After a power failure, the database replays the WAL
+   to restore the last consistent state.
+2. **Replication.** Replicas stream the WAL continuously, keeping themselves
+   up to date with the leader.
+
+### 2.3 Read Replicas
+
+Read replicas are full copies of the database that accept only SELECT
+queries. They connect to the leader and stream WAL changes, typically with
+sub-second lag.
+
+Key characteristics:
+
+- **Scaling reads horizontally.** You add replicas to increase read capacity.
+  If your read-to-write ratio is 10:1 (common for most web apps), replicas
+  absorb 90 percent of the query load.
+- **Failover target.** If the leader fails, a replica is promoted to the new
+  leader. This process can be manual or automated via a failover agent like
+  Patroni or Orchestrator.
+- **Stale reads.** Replicas may lag behind the leader by a few milliseconds
+  or seconds. Applications that require strong consistency must read from
+  the leader.
+
+### 2.4 Leader Election and Automatic Failover
+
+When using managed services (RDS, Cloud SQL, Aurora), the cloud provider
+handles failover automatically. When you run your own cluster, you use a
+leader-election system.
+
+**Patroni** is the most common solution for PostgreSQL. It uses a distributed
+consensus store (etcd or Consul) to:
+
+- Elect a leader among replicas.
+- Detect leader failure via health-check timeouts.
+- Promote the most up-to-date replica automatically.
+- Reconfigure the pooler or proxy to point to the new leader.
+
+The timeline of a failover:
+
+1. Leader crashes (network partition, OOM, hardware failure).
+2. Patroni detects missing heartbeat after `ttl` seconds (typically 30).
+3. Patroni calls `pg_rewind` on the failed leader, promotes the replica.
+4. Connection pooler detects the old leader is unreachable and reroutes writes
+   to the new leader.
+5. The old leader, when it comes back up, becomes a replica of the new leader.
+
+Total downtime: 30--60 seconds with proper automation.
+
+### 2.5 Load Balancers
+
+The load balancer sits between applications and the pooler (or directly
+before replicas). It provides:
+
+- **Health checks.** Pings each replica every few seconds; removes unhealthy
+  nodes from the pool.
+- **Traffic distribution.** Round-robin or least-connections routing across
+  replicas.
+- **Read-write splitting.** Often combined with the pooler or a proxy to
+  route SELECT statements to replicas and INSERT/UPDATE/DELETE to the leader.
+
+### 2.6 Monitoring and Alerting
+
+Every production database must expose:
+
+- **Query latency.** P50, P95, P99 response times per query pattern.
+- **Replication lag.** Seconds behind the leader per replica.
+- **Connection count.** Current vs. maximum allowed.
+- **Cache hit ratio.** Buffer pool hit rate for your working set.
+- **Disk I/O.** IOPS and queue depth on the data volume.
+- **Dead tuples / bloat.** Ratio of dead rows to live rows.
+
+Prometheus exports these metrics, Grafana visualizes them, and PagerDuty or
+Opsgenie alerts on thresholds.
+
+---
+
+## 3. Integration Patterns
+
+A relational database rarely operates in isolation. In a real system, it
+sits alongside caches, message queues, search engines, and content delivery
+networks. The patterns below show how these components interact with the
+database.
+
+### 3.1 Cache-Aside with Redis or Memcached
+
+The most common pattern for reducing database read load is to place a cache
+in front of reads.
+
+<AsciiDiagram
+  id="relational-databases/cache-aside-pattern"
+  title="Cache-aside database integration pattern"
+  alt="Application first checks a Redis cache; on a miss it queries the database and populates the cache."
+  content={`
+                        ┌──────────────┐
+                        │  Application │
+                        └──┬───────┬───┘
+                           │       │
+                    ┌──────┘       └──────┐
+                    │                     │
+                    ▼                     ▼
+            ┌──────────────┐     ┌──────────────┐
+            │    Redis     │     │  Relational  │
+            │    Cache     │◄────│  Database    │
+            │  (hot data)  │     │  (source of  │
+            │              │     │   truth)     │
+            └──────────────┘     └──────────────┘
+                        Cache-aside (lazy loading)
+                        1. App checks cache
+                        2. On miss: query DB, set cache
+                        3. On write: invalidate cache
+  `}
+/>
+
+**Read path:**
+
+1. Application looks up the key in Redis.
+2. If found (cache hit), return the value immediately.
+3. If not found (cache miss), query the database, store the result in Redis
+   with a TTL, and return it to the caller.
+
+**Write path (cache invalidation):**
+
+1. Application writes the new data to the database.
+2. Application deletes (or updates) the corresponding cache key.
+3. The next read triggers a cache miss and re-populates from the database.
+
+Do not cache writes. The database is always the source of truth; the cache
+is an ephemeral acceleration layer.
+
+### 3.2 Outbox Pattern with a Message Queue
+
+When you need to publish events to other services (email, notifications,
+analytics) in a reliable way, the transactional outbox pattern prevents
+data loss.
+
+<AsciiDiagram
+  id="relational-databases/outbox-pattern"
+  title="Transactional outbox pattern for reliable event publishing"
+  alt="Application writes to both business tables and an outbox table in the same transaction; a separate process reads the outbox and publishes to a message queue."
+  content={`
+┌──────────────┐     ┌──────────────────────────────┐
+│  Application │────>│     Relational Database       │
+│  (write)     │     │  ┌────────────────────────┐  │
+│              │     │  │  Business Tables        │  │
+│              │     │  │  (orders, users, etc.)  │  │
+│              │     │  └────────────────────────┘  │
+│              │     │  ┌────────────────────────┐  │
+│              │     │  │  Outbox Table           │  │
+│              │     │  │  (events to publish)    │  │
+│              │     │  └────────────────────────┘  │
+└──────────────┘     └───────────┬──────────────────┘
+                                 │
+                          ┌──────▼──────┐
+                          │  Outbox     │
+                          │  Publisher  │
+                          │  (poll or   │
+                          │   CDC via   │
+                          │  Debezium)  │
+                          └──────┬──────┘
+                                 │
+                          ┌──────▼──────┐
+                          │  Kafka /    │
+                          │  RabbitMQ   │
+                          │  (queue)    │
+                          └─────────────┘
+  `}
+/>
+
+**How it works:**
+
+1. In a single database transaction, the application inserts business data
+   (for example, an order row) and an event record into an `outbox` table.
+2. A separate process — either a background poller or a CDC (change data
+   capture) tool like Debezium — reads new rows from the outbox table.
+3. The publisher sends each event to a message queue (Kafka, RabbitMQ, SQS).
+4. After the message queue confirms receipt, the publisher marks the outbox
+   row as processed or deletes it.
+
+This pattern guarantees that every business event is published at least once,
+because the outbox record and the business data are committed atomically.
+
+### 3.3 Search Index Synchronization
+
+Full-text search in PostgreSQL (`tsvector`) works for small datasets, but
+beyond a few million rows you need a dedicated search engine like
+Elasticsearch or OpenSearch.
+
+<AsciiDiagram
+  id="relational-databases/search-index-sync"
+  title="Search index synchronization pattern"
+  alt="Application writes to the database; a CDC or dual-write process updates an Elasticsearch index with the same data."
+  content={`
+┌──────────────┐     ┌──────────────────┐
+│  Application │────>│  PostgreSQL      │
+│  (write)     │     │  (source of truth)│
+│              │     └────────┬─────────┘
+│              │              │ CDC (logical
+│              │              │ replication
+│              │              │ or trigger)
+└──────────────┘              │
+                              ▼
+                     ┌──────────────────┐
+                     │  Elasticsearch   │
+                     │  (search index)  │
+                     │  ┌────────────┐  │
+                     │  │ inverted   │  │
+                     │  │ index      │  │
+                     │  └────────────┘  │
+                     └──────────────────┘
+
+  Application reads search results
+  from Elasticsearch, not from the
+  database. Full-text queries run
+  10-100x faster on dedicated indexes.
+  `}
+/>
+
+**Synchronization strategies:**
+
+- **Dual write.** The application writes to both PostgreSQL and Elasticsearch
+  in the same request. Simple but risky: if one write fails, the systems
+  diverge.
+- **CDC pipeline.** Debezium streams changes from PostgreSQL WAL into Kafka,
+  and a consumer indexer writes them to Elasticsearch. This is the production
+  standard because it guarantees eventual consistency without changing
+  application code.
+- **Periodic reindex.** A cron job runs every N hours, dumps relevant rows
+  from the database, and rebuilds the Elasticsearch index. Acceptable for
+  data that changes infrequently.
+
+### 3.4 CDN Integration for Database-Generated Assets
+
+Sometimes the database produces or stores static assets — user avatars,
+report PDFs, product images — that are expensive to serve from the database
+directly. The pattern is to write to the database and serve from a CDN.
+
+<AsciiDiagram
+  id="relational-databases/cdn-integration"
+  title="CDN integration for database-generated assets"
+  alt="Application writes assets to object storage and references them in the database; the CDN caches the assets at edge locations."
+  content={`
+┌──────────────┐     ┌──────────────────┐
+│  Application │────>│  PostgreSQL      │
+│  (upload)    │     │  (stores URL or  │
+│              │     │   object key)    │
+│              │     └──────────────────┘
+│              │
+│              │     ┌──────────────────┐
+│              │────>│  Object Store    │
+│              │     │  (S3 / GCS)      │
+│              │     └────────┬─────────┘
+│              │              │
+│              │              ▼
+└──────────────┘     ┌──────────────────┐
+                     │  CDN (CloudFront,│
+                     │   Cloudflare)    │
+                     │  ┌────────────┐  │
+                     │  │ edge cache │  │
+                     │  └────────────┘  │
+                     │  ┌────────────┐  │
+                     │  │ edge cache │  │
+                     │  └────────────┘  │
+                     └──────────────────┘
+
+  1. User uploads an image.
+  2. Application stores the image in S3.
+  3. Application stores the S3 key in the database.
+  4. The frontend renders a CDN URL pointing to the image.
+  5. The CDN edge caches the image for subsequent requests.
+  `}
+/>
+
+**Why this matters:** Serving a 500 KB image directly from the database means
+a full query cycle, serialization, and transfer through the app server. A CDN
+serves the same image from the nearest edge location in a single HTTP hop,
+with zero database load.
+
+---
+
+## 4. Multi-Region and Global Scale
+
+Once your user base spans continents, a single-region deployment introduces
+visible latency for users far from that region. A user in Tokyo querying a
+database in Virginia experiences 150--200 ms of network round-trip time on
+every database call.
+
+### 4.1 Active-Passive Replication
+
+In an active-passive setup, you maintain a full replica in a secondary
+region that stays ready to accept traffic.
+
+<AsciiDiagram
+  id="relational-databases/active-passive-replication"
+  title="Active-passive multi-region replication"
+  alt="A primary region with a leader and replicas, streaming WAL to a standby region that has its own leader and replicas, with DNS failover routing."
+  content={`
+┌─────────────────────────────────────┐
+│         Region: us-east-1           │
+│  ┌────────────┐                     │
+│  │  Primary   │                     │
+│  │  (Leader)  │──WAL stream────────┐│
+│  │  RW        │                    ││
+│  └────────────┘                    ││
+│  ┌────────────┐  ┌────────────┐    ││
+│  │ Replica 1  │  │ Replica 2  │    ││
+│  │ (RO)       │  │ (RO)       │    ││
+│  └────────────┘  └────────────┘    ││
+└────────────────────────────────────┘│
+                                      │
+                                      │
+┌─────────────────────────────────────┤
+│         Region: eu-west-1           │
+│  ┌──────────────────────────────────┘
+│  │  ┌────────────┐
+│  │  │  Standby   │◄──────────────────┘
+│  │  │ (Promotable│
+│  │  │  to leader)│
+│  │  └────────────┘
+│  │  ┌────────────┐  ┌────────────┐
+│  │  │ Replica 1  │  │ Replica 2  │
+│  │  │ (RO)       │  │ (RO)       │
+│  │  └────────────┘  └────────────┘
+│  │
+│  │  DNS: Global Traffic Manager
+│  │  Routes users to nearest region
+│  │  On failover: promotes standby
+│  │  to leader, updates DNS record
+└─────────────────────────────────────┘
+  `}
+/>
+
+**How it works:**
+
+- The primary region's leader continuously streams WAL to the standby region
+  over an encrypted, low-latency network connection (typically AWS Direct
+  Connect or a VPN).
+- The standby region maintains a fully hydrated replica that can be promoted
+  to leader within minutes.
+- A global traffic manager (Route53, Cloudflare DNS) routes users to the
+  nearest region for reads. Writes always go to the primary region.
+- On a regional failure, you promote the standby to leader and update the
+  DNS record to route writes to the new primary.
+
+### 4.2 Active-Active (Multi-Writer)
+
+Active-active setups allow multiple regions to accept writes. This is
+extremely difficult with traditional relational databases because of
+conflict resolution. However, products like CockroachDB, YugabyteDB, and
+Aurora Global Database support it.
+
+**Trade-offs:**
+
+- **Conflict resolution.** Two users in different regions may update the same
+  row simultaneously. The database must resolve the conflict, typically with
+  last-writer-wins (LWW) or application-level CRDTs.
+- **Latency for strong reads.** To read your own write, you must read from
+  the region that accepted the write, or from a global leader.
+- **Cross-region write latency.** Every write must be acknowledged by a
+  quorum of regions, adding 100--300 ms to every write.
+
+**When to use it:** Active-active makes sense only when you need regional
+write availability during a full region outage, and your application can
+tolerate (or resolve) the occasional conflict.
+
+### 4.3 Latency Mitigation Strategies
+
+Regardless of the replication model, you can reduce the perceived latency
+for users far from the primary region:
+
+- **Read replicas in every region.** Users read from a local replica (under
+  10 ms latency) and write to the primary region (100--300 ms). This is the
+  most common pattern.
+- **Connection routing middleware.** A library or sidecar proxy (such as
+  pgcat or ProxySQL) inspects each query and routes it to the closest
+  replica or to the primary based on query type.
+- **Client-side caching.** Cache the most frequently accessed data on the
+  client or in a local Redis instance per region.
+
+---
+
+## 5. Capacity Planning
+
+You should be able to estimate the database resources your system needs
+before you deploy. Capacity planning answers three questions:
+
+1. How many queries per second (QPS) does the database need to handle?
+2. How much storage do you need today, and in 12 months?
+3. How much network bandwidth does replication consume?
+
+### 5.1 Estimating Queries Per Second
+
+Start with your expected daily active users (DAU) and the average number of
+database queries per user action.
+
+| Tier | DAU | Queries per user per day | Total daily queries | Peak QPS (5x avg) |
+|------|-----|--------------------------|---------------------|-------------------|
+| Startup | 10,000 | 50 | 500,000 | ~29 |
+| Growth | 500,000 | 100 | 50,000,000 | ~2,894 |
+| Enterprise | 10,000,000 | 200 | 2,000,000,000 | ~115,740 |
+
+**Formula:**
+
+```
+average QPS = (DAU x queries per user per day) / 86,400 seconds per day
+peak QPS    = average QPS x 5   (assuming a 5x diurnal spike)
+```
+
+**Read vs. write breakdown:**
+
+If 90 percent of queries are reads and 10 percent are writes:
+
+```
+read QPS  = peak QPS x 0.9
+write QPS = peak QPS x 0.1
+```
+
+For the enterprise tier: read QPS is approximately 104,166; write QPS is
+approximately 11,574.
+
+### 5.2 Storage Sizing
+
+Estimate your data size per entity and project growth.
+
+| Entity | Row size | Daily new rows | Daily growth | Annual growth |
+|--------|----------|----------------|--------------|---------------|
+| Users | 512 bytes | 1,000 | 0.5 MB | 183 MB |
+| Orders | 2 KB | 50,000 | 98 MB | 35 GB |
+| Events (logs) | 1 KB | 5,000,000 | 4.8 GB | 1.7 TB |
+| Analytics | 256 bytes | 10,000,000 | 2.4 GB | 876 GB |
+
+**Important considerations:**
+
+- **Index overhead.** Indexes typically consume 20--50 percent additional
+  storage on top of the raw data. A 1 TB table with heavy indexing may
+  consume 1.5 TB of disk.
+- **WAL storage.** The write-ahead log consumes approximately 10--20 percent
+  of your write volume. For a system writing 100 GB per day, WAL adds 10--20
+  GB per day until checkpoint cleanup.
+- **Temporary files.** Query sorting, hash joins, and maintenance operations
+  (VACUUM, REINDEX) create temporary files. Reserve at least 20 percent free
+  space on the data volume.
+- **Backup retention.** Full daily backups plus WAL archiving for point-in-
+  time recovery can multiply your storage needs by 3--5x.
+
+**Rule of thumb:** Provision 2.5x your estimated data size to account for
+indexes, WAL, temporary files, and growth buffer.
+
+### 5.3 Bandwidth and Network
+
+Replication consumes network bandwidth between the leader and replicas.
+
+```
+replication bandwidth = write throughput x WAL amplification factor
+```
+
+WAL amplification is typically 1.5--2.0x of the raw write volume. If you
+write 50 MB/s of data, replication consumes 75--100 MB/s per replica. With
+three replicas, that is 225--300 MB/s of outbound bandwidth from the leader.
+
+**Network constraints:**
+
+- A leader on a 10 Gbps NIC (approximately 1,250 MB/s) can sustain roughly
+  8--12 replicas before network becomes the bottleneck.
+- Cross-region replication adds latency and may reduce write throughput by
+  20--40 percent compared to same-region replication.
+- Encryption (TLS for replication) adds 5--10 percent CPU overhead on the
+  leader and replicas.
+
+### 5.4 Cost Estimation
+
+Cloud database costs are dominated by three components:
+
+1. **Compute (vCPU + RAM).** Scaled by instance class. A 16 vCPU, 64 GB RAM
+   instance for PostgreSQL costs approximately $500--$1,200 per month on
+   AWS RDS, depending on the storage and IOPS configuration.
+2. **Storage (provisioned IOPS or gp3).** High-performance volumes for
+   database workloads cost $0.08--$0.125 per GB-month. A 2 TB volume with
+   high IOPS costs $200--$300 per month for storage plus $200--$400 per
+   month for provisioned IOPS.
+3. **Data transfer.** Outbound data transfer from the database to
+   application servers, replicas, and across regions. At cloud egress rates
+   of $0.05--$0.09 per GB, a system serving 10 TB per month of query
+   results incurs $500--$900 per month in transfer fees.
+
+**Sample monthly cost at 1 million DAU:**
+
+| Component | Quantity | Monthly cost |
+|-----------|----------|-------------|
+| Primary (16 vCPU, 64 GB) | 1 | $850 |
+| Read replicas (8 vCPU, 32 GB) | 3 | $1,350 |
+| Storage (3 TB gp3, high IOPS) | 1 | $650 |
+| Data transfer (8 TB outbound) | 1 | $550 |
+| **Total** | | **$3,400** |
+
+These numbers vary by cloud provider and region, but the proportions are
+consistent: compute and storage account for roughly 70 percent of the total.
+
+---
+
+## 6. Deployment and Operations
+
+Running a relational database in production requires careful operational
+practices. This section covers deployment strategies, monitoring, and
+routine maintenance.
+
+### 6.1 Zero-Downtime Schema Migrations
+
+Schema changes — adding a column, creating an index, altering a table — are
+among the riskiest operations on a production database. A naive `ALTER TABLE`
+can lock the table for minutes or hours, blocking all reads and writes.
+
+**Safe migration strategies:**
+
+- **Add columns with a default of NULL.** Adding a nullable column is a
+  metadata-only operation in PostgreSQL (and MySQL 8+ with `INSTANT ADD
+  COLUMN`). No table rewrite, no lock. Backfill the default value in
+  batches afterward.
+- **Concurrent index creation.** PostgreSQL: `CREATE INDEX CONCURRENTLY`.
+  MySQL: `ALTER TABLE ... ADD INDEX ... LOCK=SHARED`. These allow reads
+  and writes during index creation.
+- **Use pt-online-schema-change (MySQL)** or **pgroll / pg_migrate** for
+  complex changes. These tools create a shadow table, apply the schema
+  change there, backfill data incrementally, then swap the tables.
+- **Expand-contract pattern for column type changes.** Rather than altering
+  a column type (which rewrites the table), add a new column with the
+  desired type, dual-write to both columns for a deployment cycle, migrate
+  reads, then drop the old column.
+
+**Migration workflow:**
+
+1. Write the migration as a versioned SQL file (for example,
+   `2026-03-15_add_user_timezone.sql`).
+2. Test the migration on a staging replica with production traffic volume.
+   Measure lock duration and verify that it runs within a maintenance window.
+3. Run the migration on the leader during a low-traffic period, or use a
+   concurrent strategy on the leader directly.
+4. Verify the migration: check that new rows appear in the `schema_migrations`
+   table, query the changed table for correctness, and monitor error rates
+   for 15 minutes after the change.
+
+### 6.2 Backup and Recovery Strategy
+
+Every production database must have a documented, tested backup and recovery
+plan. The plan specifies:
+
+| Metric | Target | Notes |
+|--------|--------|-------|
+| Recovery Point Objective (RPO) | 5 minutes | Maximum acceptable data loss |
+| Recovery Time Objective (RTO) | 2 hours | Maximum acceptable downtime |
+| Backup type | Continuous WAL archiving + daily full backup | Combines PITR with point-in-time recovery |
+| Retention | 30 days of daily backups, 12 monthly snapshots | Compliance and audit requirements |
+
+**Implementation:**
+
+- **Full backup daily.** Use `pg_dump` (logical) or volume snapshots (EBS
+  snapshots on AWS). Logical backups are portable across versions; volume
+  snapshots are faster (minutes vs. hours for multi-TB databases).
+- **WAL archiving every 5 minutes.** Ship completed WAL segments to S3 or
+  GCS. This enables point-in-time recovery to any second.
+- **Test recovery quarterly.** Spin up a fresh instance, restore the latest
+  backup, apply WAL up to a specific timestamp, and verify data integrity
+  with a checksum or a sample query.
+
+### 6.3 Monitoring: What to Watch and Why
+
+A well-monitored database allows you to detect and correct problems before
+users notice them. Below are the critical metrics and their alarm thresholds.
+
+<AsciiDiagram
+  id="relational-databases/monitoring-dashboard"
+  title="Database monitoring dashboard layout"
+  alt="A Grafana-style dashboard showing panels for query latency, connections, replication lag, cache hit ratio, and disk I/O."
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│                   Database Monitoring Dashboard               │
+├──────────────┬──────────────┬──────────────┬─────────────────┤
+│ Query Latency│  Connections │ Replication  │ Cache Hit Ratio │
+│  p50: 12ms   │  Active: 42  │  Lag: 0.3s   │  Current: 97%   │
+│  p95: 45ms   │  Idle: 18    │  Max: 1.2s   │  Warning: 90%   │
+│  p99: 120ms  │  Total: 60   │  Replicas: 4 │  Critical: 80%  │
+│  ⚠ Alert >200ms│  Max: 100 │  ⚠ Alert >5s │  ⚠ Alert <90%  │
+├──────────────┼──────────────┼──────────────┼─────────────────┤
+│  Disk I/O    │  CPU Load    │  Active Locks│  Dead Tuples    │
+│  Read: 450/s │  User: 55%   │  3 waiting   │  2.3M / 10M     │
+│  Write: 120/s│  IO Wait: 12%│  0 blocked   │  Autovacuum: ON │
+│  Queue: 0.8  │  System: 8%  │  ⚠ Alert >10 │  % Dead: 23%   │
+├──────────────┴──────────────┴──────────────┴─────────────────┤
+│  Recent Errors: 2 slow queries identified (full table scans) │
+│  Top query: SELECT * FROM orders WHERE status = 'pending';   │
+│  Recommendation: add index on orders(status, created_at)     │
+└──────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+**Alarm thresholds (PagerDuty / Opsgenie):**
+
+| Metric | Warning | Critical | Action |
+|--------|---------|----------|--------|
+| P99 query latency | >200 ms | >500 ms | Check slow query log; add indexes or tune |
+| Replication lag | >5 seconds | >30 seconds | Check replica CPU/network; may need to restart |
+| Connection count | >80% of max | >95% of max | Scale pooler or increase `max_connections` |
+| Cache hit ratio | under 90% | under 80% | Increase buffer pool size or reduce working set |
+| Disk space | under 20% free | under 10% free | Clean up old data, add volume, or migrate |
+| Replica count | 0 replicas healthy | -- | Check Patroni / Orchestrator health |
+| Dead tuple ratio | >30% | >50% | Tune autovacuum parameters; manually VACUUM |
+
+### 6.4 Routine Maintenance Tasks
+
+These tasks should run on a regular schedule, either automated or during a
+planned maintenance window.
+
+| Frequency | Task | Tool / Command |
+|-----------|------|----------------|
+| Hourly | Check replication lag | `pg_stat_replication` or monitoring agent |
+| Daily | Review slow query log | pgBadger, slow_query_log |
+| Weekly | Run ANALYZE to update statistics | `ANALYZE` (autovacuum does this, but manual is safer) |
+| Weekly | Check for bloat | pgstattuple extension, check_bloat script |
+| Monthly | Test backup restore | Spin up a test instance |
+| Monthly | Review unused indexes | `pg_stat_user_indexes` |
+| Quarterly | Upgrade minor version | Apply patch release (e.g., 16.4 to 16.5) |
+| Yearly | Major version upgrade | Test in staging; use logical replication or pg_upgrade |
+
+### 6.5 Handling a Database Outage
+
+When the database goes down, follow this runbook:
+
+1. **Confirm the outage.** Check the monitoring dashboard for replication lag,
+   connection count, and the latest error log entries. Look for common
+   patterns: OOM killer, disk full, or network partition.
+
+2. **Isolate the cause.** Log into the database server. Check:
+   - `dmesg` for kernel OOM messages.
+   - `df -h` for disk space.
+   - `top` or `htop` for CPU or memory saturation.
+   - PostgreSQL logs for `FATAL` or `PANIC` errors.
+
+3. **Restore service quickly.**
+   - If the leader is unresponsive: promote a replica using Patroni.
+   - If the entire cluster is down: restore from the latest backup and
+     replay WAL to the last known consistent state.
+   - If the issue is a bad query: use `pg_cancel_backend()` or
+     `pg_terminate_backend()` to kill the offending session.
+
+4. **Post-mortem.** After service is restored:
+   - Document the root cause and the resolution time.
+   - Determine what monitoring gap, if any, missed the early warning signs.
+   - Add a new alert or runbook step to prevent recurrence.
+
+---
+
+## 7. Bringing It All Together: A Reference Architecture
+
+Below is a complete production architecture that incorporates everything
+covered in this lesson. Use this as a reference when designing your own
+database deployment.
+
+<AsciiDiagram
+  id="relational-databases/reference-architecture"
+  title="Complete production reference architecture for relational databases"
+  alt="End-to-end architecture from users through CDN, load balancer, cache, database cluster with replicas, monitoring stack, to backup storage."
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Global Users (Worldwide)                        │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                         CDN (static assets)                         │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐          │
+│  │  Edge 1  │  │  Edge 2  │  │  Edge 3  │  │  Edge 4  │   ...    │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘          │
+└──────────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                        Load Balancer (HAProxy)                      │
+│  Routes:  /api/*  →  app servers                                    │
+│           /static/* → CDN                                            │
+└──────────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                     Application Servers (k8s / ASG)                 │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐          │
+│  │  App 1   │  │  App 2   │  │  App 3   │  │  App 4   │   ...    │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘          │
+└───────┼─────────────┼──────────────┼──────────────┼────────────────┘
+        │             │              │              │
+        ▼             ▼              ▼              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                  Redis Cache Cluster (6 nodes)                      │
+│  Hit rate: 95%  │  Memory: 24 GB  │  Eviction: LRU                  │
+└──────────────────────────────────────────────────────────────────────┘
+        │             │              │              │
+        ▼             ▼              ▼              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                    Connection Pooler (PgBouncer)                    │
+│  Active: 45 conns  │  Waiting: 3  │  Max: 200  │  Mode: Transaction │
+└──────────────────────────────────────────────────────────────────────┘
+        │             │              │              │
+        ▼             ▼              ▼              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                     PostgreSQL Cluster (Patroni)                    │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐                    │
+│  │  Primary   │  │ Replica 1  │  │ Replica 2  │                    │
+│  │  (Leader)  │  │ (RO, us)   │  │ (RO, us)   │                    │
+│  │  RW, WAL   │  │  Lag: 0.2s │  │  Lag: 0.3s │                    │
+│  └─────┬──────┘  └────────────┘  └────────────┘                    │
+│        │                                                           │
+│        │  WAL stream (async)                                       │
+│        ▼                                                           │
+│  ┌────────────┐  ┌────────────┐                                   │
+│  │  Standby   │  │  Replica   │                                   │
+│  │  (eu-west) │  │  (ap-south)│                                   │
+│  │  Lag: 1.2s │  │  Lag: 2.1s │                                   │
+│  └────────────┘  └────────────┘                                   │
+└──────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                 Monitoring & Observability                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐           │
+│  │Prometheus│  │ Grafana  │  │PagerDuty │  │   Loki   │           │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘           │
+│  ┌────────────────────────────────────────────────────────┐        │
+│  │  Alerts: p99 latency, replication lag, disk space,    │        │
+│  │          cache hit ratio, dead tuple ratio             │        │
+│  └────────────────────────────────────────────────────────┘        │
+└──────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                     Backup & Recovery                               │
+│  ┌──────────────────────┐    ┌──────────────────────┐               │
+│  │  S3 / GCS (WAL)     │    │  Volume Snapshots    │               │
+│  │  Retention: 30 days  │    │  Retention: 12 months│               │
+│  └──────────────────────┘    └──────────────────────┘               │
+└──────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Key Takeaways
+
+- **Start simple, but plan for scale.** A single-node database works for
+  prototypes and small teams, but you should design your application layer
+  to support a pooler and replicas from day one, even if you do not deploy
+  them immediately.
+- **Separation of concerns is the foundation.** Connection poolers, read
+  replicas, and dedicated leader nodes each solve one specific bottleneck.
+  Apply them one at a time as your traffic grows.
+- **Monitor everything.** Without query latency, replication lag, and cache
+  hit ratio on a dashboard, you are operating blind.
+- **Test your recovery process.** A backup that you have never restored is
+  not a backup. Run a quarterly recovery drill.
+- **Choose the right integration pattern.** Cache-aside for reads,
+  transactional outbox for reliable events, CDN for assets, and dedicated
+  search for full-text queries. Each pattern offloads a specific class of
+  work from the database.
+
+With this architecture, you can serve tens of millions of users with single-
+digit millisecond query latencies, automated failover in under a minute, and
+a clear path to multi-region deployment when you outgrow a single region.
+
+---
+
+## Further Reading
+
+- PostgreSQL Documentation: *High Availability, Load Balancing, and
+  Replication*
+- MySQL Documentation: *Replication and High Availability*
+- Patroni GitHub Repository: *PostgreSQL HA with ZooKeeper, etcd, or
+  Consul*
+- AWS Database Blog: *Best Practices for Amazon RDS and Aurora*
+- *Designing Data-Intensive Applications* by Martin Kleppmann — chapters
+  8 (Distributed Systems) and 9 (Consistency)

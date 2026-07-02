@@ -1,0 +1,683 @@
+---
+id: http-https-deep-dive
+title: HTTP and HTTPS — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+An HTTP server, at its core, is a state machine that reads bytes from a TCP socket, parses those bytes into a structured request, routes the request to a handler, collects the response, serializes it back to bytes, and writes those bytes to the socket. HTTPS adds a TLS encryption layer between the socket reads and the HTTP parser.
+
+<AsciiDiagram
+  id="http-https/internal-arch"
+  title="HTTP Server Internal Architecture"
+  content={`
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                    HTTP Server (e.g., Nginx, Envoy)                 │
+  │                                                                     │
+  │   ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌──────────┐  │
+  │   │ Connection │   │ TLS Layer  │   │   HTTP     │   │ Protocol │  │
+  │   │  Acceptor  │──>│ (OpenSSL / │──>│   Parser   │──>│ Dispatcher│  │
+  │   │ (epoll /   │   │  BoringSSL)│   │ (RFC 7230) │   │ (router) │  │
+  │   │  kqueue)   │   └────────────┘   └────────────┘   └────┬─────┘  │
+  │   └────────────┘                                           │        │
+  │                                                            ▼        │
+  │   ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌──────────┐  │
+  │   │ Response   │<──│  Response  │<──│   Handler  │<──│  Middle-  │  │
+  │   │  Writer    │   │  Builder   │   │   Logic    │   │  ware    │  │
+  │   │ (chunked,  │   │ (status +  │   │ (app code) │   │ Chain    │  │
+  │   │  compress) │   │ headers)   │   │            │   │ (auth,   │  │
+  │   └────────────┘   └────────────┘   └────────────┘   │ logging) │  │
+  │                                                       └──────────┘  │
+  │                                                                     │
+  │   ┌─────────────────────────────────────────────────────────────┐   │
+  │   │  Connection Pool / Keep-Alive Manager                       │   │
+  │   │  Tracks: idle sockets, active sockets, timeout timers       │   │
+  │   │  Max idle: 100s   Max connections: 20000   Per-worker: 512 │   │
+  │   └─────────────────────────────────────────────────────────────┘   │
+  │                                                                     │
+  │   ┌─────────────────────────────────────────────────────────────┐   │
+  │   │  Event Loop (epoll) — nonblocking I/O across all conns     │   │
+  │   │  ├── Read event:  socket readable → TLS decrypt → parse     │   │
+  │   │  ├── Write event: socket writable → serialize → TLS enc →  │   │
+  │   │  └── Timer event: check keep-alive expiry, retry queues    │   │
+  │   └─────────────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────────────┘
+  
+  Legend:
+  [ ] Component   ──> Data/control flow
+  epoll = Linux I/O event notification facility
+  `}
+  caption="The event loop drives all connections from a single thread. Nginx uses this architecture to handle 10,000+ concurrent connections per worker with under 100MB of RAM."
+/>
+
+The architecture is fundamentally I/O-bound, not CPU-bound. A single worker thread can handle thousands of idle keep-alive connections because the event loop only acts on active sockets. CPU-intensive work (TLS handshake, response compression) benefits from hardware acceleration (AES-NI for encryption, zlib for compression).
+
+## Data Structures and Algorithms
+
+### The Request Parser — Finite State Machine (FSM)
+
+The HTTP request parser is a deterministic finite state machine that transitions between states as it consumes bytes from the socket. Each state knows what byte sequence to expect next and how to extract the relevant data.
+
+<AsciiDiagram
+  id="http-https/parser-fsm"
+  title="HTTP Request Parser — Finite State Machine"
+  content={`
+  ┌──────────┐    'G','E','T',   ┌──────────────┐    ' ' (space)    ┌───────────┐
+  │ START    │ ─── 'P','O','S',─>│ METHOD       │ ────────────────> │ URI      │
+  │          │     'P','U','T',  │ (accumulate  │                  │ (accumulate)
+  │  Wait for│     'D','E','L'   │  up to 7 B)  │                  │ up to 8k) │
+  └──────────┘                   └──────────────┘                  └─────┬─────┘
+       │                                                                 │
+       │ Timeout > 5s                                                    │ ' ' (space)
+       ▼                                                                 ▼
+  ┌──────────┐                                                   ┌──────────────┐
+  │ ERROR    │                                                   │ HTTP-VERSION │
+  │ 408      │       CRLF (\\r\\n)                                  │ "HTTP/1.1"   │
+  │ Timeout  │<──────────────────────────────────────────────────│              │
+  └──────────┘                                                   └──────┬───────┘
+                                                                         │
+                                                                    CRLF (\\r\\n)
+                                                                         ▼
+                                                                  ┌──────────────┐
+                                                                  │ HEADER LINE  │
+  ┌────────────┐                                                    (key: value)
+  │ BODY       │<─────────────── double CRLF ─────────────────    │              │
+  │ (read N    │     (\\r\\n\\r\\n signals end of headers)          └──────────────┘
+  │  bytes)    │                                                        │
+  └──────┬─────┘                                                   CRLF (\\r\\n)
+         │                                                            ▼
+         ▼                                                    ┌─────────────────┐
+  ┌──────────────┐                                           │ HEADER DONE    │
+  │ COMPLETE     │                                           │ Check Content- │
+  │ Request ready│                                           │ Length /       │
+  │              │                                           │ Transfer-Enc   │
+  └──────────────┘                                           └────────────────┘
+  
+  Legend:
+  [ ] State   ──  Byte sequence that triggers transition
+  States are hardware-friendly: no backtracking, no unbounded lookahead
+  `}
+  caption="The parser consumes exactly one byte at a time with no backtracking. Each state transition is a constant-time lookup. This design allows parsing at 5-10 GB/s on modern hardware."
+/>
+
+**Why an FSM?** Because HTTP messages arrive incrementally over TCP. A single request might arrive in 3-10 TCP segments depending on network MTU. The FSM can pause mid-parse when waiting for more bytes, resume from the exact state when the next segment arrives, and never needs to buffer the entire message before beginning to parse. Memory complexity is O(1) — the FSM stores only the current state and a pointer to the accumulator for the current field.
+
+**Time complexity**: O(n) where n is the number of bytes in the request. Each byte causes exactly one state transition. Space complexity: O(h + b) where h is header size and b is body size — the parser itself uses constant memory, but the accumulated data grows with the message.
+
+### Header Map — Hash Table or Trie
+
+Once parsed, headers are stored in a data structure that supports fast lookup by name. HTTP header names are case-insensitive per the RFC (Content-Type and content-type are the same header), so the lookup must normalize case.
+
+- **Hash table**: O(1) average lookup, O(n) worst-case. Common for dynamic headers where the set varies per request. Each header is hashed on insertion; the case-insensitivity is handled by lowercasing the key before hashing.
+- **Trie (prefix tree)**: O(k) lookup where k is header name length. Used in high-performance proxies (Envoy, Nginx) that handle millions of requests per second. The trie is pre-populated with the ~20 header names that appear in 99.9% of requests (Host, Content-Type, Authorization, Accept, User-Agent, Cache-Control, Cookie, etc.). A miss in the trie falls back to a hash table for custom headers.
+
+<AsciiDiagram
+  id="http-https/header-trie"
+  title="Header Name Lookup — Trie Structure"
+  content={`
+  Root
+   │
+   ├── a────c────c────e────p────t───────────────────── "Accept"
+   │     │   │
+   │     │   └──e────p────t────-────e────n────c────o────d────i────n────g  "Accept-Encoding"
+   │     │
+   │     └──t────i────o────n────────────────────────── "Authorization" (not shown fully)
+   │
+   ├── c────o────n────t────e────n────t────-────t────y────p────e  "Content-Type"
+   │                                                     │
+   │                                                     └────l────e────n────g────t────h  "Content-Length"
+   │
+   ├── h────o────s────t────────────────────────────────── "Host"
+   │
+   ├── u────s────e────r────-────a────g────e────n────t──── "User-Agent"
+   │
+   └── c────a────c────h────e────-────c────o────n────t────r────o────l  "Cache-Control"
+  
+  Legend:
+  Each node is a character
+  A dotted underline marks a valid header name end
+  Lookup: walk characters from root, case-fold each char
+  `}
+  caption="A trie for header lookup eliminates the need to hash variable-length strings. Envoy's header map uses a trie for the first 24 header names, then falls back to a hash table for the rest."
+/>
+
+### Connection Pool — Doubly Linked List with Hash Index
+
+The connection manager maintains a pool of active TCP/TLS connections. Each connection is a node in a doubly linked list (for O(1) removal from anywhere), and also accessible via a hash table keyed by (destination IP, destination port, source IP) for connection reuse.
+
+- **Idle connections** are kept in a time-sorted list. When a new request arrives, the manager checks if an idle connection to the same destination exists. If yes, it reuses it. If no, it creates a new one. If too many idle connections exist, the oldest are closed.
+- **Maximum connections** per upstream is bounded (default 1024 per worker in Nginx). Exceeding this causes new requests to queue or fail with 503.
+
+<AsciiDiagram
+  id="http-https/connection-pool"
+  title="Connection Pool Data Structure"
+  content={`
+  Hash Index (by host:port)
+  ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │ hostA:8080│───>│ Conn #7  │───>│ Conn #12 │───> nil
+  └──────────┘    └──────────┘    └──────────┘
+  ┌──────────┐    ┌──────────┐
+  │ hostB:443 │───>│ Conn #4  │───> nil
+  └──────────┘    └──────────┘
+  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │ hostC:80  │───>│ Conn #2  │───>│ Conn #9  │───>│ Conn #15 │───> nil
+  └──────────┘    └──────────┘    └──────────┘    └──────────┘
+  
+  Idle Connection List (doubly linked, sorted by age_seconds)
+  ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐
+  │ oldest │<──>│ Conn │<──>│ Conn │<──>│ Conn │<──>│ Conn │<──>│ newest│
+  │ Conn #2│    │ #7   │    │ #9   │    │ #12  │    │ #15  │    │ #4   │
+  └──────┘    └──────┘    └──────┘    └──────┘    └──────┘    └──────┘
+  
+  Legend:
+  ──>  singly linked (hash chains)
+  <──> doubly linked (idle list — O(1) remove from any position)
+  `}
+  caption="The pool combines a hash table for fast connection lookup by destination with a doubly linked list for LRU eviction of idle connections."
+/>
+
+### TLS Session Cache — LRU Cache
+
+Repeating the full TLS handshake for every connection is expensive. The TLS session cache stores session parameters so that a returning client can resume with a 0-RTT or 1-RTT abbreviated handshake.
+
+- **Storage**: In-memory LRU cache (typically 20,000-50,000 entries) or external Redis (for multi-server session sharing).
+- **Key**: TLS session ID (32 bytes) or a session ticket (encrypted blob sent to the client).
+- **Value**: Master secret, cipher suite, creation time, peer certificate.
+- **Eviction**: LRU when full, TTL-based (default 24 hours for session tickets).
+
+<AsciiDiagram
+  id="http-https/tls-cache"
+  title="TLS Session Cache — LRU Eviction"
+  content={`
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                     TLS Session Cache                               │
+  │                                                                      │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌───────┐ │
+  │  │ Newest   │  │          │  │          │  │          │  │ Oldest│ │
+  │  │ session  │──>│ session │──>│ session │──>│ session │──>│session│ │
+  │  │ ID: 0xAB │  │ ID: 0x4C│  │ ID: 0x93│  │ ID: 0x27│  │ID:0xF1│ │
+  │  │ key: ... │  │ key:... │  │ key:... │  │ key:... │  │key:...│ │
+  │  │ ttl: 24h │  │ ttl:23h │  │ ttl:22h │  │ ttl:19h │  │ttl:1h │ │
+  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └───────┘ │
+  │       │              │             │              │          │      │
+  │       │              │    Hit → moved to front    │          │      │
+  │       │              │<────────────────────────►  │          │      │
+  │       │                                            │          │     │
+  │       │            Eviction: next insert            │          │     │
+  │       │            removes this tail entry          │←── Remove│     │
+  └──────────────────────────────────────────────────────────────────────┘
+  
+  Legend:
+  [ ] Cache entry   ──>  Linked list pointer
+  Hit: move-to-front (LRU).  Miss: create new entry, evict if full.
+  `}
+  caption="An LRU session cache stores TLS session parameters. Cloudflare's edge servers maintain 50,000-session caches per worker, covering 99.7% of repeat connections."
+/>
+
+## The Request/Write/Read Lifecycle
+
+### Phase 1 — Connection Acceptance
+
+The event loop (epoll on Linux, kqueue on macOS) waits for incoming TCP connections. When a new connection arrives, the acceptor calls accept() which returns a new socket file descriptor. The socket is set to nonblocking mode and added to the event loop's interest set. A connection object is allocated: it contains the socket fd, read buffer, write buffer, and a pointer to the TLS session object if applicable.
+
+### Phase 2 — TLS Handshake (HTTPS only)
+
+The server initiates a TLS handshake on the new connection. The TLS layer reads ClientHello bytes from the socket, selects a cipher suite based on the server's preference list, generates an ephemeral Diffie-Hellman key pair, and constructs ServerHello + Certificate + CertificateVerify + Finished messages. During this phase, the connection object's TLS state transitions through:
+
+```
+STATE_IDLE → STATE_HANDSHAKE_READ → STATE_HANDSHAKE_WRITE → STATE_HANDSHAKE_DONE
+```
+
+### Phase 3 — Request Byte Accumulation
+
+Once the TLS layer has decrypted data (or directly for HTTP), the bytes enter the read buffer — a contiguous byte array, typically 4KB to 64KB. The parser FSM consumes bytes from this buffer. When the buffer is empty and more bytes are needed, the event loop registers interest in the socket's read readiness.
+
+### Phase 4 — Header Parsing
+
+The parser enters the HEADER state after receiving the request line. It reads header lines until it encounters the double CRLF (\\r\\n\\r\\n). Each header line is split on the first colon: the key is lowercased and trimmed, the value is trimmed. Headers are inserted into the header map.
+
+### Phase 5 — Body Accumulation
+
+After headers, the parser reads the body. The Content-Length header tells it exactly how many bytes to expect. If Transfer-Encoding: chunked is present, the parser reads chunk-size lines followed by chunk data until a zero-length chunk signals end. For large bodies, the parser may stream data directly to a file or to the application handler without buffering the entire body in memory.
+
+### Phase 6 — Middleware Processing
+
+The parsed request (method, URL, headers, body) traverses the middleware chain. Each middleware can:
+
+- Inspect and modify the request (add headers, rewrite URL)
+- Short-circuit the chain by returning a response (deny access: 401 or 403)
+- Forward to the next middleware
+
+Common middleware: rate limiter, authentication, CORS validation, request logging, request ID injection.
+
+### Phase 7 — Route Dispatch
+
+The dispatcher matches the request's URL path against a routing table. The routing table is a trie (prefix tree) keyed by path segments, with method as an additional discriminator:
+
+```
+/v2/users/{userId}  →  GET: handler_getUser, DELETE: handler_deleteUser
+/v2/posts           →  GET: handler_listPosts, POST: handler_createPost
+```
+
+Path parameters (`{userId}`) are extracted and passed to the handler.
+
+### Phase 8 — Handler Execution
+
+The application handler executes the business logic. This is the only synchronous blocking phase — the handler queries databases, calls internal services, and computes the response. During this time, the event loop continues processing other connections. When the handler is done, it produces a status code, headers, and body.
+
+<AsciiDiagram
+  id="http-https/handler-exec"
+  title="Handler Execution — Synchronous Gap in Async Pipeline"
+  content={`
+  Time ──────────────────────────────────────────────────────────────────>
+  
+  Connection 1:  ┌──────┐┌──────┐┌──────┐┌─────────────────┐┌──────┐
+                  │Parse ││TLS   ││Route ││ Handler (DB)    ││Write │
+                  │Req   ││Decode││      ││ 15ms blocking   ││Resp  │
+                  └──────┘└──────┘└──────┘└─────────────────┘└──────┘
+  
+  Connection 2:       ┌──────┐┌──────┐┌──────┐┌───────────┐┌──────┐
+                      │Parse ││TLS   ││Route ││Cache read ││Write │
+                      │Req   ││Decode││      ││ 3ms       ││Resp  │
+                      └──────┘└──────┘└──────┘└───────────┘└──────┘
+  
+  Connection 3:            ┌──────┐┌──────┐┌──────┐
+                           │Parse ││TLS   ││Route │  (waiting for DB)
+                           │Req   ││Decode││      │
+                           └──────┘└──────┘└──────┘
+  
+  Thread 1:  [event loop]  [idle]  [event loop]  [blocked on DB] [event loop]
+  CPU:       <───────── parsing 20k req/s ──────>  <── idle ──>  <─ writing
+  
+  Legend
+  [ ] Phase on one connection
+  Event loop is never idle unless ALL connections are waiting on I/O
+  `}
+  caption="The event loop processes nonblocking phases (parse, route, write) while handlers block on I/O. Nginx uses multiple worker processes to utilize all CPU cores during blocking operations." />
+
+
+### Phase 9 — Response Serialization
+
+The handler's response object is serialized into bytes: status line (HTTP/1.1 200 OK), headers (one per line, sorted for HTTP/2 HPACK efficiency), and body. The serializer may apply:
+
+- **Compression**: If the request's Accept-Encoding header includes gzip or br (brotli), and the response body exceeds the minimum compression threshold (typically 1 KB), the body is compressed.
+- **Chunked transfer**: If Content-Length is not known at the start of writing (streaming response), Transfer-Encoding: chunked is used instead.
+
+### Phase 10 — TLS Encryption and Socket Write
+
+The serialized bytes pass through the TLS layer, which encrypts them in records (max 16 KB each for TLS 1.3). Each encrypted record is written to the socket's send buffer. The event loop registers interest in the socket's write readiness. When the socket is writable, the kernel copies data from the user-space send buffer to the kernel's TCP buffer. The write callback is called with the number of bytes written; remaining bytes stay in the buffer for the next write event.
+
+### Phase 11 — Keep-Alive Decision
+
+After the response is fully written, the server checks the Connection header. If the value is keep-alive (the default in HTTP/1.1 and the only option in HTTP/2), the connection returns to the idle pool. The keep-alive timeout (default 75 seconds in Nginx, 5 seconds in AWS ALB) determines how long the server holds the connection open waiting for the next request. If the timeout expires or the client sends Connection: close, the connection is shut down with a TLS close_notify alert (HTTPS) or a TCP FIN (HTTP).
+
+<AsciiDiagram
+  id="http-https/keepalive"
+  title="Keep-Alive Lifecycle — Connection States"
+  content={`
+  ┌────────────┐
+  │  NEW       │  TCP handshake complete, TLS handshake pending
+  └─────┬──────┘
+        │
+        ▼
+  ┌────────────┐   ┌──────────────┐
+  │ TLS HANDSHAKE│──>│ ACTIVE       │  Request being read or written
+  └────────────┘   └──────┬───────┘
+                          │
+              Response complete?
+                          │
+                    ┌─────▼──────┐
+                    │ IDLE       │  Waiting for next request
+                    │ (keep-alive)│  Timer: 75s default
+                    └─────┬──────┘
+                          │
+                    ┌─────▼──────┐
+                    │ TIMEOUT /  │  No new request within keepalive_timeout
+                    │ CLOSED    │  TCP FIN or RST sent
+                    └───────────┘
+  
+  Legend:
+  [ ] State   ──  Transition
+  Keep-alive reduces per-request cost from ~3 RTT to ~0 RTT
+  `}
+  caption="A connection spends most of its life in IDLE state. At peak, Facebook's load balancers maintain 2 million concurrent idle connections, with only 200,000 active at any moment."
+/>
+
+## Consistency and State
+
+HTTP is a stateless protocol — each request-response pair is independent. However, the systems built on top of HTTP (caches, proxies, load balancers, TLS session stores) maintain state. Understanding how that state behaves under failure is critical.
+
+### Crash — Mid-Request Server Failure
+
+**Scenario**: The server crashes after reading the request body but before sending the response. The client's TCP connection resets. The client sees a connection error (ECONNRESET in Linux).
+
+**What happens**: The client does not know whether the server processed the request. For a GET request, the client can retry safely (GET is idempotent). For a POST request, retrying may create duplicate state. For a PUT/PATCH/DELETE, if the request was fully received and execution began, the operation may have partially completed.
+
+<AsciiDiagram
+  id="http-https/crash-scenario"
+  title="Crash — Mid-Request Server Failure"
+  content={`
+  Timeline:
+  Client                         Server 1 (crashes)           DB
+  ──────                         ────────────────           ────
+    │                               │                         │
+    │── POST /payment (body: $50) ─>│                         │
+    │                               │── BEGIN TRANSACTION ───>│
+    │                               │── INSERT payment ──────>│
+    │                               │   (CRASH HERE)          │
+    │<── TCP RST ───────────────────│                         │
+    │                               │                         │
+    │── POST /payment (body: $50) ─>│  (retry to new server)  │
+    │                               │ Server 2                │
+    │                               │── BEGIN TRANSACTION ───>│
+    │                               │── INSERT payment ──────>│ (duplicate!)
+    │                               │── COMMIT ──────────────>│
+    │<── 200 OK ────────────────────│                         │
+  
+  Legend:
+  ──>  Successful operation   - ->  Failed / interrupted
+  Crash window: time between "start of mutation" and "success response sent"
+  `}
+  caption="A crash between receiving a request and sending its response creates an ambiguous state. The client cannot distinguish 'never processed' from 'processed but response lost.' Idempotency keys resolve this ambiguity."
+/>
+
+**Detection**: The server should write a crash-recovery log: before processing any mutating request, write the request details (method, URL, idempotency key) to a write-ahead log. On restart, replay logs of partially-processed requests. The log lives on the local filesystem or a shared volume.
+
+**Recovery**: The client retries with the same Idempotency-Key header. The server (or a shared cache) checks if it has already processed that key. If yes, return the cached response. If no, process and cache.
+
+### Network Partition — Client Cannot Reach Server
+
+**Scenario**: A network partition isolates the client from the server. The client's TCP keep-alive probes detect the lost connectivity after 2 hours (default Linux keepalive interval). The client's connection eventually times out.
+
+**What happens**: The client cannot make any HTTP requests. Any existing keep-alive connections become stale — the server may still hold the connection open, wasting resources. When connectivity returns, the client must re-establish connections from scratch (new TCP handshake + new TLS handshake).
+
+<AsciiDiagram
+  id="http-https/partition"
+  title="Network Partition — Effects on HTTP Connections"
+  content={`
+  ┌──────────┐                       ┌──────────┐
+  │  Client  │                       │  Server  │
+  │          │                       │          │
+  │ ┌──────┐ │                       │ ┌──────┐ │
+  │ │Conn 1│─│───── ESTABLISHED ────>│ │Conn 1│ │
+  │ │ (idle)│ │                       │ │ (idle)│ │
+  │ └──────┘ │                       │ └──────┘ │
+  │          │     Network break      │          │
+  │          │XXXXXXXXXXXXXXXXXXXXXXXX│          │
+  │          │    ~2 hours later       │          │
+  │          │     TCP keepalive       │          │
+  │          │     probes fail         │          │
+  │          │     Connection CLOSE_WAIT state    │
+  │          │                        │          │
+  │          │   Network restored     │          │
+  │          │                        │          │
+  │ GET /new │───── SYN ────────────>│ ┌──────┐ │
+  │          │<──── SYN-ACK ──────────│ │Conn 2│ │
+  │          │───── ACK ────────────>│ │(new) │ │
+  │          │<──── HTTP/1.1 200 OK──│ └──────┘ │
+  
+  Legend:
+  XXXX  Partition (no connectivity)
+  New connection required after partition resolves
+  Idle connections consume server memory: ~3 KB per connection
+  `}
+  caption="A network partition causes all active connections to eventually die. With 500,000 idle connections at 3 KB each, a server is wasting 1.5 GB of RAM on connections that will never deliver another request."
+/>
+
+**Detection**: The server should set a low keepalive timeout (10-30 seconds) for idle connections. The client should detect connection errors immediately on the next request attempt.
+
+**Recovery**: The client should implement retry with exponential backoff (100ms, 200ms, 400ms, 800ms, 1.6s, 3.2s, up to 30s max) and jitter. The server should aggressively close idle connections during a partition from the server side — TCP keepalive time lower than default (configure tcp_keepalive_time = 30).
+
+### Concurrent Writes — Two Clients Mutating the Same Resource
+
+**Scenario**: Two clients simultaneously send PUT requests to update the same resource. Without coordination, the last writer wins (LWW) — the server processes both requests sequentially on the same connection pool thread, and whichever arrives last at the database overwrites the first.
+
+**What happens**: The first write is lost silently. If the two writes were not intended to conflict (Client A updates field X, Client B updates field Y), the loss of one update is a data corruption.
+
+**Mitigations**:
+- **ETag / If-Match**: Client reads the resource, gets an ETag (content hash). Client sends PUT with If-Match: `<etag>`. Server rejects the write if the ETag does not match (412 Precondition Failed).
+- **Optimistic locking**: Similar to ETag, but using a version number field in the database. The update SQL includes WHERE version = :old_version. If zero rows are affected, the write fails.
+- **Last-write-wins with timestamps**: Acceptable only when the application can tolerate lost updates (e.g., non-critical metadata).
+
+<AsciiDiagram
+  id="http-https/concurrent-writes"
+  title="Concurrent Writes — Lost Update Scenario"
+  content={`
+  Client A                Server                  Client B
+  ────────                ──────                  ────────
+     │                      │                       │
+     │── GET /resource ────>│                       │
+     │  ETag: "abc"        │                       │
+     │<── 200 OK ──────────│                       │
+     │                      │                       │
+     │                      │── GET /resource ──────│
+     │                      │  ETag: "abc"          │
+     │                      │<── 200 OK ────────────│
+     │                      │                       │
+     │── PUT /resource ────>│                       │
+     │  If-Match: "abc"    │                       │
+     │  {name: "Alice"}    │                       │
+     │                      │   DB: UPDATE SET name │
+     │                      │   WHERE version=1     │
+     │<── 200 OK ──────────│   1 row affected ✓     │
+     │                      │                       │
+     │                      │── PUT /resource ──────│
+     │                      │  If-Match: "abc"      │
+     │                      │  {email: "bob@x.com"} │
+     │                      │   DB: UPDATE SET email│
+     │                      │   WHERE version=1     │
+     │                      │   0 rows affected ✗   │
+     │                      │<── 412 Precondition   │
+     │                      │    Failed ────────────│
+  
+  Legend:
+  ETag "abc" = version 1
+  Client A succeeds, bumps version to 2
+  Client B's If-Match: "abc" no longer matches version 2
+  → 412 tells client B to re-read and retry
+  `}
+  caption="ETag-based optimistic concurrency prevents lost updates. Without it, the second write silently overwrites the first — a common source of data corruption in REST APIs."
+/>
+
+### Stale Reads — Cache Says Fresh When Origin Changed
+
+**Scenario**: A CDN or HTTP cache serves a stale version of a resource because the cache's TTL has not expired, but the origin server has updated the resource.
+
+**What happens**: The client receives outdated data. For a news article, the impact is low. For a stock price or order status, the impact is critical — a user might see "order pending" when the order was actually shipped.
+
+**Detection**: The origin server sends Cache-Control: no-cache (forces cache to revalidate before serving) or Cache-Control: max-age=0, must-revalidate (cache may store but must check before serving). The cache sends If-None-Match (with the stored ETag) or If-Modified-Since (with the stored Last-Modified date). If the origin confirms the cache is fresh, it returns 304 Not Modified with an empty body. If stale, it returns 200 with the new content.
+
+<AsciiDiagram
+  id="http-https/stale-reads"
+  title="Stale Read — Cache Revalidation"
+  content={`
+  Client          CDN Cache                  Origin Server
+  ──────          ─────────                  ─────────────
+     │                │                          │
+     │── GET /price ─>│                          │
+     │                │  Cache HIT               │
+     │                │  Stored max-age: 300s    │
+     │                │  Stored at: 09:00:00     │
+     │                │  Now: 09:05:30           │
+     │                │  TTL expired             │
+     │                │                          │
+     │                │── GET /price ────────────>│
+     │                │  If-None-Match: "v1"     │
+     │                │                          │
+     │                │  Origin says:            │
+     │                │  "v1 is stale, here's    │
+     │                │   v2 with new price"     │
+     │                │<── 200 OK (new body) ────│
+     │                │  ETag: "v2"              │
+     │                │                          │
+     │                │  Update cache            │
+     │<── 200 OK ────│  Return new body          │
+     │  new price    │                          │
+  
+  Legend:
+  ──>  Request   <──  Response
+  Cache revalidates at TTL expiry
+  If origin returned 304 Not Modified: cache serves stored value (same body, no re-download)
+  `}
+  caption="Cache revalidation using ETag ensures clients never see stale data beyond the configured TTL. Without revalidation, a cache with max-age=3600s serves data up to one hour stale."
+/>
+
+## Performance Characteristics
+
+### Latency Breakdown
+
+The end-to-end latency of an HTTPS request decomposes into these components:
+
+| Component | p50 | p95 | p99.9 | Notes |
+|-----------|-----|-----|-------|-------|
+| DNS resolution | 2ms | 35ms | 200ms | Cached: 0ms (TTL depends on record) |
+| TCP handshake | 15ms | 40ms | 150ms | Varies by geographic distance |
+| TLS handshake (1.3) | 15ms | 35ms | 120ms | 1-RTT; 0-RTT for session resumption |
+| TLS handshake (1.2) | 30ms | 70ms | 250ms | 2-RTT; more cipher negotiation |
+| Request upload | 1ms | 5ms | 50ms | Body size dependent |
+| Server processing | 10ms | 80ms | 500ms | Application logic + DB queries |
+| Response download | 1ms | 10ms | 100ms | Body size + bandwidth dependent |
+| **Total (TLS 1.3, keep-alive)** | **44ms** | **200ms** | **1,120ms** | First request |
+| **Total (TLS 1.3, new conn)** | **29ms** | **170ms** | **1,000ms** | Repeat request on same connection |
+| **Total (HTTP/3, 0-RTT)** | **11ms** | **150ms** | **800ms** | No TCP or TLS latency |
+
+Numbers assume US-East to US-West coast (60ms RTT) and a well-optimized server application.
+
+### Throughput
+
+| Configuration | Requests/second | Connections | Notes |
+|---------------|----------------|-------------|-------|
+| HTTP/1.1, single thread, loopback | 80,000 | 1 | No network, no TLS |
+| HTTP/1.1, 4 workers, Nginx | 200,000 | 16,000 | 4KB responses, no TLS |
+| HTTPS (TLS 1.3), 4 workers | 80,000 | 16,000 | ~60% CPU for encryption |
+| HTTPS with AES-NI acceleration | 180,000 | 16,000 | under 5% CPU for encryption |
+| HTTP/2, 4 workers | 250,000 | 64,000 streams | Multiplexing overhead higher |
+| HTTP/3, single worker | 100,000 | 100,000 | QUIC in kernel bypass userspace |
+
+### Memory per Connection
+
+| Protocol | Memory per idle connection | Memory per active connection |
+|----------|---------------------------|------------------------------|
+| HTTP/1.1 (no keep-alive) | — | ~2 KB (read/write buffers) |
+| HTTP/1.1 (keep-alive) | ~3 KB | ~8 KB |
+| HTTPS/1.1 (keep-alive) | ~8 KB | ~30 KB (TLS session + buffers) |
+| HTTP/2 | ~10 KB | ~40 KB (stream state for up to 128 concurrent streams) |
+| HTTP/3 | ~15 KB | ~50 KB (QUIC connection + stream state + loss recovery) |
+
+At 500,000 concurrent connections with HTTP/2, a server consumes approximately 5 GB of RAM for connection state alone, before any application memory.
+
+## Configuration and Tuning
+
+### keepalive_timeout
+
+- **What it controls**: How long the server keeps an idle connection open waiting for the next request.
+- **Safe default**: 75 seconds (Nginx), 5 seconds (AWS ALB).
+- **When to change**: Lower (5-15s) if you have many idle connections and need to free server resources. Raise (120-300s) if short-lived clients reconnect frequently and the cost of new connections is high (e.g., high-latency mobile network).
+- **What breaks**: Setting too low causes clients to need new connections for every request, increasing latency by 2-3 RTT each time. Setting too high wastes server memory on connections that will never be reused.
+
+### max_connections / worker_connections
+
+- **What it controls**: Maximum number of concurrent connections per worker process.
+- **Safe default**: 1024 per worker (Nginx).
+- **When to change**: Raise if you have many clients with long idle times. Lower if the server is memory-constrained.
+- **What breaks**: Exceeding the limit causes new connections to be queued or rejected with an error. Setting too high without corresponding OS socket limits causes the kernel to run out of file descriptors.
+
+### ssl_session_cache
+
+- **What it controls**: Where and how many TLS sessions to cache for abbreviated handshakes.
+- **Safe default**: shared:SSL:10m (10 MB shared memory, holds ~40,000 sessions).
+- **When to change**: Increase (50m-100m) for high-traffic servers with many unique clients. Use shared across worker processes for multi-worker setups.
+- **What breaks**: No cache forces full TLS handshake on every new connection, adding 15-35ms of latency. Too small a cache evicts sessions prematurely, reducing session resumption rate.
+
+### send_timeout / proxy_send_timeout
+
+- **What it controls**: Maximum time the server waits for the client to acknowledge receiving data.
+- **Safe default**: 60 seconds.
+- **When to change**: Lower (5-10s) if clients are unreliable and slow sends indicate a problem. Raise (300s) for slow clients on poor networks.
+- **What breaks**: Setting too low causes premature disconnection of legitimate slow clients. Setting too high lets malfunctioning clients hold connections open indefinitely.
+
+### proxy_read_timeout
+
+- **What it controls**: Maximum time between successive read operations from the proxied backend server.
+- **Safe default**: 60 seconds.
+- **When to change**: Lower (5-15s) for fast services where long gaps indicate a backend failure. Raise (300s) for streaming responses or long-polling.
+- **What breaks**: Setting too low cuts off backend responses that include long database queries or slow upstream calls. Setting too high delays detection of a hung backend.
+
+### gzip / compression_level
+
+- **What it controls**: Whether to compress responses and at what compression level (1-9).
+- **Safe default**: on, level 2 (good compression with minimal CPU overhead).
+- **When to change**: Disable if the server is CPU-bound and serving already-compressed data (images, videos). Raise to level 6 if bandwidth is the bottleneck and CPU has headroom.
+- **What breaks**: Level 9 saves only 2-4% more bandwidth than level 6 but uses 3x more CPU. Compressing incompressible data (already-compressed images, encrypted content) wastes CPU and may increase response size.
+
+### http2_max_concurrent_streams
+
+- **What it controls**: Maximum number of concurrent HTTP/2 streams on a single connection.
+- **Safe default**: 128.
+- **When to change**: Raise (256-512) for API servers that serve many small resources simultaneously. Lower (32-64) to limit per-connection resource usage.
+- **What breaks**: Setting too high allows a single client to monopolize server resources. Setting too low forces clients to open multiple connections, defeating the purpose of HTTP/2 multiplexing.
+
+### ssl_protocols
+
+- **What it controls**: Which TLS protocol versions are accepted.
+- **Safe default**: TLSv1.2 TLSv1.3.
+- **When to change**: Remove TLSv1.2 if all clients support TLS 1.3 (dropping support for ~5% of clients as of 2026). Never enable TLSv1.0 or TLSv1.1 — they are deprecated due to security vulnerabilities (BEAST, POODLE, etc.).
+- **What breaks**: Enabling only TLS 1.3 means clients on older systems (Windows 7, some Android devices) cannot connect. Keeping TLSv1.0 or TLSv1.1 exposes the server to known attacks.
+
+### ssl_ciphers
+
+- **What it controls**: Which cipher suites are accepted, in preference order.
+- **Safe default**: HIGH:!aNULL:!MD5 (modern, authenticated ciphers only).
+- **When to change**: Use ECDHE+AESGCM:!DSS:!aNULL:!eNULL:!EXPORT:!DES:!MD5:!PSK:!RC4 for maximum compatibility with TLS 1.2 clients while maintaining security.
+- **What breaks**: Removing all AES ciphers in favor of ChaCha20-only breaks clients without ChaCha20 hardware acceleration (some Intel CPUs). Including export-grade ciphers (DES, RC4) makes the server trivially crackable.
+
+### limit_conn / limit_rate
+
+- **What it controls**: Maximum concurrent connections per IP address and maximum transfer rate per connection.
+- **Safe default**: limit_conn per IP to 10 connections; limit_rate 0 (unlimited).
+- **When to change**: Set limit_conn to 5-10 for public-facing APIs to prevent a single client from using all connections. Set limit_rate to 1 MB/s for file downloads to prevent bandwidth starvation.
+- **What breaks**: Setting limit_conn too low breaks legitimate clients using multiple connections (HTTP/1.1 browsers open 6 connections per origin). Setting limit_rate too low makes large API responses unusably slow.
+
+### client_max_body_size
+
+- **What it controls**: Maximum size of the request body.
+- **Safe default**: 1 MB.
+- **When to change**: Raise to 10 MB for APIs that accept file uploads. Raise to 50 MB for video/image upload APIs. Lower to 64 KB for APIs that only accept JSON payloads.
+- **What breaks**: Setting too low causes valid file uploads to fail with 413 Request Entity Too Large. Setting too high allows clients to upload multi-GB files that exhaust server disk space or memory.
+
+### lingering_close
+
+- **What it controls**: Whether the server waits for the client to acknowledge connection close before fully closing the TCP connection.
+- **Safe default**: on (enabled).
+- **When to change**: Disable only if you understand the TCP reset risk — when lingering_close is off, the server sends a TCP RST after closing, which may cause clients to see connection errors instead of clean closures.
+- **What breaks**: When disabled, clients may see "Connection reset by peer" errors instead of clean connection closure, especially for clients that send data after the server has closed its write side.
+
+### resolver (DNS resolver for upstream lookups)
+
+- **What it controls**: Which DNS resolver the proxy uses to resolve upstream hostnames.
+- **Safe default**: Use the system resolver (no explicit configuration).
+- **When to change**: Set an explicit resolver (resolver 8.8.8.8 valid=300s) for proxies that need to dynamically resolve upstream hostnames. This is essential for containerized environments where upstream IPs change frequently.
+- **What breaks**: Without an explicit resolver and valid= parameter, the proxy caches DNS results indefinitely — if an upstream's IP changes (after a deployment or scaling event), the proxy continues sending traffic to the old IP for the duration of the kernel's DNS cache TTL.
+
+### Performance Tuning Checklist
+
+For a production HTTPS server handling 10,000+ req/s:
+
+1. Enable TLS 1.3 with session caching (ssl_session_cache shared:SSL:50m).
+2. Use HTTP/2 with max_concurrent_streams = 128.
+3. Set keepalive_timeout = 30s (balances memory and reuse).
+4. Enable gzip compression at level 2 for text responses over 1KB.
+5. Set sendfile on and tcp_nopush on for zero-copy response delivery.
+6. Set worker_processes to match CPU core count.
+7. Set worker_connections = 4096 (requires ulimit -n 65535).
+8. Use multiple worker processes with shared SSL session cache.
+9. Enable OCSP stapling to improve TLS handshake performance.
+10. Set client_max_body_size to match your actual maximum payload (not the default).
+
+
+
+**Next**: With a thorough understanding of how HTTP and HTTPS work internally, the next step is to explore how these protocols are deployed at scale — load balancers, connection pooling, multi-region topologies, and capacity planning for 10 million daily active users.

@@ -1,0 +1,481 @@
+---
+id: publish-subscribe-architecture
+sidebar_position: 3
+title: "Publish-Subscribe at Scale"
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation and Its Limits
+
+A minimal pub-sub system can be built in a few hundred lines of code. That implementation reveals fundamental scaling bottlenecks.
+
+### Minimal Broker
+
+```python
+# naive_broker.py — do not use in production
+class NaiveBroker:
+    def __init__(self):
+        self.subscribers = {}  # topic -> list of subscriber endpoints
+
+    def subscribe(self, topic, endpoint):
+        self.subscribers.setdefault(topic, []).append(endpoint)
+
+    def publish(self, topic, message):
+        for endpoint in self.subscribers.get(topic, []):
+            self._deliver(endpoint, message)
+
+    def _deliver(self, endpoint, message):
+        try:
+            requests.post(endpoint, json=message, timeout=5)
+        except Exception as e:
+            print(f"Failed to deliver to {endpoint}: {e}")
+```
+
+This implementation works for a demo with 2 publishers and 3 subscribers on the same machine. It fails at scale for several reasons:
+
+- **Synchronous delivery**: each publish blocks until all subscribers receive the message. One slow subscriber delays the publisher.
+- **No persistence**: messages are lost if the broker crashes before delivery.
+- **Single process**: cannot use more than one CPU core. Throughput is capped by Python's GIL.
+- **No backpressure**: if a subscriber is down, the broker keeps retrying forever, consuming resources.
+- **No authentication or authorization**: any client can publish or subscribe to any topic.
+- **No message ordering guarantee**: the order of delivery to subscribers is undefined.
+- **No retry with backoff**: a brief subscriber failure causes immediate retry storm.
+- **No batching**: each message is a separate HTTP request.
+
+With this broker on a single machine, you can handle approximately 50 messages/second with 10 subscribers. Beyond that, HTTP connection overhead and blocking I/O dominate.
+
+### Scaling Limits of the Naive Approach
+
+```text
+Resource           Naive Limit     Reason
+Concurrent conns   1,000           Single thread, blocking I/O
+Throughput         50 msg/s        HTTP overhead per message
+Subscribers        100             Linear scaling of delivery work
+Message size       10 MB           Single-threaded serialization
+Durability         None            In-memory only
+Latency p99        5-30 seconds    Blocking on slow subscribers
+```
+
+## Production Architecture
+
+A production pub-sub system must handle 100,000+ messages/second, 10,000+ subscribers, and provide delivery guarantees. The architecture changes fundamentally.
+
+### Cluster Topology
+
+A production broker runs as a cluster of nodes. Each node handles a subset of connections and topics. The cluster presents a single endpoint to clients.
+
+<AsciiDiagram
+  id="publish-subscribe/03-cluster-topology"
+  title="Production Broker Cluster Topology"
+  content={
+
+`┌──────────────────────────────────────────────────────────────────────────┐
+│                      PRODUCTION BROKER CLUSTER                            │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│                           ┌──────────────────────┐                       │
+│                           │   Load Balancer       │                       │
+│                           │  (L4: round-robin)    │                       │
+│                           └────┬────┬────┬────────┘                       │
+│                                │    │    │                                │
+│             ┌──────────────────┘    │    └──────────────────┐             │
+│             ▼                       ▼                       ▼             │
+│      ┌────────────┐         ┌────────────┐         ┌────────────┐        │
+│      │  Broker-1  │         │  Broker-2  │         │  Broker-3  │        │
+│      │            │         │            │         │            │        │
+│      │ Partition  │         │ Partition  │         │ Partition  │        │
+│      │ Leader: 0  │◄────────┤ Leader: 1  │◄────────┤ Leader: 2  │        │
+│      │ Follower:1 │────────►│ Follower:0 │────────►│ Follower:2 │        │
+│      │ Follower:2 │────────►│ Follower:2 │────────►│ Follower:0 │        │
+│      └────────────┘         └────────────┘         └────────────┘        │
+│             │                      │                      │              │
+│             └──────────────────────┼──────────────────────┘              │
+│                                    ▼                                     │
+│                        ┌──────────────────────┐                          │
+│                        │   ZooKeeper / KRaft   │                          │
+│                        │   (Consensus & Meta)  │                          │
+│                        └──────────────────────┘                          │
+│                                                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │  Shared Storage Layer (NFS / EBS / Local SSDs with replication)  │    │
+│  │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐        │    │
+│  │  │Log 0 │ │Log 1 │ │Log 2 │ │Log 3 │ │Log 4 │ │Log 5 │        │    │
+│  │  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘        │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────────┘
+`
+  }
+  alt="Cluster diagram showing 3 broker nodes, load balancer, ZooKeeper, and client connections"
+/>
+
+### Key Architectural Decisions
+
+**Shared-nothing architecture**: each broker node owns its storage (log segments). Data is replicated across nodes for fault tolerance. No single shared storage bottleneck.
+
+**Partitioned topics**: topics are split into partitions. Each partition is an ordered, immutable log. Partitions are distributed across cluster nodes. This provides parallelism: a topic with 12 partitions can be served by 12 nodes.
+
+**Leader-follower replication**: each partition has a leader (handles all reads and writes) and N followers (replicate data). If the leader fails, a follower is elected as the new leader. Clients connect to the leader of the partition they need.
+
+**Metadata service**: a consensus system (ZooKeeper, etcd, or KRaft in Kafka 3.x+) stores cluster metadata: which nodes are alive, which node leads which partition, topic configuration. This metadata is updated infrequently and cached by each broker.
+
+### Horizontal Scaling
+
+To add capacity, add broker nodes. The cluster rebalances partitions across the new nodes. Some partition leadership changes occur, causing brief pauses (milliseconds).
+
+```text
+Before: 3 nodes, 12 partitions
+  Node 1: partitions 0, 1, 2, 3
+  Node 2: partitions 4, 5, 6, 7
+  Node 3: partitions 8, 9, 10, 11
+
+After adding Node 4:
+  Node 1: partitions 0, 1, 2
+  Node 2: partitions 3, 4, 5
+  Node 3: partitions 6, 7, 8
+  Node 4: partitions 9, 10, 11
+```
+
+Each node now handles 3 partitions instead of 4. Throughput increases by approximately 33%.
+
+### Networking Architecture
+
+Production brokers use a multi-layer network design:
+
+- **Client-facing subnet**: publishers and subscribers connect here. TLS termination at load balancer.
+- **Broker-to-broker subnet**: internal replication traffic. Higher bandwidth, lower latency. Often a separate VLAN with jumbo frames.
+- **Metadata subnet**: ZooKeeper/etcd/Raft traffic. Low latency, small messages.
+
+```text
+┌─────────┐     ┌─────────┐     ┌─────────┐
+│Public LB│     │Public LB│     │Public LB│       (Client-facing: port 9092, 443)
+└────┬────┘     └────┬────┘     └────┬────┘
+     │               │               │
+┌────▼────┐    ┌────▼────┐    ┌────▼────┐
+│ Broker1 │◄───│ Broker2 │◄───│ Broker3 │      (Broker-internal: port 9093)
+└────┬────┘    └────┬────┘    └────┬────┘
+     │               │               │
+     └───────┬───────┴───────┬───────┘
+             │               │
+     ┌───────▼───────┐ ┌────▼────────┐
+     │ ZK-1 / etcd-1 │ │ ZK-2 / etcd-2│   (Metadata: port 2181, 2379)
+     └───────────────┘ └─────────────┘
+```
+
+## Integration Patterns
+
+Pub-sub systems are rarely used in isolation. They integrate with the broader architecture through established patterns.
+
+### Event Sourcing
+
+In event sourcing, the pub-sub broker becomes the system of record. Every state change is an event stored in the broker. Services reconstruct their state by replaying events from the broker.
+
+```python
+# Event sourcing: service rebuilds state from broker
+class OrderService:
+    def __init__(self, broker):
+        self.broker = broker
+        self.orders = {}
+
+    def rebuild_state(self):
+        for event in self.broker.replay_from_beginning("orders"):
+            self.apply(event)
+
+    def apply(self, event):
+        if event.type == "OrderPlaced":
+            self.orders[event.order_id] = {"status": "placed", "items": event.items}
+        elif event.type == "OrderShipped":
+            self.orders[event.order_id]["status"] = "shipped"
+        elif event.type == "OrderCancelled":
+            self.orders[event.order_id]["status"] = "cancelled"
+```
+
+### CQRS (Command Query Responsibility Segregation)
+
+Pub-sub bridges the command side (writes) and the query side (reads) of an application. Commands produce events published to the broker. Read models subscribe to those events and build materialized views.
+
+<AsciiDiagram
+  id="publish-subscribe/03-cqrs"
+  title="CQRS with Pub-Sub as the Event Bus"
+  content={
+
+`┌──────────────────────────────────────────────────────────────────────┐
+│                    CQRS WITH PUB-SUB EVENT BUS                        │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  Command Side                    Event Bus                  Query Side│
+│  ┌────────────┐                ┌──────────┐              ┌─────────┐│
+│  │  POST /order│─ ─ ─(create)──│  orders  │── ─ ─ ─ ─ ─►│ Order   ││
+│  │  (REST API) │               │  topic   │              │ Read DB ││
+│  └────────────┘                └──────────┘              └─────────┘│
+│                                                                       │
+│  ┌────────────┐                ┌──────────┐              ┌─────────┐│
+│  │  POST /inv  │─ ─ ─(update)──│inventory │── ─ ─ ─ ─ ─►│Inventory││
+│  │  (REST API) │               │  topic   │              │ Read DB ││
+│  └────────────┘                └──────────┘              └─────────┘│
+│                                                                       │
+│  ┌────────────┐                ┌──────────┐              ┌─────────┐│
+│  │  POST /user │─ ─ ─(register)│  users   │── ─ ─ ─ ─ ─►│ User    ││
+│  │  (REST API) │               │  topic   │              │ Read DB ││
+│  └────────────┘                └──────────┘              └─────────┘│
+└──────────────────────────────────────────────────────────────────────┘
+`
+  }
+  alt="Architecture diagram showing commands flowing through pub-sub to update read models in a CQRS pattern"
+/>
+
+### Transactional Outbox
+
+The transactional outbox pattern ensures reliable event publication. When a service writes to its database, it atomically writes an event to an outbox table. A separate process (the outbox publisher) reads from the outbox and publishes to the broker.
+
+```sql
+-- Atomic: write order + outbox event in one transaction
+BEGIN;
+  INSERT INTO orders (id, customer_id, total) VALUES (4421, 8891, 149.99);
+  INSERT INTO outbox (event_type, aggregate_id, payload, created_at)
+    VALUES ('OrderPlaced', '4421', '{"customer_id": 8891, "total": 149.99}', NOW());
+COMMIT;
+```
+
+This prevents the dual-write problem: if the database write succeeds but the broker publish fails (or vice versa), the system becomes inconsistent. The outbox table guarantees the event is persisted. A retry mechanism publishes pending events.
+
+### Saga Pattern
+
+Distributed transactions across microservices use sagas. Each step publishes an event. The next step subscribes to that event and performs its action. If a step fails, it publishes a compensation event to undo previous steps.
+
+```text
+Order service:  publish "OrderPlaced" ──► Inventory service
+Inventory svc:  subscribe "OrderPlaced" → reserve stock → publish "StockReserved"
+Payment svc:    subscribe "StockReserved" → charge card → publish "PaymentReceived"
+Shipping svc:   subscribe "PaymentReceived" → create shipment → publish "OrderShipped"
+
+On failure at Payment:
+  Payment svc:  publish "PaymentFailed"
+  Inventory svc: subscribe "PaymentFailed" → release stock → publish "StockReleased"
+  Order svc:    subscribe "PaymentFailed" → mark order cancelled
+```
+
+## Multi-Region Deployment
+
+Global systems need pub-sub across regions. This introduces significant complexity.
+
+### Cross-Region Replication
+
+**Active-Passive**: one region hosts the primary broker cluster. Other regions host replicas that consume from the primary via a cross-region consumer. Failover requires DNS updates and may lose messages in transit.
+
+**Active-Active**: each region has a full broker cluster. Publishers send to their local cluster. Clusters replicate events to each other. Conflict resolution is required for concurrent events on the same entity.
+
+<AsciiDiagram
+  id="publish-subscribe/03-multi-region"
+  title="Multi-Region Pub-Sub Deployment"
+  content={
+
+`┌──────────────────────────────────────────────────────────────────────────┐
+│                          MULTI-REGION DEPLOYMENT                          │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  Region: us-east-1            Region: eu-west-1          Region: ap-southeast-1
+│  ┌────────────────────┐       ┌────────────────────┐      ┌────────────────────┐
+│  │  Broker Cluster A  │       │  Broker Cluster B  │      │  Broker Cluster C  │
+│  │                    │       │                    │      │                    │
+│  │  ┌──────────────┐  │       │  ┌──────────────┐  │      │  ┌──────────────┐  │
+│  │  │ orders topic │  │       │  │ orders topic │  │      │  │ orders topic │  │
+│  │  └──────────────┘  │       │  └──────────────┘  │      │  └──────────────┘  │
+│  │         │          │       │         │          │      │         │          │
+│  │         │          │       │         │          │      │         │          │
+│  │  ┌──────▼───────┐  │       │  ┌──────▼───────┐  │      │  ┌──────▼───────┐  │
+│  │  │ Mirror Maker │──┼───────┼──┤ Mirror Maker │──┼──────┼──┤ Mirror Maker │  │
+│  │  └──────▲───────┘  │       │  └──────▲───────┘  │      │  └──────▲───────┘  │
+│  │         │          │       │         │          │      │         │          │
+│  │         └──────────┼───────┼─────────┘          │      │         │          │
+│  │                    │       │                    │      │                    │
+│  │  Regional Apps:    │       │  Regional Apps:    │      │  Regional Apps:    │
+│  │  - US publishers   │       │  - EU publishers   │      │  - APAC publishers │
+│  │  - US subscribers  │       │  - EU subscribers  │      │  - APAC subscribers│
+│  └────────────────────┘       └────────────────────┘      └────────────────────┘
+│                                                                           │
+│  Cross-region latency: us-east-1 to eu-west-1: ~80ms                     │
+│                       us-east-1 to ap-southeast-1: ~200ms                 │
+└──────────────────────────────────────────────────────────────────────────┘
+`
+  }
+  alt="Architecture diagram showing three regions with active-active cross-region replication of pub-sub topics"
+/>
+
+### Challenges in Multi-Region Pub-Sub
+
+**Cross-region latency**: 50-300ms round trip. Publish acknowledgments that wait for cross-region replication add this latency to every message. Solutions: local-first writes with async replication, or region-specific topics.
+
+**Split-brain**: if a network partition isolates two regions, both may accept writes. After recovery, reconciling divergent event sequences requires conflict resolution. Strategies: last-writer-wins, per-region ID ranges, CRDTs.
+
+**Regulatory compliance**: data residency requirements (GDPR in Europe, PCI in US) may prevent cross-region replication of certain topics. Route topic-specific replication through a filtering layer.
+
+**Disaster recovery**: RPO (Recovery Point Objective) and RTO (Recovery Time Objective) determine replication strategy. RPO of 1 minute means you can lose at most 1 minute of data. This drives replication frequency.
+
+```
+RPO Target    Replication Strategy        Infrastructure Cost
+RPO = 0       Synchronous cross-region    Very high (80ms+ added latency)
+RPO < 1s      Near-sync replication       High
+RPO < 60s     Async replication (MirrorMaker)  Moderate
+RPO < 1hr     Periodic batch copy         Low
+```
+
+## Capacity Planning
+
+Properly sizing a pub-sub deployment prevents performance surprises.
+
+### Throughput Estimation
+
+Start with these inputs:
+
+- Average message size: 2 KB (typical), 10 KB (with payloads), 100 KB (with files)
+- Publish rate: 50,000 messages/second
+- Number of topics: 100
+- Average subscribers per topic: 8
+- Replication factor: 3
+
+```text
+Ingress throughput:     50,000 msg/s x 2 KB = 100 MB/s
+Egress (fan-out):      50,000 msg/s x 8 subs x 2 KB = 800 MB/s
+Replication traffic:   100 MB/s x 3 replicas = 300 MB/s internal
+Total network:         ~1.2 GB/s (ingress + egress + replication)
+```
+
+A 10 Gbps network link supports ~1.25 GB/s theoretical, so 1.2 GB/s uses 96% of capacity. You need 2x 10 Gbps links or a 25 Gbps link.
+
+### Storage Estimation
+
+```text
+Daily data:     100 MB/s x 86,400 seconds = 8.64 TB/day
+With replication x3:  25.92 TB/day
+Retention 7 days:     181.4 TB
+Retention 30 days:    777.6 TB
+```
+
+Use compression: Snappy typically reduces JSON payloads by 60%. Compressed daily storage: 3.46 TB uncompressed per day, ~1.4 TB compressed.
+
+### Hardware Sizing
+
+| Workload | CPU | RAM | Disk | Network |
+|---|---|---|---|---|
+| Low (5K msg/s) | 4 cores | 16 GB | 500 GB SSD | 1 Gbps |
+| Medium (50K msg/s) | 16 cores | 64 GB | 4 TB NVMe | 10 Gbps |
+| High (500K msg/s) | 64 cores | 256 GB | 16 TB NVMe | 25 Gbps x2 |
+| Extreme (2M+ msg/s) | 128+ cores | 512 GB+ | 32 TB+ NVMe | 100 Gbps |
+
+These estimates assume persistent delivery with 3x replication. Non-persistent delivery reduces disk and network requirements by roughly 60%.
+
+## Deployment Patterns
+
+How you configure and operate brokers differs by environment.
+
+### Containerized Deployment (Kubernetes)
+
+```yaml
+# Kafka on Kubernetes (StatefulSet)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: broker
+spec:
+  serviceName: broker-headless
+  replicas: 6
+  podManagementPolicy: Parallel
+  template:
+    spec:
+      containers:
+      - name: broker
+        image: confluentinc/cp-kafka:7.5.0
+        ports:
+        - containerPort: 9092
+        env:
+        - name: KAFKA_BROKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: KAFKA_ADVERTISED_LISTENERS
+          value: "PLAINTEXT://$(POD_NAME).broker-headless:9092"
+        resources:
+          requests:
+            cpu: "4"
+            memory: "16Gi"
+          limits:
+            cpu: "8"
+            memory: "32Gi"
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      storageClassName: fast-ssd
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 2Ti
+```
+
+Resource requests and limits should reserve CPU for critical threads (I/O threads, network threads, replica fetchers). CPU throttling at the container level causes JVM GC pauses and increased latency.
+
+### Bare Metal Deployment
+
+Large deployments (500K+ msg/s) often use bare metal. The reasons: predictable latency (no noisy neighbor from other containers), direct NVMe access, full NUMA control.
+
+```bash
+# Tuning for bare metal Kafka broker
+# Network
+sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.wmem_max=16777216
+sysctl -w net.core.netdev_budget=600
+sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216"
+sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216"
+
+# Disk
+echo noop > /sys/block/nvme0n1/queue/scheduler
+echo 4096 > /sys/block/nvme0n1/queue/nr_requests
+
+# Memory
+sysctl -w vm.dirty_ratio=40
+sysctl -w vm.dirty_background_ratio=5
+```
+
+### Cloud-Native (Serverless)
+
+Cloud-managed pub-sub services scale automatically. No cluster management required. Trade-off: higher per-message cost and less configuration control.
+
+```python
+# Google Cloud Pub/Sub — no cluster to manage
+from google.cloud import pubsub_v1
+
+publisher = pubsub_v1.PublisherClient()
+topic_path = publisher.topic_path("my-project", "orders-created")
+
+future = publisher.publish(topic_path, order_data.encode("utf-8"))
+message_id = future.result()
+print(f"Published message {message_id}")
+```
+
+GCP Pub/Sub handles scaling transparently up to 1 GB/s per region. AWS SNS/SQS handles up to 100,000 messages/second per topic (soft limit, raiseable). Azure Event Grid handles up to 10,000,000 events/second per region.
+
+### Hybrid: Managed + Self-Managed
+
+Some organizations run self-managed Kafka for core event streams (orders, payments) and managed services for auxiliary channels (notifications, analytics, audit logs). The two systems connect via a bridge service.
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│  Self-Managed Kafka (core)          Managed Pub/Sub (aux)  │
+│                                │                           │
+│  ┌─────────┐ ┌─────────┐      │     ┌─────────────┐      │
+│  │ Orders  │ │Payments │      │     │ Notifications│      │
+│  │ Topic   │ │ Topic   │      │     │   Topic     │      │
+│  └───┬─────┘ └───┬─────┘      │     └──────┬──────┘      │
+│      │           │            │            │             │
+│      └─────┬─────┘            │            │             │
+│            │                  │            │             │
+│      ┌─────▼──────┐           │     ┌──────▼──────┐      │
+│      │ Bridge Svc │───────────┼────►│ SNS Topic   │      │
+│      │ (connector)│           │     └─────────────┘      │
+│      └────────────┘           │                          │
+└───────────────────────────────┘──────────────────────────┘
+```

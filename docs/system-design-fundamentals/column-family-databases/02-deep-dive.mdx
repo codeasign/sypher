@@ -1,0 +1,907 @@
+---
+id: column-family-databases-deep-dive
+title: Column-Family Databases — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Column-Family Databases — Under the Hood
+
+**Prerequisites:** Basic familiarity with distributed systems concepts (nodes, replication, consistency models) and the column-family data model from the previous page.
+
+**Learning objectives:**
+- Describe the internal architecture of a Cassandra/ScyllaDB cluster: nodes, virtual nodes, gossip, hinted handoff
+- Explain the write path: commit log, memtable, SSTable flush, and the role of LSM trees
+- Explain the read path: Bloom filters, partition key cache, row cache, merge across memtables and SSTables
+- Compare compaction strategies (STCS, LCS, TWCS) and their trade-offs
+- Articulate how tunable consistency, hinted handoff, and read repair achieve configurable durability and availability
+- Estimate latency and throughput based on consistency level and data location
+- Choose configuration parameters (replication factor, compaction strategy, consistency levels) for a given workload
+
+---
+
+## 1. Cluster Architecture
+
+A Cassandra or ScyllaDB cluster is a peer-to-peer distributed system. Every node is identical — there is no leader, no master, no single point of failure. Nodes communicate using a protocol called **Gossip**.
+
+### Ring Topology and Virtual Nodes
+
+Data is distributed across the cluster using **consistent hashing**. Each node owns a range of the hash ring. To handle imbalance (hot spots, heterogeneous hardware), each physical node is divided into **virtual nodes (vnodes)** — typically 256 per node. Vnodes distribute ownership at finer granularity and make cluster expansion and recovery faster: when a node joins or leaves, every other node takes a proportional share of its load.
+
+<AsciiDiagram
+  id="column-family-databases/deep-dive-ring"
+  alt="Hash ring showing four physical nodes each with two virtual nodes, and how token ranges map to vnodes"
+  caption="Consistent hash ring with virtual nodes"
+>{
+`┌─────────────────────────────────────────────────────────────────┐
+│                    Consistent Hash Ring                          │
+│                                                                  │
+│                        ┌──────────┐                              │
+│                   ┌────┤ vnode A1 ├────┐                         │
+│                   │    │ 0x0-0x3F │    │                         │
+│                   │    └──────────┘    │                         │
+│           ┌───────┤                   ├────────┐                 │
+│           │       │    ┌──────────┐    │        │                 │
+│           │       └────┤ vnode C1 ├────┘        │                 │
+│           │            │ 0x40-0x7F│             │                 │
+│           │            └──────────┘             │                 │
+│    ┌──────┴──────────┐              ┌───────────┴──────┐          │
+│    │    vnode B1     │              │     vnode D1      │         │
+│    │  0xC0-0xFF      │              │   0x80-0xBF       │         │
+│    └─────────────────┘              └──────────────────┘         │
+│                                                                  │
+│  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐   │
+│  │Node A│  │Node B│  │Node C│  │Node D│  │Node E│  │Node F│   │
+│  │vnodes│  │vnodes│  │vnodes│  │vnodes│  │vnodes│  │vnodes│   │
+│  │  A1  │  │  B1  │  │  C1  │  │  D1  │  │  E1  │  │  F1  │   │
+│  │  A2  │  │  B2  │  │  C2  │  │  D2  │  │  E2  │  │  F2  │   │
+│  └──────┘  └──────┘  └──────┘  └──────┘  └──────┘  └──────┘   │
+│                                                                  │
+│  Each physical node → 256 vnodes (simplified to 2 shown here)   │
+│  Each vnode owns a token range on the ring                       │
+│  Replication: each key stored on N nodes (N = RF)               │
+└─────────────────────────────────────────────────────────────────┘`
+}
+</AsciiDiagram>
+
+### Gossip Protocol
+
+Every second, each node picks a random peer and exchanges state information: schema versions, load, uptime, suspicion of failed nodes. Within a few gossip rounds, every node learns the cluster state. Gossip has three key properties:
+
+- **Decentralized** — no single point of coordination
+- **Failure detection** — the **Phi Accrual** failure detector assigns a suspicion level (phi) rather than a binary alive/dead. If phi exceeds a threshold (default 8), the node is marked dead
+- **Eventually consistent** — state propagates within O(log N) rounds
+
+### Snitches
+
+A **snitch** maps nodes to physical data centers and racks. Cassandra uses this information to avoid putting replicas on the same rack and to route read requests to the closest replica. Common snitch types:
+
+| Snitch | Use Case |
+|--------|----------|
+| `SimpleSnitch` | Single-dC, single-rack (dev/test only) |
+| `GossipingPropertyFileSnitch` | Multi-dC, multi-rack (production standard) |
+| `Ec2Snitch` / `Ec2MultiRegionSnitch` | AWS EC2 single-region / multi-region |
+| `GoogleCloudSnitch` | GCP zones |
+
+<AsciiDiagram
+  id="column-family-databases/deep-dive-gossip"
+  alt="Three nodes exchanging gossip messages showing the Hello, Digest, and Ack/Nack phases"
+  caption="Gossip protocol message exchange between nodes"
+>{
+`┌─────────────────────────────────────────────────────────────────┐
+│                    Gossip Protocol — One Round                   │
+│                                                                  │
+│   Node A                          Node B                        │
+│   ┌────────┐                      ┌────────┐                    │
+│   │ Gossip │                      │ Gossip │                    │
+│   │Module  │                      │Module  │                    │
+│   └───┬────┘                      └───┬────┘                    │
+│       │      1. SYN (digest)          │                         │
+│       │ ─────────────────────────────>│                         │
+│       │                               │ Compare against own     │
+│       │      2. SYN-ACK (diffs)       │                         │
+│       │ <─────────────────────────────│                         │
+│       │                               │                         │
+│       │      3. ACK (acknowledge)     │                         │
+│       │ ─────────────────────────────>│                         │
+│       │                               │                         │
+│       │  After exchange: each node    │                         │
+│       │  updates its local endpoint   │                         │
+│       │  state map                    │                         │
+│       │                               │                         │
+│       │  Repeat every 1 second with   │                         │
+│       │  a random peer                │                         │
+└─────────────────────────────────────────────────────────────────┘`
+}
+</AsciiDiagram>
+
+### Hinted Handoff
+
+When a write arrives and the coordinating node discovers the target replica is down, the coordinator saves a **hint** — a note storing the write data and the intended replica's ID. Hints are stored locally (in a hints table) and replayed when the replica comes back.
+
+- Hints are capped per node (default 1 GB per node per target)
+- Hints have a **time-to-live** — default 3 hours. After that they expire
+- Hints maintain **write availability** at the cost of eventual consistency
+
+<AsciiDiagram
+  id="column-family-databases/deep-dive-hinted-handoff"
+  alt="Coordinator node accepting a write and storing a hint when one replica is down, then replaying the hint when the replica recovers"
+  caption="Hinted handoff write path during replica unavailability"
+>{
+`┌─────────────────────────────────────────────────────────────────┐
+│                  Hinted Handoff Flow                             │
+│                                                                  │
+│   Client                  Coordinator          Replica A    Rep. B (down)
+│   ┌──────┐                ┌───────────┐        ┌────────┐  ┌────────┐
+│   │Write │                │ Write Path│        │ Normal │  │  XX    │
+│   │──────|────────────────>│          │        │ Replica│  │  Down  │
+│   │      │                │           │        └───┬────┘  └────────┘
+│   │      │                │ 1. Send to A ─────────>│        │
+│   │      │                │ 2. Send to B ──────X (down)    │
+│   │      │                │           │                   │
+│   │      │                │ 3. Store hint for B           │
+│   │      │                │    ┌──────────────────┐       │
+│   │      │                │    │ Hints table      │       │
+│   │      │                │    │ key=...,          │       │
+│   │      │                │    │ target=B          │       │
+│   │      │                │    └──────────────────┘       │
+│   │      │<── success ────│              │                │
+│   │      │                │              │                │
+│   │  ... time passes ...  │              │    B restarts  │
+│   │      │                │              │ ───────────────│
+│   │      │                │ 4. Detect B up               │
+│   │      │                │    Replay hint ───────────────│
+│   │      │                │    Delete hint                │
+│   └──────┘                └───────────┘                   │
+└─────────────────────────────────────────────────────────────────┘`
+}
+</AsciiDiagram>
+
+---
+
+## 2. Storage Engine: LSM Trees
+
+Cassandra and ScyllaDB use a **Log-Structured Merge (LSM) tree** as their storage engine. An LSM tree trades read amplification for write throughput — writes are always sequential and fast.
+
+### The Write Path in Detail
+
+Every write goes through four stages:
+
+1. **Commit log append** — the mutation is written sequentially to the commit log on disk (durability)
+2. **Memtable write** — the mutation is applied to the in-memory memtable (a sorted, immutable data structure)
+3. **Memtable flush** — when the memtable reaches a size threshold (default 128-256 MB), it is frozen (made read-only) and a new memtable starts accepting writes. The frozen memtable is flushed to disk as an **SSTable** (Sorted String Table)
+4. **Commit log cleanup** — after the flush, the corresponding commit log segment is deleted
+
+### Commit Log
+
+The commit log is a **sequential append-only log** on disk. Every mutation is written here before it touches the memtable. This guarantees that no acknowledged write is lost, even if the node crashes before the memtable is flushed. On restart, the commit log is replayed to rebuild the memtables.
+
+- **Batch mode** (`commitlog_sync: batch`) — the write is acknowledged only after the commit log fsync completes. Slow (2-10 ms per write) but zero data loss.
+- **Periodic mode** (`commitlog_sync: periodic`, default 10 s) — the thread performing the write does not wait for fsync. A background thread fsyncs every N ms. The last N ms of writes can be lost on a crash. Fast (sub-millisecond write acknowledgment).
+
+### Memtables
+
+A memtable is an **in-memory skip list or B-tree** of sorted rows. It supports O(log N) lookups and O(1) appends. Each column family has one active memtable and zero or more frozen memtables waiting to be flushed.
+
+- `memtable_heap_space_in_mb` — heap allocation for memtables (default 1/4 of heap)
+- `memtable_offheap_space_in_mb` — off-heap allocation (when using `offheap_objects` strategy)
+- `memtable_flush_writers` — number of threads that flush memtables to SSTables (default 2 per data directory)
+
+### SSTables
+
+An SSTable is an **immutable, sorted, on-disk file** containing rows for a token range. Once written, it is never modified. Over time, many SSTables accumulate for the same token range, which is why compaction is necessary.
+
+Each SSTable consists of:
+
+- **Data file** — sorted rows (key-value pairs)
+- **Primary index** — offset of each partition key in the data file
+- **Bloom filter** — probabilistic set membership (for fast negative lookups)
+- **Summary** — sampling of the primary index (256-byte samples by default)
+- **Compression metadata** — offsets for compressed blocks
+- **Statistics** — min/max timestamps, clustering info, etc.
+- **Digest** — CRC checksum of SSTable content
+- **CRC** — checksum for each component
+
+<AsciiDiagram
+  id="column-family-databases/deep-dive-lsm"
+  alt="LSM tree showing the write path: commit log, memtable, and multiple SSTable layers on disk"
+  caption="LSM tree write path — commit log, memtable, and SSTable layers"
+>{
+`┌─────────────────────────────────────────────────────────────────┐
+│                    LSM Tree — Write Path                         │
+│                                                                  │
+│   Client write (INSERT INTO users ...)                          │
+│        │                                                         │
+│        ▼                                                         │
+│   ┌────────────────────────────────────────┐                    │
+│   │  Step 1: Write to Commit Log (disk)    │  Sequential append │
+│   │  ┌──────────────────────────────────┐  │  Always succeeds   │
+│   │  │ [segment 1] [segment 2] [seg 3] │  │  (unless disk full) │
+│   │  └──────────────────────────────────┘  │                    │
+│   └───────────────────┬────────────────────┘                    │
+│                       │                                          │
+│                       ▼                                          │
+│   ┌──────────────────────────────────────────────┐               │
+│   │  Step 2: Apply to Memtable (memory)          │  O(log N)    │
+│   │  ┌──────────────────────────────────────────┐ │  insert      │
+│   │  │ Sorted in-memory tree / skip list        │ │              │
+│   │  │ Key: user123 → {name: "Alice", age: 30}  │ │              │
+│   │  │ Key: user456 → {name: "Bob",   age: 25}  │ │              │
+│   │  └──────────────────────────────────────────┘ │              │
+│   │  Current memtable size: 124 MB / 256 MB       │              │
+│   └──────────────┬────────────────────────────────┘              │
+│                  │                                               │
+│     When memtable reaches threshold (256 MB):                    │
+│                  ▼                                               │
+│   ┌──────────────────────────────────────────────┐               │
+│   │  Step 3: Freeze memtable                      │              │
+│   │  (it becomes read-only; new memtable created)  │              │
+│   └──────────────┬────────────────────────────────┘              │
+│                  │                                               │
+│                  ▼                                               │
+│   ┌──────────────────────────────────────────────┐               │
+│   │  Step 4: Flush to SSTable on disk            │  Sequential   │
+│   │  ┌────────────────────────────────────────┐  │  write (bulk) │
+│   │  │ SSTable-1: sorted rows (Data.db)       │  │              │
+│   │  │ SSTable-1: Index.db (partition offsets)│  │              │
+│   │  │ SSTable-1: Filter.db (Bloom filter)    │  │              │
+│   │  │ SSTable-1: Summary.db (index sampling) │  │              │
+│   │  └────────────────────────────────────────┘  │              │
+│   └──────────────┬────────────────────────────────┘              │
+│                  │                                               │
+│                  ▼                                               │
+│   ┌──────────────────────────────────────────────┐               │
+│   │  Step 5: Delete commit log segment           │              │
+│   │  (data is now durable on disk)               │              │
+│   └──────────────────────────────────────────────┘               │
+│                                                                  │
+│   Over time, many SSTables accumulate:                           │
+│   [SSTable-1] [SSTable-2] [SSTable-3] ... [SSTable-N]           │
+│        │            │            │               │               │
+│        └────────────┴────────────┴───────────────┘               │
+│                         │                                        │
+│                         ▼                                        │
+│              Compaction merges them into one                     │
+└─────────────────────────────────────────────────────────────────┘`
+}
+</AsciiDiagram>
+
+### Bloom Filters
+
+A **Bloom filter** is a probabilistic data structure that answers "is this key definitely NOT in this SSTable?" It has three properties:
+
+- **False positives possible**: Bloom filters may say a key is present when it is not (causing an unnecessary disk read)
+- **False negatives impossible**: if the Bloom filter says a key is absent, it is definitely absent
+- **Space-efficient**: a Bloom filter with 1% false positive probability uses about 10 bits per element
+
+During a read, Cassandra checks each SSTable's Bloom filter. If the filter says "no," the entire SSTable is skipped — no disk I/O. With 10-100 SSTables per partition, Bloom filters reduce reads from scanning all SSTables to scanning only 1-2.
+
+<AsciiDiagram
+  id="column-family-databases/deep-dive-bloom"
+  alt="Diagram of a Bloom filter checking a query key against an SSTable showing hash functions and the bit array"
+  caption="Bloom filter membership test during a read"
+>{
+`┌─────────────────────────────────────────────────────────────────┐
+│                    Bloom Filter Lookup                            │
+│                                                                  │
+│   Query: "Does SSTable contain key 'user123'?"                   │
+│                                                                  │
+│   key = "user123"                                                │
+│        │                                                         │
+│        │  Apply 3 hash functions h1, h2, h3                       │
+│        ▼                                                         │
+│   ┌───────────────────────────────────────┐                      │
+│   │  Bloom Filter Bit Array (m bits)      │                      │
+│   │                                       │                      │
+│   │   ┌───┬───┬───┬───┬───┬───┬───┬───┐  │                      │
+│   │   │ 0 │ 0 │ 1 │ 0 │ 1 │ 1 │ 0 │ 1 │  │  Bits 2,4,5,7 set   │
+│   │   └───┴───┴───┴───┴───┴───┴───┴───┘  │                      │
+│   │    0   1   2   3   4   5   6   7        │                      │
+│   └───────────────────────────────────────┘                      │
+│        │                                                         │
+│        │  h1(user123) → 2  ✓  (bit 2 is 1)                      │
+│        │  h2(user123) → 5  ✓  (bit 5 is 1)                      │
+│        │  h3(user123) → 1  ✗  (bit 1 is 0 — NOT present!)       │
+│        ▼                                                         │
+│   ┌────────────────────────┐                                     │
+│   │  Result: NOT PRESENT   │  Definitely no need to read disk    │
+│   │  Skip this SSTable     │  Zero false negatives               │
+│   └────────────────────────┘                                     │
+│                                                                  │
+│   If all 3 bits were 1: "MAYBE PRESENT" → read the SSTable      │
+│   (could be a false positive)                                    │
+└─────────────────────────────────────────────────────────────────┘`
+}
+</AsciiDiagram>
+
+### Compaction Strategies
+
+Compaction merges multiple SSTables into one, discarding tombstones (deleted data) and deduplicating updates. The strategy determines how SSTables are grouped and when to merge.
+
+**Size-Tiered Compaction (STCS).** The default. When the number of SSTables in a tier (same size range) exceeds the configured threshold (default 4), they are compacted into one larger SSTable.
+
+- **Pros:** Simple, write-optimized
+- **Cons:** Can keep many SSTables per partition, slowing reads; creates very large SSTables over time
+- **Best for:** Write-heavy workloads, time-series data, or when you can tolerate read amplification
+
+**Leveled Compaction (LCS).** Data is organized into levels (L0, L1, L2...). Each level is 10x the size of the previous. L0 can have up to `sstable_per_level` (4) SSTables. Compaction repeatedly merges SSTables from Ln into Ln+1.
+
+- **Pros:** Very few SSTables per partition (typically 1-2), so reads are fast
+- **Cons:** High write amplification (10-20x), meaning more I/O and shorter SSD life
+- **Best for:** Read-heavy workloads, latency-sensitive reads
+
+**Time-Window Compaction (TWCS).** SSTables are grouped by time window (e.g., 1 hour). When a window closes, all SSTables in it are compacted once into a single SSTable, which is never compacted again.
+
+- **Pros:** Minimal write amplification for time-series data; no tombstone overhead
+- **Cons:** Requires an orderly time-series write pattern with TTLs
+- **Best for:** Metrics, logs, IoT sensor data with TTL-based expiration
+
+| Strategy | Read Cost | Write Amp | Space Amp | Use Case |
+|----------|-----------|-----------|-----------|----------|
+| STCS | High (many SSTables) | Low (~2-3x) | Low | Write-heavy, general purpose |
+| LCS | Low (1-2 SSTables) | High (~10-20x) | High (temporary) | Read-heavy, sub-ms reads |
+| TWCS | Moderate | Very Low (~1.1x) | Low | Time-series, TTL-based |
+
+<AsciiDiagram
+  id="column-family-databases/deep-dive-compaction"
+  alt="Comparison of three compaction strategies showing SSTable merging patterns for STCS, LCS, and TWCS"
+  caption="Size-tiered, leveled, and time-window compaction strategies contrasted"
+>{
+`┌─────────────────────────────────────────────────────────────────┐
+│              Compaction Strategy Comparison                       │
+│                                                                  │
+│  STCS (Size-Tiered)                                              │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐                            │
+│  │SST 1 │ │SST 2 │ │SST 3 │ │SST 4 │  4 SSTables of similar    │
+│  │ 50MB │ │ 52MB │ │ 49MB │ │ 51MB │  size trigger compaction  │
+│  └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘                            │
+│     └────────┴────────┴────────┘                                │
+│                         │                                        │
+│                         ▼                                        │
+│                    ┌──────────┐                                  │
+│                    │ SST 1-4  │  Combined into one ~200 MB       │
+│                    │  200MB   │  SSTable                         │
+│                    └──────────┘                                  │
+│                                                                  │
+│  LCS (Leveled)                                                   │
+│  L0: ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐                       │
+│      │ 10MB │ │ 10MB │ │ 10MB │ │ 10MB │                        │
+│      └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘                        │
+│         └────────┴────────┴────────┘                             │
+│                         │  merge                                  │
+│                         ▼                                        │
+│  L1: ┌──────────────────────────────────────────────────────────┐│
+│      │                   100 MB SSTable                         ││
+│      └──────────────────────────────────────────────────────────┘│
+│      (When L1 has too many, merge into L2 = 1 GB, etc.)          │
+│                                                                  │
+│  TWCS (Time-Window)                                              │
+│  Hour 1: ┌──────┐ ┌──────┐ ┌──────┐  ┌───────────┐              │
+│          │10:01 │ │10:15 │ │10:45 │  │ Window    │              │
+│          └──────┘ └──────┘ └──────┘  │ closes →  │              │
+│                                        │ compact   │              │
+│  Hour 1 final: ┌─────────────────┐    │ all into  │              │
+│                │  hour1-SSTable  │    │ one file  │              │
+│                └─────────────────┘    └───────────┘              │
+│                                                                  │
+│  Hour 2: ┌──────┐ ┌──────┐ ...                                   │
+│          │11:02 │ │11:20 │                                       │
+│          └──────┘ └──────┘                                       │
+└─────────────────────────────────────────────────────────────────┘`
+}
+</AsciiDiagram>
+
+---
+
+## 3. Read and Write Request Lifecycle
+
+### Write Request: 10-Step Lifecycle
+
+Below is the complete path a write request takes from client to durable storage:
+
+1. **Client sends write** to any node in the cluster (the **coordinator**). The driver uses a load-balancing policy to pick the coordinator (e.g., `TokenAwarePolicy` prefers the node owning the token range).
+
+2. **Coordinator computes token** from the partition key using the partitioner (Murmur3Partitioner by default). This determines which vnodes own the row.
+
+3. **Coordinator looks up replicas** from the token metadata. For replication factor RF=3, the coordinator picks the first three vnodes that own the token range, respecting the snitch to spread across racks.
+
+4. **Coordinator sends mutation to all replicas** (or just one, depending on consistency level). The forward is a binary protocol message containing the table name, partition key, clustering columns, and column values.
+
+5. **Each replica writes to commit log** (sequential append). In periodic sync mode, this is a `force()` without `fsync()` — fast but not durable until the periodic sync.
+
+6. **Each replica applies to memtable** — the mutation updates the in-memory sorted structure.
+
+7. **Each replica responds** back to the coordinator with a success or failure message.
+
+8. **Coordinator waits** for enough responses to satisfy the write consistency level (`ANY`, `ONE`, `QUORUM`, `ALL`, etc.).
+
+9. **Coordinator stores hint** if a replica was down or unresponsive (if `hinted_handoff_enabled`).
+
+10. **Coordinator responds to client** with success (or timeout/error).
+
+<AsciiDiagram
+  id="column-family-databases/deep-dive-write-lifecycle"
+  alt="Sequence diagram of a write request flowing from client through coordinator to three replicas showing commit log, memtable, and hint storage"
+  caption="Write request lifecycle — 10 steps from client to durable storage"
+>{
+`┌─────────────────────────────────────────────────────────────────┐
+│                Write Request — Full Lifecycle                     │
+│                                                                  │
+│  Client        Coordinator          Replica A    Replica B   Replica C
+│  ┌────┐        ┌──────────┐         ┌────────┐  ┌────────┐  ┌────────┐
+│  │    │  1. Write request          │        │  │        │  │        │
+│  │────|────────>│          │         │        │  │        │  │        │
+│  │    │        │          │         │        │  │        │  │        │
+│  │    │  2. Compute token hash       │        │  │        │  │        │
+│  │    │  3. Identify RF=3 replicas  │        │  │        │  │        │
+│  │    │        │          │         │        │  │        │  │        │
+│  │    │  4. Send mutation ──────>│         │  │        │  │        │
+│  │    │        │  ─────────────────│───────>│  │        │  │        │
+│  │    │        │  ─────────────────│────────────>│        │  │        │
+│  │    │        │          │         │        │  │        │  │        │
+│  │    │        │          │  5. Each replica:  │  │        │  │        │
+│  │    │        │          │   Append commit log │  │        │  │        │
+│  │    │        │          │   ┌────────────┐   │  │  ┌────┐│  │  ┌────┐│
+│  │    │        │          │   │Commit Log  │   │  │  │CL  ││  │  │CL  ││
+│  │    │        │          │   └────────────┘   │  │  └────┘│  │  └────┘│
+│  │    │        │          │                   │  │        │  │        │
+│  │    │        │          │  6. Apply to memtable: │        │  │        │
+│  │    │        │          │   ┌────────────┐   │  │  ┌────┐│  │  ┌────┐│
+│  │    │        │          │   │Memtable    │   │  │  │Mem ││  │  │Mem ││
+│  │    │        │          │   └────────────┘   │  │  └────┘│  │  └────┘│
+│  │    │        │          │                   │  │        │  │        │
+│  │    │        │  7. Response <──────────────│  │        │  │        │
+│  │    │        │  <──────────│────────────────│  │        │  │        │
+│  │    │        │  <──────────│────────────────────────│  │  │        │
+│  │    │        │          │         │        │  │        │  │        │
+│  │    │  8. Wait for CL responses              │  │        │  │        │
+│  │    │  9. Store hint if replica missed       │  │        │  │        │
+│  │    │ 10. Respond to client                  │  │        │  │        │
+│  │<───|────────|          │         │        │  │        │  │        │
+│  └────┘        └──────────┘         └────────┘  └────────┘  └────────┘
+└─────────────────────────────────────────────────────────────────┘`
+}
+</AsciiDiagram>
+
+### Read Request: 12-Step Lifecycle
+
+The read path is more complex because data may be spread across multiple SSTables and potentially inconsistent across replicas.
+
+1. **Client sends read request** to a coordinator node.
+
+2. **Coordinator computes token** and identifies replicas (same as write).
+
+3. **Coordinator determines consistency target.** For `CL.ONE`, only one replica needs to respond. For `CL.QUORUM`, majority must respond. For `CL.ALL`, all replicas must respond.
+
+4. **Coordinator sends read request to replicas** (speculative reads may be sent to additional replicas if the first is slow — see speculative retry).
+
+5. **Each replica performs local read:**
+   a. Check **row cache** (if enabled) → hit: return immediately
+   b. Check **partition key cache** → find which SSTables may contain the partition
+   c. Check **Bloom filter** for each SSTable → skip SSTables where the key is definitely absent
+   d. For remaining SSTables, check the **partition index** (offset in data file)
+   e. Read compressed data blocks from **disk** into **page cache**
+   f. Decompress and merge rows from the **memtable** (active + frozen) and all relevant **SSTables** — reconcile by timestamp (latest wins)
+
+6. **Digest request vs. full data read.** For `CL.ONE`, the coordinator sends a full data read to one replica and a **digest** (hash) request to the remaining replicas to verify consistency.
+
+7. **Digest comparison.** If digests differ, the coordinator initiates a **read repair** — fetches the full data from the replica with the newest data and sends it to the replicas with stale data.
+
+8. **Coordinator merges** results from all replicas that responded, reconciling by timestamp.
+
+9. **Coordinator returns data** to the client.
+
+10. **Background read repair** (if digest mismatch was detected but consistency level was achieved): the coordinator asynchronously repairs stale replicas.
+
+<AsciiDiagram
+  id="column-family-databases/deep-dive-read-lifecycle"
+  alt="Sequence diagram of a read request showing the 12-step lifecycle including Bloom filter checks, key cache, row cache, digest comparison, and read repair"
+  caption="Read request lifecycle — 12 steps from client to merged result"
+>{
+`┌─────────────────────────────────────────────────────────────────┐
+│                Read Request — Full Lifecycle                      │
+│                                                                  │
+│  Client       Coordinator          Replica A        Replica B    │
+│  ┌────┐       ┌──────────┐        ┌────────┐       ┌────────┐   │
+│  │    │ 1. Read request   │        │        │       │        │   │
+│  │────|───────────────>│        │        │       │        │   │
+│  │    │       │          │        │        │       │        │   │
+│  │    │       │ 2. Compute token   │        │       │        │   │
+│  │    │       │ 3. Identify replicas│        │       │        │   │
+│  │    │       │          │        │        │       │        │   │
+│  │    │       │ 4. Send read req──>│        │       │        │   │
+│  │    │       │  (digest req) ────────────>│        │       │   │
+│  │    │       │          │        │        │       │        │   │
+│  │    │       │          │ 5. Local read:  │       │ 5. Local: │   │
+│  │    │       │          │  a. Row cache?  │       │  (digest  │   │
+│  │    │       │          │  b. Key cache?  │       │   only)   │   │
+│  │    │       │          │  c. Bloom check │       │        │   │
+│  │    │       │          │  d. Index lookup│       │        │   │
+│  │    │       │          │  e. Read SSTable│       │        │   │
+│  │    │       │          │  f. Merge result│       │        │   │
+│  │    │       │          │        │        │       │        │   │
+│  │    │       │ 6. Full data  <───────│       │        │   │
+│  │    │       │ 6. Digest     <─────────────────│        │   │
+│  │    │       │          │        │        │       │        │   │
+│  │    │       │ 7. Compare digests         │        │        │   │
+│  │    │       │    Match? ✓ (consistent)   │        │        │   │
+│  │    │       │    Mismatch? → read repair │        │        │   │
+│  │    │       │          │        │        │       │        │   │
+│  │    │       │ 8. Merge results           │        │        │   │
+│  │    │       │ 9. Return merged data      │        │        │   │
+│  │<───|───────|──────────│        │        │       │        │   │
+│  │    │       │          │        │        │       │        │   │
+│  │    │       │10. Async read repair       │        │        │   │
+│  │    │       │ (if mismatch) ──────────>│        │        │   │
+│  │    │       │          │        │        │       │        │   │
+│  └────┘       └──────────┘        └────────┘       └────────┘   │
+└─────────────────────────────────────────────────────────────────┘`
+}
+</AsciiDiagram>
+
+### Caching Layers
+
+Cassandra has three caching layers that accelerate reads:
+
+**Row Cache.** Caches entire rows in memory (native heap or off-heap). When a read hits the row cache, zero disk I/O is needed. Row cache is most effective for **hot partitions** — a small number of rows that are read frequently.
+
+- Config: `row_cache_size_in_mb` (default 0 — disabled)
+- Effective for: small, frequently accessed partitions (e.g., user profiles, session data)
+- Ineffective for: range scans, large partitions, uniform access patterns
+
+**Key Cache.** Caches the mapping from partition keys to SSTable offsets. This avoids scanning the partition index each time. The key cache is stored off-heap.
+
+- Config: `key_cache_size_in_mb` (default 5% of heap, or 100 MB, whichever is smaller)
+- Saves one index lookup per SSTable per read
+- Evicted by LIRS (Low Inter-reference Recency Set) — better than LRU for scan-heavy workloads
+
+**Chunk Cache (ScyllaDB).** ScyllaDB uses a shared **page cache** rather than separate row and key caches. All disk reads go through this cache, which caches decompressed SSTable chunks. It is more memory-efficient because there is no JVM overhead.
+
+---
+
+## 4. Consistency and Repair
+
+### Tunable Consistency
+
+Cassandra's **tunable consistency** lets you choose the number of replicas that must acknowledge a read or write. The coordinator applies the consistency level to the request.
+
+**Write consistency levels:**
+
+| Level | Replicas Required | Behavior |
+|-------|-------------------|----------|
+| `ANY` | At least 0 replicas must respond, or hint stored | Most lenient; nearly always succeeds but data may not be durable |
+| `ONE` | 1 replica | Fast; risk of stale reads if replicas diverge |
+| `TWO` | 2 replicas | Higher durability; useful with RF=3 |
+| `THREE` | 3 replicas | Full durability for RF=3 |
+| `QUORUM` | `(RF / 2) + 1` | Majority; strong consistency when read also uses QUORUM |
+| `LOCAL_QUORUM` | Majority in local data center | For multi-region; avoids cross-dC latency |
+| `EACH_QUORUM` | Majority in each data center | Strict; high latency |
+| `ALL` | All replicas | Slowest; availability drops if any replica is down |
+| `SERIAL` / `LOCAL_SERIAL` | All replicas, with paxos | For lightweight transactions (compare-and-set) |
+
+**Read consistency levels:**
+
+Same levels as writes. The read returns the most recent data among the replicas that responded. If the read and write consistency levels overlap, you get **strong consistency**.
+
+**Strong consistency formula:** WriteCL + ReadCL > RF
+
+- RF=3, WriteCL=QUORUM (2 nodes), ReadCL=QUORUM (2 nodes) → 2 + 2 = 4 > 3 → **strongly consistent**
+- RF=3, WriteCL=ONE (1 node), ReadCL=ALL (3 nodes) → 1 + 3 = 4 > 3 → **strongly consistent** (but reads are slow)
+- RF=3, WriteCL=ONE (1 node), ReadCL=QUORUM (2 nodes) → 1 + 2 = 3 = 3 → **not guaranteed strong** (by the quorum overlap test)
+
+<AsciiDiagram
+  id="column-family-databases/deep-dive-consistency"
+  alt="Venn diagram showing read and write quorum overlap for consistent reads, with RF=3 and QUORUM on both sides"
+  caption="Quorum overlap for strong consistency when WriteCL + ReadCL > RF"
+>{
+`┌─────────────────────────────────────────────────────────────────┐
+│              Tunable Consistency — Quorum Overlap                 │
+│                                                                  │
+│   RF = 3 (3 replicas: A, B, C)                                  │
+│                                                                  │
+│   Write CL  = QUORUM (2 nodes)                                  │
+│   Read CL   = QUORUM (2 nodes)                                  │
+│                                                                  │
+│   Write acknowledges to:  A  B  [C may or may not]              │
+│   Read queries:          [A  B]  [or B  C, or A  C]            │
+│                                                                  │
+│   Overlap always contains at least 1 node with latest data       │
+│   → 2 + 2 = 4 > RF(3) → STRONGLY CONSISTENT                    │
+│                                                                  │
+│   ┌──────────────────────────────────────────────────────┐      │
+│   │   Replica A      Replica B      Replica C            │      │
+│   │   ┌────────┐     ┌────────┐     ┌────────┐           │      │
+│   │   │ Write  │     │ Write  │     │ (maybe │           │      │
+│   │   │ Ack    │     │ Ack    │     │  stale)│           │      │
+│   │   └───┬────┘     └───┬────┘     └────────┘           │      │
+│   │       │              │                                │      │
+│   │       │  Read queries both A and B                    │      │
+│   │       │  → at least one has latest write              │      │
+│   │       └──────┬───────┘                                │      │
+│   │              ▼                                        │      │
+│   │         Most recent timestamp wins                    │      │
+│   └──────────────────────────────────────────────────────┘      │
+│                                                                  │
+│   ┌────────────────────────────────────────────────────────┐    │
+│   │ Consistency Patterns                                    │    │
+│   │                                                        │    │
+│   │ Eventual:       W=ONE,  R=ONE    (no overlap)          │    │
+│   │ Read-Your-Writes:W=ONE,  R=QUORUM (write to read)      │    │
+│   │ Strong:         W=QUORUM,R=QUORUM (always overlap)     │    │
+│   │ Monotonic:      W=ALL,  R=QUORUM (higher durability)   │    │
+│   └────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘`
+}
+</AsciiDiagram>
+
+### Read Repair
+
+Read repair ensures replicas converge to the same data. When the coordinator detects a digest mismatch during a read, it fetches the full data from the replica with the newest data and sends the difference to other replicas.
+
+- **Blocking read repair:** Performed during the read path — the coordinator waits for the repair to complete before returning to the client. Increases read latency.
+- **Hinted handoff read repair:** After a read mismatch, the coordinator sends a hint to the stale replica.
+- **Subsequent read repairs:** If the same partition is read again, the fresh data is already propagated.
+
+### Anti-Entropy Repair (nodetool repair)
+
+Read repair only fixes partitions that are actively read. For partitions that are never read (or very rarely), divergence can persist indefinitely. **Anti-entropy repair** (a.k.a. Merkle tree repair) fixes this:
+
+1. Each replica builds a **Merkle tree** (hash tree) of its SSTable data for a token range
+2. The trees are compared root-to-leaf to find the diverging leaf nodes
+3. Only the diverging partitions are streamed to stale replicas
+
+Run `nodetool repair` periodically (default recommendation: once per week for the `gc_grace_seconds` window, which defaults to 10 days). In production, run incremental repair rather than full repair to reduce the data transferred.
+
+- **Full repair:** Reads all SSTables, builds Merkle trees, compares them, streams differences. Can run for hours on large datasets.
+- **Incremental repair:** Only repairs SSTables that were modified since the last repair. Much faster. Combine with a periodic full repair (e.g., monthly).
+
+---
+
+## 5. Performance Characteristics
+
+### Latency by Component
+
+| Component | Latency (p50) | Latency (p99) | Notes |
+|-----------|---------------|---------------|-------|
+| Commit log (batch fsync) | 2-10 ms | 10-50 ms | SSD-dependent; disable write cache on SSD |
+| Commit log (periodic) | 0.01-0.1 ms | 0.1-1 ms | Fsync every 10 seconds |
+| Memtable insert | 0.001-0.01 ms | 0.01-0.1 ms | Pure in-memory |
+| Memtable flush (128 MB) | 200-500 ms | 500-1000 ms | Blocking for the CF |
+| Bloom filter check | 0.001-0.01 ms | 0.01-0.05 ms | Always in memory (off-heap) |
+| SSTable index lookup | 0.01-0.05 ms | 0.1-1 ms | Key cache hit → O(1); miss → binary search |
+| SSTable read (cold, compressed) | 1-10 ms | 10-50 ms | Depends on partition size, compression, disk |
+| SSTable read (hot, page cache) | 0.01-0.1 ms | 0.1-1 ms | OS page cache hit |
+| Network RTT (single-dC) | 0.1-0.5 ms | 1 ms | Intra-datacenter |
+| Network RTT (cross-dC) | 50-200 ms | 200-500 ms | Inter-region |
+
+### Throughput Guidelines
+
+| Operation | Throughput per Node (ScyllaDB) | Throughput per Node (Cassandra) |
+|-----------|-------------------------------|--------------------------------|
+| Simple write (CL=ONE) | 50K-100K ops/sec | 15K-30K ops/sec |
+| Simple write (CL=QUORUM) | 25K-50K ops/sec | 8K-15K ops/sec |
+| Simple read (CL=ONE, hot) | 80K-150K ops/sec | 20K-50K ops/sec |
+| Simple read (CL=QUORUM) | 30K-60K ops/sec | 8K-20K ops/sec |
+| Range scan (CL=ONE) | 5K-20K ops/sec | 2K-10K ops/sec |
+| LWT (SERIAL, P axos round trip) | 1K-5K ops/sec | 0.5K-2K ops/sec |
+
+**Note:** ScyllaDB achieves 2-5x higher throughput per node than Cassandra because it is written in C++ (no JVM GC pauses), uses seastar's shared-nothing architecture (one thread per core), and has a more efficient page cache. These numbers assume modern NVMe SSDs, 64+ GB RAM, and 16+ cores.
+
+### Sizing Rules of Thumb
+
+**Memory:**
+- Memtables: 1/4 to 1/8 of RAM. More memtable space → larger flushes → fewer SSTables → less compaction I/O
+- Row cache: 0 (disabled) or enough for the working set of hot partitions. Start with 5-10% of RAM
+- OS page cache: Leave at least 25% of RAM for the OS. ScyllaDB automatically uses all free memory for its cache
+- Bloom filters: ~1-2 GB per TB of data (at 1% false positive rate)
+
+**Disk:**
+- Write amplification: STCS ~2-3x, LCS ~10-20x, TWCS ~1.1x
+- Disk utilization target: 50-60% maximum (to leave room for compaction temporary space)
+- Writes per second per node: aim for 10K-30K sustained writes per node (Cassandra), 30K-80K (ScyllaDB)
+- Recommend **NVMe SSDs** over SATA SSDs for compaction throughput
+
+**CPU:**
+- Cassandra is CPU-efficient per thread but has GC overhead (10-20% CPU consumed by GC at high throughput)
+- ScyllaDB uses seastar: one thread per core (no context switching). High throughput scales linearly with cores
+
+### Common Bottlenecks
+
+| Symptom | Likely Cause | Mitigation |
+|---------|-------------|------------|
+| High p99 write latency, no CPU spike | Commit log disk queue saturation | Use dedicated NVMe for commit log; increase commit log segments |
+| High p99 read latency, CPU high | Too many SSTables per read | Switch to LCS; run compaction; increase memory for Bloom filters |
+| Latency spikes every N minutes | Major GC (Cassandra) → stop-the-world pause | Use G1GC with low pause target; reduce heap size; switch to ScyllaDB |
+| High compaction backlog | Write rate exceeds compaction throughput | Increase compaction throughput; add nodes; use STCS or TWCS |
+| Slow reads after node replacement | Key cache is cold | Pre-warm the key cache; tolerate 30-60 minutes of warm-up |
+
+<AsciiDiagram
+  id="column-family-databases/deep-dive-performance"
+  alt="Heat map matrix showing read/write latency at various consistency levels and data locations (memtable, SSTable, remote node)"
+  caption="Read/write latency matrix by data location and consistency level"
+>{
+`┌─────────────────────────────────────────────────────────────────┐
+│              Latency Matrix by Data Location & CL                 │
+│                                                                  │
+│   ┌─────────────────┬──────────┬──────────┬──────────┬────────┐ │
+│   │ Scenario        │ p50      │ p99      │ Through- │ Notes  │ │
+│   │                 │          │          │ put/node │        │ │
+│   ├─────────────────┼──────────┼──────────┼──────────┼────────┤ │
+│   │ Write CL=ANY    │ 0.01 ms  │ 0.1 ms   │ 100K/s   │ Hint   │ │
+│   │ Write CL=ONE    │ 0.5 ms   │ 3 ms     │ 40K/s    │ 1 rep  │ │
+│   │ Write CL=QUORUM │ 1-2 ms   │ 10 ms    │ 20K/s    │ 2 reps │ │
+│   │ Write CL=ALL    │ 2-5 ms   │ 25 ms    │ 8K/s     │ 3 reps │ │
+│   ├─────────────────┼──────────┼──────────┼──────────┼────────┤ │
+│   │ Read row cache  │ 0.05 ms  │ 0.5 ms   │ 100K/s   │ No I/O │ │
+│   │ Read memtable   │ 0.1 ms   │ 1 ms     │ 80K/s    │ Memory │ │
+│   │ Read 1 SSTable  │ 0.5 ms   │ 5 ms     │ 30K/s    │ 1 disk │ │
+│   │ Read 5 SSTables │ 2 ms     │ 20 ms    │ 10K/s    │ Merge  │ │
+│   │ Read remote node│ +0.3 ms  │ +5 ms    │ Lower    │ RTT    │ │
+│   ├─────────────────┼──────────┼──────────┼──────────┼────────┤ │
+│   │ LWT (SERIAL)    │ 10-20 ms │ 100 ms   │ 2K/s     │ Paxos  │ │
+│   │ Batch write     │ 2-5 ms   │ 30 ms    │ 5K/s     │ Atomic │ │
+│   │ Range scan      │ 5-20 ms  │ 200 ms   │ 5K/s     │ Heavy  │ │
+│   └─────────────────┴──────────┴──────────┴──────────┴────────┘ │
+└─────────────────────────────────────────────────────────────────┘`
+}
+</AsciiDiagram>
+
+---
+
+## 6. Configuration and Tuning
+
+### Essential Configuration Parameters
+
+Replication and strategy settings are defined per keyspace and cannot be changed without re-creating the keyspace (replication factor can be altered, but data redistribution requires `nodetool repair`).
+
+```cql
+-- Keyspace with NetworkTopologyStrategy (production)
+CREATE KEYSPACE production WITH replication = {
+  'class': 'NetworkTopologyStrategy',
+  'dc1': 3,
+  'dc2': 3
+} AND durable_writes = true;
+```
+
+#### Replication Factor
+
+- **RF=1**: No redundancy. Single node failure = data loss. Dev/test only.
+- **RF=3**: Standard for production. Can tolerate one node failure per replica group (or two with hints/repair).
+- **RF=5**: For high-criticality data. Tolerates two simultaneous failures. Higher write amplification.
+
+Replication factor is per-keyspace. Hot data can have higher RF than cold data.
+
+#### Consistency Level Selection
+
+| Workload Pattern | Write CL | Read CL | Rationale |
+|-----------------|----------|---------|-----------|
+| Eventual consistency (time-series, metrics) | ONE | ONE | Maximum throughput; data freshly inserted is rarely read immediately |
+| Read-your-writes (user sessions) | ONE | QUORUM | Writes are fast; reads always see their own writes |
+| Strong consistency (financial, inventory) | QUORUM | QUORUM | Guarantees linearizability at throughput cost |
+| Absolute durability (audit logs) | ALL | ONE | Writes are slow but never lost; reads are fast |
+| Multi-region, local reads | LOCAL_QUORUM | LOCAL_QUORUM | Avoids cross-dC latency; eventual across regions |
+
+#### Compaction Strategy Selection
+
+| Data Access Pattern | Strategy | Rationale |
+|--------------------|----------|-----------|
+| Write-heavy, moderate reads | STCS | Low write amplification; simpler than LCS |
+| Read-heavy, sub-ms reads | LCS | Fewest SSTables per partition |
+| Time-series, TTL-based | TWCS | Almost no write amplification; automatic TTL cleanup |
+| High update rate (same partition) | LCS | Faster reads when many updates create many versions |
+| Append-only with rare queries | STCS | Simple; compaction is rare once SSTables stabilize |
+
+### Cassandra-Specific Tuning
+
+```yaml
+# cassandra.yaml — production tuning for 64 GB RAM, NVMe, 16 cores
+
+# Memory
+memtable_allocation_type: offheap_objects     # Reduce GC pressure
+memtable_heap_space_in_mb: 8192               # 8 GB for memtables
+memtable_offheap_space_in_mb: 8192
+row_cache_size_in_mb: 4096                    # 4 GB row cache for hot partitions
+
+# Concurrency
+concurrent_reads: 128
+concurrent_writes: 128
+concurrent_counter_writes: 32
+
+# Compaction
+compaction_throughput_mb_per_sec: 256        # Aggressive compaction for fast reads
+sstable_preemptive_open_interval_in_mb: 50   # Start serving new SSTable early during compaction
+
+# Caches
+key_cache_size_in_mb: 512
+key_cache_save_period: 14400                 # Save key cache every 4 hours
+
+# Commit log
+commitlog_sync: periodic
+commitlog_sync_period_in_ms: 2000            # 2s durability window; balances safety and speed
+commitlog_segment_size_in_mb: 64
+commitlog_total_space_in_mb: 8192            # 8 GB max commit log
+
+# Timeouts
+read_request_timeout_in_ms: 5000
+write_request_timeout_in_ms: 2000
+range_request_timeout_in_ms: 10000
+
+# GC tuning (Cassandra JVM)
+# In jvm.options or cassandra-env.sh:
+# -XX:+UseG1GC
+# -XX:G1RSetUpdatingPauseTimePercent=5
+# -XX:MaxGCPauseMillis=300
+# -XX:ParallelGCThreads=16
+# -XX:ConcGCThreads=4
+```
+
+### ScyllaDB-Specific Tuning
+
+```yaml
+# scylla.yaml — production tuning for 64 GB RAM, NVMe, 16 cores
+
+# CPU
+cpu_scheduler: true
+io_scheduler: true
+
+# Memory
+memtable_space_in_mb: 16384                  # 16 GB for memtables
+# ScyllaDB uses all free memory for its own page cache — no separate row_cache setting needed
+
+# Compaction
+compaction_enforce_min_threshold: false      # Allow STCS to compact even below threshold
+compaction_static_shares: 100                # CPU shares for compaction
+
+# Commit log
+commitlog_sync: periodic
+commitlog_sync_period_in_ms: 1000
+commitlog_segment_size_in_mb: 64
+
+# Timeouts
+read_request_timeout_in_ms: 5000
+write_request_timeout_in_ms: 2000
+
+# Network
+consistent_cluster_name: true                # Prevent cross-cluster joins
+interval_in_ms_for_repair: 604800            # Weekly repair via node_exporter
+
+# Seastar (ScyllaDB's runtime)
+# Set via command line rather than scylla.yaml:
+# --memory 64G
+# --smp 16                 (1 thread per core)
+# --overprovisioned        (for containerized deployments)
+# --developer-mode true    (disable I/O tuning checks, dev only)
+```
+
+### Common Mistakes
+
+1. **Using SimpleStrategy in production.** SimpleStrategy places one replica per rack (or ignores topology). Use `NetworkTopologyStrategy` with explicit data center and rack mappings.
+
+2. **RF > number of nodes.** If you have 3 nodes and set RF=4, some replicas are on the same physical node — violating failure isolation. Always ensure `RF <= number of nodes per data center`.
+
+3. **Ignoring GC in Cassandra.** Out-of-the-box Cassandra uses CMS GC or Parallel GC. Both cause long pause times under high throughput. Always switch to **G1GC** (`-XX:+UseG1GC`) with `MaxGCPauseMillis=300`.
+
+4. **Too many secondary indexes.** Each secondary index query fans out to all nodes and is slow at scale. Use a materialized view or a separate lookup table instead.
+
+5. **Large partitions.** A single partition larger than ~100 MB causes garbage collection pressure, slow compactions, and timeouts. Keep partition sizes under ~10 MB for consistent performance.
+
+6. **Not running `nodetool repair`.** Without regular repair, deleted data (tombstones) accumulate and data divergence grows. Run incremental repair weekly.
+
+---
+
+## Summary
+
+You now understand the internal architecture of column-family databases:
+
+- **Cluster architecture:** Peer-to-peer ring with virtual nodes, gossip protocol for membership and failure detection, snitches for topology awareness, hinted handoff for write availability
+- **LSM tree storage:** Sequential writes via commit log → memtable → SSTable flush; Bloom filters skip irrelevant SSTables during reads; compaction merges SSTables to reclaim space and maintain read performance
+- **Request lifecycle:** Writes flow through commit log and memtable in 10 steps; reads flow through cache layers, Bloom filters, index lookups, and merge across memtables + SSTables in 12 steps
+- **Tunable consistency:** Choose the number of replicas per request; strong consistency when WriteCL + ReadCL > RF; read repair and anti-entropy repair maintain data convergence
+- **Performance and sizing:** Memory, disk, and CPU trade-offs vary by compaction strategy and consistency level; G1GC tuning (Cassandra) or seastar tuning (ScyllaDB) is essential
+- **Configuration:** Replication factor per keyspace, compaction strategy per table, consistency per request; NetworkTopologyStrategy for multi-dC deployments
+
+The next page applies this knowledge to production-scale architectures: multi-region deployment, capacity planning, data modeling best practices, and advanced patterns like materialized views, CDC, and light-weight transactions.
+
+Continue to **Column-Family Databases at Scale**.

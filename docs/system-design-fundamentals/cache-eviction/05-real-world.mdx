@@ -1,0 +1,370 @@
+---
+id: cache-eviction-real-world
+title: Cache Eviction in Production
+sidebar_label: In Production
+position: 5
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Company Case Studies
+
+### Redis: Approximate LRU, LFU, and Volatile-TTL
+
+Redis is the most widely used cache in production systems. Its eviction subsystem is a masterclass in practical engineering: it prioritizes performance over perfect accuracy, and it provides enough policy options to cover most workloads.
+
+<AsciiDiagram
+  id="cache-eviction/redis-eviction-internals"
+  title="Redis Eviction Internals"
+  alt="Redis eviction subsystem showing the pool-based approximate LRU, per-key LFU counters, and the eviction cycle triggering on each SET command"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Redis Eviction Internals                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Redis uses a pool-based approximate LRU. Instead of maintaining    │
+│  a globally sorted linked list, Redis samples keys and evicts        │
+│  the best candidate from the sample.                                 │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────┐          │
+│  │  Eviction Pool (maxmemory-samples * 2 = 10 entries)  │          │
+│  │  ┌────────────────────────────────────────────────┐  │          │
+│  │  │  Candidate 1: key_42   last_access: 12:34:50   │  │          │
+│  │  │  Candidate 2: key_99   last_access: 12:35:10   │  │          │
+│  │  │  Candidate 3: key_17   last_access: 12:34:02   │  │          │
+│  │  │  Candidate 4: key_88   last_access: 12:33:45   │  │          │
+│  │  │  Candidate 5: key_55   last_access: 12:34:30   │  │          │
+│  │  └────────────────────────────────────────────────┘  │          │
+│  └──────────────────────────────────────────────────────┘          │
+│                                                                     │
+│  Eviction step:                                                     │
+│  1. SET command received, memory usage exceeds maxmemory            │
+│  2. Redis samples maxmemory-samples random keys (default 5)        │
+│  3. Adds each sample to the eviction pool                          │
+│  4. Selects the oldest key from the pool (by last_access_time)     │
+│  5. Evicts the selected key                                         │
+│  6. Rechecks memory usage; repeats if still over limit             │
+│                                                                     │
+│  LFU in Redis:                                                      │
+│  - 24-bit counter, logarithmic increment (counter grows slower)    │
+│  - lfu-log-factor: controls counter growth rate                    │
+│  - lfu-decay-time: minutes between counter halvings               │
+│  - Counter is stored in the same 24-bit field as LRU access time   │
+│    (Redis uses the same field for LRU timestamp or LFU counter)    │
+│                                                                     │
+│  Performance:                                                       │
+│  - 10 million keys, 100K writes/second                             │
+│  - Eviction overhead: 2-5 microseconds per eviction                │
+│  - Hit ratio within 5% of exact LRU                                │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+**Key design decisions:**
+
+- **Approximate LRU over exact LRU.** Exact LRU requires a sorted linked list, which would require O(log n) insertion per access. Redis's approximate LRU samples 5 keys and picks the oldest. This is within 5% of exact LRU at a fraction of the overhead.
+
+- **LRU and LFU share the same metadata field.** Redis stores a 24-bit timestamp (last access time) for LRU, or a 24-bit frequency counter for LFU, in the same field in the Redis object header. The field is interpreted as LRU or LFU based on the configured policy. This saves 3 bytes per entry.
+
+- **No eviction per database.** Redis supports multiple logical databases (db0, db1, etc.) but eviction is global across all databases. If you need per-database eviction, run separate Redis instances.
+
+- **Keyspace notification on eviction.** Redis can publish eviction events to subscribers via the keyspace notification system. This allows applications to react to evictions (e.g., re-fetch the evicted key from the database).
+
+**Production considerations:**
+
+- Redis eviction runs in the main event loop. A large eviction batch (evicting 10,000+ keys in one cycle) blocks all other operations. Set `maxmemory-eviction-tenacity` (Redis 7.0+) to control how aggressively Redis evicts per cycle.
+
+- Monitor `evicted_keys` metric. A sudden increase signals that the working set has grown beyond the cache size. Investigate immediately.
+
+- Use `CONFIG SET maxmemory-policy` to change policies at runtime. No restart needed.
+
+### Memcached: LRU with Slab Allocator
+
+Memcached's approach to eviction is tightly coupled to its slab allocator. The slab allocator divides memory into slabs of different sizes. Each slab class maintains its own LRU list.
+
+<AsciiDiagram
+  id="cache-eviction/memcached-slab-lru"
+  title="Memcached Slab Allocator with Per-Class LRU"
+  alt="Memcached memory divided into slab classes of different sizes, each with its own LRU eviction list"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│               Memcached Slab Allocator + Per-Class LRU              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Memory is divided into slab classes, each holding items of a       │
+│  specific size range. Each slab class has its own LRU list.         │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Slab Class 1 (64 bytes/chunk)    LRU: [A, B, C, D, ...]   │   │
+│  │  ┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐                  │   │
+│  │  │ A:42 ││ B:17 ││ C:99 ││ D:88 ││ E:55 │                  │   │
+│  │  └──────┘└──────┘└──────┘└──────┘└──────┘                  │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Slab Class 2 (128 bytes/chunk)   LRU: [F, G, H, ...]       │   │
+│  │  ┌──────┐┌──────┐┌──────┐┌──────┐                            │   │
+│  │  │ F:aa ││ G:bb ││ H:cc ││ I:dd │                            │   │
+│  │  └──────┘└──────┘└──────┘└──────┘                            │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Slab Class 3 (256 bytes/chunk)   LRU: [J, K, ...]          │   │
+│  │  ┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐         │   │
+│  │  │ J:ee ││ K:ff ││ L:gg ││ M:hh ││ N:ii ││ O:jj │         │   │
+│  │  └──────┘└──────┘└──────┘└──────┘└──────┘└──────┘         │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  Eviction behavior:                                                 │
+│  - When a slab class is full, the LRU tail of THAT class is evicted │
+│  - A write of 50 bytes evicts from slab class 1 only               │
+│  - A write of 200 bytes evicts from slab class 3 only              │
+│  - Big items cannot evict many small items (critical for fairness) │
+│                                                                     │
+│  Problem: slab class imbalance.                                     │
+│  If most writes are 200 bytes, slab class 3 fills up and evicts    │
+│  frequently. Slab class 1 (64 bytes) may have free space but       │
+│  cannot be used by 200-byte items.                                 │
+│                                                                     │
+│  Solution: slab rebalancing (Memcached 1.5+). Moves pages from     │
+│  underutilized slab classes to overutilized ones.                   │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+**Key design decisions:**
+
+- **Per-class LRU prevents size-based priority inversion.** Without per-class LRU, one large entry (1 MB) evicts 1,000 small entries (1 KB each), destroying the small-entry hot set. Memcached's per-class LRU ensures that evictions are proportional to item size.
+
+- **Slab rebalancing (Memcached 1.5+).** Fixed slab sizes can cause memory waste: if you have 10 GB of slab class 1 but only 1 GB of small items, 9 GB is wasted. Slab rebalancing moves pages from underutilized classes to overutilized classes.
+
+- **No explicit LFU support.** Memcached only supports LRU. For LFU workloads, you must use a different cache or implement frequency tracking at the application level.
+
+**Production considerations:**
+
+- Monitor `evictions` per slab class. If one class has high evictions while others have free space, slab rebalancing may be needed.
+- Memcached does not persist. All data is lost on restart. The eviction policy is reset on restart.
+- Memcached's LRU is approximate, similar to Redis, using a sampling approach.
+
+### Varnish: Cache Eviction for HTTP Caching
+
+Varnish is an HTTP cache that sits in front of web servers. Its eviction subsystem is designed for HTTP workloads, which have specific characteristics: large objects (HTML pages, images, CSS), high one-hit-wonder rates, and TTL-driven expiration.
+
+<AsciiDiagram
+  id="cache-eviction/varnish-eviction"
+  title="Varnish Cache Eviction Subsystem"
+  alt="Varnish eviction architecture showing the expired object list, LRU queue, and the stevedore storage backend"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Varnish Cache Eviction                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Varnish uses a two-tier eviction system: TTL-based expiration      │
+│  (primary) and LRU eviction (secondary, when storage is full).     │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  TTL Expiration (primary)                                    │   │
+│  │  - Each object has a TTL from Cache-Control header           │   │
+│  │  - Expired objects are moved to a cleanup list               │   │
+│  │  - A background thread periodically frees expired objects    │   │
+│  │  - No TTL = object is cached until LRU eviction or purge     │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  LRU Eviction (secondary)                                    │   │
+│  │  - When storage is full, the LRU object is evicted           │   │
+│  │  - Varnish maintains a global LRU list of all objects        │   │
+│  │  - Objects are moved to the LRU head on each access          │   │
+│  │  - The LRU tail is evicted when storage is full              │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Storage Backends (stevedores)                               │   │
+│  │  - malloc: in-memory storage, uses LRU                      │   │
+│  │  - file: mmap-based file storage, uses LRU                   │   │
+│  │  - persistent: file-based with crash recovery               │   │
+│  │  - Each backend manages its own eviction                    │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Purge API (manual eviction)                                 │   │
+│  │  - Ban: invalidates objects matching a pattern (regex)      │   │
+│  │  - Purge: removes a specific URL                             │   │
+│  │  - Hard purge: immediately removes object from storage       │   │
+│  │  - Soft purge: marks as expired but keeps for grace/age     │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  Key features:                                                      │
+│  - Grace mode: serve stale content while revalidating in background│
+│  - Saint mode: mark backend as unhealthy if it serves errors       │
+│  - Hit-for-pass: cache the fact that a URL is uncacheable          │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+**Key design decisions:**
+
+- **TTL as primary eviction.** HTTP responses have explicit TTLs (Cache-Control: max-age). Varnish uses TTL expiration as the primary eviction mechanism. LRU only fires when storage is full. This matches the HTTP workload where most objects have a natural expiration time.
+
+- **Grace mode for stale content.** Varnish serves stale content (within grace period) while asynchronously fetching fresh content. This improves hit ratio and reduces the impact of eviction-driven misses.
+
+- **Ban-based invalidation.** Varnish's ban system allows pattern-based invalidation (e.g., ban all objects with a specific URL prefix). This is more efficient than purging individual URLs when a large set of content needs to be invalidated.
+
+### Linux Kernel Page Cache: Clock Algorithm
+
+The Linux kernel page cache uses the clock algorithm (also known as the "second chance" algorithm) for eviction. This is a well-studied, battle-tested implementation that has evolved over decades.
+
+The clock algorithm in the Linux kernel:
+
+1. Pages are stored in a radix tree (for lookup) and a circular linked list (for eviction).
+2. Each page has a reference bit (PG_referenced) that is set on access.
+3. The kernel's page reclaim daemon (kswapd) sweeps through the circular list.
+4. Pages with PG_referenced set: clear the bit, move to the next page (second chance).
+5. Pages with PG_referenced cleared: evict the page.
+6. Dirty pages must be written back before eviction (added to the writeback queue).
+
+The Linux kernel implementation is notable for its handling of dirty pages: before evicting a dirty page, the kernel must write it back to disk. This adds complexity that user-space caches (Redis, Memcached) do not face.
+
+The kernel also maintains multiple LRU lists for different page types (active, inactive, anonymous, file-backed). This provides better isolation between page types and prevents one type of memory pressure from evicting pages of another type.
+
+## Open Source
+
+<AsciiDiagram
+  id="cache-eviction/open-source-comparison"
+  title="Open Source Cache Library Eviction Policy Comparison"
+  alt="Comparison table of open source cache libraries and their supported eviction policies"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│            Open Source Cache Eviction Comparison                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Library    Language   Default         Other Policies               │
+│  ───────    ────────   ───────         ──────────────               │
+│                                                                     │
+│  Redis      C          allkeys-lru     allkeys-lfu, volatile-*      │
+│                         (approx.)       noeviction                  │
+│                                                                     │
+│  Memcached  C          LRU             None (LRU only)              │
+│                         (per-slab)       (slab rebalancing v1.5+)  │
+│                                                                     │
+│  Caffeine   Java       W-TinyLFU       Sender policy (popularity    │
+│                         (window +        vs recency)                │
+│                          sketch)                                    │
+│                                                                     │
+│  Ehcache    Java       LRU             LFU, FIFO, clock             │
+│                         (tiered:        (tiered eviction:           │
+│                          heap->off->disk) heap->off-heap->disk)     │
+│                                                                     │
+│  Guava      Java       LRU             None (LRU only)              │
+│  Cache                  (segment-based)                              │
+│                                                                     │
+│  Varnish    C          TTL + LRU       Ban/purge API, grace mode    │
+│                                                                     │
+│  Linux      C          Clock           Active/inactive LRU lists   │
+│  Kernel                (second          (per-page-type isolation)   │
+│  Page Cache             chance)                                     │
+│                                                                     │
+│  Spring     Java       Caffeine        Ehcache, JCache (JSR 107)   │
+│  Cache                  (delegates to                               │
+│                          Caffeine)                                   │
+│                                                                     │
+│  Key insight: Most libraries converge on LRU as the default         │
+│  because it works well for the widest range of workloads.           │
+│  Specialized libraries (Caffeine, Ehcache) add LFU or adaptive     │
+│  policies for workloads that need frequency awareness.              │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Caffeine: W-TinyLFU
+
+Caffeine is a Java caching library that implements the W-TinyLFU eviction policy. W-TinyLFU combines a window LRU (for recency) with a sketch-based frequency estimator (for frequency).
+
+The "W" in W-TinyLFU stands for "window": a small LRU cache (1% of total size) that captures recent accesses. The main cache uses a frequency-based policy that estimates frequency using a Count-Min Sketch (a probabilistic data structure).
+
+Key innovations:
+- **Count-Min Sketch** for frequency estimation. Instead of storing exact frequency counters per entry (which would require O(entries) memory), W-TinyLFU uses a probabilistic sketch that gives approximate frequency with bounded error. This reduces memory overhead from O(entries) to O(1).
+- **Adaptive window size.** The window size adjusts based on the workload. If the workload has strong recency, the window grows. If the workload has strong frequency, the window shrinks.
+- **Reset on frequency overflow.** The sketch periodically resets (halves all frequency estimates) to adapt to changing access patterns.
+
+Caffeine is the default cache implementation in Spring Boot 3.x and is used by many Java applications.
+
+### Ehcache: LRU, LFU, FIFO
+
+Ehcache is a Java caching library that supports LRU, LFU, and FIFO eviction policies. It is widely used in enterprise Java applications, particularly in conjunction with Hibernate.
+
+Ehcache's key contribution is its tiered storage model: data can be stored in heap, off-heap, and disk tiers, each with its own eviction policy. Eviction at the heap tier moves data to the off-heap tier rather than dropping it entirely. This provides a graceful degradation: hot data stays in fast memory, warm data moves to slower memory, and cold data is evicted entirely.
+
+### Guava Cache: LRU-Based
+
+Guava's Cache is a popular Java caching library with a simple LRU-based eviction policy. It is not intended for high-performance production caching (Caffeine is the successor), but it is widely used in smaller applications and for prototyping.
+
+Guava Cache uses a ConcurrentHashMap with a segment-based LRU. Each segment has its own LRU list. This provides good concurrency but can lead to skewed LRU ordering across segments.
+
+## Cloud Provider
+
+### AWS ElastiCache
+
+AWS ElastiCache provides managed Redis and Memcached clusters. The eviction behavior depends on the engine:
+
+**ElastiCache for Redis:** Supports all Redis eviction policies. Additional features:
+- Automatic failover with Multi-AZ. If the primary node fails, a replica is promoted. The new primary starts with an empty cache, causing a cold start. AWS recommends pre-warming with a dummy workload.
+- Reserved memory setting. AWS recommends reserving 25% of memory for non-data purposes (replication buffers, Redis Cluster bus, etc.). The remaining 75% is available for data. Eviction is based on the available memory, not the total instance memory.
+- CloudWatch metrics: `Evictions` (number of evictions), `CurrItems` (current item count), `Reclaimed` (expired key count).
+
+**ElastiCache for Memcached:** Supports Memcached's LRU eviction. Additional features:
+- Auto-discovery: clients automatically discover new nodes when the cluster scales.
+- Slab rebalancing is supported in Memcached 1.5+.
+
+### CDN Eviction: CloudFront and CloudFlare
+
+CDN eviction is primarily TTL-based, with LRU as the overflow mechanism at edge nodes.
+
+**CloudFront:** Purge by invalidation request. You can invalidate specific URLs, URL patterns, or use wildcards. The first 1,000 paths per month are free. CloudFront propagates invalidations to all edge nodes within 1-5 minutes.
+
+**CloudFlare:** Purge by URL, by tag, by hostname, or purge everything. CloudFlare propagates purges within 1-30 seconds. Tags are particularly useful for purging groups of related assets (e.g., all assets related to a product update).
+
+**CDN evolution in practice:** CDN eviction is rarely an issue in practice because edge nodes have large storage (terabytes) and TTLs handle most expiration. The primary concern is purge propagation time: when you invalidate a URL, how long does it take for all edge nodes to stop serving the stale version?
+
+## Lessons Learned
+
+### 1. Approximate Is Good Enough
+
+Exact LRU (with a globally sorted linked list) is never necessary in production. Redis's approximate LRU with 5 samples is within 5% of exact LRU. The 5% difference in hit ratio translates to a 5% increase in database load, which is acceptable for most workloads.
+
+The complexity of exact LRU (O(log n) or O(1) with a list and hash map) is not worth the marginal hit ratio improvement. Always start with an approximate policy.
+
+### 2. Monitor Eviction Rate
+
+The eviction rate is the single most important metric for cache health. A sudden increase signals that the working set has grown, the access pattern has changed, or the cache is too small.
+
+Set up alerting on the eviction rate. A sustained increase of 2x over baseline requires investigation. The investigation should check:
+- Has the data volume increased? (More users, more products, more content.)
+- Has the access pattern changed? (A new feature that scans more data, a batch job that runs during peak hours.)
+- Has the cache size decreased? (Memory allocation changed, another process is consuming memory on the same host.)
+
+### 3. Choose Policy Based on Access Pattern
+
+There is no universal best eviction policy. The best policy depends on your access pattern:
+
+- **Strong temporal locality (recent = likely to be accessed again):** LRU. Most web application workloads.
+- **Stable popularity (frequently accessed = likely to be accessed again):** LFU. Reference data, configuration.
+- **Unknown or changing pattern:** ARC. Production systems that cannot be manually tuned.
+- **Scan-heavy workload:** 2Q or SLRU. Proxy caches, CDN edge caches.
+- **Minimal complexity:** Random. Medium-traffic caches with unpredictable access.
+
+### 4. Test With Production Traffic
+
+Eviction policies behave differently under production traffic than under synthetic benchmarks. A policy that achieves 95% hit ratio on a benchmark may achieve 60% on production traffic.
+
+The reason: production traffic has complex access patterns that benchmarks do not capture. Session expiry, batch jobs, cache warming, and traffic spikes all affect eviction behavior.
+
+Test policy changes using a canary deployment: apply the new policy to one shard (or 1% of cache nodes) and compare hit ratios, eviction rates, and latency before rolling out.
+
+### 5. TTL Reduces Eviction Pressure
+
+Every entry with a TTL will eventually expire, freeing memory without triggering eviction. This reduces the eviction rate and improves cache performance.
+
+Set TTLs aggressively. A 1-hour TTL means the entry is automatically removed after 1 hour, even if it is never accessed again. This prevents the cache from filling with stale data and reduces the burden on the eviction policy.
+
+The ideal TTL balances freshness (shorter = fresher data) and eviction pressure (longer = less eviction). For most web caches, 5-60 minutes is appropriate. For static assets with versioned URLs, 1 year is safe.

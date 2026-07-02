@@ -1,0 +1,1096 @@
+---
+id: consistency-architecture
+title: Consistency Architecture
+sidebar_position: 3
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Architecture Evolution
+Consistency architecture evolves through stages as systems grow. Each stage introduces new tradeoffs.
+---
+## Stage 1: Naive Architecture — Single Database
+The simplest approach: a single relational database with all reads and writes going to one node.
+<AsciiDiagram
+  id="consistency/arch-single-db"
+  title="Single-node database architecture providing strong consistency at small scale"
+  alt="Client applications reading and writing to a single database with an ACID guarantee, all traffic passes through one node"
+  caption="Single database node provides full ACID guarantees but creates a single point of failure"
+  content={`Single database architecture
+  ┌──────────┐          ┌──────────┐          ┌──────────┐
+  │ Web App  │          │ Web App  │          │ Web App  │
+  │  Server  │          │  Server  │          │  Server  │
+  │  US-East │          │  EU-West │          │  AP-East │
+  └────┬─────┘          └────┬─────┘          └────┬─────┘
+       │                     │                     │
+       └──────────┬──────────┴──────────┬──────────┘
+                  │                     │
+                  ▼                     ▼
+          ┌───────────────────────────────────────┐
+          │         Single Database               │
+          │         (PostgreSQL / MySQL)          │
+          │                                       │
+          │  ┌─────────────────────────────────┐  │
+          │  │  ACID Transactions               │  │
+          │  │  SERIALIZABLE isolation          │  │
+          │  │  Strong consistency guaranteed   │  │
+          │  └─────────────────────────────────┘  │
+          │                                       │
+          │  Max connections: 500                 │
+          │  Max throughput: ~5,000 writes/sec    │
+          │  Storage limit: ~10TB                 │
+          └───────────────────────────────────────┘
+`}
+/>
+**Pros:** Strong consistency is free. ACID transactions are easy. No distributed coordination needed.
+**Cons:** Single point of failure. Maximum throughput capped at one machine. Storage limited to one disk. All global traffic congregates on one node — latency penalizes distant regions.
+**Breaks at:** ~5,000 concurrent writes/second, ~10TB storage, or when any single region requires sub-50ms p99 latency.
+### Read-Replica Architecture with Streaming Replication
+When your single database exceeds its read capacity, the first step is to add read replicas with PostgreSQL streaming replication. This preserves strong consistency for writes while scaling reads horizontally.
+PostgreSQL streaming replication works by shipping the Write-Ahead Log (WAL) from the primary to replicas in near real-time. The WAL contains every committed transaction. Replicas replay the WAL to stay synchronized with the primary.
+<AsciiDiagram
+  id="consistency/arch-pgbouncer-replicas"
+  title="pgBouncer connection pool routing reads to replicas and writes to primary"
+  alt="pgBouncer sits between application servers and the database cluster, routing writes to the PostgreSQL primary and reads to two replicas, with measured replication lag on each replica"
+  caption="pgBouncer connection pooler routes writes to primary and reads to replicas; each replica shows its WAL replay lag"
+  content={`Read-replica architecture with pgBouncer
+  ┌───────────────────┐
+  │ [Web App Server]  │
+  │  US-East          │
+  └────────┬──────────┘
+           │
+           ▼
+  ┌───────────────────┐
+  │ [pgBouncer]       │
+  │ Connection Pool   │
+  │ max: 1000 conns   │
+  └───┬───────────┬───┘
+      │           │
+      │ WRITE     │ READ (round-robin)
+      ▼           ▼
+  ┌────────────────────┐
+  │ ((Primary))        │
+  │ PostgreSQL 16.3    │
+  │ WAL: seq=45230     │
+  │ WAL flush: 0ms lag │
+  │                    │
+  │ WAL senders: 2     │
+  │ active conns: 45   │
+  └───┬────────────────┘
+      │
+      │ WAL streaming
+      │ (continuous)
+      │
+  ┌────┴──────────┐  ┌────┴──────────┐
+  │ ((Replica 1)) │  │ ((Replica 2)) │
+  │ us-east-1b    │  │ us-east-1c    │
+  │ WAL: seq=45228 │  │ WAL: seq=45220 │
+  │ lag: 35ms     │  │ lag: 120ms    │
+  │ active: 120   │  │ active: 95    │
+  └───────────────┘  └───────────────┘
+`}
+/>
+The WAL replay lag on each replica creates a **staleness window** where a read returns data that is not yet visible. For example:
+- Client A writes `inventory_count = 42` to the primary at T=0ms.
+- Replica 1 receives the WAL entry at T=35ms and replays it.
+- Replica 2 receives the WAL entry at T=120ms and replays it.
+- Any read routed to a replica between T=0 and T=35ms sees `inventory_count = 41`.
+This staleness window grows under load. When the primary handles 10,000 writes/second, the WAL generation rate increases, replication slots fill, and lag can spike to 500ms or more. PostgreSQL replication slots prevent the primary from discarding WAL segments until all replicas have consumed them, which means a slow replica can cause the primary's disk to fill.
+```yaml
+# pgBouncer routing configuration
+[databases]
+primary = host=db-primary port=5432 dbname=prod
+replica = host=db-replica-1,db-replica-2 port=5432 dbname=prod
+[pgbouncer]
+# Route SELECT queries to replicas
+query_routing = true
+# Round-robin across replicas
+server_round_robin = true
+# If all replicas are down, fall back to primary
+fallback_to_primary = true
+```
+**Replica lag causes three practical problems:**
+1. **Read-after-write inconsistency:** You write data and immediately read it back from a replica — the write is invisible. Mitigate with session stickiness: pin a client to the primary for 1 second after a write.
+2. **Cascading lag:** If replica 2 is already 120ms behind and then the primary receives a burst of 50,000 writes, replica 2 falls further behind. The catch-up time grows super-linearly.
+3. **Monotonic read violation:** You read a value of 42 from replica 1 (at T=35ms), then read again from replica 2 (at T=120ms) and see 41 — time appears to go backward. Mitigate with replica-pinning by client IP hash.
+**When read replicas are enough:** Your workload is read-heavy (95% or more reads) and you tolerate up to 500ms of staleness. This covers most content-serving and analytics workloads.
+**When read replicas are not enough:** You need strong consistency for reads, or write throughput exceeds the primary's capacity. At that point, you move to a distributed architecture.
+---
+## Stage 2: Production Architecture — Distributed with Tunable Consistency
+A DynamoDB-style architecture with configurable consistency per operation.
+<AsciiDiagram
+  id="consistency/arch-tunable"
+  title="Distributed architecture with tunable consistency per operation"
+  alt="Three-region deployment with a coordinator node, consensus group for writes, read replicas for eventual reads, and per-request consistency routing"
+  caption="Distributed system with tunable consistency: strong writes through Raft, tunable reads via configurable quorum"
+  content={`Tunable consistency architecture
+  ┌──────────────────────────────────────────────────────────┐
+  │                     Client Application                    │
+  │                                                           │
+  │  Write: strong=True    Read: strong=False                 │
+  │  (must see latest)     (stale OK for 2s)                 │
+  └──────────┬───────────────────────────┬───────────────────┘
+             │                           │
+             ▼                           ▼
+  ┌────────────────────┐     ┌──────────────────────┐
+  │   Write Path       │     │    Read Path          │
+  │                    │     │                        │
+  │  ┌──────────────┐  │     │  ┌────────────────┐   │
+  │  │  Coordinator │  │     │  │  Read Router   │   │
+  │  │  (Raft       │  │     │  │  (consistent   │   │
+  │  │   leader)    │  │     │  │   read → Raft  │   │
+  │  └──────┬───────┘  │     │  │   eventual →   │   │
+  │         │           │     │  │   any replica) │   │
+  │         │           │     │  └────────┬───────┘   │
+  │         ▼           │     │           │           │
+  │  ┌──────────────┐   │     │  ┌────────┴───────┐   │
+  │  │  Raft        │   │     │  │  Replica Pool   │   │
+  │  │  Consensus   │   │     │  │  ┌─ ─ ─ ─ ─ ┐   │   │
+  │  │  Group (3/5) │   │     │  │  │  Node 4   │   │   │
+  │  └──────────────┘   │     │  │  │  (event.) │   │   │
+  │                     │     │  │  ├─ ─ ─ ─ ─ ┤   │   │
+  │  Strong path:       │     │  │  │  Node 5   │   │   │
+  │  Raft commit +      │     │  │  │  (event.) │   │   │
+  │  quorum read        │     │  └─ ─ ─ ─ ─ ┘   │   │
+  │                     │     │  └──────────────────┘   │
+  └─────────────────────┘     └─────────────────────────┘
+`}
+/>
+Key design decisions:
+- Writes go through Raft consensus for durability and ordering.
+- Reads can be served from any replica for low latency (eventual) or go through a quorum read (strong).
+- The read router checks the per-request consistency flag.
+- Replicas lag behind the Raft group by the replication delay (typically 5-100ms).
+### Coordinator Node Internal State Machine
+The coordinator is the brain of the distributed system. It is not a simple proxy — it maintains an internal state machine that tracks the lifecycle of every write and read operation.
+<AsciiDiagram
+  id="consistency/arch-coordinator-state"
+  title="Coordinator node internal state machine showing pending writes, version vectors, and read repair threads"
+  alt="Five-layer diagram of coordinator internals: request parser, pending writes queue with entries per key, version vector table with per-key vector clocks, read repair thread pool, and quorum response aggregator"
+  caption="The coordinator maintains per-key version vectors, tracks pending write promises, and runs background read repair threads"
+  content={`Coordinator internal state machine
+  ┌────────────────────────────────────────────────────────┐
+  │              [Request Parser Layer]                    │
+  │  parse_consistency_flag() → strong | eventual          │
+  │  parse_write_payload() → key, value, timestamp         │
+  └────────────────────────┬───────────────────────────────┘
+                           │
+                           ▼
+  ┌────────────────────────────────────────────────────────┐
+  │              [Pending Writes Queue]                    │
+  │                                                        │
+  │  ┌──────┬──────────┬──────────┬──────────┬──────────┐ │
+  │  │ Key  │ Timestamp│ Nodes    │ Promises │ Status   │ │
+  │  ├──────┼──────────┼──────────┼──────────┼──────────┤ │
+  │  │ u:42 │ 1719001  │ [1,2,3]  │ W=2 ack  │ commit   │ │
+  │  │ p:17 │ 1719002  │ [1,2,3]  │ W=2 ack  │ pending  │ │
+  │  │ i:99 │ 1719003  │ [1,3,4]  │ W=3 ack  │ pending  │ │
+  │  │ c:55 │ 1719004  │ [2,4,5]  │ W=2 ack  │ inflight │ │
+  │  └──────┴──────────┴──────────┴──────────┴──────────┘ │
+  │                                                        │
+  │  Max queue depth: 10,000 entries                       │
+  │  Backpressure at: 8,000 entries → 503 to new writes    │
+  └────────────────────────┬───────────────────────────────┘
+                           │
+                           ▼
+  ┌────────────────────────────────────────────────────────┐
+  │              [Version Vectors per Key]                 │
+  │                                                        │
+  │  ┌──────┬──────────────┬──────────────┬──────────────┐ │
+  │  │ Key  │ Node 1 clock │ Node 2 clock │ Node 3 clock │ │
+  │  ├──────┼──────────────┼──────────────┼──────────────┤ │
+  │  │ u:42 │  [7, 0, 0]   │  [7, 9, 0]   │  [7, 9, 11]  │ │
+  │  │ p:17 │  [3, 0, 0]   │  [3, 0, 0]   │  [3, 0, 0]   │ │
+  │  │ i:99 │  [0, 5, 0]   │  [0, 5, 2]   │  [0, 5, 2]   │ │
+  │  └──────┴──────────────┴──────────────┴──────────────┘ │
+  │                                                        │
+  │  Vector clock rules:                                   │
+  │  - A > B if all elements of A >= B and one >           │
+  │  - A || B (concurrent) if neither dominates            │
+  │  - Concurrent writes trigger conflict resolution        │
+  └────────────────────────┬───────────────────────────────┘
+                           │
+                           ▼
+  ┌────────────────────────────────────────────────────────┐
+  │              [Read Repair Thread Pool]                 │
+  │                                                        │
+  │  Threads: 8 worker threads                             │
+  │  Repair batch size: 100 keys per cycle                 │
+  │  Interval: every 500ms                                 │
+  │                                                        │
+  │  ┌─────────────────────────────────────────────────┐   │
+  │  │ Repair flow:                                    │   │
+  │  │  1. Read key from all N replicas                │   │
+  │  │  2. Compare version vectors                     │   │
+  │  │  3. Identify stale replicas                     │   │
+  │  │  4. Write latest version to stale replicas      │   │
+  │  │  5. Mark repair complete in coordinator log     │   │
+  │  └─────────────────────────────────────────────────┘   │
+  └────────────────────────┬───────────────────────────────┘
+                           │
+                           ▼
+  ┌────────────────────────────────────────────────────────┐
+  │              [Quorum Response Aggregator]              │
+  │                                                        │
+  │  Reads: wait for R responses, pick latest version      │
+  │  Writes: wait for W acknowledgments, return success    │
+  │  Timeout: 1,500ms per operation                       │
+  │  Retry: 3 attempts with 200ms backoff                  │
+  └────────────────────────────────────────────────────────┘
+`}
+/>
+The state machine processes each write through five distinct stages:
+1. **Parse:** Extract the key, value, timestamp, and consistency flag from the request.
+2. **Enqueue:** Insert into the pending writes queue. The queue has a depth limit of 10,000 entries. When the queue exceeds 8,000 entries, the coordinator returns HTTP 503 to backpressure the client.
+3. **Distribute:** Send the write to all N replicas in the preference list. Track which nodes have acknowledged.
+4. **Aggregate:** Once W acknowledgments arrive, mark the write as committed and return success to the client.
+5. **Repair:** The read repair thread pool periodically scans for version vector divergence and pushes the latest value to any node that is behind.
+Version vectors are critical for consistency. Each key stores a vector clock `[c1, c2, c3]` where each entry is the logical clock from one node. When a coordinator reads a key from multiple replicas and finds different version vectors, it can determine:
+- **One dominates:** A later version exists. Return the later one and repair the stale replicas.
+- **Both concurrent:** A write conflict occurred. Use last-writer-wins (LWW) with wall-clock timestamp, or return both versions to the application for merge.
+---
+## Stage 3: Integration Architecture
+### Pattern 1: RDBMS Leader-Follower
+PostgreSQL or MySQL with a single writer and multiple read replicas.
+```yaml
+# Configuration
+database:
+  primary: db-primary.prod.internal:5432
+  replicas:
+    - db-replica-1.prod.internal:5432  # sync replica
+    - db-replica-2.prod.internal:5432  # async replica (us-west)
+    - db-replica-3.prod.internal:5432  # async replica (eu-west)
+  consistency:
+    writes: "must go to primary"
+    reads: "prefer replica, fallback to primary"
+    read_after_write: "sticky session to primary"
+```
+The PostgreSQL synchronous replication mode guarantees that the primary waits for at least one synchronous replica to acknowledge before reporting commit to the client. This provides stronger guarantees than async replication.
+<AsciiDiagram
+  id="consistency/arch-rdbms-leader-follower"
+  title="RDBMS leader-follower with sync and async replicas"
+  alt="Primary database accepting writes with one synchronous replica and two async replicas; reads route to replicas for eventual consistency"
+  caption="PostgreSQL leader-follower: sync replica for durability, async replicas for read scaling"
+  content={`RDBMS leader-follower architecture
+  ┌──────┴──────────┐     ┌─────────┴──────────┐
+  │ Application     │     │ Application         │
+  │ (writer)        │     │ (reader)            │
+  └──────┬──────────┘     └─────────┬──────────┘
+         │ WRITE                    │ READ
+         ▼                          ▼
+  ┌──────────────────────┐  ┌───────────────────┐
+  │   Primary (Leader)   │  │   Read Router     │
+  │   PostgreSQL 16.3   │  │        │           │
+  │                      │  │        │           │
+  │  ┌────────────────┐  │  │  ┌─────┴──────┐    │
+  │  │ WAL: seq=45230 │  │  │  │ sticky?    │    │
+  │  └────────────────┘  │  │  └─────┬──────┘    │
+  └───────┬──────────────┘  └────────┼───────────┘
+          │                          │
+          │ sync replication         │
+          ▼                          ▼
+  ┌─────────────────┐     ┌──────────────────────┐
+  │ Sync Replica    │     │ Async Replica (us-w) │
+  │ PostgreSQL 16.3 │     │ PostgreSQL 16.3       │
+  │ WAL: seq=45230  │     │ WAL: seq=45228 (lag) │
+  └─────────────────┘     └──────────────────────┘
+                           ┌──────────────────────┐
+                           │ Async Replica (eu-w) │
+                           │ PostgreSQL 16.3       │
+                           │ WAL: seq=45220 (lag) │
+                           └──────────────────────┘
+`}
+/>
+### Pattern 2: DynamoDB/Cassandra Quorum
+Keyspace-sharded architecture where clients specify consistency per operation.
+```python
+# Python client for DynamoDB-style system
+class ConsistentDynamoDB:
+    def __init__(self, nodes: list[str], N: int = 3):
+        self.nodes = nodes  # all nodes in the ring
+        self.N = N          # replication factor
+    def put(self, key: str, value: dict, W: int = 2) -> bool:
+        preference_list = self._preference_list(key)
+        acks = 0
+        for node in preference_list[:self.N]:
+            if node.write(key, value):
+                acks += 1
+                if acks >= W:
+                    return True
+        return False  # quorum not met
+    def get(self, key: str, R: int = 2) -> dict | None:
+        preference_list = self._preference_list(key)
+        versions = []
+        for node in preference_list[:self.N]:
+            result = node.read(key)
+            if result:
+                versions.append(result)
+                if len(versions) >= R:
+                    break
+        latest = self._resolve_conflicts(versions)
+        return latest
+    def _preference_list(self, key: str) -> list[str]:
+        hash_val = hash(key)
+        start = hash_val % len(self.nodes)
+        return self.nodes[start:] + self.nodes[:start]
+```
+### Pattern 3: ZooKeeper/etcd for Consensus Coordination
+These systems provide linearizable consistency at the cost of throughput (~10K writes/sec per cluster). Used for coordination metadata, not bulk data.
+<AsciiDiagram
+  id="consistency/arch-zk-etcd"
+  title="ZooKeeper/etcd as coordination layer with strongly consistent metadata"
+  alt="Applications reading and writing configuration metadata through an etcd cluster; the etcd cluster uses Raft to provide linearizable operations"
+  caption="etcd/ZooKeeper provide strong consistency for coordination metadata, not application data"
+  content={`Coordination service architecture
+  ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │  Service │    │  Service │    │  Service │
+  │    A     │    │    B     │    │    C     │
+  │          │    │          │    │          │
+  │ read     │    │ watch    │    │ write    │
+  │ config   │    │ for      │    │ leader   │
+  │          │    │ changes  │    │ election │
+  └────┬─────┘    └────┬─────┘    └────┬─────┘
+       │               │               │
+       └───────┬───────┴───────┬───────┘
+               │               │
+               ▼               ▼
+  ┌──────────────────────────────────────────┐
+  │              etcd / ZooKeeper             │
+  │  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐ │
+  │  │Node 1│  │Node 2│  │Node 3│  │Node 4│ │
+  │  │Lear  │  │Folr │  │Folr │  │Folr │ │
+  │  └──────┘  └──────┘  └──────┘  └──────┘ │
+  │                                           │
+  │  Raft consensus: linearizable reads       │
+  │  Max throughput: ~10K writes/sec          │
+  │  Key-value size limit: ~1.5MB per key     │
+  │                                           │
+  │  Use cases:                               │
+  │  - Service discovery                      │
+  │  - Configuration management               │
+  │  - Distributed locks                      │
+  │  - Leader election                        │
+  └───────────────────────────────────────────┘
+`}
+/>
+### Pattern 4: CDNs and Eventual Consistency
+CDNs are the most extreme example of eventual consistency in production. A cache layer intentionally serves stale data for performance.
+```
+PUT http://cdn.example.com/image.jpg
+  → origin server accepts and makes available
+  → edge nodes poll or receive invalidation
+  → TTL expires after 300s
+  → stale image served for up to 5 minutes
+```
+### Pattern 5: Redis as a Strongly Consistent Cache Layer
+Redis Cluster provides strong consistency for cache-level operations when configured correctly. Redis does not aim for full ACID compliance like PostgreSQL, but it offers tunable durability through replication acknowledgment.
+Redis Cluster partitions keys into 16,384 hash slots distributed across nodes. Each key maps to exactly one slot. Every slot is served by a primary node with zero or more replica nodes. When you write to a key, you must connect to the node that owns that key's slot.
+<AsciiDiagram
+  id="consistency/arch-redis-cluster"
+  title="Redis Cluster architecture with hash slots, WAIT command for replication, and read-replica routing"
+  alt="Three Redis primaries each owning a subset of 16,384 hash slots, with replicas per primary, a Redis Cluster proxy routing requests, and the WAIT command ensuring replication acknowledgment before returning to the client"
+  caption="Redis Cluster: 16,384 hash slots spread across primaries; WAIT replication acknowledgment for strong cache consistency"
+  content={`Redis Cluster consistency architecture
+  ┌──────────────────────────────────────┐
+  │        [Application Client]          │
+  │  SET key:user:42                     │
+  │  flags: WAIT=1 timeout=500ms        │
+  └────────────────┬─────────────────────┘
+                   │
+                   ▼
+  ┌──────────────────────────────────────┐
+  │        [Redis Cluster Proxy]         │
+  │  hash_slot = CRC16(key) % 16384     │
+  │  slot 1234 → primary-node-2:6379    │
+  └────────────────┬─────────────────────┘
+                   │
+                   ▼
+  ┌──────────────────────────────────────────────────────┐
+  │             Primary Node 2 (owns slots 5461-10922)   │
+  │  ┌──────────────────────────────────────────────┐    │
+  │  │  SET key:user:42 → OK                        │    │
+  │  │  WAIT 1 500 → replicas acknowledged: 1       │    │
+  │  └──────────────────────────────────────────────┘    │
+  └───────────┬──────────────────────────────────────────┘
+              │
+              │ replication stream
+              ▼
+  ┌─────────────────────────────┐
+  │ ((Replica 2a))              │
+  │  key:user:42 → value synced │
+  │  lag: 0ms (WAIT confirmed)  │
+  └─────────────────────────────┘
+  ┌─────────────────────────────┐
+  │ ((Replica 2b))              │
+  │  key:user:42 → value synced │
+  │  lag: 2ms (async)           │
+  └─────────────────────────────┘
+  Redis WAIT command:
+  WAIT <num_replicas> <timeout_ms>
+  Blocks until <num_replicas> replicas acknowledge
+  Returns count of replicas that acknowledged
+  `} />
+The Redis `WAIT` command is the key to strong consistency in a cache context:
+```python
+import redis
+client = redis.RedisCluster(
+    host="redis-cluster.prod.internal",
+    port=6379,
+    # Minimum nodes required to mark cluster healthy
+    require_full_coverage=False,
+)
+def set_with_wait(key: str, value: str, ttl: int = 300) -> dict:
+    """Write to Redis and wait for at least one replica to acknowledge."""
+    pipeline = client.pipeline()
+    pipeline.set(key, value, ex=ttl)
+    pipeline.execute_command("WAIT", 1, 500)  # wait 1 replica, 500ms timeout
+    result = pipeline.execute()
+    acknowledged = result[1]  # number of replicas that confirmed
+    if acknowledged under 1:
+        return {"status": "degraded", "warning": "write not replicated"}
+    return {"status": "ok", "acknowledged": acknowledged}
+```
+The tradeoff: WAIT adds latency equal to the round-trip to the slowest replica. For a cross-AZ deployment with 2ms RTT between nodes, WAIT=1 adds approximately 2-3ms to every write. Without WAIT, Redis acknowledges the write immediately after the primary writes to memory (sub-millisecond).
+**When to use WAIT:** You need cache reads to never return a stale value after a write. For example, session data where logging out must immediately invalidate all replicas, or rate-limit counters where a stale read could allow excess traffic.
+**When to skip WAIT:** Your cache has a short TTL (under 60 seconds), and the cost of an occasional stale read is low. Most Redis deployments run without WAIT and accept the small inconsistency window.
+### Pattern 6: MongoDB with Configurable Read Concern and Write Concern
+MongoDB offers configurable consistency levels through read concern and write concern. Each operation can specify its own consistency requirements, similar to DynamoDB's approach but with different terminology.
+**Write concern** controls how many members of a replica set must acknowledge a write:
+| Concern | Behavior | Latency | Consistency Level |
+|---|---|---|---|
+| `w: 0` | Fire-and-forget, no acknowledgment | 0.5ms | None — data loss on primary crash |
+| `w: 1` | Acknowledged by primary only | 2ms | Weak — replica lag causes stale reads |
+| `w: majority` | Acknowledged by majority of replica set | 5ms | Strong — Raft-equivalent durability |
+| `w: linearizable` | Read must reflect all preceding writes | 12ms | Strongest — serializable, read-majority-write |
+**Read concern** controls which data a read returns:
+| Concern | Behavior | Staleness Window |
+|---|---|---|
+| `local` | Returns whatever the queried node has | Up to replica lag (5-200ms) |
+| `available` | Similar to local, returns immediately | Up to replica lag |
+| `majority` | Returns data acknowledged by majority | 0ms (strong) |
+| `linearizable` | Reads from the primary after confirming no concurrent writes | 0ms (serial) |
+<AsciiDiagram
+  id="consistency/arch-mongodb-concerns"
+  title="MongoDB read concern and write concern routing from application to replica set"
+  alt="Application sending a write with w=majority and a read with readConcern=majority through a MongoDB driver to a 3-node replica set, showing the path through the primary for writes and majority-acknowledged reads"
+  caption="MongoDB read/write concerns: writes with w=majority require majority acknowledgment; reads with readConcern=majority return only majority-committed data"
+  content={`MongoDB read/write concern architecture
+  ┌────────────────────────────────────────────┐
+  │            [Application Client]            │
+  │                                            │
+  │  db.collection.insertOne(                  │
+  │    { _id: "u:42", balance: 500 },         │
+  │    { writeConcern: { w: "majority" } }    │
+  │  )                                         │
+  │                                            │
+  │  db.collection.findOne(                     │
+  │    { _id: "u:42" },                       │
+  │    { readConcern: "majority" }            │
+  │  )                                         │
+  └─────────────────────┬──────────────────────┘
+                        │
+                        ▼
+  ┌────────────────────────────────────────────┐
+  │           [MongoDB Driver]                 │
+  │                                            │
+  │  Write: route to primary                   │
+  │  Read (majority): route to primary         │
+  │  Read (local): route to nearest replica    │
+  └─────────────────────┬──────────────────────┘
+                        │
+                        ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │              MongoDB Replica Set (3 nodes)               │
+  │                                                          │
+  │  ┌────────────────────────────────────────────────┐      │
+  │  │ ((Primary))                                    │      │
+  │  │  Write: acknowledged                            │      │
+  │  │  Read (majority): reads from committed view    │      │
+  │  │  Oplog: ts=1719001000                          │      │
+  │  └───────┬────────────────────────────────────────┘      │
+  │          │                                               │
+  │          │ oplog replication                             │
+  │          │                                               │
+  │  ┌───────┴──────────┐    ┌───────────┴──────────┐      │
+  │  │ ((Secondary 1))  │    │ ((Secondary 2))      │      │
+  │  │  Read (local)    │    │  Read (local)        │      │
+  │  │  oplog: 1719001  │    │  oplog: 1719000      │      │
+  │  │  lag: 0ms        │    │  lag: 35ms           │      │
+  │  └──────────────────┘    └──────────────────────┘      │
+  │                                                          │
+  │  w=majority: primary waits for sec1 ACK (majority=2)   │
+  │  commitTime: 1719001002 → data becomes visible         │
+  └──────────────────────────────────────────────────────────┘
+`}
+/>
+```javascript
+// MongoDB client with configurable consistency
+const { MongoClient } = require("mongodb");
+async function transferFunds(from, to, amount) {
+  const session = client.startSession();
+  try {
+    session.startTransaction({
+      readConcern: { level: "majority" },
+      writeConcern: { w: "majority" },
+    });
+    await collection.updateOne(
+      { _id: from },
+      { $inc: { balance: -amount } },
+      { session }
+    );
+    await collection.updateOne(
+      { _id: to },
+      { $inc: { balance: amount } },
+      { session }
+    );
+    await session.commitTransaction();
+    return { status: "committed" };
+  } finally {
+    session.endSession();
+  }
+}
+// Choosing concern levels by operation type
+const CONCERN_MAP = {
+  // Payment operations require strongest guarantees
+  payment_write: { w: "majority", j: true },
+  payment_read: { readConcern: "majority" },
+  // Analytics can tolerate staleness
+  analytics_write: { w: 1 },
+  analytics_read: { readConcern: "local" },
+  // Session data: strong on write, eventual on read
+  session_write: { w: "majority" },
+  session_read: { readConcern: "local" },
+};
+```
+**MongoDB consistency rules of thumb:**
+- Use `w: "majority"` for all writes that must survive a primary failure. Without it, the primary can acknowledge a write, crash, and the write is lost forever.
+- Use `readConcern: "majority"` when you must read your own writes. Without it, a read-committed-after-write pattern can return stale data if the read hits a lagging secondary.
+- Use `w: "linearizable"` only when you need strict serializability, such as a leader election vote or a unique constraint outside of an index. It is 3-5x slower than `w: "majority"` and must be combined with `readConcern: "linearizable"` on the read side.
+- For analytics reporting and dashboard queries, `readConcern: "local"` with `w: 1` is almost always sufficient. The 10MB aggregation pipeline run daily does not need majority commit guarantees.
+---
+## Stage 4: Multi-Region Architecture
+Consistency becomes significantly harder when replicating across geographic regions.
+<AsciiDiagram
+  id="consistency/arch-multi-region"
+  title="Multi-region replication with strong and eventual paths"
+  alt="Three-region deployment with Raft leader in us-east, Raft followers in eu-west and ap-southeast, local read replicas in each region for fast eventual reads"
+  caption="Multi-region deployment: one Raft leader accepts writes, followers replicate cross-region, local replicas serve fast reads"
+  content={`Multi-region consistency architecture
+  ┌────────────────────────────────────────────────────────────┐
+  │                    US-East (Primary)                       │
+  │  ┌────────────┐  ┌────────────┐  ┌────────────┐          │
+  │  │ Raft Ldr   │  │ Raft Fol   │  │ Read Rep   │          │
+  │  │ Write 1ms  │  │ Replicate  │  │ Nearest    │          │
+  │  └─────┬──────┘  └────────────┘  └────────────┘          │
+  │        │                                                   │
+  └────────┼───────────────────────────────────────────────────┘
+           │ cross-region replication
+           │ 60-90ms RTT
+           │
+  ┌────────┼───────────────────────────────────────────────────┐
+  │        ▼                                                   │
+  │   EU-West (Secondary)            AP-Southeast (Secondary)  │
+  │  ┌────────────┐                 ┌────────────┐            │
+  │  │ Raft Fol   │                 │ Raft Fol   │            │
+  │  │ Read only  │                 │ Read only  │            │
+  │  └────────────┘                 └────────────┘            │
+  │  ┌────────────┐                 ┌────────────┐            │
+  │  │ Local Rep  │                 │ Local Rep  │            │
+  │  │ Fast reads │                 │ Fast reads │            │
+  │  │ p99: 5ms   │                 │ p99: 8ms   │            │
+  │  └────────────┘                 └────────────┘            │
+  │                                                            │
+  │  Strong read: forward to US-East (60-90ms)                │
+  │  Eventual read: local replica (5-8ms)                      │
+  └────────────────────────────────────────────────────────────┘
+`}
+/>
+Key numbers for multi-region:
+| Operation | US-East | EU-West | AP-Southeast |
+|---|---|---|---|
+| Write to Raft leader | 1ms | N/A (forward) | N/A (forward) |
+| Strong read | 2ms | 60-90ms (+ forward) | 100-150ms (+ forward) |
+| Eventual read | 0.5ms | 5ms (local replica) | 8ms (local replica) |
+| Replication lag | 0ms | 50-100ms | 100-200ms |
+Tradeoff: Strong cross-region reads cost 60-150ms of additional latency. Most applications serve eventual reads from local replicas and accept the staleness window.
+### Active-Active vs Active-Passive Multi-Region Deployment
+When you deploy across multiple regions, you must choose between two fundamental topologies. Each makes different tradeoffs for consistency.
+<AsciiDiagram
+  id="consistency/arch-active-active-passive"
+  title="Active-passive topology versus active-active multi-region deployment side by side"
+  alt="Two-column diagram: left column shows active-passive with writes only to US-East primary and async replication to read-only EU-West and AP-Southeast replicas; right column shows active-active with writes in both US-East and EU-West and bidirectional replication with conflict resolution"
+  caption="Active-passive (left) vs active-active (right): one writer avoids conflicts but forces cross-region write latency; two writers reduce write latency but require conflict resolution"
+  content={`Active-Passive vs Active-Active topology
+  ┌──────────────────────────────┐    ┌──────────────────────────────┐
+  │   TOPOLOGY A: Active-Passive  │    │   TOPOLOGY B: Active-Active   │
+  │                              │    │                              │
+  │  US-East [WRITE]             │    │  US-East [WRITE]             │
+  │  ┌──────────────────────┐   │    │  ┌──────────────────────┐   │
+  │  │ ((Primary DB))       │   │    │  │ ((DB Node A))        │   │
+  │  │  Writes: yes         │   │    │  │  Writes: local keys   │   │
+  │  │  Reads: local 2ms    │   │    │  │  Reads: local 2ms     │   │
+  │  └──────────┬───────────┘   │    │  └──────────┬───────────┘   │
+  │             │               │    │             │               │
+  │             │ async ────────┼────┼─────── sync │               │
+  │             │ replic     │  │    │       repl  │               │
+  │             ▼               │    │             ▼               │
+  │  EU-West [READ ONLY]        │    │  EU-West [WRITE]             │
+  │  ┌──────────────────────┐  │    │  ┌──────────────────────┐   │
+  │  │ ((Replica))          │  │    │  │ ((DB Node B))        │   │
+  │  │  Writes: forwarded   │  │    │  │  Writes: local keys   │   │
+  │  │  Reads: local 5ms    │  │    │  │  Reads: local 5ms     │   │
+  │  └──────────────────────┘  │    │  └──────────────────────┘   │
+  │                              │    │                              │
+  │  AP-Southeast [READ ONLY]   │    │  AP-Southeast [WRITE]        │
+  │  ┌──────────────────────┐  │    │  ┌──────────────────────┐   │
+  │  │ ((Replica))          │  │    │  │ ((DB Node C))        │   │
+  │  │  Writes: forwarded   │  │    │  │  Writes: local keys   │   │
+  │  │  Reads: local 8ms    │  │    │  │  Reads: local 8ms     │   │
+  │  └──────────────────────┘  │    │  └──────────────────────┘   │
+  │                              │    │                              │
+  │ Tradeoffs:                   │    │ Tradeoffs:                   │
+  │  - Strong consistency: yes  │    │  - Strong consistency: no    │
+  │  - Write latency: 60-150ms │    │  - Write latency: 2-10ms     │
+  │  - Write throughput:        │    │  - Write throughput:         │
+  │    5K WPS per cluster       │    │    15K WPS (3 regions)      │
+  │  - Conflict resolution:     │    │  - Conflict resolution:      │
+  │    not needed               │    │    LWW / CRDT required       │
+  │  - Failover: promote        │    │  - Failover: instant         │
+  │    replica to primary (30s) │    │    (other regions continue)  │
+  └──────────────────────────────┘    └──────────────────────────────┘
+`}
+/>
+**Active-passive (single-writer) topology:**
+In this model, one region owns the writable primary. All other regions route writes to the primary through a global load balancer. Replicas in secondary regions serve local reads with eventual consistency.
+- If you write from EU-West, the request must cross the Atlantic (60-90ms RTT) plus the write time on the primary. Total write latency: 65-100ms from Europe.
+- Replication lag from US-East to EU-West is typically 50-100ms but can spike to 2 seconds during traffic bursts.
+- Failover requires promoting a replica to primary. This takes 10-30 seconds, during which no writes are accepted.
+**Active-active (multi-writer) topology:**
+In this model, every region accepts writes. Data is asynchronously or synchronously replicated between regions. This eliminates the cross-region write latency penalty but introduces write conflicts.
+- Two users, one in US-East and one in EU-West, write to the same key `inventory:shoes` at the same time. Their writes succeed locally. When replication catches up, both values exist and conflict resolution must decide the winner.
+- Most active-active systems use last-writer-wins (LWW) based on wall-clock timestamp. This requires synchronized clocks (NTP within 25ms tolerance).
+- CRDTs (Conflict-free Replicated Data Types) provide automatic conflict resolution for counters, sets, and maps without LWW. They require library support (e.g., `py-crdt`, `automerge`) and cannot handle arbitrary document merges.
+**How to choose:**
+Go with **active-passive** when your workload has a strong dependency on read-after-write consistency — payment systems, inventory reservation, user profile updates. The 60-150ms write latency penalty for distant regions is the cost of correctness.
+Go with **active-active** when your workload is partition-tolerant by key — multi-tenant SaaS where each tenant writes only in their nearest region, session data scoped to region, write-heavy IoT where each device writes to its nearest ingest point.
+---
+## Stage 5: Capacity Planning
+### Quorum Overhead on Latency
+The relationship between quorum size, consistency, and latency is governed by the quorum formula: `W + R > N`.
+<AsciiDiagram
+  id="consistency/arch-capacity"
+  title="Quorum overhead: write latency vs quorum size for N=5"
+  alt="Line chart showing write latency increasing linearly with write quorum size W, from 1ms at W=1 to 12ms at W=5"
+  caption="Write latency increases with quorum size due to coordination overhead"
+  content={`Quorum overhead (N=5 cluster, 1ms intra-DC RTT)
+  W=1 (eventual)     W=2 (weak)     W=3 (strong)    W=5 (all)
+  ┌─────┐            ┌─────┐         ┌─────┐         ┌─────┐
+  │0.5ms│            │1.2ms│         │2.1ms│         │5.0ms│
+  └─────┘            └─────┘         └─────┘         └─────┘
+  no waiting         wait 1 of 4 wait 2 of 4 wait all 4
+  for ACKs           follower ACKs  follower ACKs  follower ACKs
+  Throughput impact:
+  W=1: 100% throughput (no coordination)
+  W=3: ~40% throughput (coordination overhead)
+  W=5: ~15% throughput (slowest node sets the pace)
+`}
+/>
+### How to Choose N, W, R
+```
+N = replication factor (total copies of data)
+W = write quorum (nodes that must ACK a write)
+R = read quorum (nodes consulted on a read)
+If W + R > N  → strong consistency guaranteed
+If W + R <= N → eventual consistency only
+Production patterns:
+  N=3, W=2, R=2  → strong, tolerates 1 node failure
+  N=3, W=2, R=1  → eventual, fast reads
+  N=5, W=3, R=3  → strong, tolerates 2 failures
+  N=5, W=3, R=2  → eventual, fast reads, "read repair" needed
+```
+### How to Choose N for a Given Workload
+Choosing the replication factor N is the most consequential decision in your consistency architecture. N determines three things: availability, write throughput, and storage cost.
+**Availability math:**
+The probability that your system is available depends on the probability that at least one replica of your data is reachable. If each node has a failure probability `p` over a given time window, and you have N replicas spread across independent failure domains:
+```
+P(all N nodes fail) = p^N
+System uptime = 1 - p^N
+```
+For example, with individual node availability of 99.5% (downtime = 0.5%):
+| N | Availability Formula | Result | Downtime per Year |
+|---|---|---|---|
+| 1 | `1 - 0.005^1` | 99.5000% | 43.8 hours |
+| 2 | `1 - 0.005^2` | 99.9975% | 13.1 minutes |
+| 3 | `1 - 0.005^3` | 99.9999% | 4.7 seconds |
+| 5 | `1 - 0.005^5` | 99.9999+% | 0.1 seconds |
+In practice, nodes are not fully independent — they share power, network, and cooling. A more realistic model factors in correlated failure:
+```
+P(all N fail) = (p_independent)^N + p_correlated
+```
+With 1% correlated failure probability, N=3 gives 99.9985% uptime, and N=5 gives 99.9984% — almost identical. Beyond N=3 or 5, additional replicas protect only against independent failures, not correlated events like datacenter power outages.
+**Throughput impact by N, W, R:**
+The write throughput of a quorum system is limited by the slowest node in the write set. Reads can be parallelized. The following table shows approximate relative throughput for different configurations, assuming a cluster where each node can handle 5,000 writes/second and 10,000 reads/second independently.
+| N | W | R | Write Throughput | Read Throughput | Consistency | Failure Tolerance |
+|---|---|---|---|---|---|---|
+| 3 | 1 | 1 | 15,000 wps | 30,000 rps | Eventual | 0 nodes |
+| 3 | 2 | 1 | 7,500 wps | 30,000 rps | Eventual | 1 node |
+| 3 | 2 | 2 | 7,500 wps | 15,000 rps | Strong | 1 node |
+| 3 | 3 | 3 | 5,000 wps | 10,000 rps | Strong | 0 nodes |
+| 5 | 2 | 2 | 12,500 wps | 25,000 rps | Eventual | 2 nodes |
+| 5 | 3 | 2 | 8,333 wps | 25,000 rps | Eventual | 2 nodes |
+| 5 | 3 | 3 | 8,333 wps | 16,667 rps | Strong | 2 nodes |
+| 5 | 4 | 4 | 6,250 wps | 12,500 rps | Strong | 1 node |
+| 7 | 3 | 3 | 11,667 wps | 23,333 rps | Eventual | 3 nodes |
+| 7 | 4 | 4 | 8,750 wps | 17,500 rps | Strong | 3 nodes |
+| 7 | 5 | 5 | 7,000 wps | 14,000 rps | Strong | 2 nodes |
+Key observations from the table:
+- **Write throughput drops as W increases** because you wait for more acknowledgments. Going from W=2 to W=4 on N=5 reduces write throughput by 25%.
+- **Read throughput drops as R increases** because you must query more replicas. Going from R=2 to R=4 on N=5 reduces read throughput by 50%.
+- **N=5, W=3, R=3** is the safest general-purpose configuration: strong consistency, tolerates 2 node failures, and delivers 8,333 writes/second and 16,667 reads/second cluster-wide.
+- **N=5, W=4, R=4** sacrifices throughput for durability. Use only when each individual write is critical and cannot be lost (financial ledgers, audit trails).
+- **N=7 is rarely worth it** for most applications. The availability gain from N=5 to N=7 is less than 0.001%, but the storage cost is 40% higher.
+### Latency Budget Calculation
+When designing for p99 latency:
+```
+total_p99 = coordination_time + network_time + disk_time
+Example: N=3, W=2, R=2, intra-DC RTT=1ms
+  Write: 2ms (1 RTT to followers + wait for ACKs)
+  Read:  1ms (parallel reads to 2 replicas)
+  Disk:  0.5ms (fsync on SSD)
+Total p99 write latency: 2.5ms
+Total p99 strong read latency: 1.5ms
+```
+---
+## Stage 6: Deployment — Consistency Level Migration
+Migrating from eventual to strong consistency in production requires careful orchestration.
+### Migration Steps
+1. **Audit** every data access pattern. Classify each into: must-be-strong, can-be-eventual, or mixed.
+2. **Instrument** with a consistency-level flag per operation. Default to eventual.
+3. **Shadow reads** with strong consistency for a subset of traffic (5%). Compare results with eventual reads. Measure staleness.
+4. **Roll out strong** for critical paths (payment, inventory). Keep eventual for read-heavy dashboards and analytics.
+5. **Monitor** four metrics during migration:
+   - p99 write latency (expected to increase 2-5x)
+   - p99 read latency (expected to increase 3-10x for strong reads)
+   - Error rate (quorum failures on node issues)
+   - Client-side staleness detection (flag when eventual returns older data than expected)
+```python
+# Deployment configuration for phased consistency rollout
+MIGRATION_CONFIG = {
+    "phase_1_shadow": {
+        "inventory_write": {"consistency": "eventual", "shadow_strong": 0.05},
+        "order_read": {"consistency": "eventual", "shadow_strong": 0.01},
+        "user_profile_write": {"consistency": "strong"},
+        "analytics_read": {"consistency": "eventual"},
+    },
+    "phase_2_strong_critical": {
+        "inventory_write": {"consistency": "strong"},
+        "order_read": {"consistency": "strong"},
+        "catalog_read": {"consistency": "eventual"},
+    },
+    "phase_3_full_rollout": {
+        "inventory_write": {"consistency": "strong"},
+        "order_read": {"consistency": "strong"},
+        "catalog_read": {"consistency": "strong"},
+    }
+}
+```
+### Consistency-Aware Connection Pooling
+A connection pool that is aware of consistency levels can route queries to the optimal nodes without application-level routing logic. This is a deployment-time concern: you configure the pool with node roles, and the pool routes based on the consistency flag on each query.
+<AsciiDiagram
+  id="consistency/arch-connection-pool"
+  title="Consistency-aware connection pool routing writes to Raft leader and reads to nearest replica or quorum based on the consistency flag"
+  alt="Application with a consistency-aware pool that has three connection pools: one to the Raft leader for writes and strong reads, one to local replicas for eventual reads, and one to remote quorum nodes for cross-region strong reads"
+  caption="Consistency-aware connection pool: three separate pools with different routing rules, selected per operation based on the consistency flag"
+  content={`Consistency-aware connection pooling
+  ┌──────────────────────────────────────────────────────────┐
+  │                    [Application]                         │
+  │                                                          │
+  │  write(key="u:42", data={...}, consistency="strong")    │
+  │  read(key="u:42", consistency="eventual")               │
+  └───────────────────────┬──────────────────────────────────┘
+                          │
+                          ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │          [Consistency-Aware Connection Pool]             │
+  │                                                          │
+  │  ┌─────────────────┐  ┌────────────────┐  ┌───────────┐ │
+  │  │ Write Pool      │  │ Strong Read    │  │ Eventual  │ │
+  │  │                 │  │ Pool           │  │ Read Pool │ │
+  │  │ targets: Raft   │  │ targets: Raft  │  │ targets:  │ │
+  │  │ leader          │  │ leader + sync  │  │ any local │ │
+  │  │ max: 50 conns   │  │ replicas       │  │ replica   │ │
+  │  │ timeout: 2s     │  │ max: 100 conns │  │ max: 500  │ │
+  │  │                 │  │ timeout: 2s    │  │ conns     │ │
+  │  │                 │  │                │  │ timeout:  │ │
+  │  │                 │  │                │  │ 500ms     │ │
+  │  └────────┬────────┘  └────────┬───────┘  └─────┬─────┘ │
+  └───────────┼───────────────────┼──────────────────┼───────┘
+              │                   │                  │
+              ▼                   ▼                  ▼
+  ┌──────────────────────┐ ┌──────────────────────┐
+  │ ((Raft Leader))      │ │ ((Local Replica 1))  │
+  │  Write: ack          │ │  Read: return 1ms    │
+  │  Strong read: 2ms    │ └──────────────────────┘
+  └──────────────────────┘ ┌──────────────────────┐
+  ┌──────────────────────┐ │ ((Local Replica 2))  │
+  │ ((Raft Follower 1))  │ │  Read: return 1ms    │
+  │  Strong read: 2ms    │ └──────────────────────┘
+  └──────────────────────┘
+  ┌──────────────────────┐
+  │ ((Raft Follower 2))  │
+  │  Strong read: 2ms    │
+  └──────────────────────┘
+`}
+/>
+```python
+# Consistency-aware connection pool implementation
+class ConsistencyPool:
+    def __init__(self, config: dict):
+        # Separate pools for different consistency levels
+        self.write_pool = ConnectionPool(
+            hosts=config["raft_leader"],
+            max_connections=50,
+            timeout_ms=2000,
+        )
+        self.strong_read_pool = ConnectionPool(
+            hosts=config["raft_leader"] + config["sync_replicas"],
+            max_connections=100,
+            timeout_ms=2000,
+        )
+        self.eventual_read_pool = ConnectionPool(
+            hosts=config["all_replicas"],
+            max_connections=500,
+            timeout_ms=500,
+        )
+    def execute(self, query: str, params: dict, consistency: str) -> Result:
+        if query.upper().strip().startswith(("INSERT", "UPDATE", "DELETE")):
+            conn = self.write_pool.acquire()
+        elif consistency == "strong":
+            conn = self.strong_read_pool.acquire()
+        else:
+            conn = self.eventual_read_pool.acquire()
+        try:
+            return conn.execute(query, params)
+        finally:
+            conn.release()
+```
+The pool works by classifying each query at parse time:
+- **Writes (INSERT, UPDATE, DELETE):** Always route to the Raft leader. Even eventual writes must go to the leader for consistency ordering.
+- **Strong reads (SELECT ... WITH CONSISTENCY STRONG):** Route to the Raft leader or a synchronous replica. The pool prefers the leader for lowest latency but falls back to sync replicas when the leader is overloaded.
+- **Eventual reads (SELECT ... WITH CONSISTENCY EVENTUAL):** Route to the nearest replica. The pool round-robins across all local replicas and never touches the leader.
+This separation prevents read traffic from consuming write path capacity. In the naive architecture, 500 read connections to the primary consume WAL writer throughput and increase write p99 by 30-50%.
+### Monitoring Consistency in Production
+You cannot trust a consistency system without measuring it. Most production consistency failures are silent: the system returns data, but it is stale or incomplete. You need four specific metrics.
+<AsciiDiagram
+  id="consistency/arch-monitoring-dashboard"
+  title="Production consistency monitoring dashboard showing replication lag, stale read rate, quorum failure rate, and version vector divergence"
+  alt="Dashboard layout with four panels: top-left shows replication lag by node as a time-series chart, top-right shows stale read rate as a percentage bar, bottom-left shows quorum failure rate by node combination, bottom-right shows version vector divergence count per table"
+  caption="Consistency monitoring dashboard: four panels tracking replication lag, stale reads, quorum failures, and version divergence"
+  content={`Consistency monitoring dashboard layout
+  ┌────────────────────────────────────────────────────────────┐
+  │  CONSISTENCY DASHBOARD                Status: HEALTHY     │
+  ├──────────────────────────┬────────────────────────────────┤
+  │  Panel 1: Replication    │  Panel 2: Stale Read Rate      │
+  │  Lag by Node             │                                 │
+  │                          │  ┌──────────────────────────┐   │
+  │  lag_ms                  │  │ ████████████░░░░ 12%     │   │
+  │  ▲                       │  │ stale reads / total      │   │
+  │  │   node-3 ───╱╲        │  │ reads in last 5 min     │   │
+  │  │           ╱  ╲───     │  │                          │   │
+  │  │  node-2 ──╱    ╲─    │  │ P50 staleness: 45ms      │   │
+  │  │  node-1 ─────         │  │ P99 staleness: 310ms    │   │
+  │  └───┬───┬───┬───┬───▶  │  │ Max staleness: 1,200ms │   │
+  │      10  20  30  40  min │  └──────────────────────────┘   │
+  │                          │                                 │
+  │  Warning threshold:      │  Alert threshold:               │
+  │  any node >500ms for 30s │  stale rate >5% for 60s        │
+  ├──────────────────────────┼────────────────────────────────┤
+  │  Panel 3: Quorum         │  Panel 4: Version Vector       │
+  │  Failure Rate            │  Divergence                    │
+  │                          │                                 │
+  │  ┌──────────────────────┐│  ┌──────────────────────────┐   │
+  │  │ Operation  │ Errors  ││  │ Table    │ Divergent Keys │   │
+  │  ├──────────────────────┤│  ├──────────────────────────┤   │
+  │  │ W=2 agree  │ 0.01%   ││  │ users    │ 0 / 1,234,567 │   │
+  │  │ W=2 reject │ 0.04%   ││  │ orders   │ 3 / 890,123   │   │
+  │  │ W=3 agree  │ 0.02%   ││  │ products │ 0 / 45,678    │   │
+  │  │ W=3 reject │ 0.12%   ││  │ sessions │ 12 / 2,345,890│   │
+  │  │ R=2 strong │ 0.03%   ││  └──────────────────────────┘   │
+  │  └──────────────────────┘│                                 │
+  │                          │  Repair health:                  │
+  │  Quorum healthy if:      │  Repair queue: 0                │
+  │  error rate < 0.1%       │  Repair lag: N/A                │
+  └──────────────────────────┴────────────────────────────────┘
+`}
+/>
+**Metric 1: Replication Lag**
+Measure the difference between the latest write timestamp on the leader and the latest applied write timestamp on each replica.
+```python
+import time
+from dataclasses import dataclass
+@dataclass
+class ReplicaLagMetric:
+    node_id: str
+    lag_ms: float
+    leader_wal_position: int
+    replica_wal_position: int
+def measure_replication_lag(leader, replicas) -> list[ReplicaLagMetric]:
+    """Query each replica for its WAL position relative to the leader."""
+    leader_lsn = leader.execute("SELECT pg_current_wal_lsn()")
+    metrics = []
+    for replica in replicas:
+        lag_bytes = replica.execute(
+            f"SELECT pg_wal_lsn_diff('{leader_lsn}', pg_last_wal_replay_lsn())"
+        )
+        # Convert bytes to estimated milliseconds
+        # Assumes 10MB/s WAL generation rate
+        lag_ms = (lag_bytes / (10 * 1024 * 1024)) * 1000
+        metrics.append(ReplicaLagMetric(
+            node_id=replica.node_id,
+            lag_ms=lag_ms,
+            leader_wal_position=leader_lsn,
+            replica_wal_position=replica.execute("SELECT pg_last_wal_replay_lsn()"),
+        ))
+    return metrics
+```
+Set a PagerDuty alert when any replica exceeds 500ms lag for more than 30 seconds. This indicates a network issue or a backup running on the replica.
+**Metric 2: Stale Read Rate**
+Measure how often a read returns data that is older than a client-defined freshness threshold. This requires client instrumentation:
+```python
+@dataclass
+class StaleReadMetric:
+    operation: str
+    consistency_flag: str
+    staleness_ms: float
+    was_stale: bool
+# Instrument your read path
+def read_with_staleness_check(key: str, max_age_ms: int = 100):
+    """Read a value and measure how old it is."""
+    start = time.monotonic_ns()
+    # Read from the system
+    value, timestamp = database.read(key)
+    # Calculate staleness
+    now = get_cluster_time_ns()
+    staleness_ms = (now - timestamp) / 1_000_000
+    if staleness_ms > max_age_ms:
+        metrics.stale_reads_total.inc()
+        # Log the stale read for debugging
+        logger.warning(
+            "Stale read detected",
+            extra={"key": key, "staleness_ms": staleness_ms, "threshold": max_age_ms}
+        )
+    return StaleReadMetric(
+        operation="read",
+        consistency_flag=value.consistency_flag,
+        staleness_ms=staleness_ms,
+        was_stale=staleness_ms > max_age_ms,
+    )
+```
+A stale read rate above 5% indicates that your eventual consistency configuration is too aggressive for your workload. Increase the replica count, reduce read concurrency, or switch critical paths to strong consistency.
+**Metric 3: Quorum Failure Rate**
+Track every quorum operation and its outcome. A quorum failure occurs when the system cannot gather W acknowledgments for a write or R responses for a read within the timeout window.
+```python
+@dataclass
+class QuorumMetric:
+    operation_type: str  # "write" or "read"
+    n: int              # configured replication factor
+    w_or_r: int         # configured quorum size
+    responses: int      # actual responses received
+    timeout_ms: int     # configured timeout
+    success: bool       # whether quorum was met
+def track_quorum_operation(
+    op_type: str, n: int, quorum: int, responses: int, timeout: int
+) -> QuorumMetric:
+    metric = QuorumMetric(
+        operation_type=op_type,
+        n=n,
+        w_or_r=quorum,
+        responses=responses,
+        timeout_ms=timeout,
+        success=responses >= quorum,
+    )
+    # Send to monitoring system
+    emit_metric(f"quorum.{op_type}.responses", responses)
+    if not metric.success:
+        emit_metric(f"quorum.{op_type}.failure", 1)
+    return metric
+```
+Alert when the quorum failure rate exceeds 0.1% over a 5-minute window. A sustained 1% failure rate means you are approaching cluster capacity and need to scale.
+**Metric 4: Version Vector Divergence**
+Measure how many keys have divergent version vectors across replicas. High divergence signals that gossip-based replication or read repair is not keeping up with the write rate.
+```python
+async def scan_version_divergence(
+    all_nodes: list[tuple], sample_rate: float = 0.01
+) -> dict:
+    """Sample keys and compare their version vectors across all nodes."""
+    divergent_keys = []
+    for shard in all_nodes:
+        # Get a sample of keys from the first node
+        sample_keys = await shard[0].sample_keys(sample_rate)
+        for key in sample_keys:
+            # Read version vectors from all nodes
+            vectors = {}
+            for node in shard:
+                _, vector = await node.read_version(key)
+                vectors[node.id] = vector
+            # Check if all vectors are equal
+            if len(set(str(v) for v in vectors.values())) > 1:
+                divergent_keys.append({
+                    "key": key,
+                    "vectors": vectors,
+                })
+    return {
+        "total_keys_sampled": len(sample_keys),
+        "divergent_keys": len(divergent_keys),
+        "divergence_rate": len(divergent_keys) / max(len(sample_keys), 1),
+    }
+```
+Run version vector scanning every 60 seconds on a 1% key sample. A divergence rate above 0.1% indicates that read repair cannot keep up — increase the repair thread count or reduce the write rate.
+### Rollback Plan
+If p99 latency increases by more than 50% or error rate exceeds 0.1%, flip the flag back to eventual and investigate.
+---
+## Architecture Decision Tree
+Use this decision flow when designing consistency into a new system:
+```
+Q: Can you afford a single point of failure?
+    │
+    ├── No  → Use distributed database (DynamoDB/Cassandra)
+    │         with tunable consistency.
+    │
+    └── Yes → Single-node RDBMS. Strong consistency is free.
+                │
+                ├── Read traffic > 10K QPS?
+                │   → Add read replicas, accept eventual
+                │     consistency for reads.
+                │
+                └── Write traffic > 5K WPS?
+                    → Shard database. Each shard is
+                      independently consistent.
+```
+```
+Q: Do reads need to see the latest write instantly?
+    │
+    ├── Yes → Ensure W+R>N for those reads.
+    │         Route reads through the Raft leader
+    │         or a quorum read.
+    │
+    └── No  → Use eventual reads from nearest replica.
+                Accept 50-200ms staleness window.
+```
+---
+## Key Takeaways
+- Single-node databases provide strong consistency for free but break under scale — the simplicity cliff is real.
+- Tunable consistency systems let you choose strong for writes and eventual for reads on the same data.
+- Raft consensus groups handle strong writes; read replicas handle fast eventual reads.
+- Read-replica architectures with PostgreSQL streaming replication add horizontal read scaling but introduce a staleness window proportional to WAL replay lag.
+- The coordinator state machine tracks pending writes via version vectors and runs background read repair threads to fix diverging replicas.
+- Redis Cluster with the WAIT command provides strongly consistent cache operations at the cost of 2-3ms additional write latency.
+- MongoDB read concern and write concern (local, majority, linearizable) mirror DynamoDB tunable consistency with database-native syntax.
+- Active-passive multi-region deployments preserve strong consistency with a single writer region; active-active deployments reduce write latency but require conflict resolution.
+- Choosing N=5 with W=3, R=3 is the safest general-purpose configuration, tolerating 2 node failures while maintaining strong consistency.
+- The availability formula `1 - p^N` shows that N=3 provides 99.9999% uptime per key under independent failures — N=7 is rarely worth the storage cost.
+- Consistency-aware connection pools prevent read traffic from consuming write path capacity and reduce write latency by 30-50%.
+- Monitoring replication lag, stale read rates, quorum failure rates, and version vector divergence is essential for catching silent consistency failures in production.
+- Per-request consistency levels allow gradual migration from eventual to strong without downtime.
+- Migration should follow a phased shadow-read pattern, never an in-place flip.
+- ZooKeeper and etcd provide strong consistency for metadata but cannot scale to application data volumes.
+- CDNs are the most extreme example of eventual consistency — intentionally serving stale data for performance.

@@ -1,0 +1,517 @@
+---
+id: load-balancers-deep-dive
+title: Load Balancers -- Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A production load balancer is not a simple proxy. It contains a pipeline of interconnected subsystems that handle connection management, scheduling, health tracking, and observability.
+
+<AsciiDiagram
+  id="load-balancers/internal-arch"
+  title="Load Balancer Internal Architecture"
+  content={`
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│                          Load Balancer Internal Architecture                       │
+│                                                                                   │
+│  ┌──────────┐  ┌──────────────┐  ┌────────────┐  ┌───────────┐  ┌────────────┐   │
+│  │ Network  │  │ TLS          │  │ Protocol   │  │ Router    │  │ Rate       │   │
+│  │ Listener │──▶ Termination  │──▶ Parser     │──▶ (match    │──▶ Limiter    │   │
+│  │ (SO_REUSE│  │ (OpenSSL/    │  │ (HTTP/1.1, │  │  rules    │  │ (per-IP,   │   │
+│  │ _ADDR)   │  │  BoringSSL)  │  │  HTTP/2,   │  │  by path) │  │  per-key)  │   │
+│  └──────────┘  └──────────────┘  │  gRPC)     │  └───────────┘  └────────────┘   │
+│                                  └────────────┘                                  │
+│                                       │                                            │
+│                                       ▼                                            │
+│  ┌──────────────┐  ┌──────────────────────────────────────────┐  ┌─────────────┐  │
+│  │ Backend Pool │  │         Scheduler                         │  │  Connection │  │
+│  │ Manager      │  │  ┌─────────┐ ┌──────────┐ ┌───────────┐  │  │  Manager    │  │
+│  │              │  │  │Round-   │ │Least     │ │Consistent │  │  │             │  │
+│  │  ┌────────┐  │  │  │Robin    │ │Connections│ │Hash       │  │  │  ┌───────┐  │  │
+│  │  │Server A│  │  │  └─────────┘ └──────────┘ └───────────┘  │  │  │ Idle  │  │  │
+│  │  │Server B│──┼──┼──────────────────────────────────────────┼──┼──│ Pool  │  │  │
+│  │  │Server C│  │  │  ┌──────────┐ ┌──────────┐ ┌─────────┐  │  │  └───────┘  │  │
+│  │  │Server D│  │  │  │Random    │ │Weighted  │ │IP Hash  │  │  │  ┌───────┐  │  │
+│  │  └────────┘  │  │  └──────────┘ └──────────┘ └─────────┘  │  │  │Active │  │  │
+│  └──────────────┘  │  └──────────────────────────────────────┘  │  │ Count  │  │  │
+│                    │                                        │  │  └───────┘  │  │
+│  ┌──────────────┐  └──────────────────────────────────────────┘  └─────────────┘  │
+│  │ Health       │                                                                    │
+│  │ Checker      │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐    │
+│  │              │  │ Metrics      │  │ Logging      │  │ Config Reloader      │    │
+│  │ Active (HTTP)│  │ Exporter     │  │ (access log, │  │                      │    │
+│  │ Passive      │  │ (Prometheus, │  │  error log)  │  │ Hot-reload backend   │    │
+│  │ (5xx detect) │  │  statsd)     │  │              │  │ list, TLS certs,     │    │
+│  │              │  │              │  │              │  │ routing rules        │    │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────────────┘    │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+Legend:
+  [ ] = Subsystem
+  ──▶  = Data flow direction
+`}
+  caption="Every request passes through five to seven subsystems before reaching a backend. Each subsystem runs in its own goroutine or thread pool for concurrent processing."
+/>
+
+## Data Structures and Algorithms
+
+### Backend Pool (Hash Map + Sorted List)
+
+The load balancer maintains a hash map keyed by backend ID for O(1) lookup and a separate ordered list for round-robin iteration.
+
+| Property | Value |
+|---|---|
+| Structure | `map[BackendID]*Backend` + `[]*Backend` |
+| Lookup | O(1) |
+| Insert/Remove | O(1) for hash map, O(N) for round-robin list rebuild |
+| Memory | ~200 bytes per backend |
+
+When a backend is added or removed, the list is rebuilt. This happens rarely (deployments, auto-scaling events) so O(N) rebuild is acceptable.
+
+### Least-Connections Min-Heap
+
+Least-connections scheduling uses a min-heap where each backend's key is its active connection count.
+
+<AsciiDiagram
+  id="load-balancers/min-heap"
+  title="Least-Connections Min-Heap"
+  content={`
+                         ┌─────┐
+                         │  A  │  (12 active)
+                         │  12 │
+                         └─────┘
+                        /       \
+                       /         \
+                ┌─────┐           ┌─────┐
+                │  C  │           │  B  │
+                │  15 │           │  28 │
+                └─────┘           └─────┘
+               /       \         /       \
+              /         \       /         \
+        ┌─────┐     ┌─────┐ ┌─────┐     ┌─────┐
+        │  E  │     │  D  │ │  F  │     │  G  │
+        │  30 │     │  22 │ │  41 │     │  35 │
+        └─────┘     └─────┘ └─────┘     └─────┘
+
+Operation: Pop root (A, 12) → Send request → Increment to 13 → Sift-down
+            ── if A hits max capacity (e.g., 50), it stays at root only
+               until sifted lower than other nodes
+
+Algorithm:
+  1. Peek root for O(1)
+  2. Pop root, send request, increment active_count
+  3. Sift-down for O(log N)
+  4. On response received: decrement active_count, sift-up for O(log N)
+`}
+  caption="A min-heap provides O(log N) scheduling unlike the O(N) scan of a flat list. HAProxy and Nginx Plus use variants of this approach for their least-connections algorithms."
+/>
+
+### Consistent Hash Ring
+
+Used when session persistence depends on request content (user ID, API key) and you want minimal redistribution when backends join or leave.
+
+<AsciiDiagram
+  id="load-balancers/consistent-hash"
+  title="Consistent Hash Ring"
+  content={`
+                     Hash ring (0 to 2^32 - 1)
+
+                         ┌──────┐
+                    ┌────│  B3  │────┐
+                    │    └──────┘    │
+                    │                │
+              ┌─────┴┐              ┌┴─────┐
+              │  C2  │              │  A1  │
+              └──────┘              └──────┘
+                    │                │
+                    │    ┌──────┐    │
+                    └────│  D4  │────┘
+                         └──────┘
+
+  Each backend has N virtual nodes (A1, A2, A3... B1, B2... etc.)
+  placed at hash positions around the ring.
+
+  Request hash("user_89234") → lands between B3 and C2
+  ── walks clockwise to C2 → maps to backend C
+
+  When backend C is removed:
+  ── only keys between C1...C4 redistribute to neighbors
+  ── keys mapped to A, B, D are unaffected
+
+  Without consistent hashing: 100% of keys redistribute.
+  With consistent hashing:   ~K/N redistribute (K = virtual nodes)
+`}
+  caption="Consistent hashing limits redistribution to ~1/N of keys when a backend joins or leaves, compared to 100% reshuffling with a naive hash modulo N approach."
+/>
+
+### Weighted Round-Robin Sequence
+
+Each backend has an integer weight. A backend with weight 3 gets three requests before the scheduler moves to the next backend with weight 1.
+
+| Backend | Weight | Requests per cycle |
+|---|---|---|
+| A (new, fast) | 5 | 5 |
+| B (old, slow) | 1 | 1 |
+| C (medium) | 2 | 2 |
+
+A smooth weighted round-robin (used by Nginx) distributes bursts evenly rather than sending all 5 A requests consecutively. The sequence for weights {5, 1, 2} is: A, A, C, A, B, A, C, A.
+
+## The Request Lifecycle -- 12 Detailed Steps
+
+### Connection Establishment
+
+<AsciiDiagram
+  id="load-balancers/lifecycle"
+  title="Full Request Lifecycle -- 12 Steps"
+  content={`
+┌────────┐  ┌─────────────────────────────────────────────────────┐  ┌─────────┐
+│ Client │  │                   Load Balancer                     │  │ Backend │
+└───┬────┘  └──┬──────┬──────┬──────┬──────┬──────┬──────┬───────┘  └────┬────┘
+    │          │      │      │      │      │      │      │              │
+    │  1. SYN  │      │      │      │      │      │      │              │
+    │─────────▶│      │      │      │      │      │      │              │
+    │          │  2. SYN-ACK │      │      │      │      │              │
+    │◀─────────│      │      │      │      │      │      │              │
+    │  3. ACK  │      │      │      │      │      │      │              │
+    │─────────▶│      │      │      │      │      │      │              │
+    │          │  4. TLS handshake │      │      │      │              │
+    │◀════════▶│      │      │      │      │      │      │              │
+    │          │  5. Parse request │      │      │      │              │
+    │          │     (method, path, headers) │      │      │              │
+    │          │      │      │      │      │      │      │              │
+    │          │  6. Run scheduler ██████████████▶│      │              │
+    │          │      │      │      │      │      │      │              │
+    │          │  7. Connect to backend │      │      │              │
+    │          │─────────────────────────────────────────▶│ 8. SYN
+    │          │◀──────────────────────────────────────────│ 9. SYN-ACK
+    │          │─────────────────────────────────────────▶│ 10. ACK
+    │          │                                          │
+    │          │ 11. Forward HTTP request                 │
+    │          │─────────────────────────────────────────▶│
+    │          │                                          │ 12. Process
+    │          │◀──────────────────────────────────────────│ 13. HTTP 200
+    │          │ 14. TLS encrypt + send                   │
+    │◀─────────│      │      │      │      │      │      │              │
+    │ 15. ACK  │      │      │      │      │      │      │              │
+    │─────────▶│      │      │      │      │      │      │              │
+`}
+  caption="12 steps from client SYN to backend response. TLS termination and scheduling add 2-5ms to the first request; subsequent requests on the same TCP connection skip the handshake."
+/>
+
+**Step 1-3**: TCP three-way handshake between client and load balancer. The load balancer's network listener (epoll/kqueue/IOCP) accepts the connection in an event-driven loop. Memory allocated: ~4 KB per connection for socket buffers.
+
+**Step 4**: TLS handshake (one round trip for TLS 1.3, two for TLS 1.2). The load balancer selects the certificate based on SNI (Server Name Indication). Total TLS overhead: 1-3 ms with hardware acceleration, 5-15 ms with software crypto.
+
+**Step 5**: Protocol parsing. For HTTP/1.1, the parser reads the request line and headers into a buffer. An inefficient or malicious request (very long headers, no body termination) is caught here and rejected with 400 Bad Request. Buffer size limit: typically 8-16 KB for headers.
+
+**Step 6**: Scheduler selects a backend. The algorithm runs in O(log N) (min-heap) or O(1) (round-robin with current index pointer). This step adds under 0.001 ms to the critical path.
+
+**Step 7**: Connection to backend. If a keep-alive connection exists in the idle pool, it is reused (no TCP handshake). Otherwise, a new TCP connection is opened. Adding new connections adds latency: ~0.5-2 ms for local network, 5-50 ms across regions.
+
+**Step 8-10**: Backend TCP handshake. The load balancer has a separate event loop for backend connections. Connections time out after a configurable interval (default 5 seconds for connect timeout).
+
+**Step 11-14**: Request forward, backend processing, response return, TLS encryption, response send to client.
+
+### Keep-Alive Connection Reuse
+
+Without keep-alive, every request opens and closes two TCP connections (client-to-LB and LB-to-backend). With keep-alive, the backend connection stays open and is reused.
+
+<AsciiDiagram
+  id="load-balancers/keepalive"
+  title="Keep-Alive Connection Reuse"
+  content={`
+Without keep-alive (3 requests):
+
+  Client    LB    Backend
+    │       │       │
+    │──REQ──▶│──REQ──▶│
+    │◀─RES──│◀─RES──│
+    │       │       │
+    │──REQ──▶│──REQ──▶│  (new TCP)
+    │◀─RES──│◀─RES──│
+    │       │       │
+    │──REQ──▶│──REQ──▶│  (new TCP)
+    │◀─RES──│◀─RES──│
+
+  Total TCP handshakes: 6
+
+With keep-alive (3 requests):
+
+  Client    LB    Backend
+    │       │       │
+    │──REQ──▶│──REQ──▶│
+    │◀─RES──│◀─RES──│
+    │       │       │
+    │──REQ──▶│──REQ──▶│  (reused)
+    │◀─RES──│◀─RES──│
+    │       │       │
+    │──REQ──▶│──REQ──▶│  (reused)
+    │◀─RES──│◀─RES──│
+
+  Total TCP handshakes: 2
+`}
+  caption="Keep-alive eliminates repeated TCP handshakes. HAProxy's default keep-alive timeout is 60 seconds. Connection pooling reduces per-request latency by 2-10 ms and cuts CPU usage from kernel TCP processing."
+/>
+
+### Connection Pool Internals
+
+The connection manager maintains two data structures per backend:
+
+**Idle Pool**: A stack (LIFO) of connections ready for reuse. LIFO maximizes cache locality -- the same CPU core that last used the connection likely still has TCP state in its cache.
+
+**Active Set**: A hash set of connections currently serving a request. When a response arrives, the connection moves from active back to idle.
+
+```
+Active: {conn_7, conn_12, conn_19}   -- in use
+Idle:   [conn_4, conn_2, conn_15]    -- LIFO stack, conn_4 reused next
+```
+
+**Pool limits per backend**:
+- `max_connections`: total connections this load balancer opens to one backend. Default: unlimited (risky) or 1024 (safe).
+- `max_keepalive_connections`: idle connections kept open. Default: 32.
+- When `max_connections` is reached, new requests queue and wait. Queue depth and timeout prevent unbounded accumulation.
+
+## Consistency and State
+
+### Crash: Backend Dies Mid-Request
+
+A backend handling 47 active requests crashes (power failure, OOM kill, hardware fault).
+
+<AsciiDiagram
+  id="load-balancers/crash"
+  title="Backend Crash Handling"
+  content={`
+┌────────────┐                              ┌──────────────────┐
+│  LB        │  47 active connections        │  Backend A       │
+│            │──────────────────────────────▶│                  │
+│  ┌───────┐ │                              │ ┌───────┐        │
+│  │Active │ │─────── TCP RST/reset ───────▶│ │ App   │─crashes│
+│  │Count  │ │                              │ │ Proc  │  X     │
+│  │A: 47  │ │  TCP RST received            │ └───────┘        │
+│  │B: 12  │ │◀─────────────────────────────│                  │
+│  └───────┘ │                              └──────────────────┘
+│            │
+│  ┌───────┐ │   Health check detects failure
+│  │Health │ │    1st check: timeout
+│  │A: DOWN│ │    2nd check: timeout
+│  └───────┘ │    3rd check: timeout → Marked DOWN
+│            │
+│  ┌───────┐ │   Clients see connection reset
+│  │Retry  │ │    Idempotent requests (GET): auto-retry to Backend B
+│  │Policy │ │    Non-idempotent (POST): 502 Bad Gateway to client
+│  └───────┘ │
+└────────────┘
+`}
+  caption="A crashed backend drops all active connections. The load balancer sees TCP resets, retries idempotent requests to other backends, and marks the backend down after consecutive health check failures. Non-idempotent POST requests return 502."
+/>
+
+**Blast radius**: All in-flight requests on the crashed backend are lost. The number depends on max connections per backend (commonly 100-500). Retries redirect to remaining backends, which must handle the surge in load (up to +100%).
+
+**Mitigation**: Set per-backend max connections to avoid overloading healthy servers during failover. Enable retry for idempotent methods only. Use circuit breakers to stop cascading failures.
+
+### Partition: Network Split Between Load Balancer and Backend
+
+The load balancer cannot reach the backend due to a switch misconfiguration or firewalling.
+
+<AsciiDiagram
+  id="load-balancers/partition"
+  title="Network Partition Between LB and Backend"
+  content={`
+┌──────────────┐     Network partition      ┌──────────────┐
+│  Load        │                            │  Backend A    │
+│  Balancer    │                            │              │
+│              │  X ── X  port 80 blocked   │  ┌────────┐  │
+│  ┌────────┐  │                            │  │ App    │  │
+│  │ Backend│  │──health check fails────────│  │ (alive)│  │
+│  │ A: DOWN│  │◀──(no response to probe)──│  └────────┘  │
+│  │ B: OK  │  │                            │  ┌────────┐  │
+│  └────────┘  │                            │  │ DB     │  │
+│              │  Backend IS RUNNING but     │  │ (ok)   │  │
+│  Traffic     │  LB cannot reach it         │  └────────┘  │
+│  redirected  │                            └──────────────┘
+│  to B        │
+└──────────────┘
+
+  Consequence:
+  ── Backend A is alive but receives no traffic
+  ── Backend B receives double load (original + A's share)
+  ── Users experience no outage IF B can handle the surge
+  ── If B cannot handle the surge: cascading failure
+`}
+  caption="A network partition isolates a healthy backend from the load balancer. The backend is marked down and traffic shifts to survivors. The backend is still running, so auto-remediation (flapping detection) is needed to avoid repeated on/off cycling."
+/>
+
+**Detection**: The health checker sees 100% failure. The backend is marked down. When the partition heals, the backend passes a health check and returns to the pool.
+
+**Recovery**: Use a "slow start" mode -- when a backend comes back online, ramp traffic gradually (10 requests, then 50, then full load over 30 seconds). This prevents the "thundering herd" of all retry requests hitting a freshly revived server.
+
+### Concurrent Writes and Stateful Backends
+
+Two requests from the same user hit different backends because sticky sessions use IP hash and the user's ISP changed their IP mid-session.
+
+<AsciiDiagram
+  id="load-balancers/stateful"
+  title="Stateful Backend -- Split Session"
+  content={`
+Time ────────────────────────────────────────────────────────────▶
+
+Client (original IP: A)          Client (new IP after NAT refresh: B)
+  │                                  │
+  │──POST /cart/add (sess=abc)──▶    │
+  │    Backend A (sess=abc exists)   │
+  │    cart = {item: "laptop"}       │
+  │◀──200 OK ───────────────────────│
+  │                                  │
+  │                                  │──POST /cart/checkout(sess=abc)──▶
+  │                                  │    Backend C (no session!)
+  │                                  │    cart = {} (empty!)
+  │                                  │◀──302 Redirect to login───────
+  │                                  │
+  │  User loses cart item, must log in again
+  │  Because client IP changed, hash maps to different backend
+
+  Root cause: Session state stored in backend local memory.
+  Solution: Store session in Redis, accessible by all backends.
+  LB-level: Use cookie-based stickiness (JSessionID), not IP hash.
+`}
+  caption="Sticky sessions based on IP break when client IP changes (NAT refresh, mobile network handoff, VPN on/off). Cookie-based stickiness or an external session store (Redis) prevents this."
+/>
+
+**Root cause**: The load balancer's persistence mechanism (IP hash) maps the request to a backend that has no session data.
+
+**Fix options** (ranked by preference):
+1. Externalize session state to Redis/Memcached (best -- no stickiness needed)
+2. Use encrypted cookies (JWT) that carry session data (stateless, no backend memory)
+3. Use cookie-based stickiness (Set-Cookie with backend ID, encrypted)
+
+### Stale Reads During Rollout
+
+A rolling deployment updates backends one at a time. The new backend code queries a cache that still has stale data from the old schema.
+
+<AsciiDiagram
+  id="load-balancers/stale-read"
+  title="Stale Read During Deployment"
+  content={`
+┌─────────┐     ┌──────────┐     ┌─────────┐
+│ Client  │────▶│ LB       │────▶│ Backend │
+│         │     │          │     │ A (old) │
+│ GET /v2 │     │          │     └─────────┘
+│ /orders │     │          │         │
+└─────────┘     └──────────┘         │  DB query: orders_old_schema
+                                     ▼
+                               ┌──────────┐
+                               │ Database │
+                               └──────────┘
+                                     ▲
+                                    │
+┌─────────┐     ┌──────────┐     ┌────┴─────┐
+│ Client  │────▶│ LB       │────▶│ Backend  │
+│         │     │          │     │ B (new)  │
+│ GET /v2 │     │          │     └──────────┘
+│ /orders │     └──────────┘         │
+└─────────┘                          │  DB query: orders_new_schema
+                                     │  Cache: stale_v1_data
+                                     ▼
+                               ┌──────────┐
+                               │  Redis   │
+                               │ (stale)  │
+                               └──────────┘
+
+  Stale data surfaces because:
+  ── Backend A wrote cache with v1 format
+  ── Backend B reads cache and gets v1 data
+  ── Backend B expects v2 format → parse failure or wrong data
+`}
+  caption="During rolling deployments, old and new backends coexist. The load balancer has no awareness of schema versions. Cache invalidation or versioned cache keys are required."
+/>
+
+**Mitigation**: Use blue-green deployment (all backends swap at once) or canary with cache namespace versioning. The load balancer does not solve this on its own -- it needs deployment orchestration.
+
+## Performance Characteristics
+
+Measured on an m5.xlarge (4 vCPU, 16 GB RAM, 10 Gbps NIC) running HAProxy or Nginx:
+
+| Operation | Latency (p50) | Latency (p99) | p99/p50 ratio |
+|---|---|---|---|
+| TCP proxy (L4), no TLS | 0.05 ms | 0.12 ms | 2.4x |
+| TCP proxy (L4), with TLS | 0.8 ms | 3.2 ms | 4.0x |
+| HTTP proxy (L7), no TLS | 0.15 ms | 0.40 ms | 2.7x |
+| HTTP proxy (L7), with TLS | 1.1 ms | 4.5 ms | 4.1x |
+| HTTP proxy + health check | 0.20 ms | 0.60 ms | 3.0x |
+| gRPC proxy (L7), with TLS | 0.9 ms | 4.0 ms | 4.4x |
+
+**Throughput** (same hardware):
+
+| Configuration | Requests/second | Connections | Memory |
+|---|---|---|---|
+| L4, no logging | 250,000 rps | 100,000 | 450 MB |
+| L4, access log | 180,000 rps | 100,000 | 520 MB |
+| L7, no logging | 120,000 rps | 50,000 | 680 MB |
+| L7, access log | 65,000 rps | 50,000 | 780 MB |
+| L7, TLS + logging | 40,000 rps | 25,000 | 920 MB |
+
+**Memory per connection**: ~4-8 KB for socket buffers + ~200 bytes for connection state object. At 500,000 concurrent connections: 2-4 GB of RAM just for connection tracking.
+
+**CPU breakdown** (L7 with TLS): 35% TLS crypto, 25% protocol parsing, 15% kernel networking, 10% scheduler, 10% logging, 5% health checking.
+
+## Configuration and Tuning
+
+### Core Settings
+
+| Setting | Default | What it controls | When to change | What breaks |
+|---|---|---|---|---|
+| `maxconn` | 2000 | Maximum concurrent connections | Server has >5000 concurrent connections | Connection refused above limit |
+| `timeout connect` | 5s | Max time to connect to backend | Backend is cross-region (increase to 10s) | Requests fail with 503 if too low |
+| `timeout server` | 50s | Max time to wait for backend response | Backend has long polling (increase to 300s) | Long requests timeout prematurely |
+| `timeout client` | 50s | Max idle time on client connection | Public API clients are slow (increase to 120s) | Clients get disconnected mid-upload |
+| `timeout keep-alive` | 60s | How long to keep idle connections | Short-lived connections (decrease to 5s) | Resource leaks, too many open FDs |
+| `retries` | 3 | Number of retry attempts on failure | Idempotent endpoints only (keep at 3) | Duplicate writes on POST |
+| `max-keep-alive-queue` | 100 | Queue requests when all conns busy | High traffic backend (increase to 500) | Request queuing delays |
+| `check-interval` | 10s | Time between health checks | Need faster failover (decrease to 2s) | Unnecessary network noise, false positives |
+| `check-fall` | 3 | Consecutive failures to mark down | Flaky network (increase to 5) | Slow failover during real failures |
+| `check-rise` | 2 | Consecutive successes to mark up | Unstable recovery (increase to 5) | Backend flaps in and out of pool |
+
+### TLS Tuning
+
+| Setting | Default | Effect |
+|---|---|---|
+| `ssl-min-ver` | TLSv1.2 | Disables TLS 1.0/1.1 (PCI DSS compliance) |
+| `ssl-ciphers` | ECDHE+AESGCM | Forward secrecy, hardware-accelerated |
+| `ssl-engine` | (none) | Offload to QAT or AES-NI hardware |
+| `ssl-session-cache` | true | Cache TLS session tickets, reduce handshake overhead by 60% |
+| `ssl-session-cache-timeout` | 300s | Purge stale sessions |
+
+### Logging Impact
+
+Access logging is the single largest performance drain on a load balancer. Each log line requires a write syscall (or buffer flush). At 100,000 rps, buffered logging writes ~20 MB/s. Unbuffered (sync) logging drops throughput by 50-70%.
+
+**Recommendations**:
+- Use buffered logging with `log-buffer-size 4096` (HAProxy) or `buffer` directive (Nginx)
+- Sample logs at 1:100 for high-traffic endpoints
+- Send logs to a separate disk or over UDP to a log aggregator
+- Disable access logs in the hot path and rely on metrics export (Prometheus/statsd)
+
+### Resource Limits
+
+Linux kernel tuning for high-connection load balancers:
+
+```
+# /etc/sysctl.conf  (required above 100,000 connections)
+
+net.core.somaxconn = 65535           # listen backlog
+net.ipv4.tcp_max_syn_backlog = 65535 # SYN queue depth
+net.core.rmem_max = 16777216         # max TCP receive buffer (16 MB)
+net.core.wmem_max = 16777216         # max TCP send buffer (16 MB)
+net.ipv4.tcp_tw_reuse = 1            # reuse TIME_WAIT sockets
+net.ipv4.ip_local_port_range = 1024 65535  # ephemeral port range
+fs.file-max = 1000000                # max file descriptors
+```
+
+Each connection consumes one file descriptor. A load balancer handling 500,000 connections needs `fs.file-max >= 500000 + headroom`.
+
+---
+**Next: The architecture page shows how to build a load balancing layer that handles 10 million daily active users across multiple regions.**

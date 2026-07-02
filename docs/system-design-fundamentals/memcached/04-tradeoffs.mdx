@@ -1,0 +1,382 @@
+---
+id: memcached-tradeoffs
+title: Memcached — Trade-offs & Failure Modes
+position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Core Tension
+
+Memcached trades persistence, data structure variety, and security features for extreme simplicity, speed, and minimal memory overhead. It is the most minimal production-grade caching system in common use — and its minimalism is both its greatest strength and its most dangerous limitation.
+
+Every feature Memcached does not have was a conscious design decision:
+
+- **No persistence.** Memcached does not write to disk, ever. This means zero I/O latency, zero fsync overhead, zero write-ahead log management. It also means node crash = total data loss.
+- **No data structures beyond key-value.** Redis gives you lists, sets, sorted sets, hashes, bitmaps, hyperloglogs. Memcached gives you one thing: a key and a blob of bytes. This eliminates all internal complexity around data structure encoding, but it means your application must handle all serialization.
+- **No authentication (vanilla).** Memcached has no ACL, no user system, no password. The SASL support in the binary protocol is rarely used. This means you secure Memcached with network firewalls, not server configuration.
+- **No replication (vanilla).** Each node is independent. This eliminates the complexity of replication lag, conflict resolution, quorum management, and failover detection. It also means that if a node fails, every key on that node is gone.
+
+## Decision Matrix
+
+When to choose Memcached versus alternatives:
+
+| Dimension | Memcached | Redis | Local (in-process) Cache | Database Query Cache |
+|---|---|---|---|---|
+| **Data structures** | Key-value only | Rich (string, hash, list, set, sorted set, bitmap, hyperloglog, JSON, graph, search, stream) | Whatever you implement | None (caches query results only) |
+| **Persistence** | None | RDB snapshots + AOF append-only log | Depends on implementation | Database-native |
+| **Memory efficiency** | Excellent (slab allocator, ~56B overhead per item) | Good (jemalloc, ~64-100B overhead per item) | Best (no network overhead, no protocol) | N/A (stored in DB buffer pool) |
+| **Multi-core scaling** | Good (up to 8 threads, global lock bottleneck) | Excellent (single-threaded event loop, no lock contention) | Excellent (process-local) | N/A |
+| **Client complexity** | Low (simple protocol, but must handle distribution) | Low (single-node focus, cluster support in Redis Stack) | None (direct memory access) | None (database driver) |
+| **Network overhead** | TCP per request (but very small protocol) | TCP per request | Zero (same process) | Zero (same process) |
+| **Eviction policy** | LRU per slab class | global LRU / LFU / TTL / random / no eviction | LRU / LFU / TTL | DB buffer pool LRU |
+| **Max item size** | 1 MB (configurable, but memory-wasteful above) | 512 MB | RAM-limited | RAM-limited |
+| **CAS / optimistic locking** | Yes (native) | Yes (WATCH/MULTI/EXEC) | N/A (single-threaded) | Database transactions |
+| **TTL / expiry** | Per-item, lazy eviction | Per-item, active + lazy eviction | Per-item | N/A |
+| **Production ops** | Simple (single binary, few config options) | Moderate (more config, persistence management, cluster setup) | None (part of application process) | None (DB admin responsibility) |
+
+## CAP Theorem
+
+Memcached is a pure **AP** system under the CAP theorem. It sacrifices consistency and partition tolerance is irrelevant because there is no cross-node state.
+
+<AsciiDiagram
+  id="memcached/tradeoffs-cap"
+  title="Memcached in CAP Theorem"
+  alt="CAP triangle showing Memcached in the AP corner — No persistence or replication, and high availability through stateless client-driven failover"
+  caption="Memcached is purely AP — no replication means no consistency guarantees across nodes"
+>{`
+                    ┌─────────┐
+                    │  C      │
+                    │  Consistency  │
+                    └────┬────┘
+                         │
+                         │    Memcached:
+                         │    • No replication →
+                         │      no consistency model
+                         │    • Each node is
+                         │      independently consistent
+                         │      (single-node CP)
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+              │     Memcached       │
+              │        │            │
+          ┌───┴───┐  ┌─┴─┐  ┌──────┴───┐
+          │  A    │  │ P │  │   AP     │
+          │Avail- │  │Part│  │Memcached│
+          │ability│  │Tol │  │         │
+          └───────┘  └───┘  └─────────┘
+
+  Memcached's CAP properties:
+  - Availability: High (client failover → requests re-route)
+  - Partition tolerance: High (partitions handled by client)
+  - Consistency: None (no cross-node state to keep consistent)
+
+  When a Memcached node goes down:
+  ┌─────────┐         ┌─────────┐
+  │ Client  │────────>│ mc-1   │  DOWN
+  │         │         ├─────────┤
+  │         │────────>│ mc-2   │  Still serving
+  └─────────┘         └─────────┘
+
+  Keys assigned to mc-1 produce cache misses.
+  No error.  No inconsistency.  Just a miss.
+  Application falls through to database.
+`}</AsciiDiagram>
+
+The practical implication: Memcached never gives you wrong data. It either gives you the right data (if the key exists and is not expired) or tells you it has no data (miss). There is no stale replica returning outdated data, no split-brain scenario, no inconsistency window. This is one of Memcached's most underappreciated strengths.
+
+## Failure Modes
+
+### 1. Hot Keys
+
+**Scenario.** A single key receives 90% of all requests. The node holding that key is overloaded while every other node sits idle.
+
+<AsciiDiagram
+  id="memcached/tradeoffs-hotkey-failure"
+  title="Hot Key Failure Mode"
+  alt="Diagram showing one Memcached node saturated at 100% CPU while other nodes are idle, with a warning sign on the overloaded node"
+  caption="A hot key saturates one node while others remain underutilized"
+>{`
+  Normal distribution:                       Hot key scenario:
+
+  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐          ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐
+  │ mc1 │ │ mc2 │ │ mc3 │ │ mc4 │          │ mc1 │ │ mc2 │ │ mc3 │ │ mc4 │
+  │ 25% │ │ 25% │ │ 25% │ │ 25% │          │ 90% │ │  3% │ │  4% │ │  3% │
+  └─────┘ └─────┘ └─────┘ └─────┘          └──┬──┘ └─────┘ └─────┘ └─────┘
+                                                 │
+                                           🔥 100% CPU
+                                              Requests queued
+                                              Latency spike
+                                              Connection timeouts
+                                              Thundering herd on DB
+
+  Prevention:
+  1. Add local L1 cache in application for hot keys
+  2. Use mcrouter's replication for known hot prefixes
+  3. Implement random TTL jitter (±10% of TTL) to avoid
+     all clients reloading simultaneously
+`}</AsciiDiagram>
+
+**Detection.** Monitor per-node CPU, request latency, and eviction rate. If one node shows consistently higher CPU than the cluster average, you have a hot key.
+
+**Prevention.**
+1. **Local L1 cache.** Cache the top-N keys in application memory for a few seconds. This absorbs the spike.
+2. **Replicate the hot key.** Write the hot key to multiple nodes. Clients randomly select one replica to read from.
+3. **mcrouter fan-out.** Use mcrouter to replicate keys matching certain patterns.
+
+### 2. Slab Imbalance
+
+**Scenario.** One slab class (e.g., for small session objects) fills completely and starts evicting aggressively, while another slab class (e.g., for large API responses) has 80%+ free space.
+
+**Why it happens.** Slab classes claim pages as needed. If your application stores many small items early in its lifetime (e.g., during initialization), slab class 1 claims many pages. Later, when medium items dominate, the slab class for medium items finds no free pages and must evict, while class 1 sits partially empty.
+
+**Detection.** Run `stats slabs` and look at each class:
+- `used_chunks` / `total_chunks` per class
+- `evicted` per class (nonzero means that class is thrashing)
+
+```bash
+# Check slab imbalance
+echo "stats slabs" | nc localhost 11211 | grep -E "STAT [0-9]+:(chunk_size|used_chunks|total_chunks|evicted)"
+```
+
+**Prevention.** The vanilla version does not rebalance. You can:
+- Restart Memcached to reset slab allocation (destructive).
+- Use Facebook's Memcached fork with automatic slab rebalancing.
+- Use mcrouter with slab rebalancing support.
+- Adjust your application to use more uniform item sizes.
+
+### 3. OOM Kill (If No Slab Eviction)
+
+**Scenario.** Memcached runs out of memory and cannot allocate new pages from the OS. If LRU eviction is disabled or a slab class's items have refcount > 0 and cannot be evicted, the server returns OOM errors.
+
+```bash
+# Client sees:
+SERVER_ERROR out of memory storing object
+```
+
+**Why it happens.** The global `-m` limit is reached and all slab classes are full with pinned items (refcount > 0 because the items are being served to clients). New SET operations fail.
+
+**Detection.**
+- Monitor `stats` for `out_of_memory` counter.
+- Monitor application logs for `SERVER_ERROR out of memory`.
+
+**Prevention.**
+- Set realistic `-m` values (80-90% of RAM, not 100%).
+- Ensure LRU eviction is active (default).
+- Monitor refcount spikes and tune worker threads to drain responses faster.
+
+### 4. Network Bottleneck
+
+**Scenario.** Memcached nodes have spare CPU and memory, but the network interface is saturated. All requests are queued waiting for network transmit.
+
+**Detection.**
+- Monitor network interface (sar, iftop): utilization above 80%.
+- Connection latency increases for all clients.
+- `curr_connections` stays flat or drops (clients cannot connect).
+
+**Prevention.**
+- Use 10 Gbps or 25 Gbps NICs.
+- Add more nodes to distribute network load.
+- Use the binary protocol for lower per-request network overhead.
+- Compress values larger than 10 KB before storing.
+
+### 5. Connection Exhaustion
+
+**Scenario.** The application creates too many connections to Memcached, hitting the `-c` limit. New connections are refused.
+
+**Detection.**
+- Monitor `curr_connections` in `stats`.
+- Application errors: `Cannot connect to memcached: Connection refused`.
+
+**Prevention.**
+- Use connection pooling on the client side.
+- Set `-c` to a high value (100,000+) in production.
+- Use a proxy like Twemproxy or mcrouter to multiplex connections.
+
+## Anti-Patterns
+
+### 1. Storing Items Over 1 MB
+
+Memcached's default maximum item size is 1 MB. If you try to `SET` a value larger than 1 MB, the server returns an error. Increasing the limit with `-I` wastes memory because the largest slab class consumes an entire 1 MB page per chunk.
+
+**What to do instead:** Split large objects into chunks at the application layer.
+
+```python
+def set_large_object(client, key, data, chunk_size=900000):
+    """Split and store a large object across multiple keys."""
+    chunks = [data[i:i+chunk_size] for i in range(0, len(data), chunk_size)]
+    client.set(f"{key}:meta", {"chunks": len(chunks)})
+    for i, chunk in enumerate(chunks):
+        client.set(f"{key}:chunk:{i}", chunk)
+```
+
+### 2. No Consistent Hashing
+
+Using simple modulo hashing (`hash(key) % N`) means that adding or removing a single server causes nearly every key to map to a different server. This creates a massive wave of cache misses and thundering herd on the database.
+
+**What to do instead:** Use a client library that implements consistent hashing (ketama hash ring). Every major Memcached client supports it.
+
+<AsciiDiagram
+  id="memcached/tradeoffs-modulo-vs-consistent"
+  title="Modulo vs Consistent Hashing"
+  alt="Two side-by-side diagrams: left shows modulo hashing where adding a node moves 90% of keys; right shows consistent hashing where adding a node moves only K/N keys"
+  caption="Modulo hashing moves nearly all keys when the cluster changes; consistent hashing moves only a fraction"
+>{`
+  Modulo hashing:  hash(key) % N
+
+  N=4 servers:          N=5 servers (+1):
+  key:A → server 2      key:A → server 1   ✗ moved
+  key:B → server 0      key:B → server 4   ✗ moved
+  key:C → server 3      key:C → server 0   ✗ moved
+  key:D → server 1      key:D → server 2   ✗ moved
+  key:E → server 0      key:E → server 3   ✗ moved
+  key:F → server 2      key:F → server 1   ✗ moved
+  key:G → server 1      key:G → server 4   ✗ moved
+  key:H → server 3      key:H → server 0   ✗ moved
+  key:I → server 0      key:I → server 3   ✗ moved
+  key:J → server 2      key:J → server 1   ✗ moved
+
+  9 of 10 keys moved!  Thundering herd on database.
+
+  Consistent hashing (ketama):
+
+  N=4 servers:          N=5 servers (+1):
+  key:A → server 2      key:A → server 2   ✓ same
+  key:B → server 0      key:B → server 0   ✓ same
+  key:C → server 3      key:C → server 3   ✓ same
+  key:D → server 1      key:D → server 1   ✓ same
+  key:E → server 0      key:E → server 0   ✓ same
+  key:F → server 2      key:F → server 5   ✗ moved (only key:F)
+  key:G → server 1      key:G → server 1   ✓ same
+  key:H → server 3      key:H → server 3   ✓ same
+  key:I → server 0      key:I → server 0   ✓ same
+  key:J → server 2      key:J → server 2   ✓ same
+
+  1 of 10 keys moved!  Minimal database impact.
+`}</AsciiDiagram>
+
+### 3. Ignoring CAS for Concurrent Updates
+
+When multiple application threads or processes update the same cache key without CAS, the last write wins — silently overwriting intermediate updates.
+
+```python
+# BAD: Last write wins — silently loses data
+def update_counter(user_id, increment):
+    key = f"counter:{user_id}"
+    current = cache.get(key) or 0
+    cache.set(key, current + increment)  # Lost if another thread wrote between get and set
+
+# GOOD: CAS prevents lost updates
+def update_counter(user_id, increment):
+    key = f"counter:{user_id}"
+    result = cache.gets(key)
+    if result:
+        current, cas_id = result
+        while True:
+            stored = cache.cas(key, current + increment, cas_id)
+            if stored:
+                break  # Success
+            # CAS failed — someone else updated. Re-read and retry.
+            result = cache.gets(key)
+            current, cas_id = result
+    else:
+        cache.add(key, increment)  # First write
+```
+
+### 4. No Monitoring of Eviction Rate
+
+Eviction rate is the most important operational metric. A non-zero eviction rate means your cache is too small for your working set. Ignoring it means you are paying for cache infrastructure that provides minimal benefit (data is evicted before it can be reused).
+
+**What to do:** Alert on `evictions > 0` for more than 5 minutes. When evictions appear, increase `-m` or add nodes.
+
+<AsciiDiagram
+  id="memcached/tradeoffs-eviction-cycle"
+  title="Eviction Spiral"
+  alt="Diagram showing the vicious cycle: cache too small → evictions → cache misses → database load spike → slow responses → more requests queued → more evictions"
+  caption="Ignoring evictions creates a positive feedback loop that degrades performance"
+>{`
+  The Eviction Spiral — Ignore it and this happens:
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Step 1: Cache is undersized (working set > -m)            │
+  │                                                             │
+  │  Step 2: Items are evicted before their TTL expires        │
+  │                                                             │
+  │  Step 3: Next request for evicted item → cache miss        │
+  │                                                             │
+  │  Step 4: Application queries database (adds DB load)       │
+  │                                                             │
+  │  Step 5: Application writes item back to cache              │
+  │         (adds cache write load, evicts another item)        │
+  │                                                             │
+  │  Step 6: Go to Step 2.                                     │
+  │                                                             │
+  │  ┌─────────────────────────────────────────────────────┐   │
+  │  │  Without monitoring, you see:                       │   │
+  │  │  - p50 latency: 2 ms (fine)                         │   │
+  │  │  - CPU: 40% (fine)                                  │   │
+  │  │  - But database QPS is 5x normal!                   │   │
+  │  │  - Cache is full of short-lived items               │   │
+  │  └─────────────────────────────────────────────────────┘   │
+  │                                                             │
+  │  Fix: Add memory or nodes until evictions reach zero.      │
+  └─────────────────────────────────────────────────────────────┘
+`}</AsciiDiagram>
+
+### 5. Default Memory Settings Without Calculation
+
+The default `-m` is 64 MB. Running Memcached with this setting in production means your entire cache fits in 64 MB — essentially useless for any real application.
+
+**What to do:** Calculate your working set (see Capacity Planning in the Architecture page). Set `-m` to at least 2x your working set. Never use the default.
+
+## When NOT to Use Memcached
+
+Memcached is the wrong choice in these scenarios:
+
+**Need persistence.** If you cannot tolerate data loss on node crash, do not use Memcached. Use Redis with AOF persistence, or a database.
+
+<AsciiDiagram
+  id="memcached/tradeoffs-decision-flow"
+  title="Decision Flow: Memcached or Alternative"
+  alt="Flowchart: do you need persistence? Y→Redis. Need data structures? Y→Redis. Items over 1MB? Y→Redis or split. Need high availability? Y→Redis Cluster or Sentinel. Otherwise Memcached fits."
+  caption="Decision flowchart for choosing between Memcached and alternatives"
+>{`
+  Start: Need a cache?
+       │
+       ▼
+  Need persistence?
+  ┌───────┴───────┐
+  YES             NO
+   │               │
+   ▼               ▼
+  Use Redis    Need complex data
+  (AOF/RDB)    structures?
+               ┌───────┴───────┐
+               YES             NO
+                │               │
+                ▼               ▼
+               Use Redis    Items > 1MB?
+               (rich types) ┌───────┴───────┐
+                            YES             NO
+                             │               │
+                             ▼               ▼
+                           Split into    Need HA
+                           chunks OR     with repl?
+                           use Redis     ┌───────┴───────┐
+                                         YES             NO
+                                          │               │
+                                          ▼               ▼
+                                       Use Redis     Use Memcached!
+                                       (cluster)     (fast, simple)
+`}</AsciiDiagram>
+
+**Need complex data structures.** If you need lists, sets, sorted sets, bitmaps, or hyperloglogs, Redis gives you all of them natively. Memcached is key-value only.
+
+**Items regularly over 1 MB.** If your caching workload includes items larger than 1 MB, Memcached's slab allocator becomes inefficient. Redis handles up to 512 MB per value with better memory management for large objects.
+
+**Need high availability guarantees.** If every cache node must survive a failure without data loss, you need replication and automatic failover. Memcached provides neither (without mcrouter or custom proxy). Use Redis Sentinel or Redis Cluster.
+
+**Need replication.** If your architecture requires every cache write to be mirrored to multiple nodes for redundancy, Memcached's vanilla version cannot do this. Use Redis with replication or the mcrouter/Memcached fork combination.
+
+**Need authentication and ACLs.** If your cache must be accessible across network boundaries with access control, Memcached's minimal security model is insufficient. Use Redis with ACL support or keep Memcached strictly behind a firewall.

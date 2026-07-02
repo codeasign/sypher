@@ -1,0 +1,416 @@
+---
+id: distributed-counters-architecture
+title: Distributed Counters at Scale
+sidebar_position: 3
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation: The Single-Node Counter
+
+Every distributed counter system starts as a single integer column in a database. This is the foundation that fails in predictable ways at each growth milestone.
+
+<AsciiDiagram
+  id="distributed-counters/naive-arch"
+  title="Naive Single-Node Counter Architecture"
+  content={`
+┌────────────────────────────────────────────────────┐
+│            NAIVE COUNTER ARCHITECTURE                │
+│                                                      │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐     │
+│  │ [Client] │    │ [Client] │    │ [Client] │     │
+│  └────┬─────┘    └────┬─────┘    └────┬─────┘     │
+│       │               │               │            │
+│       │    SELECT val FROM counters   │            │
+│       │    WHERE key='post:abc123'    │            │
+│       └───────┬───────┴───────┬───────┘            │
+│               │               │                     │
+│               ▼               ▼                     │
+│        ┌──────────────────────────────┐            │
+│        │     ((PostgreSQL Single))     │            │
+│        │     counters table            │            │
+│        │     key        | val         │            │
+│        │     post:abc123 | 142         │            │
+│        │     post:def456 | 73          │            │
+│        │     ...                       │            │
+│        │                              │            │
+│        │  UPDATE counters              │            │
+│        │  SET val = val + 1           │            │
+│        │  WHERE key = 'post:abc123'   │            │
+│        └──────────────────────────────┘            │
+│                                                      │
+│  Problem: UPDATE is serialized by row-level lock    │
+│  All increments queue on the same row               │
+└────────────────────────────────────────────────────┘
+  Legend: [ ] = service   (( )) = database
+  `}
+  alt="Single PostgreSQL table with counters row; all clients read and write the same row, creating a serial bottleneck"
+  caption="Naive single-node counter architecture — fails at each growth milestone"
+/>
+
+### At 1,000 Users
+
+**The setup**: A single PostgreSQL instance (db.r6g.large, 2 vCPUs, 16 GB RAM). Counter table with an integer column. Application servers execute `UPDATE counters SET val = val + 1 WHERE key = 'post:abc123'` for each like.
+
+**What works**: The `UPDATE` is atomic within PostgreSQL's transaction isolation. Row-level locking serializes concurrent updates. Total throughput: approximately 2,000 increments per second — well above the 100 likes per second that 1,000 users generate. Response time: 2-5ms. No problem.
+
+### At 100,000 Users
+
+**What breaks**: The single counter row becomes a contention hotspot. With 10,000 concurrent likes per second, the PostgreSQL row lock queues. Each `UPDATE` holds the row lock for approximately 0.5ms while the WAL is written. With 10,000 updates per second, the average wait time for the lock is 5,000 milliseconds (10,000 × 0.5ms queued). Queries time out after 30 seconds. The page view counter for the most popular post reads 12,000 — but only 3,000 actual likes were processed because 9,000 clients timed out and retried, causing the application to double-count some and drop others.
+
+**Mitigation attempted**: Replace `SELECT + UPDATE` with atomic `UPDATE counters SET val = val + 1 WHERE key = 'post:abc123' RETURNING val`. Remove the application-level read-modify-write race, but the row lock contention remains.
+
+### At 10,000,000 Users
+
+**What breaks**: Even with the atomic `UPDATE`, a single PostgreSQL row cannot handle 1 million concurrent writes per second. The row lock queue alone adds 500,000ms of cumulative wait. PostgreSQL's connection pool saturates at 300 connections. The database CPU is pinned at 100% on WAL writes. The counter reads a value of 48,000, but the actual number of user taps is 4.2 million — a 98.9% undercount. The system is effectively broken.
+
+---
+
+## Production-Grade Architecture
+
+The production architecture solves each bottleneck from the naive implementation. The key insight: **remove all contention from the write path by sharding the counter across many independent nodes, and aggregate on the read path**.
+
+<AsciiDiagram
+  id="distributed-counters/prod-arch"
+  title="Production-Grade Distributed Counter Architecture"
+  content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│              PRODUCTION-GRADE DISTRIBUTED COUNTER ARCHITECTURE           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────┐                                                    │
+│  │ [Clients]        │── HTTP/gRPC increment requests                     │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌────────────────────────────────────────────────────┐                │
+│  │ [Rate Limiter + Idempotency Layer]                  │                │
+│  │  Per-IP: 100 req/s | Idempotency TTL: 300s        │                │
+│  │  Backend: Redis Set (ephemeral)                    │                │
+│  └──────────────────────┬─────────────────────────────┘                │
+│                         │                                              │
+│                         ▼                                              │
+│  ┌────────────────────────────────────────────────────┐                │
+│  │ [Consistent Hash Ring]                              │                │
+│  │  256 virtual nodes per physical node               │                │
+│  │  hash(key) → vnode → physical shard                │                │
+│  └──────────────────────┬─────────────────────────────┘                │
+│                         │                                              │
+│           ┌─────────────┼─────────────┬────────────┐                  │
+│           │             │             │            │                  │
+│           ▼             ▼             ▼            ▼                  │
+│  ┌────────────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐          │
+│  │ {Shard 0}      │ │ {Shard 1}│ │ {Shard 2}│ │ ...      │ ...     │
+│  │ (Redis Prim)   │ │ (Redis)  │ │ (Redis)  │ │          │          │
+│  │ [Replica A]    │ │ [Rep A]  │ │ [Rep A]  │ │ [Rep A]  │          │
+│  │ [Replica B]    │ │ [Rep B]  │ │ [Rep B]  │ │ [Rep B]  │          │
+│  └────────────────┘ └──────────┘ └──────────┘ └──────────┘          │
+│           │             │             │            │                  │
+│           └─────────────┼─────────────┼────────────┘                  │
+│                         │              │                               │
+│                         ▼              ▼                               │
+│  ┌────────────────────────────────────────────────────┐                │
+│  │ [Read Aggregator]                                   │                │
+│  │  Fan-out → Sum → Cache (TTL 100ms)                 │                │
+│  │  Fallback to stale cache on shard timeout          │                │
+│  └──────────────────────┬─────────────────────────────┘                │
+│                         │                                              │
+│                         ▼                                              │
+│  ┌────────────────────────────────────────────────────┐                │
+│  │ [Background Reconciliation]                         │                │
+│  │  Gossip merge every 100ms                          │                │
+│  │  Tombstone GC every 24hr                           │                │
+│  │  Rebalance on topology change                      │                │
+│  └────────────────────────────────────────────────────┘                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+  Legend: [ ] = service   { } = cache   (( )) = database
+  `}
+  alt="Production architecture: rate limiter, idempotency layer, consistent hash ring, Redis shards with replicas, read aggregator with cache, background reconciliation"
+  caption="Production-grade distributed counter architecture with six main subsystems"
+/>
+
+**Key design decisions**:
+
+1. **Shard count = 64 shards as baseline**. Each shard handles 50,000 writes/sec, giving 3.2 million aggregate writes/sec. Doubling to 128 shards provides headroom to 6.4 million writes/sec.
+
+2. **Redis over PostgreSQL** for the counter shard. Redis INCR is atomic, single-threaded (no lock contention), and operates entirely in memory. PostgreSQL row locks would serialize writes even with partitioning.
+
+3. **Consistent hashing with 256 virtual nodes** ensures balanced load even when a shard is added or removed. With 64 physical shards, the coefficient of variation in load across shards is under 5%.
+
+4. **Two replicas per shard**. One for failover (asynchronous replication), one for read offloading (also async). All writes go to the primary. Reads can go to any replica for eventual consistency.
+
+5. **Read aggregator with local cache (TTL 100ms)** avoids the fan-out-on-every-read cost. The cache serves 95% of reads without touching any shard. On cache miss, the aggregator fans out to all 64 shards in parallel.
+
+6. **Idempotency layer** prevents double-counting from retries. Each client request carries an idempotency key stored in a Redis Set with 300-second TTL. The same key is rejected within the TTL window.
+
+---
+
+## Integration Patterns
+
+Four scenarios that show how distributed counters integrate with other systems.
+
+### Pattern 1: RDBMS + Counter as Materialized View
+
+You need the counter queryable via SQL for reporting. The database is the system of record; the distributed counter is a low-latency write path.
+
+<AsciiDiagram
+  id="distributed-counters/pattern-rdbms"
+  title="RDBMS Integration: Counter Updates via Change Data Capture"
+  content={`
+┌─────────┐    INCR    ┌──────────┐
+│ [Client] │ ──────────>│ {Redis   │
+│          │           │  Shard}  │
+└─────────┘           └────┬─────┘
+                           │
+                           │ Async: Write increment event
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │ (Kafka Topic) │
+                    │ counter:incr  │
+                    └──────┬───────┘
+                           │
+                           │ Kafka Connect / Debezium
+                           │
+                           ▼
+                    ┌──────────────────┐
+                    │ ((PostgreSQL))    │
+                    │ counters_mv      │
+                    │ key, val, ts     │
+                    └──────────────────┘
+  Legend: [ ] = service   { } = cache   (( )) = database   ( ) = queue
+  `}
+  alt="Client increments Redis shard; the increment event is asynchronously published to Kafka and consumed by Debezium to update a PostgreSQL materialized view"
+  caption="Pattern 1: Redis counter with async CDC to PostgreSQL for reporting queries"
+/>
+
+**Setup**: Each Redis shard writes increment events to a Kafka topic. Debezium (Kafka Connect) reads the topic and applies batch updates to a PostgreSQL materialized view. Reporting queries hit PostgreSQL with 1-5 second latency from the live counter.
+
+**When to use**: You need real-time writes (sub-millisecond) but also need to run SQL aggregations, JOIN counters with user data, or provide historical counter snapshots.
+
+**When NOT to use**: You need the counter value to be immediately consistent with the database. The upstream counter writes are eventually consistent with the materialized view — the view lags by 1-5 seconds.
+
+### Pattern 2: Cache-Aside with Counter as Origin of Truth
+
+The distributed counter is the source of truth. A CDN or edge cache reads the counter value and caches it for a short TTL.
+
+<AsciiDiagram
+  id="distributed-counters/pattern-cache"
+  title="Cache-Aside: Counter as Origin of Truth with CDN Edge Caching"
+  content={`
+┌──────────┐  GET /post/abc123   ┌──────────────┐
+│ [Browser] │ ───────────────────>│ [CDN Edge]    │
+│           │ <───── HTML ──────  │  Cache TTL:   │
+│           │                    │  30 seconds   │
+└──────────┘                    └──────┬───────┘
+                                       │
+                              CDN Miss or stale?
+                                       │
+                                       ▼
+                               ┌──────────────┐
+                               │ [Web App]     │
+                               │  Render page  │
+                               └──────┬───────┘
+                                      │
+                              Read aggregator sum()
+                                      │
+                                      ▼
+                               ┌──────────────┐
+                               │ {Counter      │
+                               │  Shards}      │
+                               └──────────────┘
+  Legend: [ ] = service   { } = cache
+  `}
+  alt="Browser requests page from CDN edge; on cache miss, web app calls read aggregator to sum counter shards, returns rendered HTML with counter value"
+  caption="Pattern 2: Counter as origin of truth with CDN edge caching for read-heavy workloads"
+/>
+
+**Setup**: The counter is the authoritative source. The CDN caches the rendered page containing the counter value. TTL is set to 30 seconds — acceptable for a like counter that does not need second-level freshness.
+
+**When to use**: Read-to-write ratio exceeds 100:1. The CDN absorbs 99% of read traffic, so only 1% of reads hit the counter shards.
+
+**When NOT to use**: You need sub-second freshness for the displayed counter. A CDN TTL of 30 seconds means the counter can be 30 seconds stale on the user-visible page.
+
+### Pattern 3: Message Queue for Bulk Counter Processing
+
+Increment requests are buffered in a queue, and a consumer applies them to the counter in batches.
+
+<AsciiDiagram
+  id="distributed-counters/pattern-mq"
+  title="Message Queue Integration: Buffered Counter Increments"
+  content={`
+┌─────────┐    ┌──────────────┐
+│ [Client] │───>│ (Kafka/Q)    │  Partition by post_id
+│ [Client] │───>│  topic:      │
+│ [Client] │───>│  counter_inc │
+│ [Client] │───>│              │
+└─────────┘    └──────┬───────┘
+                      │
+              Consumer group: 4 consumers
+                      │
+                      ▼
+              ┌──────────────┐
+              │ [Counter     │
+              │  Ingester]   │
+              │  Batch:      │
+              │  INCRBY post │ 5
+              │  INCRBY post │ 12
+              │  ...         │
+              └──────┬───────┘
+                     │
+                     ▼
+              ┌──────────────┐
+              │ {Redis Shard} │
+              └──────────────┘
+  Legend: [ ] = service   { } = cache   ( ) = queue
+  `}
+  alt="Clients write increment events to Kafka; four consumers read from the topic, batch INCRBY commands, and apply to Redis shards"
+  caption="Pattern 3: Kafka-buffered counter ingestion with batching consumers"
+/>
+
+**Setup**: The client writes an increment event to a Kafka topic (partitioned by `post_id`). A consumer group of 4 instances reads from the topic in batches of 500 records (or every 100ms, whichever comes first) and applies the increments as `INCRBY` commands to the appropriate Redis shard.
+
+**When to use**: You need strict ordering guarantees within a partition. Kafka guarantees order within a partition, so increments for the same `post_id` are always applied in order. You also need a durable event log for replaying lost increments.
+
+**When NOT to use**: You need sub-10ms write latency. Kafka's produce-and-consume pipeline adds 50-500ms of latency. For real-time feedback (like a like button animation), this is too slow.
+
+### Pattern 4: External API Counter (Third-Party Rate Limits)
+
+A counter that tracks consumption of a third-party API quota. The counter decrements on each API call and rejects when the daily budget is exhausted.
+
+**Setup**: A sharded PN-Counter tracks the remaining quota for each API key. On each API call, the counter decrements by 1. When the counter reaches 0, the API gateway returns HTTP 429. The quota resets at midnight UTC via a batch reset.
+
+**When to use**: You need to enforce rate limits across multiple application servers without a centralized rate limiter.
+
+**When NOT to use**: You cannot afford any overshoot. The eventually-consistent counter may overshoot the limit by the number of increments in the staleness window. For a daily quota of 1,000,000 with 100ms staleness and 5,000 requests per second, overshoot is 500 requests (0.05%).
+
+---
+
+## Multi-Region and Global Scale
+
+A global counter system spans multiple AWS regions. Each region runs its own counter cluster. Cross-region replication ensures that a counter value is eventually consistent across all regions.
+
+<AsciiDiagram
+  id="distributed-counters/multi-region"
+  title="Multi-Region Distributed Counter Topology"
+  content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   MULTI-REGION COUNTER TOPOLOGY                          │
+│                                                                         │
+│  ┌─────────────── US-East-1 ───────────────┐                           │
+│  │  [LB] → [Router] → 64 Shards → [Cache]  │                           │
+│  │                       │                  │                           │
+│  └───────────────────────┼──────────────────┘                           │
+│                          │ Cross-region replication (Kafka mirror)      │
+│  ┌─────────────── EU-West-1 ──────────────┐ │                          │
+│  │  [LB] → [Router] → 64 Shards → [Cache]│ │                          │
+│  │                       │                  │ │                         │
+│  └───────────────────────┼──────────────────┘ │                         │
+│                          │                     │                         │
+│  ┌─────────────── AP-Southeast-1 ──────────┐  │                         │
+│  │  [LB] → [Router] → 64 Shards → [Cache]  │  │                        │
+│  └─────────────────────────────────────────┘  │                        │
+│                                                │                         │
+│  ┌────────────────────────────────────────────┘                         │
+│  │                                                                      │
+│  ▼                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐    │
+│  │ {Global Counter Aggregator (CRDT)}                             │    │
+│  │  Merges regional totals every 5 seconds                       │    │
+│  │  Produces globally authoritative total                        │    │
+│  └───────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+  Legend: [ ] = service   { } = cache
+  `}
+  alt="Three AWS regions each run 64-shard counter clusters; cross-region Kafka mirror replicates increment events; global CRDT aggregator merges regional totals every 5 seconds"
+  caption="Multi-region counter topology with three AWS regions and global CRDT aggregation"
+/>
+
+**Write path**: Each region accepts increments independently. No cross-region coordination on the write path. This keeps p99 write latency under 2ms regardless of geographic distance.
+
+**Cross-region replication**: Increment events are mirrored to other regions via Kafka MirrorMaker 2 with a 500ms-2 second replication lag. Each region applies incoming cross-region increments to the appropriate shard.
+
+**Global read**: The global aggregator reads all three regional totals every 5 seconds and produces a merged total. The merged total is the element-wise max of each region's G-Counter vector, then summed. This guarantees that no increment from any region is ever lost.
+
+**Regional failover**: If US-East-1 fails, the DNS-based routing layer shifts US traffic to EU-West-1. The counter system in EU-West-1 accepts both EU and US increments. The EU-West-1 counter value reflects both regional contributions within the replication window. When US-East-1 recovers, the CRDT merge recovers the US-East-1 delta.
+
+---
+
+## Capacity Planning
+
+A worked example: plan the counter infrastructure for a social platform expecting 500 million monthly active users (MAU), targeting 100,000 likes per second at peak with a 10:1 peak-to-average ratio.
+
+**Step 1: Write throughput**
+
+Peak writes per second: 100,000 likes/sec. Each increment produces a single INCR command. Shard target utilization: 60% of max to leave headroom for traffic spikes. Redis capacity per shard: 50,000 ops/sec. Required shards: 100,000 / (50,000 × 0.6) = 3.33, rounded up to 4 shards. **Recommendation: 8 shards** for 50% headroom and to handle hash distribution skew.
+
+**Step 2: Memory**
+
+Each counter key: 80 bytes (72 bytes Redis overhead + 8 bytes integer). Active counters per day: 100 million distinct posts liked per day × 7 days = 700 million active counters. Memory: 700M × 80 bytes = 56 GB. Add 30% overhead for replication buffers, AOF, and metadata: 73 GB. **Recommendation: 8 shards × 16 GB each = 128 GB** (approximately 55% utilization).
+
+**Step 3: Read throughput**
+
+Reads per second: 500,000 page views/sec, each requesting the counter. With a 100ms cache TTL, cache hit rate is 98%. Shard reads per second: 500,000 × 2% = 10,000 reads/sec for cache misses (fan-out to all 8 shards = 80,000 shard reads/sec). Each shard handles 10,000 reads/sec and 12,500 writes/sec (100,000/8) = 22,500 ops/sec total per shard. **Well within the 50,000 ops/sec limit**.
+
+**Step 4: Network bandwidth**
+
+Each increment command: 200 bytes (request + response). 100,000 incr/sec × 200 bytes = 20 MB/sec ingest. Replication to 2 replicas: 20 MB/sec × 2 = 40 MB/sec total. Cross-region replication: 100,000 incr/sec × 200 bytes per region × 2 regions = 40 MB/sec. **Total network: 100 MB/sec** — well within a 10 Gbps NIC (1.25 GB/sec).
+
+**Step 5: Cost estimate (AWS, on-demand pricing)**
+
+| Component | Size | Count | Monthly Cost |
+|---|---|---|---|
+| Redis shards | cache.r6g.xlarge (8GB, 2 vCPU) | 8 | $2,400 |
+| Redis replicas | Same (2 per shard) | 16 | $4,800 |
+| Read aggregator | t3.medium (2 vCPU, 4GB) | 2 (HA pair) | $120 |
+| Router/API gateway | t3.large (2 vCPU, 8GB) | 4 | $360 |
+| Kafka for CDC | kafka.m5.large | 3-broker cluster | $2,100 |
+| Data transfer | 100 MB/sec egress | ~260 TB/month | $2,800 |
+| **Total** | | | **$12,580/month** |
+
+Reserved instances reduce the Redis cost by 60-70%: approximately $6,000/month on a 3-year all-upfront reservation.
+
+---
+
+## Deployment and Operations
+
+### Zero-Downtime Deployment
+
+Adding shards (scaling from 8 to 16 shards):
+
+1. **Update the consistent hash ring** to include 8 new virtual node groups pointing to the new physical shards.
+2. **Dual-write phase**: The router increments both the old shard and the new shard for 5 minutes. The old shard handles reads. This ensures no increment is lost during migration.
+3. **Background rebalance**: A background task scans counters with hash values mapping to the new shards and migrates their state from old shards to new shards.
+4. **Cutover**: After rebalance completes and dual-write has run for 5 minutes, the router sends both writes and reads to the new shards only.
+5. **Old shard drain**: Old shards remain online for 24 hours serving any delayed reads, then are decommissioned.
+
+### Monitoring
+
+Six dashboards for operational visibility:
+
+1. **Shard health**: CPU, memory, ops/sec, replication lag per shard. Alert: any shard above 80% CPU for 5 minutes.
+2. **Write throughput**: Increments per second aggregate, per-shard breakdown. Alert: throughput drops below 50% of expected for 1 minute (indicates client-side failure).
+3. **Read latency**: p50, p99, p999 read latency from aggregator. Alert: p99 read latency above 50ms for 1 minute.
+4. **Cache hit rate**: Read aggregator local cache hit ratio. Alert: hit rate below 90% for 5 minutes.
+5. **Replication lag**: Lag time between primary and each replica. Alert: any replica lagging more than 500ms for 1 minute.
+6. **Gossip convergence**: Time for all shards to converge after partition heal. Alert: convergence takes more than 5 seconds.
+
+### Debugging Inconsistencies
+
+When a counter appears wrong (too high or too low):
+
+1. **Check the idempotency layer**: Are retry requests being double-counted? Query the idempotency key Redis Set TTL to see if keys are expiring prematurely.
+2. **Check shard assignment**: Is the consistent hash ring stable? A flapping node causes the same key to route to different shards, splitting the counter.
+3. **Check replication lag**: Is one replica so far behind that it returned a stale value during a read?
+4. **Compare with event log**: If available, replay increment events from the Kafka topic and compare the computed total with the counter value.
+
+### Upgrades
+
+**Redis version upgrade**: Deploy a new Redis cluster running the target version alongside the old cluster. Dual-write for 5 minutes, then cutover. No data loss, no downtime.
+
+**Protocol change (e.g., RESP2 to RESP3)**: The router and aggregator are decoupled from the underlying Redis protocol through an abstraction layer. Deploy a new aggregator version that speaks RESP3, then cut traffic gradually using a 10% canary for 1 hour.
+
+---
+
+On the Trade-offs page, you will evaluate when a distributed counter is the wrong solution and what failure modes can corrupt the count.

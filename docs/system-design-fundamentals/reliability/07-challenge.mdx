@@ -1,0 +1,503 @@
+---
+id: reliability-challenge
+title: Reliability — Challenge
+sidebar_position: 7
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Reliability — Challenge
+
+Apply everything you have learned to three progressively harder reliability design challenges. Each challenge specifies the system, the failure scenario, and what you need to design. Model answers follow each challenge so you can compare your approach.
+
+## Tier 1: Idempotent Payment API
+
+### Scenario
+
+You are designing a payment processing API for an e-commerce platform. The API handles credit card charges. The payment gateway (Stripe, Adyen) has occasional network timeouts and returns duplicate responses in rare cases. The business requirement: zero double charges. Customers must be charged exactly once for each purchase.
+
+Current architecture: a monolithic checkout service that calls the payment gateway directly. No reliability mechanisms. You are seeing 50 duplicate charges per day out of 100,000 transactions (0.05%).
+
+### Your Task
+
+Design the reliability layer for the payment API. Cover:
+
+1. Idempotency key design — how the client generates and sends it, how the server checks and stores it, TTL and cleanup.
+2. Retry policy — when to retry, how many attempts, backoff strategy, jitter parameters.
+3. Circuit breaker — threshold, window, open duration, half-open behavior.
+4. Recovery — what happens when the payment gateway comes back after an outage. How are pending requests handled?
+5. Failure modes — what are the remaining failure modes after your design? List at least three.
+
+### Model Answer
+
+#### Idempotency Key Design
+
+The client generates a UUID v4 for each unique checkout operation. The key is sent as an `Idempotency-Key` header on every mutation request. The server maintains an idempotency cache in Redis with a 24-hour TTL:
+
+```python
+import uuid
+import redis
+
+cache = redis.Redis(host="idempotency-cache", port=6379)
+
+def charge_with_idempotency(amount, currency, payment_method):
+    idempotency_key = request.headers.get("Idempotency-Key")
+    if not idempotency_key:
+        return {"error": "Idempotency-Key header required"}, 400
+
+    # Check cache
+    cached = cache.get(idempotency_key)
+    if cached:
+        return json.loads(cached), 200
+
+    # Process charge
+    try:
+        result = payment_gateway.charge(amount, currency, payment_method)
+        cache.setex(idempotency_key, 86400, json.dumps(result))
+        return result, 201
+    except PaymentError as e:
+        # Do not cache errors — client can retry
+        return {"error": str(e)}, 502
+```
+
+Key validation: the server also checks that the same idempotency key is not reused with a different request body. If the request body differs, return 409 Conflict:
+
+```python
+existing = cache.get(idempotency_key + ":body_hash")
+if existing and existing != hash(request_body):
+    return {"error": "Idempotency key reused with different request"}, 409
+```
+
+#### Retry Policy
+
+Retry only on transient failures: network timeouts, 503 Service Unavailable, 502 Bad Gateway. Do not retry on 400 (bad request), 401 (auth failure), 404 (not found), 409 (conflict), or 422 (unprocessable entity).
+
+```python
+retry_policy = {
+    "max_attempts": 3,
+    "base_delay_ms": 200,
+    "max_delay_ms": 5000,
+    "jitter_factor": 0.25,
+    "retryable_status_codes": [502, 503, 504],
+    "retryable_exceptions": [TimeoutError, ConnectionError]
+}
+```
+
+#### Circuit Breaker
+
+```python
+circuit_breaker = {
+    "failure_threshold": 0.30,  # 30% failure rate
+    "window_size": 100,  # last 100 calls
+    "open_duration_ms": 30000,  # 30 seconds
+    "half_open_max_calls": 3  # probe with 3 requests
+}
+```
+
+The threshold is 30% for payments because payment failures are critical. At 30% failure rate, the payment gateway is clearly having problems. Open the circuit to prevent further calls.
+
+#### Recovery
+
+When the payment gateway recovers, the circuit breaker transitions to half-open. Three probe requests are allowed through. If all three succeed, the circuit closes. If any fails, the circuit opens again for 60 seconds (doubled).
+
+Pending requests during the outage are rejected immediately (circuit breaker open) with a 503 response. The client retries using its own retry policy. The idempotency key ensures that the retry is safe — the client sends the same key, and the server processes the retry as a new attempt (not a duplicate charge).
+
+#### Remaining Failure Modes
+
+1. **Redis failure.** If the idempotency cache is down, the server cannot deduplicate. Solution: a local in-memory cache (small, bounded) as a secondary check, plus an alert when Redis is unreachable. Accept the risk of rare duplicates during Redis downtime.
+
+2. **Payment gateway accepts but does not return a result.** The charge went through on the gateway side, but the response was lost. The client retries with the same idempotency key. The gateway must support idempotency keys — most modern gateways (Stripe, Adyen) do. If the gateway does not support idempotency, this is a hard problem requiring reconciliation (a periodic batch job to compare transactions).
+
+3. **Client generates duplicate keys.** If the client generates the same idempotency key for two different purchases, the second purchase is incorrectly deduplicated. Solution: the client key must include enough entropy (UUID v4, 122 random bits) to make collisions astronomically unlikely.
+
+## Tier 2: Multi-Region Order Processing
+
+### Scenario
+
+You are designing an order processing system for a global e-commerce company. The system runs in two AWS regions (us-east-1 and eu-west-1). Each region handles orders for customers in its geographic area. The business requirement: zero order loss. Every order placed by a customer must eventually be processed, even if a region fails entirely.
+
+The system has three services: Order Service (accepts orders), Inventory Service (reserves stock), Shipping Service (initiates fulfillment). Each service depends on the database below it.
+
+### Your Task
+
+Design the reliability mechanisms for this multi-region system. Cover:
+
+1. Cross-region failover — how does traffic shift when one region fails? What is the RTO (recovery time objective) and RPO (recovery point objective)?
+2. Data replication — how are orders replicated between regions? What happens during a partition?
+3. Retry and circuit breaker configuration per service — different services have different criticality and latency profiles.
+4. Fallback design — what happens when a region's database is unavailable but the service is still running?
+5. Testing strategy — how do you verify that the reliability mechanisms work?
+
+### Model Answer
+
+#### Cross-Region Failover
+
+**Setup.** Route53 latency-based routing. Each region DNS TTL is 60 seconds. Failover time: `60s (DNS TTL) + 30s (health check interval) + 30s (unhealthy threshold) = 120s`. RTO: 120 seconds. RPO: 5 seconds (asynchronous replication lag).
+
+**Failover process:**
+1. Health check detects region A is unhealthy (3 consecutive failures over 30 seconds).
+2. Route53 removes region A from DNS (60-second TTL propagation).
+3. All traffic shifts to region B.
+4. Region B's database has a 5-second lag at most. Unacknowledged orders in region A's WAL are replicated within 5 seconds.
+5. Orders that were in-flight (accepted by the service but not committed to the database) are lost. The client retry policy handles this — the client retries the order creation with the same idempotency key.
+
+#### Data Replication
+
+Orders are stored in DynamoDB global tables. DynamoDB global tables provide active-active replication across regions with eventual consistency. Replication lag is typically under 1 second within the same continent, up to 5 seconds across continents.
+
+During a partition, both regions continue accepting writes. When the partition heals, DynamoDB uses last-writer-wins (LWW) conflict resolution based on the timestamp. For orders: LWW is acceptable because each order has a unique ID. Two regions cannot create the same order ID because each region has a unique region prefix in the order ID.
+
+```python
+order_id = f"{region_prefix}-{uuid.uuid4()}"
+# us-east-1 produces: us-550e8400-e29b-...
+# eu-west-1 produces: eu-550e8400-e29b-...
+```
+
+#### Retry and Circuit Breaker Configuration
+
+Order Service (write path, critical):
+```json
+{
+  "retry": { "max_attempts": 5, "base_delay_ms": 100, "jitter": 0.25 },
+  "circuit_breaker": { "threshold": 0.30, "window": 10, "open_ms": 60000 }
+}
+```
+
+Inventory Service (read path, latency-sensitive):
+```json
+{
+  "retry": { "max_attempts": 3, "base_delay_ms": 50, "jitter": 0.25 },
+  "circuit_breaker": { "threshold": 0.50, "window": 30, "open_ms": 30000 }
+}
+```
+
+Shipping Service (async, fire-and-forget):
+```json
+{
+  "retry": { "max_attempts": 10, "base_delay_ms": 1000, "max_delay_ms": 600000 },
+  "circuit_breaker": { "threshold": 0.70, "window": 100, "open_ms": 120000 }
+}
+```
+
+#### Fallback Design
+
+When the primary database is unavailable:
+- Order Service writes to a local disk queue. A background worker replays the queue when the database recovers.
+- Inventory Service returns stale data from the local cache (30-second TTL). TTL is short enough that inventory inaccuracies are bounded.
+- Shipping Service falls back to zero — shipping is async; if the database is down, the messages queue in the shipping worker and get processed when the database recovers.
+
+```python
+def save_order(order):
+    try:
+        return database.save(order)
+    except DatabaseUnavailable:
+        # Write to local disk queue (WAL)
+        disk_queue.append(order)
+        return {"status": "queued", "order_id": order.id}
+```
+
+A background process replays the queue:
+```python
+def replay_queue():
+    while True:
+        order = disk_queue.pop()
+        try:
+            database.save(order)
+        except DatabaseUnavailable:
+            disk_queue.append(order)  # back to the queue
+            time.sleep(10)
+            break
+        time.sleep(1)
+```
+
+#### Testing Strategy
+
+1. **Chaos testing.** Randomly kill instances in one region. Verify that all traffic shifts to the other region within 120 seconds.
+2. **Load test.** Verify that one region can handle 2x traffic when the other region fails. Run at 50% capacity per region under normal load.
+3. **Latency test.** Verify that cross-region replication stays under 5 seconds during peak traffic.
+4. **Queue drain test.** Verify that the local disk queue drains completely within 5 minutes when the database recovers.
+5. **Jam session.** Simulate a complete region failure during a code freeze. The team practices the failover procedure under time pressure.
+
+## Tier 3: Reliable Event Processing Pipeline
+
+### Scenario
+
+You are designing an event processing pipeline for a financial analytics platform. The pipeline ingests 50,000 events per second from 500 sources (stock exchanges, news feeds, social media). Each event must be processed exactly once — duplicates cause incorrect financial calculations, and missing events cause incorrect market analysis.
+
+The pipeline stages are: ingestion (accept raw events), normalization (parse and standardize), enrichment (merge with reference data), aggregation (compute rolling statistics), and output (publish to analytics consumers).
+
+### Your Task
+
+Design the pipeline with end-to-end exactly-once semantics. Cover:
+
+1. Exactly-once guarantees at each stage — how do you prevent duplicates and omissions at scale?
+2. Backpressure handling — what happens when a downstream stage is slower than the upstream stage?
+3. Dead-letter handling — what happens to events that cannot be processed?
+4. Pipeline recovery — how does the pipeline recover from a crash without losing events?
+5. Monitoring — what metrics and alerts ensure the pipeline stays healthy?
+
+### Model Answer
+
+#### Exactly-Once Guarantees
+
+Each stage uses a transactional outbox pattern combined with idempotent processing:
+
+**Ingestion stage.**
+Events arrive via HTTP POST with idempotency keys. The ingestion service writes events to a Kafka topic (`raw-events`) using Kafka's exactly-once semantics (EOS). The producer sets `enable.idempotence=true` and `acks=all`. Kafka's transaction API ensures that the produce and commit are atomic:
+
+```python
+producer = KafkaProducer(
+    bootstrap_servers="kafka:9092",
+    enable_idempotence=True,
+    acks="all",
+    transactional_id="ingestion-1"
+)
+
+def ingest_event(event, idempotency_key):
+    producer.begin_transaction()
+    producer.send("raw-events", key=idempotency_key, value=event)
+    producer.commit_transaction()  # Atomic: either both or neither
+```
+
+**Normalization stage.**
+The consumer reads from `raw-events` with `isolation.level=read_committed` to guarantee it only processes committed messages. The consumer stores its offset in the same transaction that produces the normalized event:
+
+```python
+def normalize_event(event):
+    normalized = parse_and_validate(event)
+    producer.begin_transaction()
+    # Send normalized event
+    producer.send("normalized-events", key=event.key, value=normalized)
+    # Commit offset in same transaction
+    consumer.commit_offsets_in_transaction(producer)
+    producer.commit_transaction()
+```
+
+This is Kafka's "exactly-once" approach: produce and commit are in the same transaction. If the consumer crashes between sending and committing, the transaction is aborted, and the consumer re-reads the original offset.
+
+**Enrichment stage.**
+Enrichment calls an external reference data service. To handle external calls within the transaction boundary, the enrichment stage uses a two-phase approach:
+
+1. Snapshot reference data into a local database every hour.
+2. Enrich events using local data (no external call on the hot path).
+3. If the local data is stale (event outside the snapshot window), the event goes to a separate enrichment retry topic for batch reprocessing.
+
+#### Backpressure Handling
+
+Each stage has a bounded buffer (Kafka topic with configurable retention). When a downstream stage cannot keep up:
+
+1. The downstream consumer's lag grows. This is visible in Kafka consumer lag metrics.
+2. When lag exceeds a threshold (100,000 messages for a 50,000 msg/s stage = 2 seconds of lag), an alert fires.
+3. When lag exceeds a hard limit (500,000 messages = 10 seconds), the upstream stage begins dropping non-critical events (low-priority news feeds, social media) while continuing to process critical events (stock exchange data).
+4. If lag reaches 1,000,000 messages, the pipeline triggers a scale-up event (add more partitions and consumers).
+
+<AsciiDiagram
+  id="reliability/pipeline-backpressure"
+  title="Event Pipeline Backpressure Handling"
+  alt="Flow showing events entering a Kafka topic, backed up when the consumer slows, with lag thresholds triggering alerts and auto-scaling."
+>{` 
+  [Sources] ──> <Kafka Topic> ──> [Consumer]
+                ┌──────────┐
+                │  Events  │     Normal: consume
+                │  ┌───┐   │     10,000 msg/s
+                │  │   │   │
+                │  │   │   │     Lag: 0-100K = OK
+                │  │   │   │     Lag: 100K-500K = Alert
+                │  └───┘   │     Lag: 500K-1M = Drop low-priority
+                │          │     Lag: >1M = Auto-scale
+                └──────────┘
+ `}
+</AsciiDiagram>
+
+#### Dead-Letter Handling
+
+Events that cannot be processed after `max_retries` (3 attempts) go to a dead-letter topic per stage:
+
+```
+normalization-dlq
+enrichment-dlq
+aggregation-dlq
+```
+
+Each DLQ message includes the original event, the error message, the attempt count, and the timestamp of each attempt:
+
+```json
+{
+  "original_event": {"source": "nyse", "type": "trade", "symbol": "AAPL", ...},
+  "errors": [
+    {"attempt": 1, "error": "ParseError: invalid price field", "timestamp": "...", "retry_after_ms": 200},
+    {"attempt": 2, "error": "ParseError: invalid price field", "timestamp": "...", "retry_after_ms": 800},
+    {"attempt": 3, "error": "ParseError: invalid price field", "timestamp": "...", "retry_after_ms": 3200}
+  ]
+}
+```
+
+An alert fires whenever any DLQ receives a message. An operator reviews the DLQ, fixes the root cause (schema change in source data, bug in normalization code), and replays the DLQ through the pipeline.
+
+#### Pipeline Recovery
+
+When a pipeline stage crashes:
+
+1. **Consumer restart.** The consumer group rebalances. Each partition is assigned to a surviving consumer. The new consumer starts from the last committed offset (stored in the transaction).
+2. **Transaction recovery.** Any incomplete transactions are aborted. The events are re-read from the committed offset.
+3. **State recovery.** Stateful stages (aggregation) checkpoint their state to a persistent store (RocksDB for Kafka Streams) every 60 seconds. On restart, the state is reconstructed from the checkpoint and the unprocessed events.
+4. **Warm-up.** After restart, the new consumer processes events faster than real-time (the pipeline has headroom) to catch up with the live stream.
+
+#### Monitoring
+
+Essential metrics:
+
+| Metric | Source | Alert threshold |
+|---|---|---|
+| Consumer lag per partition | Kafka consumer group | > 100,000 |
+| Transaction abort rate | Kafka broker metrics | > 1/minute |
+| DLQ message count | Custom counter per DLQ | > 0 |
+| Enrichment cache hit rate | Application metric | < 90% |
+| Processing latency p99 | Application metric | > 1000ms |
+| Events per second per stage | Application metric | < 80% of expected |
+| Rebalance count per hour | Kafka consumer group | > 2 |
+
+**Dashboard.** A single dashboard shows all five stages with: EPS (events per second), lag, error rate, and latency percentile. Color-coded: green (healthy), yellow (warning), red (alerting).
+
+**Runbook.** Each alert has a runbook entry describing the triage steps, common causes, and remediation actions. The runbook is updated after every incident.
+
+**Runbook.** Each alert has a runbook entry describing the triage steps, common causes, and remediation actions. The runbook is updated after every incident.
+
+## Bonus Challenge: Reliable Webhook Delivery System
+
+### Scenario
+
+You are designing a webhook delivery system for a SaaS platform. The platform sends webhook events to customer-configured endpoints whenever an event occurs (invoice paid, user created, subscription canceled). Customers rely on these webhooks for their own business logic. The business requirement: deliver each webhook at least once with a maximum delay of 5 minutes.
+
+The system receives 10,000 events per second. Each event must be delivered to 1-3 customer endpoints (average 1.5). Delivery must be retried on failure. Customer endpoints have variable reliability — some are 99.99% uptime, others are 50% uptime and regularly timeout.
+
+### Design Constraints
+
+1. At-least-once delivery: a webhook must be delivered at least once. Duplicate deliveries are acceptable (customers are expected to handle deduplication via the `Idempotency-Key` header).
+2. 5-minute delivery SLA: 99.9% of webhooks must be delivered within 5 minutes of the event occurring.
+3. Customer endpoint failures: if a customer's endpoint is down, keep retrying for 24 hours. After 24 hours, mark the endpoint as "disabled" and stop delivering.
+4. Backpressure: if a customer's endpoint is slow, do not let it affect delivery to other customers.
+5. Observability: customers must be able to see delivery status (delivered, pending, failed) in a dashboard.
+
+### Step 1: Architecture Design
+
+The webhook delivery system has four components:
+
+1. **Event Ingestion.** An HTTP endpoint that accepts events and publishes them to a Kafka topic. Each event has a unique ID and the webhook configuration ID.
+2. **Webhook Router.** A Kafka consumer that reads events and, for each event, looks up the target endpoints. Each target generates a delivery task. Tasks are published to a delivery queue.
+3. **Delivery Worker.** A pool of workers that read delivery tasks from the queue and make HTTP POST calls to customer endpoints. Each worker handles one task at a time.
+4. **Status Store.** A database that tracks the delivery status of each webhook attempt. Customers query this database for delivery history.
+
+<AsciiDiagram
+  id="reliability/webhook-architecture"
+  title="Webhook Delivery System Architecture"
+  alt="Architecture showing event ingestion via Kafka, webhook router, per-customer delivery queues, worker pools, and status store."
+>{`
+  [Event Source] ──> <Kafka> ──> [Webhook Router]
+                                       │
+                               Lookup endpoints
+                                       │
+                ┌──────────────────────┼──────────────────────┐
+                │                      │                      │
+          <Queue Cust A>         <Queue Cust B>          <Queue Cust C>
+                │                      │                      │
+          [Worker Pool A]        [Worker Pool B]        [Worker Pool C]
+                │                      │                      │
+           POST endpoint           POST endpoint           POST endpoint
+                │                      │                      │
+           ((Status Store ── Dashboard))
+`}
+</AsciiDiagram>
+
+
+### Step 2: Per-Customer Isolation
+
+Each customer has a dedicated delivery queue and worker pool. This prevents one customer's slow endpoint from blocking other customers' deliveries. The queue is a Kafka topic partitioned by customer ID, or a separate topic per customer for high-volume customers.
+
+Worker pool size per customer:
+```
+pool_size = min(max_workers, max_pending / target_latency)
+```
+
+For a customer with 100 pending deliveries and a 5-minute delivery target: `pool_size = min(10, 100 / 300) = min(10, 0.33) = 1`. One worker is sufficient. For a customer with 10,000 pending deliveries: `pool_size = min(10, 10000 / 300) = min(10, 33) = 10`. Cap at 10 workers to limit resource consumption.
+
+### Step 3: Retry Strategy
+
+Each webhook delivery follows this retry schedule:
+
+| Attempt | Delay | Cumulative time | Notes |
+|---|---|---|---|
+| 1 | 0s (immediate) | 0s | First attempt |
+| 2 | 10s | 10s | Brief network blip |
+| 3 | 60s | 70s | Transient overload |
+| 4 | 5m | ~6m | Service restart |
+| 5 | 15m | ~21m | Partial recovery |
+| 6 | 30m | ~51m | Full recovery |
+| 7 | 1h | ~1h 51m | Longer outage |
+| 8-24 | 1h each | ~24h | Continued retry |
+
+After 24 hours of retries, the endpoint is marked as "disabled." The webhook owner receives a notification. The disabled endpoint must be manually re-enabled by the customer after fixing the issue.
+
+The first 4 attempts cover the 5-minute SLA. If the first 4 attempts fail, the webhook is marked as "delayed" in the status store. The customer sees a warning indicator.
+
+### Step 4: Rate Limiting for Customer Endpoints
+
+Each customer endpoint has a rate limit. The delivery system respects `Retry-After` headers and enforces a maximum throughput per endpoint:
+
+```python
+class EndpointRateLimiter:
+    def __init__(self, endpoint, max_rps):
+        self.endpoint = endpoint
+        self.bucket = TokenBucket(capacity=max_rps, refill_rate=max_rps)
+
+    def can_send(self):
+        return self.bucket.try_consume(1)
+
+    def on_rate_limited(self, retry_after_seconds):
+        self.bucket.drain(retry_after_seconds * self.bucket.refill_rate)
+        logger.warning(f"Rate limited by {self.endpoint}, backing off {retry_after_seconds}s")
+```
+
+The rate limiter prevents the delivery system from overwhelming a customer's endpoint. If the endpoint responds with 429, the delivery system backs off for `Retry-After` seconds (or a default of 60 seconds if the header is missing).
+
+### Step 5: Delivery Status and Observability
+
+Each webhook delivery produces a status record:
+
+```json
+{
+  "webhook_id": "wh_abc123",
+  "event_id": "evt_xyz789",
+  "endpoint": "https://customer.example.com/webhooks",
+  "status": "delivered",
+  "attempts": [
+    {"attempt": 1, "status_code": 502, "timestamp": "2026-06-15T14:23:10Z"},
+    {"attempt": 2, "status_code": 200, "timestamp": "2026-06-15T14:23:20Z"}
+  ],
+  "delivered_at": "2026-06-15T14:23:20Z",
+  "latency_ms": 12000
+}
+```
+
+Customers query the status store via a REST API: `GET /api/v1/webhooks/{webhook_id}`. The dashboard shows:
+
+- **Delivery rate**: percentage of webhooks delivered on first attempt vs with retries.
+- **P50, P95, P99 delivery latency**: how long webhooks take to deliver.
+- **Endpoint health**: success rate, average latency, error distribution per endpoint.
+- **Queue depth**: pending deliveries per customer endpoint.
+
+### Step 6: Failure Mode Analysis
+
+| Failure Mode | Mitigation |
+|---|---|
+| Customer endpoint returns 5xx | Retry with exponential backoff, up to 24 hours |
+| Customer endpoint times out (10s timeout) | Worker thread released after 10s, retry scheduled |
+| Customer endpoint is down for 48 hours | Endpoint disabled after 24 hours of failures, owner notified |
+| Delivery worker crashes mid-delivery | Message remains in queue, redelivered to another worker (at-least-once) |
+| Kafka broker fails | Replicated with replication.factor=3, min.insync.replicas=2 |
+| Status database fails | Writes queued to local disk, replayed when database recovers |
+| Event too large (>1MB) | Rejected at ingestion with 413 status, stored for manual review |
+
+The webhook delivery challenge demonstrates how reliability patterns apply to a customer-facing SaaS system. The key insight is per-customer isolation: one customer's failing endpoint must not affect another customer's delivery latency. This is achieved through per-customer queues, worker pools, and rate limiters.
+
+This completes the bonus challenge. You have now applied reliability engineering to three practical scenarios: an idempotent payment API, a multi-region order processing system, an exactly-once event pipeline, and a customer-facing webhook delivery system. These four challenges cover the full spectrum of reliability patterns used in production systems.

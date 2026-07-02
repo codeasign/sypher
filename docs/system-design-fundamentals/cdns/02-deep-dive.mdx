@@ -1,0 +1,871 @@
+---
+id: cdns-deep-dive
+title: CDNs — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A production CDN edge server is not a simple reverse proxy. It is a layered pipeline of specialized modules. Understanding each layer is essential because tuning the wrong layer causes cascading failures that are difficult to diagnose.
+
+<AsciiDiagram
+  id="cdns/internal-arch"
+  title="CDN Edge Server Internal Architecture"
+  content={`
+┌────────────────────────────────────────────────────────────────────┐
+│                      CDN EDGE SERVER PIPELINE                       │
+│                                                                      │
+│  Incoming Request                                                    │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ 1. TLS Termination (SSL/TLS offload)                           │ │
+│  │    Decrypt, validate certificate, negotiate session             │ │
+│  │    Speed: 10,000 handshakes/second per core                     │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ 2. Request Router (HTTP parser + header normalizer)            │ │
+│  │    Parse method, path, headers. Normalize cache key.           │ │
+│  │    Detect protocol (HTTP/1.1, HTTP/2, HTTP/3).                 │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ 3. Access Control & Rate Limiter                               │ │
+│  │    IP allow/deny lists, WAF rules, geo-blocking.               │ │
+│  │    Rate limit: per-IP tokens, burst allowance.                 │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ 4. Cache Lookup Engine                                        │ │
+│  │    Hash-based key lookup. MC/Redis/Varnish internal store.     │ │
+│  │    Cache hit → serve from cache layer                          │ │
+│  │    Cache miss → continue to upstream fetch                     │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ 5. Origin Fetcher (request coalescing)                         │ │
+│  │    Deduplicate concurrent misses for same key.                 │ │
+│  │    Select upstream: shield → regional → origin.                │ │
+│  │    Timeouts, retries, circuit breakers.                        │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ 6. Response Processor                                          │ │
+│  │    Validate response headers. Apply edge transforms            │ │
+│  │    (minification, image optimization, header injection).       │ │
+│  │    Enforce Cache-Control directives from origin.               │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ 7. Cache Write Engine                                         │ │
+│  │    Store response in cache tiers (RAM → SSD → disk).           │ │
+│  │    Eviction policy (LRU, LFU, TTL-based).                      │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ 8. Response Sender (TLS encrypt + connection manage)           │ │
+│  │    Keep-alive management, HTTP/3 QUIC framing.                 │ │
+│  │    Response compression (gzip, brotli).                        │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│       │                                                              │
+│       ▼                                                              │
+│  Response to Client                                                  │
+└────────────────────────────────────────────────────────────────────┘
+  `}
+  caption="Eight-layer pipeline inside a CDN edge server. Every request passes through every layer in sequence."
+/>
+
+Each layer in this pipeline is independently configurable and independently monitored. A bottleneck at any layer degrades overall performance. In practice, layer 4 (cache lookup) and layer 5 (origin fetcher) are where most tuning effort concentrates because they determine hit ratio and origin load.
+
+## Data Structures and Algorithms
+
+### Cache Key Hash Table (Primary Index)
+
+**Structure:** Open-addressed hash table with 32-byte keys (SHA-256 of the normalized URL) and 8-byte value pointers.
+
+**Why this structure:** Cache lookup must complete in under 1 millisecond to keep p50 latency below 10ms. A hash table with O(1) average lookup satisfies this requirement. Open addressing (rather than chaining) avoids pointer chasing and cache misses at the CPU level — the hash table itself fits in L3 cache for tables under 4GB.
+
+**Time complexity:** O(1) average, O(n) worst case (resize). Real-world load factor stays under 0.7 to keep collision rate low.
+
+**Space complexity:** 40 bytes per entry (32 key + 8 pointer), plus the variable-length object storage. A 100 million entry table consumes approximately 4GB for the index alone.
+
+<AsciiDiagram
+  id="cdns/hash-table"
+  title="Cache Key Hash Table Structure"
+  content={`
+┌────────────────────────────────────────────────────────────────────┐
+│                    CACHE KEY HASH TABLE                              │
+│                                                                      │
+│  URL: /images/cat.jpg                                                │
+│       │                                                              │
+│       ▼                                                              │
+│  SHA-256 → bucket 0x7A3F                                            │
+│                                                                      │
+│  Bucket Array (index 0 to N-1)                                      │
+│  ┌──────┬────────────┬────────────┬──────────────────────────────┐  │
+│  │ Index│  Hash Key  │  Value Ptr  │  Status                      │  │
+│  ├──────┼────────────┼────────────┼──────────────────────────────┤  │
+│  │ 0000 │ 0x0000...  │ null       │ EMPTY                        │  │
+│  │ 0001 │ 0x7A3F...  │ 0x00FF2000 │ OCCUPIED → metadata block   │  │
+│  │ 0002 │ 0x7A40...  │ null       │ DELETED (tombstone)          │  │
+│  │ 0003 │ 0x7A41...  │ 0x00FF3400 │ OCCUPIED                     │  │
+│  │ ...  │ ...        │ ...        │ ...                          │  │
+│  └──────┴────────────┴────────────┴──────────────────────────────┘  │
+│                                                                      │
+│  Probe sequence (linear probing, step 8):                            │
+│  bucket 0x7A3F → occupied? → try 0x7A47 → occupied? → try 0x7A4F   │
+│  → empty → insert.                                                   │
+│                                                                      │
+│  Tombstone handling: DELETED slots are skipped during lookup         │
+│  but reused on insert. Compact when load < 0.3.                     │
+└────────────────────────────────────────────────────────────────────┘
+  `}
+  caption="Open-addressed hash table with linear probing. Tombstone markers handle deletions compactly."
+/>
+
+### LRU Eviction List (Cache Replacement)
+
+**Structure:** Doubly-linked list with a hash table for O(1) find-and-move operations. The most recently accessed entry sits at the head; the least recently accessed sits at the tail.
+
+**Why this structure:** CDN cache slots are finite (typically 80 percent of available RAM/SSD is allocated to cache storage). When a new entry must be inserted and the cache is full, something must be evicted. LRU assumes that content accessed recently will be accessed again soon — which is true for content that follows a Zipf-like access distribution where 80 percent of requests hit 20 percent of content.
+
+**Time complexity:** O(1) for lookup, insert, delete, and promote-to-head. The hash table provides the pointer; the list provides the ordering.
+
+**Space complexity:** 24 bytes per entry (two pointers + key) for the list node, plus the hash table entry (40 bytes). Total overhead per cached object: approximately 64 bytes.
+
+<AsciiDiagram
+  id="cdns/lru-list"
+  title="LRU Eviction List — Doubly-Linked List with Hash Table"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                        LRU CACHE LIST                                │
+│                                                                      │
+│      ┌─────┐    ┌─────┐    ┌─────┐    ┌─────┐    ┌─────┐           │
+│  ◄──►│  A  │◄──►│  B  │◄──►│  C  │◄──►│  D  │◄──►│  E  │──► NULL  │
+│      └─────┘    └─────┘    └─────┘    └─────┘    └─────┘           │
+│        ▲                                                      ▲      │
+│        │                                                      │      │
+│     HEAD (most                                         TAIL (least  │
+│     recently)                                          recently)    │
+│                                                                      │
+│  Hash Table for O(1) access:                                        │
+│  ┌──────────┬──────────┐                                            │
+│  │ Cache Key│ List Ptr │                                            │
+│  ├──────────┼──────────┤                                            │
+│  │ key_A    │ ──► A    │                                            │
+│  │ key_B    │ ──► B    │                                            │
+│  │ key_C    │ ──► C    │                                            │
+│  │ key_D    │ ──► D    │                                            │
+│  │ key_E    │ ──► E    │                                            │
+│  └──────────┴──────────┘                                            │
+│                                                                      │
+│  On cache hit for C:                                                │
+│  1. Hash(key_C) → pointer to C                                      │
+│  2. Unlink C from current position                                  │
+│  3. Insert C at HEAD                                                │
+│  4. Return cached data                                              │
+│  5. All operations: O(1)                                            │
+│                                                                      │
+│  On eviction (cache full, insert new F):                            │
+│  1. Remove E from TAIL                                              │
+│  2. Remove key_E from hash table                                    │
+│  3. Write F to disk (if dirty)                                      │
+│  4. Insert F at HEAD                                                │
+│  5. Add key_F to hash table                                         │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+  caption="Doubly-linked LRU list with auxiliary hash table enables O(1) lookup, insertion, and eviction."
+/>
+
+### Adaptive TTL Timer Wheel
+
+**Structure:** Hierarchical timing wheel with 4 levels (milliseconds, seconds, minutes, hours) using a circular buffer of linked lists.
+
+**Why this structure:** Each cached object has its own TTL. A naive approach checks every object's TTL on every access, which wastes CPU. A timer wheel groups objects by their expiry time and processes only expired buckets when time advances. The hierarchical design supports TTLs from 1 millisecond to 30 days without allocating 2.6 billion slots.
+
+**Time complexity:** O(1) insert, O(1) tick, O(n) per tick for expired entries (n = objects in the expired bucket, ideally few).
+
+**Space complexity:** 1024 slots per level × 4 levels = 4096 head pointers, plus the entries themselves.
+
+<AsciiDiagram
+  id="cdns/timer-wheel"
+  title="Hierarchical Timer Wheel for TTL Management"
+  content={`
+Level 0 (ms): Ticks every 1ms, covers 0-1023ms
+┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+│  0 │  1 │  2 │  3 │ ...│ 510│ ...│ 767│ ...│1023│
+└────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+  │    │    │    │                      │
+  │    │    │    └── Object: TTL=3ms    │
+  │    │    └─────── Object: TTL=2ms    │
+  │    └─────────── Object: TTL=1ms     │
+  └────────────────────────────── Object: TTL=0ms (expire now)
+
+When Level 0 wraps around (after 1024 ticks, 1024ms):
+  → Cascade one Level 1 slot into Level 0
+
+Level 1 (s): Ticks every 1024ms, covers 1-1024s
+┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+│  0 │  1 │  2 │  3 │ ...│ 510│ ...│ 767│ ...│1023│
+└────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+
+Level 2 (min): Ticks every ~17min, covers 17min-12d
+Level 3 (hr):  Ticks every ~12d, covers 12d-34yr
+
+  TTL = 3600s (1 hour):
+  → Insert in Level 2 slot (3600 / 1024 ≈ 3.5 → slot 3)
+  → After 3.5 minutes, cascade to Level 1
+  → After 3.5 + 1024 seconds, cascade to Level 0
+  → After 3600s total, expire
+  `}
+  caption="Hierarchical timer wheel efficiently manages TTL expiry across 4 orders of magnitude without per-object timer threads."
+/>
+
+### Bloom Filter for Hot Object Detection
+
+**Structure:** Bit array of size m with k hash functions. Insertion sets k bits. Lookup checks all k bits — if any is 0, the object is definitely not in the hot set.
+
+**Why this structure:** Not all cached objects are equal. The top 1 percent of objects serve 90 percent of traffic. Detecting hot objects allows the CDN to prioritize them in RAM (fast tier) versus SSD (slow tier). A bloom filter provides a fast, memory-efficient membership test with tunable false-positive rate.
+
+**Time complexity:** O(k) per operation (k hash functions, typically 7-10).
+
+**Space complexity:** For 10 million objects at 1 percent false positive rate: approximately 12MB (1.2 bytes per element). An equivalent hash set would require 400MB.
+
+<AsciiDiagram
+  id="cdns/bloom-filter"
+  title="Bloom Filter for Hot Object Detection"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                         BLOOM FILTER                                 │
+│  Bit array size: 100 million bits (12.5 MB)                          │
+│  Hash functions: 7 (murmur3, xxhash, cityhash variants)             │
+│  Expected objects: 10 million                                       │
+│  False positive rate: ~1%                                           │
+│                                                                      │
+│  Insert key "/images/cat.jpg":                                      │
+│                                                                      │
+│    h1("/images/cat.jpg") → position 12,345,678                      │
+│    h2("/images/cat.jpg") → position 45,678,901                      │
+│    h3( ... )        → position 78,901,234                           │
+│    ... → 7 positions total                                          │
+│                                                                      │
+│    Set bits [12345678, 45678901, 78901234, ...] to 1                │
+│                                                                      │
+│  Check key "/images/dog.jpg":                                       │
+│                                                                      │
+│    h1("/images/dog.jpg") → position 98,765,432 — bit is 0           │
+│    → Definitely NOT in hot set → serve from SSD, not RAM            │
+│                                                                      │
+│  Check key "/images/cat.jpg":                                       │
+│                                                                      │
+│    All 7 bits are 1 → Probably in hot set → serve from RAM          │
+│    (1% chance it is a false positive and actually cold)             │
+│                                                                      │
+│  Hot set promotion: if an object gets 100+ requests/minute,          │
+│  add to bloom filter. Next request hits RAM.                        │
+│  Cold set demotion: if TTL expires without a hit, remove from       │
+│  bloom filter (requires counting bloom or periodic rebuild).        │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+  caption="Bloom filter enables fast, memory-efficient identification of hot objects for RAM/SSD tiering."
+/>
+
+### Consistent Hash Ring for Cache Sharding
+
+**Structure:** A ring of 2^64 positions. Each cache node maps to multiple virtual positions on the ring. Each cache key maps to exactly one position. The owner of a key is the nearest node clockwise from the key's position.
+
+**Why this structure:** When the cache cluster adds or removes nodes, a naive modulo-N hash would remap every key (catastrophic miss storm). Consistent hashing remaps only K/N keys, where K is total keys and N is number of nodes.
+
+**Time complexity:** O(log V) per lookup with binary search on virtual node positions, where V is the number of virtual nodes (typically 100-200 per physical node).
+
+**Space complexity:** O(V) for the sorted position list (negligible).
+
+<AsciiDiagram
+  id="cdns/consistent-hash"
+  title="Consistent Hash Ring for Cache Sharding"
+  content={`
+                    2^64 - 1 / 0
+                        │
+          ┌───────── Node A3 ─────────┐
+          │                           │
+    Node C3                          Node B3
+          │                           │
+          │    ┌─────────────────┐    │
+    Node B1─────┤   HASH RING    ├─────Node C2
+          │    │                 │    │
+          │    │ Key "cat.jpg"  │    │
+    Node A2─────┤ → resolves to  ├─────Node A1
+          │    │   Node B       │    │
+          │    └─────────────────┘    │
+    Node C1                          Node B2
+          │                           │
+          └──────────Node A3─────────┘
+                        │
+                     2^64 - 1
+
+  Physical nodes: 3 (A, B, C)
+  Virtual nodes: 150 each (A1..A150, B1..B150, C1..C150)
+
+  When Node B is removed:
+  - Only keys hashing to B's virtual nodes are remapped
+  - Roughly 1/N of all keys = 33%
+  - Compare with modulo-N: 100% remapped
+
+  When Node D is added:
+  - Only 1/(N+1) of keys remap = 25%
+  - Remaining 75% stay where they are
+  `}
+  caption="Consistent hash ring with virtual nodes minimizes key remapping when the cache cluster topology changes."
+/>
+
+### Range Bloom Filter for Range Request Handling
+
+**Structure:** A set of bloom filters, one per 1MB chunk of a large file, plus a prefix bloom filter that summarizes the full set.
+
+**Why this structure:** Video downloads use HTTP Range requests (partial content). Each byte range translates to one or more chunks. The CDN must know which chunks are cached to respond with the correct byte range or fetch missing chunks from origin. Scanning all chunks on every request is too slow.
+
+**Time complexity:** O(chunks_in_range) per request. Typical range covers 2-5 chunks.
+
+**Space complexity:** 1.2 bytes per chunk at 1 percent FPR. A 10GB video file divided into 1MB chunks uses 12KB of bloom filter data.
+
+## The Request/Write/Read Lifecycle
+
+### Lifecycle Step 1: Content Publication (Write Path)
+
+Your deployment pipeline pushes updated assets to the origin server. The origin saves each file to disk and sends `Cache-Control: public, max-age=31536000` in the response header. The CDN has not seen this content yet.
+
+<AsciiDiagram
+  id="cdns/lifecycle-write"
+  title="Write Path — Content Publication"
+  content={`
+┌──────────────────┐     Deploy cmd      ┌────────────────────┐
+│  CI/CD Pipeline   │ ─────────────────►  │   Origin Server    │
+│  (GitHub Actions) │                     │                    │
+│                   │                     │   Write file to    │
+│                   │                     │   /var/www/v2/     │
+│                   │                     │   style.css        │
+└──────────────────┘                     └────────────┬───────┘
+                                                       │
+                                                       │ HTTP Response:
+                                                       │ Cache-Control:
+                                                       │ public, max-age=
+                                                       │ 31536000
+                                                       │ ETag: "v2-abc"
+                                                       │
+                                                       ▼ (No CDN yet)
+  CDN does not know about the file until the first user request triggers it.
+  `}
+  caption="The write path only involves the origin. CDN learns about new content through demand (cache misses)."
+/>
+
+### Lifecycle Step 2: First Request (Cache Miss / Fetch)
+
+A user requests the new style.css. The edge POP computes the cache key, finds it absent, and begins the upstream fetch sequence.
+
+<AsciiDiagram
+  id="cdns/lifecycle-miss"
+  title="First Request — Cache Miss and Upstream Fetch Chain"
+  content={`
+User     Edge POP    Regional Cache  Origin Shield   Origin
+ │         │              │              │              │
+ │─GET────►│              │              │              │
+ │  style  │  Cache key   │              │              │
+ │  .css   │  miss:       │              │              │
+ │         │  lookup:     │              │              │
+ │         │  0.3ms       │              │              │
+ │         │─GET─────────►│              │              │
+ │         │              │  Cache miss  │              │
+ │         │              │─GET─────────►│              │
+ │         │              │              │  Cache miss  │
+ │         │              │              │─GET─────────►│
+ │         │              │              │              │
+ │         │              │              │              20ms server
+ │         │              │              │◄───200 OK────│
+ │         │              │              │  style.css   │
+ │         │              │◄───200 OK────│  cached      │
+ │         │◄───200 OK───│  cached      │  TTL=14400s  │
+ │         │  cached      │  TTL=7200s  │              │
+ │         │  TTL=3600s  │              │              │
+ │◄───200──│              │              │              │
+ │         │              │              │              │
+ │ Total latency: 260ms (140ms RTT edge→origin + 120ms processing)
+  `}
+  caption="First request triggers a cascade of cache misses. Each layer caches the response for progressively longer TTLs."
+/>
+
+### Lifecycle Step 3: Subsequent Requests (Cache Hit)
+
+All subsequent requests for style.css within the TTL window hit at the edge POP.
+
+<AsciiDiagram
+  id="cdns/lifecycle-hit"
+  title="Subsequent Requests — Cache Hit Path"
+  content={`
+User A    Edge POP    (no upstream traffic)
+ │         │
+ │─GET────►│
+ │  style  │  Hash lookup: 0.3ms
+ │  .css   │  LRU promote: O(1)
+ │         │  Read from SSD: 2ms
+ │         │  Compress (brotli): 1ms
+ │         │  Response encoding: 0.5ms
+ │◄───200──│
+ │         │
+ │ Total latency: 12ms (10ms network + 2ms POP processing)
+ │ No upstream bandwidth consumed
+ │ Origin load: 0 requests
+
+ 500 users/second, 10-hour TTL:
+ Cache hits: 18,000,000 (99.97%)
+ Cache misses: 1 (the first request)
+ Origin requests: 0 after the first miss
+  `}
+  caption="Cache hit serves in 12ms with zero origin traffic. The hit ratio for static assets approaches 99.97 percent."
+/>
+
+### Lifecycle Step 4: TTL Expiry and Revalidation
+
+After the edge TTL expires, the next request triggers a conditional GET.
+
+<AsciiDiagram
+  id="cdns/lifecycle-revalidate"
+  title="TTL Expiry — Conditional Revalidation"
+  content={`
+Time: t=3601s (1 hour + 1 second after first fetch)
+
+User     Edge POP    Origin Shield
+ │         │              │
+ │─GET────►│              │
+ │         │  Hash hit but TTL expired
+ │         │  Check ETag: "v2-abc"
+ │         │  Send conditional GET
+ │         │─GET─────────►│
+ │         │  If-None-Match: "v2-abc"
+ │         │              │
+ │         │              │  Shield cached? Yes
+ │         │              │  Shield TTL: 14400s (still valid)
+ │         │              │  ETag matches → no change
+ │         │◄───304───────│
+ │         │  Not Modified
+ │         │  No body transferred
+ │         │  Update edge TTL +1h
+ │◄───200──│
+ │  (from  │
+ │  edge   │
+ │  cache) │
+ │         │
+ │ Wire latency: 30ms (to shield, not origin)
+ │ Body transferred: 0 bytes (only headers)
+ │ Users see no delay
+  `}
+  caption="Conditional revalidation with ETag confirms content is unchanged. Only headers (not the full body) traverse the network."
+/>
+
+### Lifecycle Step 5: Purge and Cache Busting
+
+Your team updates style.css with new rules. You issue a purge for the old URL, then deploy with a versioned URL.
+
+<AsciiDiagram
+  id="cdns/lifecycle-purge"
+  title="Purge and Versioned URL Deploy"
+  content={`
+Option A: Purge old URL
+┌──────────────────────┐
+│  PURGE POST /purge   │
+│  Path: /style.css    │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  Control Plane API   │
+│  Sends purge to all  │
+│  200 POPs            │
+│  Average time: 5s    │
+└──────────────────────┘
+           │
+   ┌───────┴───────┐
+   ▼               ▼
+┌────────┐    ┌────────┐
+│POP NYC │    │POP TYO │ ...
+│Delete  │    │Delete  │
+│entry   │    │entry   │
+└────────┘    └────────┘
+  Results in cache misses globally
+  until content is re-fetched.
+
+Option B: Versioned URL (preferred)
+┌──────────────────────┐
+│  New file:           │
+│  style.v3.css        │
+│  Old file:           │
+│  style.v2.css        │
+│                      │
+│  Old cache key:      │
+│  /style.v2.css       │
+│  New cache key:      │
+│  /style.v3.css       │
+│                      │
+│  HTML references:    │
+│  href="style.v3.css" │
+│                      │
+│  Result: old entry   │
+│  expires naturally   │
+│  via TTL. No purge   │
+│  needed.             │
+└──────────────────────┘
+  `}
+  caption="Versioned URLs avoid purge operations entirely. Old cache entries expire naturally via TTL."
+/>
+
+### Lifecycle Step 6: Flash Crowd (Concurrent Cache Misses)
+
+50,000 users in the same region all request a new asset simultaneously. Without deduplication, the origin sees 50,000 concurrent requests.
+
+<AsciiDiagram
+  id="cdns/lifecycle-flashcrowd"
+  title="Flash Crowd — Origin Shield Deduplication in Action"
+  content={`
+Time: t=0ms                    Time: t+50ms                 Time: t+200ms
+
+50,000 users                   50,000 users                 50,000 users
+   │ │ │...│                      │ │ │...│                    │ │ │...│
+   ▼ ▼ ▼  ▼                      ▼ ▼ ▼  ▼                    ▼ ▼ ▼  ▼
+┌──────────────┐              ┌──────────────┐             ┌──────────────┐
+│  Frankfurt   │              │  Frankfurt   │             │  Frankfurt   │
+│  Edge POP    │              │  Edge POP    │             │  Edge POP    │
+│              │              │              │             │              │
+│ 50K MISS     │              │ 1 request→   │             │ 50K requests │
+│              │              │ shield       │             │ ← cached     │
+│──► Request   │              │ 49,999 wait  │             │ response     │
+│   coalescer  │              │ in queue     │             │ (cache hit)  │
+└──────┬───────┘              └──────┬───────┘             └──────┬───────┘
+       │                             │                            │
+       │ 1 request (not 50K)         │ 1 request in flight       │
+       ▼                             ▼                            ▼
+  ┌──────────┐                  ┌──────────┐                ┌──────────┐
+  │  Origin   │                  │  Origin   │                │  Origin   │
+  │  Shield   │                  │  Shield   │                │  Shield   │
+  │  (miss)   │                  │  (miss)   │                │  (cached) │
+  └──────┬───────┘               └──────┬───────┘             └──────────┘
+         │                              │
+         │ 1 request (not 50K)          │ 1 request
+         ▼                              ▼
+    ┌──────────┐                   ┌──────────┐
+    │  Origin   │                   │  Origin   │
+    │  Server   │                   │  Server   │
+    │           │                   │  responds │
+    │ 20ms gen  │                   │           │
+    └──────────┘                   └──────────┘
+
+  Origin load without shield: 50,000 requests
+  Origin load with shield:    1 request
+  Shield effectiveness:       99.998% reduction
+  `}
+  caption="Request coalescing at the edge and origin shield reduces a 50,000 concurrent flash crowd to a single origin request."
+/>
+
+## Consistency and State
+
+### Scenario 1: Cache Invalidation Propagation Delay
+
+An origin update propagates to edge caches at different speeds. Two users in different regions see different versions of the same URL.
+
+<AsciiDiagram
+  id="cdns/consistency-propagation"
+  title="Inconsistency — Staggered Purge Propagation"
+  content={`
+Time: t=0s — Publish new content to origin
+
+┌──────────────────┐
+│  ORIGIN SERVER    │
+│  /index.html v2   │
+└──────────────────┘
+         │
+         │ Purge sent to POPs at t=0s
+         ▼
+┌─────────────────────────────────────────┐
+│          CONTROL PLANE                   │
+│  Fan-out purge message to 200 POPs      │
+└─────────────────────────────────────────┘
+    │           │            │
+    │ 5ms       │ 2s         │ 8s
+    ▼           ▼            ▼
+┌────────┐ ┌────────┐  ┌────────┐
+│POP NYC │ │POP LON │  │POP SYD │
+│Purged  │ │Purged  │  │Still   │
+│at t=5ms│ │at t=2s │  │serving │
+│        │ │        │  │v1      │
+│Serves v2│ │Serves v2│  │Serves v1│
+└────────┘ └────────┘  └────────┘
+
+  User in NYC: sees v2 (correct)
+  User in Sydney: sees v1 (stale, for up to 8 seconds)
+  Both access the same URL
+
+  Remediation:
+  - Use versioned URLs for breaking changes
+  - Accept eventual consistency within seconds
+  - CDN SLAs typically guarantee purge ≤ 10 seconds for 99.9% of POPs
+  `}
+  caption="Purge propagation takes seconds. During that window, users in different regions see different versions of the same URL."
+/>
+
+### Scenario 2: Origin Server Crash During Cache Miss
+
+The origin server goes down. Edge POPs still serve cached content, but any cache miss produces a 502 or timeout.
+
+<AsciiDiagram
+  id="cdns/consistency-origin-down"
+  title="Origin Crash — CDN Serves Stale but Survives"
+  content={`
+┌──────────────────────────────────────────────────┐
+│                ORIGIN DOWN                        │
+│  ┌────────────────────┐                          │
+│  │   ORIGIN SERVER    │                          │
+│  │   HTTP 503 /       │                          │
+│  │   Unreachable      │                          │
+│  └────────────────────┘                          │
+│           ▲                                       │
+│           │ All upstream fetches fail             │
+└───────────┼──────────────────────────────────────┘
+            │
+   ┌────────┴────────┐
+   ▼                 ▼
+┌────────┐     ┌────────┐
+│POP NYC │     │POP TYO │
+│        │     │        │
+│Cached  │     │Cached  │
+│content │     │content │
+│for     │     │for     │
+│known   │     │known   │
+│URLs    │     │URLs    │
+│        │     │        │
+│Serving │     │Serving │
+│from    │     │from    │
+│cache   │     │cache   │
+│(hits)  │     │(hits)  │
+│        │     │        │
+│Misses  │     │Misses  │
+│get 502 │     │get 502 │
+│or stale│     │or stale│
+└────────┘     └────────┘
+
+  What survives: All cached URLs continue serving.
+  What breaks: Cache misses fail.
+  Duration: Until origin recovers or cached content TTL fully expires.
+  Mitigation: origin-keepalive mode (serve stale for up to 7 days if origin unreachable).
+  `}
+  caption="CDN masks origin failures for cached content. New or expired content fails until origin recovers."
+/>
+
+### Scenario 3: Concurrent Write Race — Last Write Wins
+
+Two origin servers (active-active setup) write different versions of the same object simultaneously. The CDN observes the second write and caches it, overwriting the first.
+
+<AsciiDiagram
+  id="cdns/consistency-race"
+  title="Concurrent Write Race — Last-Write-Wins"
+  content={`
+Time: t=0ms                     Time: t+5ms                 Time: t+10ms
+
+┌──────────────────┐          ┌──────────────────┐        ┌──────────────────┐
+│  Origin A (us)   │          │  Origin B (eu)   │        │  CDN Edge POP    │
+│  PUT /config.json│          │  PUT /config.json│        │                  │
+│  Value: "A=true" │          │  Value: "B=true" │        │  Receives B's    │
+└────────┬─────────┘          └────────┬─────────┘        │  write second    │
+         │                             │                   │  ┌────────────┐  │
+         │  Arrives at CDN at t+2ms     │  Arrives at CDN  │  │  Config:   │  │
+         │  CDN caches "A=true"        │  at t+7ms        │  │  "B=true"  │  │
+         │                             │                   │  └────────────┘  │
+         │                             │                   │                  │
+         ▼                             ▼                   │  A's value was   │
+  ┌──────────────────────┐   ┌──────────────────────┐     │  overwritten     │
+  │  CDN Interim State:  │   │  CDN Final State:    │     │  Lost in cache   │
+  │  config.json → A     │   │  config.json → B     │     │                  │
+  └──────────────────────┘   └──────────────────────┘     └──────────────────┘
+
+  Result: B wins. A's write is silently lost.
+  Users who read between t+2ms and t+7ms see A, then B after t+7ms.
+
+  Mitigation:
+  - Use conditional writes (If-Match with ETag)
+  - Single origin of truth for mutable content
+  - Accept that CDN is last-write-wins for cache storage
+  `}
+  caption="Concurrent writes to the CDN produce last-write-wins semantics. The second write silently overwrites the first."
+/>
+
+### Scenario 4: Stale Read During Origin Recovery
+
+Origin crashes, then recovers. During recovery, cached objects with expired TTLs are served as stale because the edge cannot reach the origin to revalidate.
+
+<AsciiDiagram
+  id="cdns/consistency-stale"
+  title="Stale Reads During Origin Recovery Window"
+  content={`
+Timeline:
+│
+│  t=0s   Origin goes down
+│  t=5s   Edge gets cache miss for /prices.json (TTL expired)
+│  t=5s   Edge tries origin → timeout (5s)
+│  t=10s  Edge serves stale /prices.json (stale-while-revalidate)
+│  t=30s  Origin comes back up
+│  t=31s  Edge retries stale /prices.json → success → fresh cache
+│
+┌──────────────────────────────────────────────────────────────────────┐
+│  Stale window: t=10s to t=31s = 21 seconds                          │
+│  During this window:                                                 │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  User sees: prices from 1+ hour ago (if TTL was 3600s)         │  │
+│  │  User action: adds item to cart based on stale price           │  │
+│  │  Reality: price has changed → checkout mismatch → cart error   │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  Mitigation:                                                         │
+│  - Set stale-while-revalidate to 0 for pricing endpoints            │
+│  - Use shorter TTLs with background revalidation                    │
+│  - CDN config: serve_stale_for = 0 for dynamic content              │
+│  - Monitor: stale_served_rate > 1% = alert                         │
+└──────────────────────────────────────────────────────────────────────┘
+  `}
+  caption="Stale reads occur when the origin is unreachable during revalidation. Dynamic content should not serve stale at all."
+/>
+
+### Scenario 5: Network Partition Between Edge and Origin
+
+A submarine cable cut isolates the Singapore POP from the origin in us-east-1. The POP still serves cached content to Southeast Asian users.
+
+<AsciiDiagram
+  id="cdns/consistency-partition"
+  title="Network Partition — Cable Cut Scenario"
+  content={`
+┌──────────────────┐   Cable Cut (broken)   ┌─────────────────────┐
+│  SINGAPORE POP    │ ◄═══════════════════►  │  ORIGIN (us-east-1) │
+│  (Southeast Asia) │                        │                     │
+└──────────────────┘                        └─────────────────────┘
+         │
+         │ Still serving cached content to local users
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  What happens during the partition:                                 │
+│                                                                      │
+│  ● All cache hits → serve normally (200, under 10ms)                     │
+│  ● All cache misses → fail (502, timeout after 30s)                 │
+│  ● All revalidation (conditional GET) → fail → serve stale          │
+│  ● Purge commands from control plane → fail (cannot reach POP)      │
+│                                                                      │
+│  After partition heals:                                              │
+│  ● Stale content purged via TTL expiry                              │
+│  ● Cache misses re-fetch from origin                                │
+│  ● Purge backlog replayed                                           │
+│                                                                      │
+│  AP behavior: Partition is tolerated. Availability over consistency │
+│  (AP in CAP theorem terms).                                         │
+└─────────────────────────────────────────────────────────────────────┘
+  `}
+  caption="During a network partition, the CDN edge continues serving cached content (AP behavior). Writes and purges fail until the partition heals."
+/>
+
+## Performance Characteristics
+
+### Latency by Cache Tier
+
+| Layer | p50 Latency | p99 Latency | p999 Latency | Transfer Speed |
+|-------|-------------|-------------|--------------|----------------|
+| RAM cache (hot) | 0.3ms | 1ms | 5ms | 10 GB/s |
+| SSD cache (warm) | 2ms | 10ms | 50ms | 500 MB/s |
+| Regional cache | 30ms | 100ms | 300ms | Varies by distance |
+| Origin shield | 80ms | 200ms | 500ms | Varies by distance |
+| Origin server | 150ms | 500ms | 2000ms | Server-dependent |
+
+### Cache Hit Ratio by Content Type
+
+| Content Type | Typical Hit Ratio | TTL Range | Notes |
+|--------------|-------------------|-----------|-------|
+| Static images (JPEG, PNG) | 95-99% | 7-365 days | Highest hit ratio |
+| CSS/JS bundles | 90-98% | 7-365 days | Versioned URLs help |
+| Fonts | 98-99.5% | 365 days | Rarely change |
+| HTML pages | 40-80% | 0-3600s | Highly variable |
+| API responses (JSON) | 20-60% | 0-300s | Personalization reduces hits |
+| Video (HLS segments) | 85-95% | 6-24 hours | Pre-positioning helps |
+
+### Throughput Limits per Edge Server
+
+| Metric | Typical Value | Bottleneck |
+|--------|---------------|------------|
+| Max connections | 50,000-100,000 simultaneous | File descriptors, RAM |
+| New connections/second | 10,000-30,000 | CPU (TLS handshake) |
+| Request throughput | 100,000-300,000 req/s | CPU (HTTP parsing) |
+| Bandwidth (egress) | 10-40 Gbps | NIC, PCIe bandwidth |
+| Cache storage | 4-20 TB (SSD) | Physical drives |
+| RAM cache | 64-256 GB | Server memory |
+
+### Memory Budget Breakdown (16GB RAM allocated to cache)
+
+| Component | Allocation | Purpose |
+|-----------|------------|---------|
+| Hash table index | 1 GB | Cache key lookup |
+| Object metadata | 2 GB | Headers, ETag, TTL, size |
+| Hot object data | 10 GB | The actual cached content |
+| LRU list + bloom filter | 0.5 GB | Eviction management |
+| Connection buffers | 2 GB | TCP buffers per connection |
+| System overhead | 0.5 GB | OS, monitoring, logging |
+
+### Compression Cost/Benefit
+
+| Content Type | Compression | Size Reduction | CPU Cost | Net Benefit |
+|-------------|-------------|----------------|----------|-------------|
+| Text (HTML, CSS, JS) | Brotli L4 | 70-80% | 5ms CPU | High (smaller, slower CPU) |
+| Text (HTML, CSS, JS) | Gzip L6 | 60-70% | 2ms CPU | High (good balance) |
+| JSON API responses | Gzip L6 | 70-85% | 2ms CPU | High |
+| JPEG images | None | 0% | N/A | Already compressed |
+| PNG images | Zopfli | 5-15% | 200ms CPU | Marginal (CPU expensive) |
+| Video (H264) | None | 0% | N/A | Already compressed |
+
+## Configuration and Tuning
+
+### Cache-Control Header Directives
+
+| Directive | Purpose | Safe Default | When to Change | What Breaks |
+|-----------|---------|-------------|----------------|-------------|
+| `max-age=N` | How long (seconds) the CDN caches without revalidation | 3600 for HTML, 31536000 for static assets | Shorter for dynamic content, longer for evergreen assets | Too long = stale content served; too short = origin overload |
+| `s-maxage=N` | Overrides max-age specifically for shared caches (CDNs) | Same as max-age | When you want CDN to cache longer than browser cache | Browser vs CDN TTL mismatch causes confusion |
+| `public` | Allows any cache to store the response | Set for all cacheable content | Remove for authenticated/user-specific responses | Exposing private data if set incorrectly |
+| `private` | Prevents CDN from caching (browser only) | Set for user-specific content | Remove for public content | Zero CDN benefit for that endpoint |
+| `no-cache` | Must revalidate with origin before every serve | Omit for cacheable content | Set for content that changes every request | Kills cache hit ratio (forces every request to origin) |
+| `no-store` | Never store any copy (CDN or browser) | Set for sensitive data (PII, tokens) | Remove for public content | Zero caching possible |
+| `stale-while-revalidate=N` | Serve stale during background revalidation for N seconds | 86400 (1 day) for static; 0 for dynamic | Higher for origin reliability | Serves slightly stale content during revalidation window |
+| `stale-if-error=N` | Serve stale content if origin returns error for N seconds | 86400 for non-critical content | 0 for transactional endpoints | Masks real origin errors |
+
+### CDN Platform Configuration
+
+| Setting | What It Controls | Safe Default | When to Change | What Breaks |
+|---------|-----------------|-------------|----------------|-------------|
+| Cache key template | Which URL parts form the cache key | Host + path + extension | Strip query params for static assets | Too narrow = low hit ratio; too broad = cache collisions |
+| TTL override | Force TTL on objects that lack Cache-Control headers | 3600s | When origin cannot set headers | Overriding a long-lived TTL with a short one reduces performance |
+| Query parameter filtering | Which query params are included in cache key | Strip all except known params | API responses using query-based differentiation | Cache serves wrong content variant |
+| Origin connect timeout | How long to wait for origin TCP connection | 5s | Increase for slow origin under load | Slow failure detection on dead origin |
+| Origin read timeout | How long to wait for origin response body | 30s | Increase for large file origins | Premature 504 errors on slow responses |
+| Max object size | Largest single object the CDN will cache | 1GB | Increase for video content | Cache fills with huge objects, evicting many smaller ones |
+| Compression level | Brotli/gzip compression ratio | Auto (brotli 4) | Lower for CPU-bound edge servers | Too high = increased CPU at edge reducing throughput |
+| Rate limiting | Max requests per IP per second | 1000 req/s/IP | Lower for API protection | Blocking legitimate users if set too low |
+| WAF sensitivity | How aggressively to block suspicious requests | Medium | Lower for traffic-heavy applications | Blocking legitimate traffic (false positives) |
+| Origin shield level | Number and distribution of shield layers | Regional shield only | Add global shield for flash crowd protection | More layers = higher stale content propagation delay |
+
+When tuning a CDN, change one parameter at a time and monitor the cache hit ratio, origin load, and p99 latency. A change that improves hit ratio by 5 percent but doubles origin timeout errors is a net negative. The most common production tuning sequence is: normalize cache keys first (removing session IDs and timestamps), then extend TTLs, then add shield layers, then tune compression.
+
+---
+
+You now understand every major component and algorithm inside a production CDN. The next page takes this knowledge and applies it to designing a complete CDN at scale — from a naive single-node reverse proxy to a global multi-region system handling 10 million daily active users.

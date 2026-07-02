@@ -1,0 +1,699 @@
+---
+id: kafka-deep-dive
+sidebar_position: 2
+title: "Kafka — Under the Hood"
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+This page examines Kafka's internal architecture, data structures, consistency model, and performance characteristics. Understanding these internals enables you to configure Kafka effectively, diagnose production issues, and design systems that use Kafka correctly.
+
+## Internal Architecture
+
+Kafka's architecture is deceptive in its simplicity. The public API is straightforward — produce to a topic, consume from a topic. The internals involve a carefully tuned stack of data structures, I/O strategies, and coordination protocols.
+
+### Broker Internals
+
+A Kafka broker runs as a Java Virtual Machine (JVM) process. The broker's memory is divided into several regions, each serving a distinct purpose:
+
+- **Page cache**: The operating system caches recently accessed disk pages in memory. Kafka relies heavily on this cache. When a producer writes to a partition, the data lands in the page cache and is flushed to disk asynchronously. When a consumer reads, the data is served from the page cache if it is still warm. This design exploits the OS's virtual memory management rather than implementing custom caching.
+
+- **JVM heap**: The heap stores Java objects — broker metadata, partition state, socket buffers, and in-flight requests. Heap size typically ranges from 4 GB to 16 GB depending on the workload. A smaller heap is preferred because garbage collection pauses increase with heap size.
+
+- **Direct memory**: Kafka uses direct byte buffers for network I/O. Data moves from the network into direct buffers, then to the page cache, then to disk. This avoids copying data through the JVM heap.
+
+- **Socket buffers**: Each connection has send and receive buffers. These are managed by the JVM's selector implementation.
+
+<AsciiDiagram
+  id="kafka/deep-dive-broker-memory"
+  title="Kafka broker memory layout"
+  alt="Diagram showing the memory regions of a Kafka broker: page cache, JVM heap, direct memory, and socket buffers"
+  content={`
+  ┌─────────────────────────────────────────────────────────────┐
+  │              KAFKA BROKER MEMORY LAYOUT                      │
+  │                                                              │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │         OS PAGE CACHE (managed by kernel)             │   │
+  │  │  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  │   │
+  │  │  │ P0   │  │ P1   │  │ P2   │  │ P3   │  │ P4   │  │   │
+  │  │  │ seg3 │  │ seg2 │  │ seg1 │  │ seg0 │  │ seg0 │  │   │
+  │  │  └──────┘  └──────┘  └──────┘  └──────┘  └──────┘  │   │
+  │  │  Typically 8-32 GB, as large as available            │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  │                         │                                    │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │         JVM HEAP (4-8 GB preferred)                   │   │
+  │  │  ┌──────────┐  ┌──────────┐  ┌───────────────────┐  │   │
+  │  │  │ Partitions│  │ Metadata │  │ In-flight requests│  │   │
+  │  │  │ State     │  │ (topics, │  │ (producer acks    │  │   │
+  │  │  │           │  │  configs)│  │  pending)         │  │   │
+  │  │  └──────────┘  └──────────┘  └───────────────────┘  │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  │                         │                                    │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │         DIRECT MEMORY (network buffers)               │   │
+  │  │  send.buffer.bytes=128KB  receive.buffer.bytes=128KB │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────┘
+  `}
+  caption="Kafka offloads caching to the OS page cache rather than the JVM heap"
+/>
+
+### Log Segments and Index Files
+
+Each partition is stored as a directory on disk. The directory contains one or more sets of segment files. Each segment consists of three files:
+
+- **`.log`**: The raw message data. Records are appended sequentially. Each record includes a length prefix, key, value, headers, timestamp, and offset.
+
+- **`.index`**: A sparse index mapping offsets to file positions. Kafka stores one index entry for every N bytes of log data (configured by `log.index.interval.bytes`, default 4096). The entry contains the offset and the byte position in the `.log` file.
+
+- **`.timeindex`**: A sparse index mapping timestamps to offsets. This enables consumers to seek to a specific point in time — for example, "find all records from 10:30 AM today."
+
+<AsciiDiagram
+  id="kafka/deep-dive-segment-files"
+  title="Segment file structure with index pointers"
+  alt="Diagram showing a Kafka log segment with its three files: log, index, and timeindex"
+  content={`
+  ┌─────────────────────────────────────────────────────────────┐
+  │              SEGMENT FILE STRUCTURE                          │
+  │                                                              │
+  │  Segment: "orders-0-0000000000000012500.log"                 │
+  │  Size: 1 GB  |  Records: ~250,000  |  Active: No            │
+  │                                                              │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  .log  (message data)                                │   │
+  │  │  ┌──────────┬──────────┬──────────┬──────────┬─────┐ │   │
+  │  │  │ Record   │ Record   │ Record   │ Record   │ ... │ │   │
+  │  │  │ offset   │ offset   │ offset   │ offset   │     │ │   │
+  │  │  │ 12500    │ 12501    │ 12502    │ 12503    │     │ │   │
+  │  │  └──────────┴──────────┴──────────┴──────────┴─────┘ │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  │                         │                                    │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  .index  (offset → position mapping)                  │   │
+  │  │  ┌──────────────────┬──────────────────┬────────────┐ │   │
+  │  │  │ Offset: 12500    │ Offset: 13000    │ Offset:    │ │   │
+  │  │  │ Position: 0      │ Position: 4096   │ 13500      │ │   │
+  │  │  │                  │                  │ Position:  │ │   │
+  │  │  │                  │                  │ 8192       │ │   │
+  │  │  └──────────────────┴──────────────────┴────────────┘ │   │
+  │  │  One entry per 4096 bytes of log data                  │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  │                         │                                    │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  .timeindex  (timestamp → offset mapping)             │   │
+  │  │  ┌──────────────────┬──────────────────┬────────────┐ │   │
+  │  │  │ Timestamp:       │ Timestamp:       │ Timestamp: │ │   │
+  │  │  │ 2026-07-02T10:30 │ 2026-07-02T10:35 │ 2026-07-02 │ │   │
+  │  │  │ Offset: 12500    │ Offset: 13000    │ T10:40     │ │   │
+  │  │  │                  │                  │ 13500      │ │   │
+  │  │  └──────────────────┴──────────────────┴────────────┘ │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────┘
+  `}
+  caption="The index and timeindex files enable fast lookups without scanning the entire log"
+/>
+
+### Controller
+
+One broker in the cluster acts as the controller (in ZooKeeper mode) or one of the KRaft controllers takes this role. The controller is responsible for:
+
+- **Leader election**: When a broker fails, the controller detects the failure and elects new leaders for the partitions that lost their leader.
+- **Metadata changes**: The controller handles topic creation, partition reassignment, and configuration changes.
+- **Preferred replica election**: The controller periodically ensures that partition leadership is balanced across brokers.
+
+In ZooKeeper mode, the controller is elected by ZooKeeper. If the controller fails, another broker takes over. In KRaft mode, the controller quorum handles all metadata operations using the Raft consensus protocol.
+
+### Network Layer
+
+Each broker has a network layer that handles incoming connections. The network layer uses the Java NIO selector for non-blocking I/O. The `num.network.threads` parameter (default 3) controls the number of threads that handle network requests. These threads deserialize requests and place them into a request queue.
+
+A separate pool of `num.io.threads` (default 8) handles the actual I/O operations — reading from and writing to the log. The separation between network threads and I/O threads allows the broker to handle many concurrent connections without blocking on disk I/O.
+
+The request queue is bounded. If the queue fills up, network threads stop accepting new requests, applying backpressure to producers. The `queued.max.requests` parameter (default 500) controls the queue size.
+
+### Replica Manager
+
+The replica manager is a core broker component that manages the state of all partition replicas on the broker. It tracks:
+
+- Which replicas are leaders and which are followers.
+- The high watermark (last committed offset) for each partition.
+- The ISR set for each partition.
+- Log segments and their lifecycle.
+
+The replica manager communicates with the controller to receive leadership assignments and with other brokers to coordinate replication.
+
+## Data Structures
+
+Kafka's performance depends on three core data structures: the append-only log, the sparse index, and the hash index for compaction.
+
+### Append-Only Log
+
+The append-only log is the primary data structure. Records are written to the end of the active segment file. This is the fastest possible write pattern because:
+
+- Sequential writes are 10-100x faster than random writes on spinning disks.
+- Sequential writes are 3-10x faster on SSDs.
+- No read-modify-write cycle — the write head moves in one direction.
+- The OS can prefetch and batch flush operations.
+
+A single broker can sustain 200-500 MB/s of sequential writes using a single disk. With multiple disks (JBOD or RAID), the throughput scales linearly.
+
+### Sparse Index
+
+The sparse index maps offset ranges to file positions. It is sparse by design — Kafka stores one index entry per 4096 bytes of log data (default). A 1 GB segment file produces approximately 250,000 index entries. The index is memory-mapped into the broker's address space for fast access.
+
+When a consumer wants to read from offset 15000, the broker:
+
+1. Binary-searches the index to find the nearest offset under 15000.
+2. Gets the file position for that offset.
+3. Seeks to that position in the `.log` file.
+4. Reads sequentially from that point.
+
+The index lookup is O(log N) where N is the number of index entries. For a 1 GB segment with 250,000 entries, this takes under 1 microsecond.
+
+### Time Index
+
+The time index maps timestamps to offsets. It has the same sparsity as the offset index. Consumers that want to read from a specific time — for example, "start from 10:30 AM" — use the time index to find the appropriate offset.
+
+The broker scans the time index to find the first entry with a timestamp >= the requested time. It then uses the offset index to find the exact file position. This operation is O(log N) for each index.
+
+### Compaction Data Structures
+
+Compaction requires tracking the latest record for each key. Kafka uses a hash map of keys to offsets, built during the compaction pass. The compactor:
+
+1. Reads the entire log segment into memory.
+2. Builds a hash map of key → latest offset (for compacted topics).
+3. Writes a new segment containing only the latest record for each key.
+4. Swaps the new segment for the old segment.
+
+The hash map must fit in memory. For a topic with 50 million unique keys, the map requires approximately 2-4 GB of memory. Kafka configures the compaction buffer size via `log.cleaner.dedupe.buffer.size` and `log.cleaner.threads`.
+
+## Message Lifecycle: End to End
+
+The following trace walks through every step of a message's journey from producer to consumer, covering 14 distinct stages.
+
+<AsciiDiagram
+  id="kafka/deep-dive-lifecycle"
+  title="End-to-end message lifecycle with 14 stages"
+  alt="Diagram showing the 14-stage lifecycle of a Kafka message from producer to consumer"
+  content={`
+  ┌─────────────────────────────────────────────────────────────┐
+  │              MESSAGE LIFECYCLE (14 Stages)                   │
+  │                                                              │
+  │  PRODUCER SIDE                      BROKER SIDE              │
+  │  ┌──────────────┐                  ┌──────────────────┐     │
+  │  │ 1. Serialize  │                  │ 7. Validate      │     │
+  │  │ 2. Partition  │──── produce ────▶│ 8. Append to log │     │
+  │  │ 3. Compress   │                  │ 9. Replicate     │     │
+  │  │ 4. Batch      │◀── ack ─────────│ 10. Flush to disk│     │
+  │  │ 5. Send       │                  │ 11. Index update │     │
+  │  │ 6. Retry/ack  │                  └──────────────────┘     │
+  │  └──────────────┘                                           │
+  │                         │                                    │
+  │  CONSUMER SIDE          │                                    │
+  │  ┌──────────────┐                  ┌──────────────────┐     │
+  │  │ 12. Fetch     │◀── poll ────────│ 12. Serve from   │     │
+  │  │ 13. Decompress│                  │  page cache/disk │     │
+  │  │ 14. Process   │                  │ 13. Send records │     │
+  │  │ 15. Commit    │                  └──────────────────┘     │
+  │  └──────────────┘                                           │
+  │                                                              │
+  │  Total end-to-end latency (acks=1): 2-15 ms                  │
+  └─────────────────────────────────────────────────────────────┘
+  `}
+  caption="Understanding the full lifecycle is essential for debugging latency issues"
+/>
+
+### Stage 1: Serialization
+
+The producer serializes the record's key and value into bytes. Kafka does not care about the data format — it stores bytes. The Schema Registry is a separate concern that manages the serialization format.
+
+### Stage 2: Partition Assignment
+
+The producer applies the partitioner to determine the target partition. The default partitioner uses the murmur2 hash of the key modulo the number of partitions. If no key is provided, the producer uses round-robin or sticky partitioning.
+
+### Stage 3: Compression
+
+The producer compresses the record batch. Supported compression algorithms: `gzip`, `snappy`, `lz4`, `zstd`. Compression reduces network bandwidth and storage at the cost of CPU. Snappy and LZ4 offer the best balance for most workloads. Zstd provides the highest compression ratio but uses more CPU.
+
+### Stage 4: Batching
+
+The producer accumulates records into batches before sending. Batches are per-partition. The producer waits for either `batch.size` bytes (default 16 KB) or `linger.ms` milliseconds (default 0) before sending the batch. Higher latency settings increase batching efficiency.
+
+### Stage 5: Network Send
+
+The producer sends the batch to the partition leader. The send is asynchronous from the application's perspective — the producer thread returns immediately, and a background I/O thread handles the actual network request.
+
+### Stage 6: Acknowledgment Handling
+
+The producer waits for the broker's acknowledgment. The `acks` setting determines the level of durability:
+
+- `acks=0`: Fire-and-forget. The producer does not wait for any acknowledgment. Highest throughput, lowest durability. Records can be lost without notification.
+- `acks=1`: Leader acknowledgment. The producer waits for the leader to append to its log. If the leader crashes before replication, the record is lost.
+- `acks=all` or `acks=-1`: Full acknowledgment. The producer waits for all in-sync replicas to acknowledge. Highest durability, but higher latency.
+
+### Stage 7: Broker Validation
+
+The broker validates the produce request. It checks that the record is within the partition's allowed size, that the producer has the correct authorization, and that the broker is the current leader for the partition.
+
+### Stage 8: Log Append
+
+The broker appends the record batch to the active log segment. The append is sequential — the broker writes the data to the end of the file. This is a fast operation, typically taking under 1 millisecond.
+
+### Stage 9: Replication
+
+The leader sends the record to each follower in the ISR. Followers acknowledge after appending to their local logs. The leader monitors follower progress. Followers that fall behind are removed from the ISR.
+
+### Stage 10: Flush to Disk
+
+Kafka flushes the log to disk based on `flush.messages` and `flush.ms` configuration. By default, Kafka relies on the OS page cache and does not flush explicitly. The OS flushes the page cache to disk based on the dirty page ratio (`vm.dirty_ratio` and `vm.dirty_background_ratio`). This provides better performance at the cost of a small window of data loss on power failure.
+
+### Stage 11: Index Update
+
+The broker updates the offset index and time index at the configured interval. Index entries are not written for every record — only at the configured sparsity interval.
+
+### Stage 12: Consumer Fetch
+
+The consumer sends a fetch request to the partition leader. The fetch request includes the partition, offset, and maximum bytes to return. The broker reads from the log segment, using the index to find the correct position. Data is served from the page cache if available, minimizing disk I/O.
+
+### Stage 13: Zero-Copy Transfer
+
+Kafka uses the `sendfile` system call to transfer data from the page cache to the network socket without copying through the JVM heap. The data path is:
+
+1. Disk → Page cache (OS kernel, one copy).
+2. Page cache → Network socket (OS kernel, zero-copy via `sendfile`).
+
+Without zero-copy, the data would travel:
+1. Disk → Page cache (OS kernel).
+2. Page cache → JVM heap (one copy).
+3. JVM heap → Socket buffer (second copy).
+4. Socket buffer → Network (third copy).
+
+### Stage 14: Consumer Processing
+
+The consumer decompresses the batch, deserializes the records, and passes them to the application's processing logic. The consumer then commits the offset.
+
+## Consistency Model
+
+Kafka's consistency model balances strict guarantees with performance. Understanding the trade-offs is essential for correct system design.
+
+### ISR-Based Consistency
+
+The ISR (In-Sync Replica) set is the foundation of Kafka's consistency. A replica is in the ISR if it is fully caught up with the leader — within `replica.lag.time.max.ms` (default 30 seconds) of the leader's latest record.
+
+When `acks=all` and `min.insync.replicas=2`:
+
+- The leader writes to its local log.
+- The leader waits for at least one ISR follower to acknowledge.
+- The leader acknowledges the producer.
+- A consumer reading with `isolation.level=read_committed` sees only records that have been acknowledged by all ISRs.
+
+<AsciiDiagram
+  id="kafka/deep-dive-isr-state"
+  title="ISR states and transitions"
+  alt="Diagram showing the ISR lifecycle: leader, in-sync followers, and out-of-sync followers"
+  content={`
+  ┌─────────────────────────────────────────────────────────────┐
+  │              ISR STATE TRANSITIONS                           │
+  │                                                              │
+  │  ┌────────────────────────────────────────────────────────┐ │
+  │  │              ISR SET (In-Sync Replicas)                 │ │
+  │  │                                                         │ │
+  │  │  ┌──────────┐    ┌──────────┐    ┌──────────┐         │ │
+  │  │  │  Leader  │    │Follower A│    │Follower B│         │ │
+  │  │  │  (Broker │    │(Broker 2)│    │(Broker 3)│         │ │
+  │  │  │  1)      │    │  ISR: Yes│    │  ISR: Yes│         │ │
+  │  │  └──────────┘    └──────────┘    └──────────┘         │ │
+  │  │       │                │               │               │ │
+  │  │       │◄─── replicate ──┤◄── replicate ─┤              │ │
+  │  │       │                │               │               │ │
+  │  └────────────────────────────────────────────────────────┘ │
+  │                         │                                    │
+  │  ┌────────────────────────────────────────────────────────┐ │
+  │  │  Follower B falls behind > 30 seconds                   │ │
+  │  │  Leader removes Follower B from ISR                     │ │
+  │  └────────────────────────────────────────────────────────┘ │
+  │                         │                                    │
+  │  ┌────────────────────────────────────────────────────────┐ │
+  │  │              REDUCED ISR SET                            │ │
+  │  │  ┌──────────┐    ┌──────────┐    ┌──────────┐         │ │
+  │  │  │  Leader  │    │Follower A│    │Follower B│         │ │
+  │  │  │          │    │  ISR: Yes│    │  ISR: No │         │ │
+  │  │  │          │    │          │    │(lagging) │         │ │
+  │  │  └──────────┘    └──────────┘    └──────────┘         │ │
+  │  └────────────────────────────────────────────────────────┘ │
+  │                         │                                    │
+  │  ┌────────────────────────────────────────────────────────┐ │
+  │  │  Follower B catches up → rejoins ISR                    │ │
+  │  └────────────────────────────────────────────────────────┘ │
+  └─────────────────────────────────────────────────────────────┘
+  `}
+  caption="ISR membership changes dynamically based on follower lag"
+/>
+
+### min.insync.replicas
+
+The `min.insync.replicas` configuration defines the minimum number of replicas that must acknowledge a write for the producer to receive a successful response. If the ISR size drops below this threshold, the broker rejects produce requests with a `NotEnoughReplicasException`.
+
+This setting is the primary defense against data loss. With `replication.factor=3` and `min.insync.replicas=2`, the system can tolerate one broker failure without data loss. If two brokers fail, the remaining broker cannot accept writes because it cannot assemble the required two replicas.
+
+### Unclean Leader Election
+
+When a partition leader fails and no in-sync replica is available (all followers are out of sync), the cluster has two options:
+
+- **Default (unclean.leader.election.enable=false)**: The partition remains unavailable. No writes or reads are served until the old leader comes back and the ISR is restored. This preserves consistency at the cost of availability.
+
+- **Permissive (unclean.leader.election.enable=true)**: The cluster elects an out-of-sync replica as the leader. This restores availability but loses records that were on the old leader and not replicated. This is a CP vs. AP trade-off within the CAP framework.
+
+### Exactly-Once Semantics
+
+Kafka provides exactly-once semantics (EOS) through a combination of features:
+
+- **Idempotent producers**: The producer includes a producer ID and sequence number in each batch. The broker deduplicates batches with the same sequence number. This prevents duplicate records from retries. Enable with `enable.idempotence=true`.
+
+- **Transactional producers**: The producer can group multiple records into a transaction. Records are written atomically — either all are visible or none are. The transaction is committed or aborted atomically. Enable with `transactional.id`.
+
+- **Transactional consumers**: Consumers read only committed records when `isolation.level=read_committed`. Aborted transactions are skipped. The consumer can commit offsets and produce results in the same transaction, achieving end-to-end exactly-once semantics.
+
+**End-to-end exactly-once flow:**
+
+1. Producer starts a transaction: `producer.beginTransaction()`.
+2. Producer writes records to one or more partitions.
+3. Producer reads from a source topic (as a consumer) and writes to a sink topic within the same transaction.
+4. Producer commits: `producer.commitTransaction()`. The broker marks all records in the transaction as committed.
+5. Consumer with `isolation.level=read_committed` reads only committed records. It skips aborted transactions entirely.
+
+**Limitations of exactly-once semantics:**
+
+- **Performance overhead**: Transactions add 2-5 ms of latency and require additional state on the broker. The transaction coordinator manages transaction state.
+- **Coordinator state**: The transaction coordinator must maintain state for all active transactions. If the coordinator fails, transactions are recovered after failover, potentially aborting in-flight transactions.
+- **Produced records not visible until commit**: Other consumers cannot read records from an uncommitted transaction. This increases end-to-end latency.
+- **Not suitable for all workloads**: Transactions are useful for read-process-write patterns (Kafka Streams) but add unnecessary overhead for simple produce-only or consume-only applications.
+
+### Log Compaction
+
+Log compaction is an alternative to deletion-based retention. Instead of removing segments after a time threshold, compaction retains the most recent record for each key. This is useful for stateful topics where you only need the latest value.
+
+**Compaction lifecycle:**
+
+1. The log cleaner thread reads a log segment.
+2. It builds an in-memory map of keys to their latest offset within the segment.
+3. It creates a new segment containing only the latest record for each key.
+4. It removes duplicate keys within the segment (the old entry is deleted).
+5. It swaps the new segment for the old one.
+
+Compaction is configured per topic: `cleanup.policy=compact`. The `min.cleanable.dirty.ratio` (default 0.5) controls how aggressively the log cleaner runs. A lower ratio means more frequent compaction but higher CPU usage.
+
+**Practical example:**
+
+A customer-address topic has `cleanup.policy=compact`. Customer 12345's address changes 10 times in a day. After compaction, only the latest address for customer 12345 is retained. A consumer that reads from this compacted topic sees only the current address for each customer, not the history of changes. Consumers that read before compaction see all 10 versions.
+
+### Replication Protocol Detail
+
+Kafka's replication protocol operates in two modes: synchronous and asynchronous (in the sense of the leader waiting or not).
+
+**Normal operation (all ISRs caught up):**
+
+1. Leader receives a produce request.
+2. Leader appends to its local log.
+3. Each ISR follower sends a fetch request to the leader. The fetch request includes the follower's current offset.
+4. The leader responds with new records starting from that offset.
+5. The follower appends to its local log and acknowledges.
+6. The leader considers the record committed when all ISRs have acknowledged.
+
+**Follower lag detection:**
+
+1. The leader tracks the last fetch time for each follower.
+2. If a follower has not fetched within `replica.lag.time.max.ms` (default 30 seconds), the leader removes it from the ISR.
+3. The removed follower continues fetching but is not counted for `min.insync.replicas`.
+4. When the follower catches up, the leader adds it back to the ISR.
+
+**Leader failure recovery:**
+
+1. The controller detects the leader failure (missed heartbeat).
+2. The controller selects a new leader from the ISR.
+3. The new leader truncates its log to the high watermark — any records beyond the watermark that were not replicated to the old leader are discarded.
+4. The old leader, when it returns, discovers it is no longer the leader and truncates its log to the high watermark.
+5. The old leader starts fetching from the new leader as a follower.
+
+The log truncation ensures consistency: all replicas agree on which records are committed and which are not. Any record that was acknowledged to the producer was committed to the ISR and appears in all ISR replicas at the watermark.
+
+## Performance Characteristics
+
+Kafka's performance is the result of deliberate design choices that exploit modern hardware.
+
+### Sequential I/O
+
+Sequential disk I/O is dramatically faster than random I/O. On a modern SSD:
+
+- Sequential read: 3,500 MB/s (NVMe)
+- Random read (4 KB): 500 MB/s (NVMe)
+- Sequential write: 3,000 MB/s (NVMe)
+- Random write (4 KB): 200 MB/s (NVMe)
+
+Kafka's append-only design ensures that 99% of writes are sequential. The only random writes are occasional compaction operations.
+
+### Zero-Copy Data Transfer
+
+Kafka uses the `sendfile` system call to transfer data from the page cache to the network socket without copying through the JVM heap. This eliminates two data copies and reduces CPU usage by 30-60% for consumer-heavy workloads.
+
+The data path without zero-copy:
+1. Disk → Page cache (OS kernel).
+2. Page cache → Application buffer (JVM heap).
+3. Application buffer → Socket buffer (JVM heap).
+4. Socket buffer → Network card (OS kernel).
+
+The data path with zero-copy:
+1. Disk → Page cache (OS kernel).
+2. Page cache → Network card (OS kernel, via `sendfile`).
+
+### Page Cache
+
+Kafka relies on the OS page cache rather than managing its own cache in the JVM heap. This has several advantages:
+
+- The OS manages memory more efficiently than the JVM garbage collector.
+- The page cache is shared across all processes, so the OS can allocate memory where it is most needed.
+- When a consumer reads recently written data, the data is already in the page cache — no disk read is needed.
+- Kafka's JVM heap can be kept small (4-8 GB), reducing garbage collection pauses.
+
+### Batching and Compression
+
+Batching is the most effective optimization for Kafka throughput. A single batch of 100 records is processed more efficiently than 100 individual records because:
+
+- Network overhead is amortized (one TCP round trip instead of 100).
+- Compression works better on larger batches.
+- The broker's I/O system processes one large write instead of 100 small writes.
+
+Real production numbers:
+
+| Batch Size | Records/Batch | Throughput (MB/s) | CPU Usage | Latency (p99) |
+|-----------|--------------|-------------------|-----------|---------------|
+| 1 KB      | 1            | 15                | 75%       | 2 ms          |
+| 16 KB     | 10           | 120               | 40%       | 5 ms          |
+| 64 KB     | 40           | 350               | 25%       | 12 ms         |
+| 512 KB    | 320          | 800               | 15%       | 45 ms         |
+
+### Network Throughput
+
+A single broker can handle 10,000-50,000 produce requests per second and 20,000-100,000 fetch requests per second, depending on hardware, batch size, and compression. The bottleneck is typically the network bandwidth, not CPU or disk I/O.
+
+### Garbage Collection Tuning
+
+Kafka runs on the JVM, so garbage collection behavior directly affects performance. The most common GC-related issue is the "stop-the-world" pause that stops all application threads.
+
+**Recommended JVM settings for Kafka brokers:**
+
+- **GC algorithm**: G1GC (default since Java 9) with a target pause time of 200 ms.
+- **Heap size**: 4-8 GB. A larger heap increases GC pause times without proportional benefit since most data lives in the page cache.
+- **New ratio**: Set `-XX:NewRatio=3` to give 1/3 of the heap to young generation. This reduces promotion failure rates under high allocation.
+- **GC logging**: Enable GC logging to diagnose pause events: `-Xlog:gc*,gc+age=trace,safepoint:file=/var/log/kafka/gc.log:utctime,pid,tags:filecount=32,filesize=64m`.
+
+**GC pause impact on production:**
+
+A 1-second GC pause on a broker that is the leader for 100 partitions means 100 partitions stop accepting produces for 1 second. During this second, producers retry, potentially causing backpressure. With a 1 GB/s produce rate, 1 GB of data is queued in producer buffers. When the broker resumes, it must drain this backlog.
+
+### Disk Layout Optimization
+
+The performance of Kafka's disk I/O depends on the physical disk layout:
+
+- **RAID 0**: Provides maximum throughput by striping across multiple disks. No redundancy — rely on Kafka's replication for data safety. Recommended for throughput-sensitive deployments.
+- **RAID 10**: Provides both throughput and redundancy. Lower effective capacity (50% of raw) but safer if replication is insufficient.
+- **JBOD**: Each disk operates independently. Partitions are placed on specific disks. Good for isolation but requires careful partition-to-disk mapping.
+
+**Mount options for XFS (Linux):**
+
+```
+noatime,nodiratime,nobarrier,allocsize=1m
+```
+
+These options reduce metadata writes and optimize allocation for large sequential writes.
+
+## Essential Configuration
+
+Kafka has over 70 configuration parameters for brokers, producers, and consumers. The following sections cover the essential ones.
+
+### Broker Configuration
+
+| Parameter | Default | Recommended | Notes |
+|-----------|---------|-------------|-------|
+| `num.partitions` | 1 | 10-50 per broker | Calculate based on throughput requirements |
+| `default.replication.factor` | 1 | 3 | Prevents data loss on single broker failure |
+| `log.retention.ms` | 604800000 (7d) | 7-30 days | Balance storage cost vs. replay window |
+| `log.retention.bytes` | -1 (unlimited) | Set per broker disk | Prevents disk from filling |
+| `log.segment.bytes` | 1073741824 (1 GB) | 1 GB | Larger segments improve compaction |
+| `log.cleanup.policy` | delete | delete or compact | Compact for keyed state topics |
+| `min.insync.replicas` | 1 | 2 | Prevents data loss with acks=all |
+| `unclean.leader.election.enable` | false | false | Preserves consistency at cost of availability |
+| `num.network.threads` | 3 | 4-8 per CPU core | Handles incoming network requests |
+| `num.io.threads` | 8 | 8-16 per CPU core | Handles disk I/O |
+| `socket.send.buffer.bytes` | 102400 | 131072 (128 KB) | Larger buffers improve throughput |
+| `socket.receive.buffer.bytes` | 102400 | 131072 (128 KB) | Larger buffers improve throughput |
+| `replica.lag.time.max.ms` | 30000 | 10000-30000 | Lower values detect failures faster |
+| `log.cleaner.threads` | 1 | 2-4 | More threads for compacted topics |
+| `log.cleaner.dedupe.buffer.size` | 134217728 (128 MB) | 512 MB-2 GB | Larger buffer handles more unique keys |
+| `log.cleaner.io.max.bytes.per.second` | `Double.MAX_VALUE` | 10-50 MB/s | Throttle compaction I/O to avoid impacting produces |
+
+### Log Cleaner Internals
+
+The log cleaner is a pool of background threads that perform log compaction. Each thread processes one partition at a time. The cleaner selects partitions to compact based on the `min.cleanable.dirty.ratio` — the ratio of dirty (non-compacted) data to total data in the partition. A dirty ratio of 0.5 means compaction runs when 50% of the partition is eligible for compaction.
+
+**Compaction processing steps:**
+
+1. **Select a partition to compact.** The cleaner scans all partitions and selects the one with the highest dirty ratio that is not already being cleaned.
+
+2. **Build the deduplication map.** The cleaner reads the entire partition and builds a map of key to offset. Only the latest offset for each key is retained. The map must fit in the `log.cleaner.dedupe.buffer.size`.
+
+3. **Filter and write.** The cleaner reads the partition again, from oldest to newest. It writes to a new segment only the records whose offset matches the latest offset for their key in the dedup map.
+
+4. **Swap segments.** The cleaner atomically swaps the new compacted segment for the original segment. The original segment is deleted.
+
+5. **Update offset mapping.** The cleaner updates the partition's offset index to reflect the new segment structure.
+
+**Performance considerations:**
+
+- Compaction is CPU-intensive. It reads the entire partition (sequential I/O) and writes a new segment (sequential I/O). The I/O amplifies data written — a 100 GB partition may write 50 GB of compacted output.
+- The cleaner has a configurable I/O throttle: `log.cleaner.io.max.bytes.per.second`. Setting this to 20 MB/s prevents compaction from starving produce and consume I/O.
+- For topics with many unique keys (for example, 100 million), the dedup map may not fit in the default buffer. Increase `log.cleaner.dedupe.buffer.size` or partition the topic to reduce keys per partition.
+
+### Consumer Fetch Internals
+
+The consumer fetch process involves several interactions between client and broker:
+
+1. **Consumer sends FetchRequest.** The request includes: topic, partition, fetch offset, `max.wait.ms`, `min.bytes`, and `max.partition.bytes`.
+
+2. **Broker checks the log.** The broker reads from the partition starting at the requested offset. It uses the index file to find the nearest offset, then reads sequentially.
+
+3. **Broker returns FetchResponse.** If data is available (offset < log end offset), the broker returns the records. If no data is available, the broker holds the connection until `max.wait.ms` (default 500 ms) or until `min.bytes` (default 1) of data accumulates.
+
+4. **Consumer processes the records.** The consumer deserializes and decompresses the batch, then calls the user-provided record handler.
+
+5. **Consumer sends next FetchRequest.** The new fetch offset is the offset after the last record in the previous response.
+
+**Zero-copy fetch path:**
+
+When the broker serves a fetch request from the page cache:
+
+1. Kernel reads data from page cache into a kernel buffer (zero copy — the page cache IS the buffer).
+2. Kernel sends the data to the network socket via `sendfile` (DMA transfer to NIC).
+3. The data never enters the JVM heap. This reduces CPU usage by 30-60%.
+
+When the data is not in the page cache (cold cache):
+
+1. Kernel issues a disk read to bring the data into the page cache.
+2. The fetch thread blocks on the disk read. This adds 1-5 ms for NVMe or 5-15 ms for SSD.
+3. Once in the page cache, subsequent fetches benefit from zero-copy.
+| `compression.type` | producer | producer | Let the producer decide |
+| `auto.create.topics.enable` | true | false | Prevents accidental topic creation |
+
+### Producer Configuration
+
+| Parameter | Default | Recommended | Notes |
+|-----------|---------|-------------|-------|
+| `acks` | 1 | all | Set to all for durability |
+| `compression.type` | none | snappy or lz4 | Reduces network and storage |
+| `batch.size` | 16384 (16 KB) | 32768-65536 | Larger batches improve throughput |
+| `linger.ms` | 0 | 5-20 | Adds latency for better batching |
+| `buffer.memory` | 33554432 (32 MB) | 67108864-134217728 | Larger buffer handles bursts |
+| `max.request.size` | 1048576 (1 MB) | 1048576-10485760 | Match to largest message size |
+| `enable.idempotence` | false | true | Prevents duplicates from retries |
+| `max.in.flight.requests.per.connection` | 5 | 5 | 5 is safe with idempotence |
+| `retries` | 2147483647 | Integer.MAX_VALUE | Retry until success or timeout |
+| `request.timeout.ms` | 30000 | 30000-60000 | Timeout for broker response |
+
+### Consumer Configuration
+
+| Parameter | Default | Recommended | Notes |
+|-----------|---------|-------------|-------|
+| `group.id` | null | Required | Join a consumer group |
+| `auto.offset.reset` | latest | latest or earliest | Controls start position |
+| `enable.auto.commit` | true | false | Manual commit gives control |
+| `auto.commit.interval.ms` | 5000 | N/A | Only relevant if auto-commit enabled |
+| `fetch.min.bytes` | 1 | 1-1024 | Minimum data per fetch |
+| `fetch.max.wait.ms` | 500 | 500-1000 | Max wait when min bytes not met |
+| `max.poll.records` | 500 | 500-1000 | Records per poll iteration |
+| `max.poll.interval.ms` | 300000 | 300000-600000 | Max time between polls before rebalance |
+| `isolation.level` | read_uncommitted | read_committed | Avoid reading aborted transactions |
+| `session.timeout.ms` | 45000 | 10000-45000 | Lower values detect failures faster |
+| `partition.assignment.strategy` | RangeAssignor | CooperativeStickyAssignor | Reduces rebalance impact |
+| `client.rack` | null | Set to rack ID | Enables follower fetching for read locality |
+
+### Rebalance Protocol in Detail
+
+Consumer group rebalancing is the mechanism by which partitions are reassigned when consumers join or leave a group. Two protocols exist.
+
+**Eager rebalancing (old, default with RangeAssignor):**
+
+1. The coordinator detects a new consumer joining or an existing consumer leaving.
+2. The coordinator sends a REBALANCE_IN_PROGRESS signal to all consumers.
+3. All consumers revoke their partition assignments and stop processing.
+4. Each consumer sends a JoinGroup request to the coordinator.
+5. The coordinator elects a group leader (typically the first consumer to join) and sends the list of all members.
+6. The leader assigns partitions using the configured partition assignor.
+7. The leader sends the assignment back to the coordinator.
+8. The coordinator sends the assignment to each consumer.
+9. Consumers resume processing from the last committed offset.
+
+**Duration:** All partitions are unavailable for the duration of steps 2-9 — typically 2-10 seconds for small groups, 30-60 seconds for large groups with many partitions.
+
+**Cooperative rebalancing (new, preferred with CooperativeStickyAssignor):**
+
+1. The coordinator detects a change in group membership.
+2. The coordinator sends a REBALANCE_IN_PROGRESS signal.
+3. Consumers revoke only a subset of their partitions, not all. The subset is chosen to rebalance load.
+4. Consumers continue processing the remaining partitions.
+5. Consumers rejoin and receive new assignments.
+6. If further revocation is needed, repeat steps 2-5 (multiple rounds).
+
+**Duration:** Only the partitions being moved are unavailable. Remaining partitions continue processing. Typical disruption is 1-3 seconds per affected partition.
+
+### Sticky Partition Assignment
+
+The CooperativeStickyAssignor also provides sticky assignment — partitions stay with the same consumer across rebalances as much as possible. This minimizes the number of partitions that must move when a consumer leaves and rejoins. Sticky assignment reduces the data re-fetching needed after a rebalance since the consumer already has the partition's state.
+
+### Asynchronous Commit Patterns
+
+Manual offset commits should use async commits for the regular commit path and sync commits only during shutdown:
+
+```java
+// Normal processing — async commit for low latency
+consumer.commitAsync((offsets, exception) -> {
+    if (exception != null) {
+        logger.error("Commit failed for offsets: {}", offsets, exception);
+    }
+});
+
+// Shutdown or rebalance listener — sync commit for certainty
+try {
+    consumer.commitSync();
+} catch (CommitFailedException e) {
+    logger.error("Final commit failed", e);
+}
+```
+
+The async commit pattern decouples offset tracking from processing. If an async commit fails, the next async commit will succeed and overwrite the offset. The only risk is on shutdown — if the last async commit fails, the consumer restarts from an earlier offset and reprocesses some records.
+
+## Summary
+
+Kafka's internal architecture is built on the append-only log, sparse indexes, and the page cache. The ISR mechanism provides configurable consistency. Zero-copy transfers and batching deliver high throughput. Understanding these internals enables you to configure Kafka for your workload and diagnose production issues effectively. The essential configuration parameters for brokers, producers, and consumers span about 30 settings that control durability, throughput, latency, and availability.
+
+The next page examines Kafka at scale — multi-broker clusters, replication strategies, integration patterns, and deployment considerations.

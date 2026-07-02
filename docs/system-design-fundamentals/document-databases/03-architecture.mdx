@@ -1,0 +1,468 @@
+---
+id: document-databases-architecture
+title: Document Databases at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Document Databases at Scale
+
+## Naive Implementation
+
+The simplest document database deployment is a single MongoDB server running
+on a single machine. You install mongod, start it, and your application
+connects to `localhost:27017`. This works fine for a prototype with 1K users.
+
+<AsciiDiagram
+  id="document-databases/naive-single"
+  title="Single-Node Document Database"
+  caption="A single mongod process on one machine. All reads and writes target one server. No replication, no sharding."
+>
+{`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        SINGLE NODE (1K users)                               │
+│                                                                              │
+│  ┌──────────────────┐                                                        │
+│  │ Your Application  │                                                       │
+│  │ (1 server)        │─────── connection to localhost:27017 ──────────┐     │
+│  └──────────────────┘                                                  │     │
+│                                                                        │     │
+│  ┌─────────────────────────────────────────────────────────────────────┘     │
+│  │  ┌─────────────────────────────────────────────────────────────┐         │
+│  │  │ Server: t3.medium (2 vCPU, 4GB RAM, 100GB SSD)              │         │
+│  │  │                                                               │         │
+│  │  │  ┌────────────────────────────────────────────────────────┐  │         │
+│  │  │  │  mongod (single process, no replication)               │  │         │
+│  │  │  │  ┌───────────────────┐  ┌──────────────────┐          │  │         │
+│  │  │  │  │ WiredTiger Cache   │  │ Journal + Data   │          │  │         │
+│  │  │  │  │ (2GB = 50% of RAM)│  │ (disk)           │          │  │         │
+│  │  │  │  └───────────────────┘  └──────────────────┘          │  │         │
+│  │  │  └────────────────────────────────────────────────────────┘  │         │
+│  │  └─────────────────────────────────────────────────────────────┘         │
+│                                                                              │
+│  Works fine up to: 1K users, 10K docs, 100 QPS                              │
+|  Failure mode: server dies = data unavailable                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### What Breaks at 1K Users
+
+Nothing. A single server handles 1K users with ease. Reads hit cache. Writes
+complete in microseconds. The database uses 200MB of RAM.
+
+### What Breaks at 100K Users
+
+**Server crash = total downtime**: If the single server goes down (OOM,
+hardware failure, AWS host maintenance), your entire application is offline
+until the server restarts. Recovery takes 5-30 minutes.
+
+**Cache pressure**: The working set grows beyond 2GB. WiredTiger evicts pages
+aggressively. Cache misses cause disk reads. Latency spikes from under 1ms
+to 10-50ms. Some queries start taking over 100ms.
+
+**Connection exhaustion**: A single mongod has a default connection limit of
+1,024,000 but practical limits are much lower. Each connection consumes a
+thread and memory. At 100K users with connection pooling, you have 100-500
+concurrent connections, which is manageable but growing.
+
+### What Breaks at 10M Users
+
+**Single node cannot handle write throughput**: A single server processes
+roughly 5,000-10,000 writes/second for small documents. With 10M users
+generating 50,000 writes/second at peak, one server is saturated. Writes
+queue up, latency increases, and the server may run out of disk I/O capacity.
+
+**Data volume exceeds disk**: 10M users with average 100KB of data per user
+equals 1TB of data. A single 100GB SSD is full. Even with a 1TB disk, backup,
+restore, and maintenance windows grow linearly with data size.
+
+**Geographic latency**: A single server in us-east-1 serves users in Europe
+and Asia with 100-300ms network round-trips. Every database operation feels
+slow. Users in Sydney wait 200ms for every page load.
+
+## Production-Grade Architecture
+
+A production document database deployment adds three layers on top of the
+single node: replication for availability, sharding for scale, and routing
+for connection management. The diagram below shows a complete sharded cluster
+with replica sets.
+
+<AsciiDiagram
+  id="document-databases/prod-arch"
+  title="Production-Grade Sharded Document Database"
+  caption="A sharded cluster with 3 config servers (Raft), 4 shards (each a 3-node replica set), and 2 mongos routers. Application connects to mongos, which routes queries to the correct shard."
+>
+{`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                  PRODUCTION SHARDED CLUSTER (10M users)                     │
+│                                                                              │
+│                               ┌──────────────────────┐                      │
+│                     ┌────────>│  Mongos Router 1      │<────────┐           │
+│                     │         │  (query router)       │         │           │
+│                     │         └──────────────────────┘         │           │
+│                     │                                            │           │
+│  ┌─────────────┐   │   ┌────────────────────────────────────┐   │  ┌──────┐ │
+│  │ Application  │───┼──>│ Connection Pool (10 connections)   │───┼──│ App  │ │
+│  │ (web tier)   │   │   └────────────────────────────────────┘   │  │ (API)│ │
+│  └─────────────┘   │   ┌──────────────────────┐                 │  └──────┘ │
+│                     └───>│  Mongos Router 2      │<────────────────┘         │
+│                         │  (query router)       │                           │
+│                         └──────────┬───────────┘                           │
+│                                    │                                         │
+│            ┌───────────────────────┼─────────────────────────────────┐      │
+│            │                       │                                 │      │
+│            ▼                       ▼                                 ▼      │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐            │
+│  │ Shard A (range  │  │ Shard B (range  │  │ Shard C (range  │            │
+│  │ 0000-3FFF)      │  │ 4000-7FFF)      │  │ 8000-BFFF)      │            │
+│  │ Replica Set:    │  │ Replica Set:    │  │ Replica Set:    │            │
+│  │ ┌─ P ─┐ ┌─S──┐ │  │ ┌─ P ─┐ ┌─S──┐ │  │ ┌─ P ─┐ ┌─S──┐ │            │
+│  │ │Pri- │ │Sec │ │  │ │Pri- │ │Sec │ │  │ │Pri- │ │Sec │ │            │
+│  │ │mary │ │ond │ │  │ │mary │ │ond │ │  │ │mary │ │ond │ │            │
+│  │ └─────┘ └────┘ │  │ └─────┘ └────┘ │  │ └─────┘ └────┘ │            │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘            │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  Config Servers (3, Raft consensus) — cluster metadata & shard map    │   │
+│  │  CS1 ◄──► CS2 ◄──► CS3  |  namespace ↔ shard mapping, indexes        │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Key Components
+
+**mongos**: The query router. It is a lightweight, stateless process. Your
+application connects to mongos, not directly to shards. Mongos uses the
+config server's metadata to determine which shard holds a given document
+(based on shard key range). It sends the query to the correct shard (or all
+shards for scatter-gather queries) and merges results.
+
+**Config servers**: Three replica set members running Raft consensus. They
+store cluster metadata: which collections are sharded, the shard key, the
+key range-to-shard mapping, and index definitions. If the config servers are
+down, no chunk migrations or new shard creation can happen, but existing
+reads and writes continue.
+
+**Shards**: Each shard is a 3-node replica set (one primary, two secondaries).
+The primary handles writes and consistent reads. Secondaries replicate data
+from the primary and can serve reads if configured.
+
+**Balancer**: A background process that runs on the config server primary. It
+monitors chunk distribution across shards. When one shard has too many chunks
+compared to others, the balancer moves chunks. The balancer is the reason
+sharded clusters auto-scale storage and throughput.
+
+## Integration Patterns
+
+### Pattern 1: Document Database as Primary Operational Store
+
+This is the most common pattern. The document database (MongoDB) is the
+system of record for all application data. Reads and writes go through the
+document database exclusively. A search index (Elasticsearch) is optionally
+kept in sync for full-text search.
+
+<AsciiDiagram
+  id="document-databases/pattern-primary"
+  title="Document DB as Primary Operational Store"
+  caption="MongoDB serves as the source of truth. The application reads from and writes to MongoDB. Elasticsearch indexes data asynchronously for search queries."
+>
+{`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│              PATTERN 1: PRIMARY OPERATIONAL STORE                           │
+│                                                                              │
+│  ┌──────────────┐     write      ┌─────────────────┐                       │
+│  │  API Server   │ ─────────────>│  MongoDB         │                       │
+│  │  (create post)│               │  (primary store)  │                       │
+│  └──────┬───────┘               └────────┬─────────┘                       │
+│         │                                │ change stream                    │
+│         │ read                    ┌──────▼──────┐                          │
+│         ├────────────────────────>│ Sync Worker  │                          │
+│         │                         │ (change stream│                         │
+│         │                         │  listener)   │                          │
+│         │                         └──────┬──────┘                          │
+│         │                                │ index                            │
+│         │                         ┌──────▼──────┐                          │
+│         └────────────────────────>│ Elasticsearch│                          │
+│            search query           │ (search idx) │                          │
+│                                   └─────────────┘                          │
+└──────────────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Pattern 2: Document Database Backed by Relational Store
+
+Some architectures use a relational database as the source of truth and a
+document database as a read-optimized cache. This is common when you need
+both transactional integrity and flexible query shapes. The document
+database materializes frequently-accessed data as denormalized documents.
+
+### Pattern 3: Document Database with Caching Layer
+
+A cache (Redis or memcached) sits in front of the document database for
+hot-path reads. The application checks cache first. On a cache miss, it
+reads from the document database and populates the cache. Writes go to both:
+the document database (synchronously) and a cache invalidation/update
+(asynchronously).
+
+<AsciiDiagram
+  id="document-databases/pattern-cache"
+  title="Document DB with Redis Cache Layer"
+  caption="Redis caches frequently accessed documents. Cache-aside pattern: read from Redis first, fall back to MongoDB on miss and populate cache."
+>
+{`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│           PATTERN 3: DOCUMENT DB WITH CACHE LAYER                          │
+│                                                                              │
+│  ┌──────────────┐                                                           │
+│  │  API Server   │                                                          │
+│  │  (read post)  │                                                          │
+│  └──────┬───────┘                                                           │
+│         │                                                                    │
+│    ┌────┴────┐                                                              │
+│    │ Redis    │──── cache hit? ──> return document (1ms)                    │
+│    │ (cache)  │── cache miss? ──> fall through to MongoDB                  │
+│    └─────────┘                                                              │
+│         │ cache miss                                                         │
+│         ▼                                                                    │
+│    ┌──────────────┐     populate cache     ┌──────────────────┐            │
+│    │ MongoDB       │<──────────────────────│  App reads +     │            │
+│    │ (source of    │  (TTL: 300s)          │  writes to Redis │            │
+│    │  truth)       │                       │  on miss         │            │
+│    └──────────────┘                       └──────────────────┘            │
+│                                                                              │
+│  Cache hit ratio target: 95%+                                                │
+|  Cache eviction: LRU with TTL                                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Pattern 4: Document Database for Event Sourcing
+
+Events are stored as append-only documents in a MongoDB collection. Each
+event document represents one state change: `{type: "order_placed", data: {...},
+timestamp: ...}`. The current state is derived by replaying events. This
+pattern uses MongoDB's TTL indexes to archive events older than a threshold
+and MongoDB change streams to emit events to downstream consumers (Kafka,
+Pub/Sub).
+
+<AsciiDiagram
+  id="document-databases/pattern-events"
+  title="Event Sourcing with Document Database"
+  caption="Events are stored as immutable documents. Change streams emit events to Kafka for downstream processing. Current state is materialized by aggregating events."
+>
+{`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│           PATTERN 4: EVENT SOURCING WITH MONGODB                           │
+│                                                                              │
+│  ┌──────────────┐   append event    ┌──────────────────┐   change stream   │
+│  │  Application  │ ────────────────>│  MongoDB          │ ───────────────> │
+│  │  (order event) │                 │  events collection │                  │
+│  └──────────────┘                  │  TTL: 90 days     │                  │
+│                                     └────────┬─────────┘                   │
+│                                              │                              │
+│                                              │ filter by type               │
+│                                              ▼                              │
+│                                   ┌──────────────────────┐                 │
+│                                   │  Materialized View    │                 │
+│                                   │  (aggregated on read) │                 │
+│                                   │  CURRENT STATE:       │                 │
+│                                   │  order_id: 123,       │                 │
+│                                   │  status: "shipped"    │                 │
+│                                   └──────────────────────┘                 │
+└──────────────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+## Multi-Region and Global Scale
+
+### The Asynchronous Replication Model
+
+MongoDB's cross-region replication is inherently asynchronous. A cluster in
+us-east-1 writes to its primary. The oplog entries are shipped over the WAN
+to a replica set member in eu-west-1. That member applies the oplog entries,
+becoming a secondary copy of the data. The replication lag is the WAN
+round-trip time plus apply time: typically 50-200ms for US-to-Europe.
+
+This design means the secondary region may serve stale data. If a user in
+London writes a document to us-east-1, it takes 80ms for that write to
+appear in the eu-west-1 secondary. During that window, a read from eu-west-1
+will not see the new document.
+
+### Read-Only Replicas for Local Reads
+
+The standard multi-region pattern deploys one primary region (us-east-1) with
+read-only replica set members in other regions. Application instances in
+Europe connect to the nearest secondary with `readPreference: nearest`. This
+gives local read latency (under 5ms) at the cost of possibly stale reads.
+
+### Active-Active with Multi-Datacenter Clusters
+
+MongoDB 7.0+ supports multi-datacenter clusters where writes can be
+acknowledged in any region. This requires careful shard key design and the
+use of `writeConcern: majority` with `readPreference: nearest`. Each region
+has one replica set member that can become primary. Cross-region writes
+require two-phase commit or distributed transactions, adding 2x-3x latency
+compared to single-region writes.
+
+<AsciiDiagram
+  id="document-databases/multiregion"
+  title="Multi-Region Document Database Deployment"
+  caption="Primary writes in us-east-1. Read replicas in eu-west-1 and ap-southeast-1. Replication is async across regions; local reads query the nearest replica."
+>
+{`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                   MULTI-REGION DEPLOYMENT                                   │
+│                                                                              │
+│  ┌─────────────────────────────────────┐  ┌──────────────────────────────┐  │
+│  │ US-EAST-1 (Primary Region)          │  │ EU-WEST-1 (Read Replica)    │  │
+│  │                                     │  │                              │  │
+│  │  ┌──────────────────┐              │  │  ┌──────────────────┐       │  │
+│  │  │ Replica Set:     │  async oplog  │  │  │ Secondary        │       │  │
+│  │  │ ┌─P─┐ ┌─S─┐ ┌S─┐│ ◄────────────┤  │  │ (read-only)      │       │  │
+│  │  │ │Pri│ │Sec│ │Sec││   80-120ms    │  │  │                  │       │  │
+│  │  │ └───┘ └───┘ └──┘│              │  │  │ readPreference:   │       │  │
+│  │  └──────────────────┘              │  │  │ nearest           │       │  │
+│  │                                     │  │  └──────────────────┘       │  │
+│  │  App: us-east-1 app pool            │  │  App: eu-west-1 app pool    │  │
+│  │  Latency to primary: 0.5ms          │  │  Latency to replica: 2ms    │  │
+│  └─────────────────────────────────────┘  └──────────────────────────────┘  │
+│                                                                              │
+│  ┌─────────────────────────────────────┐                                   │
+│  │ AP-SOUTHEAST-1 (Read Replica)       │  Failover:                       │
+│  │                                     │  If us-east-1 primary fails,      │
+│  │  ┌──────────────────┐              │  a secondary in same region is    │
+│  │  │ Secondary (RO)   │  200ms lag    │  elected primary. EU/AP replicas  │
+│  │  │ readPreference:  │              │  connect to the new primary.      │
+│  │  │ nearest          │              │  Write outage: 10-30s             │
+│  │  └──────────────────┘              │                                   │
+│  │  App: ap-southeast-1 app pool      │                                   │
+│  │  Latency to replica: 3ms           │                                   │
+│  └─────────────────────────────────────┘                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Consistency Trade-offs in Multi-Region
+
+With async replication, you face a fundamental choice on every read:
+
+- **Read from primary (us-east-1)**: Consistent data, but 100-300ms latency
+  for remote users.
+- **Read from local replica**: Fast (2-5ms), but possibly stale. The staleness
+  bound is configured with `maxStalenessSeconds`.
+
+Most applications pick a hybrid: fast reads default to local, and
+consistency-critical reads (payment confirmation, password change) are
+forced to the primary region.
+
+## Capacity Planning
+
+### Estimating QPS
+
+For a social application with 10M daily active users:
+
+```
+Average reads per user per day: 20
+Average writes per user per day: 2
+DAU: 10M (daily active users)
+
+Total reads per day: 10M × 20 = 200M
+Total writes per day: 10M × 2 = 20M
+
+Peak read QPS (10x daily average): 200M / 86400 × 10 ≈ 23,000 QPS
+Peak write QPS (10x daily average): 20M / 86400 × 10 ≈ 2,300 QPS
+```
+
+For 23K read QPS and 2.3K write QPS, a single mongod handles this, but
+without replication there is no HA. A 3-node replica set handles this
+comfortably. At 10x growth (230K read QPS), sharding is required.
+
+### Storage Calculation
+
+```
+Average document size: 2KB (user profile)
+Documents per user: 5 (profile + preferences + activity)
+Total documents: 10M × 5 = 50M
+Raw data: 50M × 2KB = 100GB
+
+Index overhead: 1.5x (compound indexes + secondary indexes)
+WiredTiger compression (snappy): 0.7x
+Oplog (10% of data): 10GB
+Journal (10% of WiredTiger cache): 20GB (for 200GB cache)
+
+Estimated disk: (100GB × 1.5 × 0.7) + 10GB + 20GB ≈ 135GB
+With replication (3x): 135GB × 3 ≈ 405GB
+Buffer for headroom (20%): 486GB
+
+Shard sizing: 3 shards with 200GB SSD each = 600GB total.
+```
+
+### Compute Sizing
+
+Each replica set member needs enough CPU to handle its share of traffic:
+
+- **Primary**: 8 vCPUs for 5K writes/sec + 10K reads/sec
+- **Secondary (read-serving)**: 8 vCPUs for 15K reads/sec
+- **Secondary (no reads)**: 4 vCPUs for oplog replay only
+- **Mongos router**: 2 vCPUs (stateless, light)
+
+### Network Bandwidth
+
+The primary's outbound bandwidth is the bottleneck in write-heavy clusters.
+Each oplog entry is sent to every secondary. For 2,300 writes/sec with 2KB
+documents: 2,300 × 2KB × 2 secondaries = 9.2 MB/sec outbound. At peak with
+10x burst: 92 MB/sec (736 Mbps). Use a VM with at least 10 Gbps NIC.
+
+## Deployment and Operations
+
+### Zero-Downtime Deployments
+
+MongoDB replica sets support rolling upgrades:
+
+1. Step down the primary: `rs.stepDown(60)`. A new primary is elected within
+   2-5 seconds. Writes pause during election then resume on the new primary.
+
+2. Upgrade the old primary (now a secondary): stop mongod, upgrade binary,
+   restart. It catches up oplog from the current primary.
+
+3. Repeat for each secondary. At most one secondary is down at any time.
+
+4. If you run mongos routers, upgrade them one by one (stateless).
+
+### Monitoring
+
+Track these metrics in your observability system:
+
+- **Oplog window**: The time range of oplog entries still available. If it
+  drops below 1 hour, increase oplog size or fix a stuck secondary.
+- **WiredTiger cache dirty ratio**: Percentage of cache pages modified but
+  not yet written to disk. Above 20% means write pressure is building.
+- **Eviction rate**: Pages evicted from cache per second. Sustained high
+  eviction means the working set exceeds cache.
+- **Scatter-gather ratio**: For sharded clusters, the proportion of queries
+  that touch all shards. High scatter-gather is a shard key problem.
+- **Cursor timeout**: Queries that time out indicate slow operations or
+  missing indexes.
+
+### Debugging Slow Queries
+
+Enable the profiler: `db.setProfilingLevel(1, {slowms: 100})`. Query the
+`system.profile` collection for operations over 100ms. Common patterns:
+
+- **COLLSCAN** in the query plan: Missing index. Add a covering index.
+- **SORT stage > 32MB**: Blocking sort spilling to disk. Add an index that
+  provides the sort order.
+- **$lookup without index**: The foreign collection needs an index on the
+  join field.
+- **Large documents (>100KB)**: Each read fetches the full document.
+  Project only needed fields.
+
+### Backup and Restore
+
+For production clusters, use MongoDB Atlas continuous backup or `mongodump`
+with `--oplog` for point-in-time recovery. A 500GB database takes 2-4 hours
+to restore from a full backup. Test your restore procedure quarterly.

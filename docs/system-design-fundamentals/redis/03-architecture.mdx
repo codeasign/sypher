@@ -1,0 +1,743 @@
+---
+id: redis-architecture
+title: Redis at Scale
+position: 3
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest Redis deployment is a single instance running on a single server. This is how most teams start — including Twitter, GitHub, and Discord in their early days.
+
+<AsciiDiagram
+  id="redis/naive-single-node"
+  title="Naive Single-Node Redis Deployment"
+  alt="A single Redis instance serving multiple application servers with no replication, no clustering"
+  caption="The naive approach — one Redis instance for everything">
+{`
+┌─────────────────────────────────────────────────────────────┐
+│                   Single Server (ec2-2xlarge)                │
+│                                                             │
+│  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐           │
+│  │[Web    │  │[API    │  │[Worker]│  │[Cron]  │           │
+│  │ Server]│  │ Gateway│  │        │  │        │           │
+│  └───┬────┘  └───┬────┘  └───┬────┘  └───┬────┘           │
+│      │           │           │           │                  │
+│      └───────────┼───────────┼───────────┘                  │
+│                  │           │                              │
+│          ┌───────▼───────────▼───────┐                     │
+│          │       { Redis :6379 }     │                     │
+│          │                           │                     │
+│          │   Memory: 32 GB          │                     │
+│          │   CPU: 4 vCPU            │                     │
+│          │   Disk: 100 GB SSD       │                     │
+│          │   No persistence          │                     │
+│          │   No replication          │                     │
+│          │   Maxmemory: 24 GB       │                     │
+│          └───────────────────────────┘                     │
+│                                                             │
+│  All eggs in one basket.                                   │
+│  If this server goes down, everything stops.               │
+└─────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Where This Breaks
+
+**At 1,000 requests/second (memory)**:
+- 24GB of cache is plenty, but if you cache full API responses (50KB each), that is only ~500K cached items
+- No issue yet, but you are starting to plan for growth
+
+**At 100,000 requests/second (single point of failure)**:
+- Redis handles 100K ops/sec easily, but the server itself is a single point of failure
+- One hardware failure, one network outage, one OOM kill, and every service that depends on Redis is down
+- Your web servers return 500 errors. Your API gateway times out. Your background jobs fail. User sessions are lost, and everyone has to log in again.
+
+**At 1,000,000 requests/second (memory and throughput limits)**:
+- You have 10M users, each with cached data. You need 100GB of cache memory
+- A single server with 32GB cannot hold it all
+- Even if you upgrade to 256GB, the cost is prohibitive compared to sharding across smaller nodes
+- At this scale, your single-threaded bottleneck starts to show: a complex operation (ZRANGE with high cardinality, SORT, KEYS) blocks all other clients
+
+## Production-Grade Architecture
+
+A production Redis deployment addresses three concerns: **scalability** (more data), **availability** (no downtime), and **performance** (low latency).
+
+### Redis Cluster Architecture
+
+<AsciiDiagram
+  id="redis/production-cluster"
+  title="Production Redis Cluster with Sharding and Replication"
+  alt="A Redis Cluster with three shards, each having a primary and replica, behind a proxy layer for client routing"
+  caption="Production-grade Redis Cluster with 3 shards, replication, and proxy-based routing">
+{`
+┌──────────────────────────────────────────────────────────────────┐
+│                    Client Applications                             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │[Web App] │  │[API GW]  │  │[Worker]  │  │[Analytics]│      │
+│  └─────┬────┘  └─────┬────┘  └─────┬────┘  └─────┬────┘       │
+│        │              │              │              │            │
+│  ┌─────▼──────────────▼──────────────▼──────────────▼─────┐    │
+│  │           Smart Client / Proxy Layer                    │    │
+│  │                                                          │    │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐       │    │
+│  │  │ Redis       │  │ Twemproxy  │  │ Envoy with  │       │    │
+│  │  │ Cluster     │  │ (nutcracker)│  │ Redis proxy │       │    │
+│  │  │ Client      │  │            │  │             │       │    │
+│  │  └────────────┘  └────────────┘  └────────────┘       │    │
+│  └───────────────────────┬────────────────────────────────┘    │
+│                           │                                      │
+└───────────────────────────┼──────────────────────────────────────┘
+                            │
+  ┌─────────────────────────┼─────────────────────────────────────┐
+  │                  ┌──────┴──────┐                               │
+  │                  │  Hash Slot  │                               │
+  │                  │    Routing  │                               │
+  │                  │   CRC16(key)│                               │
+  │                  │  % 16384    │                               │
+  │                  └─────────────┘                               │
+  │                          │                                      │
+  │         ┌────────────────┼────────────────┐                    │
+  │         │                │                │                    │
+  │         ▼                ▼                ▼                    │
+  │  ┌────────────┐  ┌────────────┐  ┌────────────┐             │
+  │  │Shard 0     │  │Shard 1     │  │Shard 2     │             │
+  │  │Slots:      │  │Slots:      │  │Slots:      │             │
+  │  │0-5460     │  │5461-10922  │  │10923-16383 │             │
+  │  │            │  │            │  │            │             │
+  │  │┌────────┐│  │┌────────┐ │  │┌────────┐ │             │
+  │  ││Primary ││  ││Primary │ │  ││Primary │ │             │
+  │  ││A       ││  ││B       │ │  ││C       │ │             │
+  │  │└───┬────┘│  │└───┬────┘ │  │└───┬────┘ │             │
+  │  │    │     │  │    │     │  │    │     │             │
+  │  │┌───▼────┐│  │┌───▼────┐ │  │┌───▼────┐ │             │
+  │  ││Replica ││  ││Replica │ │  ││Replica │ │             │
+  │  ││A1      ││  ││B1      │ │  ││C1      │ │             │
+  │  │└────────┘│  │└────────┘ │  │└────────┘ │             │
+  │  └────────────┘  └────────────┘  └────────────┘             │
+  │                                                               │
+  │  Nodes: 6 (3 primaries + 3 replicas)                         │
+  │  Max data: 3x individual node memory                         │
+  │  Fail tolerance: 1 node per shard                            │
+  └───────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Hash Slot Distribution
+
+Redis Cluster uses a 16384-slot hash space. For every key, CRC16 mod 16384 determines which slot it belongs to:
+
+```python
+def get_slot(key):
+    """Compute hash slot for a key"""
+    # Handle hash tags for multi-key operations
+    if b'{' in key and b'}' in key:
+        start = key.index(b'{') + 1
+        end = key.index(b'}', start)
+        if end > start:
+            key = key[start:end]
+    return crc16(key) % 16384
+```
+
+**Hash tags** (`{ }` in key names) let you force multiple keys into the same slot for atomic multi-key operations:
+- `user:{123}:profile` and `user:{123}:settings` → both in slot for hash `123`
+- Enables MSET, transactions, and Lua scripts across these keys
+
+### Proxy-Based Architecture
+
+An alternative to smart clients is to use a proxy layer. The proxy handles routing, connection pooling, and failover:
+
+| Proxy | Features | Pros | Cons |
+|-------|----------|------|------|
+| Twemproxy (nutcracker) | Static sharding, connection pooling | Battle-tested, low overhead | No dynamic cluster resizing, no auto-failover |
+| Redis Cluster proxy (built-in) | Native Cluster protocol, dynamic routing | Shipped with Redis 6+, no extra service | Relatively new |
+| Envoy Redis filter | L7 proxy for Redis, circuit breaking | Integrates with service mesh | Higher latency overhead |
+| HAProxy (TCP mode) | Simple TCP load balancing | Can balance to replicas | L4 only, no routing |
+
+## Integration Patterns
+
+### Cache-Aside with Redis
+
+The most common Redis pattern. The application checks Redis first, and only queries the database on a cache miss.
+
+<AsciiDiagram
+  id="redis/cache-aside"
+  title="Cache-Aside Pattern with Redis"
+  alt="Application checks Redis first, and on a cache miss queries the database, then writes back to Redis"
+  caption="Cache-aside (lazy loading) — the most common Redis caching pattern">
+{`
+┌──────────┐          ┌──────────┐          ┌──────────┐
+│ Application│          │ { Redis } │          │((Postgres))│
+└─────┬────┘          └─────┬────┘          └─────┬────┘
+      │                     │                     │
+      │  1. GET user:123    │                     │
+      │────────────────────▶│                     │
+      │                     │                     │
+      │  2. Cache MISS      │                     │
+      │◀────────────────────│                     │
+      │                     │                     │
+      │  3. SELECT * FROM   │                     │
+      │     users WHERE id  │                     │
+      │     = 123           │                     │
+      │─────────────────────────────────────────▶│
+      │                     │                     │
+      │  4. Result: {...}   │                     │
+      │◀──────────────────────────────────────────│
+      │                     │                     │
+      │  5. SET user:123    │                     │
+      │     {...} EX 3600   │                     │
+      │────────────────────▶│                     │
+      │                     │                     │
+      │  6. Return cached   │                     │
+      │     data            │                     │
+      │◀────────────────────│                     │
+      │                     │                     │
+      │  Next request:      │                     │
+      │  7. GET user:123    │                     │
+      │────────────────────▶│                     │
+      │  8. Cache HIT       │                     │
+      │◀────────────────────│                     │
+      │                     │                     │
+└─────┴────┘          └─────┴────┘          └─────┴────┘
+`}
+</AsciiDiagram>
+
+**Implementation considerations**:
+- Set appropriate TTLs based on data volatility
+- Implement cache invalidation on writes (delete the cache key, don't update in place)
+- Handle cache stampede: when a popular key expires, many requests simultaneously hit the database. Use locking or hedging to prevent this.
+- Monitor cache hit ratio via `INFO stats` (keyspace_hits / (keyspace_hits + keyspace_misses))
+
+### Session Store
+
+Store user sessions in Redis hashes with automatic expiration. Each user's session is a hash of key-value pairs.
+
+```bash
+# Store session on login
+HMSET session:abc123 user_id 1000 role admin last_access 1704067200
+EXPIRE session:abc123 86400
+
+# Read session on each request
+HGETALL session:abc123
+
+# Extend session on activity
+EXPIRE session:abc123 86400
+```
+
+**Why Redis wins for sessions**:
+- Sub-millisecond read/write latency
+- Automatic TTL cleanup — no cron jobs for expired sessions
+- Atomic field updates (HINCRBY for counters)
+- Replication for durability
+- Cross-datacenter replication for global sessions
+
+### Rate Limiter (Sorted Set)
+
+Implement sliding-window rate limiting using sorted sets with timestamps as scores.
+
+```python
+def is_rate_limited(client_id, max_requests=100, window_secs=60):
+    key = f"ratelimit:{client_id}"
+    now = time.time() * 1000
+    window_start = now - (window_secs * 1000)
+
+    pipe = redis.pipeline()
+    # Remove entries outside the window
+    pipe.zremrangebyscore(key, 0, window_start)
+    # Count remaining entries
+    pipe.zcard(key)
+    # Add current request
+    pipe.zadd(key, {str(now): now})
+    # Set TTL to auto-cleanup
+    pipe.expire(key, window_secs)
+    _, count, _, _ = pipe.execute()
+
+    return count > max_requests
+```
+
+<AsciiDiagram
+  id="redis/rate-limiter"
+  title="Sliding-Window Rate Limiter with Sorted Set"
+  alt="A sorted set stores request timestamps per client, entries outside the window are removed, and the count of remaining entries determines if the request is allowed"
+  caption="Sliding-window rate limiting using Redis sorted sets">
+{`
+┌──────────────────────────────────────────────────────────────────┐
+│  Rate Limiter: user_id = 42, window = 60s, max = 100            │
+│                                                                  │
+│  Key: ratelimit:42                                              │
+│                                                                  │
+│  Sorted Set Members (score = timestamp_ms):                     │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │  Member     │ Score (ms)      │ Window?                   │ │
+│  ├────────────────────────────────────────────────────────────┤ │
+│  │  req_1      │ 1704067199000   │ │ ░░░░░░░░░░ │ OLD ✗     │ │
+│  │  req_2      │ 1704067200000   │ │ ░░░░░░░░░░ │ EDGE ✓    │ │
+│  │  req_3      │ 1704067205000   │ │ ░░░░░░░░░░ │ ✓         │ │
+│  │  ...        │ ...             │ │ ░░░░░░░░░░ │ ✓         │ │
+│  │  req_100    │ 1704067250000   │ │ ░░░░░░░░░░ │ ✓         │ │
+│  │  req_101    │ 1704067255000   │ │ ░░░░░░░░░░ │ ✓         │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  ── ZREMRANGEBYSCORE ratelimit:42 0 1704067199999 ────────────▶│
+│  ── ZCARD ratelimit:42 → 101 ─────────────────────────────────▶│
+│  ── 101 > 100 → RATE LIMITED ─────────────────────────────────▶│
+│                                                                  │
+│  Memory per entry: ~80 bytes (member string + score)            │
+│  100 entries per user: ~8KB per user                            │
+│  1M active users: ~8GB total                                    │
+└──────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Pub/Sub Event Bus
+
+Redis Pub/Sub enables real-time messaging between services without a dedicated message broker.
+
+<AsciiDiagram
+  id="redis/pubsub-event-bus"
+  title="Redis Pub/Sub Event Bus"
+  alt="Multiple publishers send events to Redis channels, and multiple subscribers receive those events in real time"
+  caption="Redis Pub/Sub as a lightweight event bus between microservices">
+{`
+┌──────────────────────────────────────────────────────────────────┐
+│                   Redis Pub/Sub Event Bus                         │
+│                                                                  │
+│  Publishers:                         Subscribers:                │
+│                                                                  │
+│  ┌──────────┐    channel:            ┌──────────┐              │
+│  │[Order    │─── events:orders ────▶│[Email    │              │
+│  │ Service] │    "order.created"     │ Service] │              │
+│  └──────────┘                        └──────────┘              │
+│                                                                  │
+│  ┌──────────┐    channel:            ┌──────────┐              │
+│  │[Payment  │─── events:payments ──▶│[Audit    │              │
+│  │ Service] │    "payment.completed" │ Service] │              │
+│  └──────────┘                        └──────────┘              │
+│                                                                  │
+│  ┌──────────┐    channel:            ┌──────────┐              │
+│  │[Shipping │─── events:shipping ──▶│[Notific- │              │
+│  │ Service] │    "shipment.tracking" │ ations]  │              │
+│  └──────────┘                        └──────────┘              │
+│                                                                  │
+│  Pattern: services publish to topic channels,                   │
+│  subscribers receive in real-time (fan-out)                     │
+│  No persistence — if subscriber is offline, message is lost     │
+│  For persistence, use Redis Streams instead                    │
+└──────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+**When to use Pub/Sub**:
+- Real-time notifications (user logged in, new message)
+- Cache invalidation broadcasts across services
+- Log aggregation pipelines
+- Live dashboards and monitoring
+
+**When to use Streams instead**:
+- When message persistence is required
+- When consumers need to replay messages
+- When you need consumer groups with offset tracking
+- When message ordering matters per consumer group
+
+### Task Queue (List / Stream)
+
+Use Redis lists as a lightweight job queue with BRPOP for blocking consumers.
+
+```bash
+# Producer: push job to queue
+LPUSH job:email:queue '{"to":"user@example.com","subject":"Welcome"}'
+
+# Consumer: block until job available
+BRPOP job:email:queue 0
+# Returns: ["job:email:queue", '{"to":"user@example.com","subject":"Welcome"}']
+```
+
+<AsciiDiagram
+  id="redis/task-queue"
+  title="Redis List-Based Task Queue"
+  alt="Multiple producers push jobs via LPUSH, and multiple workers consume via BRPOP in a fair distribution pattern"
+  caption="Lightweight task queue using Redis lists and blocking pop">
+{`
+┌──────────────────────────────────────────────────────────────────┐
+│                   Redis Task Queue                                 │
+│                                                                   │
+│  Producers:                         Queue (Redis List):          │
+│                                                                   │
+│  ┌──────────┐  LPUSH                ┌──────┐                    │
+│  │[Web App]  │──────────────────▶   │ Job5 │ ← new jobs pushed │
+│  └──────────┘                       ├──────┤  here               │
+│                                     │ Job4 │                     │
+│  ┌──────────┐  LPUSH                ├──────┤                     │
+│  │[Cron Job]│──────────────────▶   │ Job3 │                     │
+│  └──────────┘                       ├──────┤                     │
+│                                     │ Job2 │                     │
+│  ┌──────────┐  LPUSH                ├──────┤                     │
+│  │[API GW]  │──────────────────▶   │ Job1 │                     │
+│  └──────────┘                       └──────┘                     │
+│                                       │                           │
+│  Consumers:                           │ BRPOP                     │
+│                                       │                           │
+│  ┌──────────┐  BRPOP job:queue 0     ▼                           │
+│  │[Worker 1]│◀─────────────────── Get Job1 from tail            │
+│  └──────────┘                                                    │
+│                                                                   │
+│  ┌──────────┐  BRPOP job:queue 0                                │
+│  │[Worker 2]│◀─────────────────── Get Job2 from tail            │
+│  └──────────┘                                                    │
+│                                                                   │
+│  Key properties:                                                  │
+│  - Fair distribution (round-robin via BRPOP)                     │
+│  - At-most-once delivery (no ack mechanism)                      │
+│  - For at-least-once, use Streams with XREADGROUP               │
+└──────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Real-Time Leaderboard (Sorted Set)
+
+Sorted sets are purpose-built for leaderboards. Each participant's score is a member, and their score determines rank.
+
+```bash
+# Update score: add 10 points to "player_42"
+ZINCRBY leaderboard:game:daily 10 "player_42"
+
+# Get top 10
+ZREVRANGE leaderboard:game:daily 0 9 WITHSCORES
+
+# Get player's rank
+ZREVRANK leaderboard:game:daily "player_42"
+
+# Get player's score
+ZSCORE leaderboard:game:daily "player_42"
+
+# Get players around a specific player
+ZREVRANGE leaderboard:game:daily
+  $((rank - 5)) $((rank + 5)) WITHSCORES
+```
+
+### Distributed Lock (Redlock Algorithm)
+
+The Redlock algorithm provides a distributed lock implementation using multiple independent Redis nodes.
+
+```python
+def acquire_lock(redis_nodes, resource, ttl_ms):
+    """Acquire a distributed lock using Redlock"""
+    lock_value = uuid.uuid4().hex
+    n = len(redis_nodes)
+    acquired = 0
+    start_time = current_time_ms()
+
+    for node in redis_nodes:
+        # Try to acquire on each node
+        result = node.set(
+            f"lock:{resource}",
+            lock_value,
+            nx=True,           # Only set if key doesn't exist
+            px=ttl_ms          # Auto-release after TTL
+        )
+        if result == "OK":
+            acquired += 1
+
+    # Check if we acquired majority of nodes
+    elapsed = current_time_ms() - start_time
+    if acquired >= n // 2 + 1 and elapsed < ttl_ms:
+        return lock_value  # Lock acquired
+    else:
+        release_lock(redis_nodes, resource, lock_value)
+        return None  # Lock acquisition failed
+```
+
+<AsciiDiagram
+  id="redis/redlock"
+  title="Redlock Distributed Lock Algorithm"
+  alt="A client attempts to acquire a lock on five independent Redis nodes, succeeds if it gets a majority, and the lock auto-releases after TTL"
+  caption="Redlock — distributed locking with majority consensus across independent Redis nodes">
+{`
+┌──────────────────────────────────────────────────────────────────────┐
+│                     Redlock Distributed Lock                          │
+│                                                                      │
+│  Client A tries to acquire lock: resource="order:123"               │
+│                                                                      │
+│  ┌──────────┐                                                       │
+│  │ Client A  │                                                       │
+│  │ uuid=xyz │                                                       │
+│  └────┬─────┘                                                       │
+│       │                                                              │
+│       │   SET lock:order:123 xyz NX PX 10000                        │
+│       ├─────────────────┬─────────────────┬─────────────────┬──     │
+│       │                 │                 │                 │       │
+│       ▼                 ▼                 ▼                 ▼       │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐     │
+│  │ Redis A   │    │ Redis B   │    │ Redis C   │    │ Redis D   │   │
+│  │ OK ✓     │    │ OK ✓     │    │ OK ✓     │    │ FAIL ✗   │     │
+│  └──────────┘    └──────────┘    └──────────┘    └──────────┘     │
+│                                                                      │
+│  Acquired: 3/5 nodes (majority) ✓                                   │
+│  Elapsed: 15ms < 10000ms TTL ✓                                     │
+│  Lock acquired!                                                      │
+│                                                                      │
+│  ───────────────────────────────────────────────────────────────── │
+│                                                                      │
+│  Client B tries same lock (while A holds it):                      │
+│                                                                      │
+│  ┌──────────┐                                                       │
+│  │ Client B  │                                                       │
+│  │ uuid=abc │                                                       │
+│  └────┬─────┘                                                       │
+│       │   SET lock:order:123 abc NX PX 10000                        │
+│       ├─────────────────┬─────────────────┬────                    │
+│       │                 │                 │                         │
+│       ▼                 ▼                 ▼                         │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐                     │
+│  │ Redis A   │    │ Redis B   │    │ Redis C   │                   │
+│  │ FAIL ✗   │    │ FAIL ✗   │    │ FAIL ✗   │                     │
+│  └──────────┘    └──────────┘    └──────────┘                     │
+│  Acquired: 0/5 nodes → lock not acquired                           │
+└──────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+**Important caveats**:
+- Redlock requires at least 5 independent Redis nodes (not a Cluster, but standalone instances)
+- The TTL serves as a safety net — if a client crashes while holding the lock, it auto-releases after TTL
+- Clients should extend the lock (via Lua script that checks the UUID) for long operations
+- Redlock makes assumptions about clock synchronization: all nodes must have roughly synchronized clocks (within milliseconds)
+
+## Multi-Region Architecture
+
+### Active-Passive Cross-Region
+
+<AsciiDiagram
+  id="redis/multi-region"
+  title="Multi-Region Redis with Active-Passive Replication"
+  alt="Primary Redis in us-east-1 replicates to passive replicas in eu-west-1 and ap-southeast-1"
+  caption="Active-passive multi-region Redis deployment">
+{`
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Multi-Region Redis                            │
+│                                                                     │
+│  ┌─────────────────────┐          ┌─────────────────────┐         │
+│  │   us-east-1 (Active) │          │   eu-west-1 (Passive)│        │
+│  │                     │          │                     │         │
+│  │  ┌─────────────────┐│          │  ┌─────────────────┐│         │
+│  │  │Primary A        ││─────────▶│  │Replica A        ││         │
+│  │  │Read + Write     ││  async   │  │Read-Only        ││         │
+│  │  │32 GB            ││  repl    │  │32 GB            ││         │
+│  │  └─────────────────┘│          │  └─────────────────┘│         │
+│  │                     │          │                     │         │
+│  │  ┌─────────────────┐│          │  ┌─────────────────┐│         │
+│  │  │Replica A1       ││          │  │Replica A2       ││         │
+│  │  │Read-Only        ││          │  │Read-Only        ││         │
+│  │  └─────────────────┘│          │  └─────────────────┘│         │
+│  └─────────────────────┘          └─────────────────────┘         │
+│                                                                     │
+│  ┌─────────────────────┐          ┌─────────────────────┐         │
+│  │  ap-southeast-1      │          │  Global Replication  │        │
+│  │  (Passive)          │          │  Latency:            │        │
+│  │                     │          │  us-east-1 ↔ eu: ~80ms│        │
+│  │  ┌─────────────────┐│          │  us-east-1 ↔ ap: ~200ms│       │
+│  │  │Replica B        ││          │                     │         │
+│  │  │Read-Only        ││          │  Replication lag:   │        │
+│  │  │32 GB            ││          │  ~100-500ms         │        │
+│  │  └─────────────────┘│          │  (inter-region)     │        │
+│  └─────────────────────┘          └─────────────────────┘         │
+│                                                                     │
+│  Failover: DNS-based or global load balancer routes traffic        │
+│  to new region. Replica becomes primary.                           │
+│  Data loss window: async replication lag (~100-500ms).            │
+└─────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+## Capacity Planning
+
+### 10M DAU — Redis Sizing
+
+Assume each user generates the following load:
+
+| Use Case | Data Size | Per User | Total |
+|----------|-----------|----------|-------|
+| Session hash | ~500 bytes | Active sessions: 20% DAU | 10M × 0.2 × 500B = 1 GB |
+| Cache (API responses) | ~2KB per item | 50 items cached per user | 10M × 50 × 2KB = 100 GB |
+| Rate limiter sorted set | ~80 bytes/entry | 100 entries per active user | 2M × 100 × 80B = 16 GB |
+| Leaderboard (top 1000) | ~120 bytes/entry | 1000 entries total | 1000 × 120B = 120 KB |
+| Task queue | ~1KB per job | 100K pending jobs | 100K × 1KB = 100 MB |
+| **Total** | | | **~117 GB** |
+
+### Cluster Node Count
+
+With 32GB per node:
+- 117 GB / (32 GB × 0.8) = ~4.6 primaries (round up to 5)
+- 5 primaries + 5 replicas = 10 nodes total
+- Add 2 spare nodes for failover capacity = 12 nodes total
+
+### Memory Break-Down by Component
+
+| Component | Memory | Notes |
+|-----------|--------|-------|
+| Data | 117 GB | Raw key-value storage |
+| RSS overhead | ~15% | Fragmentation, allocator overhead |
+| Replication backlog | ~1 GB | repl-backlog-size |
+| AOF buffer | ~500 MB | During BGREWRITEAOF |
+| Client output buffers | ~2 GB | 10K clients × 200KB average |
+| **Total RSS** | **~140 GB** | Across all nodes |
+
+### Request Routing Overhead
+
+Redis Cluster's smart client maps keys to nodes locally using the hash slot table. This table is ~16KB (16384 entries × 8 bytes per slot). The client fetches the cluster topology from any node on startup and refreshes it when it receives a MOVED redirect.
+
+Network overhead per operation:
+- Request: ~100 bytes (RESP-encoded SET with 20-byte key, 100-byte value)
+- Response: ~10 bytes (simple +OK)
+- Total per operation: ~110 bytes + TCP/IP overhead (~60 bytes)
+- 100K ops/sec: ~17 MB/sec network throughput (trivial for modern NICs)
+
+## Deployment
+
+### Sentinel-Based Failover Architecture
+
+<AsciiDiagram
+  id="redis/sentinel-deployment"
+  title="Production Sentinel Deployment"
+  alt="Three Redis nodes (one primary, two replicas) monitored by three Sentinel processes for high availability"
+  caption="Production deployment with Sentinel-based high availability">
+{`
+┌─────────────────────────────────────────────────────────────────────┐
+│                  Production Redis Deployment                          │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │              Load Balancer (HAProxy / ELB)                    │  │
+│  │  Routes to primary for writes, to replicas for reads         │  │
+│  └──────────────┬───────────────────────────────────────────────┘  │
+│                 │                                                   │
+│                 ▼                                                   │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                    Sentinel Cluster                           │  │
+│  │                                                               │  │
+│  │  ┌─────────┐   ┌─────────┐   ┌─────────┐                    │  │
+│  │  │Sentinel │   │Sentinel │   │Sentinel │                    │  │
+│  │  │srv-1    │   │srv-2    │   │srv-3    │                    │  │
+│  │  │:26379   │   │:26379   │   │:26379   │                    │  │
+│  │  └────┬────┘   └────┬────┘   └────┬────┘                    │  │
+│  └───────┼──────────────┼──────────────┼──────────────────────────┘
+│          │              │              │                           │
+│  ┌───────┴──────────────┴──────────────┴──────────────────────┐  │
+│  │              Redis Nodes                                    │  │
+│  │                                                             │  │
+│  │  ┌─────────────────┐   ┌─────────────────┐                │  │
+│  │  │Primary          │   │Replica 1        │                │  │
+│  │  │:6379            │   │:6380            │                │  │
+│  │  │Read+Write       │◀──│Read-Only        │                │  │
+│  │  │maxmemory 24GB   │   │maxmemory 24GB   │                │  │
+│  │  │appendonly yes   │   │appendonly yes   │                │  │
+│  │  └─────────────────┘   └─────────────────┘                │  │
+│  │                                                             │  │
+│  │  ┌─────────────────┐                                       │  │
+│  │  │Replica 2        │                                       │  │
+│  │  │:6381            │                                       │  │
+│  │  │Read-Only        │                                       │  │
+│  │  │Used for backups │                                       │  │
+│  │  └─────────────────┘                                       │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  Sentinel monitors: primary health + pings every 1 second          │
+│  Failover: automatic when quorum (2/3) Sentinels detect failure    │
+│  Replica 1 becomes new primary. Sentinel updates config.           │
+│  Backup replica (Replica 2) used for periodic RDB exports.         │
+└─────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Cluster Resharding
+
+Adding a node to a Redis Cluster requires resharding: moving hash slots from existing nodes to the new node.
+
+```bash
+# Add new node to cluster
+redis-cli --cluster add-node 10.0.1.100:6379 10.0.0.1:6379
+
+# Reshard slots (interactive)
+redis-cli --cluster reshard 10.0.1.100:6379
+
+# Or reshard programmatically:
+# 1. Set target node to import mode
+# 2. Set source node to migrating mode
+# 3. Migrate keys one by one (MIGRATE command)
+# 4. Update slot assignment
+```
+
+**During resharding**:
+- Keys being migrated are briefly unavailable (atomic MIGRATE command handles this)
+- Clients get ASK redirects for keys that have been moved
+- Use `redis-cli --cluster rebalance` to automatically balance slots
+
+### Persistence Tuning
+
+For production, use **both RDB and AOF**:
+
+```bash
+# redis.conf — Production persistence
+save 900 1          # RDB every 15 min if 1+ key changed
+save 300 10         # RDB every 5 min if 10+ keys changed
+save 60 10000       # RDB every 1 min if 10000+ keys changed
+appendonly yes      # Enable AOF
+appendfsync everysec # Fsync every second (good balance)
+auto-aof-rewrite-percentage 100  # Rewrite when 2x size
+auto-aof-rewrite-min-size 64mb   # Min size for rewrite
+```
+
+### Monitoring Setup
+
+| Tool | What It Monitors |
+|------|-----------------|
+| Prometheus + redis_exporter | Latency, throughput, memory, hit ratio, evictions, replication lag |
+| Grafana dashboards | Visual dashboards for all metrics |
+| Alertmanager | Alerts for: latency over 10ms, hit ratio under 80%, memory over 90%, replication lag over 10s |
+| Redis Insight (formerly Redis Desktop Manager) | GUI for inspecting keys, slow logs, memory analysis |
+
+### Backup and Restore
+
+```bash
+# Automatic: RDB snapshots (configured in redis.conf)
+# RDB files are in /var/lib/redis/dump.rdb
+
+# Manual backup via SAVE (blocking) or BGSAVE (background)
+redis-cli BGSAVE
+
+# Copy RDB file to backup location
+cp /var/lib/redis/dump.rdb /backup/redis/$(date +%Y%m%d).rdb
+
+# Restore: copy RDB to data directory and restart
+cp /backup/redis/20240701.rdb /var/lib/redis/dump.rdb
+systemctl restart redis
+
+# Or use AOF for point-in-time recovery
+# Copy AOF file and restart — Redis replays all commands
+```
+
+**Backup best practices**:
+- Take backups from a replica (not the primary) to avoid CPU/memory overhead
+- Use BGSAVE (not SAVE) to avoid blocking the event loop
+- Encrypt backup files if they contain sensitive data
+- Test restore procedure regularly
+- Store backups in a different region from the production cluster
+
+### Upgrade Strategy
+
+| Upgrade Type | Downtime | Procedure |
+|-------------|----------|-----------|
+| Version upgrade (single node) | ~seconds | Shutdown → replace binary → restart. RDB/AOF loads. |
+| Version upgrade (replicated) | Zero | Upgrade replicas one by one → failover → upgrade old primary |
+| Cluster node replacement | Zero | Add new node → reshard slots to it → remove old node |
+| Configuration change (hot) | Zero | CONFIG SET (most parameters support hot reload) |
+| Configuration change (requires restart) | ~seconds | Plan maintenance window, use replicas for zero-downtime |
+
+**Rolling upgrade with Sentinel**:
+```
+1. Upgrade Replica 2 → restart → verify replication catches up
+2. Upgrade Replica 1 → restart → verify replication catches up
+3. Sentinel failover to Replica 1 (now upgraded)
+4. Upgrade old Primary (now Replica) → restart → rejoin as replica
+5. Sentinel failover back to original node (optional)
+```

@@ -1,0 +1,393 @@
+---
+id: reverse-proxies-tradeoffs
+title: Reverse Proxies — Trade-offs & Failure Modes
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Hard Choices
+
+### The Core Tension
+
+Every reverse proxy faces a fundamental trade-off between **freshness** and **performance**. The more aggressively you cache, buffer, and pool, the faster your responses and the cheaper your backend costs. But each optimization layer introduces staleness — a window where the data the client receives is not the latest state on the backend.
+
+This tension runs through every design decision in a reverse proxy:
+
+- Cache TTL: longer TTL improves hit rates but increases stale read windows.
+- Connection pooling: larger pools reduce latency but increase the blast radius of a backend failure (more connections die when one backend goes down).
+- Response buffering: buffering to disk frees backend connections quickly but adds disk I/O and means clients see the entire response at once instead of streaming.
+- TLS session resumption: reusing sessions avoids handshake cost but ties client identity to a session ticket that an attacker could steal.
+- Compression: smaller data on the wire means lower bandwidth cost but higher CPU usage and added latency.
+
+Choosing the right balance depends on your data characteristics, user expectations, and cost constraints. Social media feeds tolerate 30-second stale data; stock trading platforms tolerate zero seconds.
+
+### Decision Matrix
+
+| Decision | Option A | Option B | Choose A When | Choose B When |
+|----------|----------|----------|---------------|---------------|
+| **Buffer strategy** | Buffer to disk | Stream directly to client | API responses under 100 KB, backend concurrency is limited, or clients are on slow networks | Large file downloads (1+ GB), media streaming, or real-time data (SSE, WebSocket) |
+| **Cache placement** | In-memory (proxy RAM) | External (Redis/Memcached) | Single proxy instance, latency-critical (under 1ms cache reads), or total cache under 2 GB | Multi-proxy deployment, cache larger than available RAM, or shared cache across services needed |
+| **Compression level** | gzip level 1-3 | gzip level 6-9 | Dynamic API responses (JSON, text), CPU is constrained, or response time is the top priority | Pre-compressed static assets, bandwidth is expensive (mobile users), or you have dedicated compression hardware |
+| **TLS termination** | At reverse proxy | At backend services | Multiple backends, centralized cert management wanted, or backends are legacy (can't handle modern TLS) | Compliance requires end-to-end encryption (HIPAA, PCI-DSS), or backends handle TLS efficiently on their own hardware |
+| **Health check type** | Active (probe on timer) | Passive (detect failures on real requests) | You need quick detection (1-5 seconds), or low traffic volume where passive detection would be slow | Traffic volume is high enough that passive detects within seconds, or you want zero extra probe traffic |
+| **Load balancing** | Least connections | Consistent hash (IP hash) | Request processing times vary widely, or backends have heterogeneous capacity | Session affinity is required (backend stores local state), or cache locality is important |
+| **Connection keepalive** | Long (300s) | Short (10s) | Clients make many requests in quick succession (SPA apps), or traffic is predictable | Clients are intermittent (mobile apps with background refresh), or you need to free kernel resources quickly |
+
+### CAP Theorem Positioning
+
+A reverse proxy is a **CP** (Consistency and Partition Tolerance) system, sacrificing Availability in the face of backend partitions. When the proxy cannot reach a backend, it returns 502 or 504 errors rather than serving stale or partial data.
+
+However, when caching is enabled, the proxy can temporarily become **AP** (Availability and Partition Tolerance) — it serves cached responses even if the backend is unreachable. This is why many production proxies use a "stale-while-revalidate" strategy: serve stale cache (available) while asynchronously checking the backend for updates.
+
+<AsciiDiagram
+  id="reverse-proxies/cap-partition"
+  title="CAP Theorem Partition Scenario for a Reverse Proxy"
+  alt="Three-node diagram showing proxy behavior during network partition: one proxy can reach backends, the other cannot"
+  caption="During a network partition, the proxy without backend access serves stale cache (AP) or returns errors (CP)"
+>{` 
+┌──────────────────────────────────────────────────────────────────────┐
+│                    NETWORK PARTITION SCENARIO                        │
+│                                                                       │
+│                         ┌──────────────┐                             │
+│                         │   Client A   │                             │
+│                         │ Request:     │                             │
+│                         │ GET /scores  │                             │
+│                         └──────┬───────┘                             │
+│                                │                                     │
+│                                ▼                                     │
+│                         ┌──────────────┐                             │
+│                         │  Proxy US    │                             │
+│                         │  (Instance 1)│                             │
+│                         │              │                             │
+│                         │  Cache: MISS │                             │
+│                         │  (no cached  │                             │
+│                         │   scores)    │                             │
+│                         └──────┬───────┘                             │
+│                                │                                     │
+│                        ┌───────┴────────┐                            │
+│                        │                │                            │
+│                    CONNECTED         PARTITIONED                     │
+│                        │                │                            │
+│                        ▼                X                            │
+│                ┌──────────────┐  ┌──────────────┐                    │
+│                │ Backend A    │  │ Backend B    │                    │
+│                │ (Reachable)  │  │ (Unreachable)│                    │
+│                └──────────────┘  └──────────────┘                    │
+│                                                                       │
+│  Behavior:                      Behavior:                            │
+│  Proxy US returns data          Proxy EU (same scenario,             │
+│  from Backend A.                but with cached response):          │
+│  No partition impact.           "stale-while-revalidate"             │
+│                                 Serves stale cache (if available)    │
+│                                 Returns 502 if no cache exists       │
+│                                                                       │
+│  Trade-off: CP strict: return 502 on partition                       │
+│             AP lenient: serve stale cache while revalidating         │
+└──────────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+Most production proxies choose the middle path: serve cached responses during partition (preferring availability over consistency), but mark the response with `Age` and `Warning: 110 - Response is stale` headers so clients know the data may be out of date. This is the **stale-while-revalidate** pattern from RFC 5861.
+
+### Failure Modes
+
+**Failure 1: Backend Slowdown (Cascading Timeout)**
+
+Five backend servers normally respond in 50 ms. Two servers develop a problem (CPU spike from a bad deployment) and start responding in 2,000 ms. The proxy has `proxy_read_timeout` set to 60 seconds, so it does not mark them as down. The least-connections load balancer sends new requests to the slow servers because their active connections are low (they handle one request at a time, very slowly). Clients hitting the slow servers experience 2-second latency. Clients hitting the healthy servers experience 50 ms latency. Average latency shifts from 50 ms to 500 ms because 40% of servers are slow but no proxy action is taken.
+
+Root cause: Load balancer interprets low active connections as "available capacity" not "stuck processing." The passive health check does not catch slow responses because responses do eventually arrive (under the 60-second timeout).
+
+Blast radius: 40% of users experience 40x latency increase. User-facing impact: slow page loads, request timeouts on mobile (mobile clients often time out at 5-10 seconds).
+
+Detection: Monitor p99 upstream response time. If p99 exceeds 3x p50, investigate. The ratio shift indicates a subset of servers is slow while most are fast. Even better: monitor per-server p99 latency and alert if any server's p99 exceeds the pool average by 2x.
+
+<AsciiDiagram
+  id="reverse-proxies/slow-server"
+  title="Cascading Slow Server Failure: How One Bad Server Degrades the Whole Pool"
+  alt="Diagram showing how one slow backend server causes long tail latency even with healthy servers available"
+  caption="An underperforming backend can degrade overall latency without triggering timeout-based health checks"
+>{` 
+                        ┌────────────────────┐
+                        │  Actual Request     │
+                        │  Arrival: 100 req/s │
+                        └─────────┬──────────┘
+                                  │
+                    ┌─────────────┼────────────┐
+                    │             │            │
+                    ▼             ▼            ▼
+            ┌────────────┐ ┌────────────┐ ┌────────────┐
+            │ Backend 1  │ │ Backend 2  │ │ Backend 3  │
+            │ Healthy    │ │ SLOW        │ │ Healthy    │
+            │ 50ms       │ │ 2000ms     │ │ 50ms       │
+            │ 33 req/s   │ │ 2 req/s    │ │ 33 req/s   │
+            └────────────┘ └────────────┘ └────────────┘
+                              │
+                              │ Queue fills up
+                              ▼
+                    ┌────────────────────┐
+                    │  What the proxy    │
+                    │  sees:             │
+                    │                    │
+                    │  Backend 2 has     │
+                    │  only 2 active     │
+                    │  connections       │
+                    │  (other backends   │
+                    │  have 33 each).    │
+                    │                    │
+                    │  Least-connections │
+                    │  sends MORE        │
+                    │  requests to       │
+                    │  Backend 2!        │
+                    │                    │
+                    │  Result: Backend 2 │
+                    │  gets 50+ req/s    │
+                    │  queued, all slow  │
+                    └────────────────────┘
+ 
+Recovery:
+1. Set proxy_next_upstream timeout &lt; proxy_read_timeout
+2. Configure passive check: max_fails=3, fail_timeout=10s
+3. Add active health check with response-time threshold
+4. Monitor per-server p99 latency, not just pool average
+ `}
+</AsciiDiagram>
+
+**Failure 2: Cache Stampede (Thundering Herd)**
+
+A popular cache key expires simultaneously across all proxy instances. Every request for that key misses cache and hits the backend simultaneously. With 20 proxy instances, and each instance forwarding 50 requests per second for this key, the backend receives 1,000 requests per second for one resource — 100x its normal load. The backend CPU spikes to 100%, all responses slow down, and the slow responses cause more proxy connections to be held open, consuming the connection pool for other keys.
+
+Root cause: A large number of cached responses had the same TTL and expire at the same instant. The proxy instances have no coordination — each one independently sees a cache miss and forwards to the backend.
+
+Blast radius: The affected backend crashes or becomes unresponsive for 30-120 seconds. Collateral damage: all other API endpoints on that backend become slow or unavailable because the stampede consumes all backend resources.
+
+Detection: Sudden spike in backend CPU (from 40% to 100%), increase in cache miss rate for one specific URL path, increase in 5xx errors from that backend.
+
+Prevention:
+- Add `stale-while-revalidate` header: serve the stale cached response while async-refreshing in the background. Clients never see the refresh latency.
+- Add jitter to TTL: instead of `max-age=60`, use `max-age=45-75` (randomized per request). Cache keys expire at different times, spreading the load.
+- Use request collapsing: when one proxy instance is already fetching from the backend for a key, other instances wait for that response instead of sending duplicate requests (Nginx `proxy_cache_lock on`).
+- Pre-warm the cache: after a deployment, run a script to hit all critical endpoints before traffic arrives.
+
+**Failure 3: Connection Pool Exhaustion (Backend Connection Leak)**
+
+The backend has a connection leak: every time the proxy opens a connection, the backend accepts it but never closes it properly (the backend keeps the socket open waiting for more data). The proxy's connection pool fills to its maximum (256 connections). All 256 connections are in CLOSE_WAIT state on the backend. The proxy cannot open new backend connections. Incoming requests queue up waiting for pool slots to free up. The queue depth grows. After 60 seconds (`proxy_read_timeout`), queued requests start timing out with 504 errors.
+
+<AsciiDiagram
+  id="reverse-proxies/connection-pool-exhaustion"
+  title="Connection Pool Exhaustion from Backend Connection Leak"
+  alt="Timeline showing connection pool filling up as backend leaks connections, leading to queue buildup and timeouts"
+  caption="A backend connection leak fills the pool with stuck connections, causing all subsequent requests to queue and eventually timeout"
+>{` 
+Connection Pool Exhaustion Timeline
+ 
+Proxy                              Backend                           
+  │                                   │                               
+  │ CONNECT ───────────────────────&gt;  │                               
+  │                                   │ ACCEPT (fd=42)               
+  │                                   │                               
+  │ CONNECT ───────────────────────&gt;  │                               
+  │                                   │ ACCEPT (fd=43)               
+  │                                   │                               
+  │ ... (requests complete, but backend never closes)                 
+  │                                   │                               
+  │ CONNECT ───────────────────────&gt;  │                               
+  │                                   │ ACCEPT (fd=256)              
+  │                                   │                               
+  │ POOL FULL (256/256 connections used)                              
+  │                                    │                              
+  │ NEW REQUEST arrives               │                              
+  │   No idle connection in pool      │                              
+  │   Request queued                  │                              
+  │   Queue depth: 1 ? 50 ? 200   │                              
+  │                                    │                              
+  │ After 60s: proxy_read_timeout     │                              
+  │ Queue head request timeouts       │                              
+  │ Returns 504 Gateway Timeout       │                              
+  │ All subsequent requests fail      │                              
+  │                                    │                              
+  │ Recovery: restart backend         │                              
+  │ Sockets close (all 256 CLOSE_WAIT)│                              
+  │ Pool drains, new connections work │                              
+  │                                    │                              
+  │ Total downtime: ~60-120 seconds   │                              
+ `}
+</AsciiDiagram>
+
+Root cause: Backend bug (leaked file descriptors, threads not closing sockets). Proxy pool size set too low for the concurrent request volume.
+
+Blast radius: All traffic to that backend fails after the pool fills. Other backends (different upstreams) are unaffected.
+
+Recovery: Restart the backend to close all sockets. In the short term, reduce `proxy_read_timeout` to detect stuck connections faster, and increase `keepalive` to provide more pool slots. Long-term: fix the backend connection leak and add connection monitoring.
+
+**Failure 4: TLS Certificate Expiration**
+
+The reverse proxy's TLS certificate expires at midnight. At 12:01 AM, the first client initiates a TLS handshake. The proxy presents the expired certificate. Modern clients reject the connection immediately. The proxy logs a TLS handshake failure. All subsequent connections also fail. The entire application is unreachable via HTTPS.
+
+Root cause: Certificate renewal process is manual or the automated renewal system failed (certbot renewal cron stopped, Let's Encrypt DNS challenge failed, ACME client crashed).
+
+Blast radius: 100% of HTTPS traffic fails. If HTTP-to-HTTPS redirect is configured, HTTP traffic also fails (redirected to the dead HTTPS endpoint).
+
+Detection: A single pagerduty alert should exist: "TLS Certificate Expires in 7 Days." Most monitoring systems (Datadog, Prometheus with blackbox_exporter) can check certificate expiration via TCP/TLS probes. Set alerts at 30 days, 14 days, 7 days, and 1 day.
+
+Prevention: Automate certificate renewal with certbot or ACME (Let's Encrypt, cert-manager in Kubernetes). Test automated renewal in staging with a daily cron that simulates expiration by using a test certificate with 1-hour TTL.
+
+**Failure 5: Configuration Error Push**
+
+An engineer pushes a configuration change with a typo: `proxy_pass http://backend` becomes `proxy_pass http://bakend`. The proxy's `nginx -t` check passes (the syntax is valid, just pointing to a non-existent host). All traffic routes to a non-existent backend. The proxy returns 502 Bad Gateway for every request.
+
+<AsciiDiagram
+  id="reverse-proxies/config-error"
+  title="Configuration Error Push Blast Radius"
+  alt="Swimlane diagram showing how a typo in proxy config propagates through syntax check, deployment, and causes full outage"
+  caption="A syntax-valid but semantically incorrect configuration change can take down 100% of traffic"
+>{` 
+Configuration Error Chain Reaction
+ 
+Step 1: Engineer edits proxy.conf          
+  ┌──────────────────────────────────┐    
+  │ proxy_pass http://bakend;        │    
+  │ (typo: missing 'c' in backend)   │    
+  └─────────────┬────────────────────┘    
+                │                          
+Step 2: nginx -t (syntax check)           
+                │                          
+  ┌─────────────▼────────────────────┐    
+  │ Syntax OK. Configuration valid.   │    
+  │ nginx -t checks syntax, NOT       │    
+  │ hostname resolution. "bakend" is  │    
+  │ a valid hostname that does not    │    
+  │ resolve, but syntax passes.       │    
+  └─────────────┬────────────────────┘    
+                │                          
+Step 3: Deployment triggers reload         
+                │                          
+  ┌─────────────▼────────────────────┐    
+  │ nginx -s reload                  │    
+  │ Master starts new workers with   │    
+  │ bad config. Old workers drain.   │    
+  │ After drain: ALL traffic uses    │    
+  │ "http://bakend" (no DNS record)  │    
+  └─────────────┬────────────────────┘    
+                │                          
+Step 4: Full outage (100% traffic)         
+                │                          
+  ┌─────────────▼────────────────────┐    
+  │ Every request:                   │    
+  │  -&gt; DNS lookup for "bakend"      │    
+  │     -&gt; NXDOMAIN (no such host)   │    
+  │  -&gt; 502 Bad Gateway              │    
+  │  -&gt; Error rate: 100%             │    
+  │  -&gt; Blast radius: all endpoints  │    
+  │     on this proxy instance       │    
+  └─────────────┬────────────────────┘    
+                │                          
+Step 5: Detection and rollback            
+                │                          
+  ┌─────────────▼────────────────────┐    
+  │ Time to detection: 1-5 minutes   │    
+  │ (monitoring alert on 5xx spike)  │    
+  │ Time to rollback: +60 seconds    │    
+  │ Total outage: 2-6 minutes        │    
+  └──────────────────────────────────┘    
+ `}
+</AsciiDiagram>
+
+Root cause: Configuration validation tested syntax but not semantics. The proxy cannot know that "bakend" is a typo of "backend."
+
+Blast radius: 100% traffic affected until the configuration is fixed and reloaded. If the deployment system auto-reloads after push, blast radius starts immediately. If it requires a manual reload, the configuration sits in staging while production is unaffected.
+
+Detection: Error rate spikes from 0.5% to 100% 5xx. Dashboard showing healthy backends drops from 6/6 to 0/6 instantly.
+
+Prevention:
+- Use canary deployments: deploy the config change to 1 proxy instance first, run synthetic traffic for 60 seconds, verify all test requests pass.
+- Use configuration management with rollback: store previous config, auto-rollback if error rate increases 10x after deployment.
+- Add semantic validation: a CI step that resolves all hostnames in the config and verifies they exist.
+- Implement manual approval for proxy config changes in production.
+
+### Anti-Patterns Hall of Shame
+
+**Anti-Pattern 1: The Proxy-as-Database**
+
+You configure the reverse proxy to cache all database query results with a 24-hour TTL. The application never invalidates cache entries. After a week, every page shows data that is at least one day old. Users report: "I changed my profile picture and it still shows the old one." Engineering's response: "Clear the cache manually." This happens weekly.
+
+Why this seems reasonable: Caching is easy to configure. Setting a long TTL gives high hit rates and great performance numbers in dashboards. No code changes needed in the application.
+
+Production impact: Users lose trust in data freshness. Customer support spends 10 hours per week handling "stale data" tickets. Product team cannot ship features that require real-time updates.
+
+Correct pattern: Use short TTLs (30-300 seconds) for dynamic data, long TTLs (1-24 hours) for static content. Implement explicit cache invalidation from the application for write operations. Monitor cache hit rate AND staleness (time since last backend refresh).
+
+**Anti-Pattern 2: The Unlimited Connection Pool**
+
+You set `keepalive 4096` to avoid connection pool exhaustion, reasoning that more connections equals more capacity. The proxy machine has 16 GB RAM. Each idle connection costs approximately 3 KB in kernel memory (TCP buffer overhead). 4,096 idle connections per worker x 8 workers = 32,768 total idle connections. Kernel memory for TCP buffers: 32,768 * 3 KB = 96 MB just for idle sockets. When traffic spikes and all connections become active, each connection allocates a full buffer (16 KB read + 16 KB write), totaling 32,768 * 32 KB = 1 GB of buffer memory. Plus connection state objects (43 KB each, see performance characteristics), adding 32,768 * 43 KB = 1.4 GB. Total memory spike: 2.5 GB attributed to connections.
+
+Why this seems reasonable: "More is better" thinking. Connection pool exhaustion is scary, and this prevents it.
+
+Production impact: Memory pressure forces the kernel to swap. Swap I/O kills performance. The proxy slows to 10% of normal throughput. The node health check fails, and the auto-scaler replaces it. The new node repeats the cycle.
+
+Correct pattern: `keepalive 32-128`. Monitor pool utilization. If connections hit 80% of pool size, increase pool size or add more proxy instances. Each worker should have at most 2x the number of backend servers in its pool.
+
+**Anti-Pattern 3: Health Check on the Public Endpoint**
+
+You configure the load balancer health check to hit the public-facing `GET /health` endpoint — the same endpoint that proxies through to a database connection check. During a minor database replica failover (30-second blip), the health check fails. The load balancer removes the proxy instance. All connections on that instance are dropped. 16,000 concurrent users get connection reset.
+
+Why this seems reasonable: The health check should verify end-to-end functionality, including the database connection, right?
+
+Production impact: The health check creates a cascading failure. Minor database blip causes proxy removal, causing dropped connections, causing user retries (increased traffic), causing more load on the already-strained database.
+
+Correct pattern: Health checks should check the proxy process itself, not the full stack. Use a simple `GET /` that returns 200 if Nginx is running. The proxy's own health check file (`/health`) should be a static file served from disk, not a proxied request. Database health is checked by a separate monitoring system, not by the load balancer's proxy health check.
+
+**Anti-Pattern 4: Compression of Already-Compressed Data**
+
+You enable gzip compression on the proxy for all response types, including images, videos, and pre-compressed assets (`.gz`, `.zip`, `.jpg`). The proxy spends CPU compressing JPEG files that are already compressed. The compression achieves 0% reduction on JPEGs and PNGs, but consumes 5-10 ms of CPU per megabyte.
+
+Why this seems reasonable: "Compression makes everything smaller" and it is easier to enable gzip globally than to configure MIME type filters.
+
+Production impact: Proxy CPU is 40% higher than necessary. Throughput drops by 15-25% because CPU is the bottleneck for TLS + compression. Larger proxy instance size is needed, increasing cost.
+
+Correct pattern: Use `gzip_types` to compress only text-based content: `gzip_types text/plain text/css application/json application/javascript text/xml application/xml text/javascript`. Never compress images, videos, or pre-compressed archives. Use `gzip_disable "msie6"` to skip ancient browsers with broken gzip support.
+
+**Anti-Pattern 5: Blindly Following Default Timeouts**
+
+You deploy with default `proxy_read_timeout=60s` and `proxy_connect_timeout=60s` across all endpoints. An attacker sends a request to a slow endpoint, opens 5,000 connections, and holds them all open (by sending request bodies slowly, 1 byte per second). Each connection ties up a proxy worker slot and a backend connection. After 60 seconds, the proxy closes the connection, but the attacker immediately reconnects. This continues indefinitely. All 5,000 connections are tied up handling this one attacker, leaving zero capacity for legitimate users.
+
+Why this seems reasonable: Defaults exist for a reason. If a 60-second timeout was not safe, the project would not have chosen it.
+
+Production impact: Denial of service from a single slow client. 5,000 connections exhausted. All proxy workers busy. New connections queue or get refused.
+
+Correct pattern: Set aggressive timeouts per endpoint type:
+- `proxy_connect_timeout 5s` (backends should accept connections quickly)
+- `proxy_read_timeout 30s` for API endpoints, 120s for slow endpoints
+- `client_body_timeout 10s` (stop slow-body attacks)
+- `client_header_timeout 10s` (stop slow-header attacks)
+- `send_timeout 10s` (stop slow-client consumption)
+Implement connection rate limiting per IP: `limit_conn perip 10` limits any IP to 10 simultaneous connections.
+
+### When NOT to Use This
+
+A reverse proxy is the right tool for most production web applications, but there are situations where it adds unnecessary complexity.
+
+**Scale thresholds where no proxy is needed:**
+- Under 500 requests/second with a single backend server: a TLS-terminating reverse proxy still provides security benefits (hiding the backend IP, TLS termination), but you can skip caching, connection pooling, and load balancing. Use a simple Caddy or Nginx setup with minimal configuration.
+- Internal services on the same machine communicating via Unix sockets: a reverse proxy adds latency (even 0.1 ms overhead matters at 100,000+ internal calls/second) with no benefit because the services are not exposed to the internet.
+
+**Signs of over-engineering:**
+- You set up an API gateway with request aggregation and response transformation but your application has only 3 endpoints.
+- You configure a 50-instance proxy pool for an application serving 1,000 requests/second.
+- You implement a 3-region global proxy topology when all users are in one city.
+- You cache aggressively and then spend more engineering time on cache invalidation than you would have spent serving from the backend directly.
+- You use a reverse proxy to work around a slow backend instead of fixing the backend (e.g., caching a 5-second database query result rather than adding an index).
+
+**Simpler alternatives:**
+- Single server with TLS directly on the application (Go net/http with built-in TLS, Python with gunicorn + SSL) for small deployments under 500 requests/second.
+- CDN-only for static sites without dynamic backend logic.
+- Cloud load balancer only (AWS ALB, GCP HTTP LB) for simple routing without caching or request manipulation. ALB handles path-based routing, TLS termination, and health checks natively — you may not need a separate proxy.
+- Client-side retry and caching for mobile apps (HTTP cache headers + local storage) instead of proxy-level caching, eliminating the proxy layer entirely for read-heavy workloads.
+
+**When to choose the proxy despite the complexity:**
+- Multiple backend services with different routing rules.
+- Need for centralized security controls (rate limiting, IP blocking, WAF).
+- TLS termination for legacy backends that cannot handle HTTPS.
+- Traffic patterns require caching to meet latency SLAs.
+- Multiple development teams deploying independently to shared infrastructure.

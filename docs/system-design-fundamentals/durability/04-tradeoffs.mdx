@@ -1,0 +1,512 @@
+---
+id: durability-tradeoffs
+title: Durability Tradeoffs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Durability Tradeoffs
+
+Durability is not free. Every additional safety guarantee costs money, latency, throughput, or operational complexity. The right durability level depends on your data value, regulatory requirements, and performance budget.
+
+---
+
+## The Core Tension: Durability vs Performance
+
+Durability and write performance are fundamentally opposed. Every durability mechanism adds latency to the write path.
+
+<AsciiDiagram
+  title="Durability vs Performance — The Core Tradeoff"
+  content={`
+Durability Level                          Write Latency   Max Throughput
+────────────────────────────────────────────────────────────────────────
+No fsync, no WAL                             0.05 ms       500,000/s
+WAL + periodic fsync (every 100 ms)          0.1 ms        100,000/s
+WAL + fsync per transaction                  2 ms            5,000/s
+WAL + fsync + sync replica                   5 ms            2,000/s
+WAL + fsync + sync replicas (quorum=2)       10 ms           1,000/s
+WAL + fsync + sync replicas (quorum=3)       20 ms             500/s
+WAL + fsync + sync replicas + checksums      22 ms             450/s
+WAL + fsync + backup verification            25 ms             400/s
+
+Adding each safety layer multiplies latency.
+The question: which layer does your data need?
+  `}
+  alt="Table showing durability levels from no-fsync through synchronous replication with checksums and backup verification, with write latency increasing from 0.05ms to 25ms and throughput dropping from 500K to 400 writes per second"
+  caption="Each additional durability layer adds 2-10x latency and reduces throughput proportionally"
+/>
+
+### Latency Budget Breakdown
+
+A single durable write consumes latency at each stage. Understanding where the time goes helps you optimize.
+
+```
+Write path latency budget (enterprise NVMe, sync replication):
+
+Stage                         Latency      Cumulative
+──────────────────────────────────────────────────────
+1. Network RTT (client → app)  1ms          1ms
+2. Application processing      1ms          2ms
+3. WAL buffer write            0.01ms       2.01ms
+4. WAL fsync (NVMe)            1ms          3.01ms
+5. Data page modification      0.1ms        3.11ms
+6. Commit WAL record write     0.01ms       3.12ms
+7. Commit fsync                1ms          4.12ms
+8. Network send to replica     0.5ms        4.62ms
+9. Replica WAL write + fsync   1ms          5.62ms
+10. Replica ACK network        0.5ms        6.12ms
+11. Response to client         1ms          7.12ms
+
+Total p50 latency: ~7ms
+Total p99 latency: ~15ms (network jitter, queueing)
+
+If you remove synchronous replication:
+Total p50 latency: ~4ms (stages 8-10 eliminated)
+
+If you set synchronous_commit = off:
+Total p50 latency: ~3ms (stages 7-10 eliminated or async)
+
+Each millisecond saved is a tradeoff against durability.
+```
+
+### The Cost of fsync
+
+A single fsync call costs 1-15 milliseconds depending on storage hardware. During that time, the database thread is blocked. Database connection pools have a fixed number of connections. If every thread is blocked on fsync, new requests queue up.
+
+```
+Scenario: 100 connections, each doing 1 write per second
+  Without fsync:      100 writes/s, latency 1ms per write
+  With fsync (SSD):   100 writes/s, latency 3ms per write
+  With fsync (HDD):   100 writes/s, latency 12ms per write
+
+Throughput is the same in all three cases because
+fsync serializes writes within each connection.
+But latency and connection pool saturation differ:
+
+  fsync (HDD): each connection busy for 12ms of each second
+               12% utilization → connection pool is fine
+
+  fsync (HDD) + 100 writes/s per connection:
+               each connection busy for 1.2 seconds of each second
+               connection pool saturates → queueing delay → timeouts
+
+The fix: fewer connections doing batch writes with group commit.
+```
+
+### Cost of Durability by Infrastructure
+
+Durability has a direct infrastructure cost. Each additional copy, each additional fsync, each additional region multiplies the cost.
+
+```
+Cost comparison for a 1TB database system:
+
+Single node, no backups:
+  - 1 × r6g.xlarge: USD 320/month
+  - 1TB EBS gp3: USD 80/month
+  - Total: USD 400/month
+  - Durability: data lost on any storage failure
+
+Single node with daily backups:
+  - Same DB instance: USD 320/month
+  - 1TB EBS gp3: USD 80/month
+  - S3 backup (600GB compressed): USD 14/month
+  - Total: USD 414/month
+  - Durability: survive disk failure, up to 24h data loss
+
+Primary + sync replica + daily backups:
+  - Primary: r6g.xlarge × 1: USD 320/month
+  - Replica: r6g.xlarge × 1: USD 320/month
+  - Storage (primary): 1TB gp3: USD 80/month
+  - Storage (replica): 1TB gp3: USD 80/month
+  - S3 backup + WAL archive: USD 20/month
+  - Cross-region data transfer: USD 30/month
+  - Total: USD 850/month
+  - Durability: zero data loss on single-AZ failure
+
+Multi-region (active-passive):
+  - Primary region (us-east-1): r6g.xlarge × 2: USD 640/month
+  - Storage (us-east-1): USD 160/month
+  - DR region (us-west-2): r6g.xlarge × 1: USD 320/month
+  - Storage (us-west-2): 1TB gp3: USD 80/month
+  - WAL shipping (cross-region): USD 50/month
+  - S3 backup cross-region: USD 30/month
+  - Total: USD 1,280/month
+  - Durability: zero data loss, survive region failure
+
+Multi-cloud (AWS + GCP):
+  - Primary (AWS us-east-1): r6g.xlarge × 2: USD 640/month
+  - DR (GCP us-central1): n2-standard-8 × 1: USD 280/month
+  - Cross-cloud data transfer: USD 100/month
+  - S3 + GCS backup: USD 50/month
+  - Total: USD 1,070/month
+  - Durability: survive cloud provider failure
+```
+
+The cost difference between no backups and multi-region durability is approximately 3x. For most production systems, the difference between single-node and primary+replica is the right investment.
+
+### When Durability Is Overkill
+
+Some data does not need synchronous durability:
+
+- **Session cache data**: Redis with periodic snapshotting is fine. A few lost sessions are a minor inconvenience.
+- **Analytics clickstream**: Batch-processed log data where losing 0.1% of events is acceptable. Kafka with `acks=1` is adequate.
+- **CDN cache**: Purging the entire CDN and re-caching is better than synchronously writing every cached object to persistent storage.
+- **Ephemeral workspaces**: Temporary file storage for CI/CD builds. Recreated on next run.
+- **Read-only caches**: Replica data that can be rebuilt from the source of truth.
+
+For these cases, the cost of synchronous durability exceeds the value of the data.
+
+---
+
+## Decision Matrix
+
+The right durability configuration depends on your data's value, your regulatory obligations, and your performance requirements.
+
+<AsciiDiagram
+  title="Durability Configuration Decision Matrix"
+  content={`
+│ Data loss    │ Performance  │ Regulatory     │ Recommended              │
+│ tolerance    │ requirement  │ requirement    │ configuration            │
+├──────────────┼──────────────┼────────────────┼─────────────────────────┤
+│ Zero         │ Low          │ SOX, PCI, HIPAA│ sync_commit = on         │
+│              │ (under 1000/s)   │                │ replication = sync x 3  │
+│              │              │                │ backups = continuous WAL │
+│              │              │                │ cross-region = yes       │
+├──────────────┼──────────────┼────────────────┼─────────────────────────┤
+│ Zero         │ High         │ SOX, PCI, HIPAA│ sync_commit = on         │
+│              │ (> 10000/s)  │                │ replication = async x 3  │
+│              │              │                │ backups = WAL + snapshots│
+│              │              │                │ cross-region = async WAL │
+│              │              │                │ (batch group commit)      │
+├──────────────┼──────────────┼────────────────┼─────────────────────────┤
+│ under 1s         │ Medium       │ None           │ sync_commit = off        │
+│              │              │                │ replication = async x 2  │
+│              │              │                │ backups = hourly WAL     │
+│              │              │                │ cross-region = optional  │
+├──────────────┼──────────────┼────────────────┼─────────────────────────┤
+│ under 1 minute   │ High         │ None           │ sync_commit = off        │
+│              │              │                │ replication = async x 2  │
+│              │              │                │ backups = daily snapshot │
+│              │              │                │ cross-region = optional  │
+├──────────────┼──────────────┼────────────────┼─────────────────────────┤
+│ Any loss OK  │ Very high    │ None           │ No fsync                 │
+│              │              │                │ No WAL (memtable only)   │
+│              │              │                │ No replication           │
+│              │              │                │ No backups               │
+│              │              │                │ (cache-only systems)      │
+└──────────────┴──────────────┴────────────────┴─────────────────────────┘
+  `}
+  alt="Decision matrix with five configurations: zero-loss low-performance with full sync replication, zero-loss high-performance with async replication, sub-second loss tolerant, sub-minute loss tolerant, and any-loss-tolerant cache-only systems"
+  caption="Choose your durability configuration by data loss tolerance, performance needs, and regulatory requirements"
+/>
+
+---
+
+## CAP Positioning
+
+Durability relates to the CAP theorem's Partition Tolerance (P) and Consistency (C) properties.
+
+In the CAP formulation:
+- **Durability** is not explicitly one of the three CAP properties
+- It lives at the intersection of **Availability** and **Partition Tolerance**: when a partition occurs, can you still write durably?
+- Strong durability requires consensus, which requires a majority of nodes to confirm writes
+
+<AsciiDiagram
+  title="Durability in the CAP Theorem"
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│                    CAP THEOREM                                 │
+│                                                                │
+│           ┌───────────────┐                                    │
+│           │  Consistency  │                                    │
+│           │  (C)          │                                    │
+│           └───────┬───────┘                                    │
+│                   │                                             │
+│                   │  Linearizability = strong consistency       │
+│                   │  relates to synchronous replication         │
+│                   │                                             │
+│  ┌────────┐       │       ┌────────────┐                       │
+│  │Avail-  │───────┴──────►│ Partition  │                       │
+│  │ability │               │ Tolerance   │                       │
+│  │ (A)    │               │ (P)         │                       │
+│  └────────┘               └─────────────┘                       │
+│       │                        │                                │
+│       │                        │                                │
+│       └────────────────────────┘                                │
+│                    │                                             │
+│          Durability lives here                                  │
+│          When P happens, does A continue                         │
+│          with durable writes?                                    │
+│                                                                │
+│  CP systems:  Strong consistency + partition tolerance          │
+│    Durability via synchronous replication (quorum writes)       │
+│    Example: Spanner, Zookeeper, etcd                            │
+│    Tradeoff: non-leader partitions reject writes                │
+│                                                                │
+│  AP systems:  Availability + partition tolerance                │
+│    Durability via asynchronous replication (eventual)          │
+│    Example: Cassandra, DynamoDB (tunable)                       │
+│    Tradeoff: stale reads possible, conflict resolution needed   │
+│                                                                │
+│  CA systems:  Consistency + availability (no network partition)│
+│    Single-node durability via WAL + fsync                       │
+│    Example: Single PostgreSQL instance                          │
+│    Tradeoff: no partition tolerance (rare in distributed env)   │
+└──────────────────────────────────────────────────────────────────┘
+  `}
+  alt="CAP theorem diagram showing durability at the intersection of availability and partition tolerance, with CP, AP, and CA system examples and their durability approaches"
+  caption="Durability is constrained by the same CAP tradeoffs: strong durability with sync replication sacrifices availability during partitions"
+/>
+
+---
+
+## Failure Modes
+
+Durability guarantees are only as strong as your weakest link. Here are the most common failure modes that defeat durability protections.
+
+### Failure Mode 1: Bit Rot and Silent Data Corruption
+
+Data decays silently on storage media. A bit flips. No error is reported. The next time the data is read, it returns corrupted results.
+
+```
+Frequency: 1 in 10^14 to 10^16 bits read
+Detection: checksums, periodic scrubbing
+Mitigation: page-level checksums (PostgreSQL data_checksums = on)
+             filesystem checksums (ZFS, Btrfs)
+             application-level checksums on critical records
+             scrub all data at least every 30 days
+```
+
+**Real impact**: GitHub's MySQL cluster experienced silent data corruption in 2016 due to a corrupted data page that passed through their normal replication without detection. They had to restore from a backup taken 9 days earlier and lost 9 days of issue comments.
+
+### Failure Mode 2: Backup Corruption Without Alerting
+
+The backup process ran successfully, the backup file exists, checksums match during backup. But the tape or S3 object has a silent error that only appears during restore.
+
+```
+Frequency: 5-10% of backups have issues that would prevent restore
+Detection: automated restore testing
+Mitigation: quarterly automated restore tests
+             random row count validation after restore
+             checksums computed and verified at both backup and restore
+             separate monitoring: backup success ≠ backup usability
+```
+
+### Failure Mode 3: Incomplete Replication
+
+Replication lag is the silent killer. The primary acknowledges a write. The write is on the primary's WAL. But the replicas have not received it yet. The primary's disk fails. The write is gone.
+
+```
+Scenario:
+  T=0:   Write arrives at primary
+  T=1ms: WAL fsync on primary, ACK sent to client
+  T=5ms: Replication lag = 4ms (async replica behind)
+  T=6ms: Primary disk fails
+  T=7ms: Failover to replica
+  T=8ms: Replica is missing Write from T=0
+
+That write is permanently lost.
+
+Mitigation:
+  - Synchronous replication (write ACK only after replica confirms)
+  - Monitor replication lag and alert if > threshold
+  - For critical data: synchronous_commit = remote_write (PostgreSQL)
+```
+
+### Failure Mode 4: Human Error (Accidental Deletion)
+
+The most common cause of data loss. A human runs `DROP TABLE` or `DELETE FROM orders WHERE 1=1` without a WHERE clause.
+
+```
+Frequency: 1-2 incidents per 100 engineering teams per year
+Impact: varies — minutes to permanent loss
+Detection: immediate (query results change drastically)
+Mitigation:
+  - Point-in-time recovery (WAL archiving)
+  - Database roles: no direct DROP/DELETE in production
+  - Deployment automation: no manual SQL execution in prod
+  - Read-only replicas for reporting (no accidental mutation)
+  - "Confirm deployment" step for destructive operations
+  - 4-eyes principle: two engineers approve destructive actions
+```
+
+### Failure Mode 5: Storage Controller Firmware Bugs
+
+A bug in the storage controller firmware causes silent corruption. Because the controller lies at every layer — RAID, replication, backup — the corruption propagates to all copies.
+
+```
+Example incidents:
+  - Dell PERC H710 RAID controller firmware bug (2019):
+    In rare conditions, writes to a RAID-10 array returned
+    stale data from cache. Affected writes were 512 bytes
+    at specific alignment boundaries. Data was silently corrupted.
+
+  - NetApp ONTAP memory corruption bug (2020):
+    A firmware bug under high load caused memory corruption
+    in the write path. The corrupted data was written to all
+    RAID members and all snapshots.
+
+Mitigation:
+  - Checksums at the application level (above the storage stack)
+  - Scrubbing that reads through the entire stack
+  - Diversification: not all data on same storage hardware
+```
+
+---
+
+## Anti-Patterns
+
+### 1. No Backups
+
+The most common durability anti-pattern in early-stage startups. A single database with no backups handles months of growth. The founders believe "it has never failed." It will.
+
+```
+Anti-pattern: "RAID is our backup."
+Reality:      RAID protects against disk failure, not human error,
+              software bugs, ransomware, or site disasters.
+              RAID is redundancy, not backup.
+
+Fix:        3-2-1 rule: 3 copies, 2 different media, 1 offsite.
+             Daily backups with automated verification.
+```
+
+### 2. Same-Region Backups Only
+
+Backups stored in the same region as the primary data are vulnerable to region-wide outages. An AWS us-east-1 outage takes down both your primary and your backup.
+
+```
+Anti-pattern: "We backup to S3 in the same region."
+Reality:      S3 us-east-1 has had multi-hour outages.
+              A region-level event takes both primary and backup.
+
+Fix:         Cross-region replication for backups.
+             Secondary region with different cloud provider for critical data.
+```
+
+### 3. Relying Only on RAID
+
+RAID-5 and RAID-6 protect against disk failure. They do not protect against controller bugs, firmware corruption, accidental deletion, or file system corruption.
+
+```
+Anti-pattern: "We have RAID-6, our data is safe."
+Reality:      Controllers fail. Firmware corrupts. Humans delete.
+              A RAID rebuild stresses remaining disks and can trigger
+              secondary failures.
+
+Fix:         RAID + backups + replication. Defense in depth.
+```
+
+### 4. No Checksums
+
+Writing data without a checksum means you will not know when it corrupts. You might run a corrupt database for months before discovering the problem.
+
+```
+Anti-pattern: "Checksums add CPU overhead, we skip them."
+Reality:      CRC32C adds ~3% CPU overhead.
+              A single undetected corruption can cost millions.
+
+Fix:         Enable data checksums in the database.
+             Use a filesystem with checksums (ZFS, Btrfs).
+             Add application-level checksums for critical records.
+```
+
+### 5. Never Testing Restores
+
+A backup that has never been restored is a hope, not a plan. Many teams discover during actual emergencies that their backups are unusable.
+
+```
+Anti-pattern: "Our backup monitoring shows 'success' every day."
+Reality:      Backup success just means the copy was made.
+              It does not mean the copy is restorable.
+
+Fix:         Automated quarterly restore drills.
+             Random data validation after each restore.
+             RTO and RPO metrics tracked and reported.
+```
+
+---
+
+## When NOT to Optimize for Durability
+
+Durability is not always the right priority. Some systems trade durability for speed, cost, or simplicity intentionally.
+
+### Cache-Only Systems
+
+A CDN or application cache (Redis, Memcached) stores copies of data from a source of truth. Losing the cache means slower responses, not data loss.
+
+```
+Redis persistence options:
+  RDB (point-in-time snapshots):   dump every N seconds
+    Loss window: up to N seconds of writes
+    Performance: negligible during snapshot
+  
+  AOF (append-only file):         fsync every write or every second
+    Loss window: 0 or 1 second
+    Performance: 50% write throughput reduction
+    Disk usage: 2-5x more than RDB
+  
+  No persistence:                 purely in-memory
+    Loss window: entire dataset
+    Performance: maximum
+    Use case: ephemeral caches, session data with short TTL
+
+If your cache is truly a cache (data is reproducible from the primary
+database), then durability is an unnecessary expense.
+```
+
+### Ephemeral Environments
+
+CI/CD build servers, development databases, test environments, and staging environments with synthetic data do not need production durability.
+
+```
+The rule: if you can recreate the environment from automation
+in under an hour, you do not need backups or replication.
+
+Exception: environments with developer debug data that is
+expensive to reproduce. Consider daily snapshots for these.
+```
+
+### Event Streams with Offline Processing
+
+Some event processing systems accept bounded data loss. If a clickstream analytics pipeline loses 0.01% of events because a Kafka broker failed before replicating the latest segment, the analysis remains accurate.
+
+```
+The durability level should match the data's value.
+  - User authentication records: zero loss
+  - Clickstream events: 0.1% loss acceptable
+  - Server access logs: 1% loss acceptable
+  - Debug/trace logs: 10% loss acceptable, or no persistence
+```
+
+---
+
+## Summary Tradeoff Table
+
+<AsciiDiagram
+  title="Durability Decision Quick Reference"
+  content={`
+│ Requirement              │ Configuration                │ Cost impact │
+├──────────────────────────┼──────────────────────────────┼─────────────┤
+│ Zero data loss           │ synchronous_commit = on      │ 10x latency │
+│ Financial transactions   │ replication = sync x 3       │ vs async    │
+│                          │ cross-region backup          │             │
+├──────────────────────────┼──────────────────────────────┼─────────────┤
+│ Sub-second loss          │ synchronous_commit = off     │ 2x latency  │
+│ Session store            │ replication = async x 2      │ vs no rep   │
+│                          │ WAL archiving every second   │             │
+├──────────────────────────┼──────────────────────────────┼─────────────┤
+│ Minute-level loss        │ no fsync per transaction     │ same as     │
+│ Analytics / logs         │ batch commit every 30s       │ async       │
+│                          │ daily snapshot               │             │
+├──────────────────────────┼──────────────────────────────┼─────────────┤
+│ Accept permanent loss    │ no WAL, no replication       │ fastest     │
+│ Cache data               │ no backups                   │ cheapest    │
+│ Reproducible data        │                              │             │
+└──────────────────────────┴──────────────────────────────┴─────────────┘
+  `}
+  alt="Quick reference table mapping durability requirements (zero data loss through accept permanent loss) to configurations and cost impacts"
+  caption="Match your durability configuration to your data value. Not all data needs tattoo-level permanence."
+/>
+
+The tradeoffs you have seen — latency vs safety, cost vs durability, complexity vs guarantees — determine how you configure every storage system. The next page shows how the world's largest systems implement durability at planetary scale.

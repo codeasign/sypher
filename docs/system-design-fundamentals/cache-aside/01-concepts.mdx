@@ -1,0 +1,619 @@
+---
+id: cache-aside-concepts
+title: Understanding Cache-Aside
+sidebar_label: Mental Model
+position: 1
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Problem Story
+
+A database handles every read request. Every single one. When a user opens a profile page, the application sends `SELECT * FROM users WHERE id = 42`. When they refresh, another identical query. When a thousand users visit the same profile simultaneously, the database processes the same query a thousand times.
+
+This is the bottleneck problem. Databases are optimized for durability and consistency, not for repeated reads of the same data. Each query involves parsing SQL, planning execution, reading pages from disk (or buffer pool), and serializing the result. Doing this 50,000 times per second for the same 10 rows of data wastes CPU, memory bandwidth, and disk I/O.
+
+The pain points accumulate:
+
+- **Database connections saturate.** Connection pools max out at 100-200 connections per instance. When every read goes to the database, a traffic spike exhausts the pool, and requests queue or fail.
+
+- **Read replicas lag or fall over.** You add read replicas to distribute the load, but each replica still runs the same queries. With 50,000 reads per second across 10 replicas, each replica handles 5,000 queries per second -- well past the comfort zone for most PostgreSQL or MySQL instances.
+
+- **Response times degrade.** Database queries take 10-100 milliseconds for simple lookups under load. A page that needs 5 database queries adds 50-500 milliseconds before the first byte of HTML is sent.
+
+- **Cost skyrockets.** Scaling databases vertically (bigger instances) hits diminishing returns beyond 16-32 vCPUs. Horizontally scaling read replicas multiplies cost linearly with traffic. A 10x traffic increase means 10x more database infrastructure.
+
+The core observation: most of these queries return the same data. The user's profile name doesn't change between refreshes. The product catalog changes once a day. The configuration settings are read 10,000 times per write.
+
+## The Insight
+
+Cache-aside is a caching strategy where the application code explicitly manages the cache, checking it before querying the database and populating it after a miss. The application is responsible for loading data into the cache and keeping it coherent.
+
+The mental model is a kitchen analogy. You need eggs. You check your refrigerator (the cache) first. If eggs are there, you use them -- that is a cache hit. If the fridge is empty, you walk to the grocery store (the database), buy eggs, bring them home, and put them in the fridge for next time -- that is a cache miss with population.
+
+```
+Checks fridge -> Has eggs? -> Cook breakfast
+               -> No eggs?  -> Go to store -> Buy eggs -> Stock fridge -> Cook breakfast
+```
+
+The cache is your fast, local copy of data that changes infrequently. The database is the source of truth that is slower but authoritative.
+
+This pattern is called "cache-aside" because the cache sits alongside the database, not between the application and the database. The application actively manages both, deciding when to read from cache and when to bypass it.
+
+## Core Vocabulary
+
+**Cache hit.** A request where the data is found in the cache. The application returns the cached value without touching the database. Hits are fast (0.5-5 milliseconds) and cheap. They are the desired outcome of caching.
+
+**Cache miss.** A request where the data is not found in the cache. The application must query the database to fetch the data, then populate the cache for future requests. Misses are expensive (10-200 milliseconds) because they incur both the database query and the cache population overhead.
+
+**Cache population (or seeding).** The act of writing data into the cache after a miss. The application takes the database result, serializes it, sets a TTL, and stores it. Population happens on every miss, which means the first request for any piece of data is always slow.
+
+**Time-to-live (TTL).** A duration assigned to each cache entry, after which the entry is automatically evicted. TTL is the primary mechanism for eventual consistency in cache-aside. A 300-second TTL means data is at most 5 minutes stale. TTL prevents stale data from living in the cache indefinitely.
+
+**Stale data.** Data in the cache that no longer matches the database. Staleness is the cost of caching. A cache returns data that was fresh at the time of population but may have been updated in the database since. TTL bounds the maximum staleness window.
+
+**Lazy loading (read-through).** A variant where the cache itself fetches the data from the database on a miss. In cache-aside, the application does the fetching. In read-through, the cache library or middleware handles it transparently.
+
+**Write-through.** A strategy where writes go to both cache and database synchronously. This is not cache-aside; it is a different pattern for write handling. Cache-aside typically handles writes by invalidating the cache entry rather than updating it.
+
+**Cache invalidation.** Removing or updating a cache entry when the underlying data changes. Invalidation is the hardest problem in caching. With cache-aside, invalidation usually means deleting the stale key so the next read triggers a miss and fetches fresh data.
+
+**Thundering herd (cache stampede).** A failure mode where many concurrent requests miss the cache simultaneously and all query the database. This happens when a popular cache key expires. The database sees a sudden spike of identical queries, which can overwhelm it.
+
+**Cache warming (pre-warming).** Actively populating the cache before traffic arrives, rather than waiting for misses. Pre-warming loads frequently accessed data (hot keys) during deployment or after a cache restart, preventing cold-start misses.
+
+**Eviction policy.** The algorithm the cache uses to decide which entries to remove when memory is full. Common policies: LRU (least recently used), LFU (least frequently used), FIFO (first in, first out), TTL-based expiration.
+
+**Empty cache warmup.** The initial period after a cache node starts where every request is a miss. All data must be loaded from the database, creating high load on the database and slow responses for users.
+
+**Cache-aside penalty.** The extra latency added by a cache miss compared to a direct database query. This includes serialization overhead, network round-trip to the cache server, and deserialization. In well-tuned systems, this penalty is under 5 milliseconds.
+
+**Hot key.** A cache key that receives significantly more traffic than others. A celebrity user's profile, a trending product, or a viral post. Hot keys can saturate a single cache node even when the cluster has spare capacity.
+
+## The Big Picture
+
+<AsciiDiagram
+  id="cache-aside/big-picture-flow"
+  title="Cache-Aside Read Flow"
+  alt="Application checks cache first, returns on hit, or queries database on miss and populates cache"
+  content={`
+┌──────────────┐     ┌──────────────────┐
+│  Application  │     │  { Cache Layer } │
+│  (Web Server) │────>│  Redis / MC     │
+└──────┬───────┘     └────────┬─────────┘
+       │                      │
+       │  (1) GET key         │
+       │  (2) Hit -> return   │
+       │  (3) Miss -> fetch   │
+       │                      │
+       │         ┌────────────┴──────────┐
+       │         │   (( Database ))      │
+       └────────>│   Primary / Replica   │
+                 └───────────────────────┘
+
+       Hit path:    (1)->(2)                     → response
+       Miss path:   (1)->(3)->query DB->populate → response
+  `}
+/>
+
+The flow has two paths. On a cache hit, the request completes in a single cache round-trip. On a cache miss, the request pays the database penalty plus the cache population cost. The system aims to maximize the hit path and minimize the miss path.
+
+## How It Actually Works
+
+### Step-by-Step: Cache Hit
+
+A cache hit follows this sequence:
+
+1. Application receives a request for data identified by key `user:42:profile`
+2. Application calls `cache.get("user:42:profile")`
+3. The cache client hashes the key to determine the responsible cache node
+4. The cache node performs O(1) hash table lookup on the key
+5. The cache node checks the TTL: entry was set 120 seconds ago with TTL of 300 seconds -- still valid
+6. The cache node reads the serialized value (JSON blob, 2 KB)
+7. The cache node sends the value back to the client
+8. The cache client deserializes the JSON into the application's data structure
+9. Application returns the data to the caller
+10. Total elapsed: 1-3 milliseconds
+
+<AsciiDiagram
+  id="cache-aside/cache-hit-sequence"
+  title="Cache Hit Sequence Diagram"
+  alt="Sequence of requests and responses during a cache hit showing the fast path"
+  content={`
+┌──────────┐    ┌──────────┐    ┌──────────┐
+│  Caller   │    │   App    │    │  Cache   │
+└────┬─────┘    └────┬─────┘    └────┬─────┘
+     │               │               │
+     │  GET profile  │               │
+     │──────────────>│               │
+     │               │  GET key      │
+     │               │──────────────>│
+     │               │               │  hash(key)->node
+     │               │               │  ────────────────
+     │               │               │  hash table O(1)
+     │               │               │  TTL check: alive
+     │               │               │  ────────────────
+     │               │     value     │  deserialize
+     │               │<──────────────│
+     │   response    │  deserialize  │
+     │<──────────────│               │
+     │               │               │
+
+  Fast path: under 5ms
+  No database touched
+  `}
+/>
+
+### Step-by-Step: Cache Miss
+
+A cache miss is more expensive. The request that misses pays both the database query cost and the cache population cost.
+
+1. Application receives request for key `user:42:profile`
+2. Application calls `cache.get("user:42:profile")`
+3. Cache client hashes the key, routes to the cache node
+4. Cache node performs hash table lookup -- key not found (or TTL expired)
+5. Cache node returns nil/miss
+6. Application must query the database
+7. Application constructs SQL: `SELECT name, email, avatar FROM users WHERE id = 42`
+8. Database parses the SQL, plans the query (or uses cached plan), executes
+9. Database returns the row: `{name: "Alice", email: "alice@example.com", avatar: "url"}`
+10. Application deserializes the database result into a struct or dict
+11. Application serializes the data for caching: `json.dumps(result)` (2 KB)
+12. Application calls `cache.set("user:42:profile", serialized_data, ttl=300)`
+13. Cache client sends the data to the cache node
+14. Cache node stores the key-value pair with TTL, may trigger eviction
+15. Application returns the data to the caller
+16. Total elapsed: 20-150 milliseconds
+
+<AsciiDiagram
+  id="cache-aside/cache-miss-sequence"
+  title="Cache Miss Sequence Diagram"
+  alt="Sequence of requests during a cache miss showing the expensive path through database"
+  content={`
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────────┐
+│  Caller   │    │   App    │    │  Cache   │    │  Database    │
+└────┬─────┘    └────┬─────┘    └────┬─────┘    └──────┬───────┘
+     │               │               │                 │
+     │  GET profile  │               │                 │
+     │──────────────>│  GET key      │                 │
+     │               │──────────────>│                 │
+     │               │    nil/miss   │  key not found  │
+     │               │<──────────────│  or expired     │
+     │               │               │                 │
+     │               │  SQL query    │                 │
+     │               │────────────────────────────────>│
+     │               │               │                 │ parse plan exec
+     │               │   row data    │                 │ ───────────────
+     │               │<────────────────────────────────│
+     │               │                               │
+     │               │  serialize -> SET key          │
+     │               │──────────────>│                 │
+     │               │               │  store+TTL     │
+     │   response    │               │                 │
+     │<──────────────│               │                 │
+     │               │               │                 │
+
+  Miss path: 20-150ms
+  Database touched + cache populated
+  `}
+/>
+
+### TTL Check Mechanics
+
+The TTL check is not free. Each get operation involves:
+
+1. Read the key's entry from the hash table (O(1))
+2. Read the stored expiration timestamp
+3. Compare against the current time (wall clock on the cache node)
+4. If expired: delete the entry, return nil
+5. If valid: return the value, optionally update the LRU position
+
+<AsciiDiagram
+  id="cache-aside/ttl-check-detail"
+  title="TTL Check Internal Detail"
+  alt="How the cache checks whether a key has expired by comparing stored expiration time with current time"
+  content={`
+  Hash table lookup
+  ┌─────────────────────┐
+  │ key: "user:42"       │
+  │ value: "{...}"       │
+  │ expires_at: 17198712 │  <-- stored as epoch seconds
+  │ lru_next: ptr        │
+  │ lru_prev: ptr        │
+  └──────────┬──────────┘
+             │
+             ▼
+  TTL check: expires_at > now() ?
+  ┌─────────────────┐              ┌──────────────────┐
+  │ YES: return value│─────────────>│  Also update LRU │
+  └─────────────────┘              └──────────────────┘
+  ┌─────────────────┐
+  │ NO: delete key   │─────────────> return nil to caller
+  └─────────────────┘
+
+  TTL granularity: seconds or milliseconds
+  Clock skew between cache nodes can cause premature expiry
+  `}
+/>
+
+### The Serialization Layer
+
+Every cache operation involves serialization on write and deserialization on read. This is a hidden cost that matters at scale.
+
+**On write (cache population):**
+- Application data structure (dict, object) -> bytes
+- Cost: CPU for encoding, memory allocation for the byte buffer
+- JSON: 1-5 microseconds for a 2 KB object
+- Protocol Buffers: 0.5-2 microseconds but requires schema
+- MessagePack: 1-3 microseconds, more compact than JSON
+
+**On read (cache hit):**
+- Bytes -> application data structure
+- Cost: same as serialization, plus memory for the decoded object
+- Python's `json.loads` takes roughly 2-4 microseconds per kilobyte
+
+At 10,000 cache hits per second, serialization alone consumes 20-40 milliseconds of CPU per second -- but on a single core at 2.5 GHz, that's 5-10% of one core. Spread across multiple cores and instances, it is negligible until you reach 100,000+ operations per second per instance.
+
+## Variants
+
+### Cache-Aside with TTL
+
+The simplest and most common variant. Every cache entry has a TTL. The application does not explicitly invalidate entries -- it lets TTL expiry trigger a miss and re-population.
+
+```
+Read:  cache.get(key)
+       hit  -> return value (TTL ensures eventual freshness)
+       miss -> db.query(key) -> cache.set(key, value, ttl) -> return
+
+Write: db.write(key, new_value)
+       # TTL will handle eventual consistency
+       # Optionally: cache.delete(key) for faster propagation
+```
+
+<AsciiDiagram
+  id="cache-aside/ttl-variant-flow"
+  title="Cache-Aside with TTL Only"
+  alt="Simple variant where TTL expiry is the only invalidation mechanism"
+  content={`
+  READ PATH                          WRITE PATH
+  ┌──────────┐                      ┌──────────┐
+  │ Request  │                      │ Request  │
+  └────┬─────┘                      └────┬─────┘
+       │                                  │
+       ▼                                  ▼
+  ┌──────────┐                      ┌──────────┐
+  │[App] GET │                      │[App]     │
+  │ cache    │                      │ DB write │
+  └────┬─────┘                      └────┬─────┘
+       │                                  │
+    ┌──┴──┐                               ▼
+    │ Hit?│                        ┌──────────┐
+    └──┬──┘                        │(( DB ))  │
+   YES │  NO                       │ updated  │
+       │    │                      └──────────┘
+       ▼    ▼                            │
+  ┌──────┐ ┌──────────────┐              │
+  │return│ │[App] DB query│              │
+  └──────┘ └──────┬───────┘              │
+                  │                      │
+                  ▼                      │
+            ┌──────────┐                 │
+            │{Cache}   │<────────────────┘ (optional delete)
+            │ SET ttl  │
+            └──────────┘
+                  │
+                  ▼
+            ┌──────────┐
+            │ return   │
+            └──────────┘
+  `}
+/>
+
+**When to use this variant:** Read-heavy workloads where TTL-based staleness is acceptable. Social media feeds, content delivery, configuration data, static reference data. The simplicity is the biggest advantage -- no complex invalidation logic in the application.
+
+### Cache-Aside with Explicit Invalidation
+
+The application explicitly deletes or updates cache entries when the underlying data changes, in addition to TTL-based expiry.
+
+```
+Read:  cache.get(key)
+       hit  -> return
+       miss -> db.query(key) -> cache.set(key, value, ttl) -> return
+
+Write: db.write(key, new_value)
+       cache.delete(key)  # or cache.set(key, new_value)
+       return
+```
+
+<AsciiDiagram
+  id="cache-aside/explicit-invalidation-flow"
+  title="Cache-Aside with Explicit Invalidation"
+  alt="Variant where write operations explicitly delete or update cache entries for tighter consistency"
+  content={`
+  READ PATH                          WRITE PATH
+  ┌──────────┐                      ┌──────────┐
+  │ Request  │                      │ Request  │
+  └────┬─────┘                      └────┬─────┘
+       │                                  │
+       ▼                                  ▼
+  ┌──────────┐                      ┌──────────┐
+  │[App] GET │                      │[App]     │
+  │ cache    │                      │ DB write │
+  └────┬─────┘                      └────┬─────┘
+       │                                  │
+    ┌──┴──┐                               ▼
+    │ Hit?│                        ┌──────────┐
+    └──┬──┘                        │(( DB ))  │
+   YES │  NO                       │ saved    │
+       │    │                      └────┬─────┘
+       ▼    ▼                           │
+  ┌──────┐ ┌──────────────┐             │
+  │return│ │[App] DB query│             ▼
+  └──────┘ └──────┬───────┘      ┌──────────┐
+                  │              │[App] DEL │
+                  ▼              │ cache key│
+            ┌──────────┐         └────┬─────┘
+            │{Cache}   │              │
+            │ SET ttl  │              ▼
+            └──────────┘       ┌──────────┐
+                  │            │{Cache}   │
+                  ▼            │ deleted  │
+            ┌──────────┐       └──────────┘
+            │ return   │
+            └──────────┘
+  `}
+/>
+
+**When to use this variant:** Write-heavy workloads where stale data causes visible problems. User profiles, payment status, inventory counts, any data where freshness within seconds matters more than strict consistency.
+
+### Cache-Aside with Pre-Warming
+
+Pre-warming loads frequently accessed data into the cache before user traffic hits. This is done during deployment, after a cache restart, or on a schedule.
+
+```
+Deployment:   warmup_script.py
+              for each hot_key in HOT_KEYS:
+                  value = db.query(hot_key)
+                  cache.set(hot_key, value, ttl=3600)
+
+Traffic:      normal cache-aside reads
+```
+
+<AsciiDiagram
+  id="cache-aside/prewarming-flow"
+  title="Cache-Aside with Pre-Warming"
+  alt="Pre-warming variant where a warmup script populates hot keys before traffic arrives"
+  content={`
+  ┌───────────────────────────────────────────────────┐
+  │              Deployment Pipeline                  │
+  │                                                   │
+  │  ┌──────────┐   ┌──────────┐   ┌──────────┐      │
+  │  │ Deploy   │──>│ Warmup   │──>│ Health   │      │
+  │  │ App      │   │ Cache    │   │ Check    │      │
+  │  └──────────┘   └────┬─────┘   └──────────┘      │
+  │                      │                            │
+  └──────────────────────┼────────────────────────────┘
+                         │
+                         ▼
+                   ┌──────────────┐
+                   │  Pre-Warm    │
+                   │  Script      │
+                   └──────┬───────┘
+                          │
+            ┌─────────────┴─────────────┐
+            │                           │
+            ▼                           ▼
+      ┌──────────────────┐    ┌──────────────────┐
+      │  (( Database ))   │    │  { Cache }       │
+      │  SELECT hot_keys  │    │  SET key=value   │
+      └──────────────────┘    │  ttl=3600        │
+                              └──────────────────┘
+                                    │
+                                    ▼
+                            ┌──────────────────┐
+                            │  Cache is warm   │
+                            │  0 misses on     │
+                            │  first request   │
+                            └──────────────────┘
+  `}
+/>
+
+**When to use this variant:** Launch events, after cache cluster restarts, daily batch loads, promotions where specific items will see sudden high traffic. Pre-warming costs extra engineering effort but prevents the thundering herd during traffic spikes.
+
+### Cache-Aside with Stale-While-Revalidate
+
+A refinement of cache-aside where the cache returns stale data while asynchronously refreshing the value in the background. This eliminates the miss penalty for the user who triggers the refresh.
+
+```
+Read:  cache.get(key)
+       hit (fresh)     -> return immediately
+       hit (stale)     -> return stale data, trigger async refresh
+       miss            -> db.query(), cache.set(), return
+
+Async refresh (for stale hit):
+       db.query(key) -> cache.set(key, value, ttl) -> done
+       User already got the stale response, gets fresh on next request
+```
+
+<AsciiDiagram
+  id="cache-aside/stale-while-revalidate"
+  title="Stale-While-Revalidate Variant"
+  alt="Variant where stale data is served immediately while a background refresh populates the cache with fresh data"
+  content={`
+  READ PATH
+  ┌──────────┐
+  │ Request  │
+  └────┬─────┘
+       │
+       ▼
+  ┌──────────┐
+  │[App] GET │
+  │ cache    │
+  └────┬─────┘
+       │
+  ┌────┴────────────────────┐
+  │  Result classification  │
+  └────┬────────────────────┘
+       │
+  ┌────┴────┐  ┌────┴──────┐  ┌────┴──────┐
+  │ Fresh   │  │ Stale     │  │ Miss      │
+  │ (hit)   │  │ (expired) │  │ (no key)  │
+  └────┬────┘  └────┬──────┘  └────┬──────┘
+       │           │           │
+       ▼           │           ▼
+  ┌──────────┐     │     ┌──────────────┐
+  │ Return   │     │     │[App] DB query│
+  │ cached   │     │     └──────┬───────┘
+  └──────────┘     │            │
+                   ▼            ▼
+            ┌──────────────┐ ┌──────────────┐
+            │ Return stale │ │{Cache}       │
+            │ Trigger async│ │ SET fresh    │
+            │ refresh      │ │              │
+            └──────┬───────┘ └──────────────┘
+                   │
+                   ▼
+            ┌──────────────────┐
+            │  Background Job  │
+            │  DB.query(key)   │
+            │  cache.set(key)  │
+            └──────────────────┘
+  `}
+/>
+
+**When to use this variant:** Systems where serving a slightly stale response (under 1 second old) is acceptable and you want to minimize the p99 latency impact of cache misses. News feeds, content pages, recommendation lists.
+
+## Cache-Aside vs. Database-Level Caching
+
+Many databases implement their own internal caching (PostgreSQL's shared_buffers, MySQL's InnoDB buffer pool, MongoDB's WiredTiger cache). Understanding the difference between these and application-level cache-aside is important for choosing the right caching strategy.
+
+| Aspect | Database Buffer Pool | Cache-Aside (Redis) |
+|--------|---------------------|---------------------|
+| Location | Inside the database process | External Redis cluster |
+| Data stored | Raw database pages (8-16 KB) | Serialized application objects |
+| Query speedup | Avoids disk reads only | Avoids entire query execution |
+| Cache key | Page number | Application-defined key |
+| Cache content | Same as disk (pages) | Transformed data (aggregates, joins) |
+| TTL | None (page stays until evicted) | Configurable per key |
+| Staleness | None (always consistent with disk) | Possible (TTL or invalidation) |
+
+**Example of overlap:** You query `SELECT name, email FROM users WHERE id = 42`. The database's buffer pool caches the database page containing row 42. If another query asks for `SELECT avatar, bio FROM users WHERE id = 42`, the page is still cached, so the database avoids a disk read. But the database must still parse the SQL, check permissions, locate the row within the page, and serialize the result.
+
+With cache-aside, the application stores `{"name": "Alice", "email": "alice@x.com"}` directly in Redis. A subsequent read returns the pre-serialized object in under 1 millisecond, avoiding all database processing.
+
+The two caches are complementary. The database buffer pool is always active and reduces disk I/O. Cache-aside sits above it and reduces query processing overhead. Both layers improve performance, but cache-aside provides a 10-50x greater improvement per request.
+
+## Mental Model Check
+
+### Question 1
+You build a social media feed. Each user request loads 50 posts. Without caching, every feed load generates 50 database queries. With cache-aside set to a 5-minute TTL, what happens when a user reloads their feed after 30 seconds?
+
+**Answer:** After 30 seconds, the cache entries set during the first load are still within the 5-minute TTL window. Every post that was cached produces a cache hit. The feed loads in 1-3 milliseconds per post instead of 10-50 milliseconds per database query. Posts created since the first load are not in the cache and trigger misses (plus population). The overall latency drops from 500-2500 milliseconds to 50-150 milliseconds.
+
+### Question 2
+Your cache server runs out of memory. What happens to cache-aside behavior?
+
+**Answer:** The eviction policy activates. The cache removes the least recently used entries to make space for new ones. Frequently accessed keys remain cached. Cold keys are evicted first. This is graceful degradation -- the system continues working, but cache hit ratio drops because evicted keys now cause misses. The application does not crash; it just runs slower as more requests fall through to the database.
+
+### Question 3
+You update a user's email address in the database. The cache still holds the old email with a TTL of 10 minutes. How does cache-aside handle this?
+
+**Answer:** In the basic cache-aside with TTL variant, nothing happens immediately. The cache returns the old email until the TTL expires (up to 10 minutes). This is eventual consistency. In the explicit invalidation variant, the write handler deletes the cache key, so the next read triggers a miss and fetches the new email from the database. The explicit variant reduces the staleness window from minutes to milliseconds.
+
+### Question 4
+A celebrity posts a tweet and 1 million users load their feeds in the same second. The cache key for the tweet does not exist yet (it was just created). What happens?
+
+**Answer:** This is a thundering herd. The first 1 million feed loads all discover the cache miss for the new tweet's key. Without protection, all 1 million requests hit the database simultaneously, asking for the same tweet. The database may crash or become severely degraded. Protection strategies include: (a) mutex/locking so only one request populates the cache while others wait; (b) pre-warming the tweet into the cache when it is created; (c) using a read-through cache that serializes concurrent misses.
+
+### Question 5
+Your cache-aside system uses Redis with 1 GB memory. Each cache entry averages 5 KB. What is the maximum number of entries the cache can hold, and what happens at that limit?
+
+**Answer:** Maximum entries = 1 GB / 5 KB = approximately 200,000 entries. When the limit is reached, Redis's eviction policy (default: noeviction, but commonly configured as allkeys-lru) activates. With allkeys-lru, Redis evicts the least recently used entries. Frequently accessed entries survive; rarely accessed ones are evicted. The eviction process itself consumes CPU cycles but is typically under 1 microsecond per eviction. The system continues operating with a reduced hit ratio.
+
+## Real-World Latency Comparison
+
+Understanding the latency difference between cache hits and database queries helps you make informed decisions about when cache-aside is worth the complexity.
+
+### Typical Latencies by Data Source
+
+| Data Source | p50 Latency | p99 Latency | Throughput (single connection) |
+|-------------|-------------|-------------|-------------------------------|
+| In-process cache (dict) | 0.001 ms | 0.010 ms | 1,000,000+ ops/sec |
+| Local Redis (same host) | 0.3 ms | 2 ms | 100,000 ops/sec |
+| Remote Redis (same DC) | 1 ms | 5 ms | 50,000 ops/sec |
+| Memcached (same DC) | 0.8 ms | 4 ms | 60,000 ops/sec |
+| PostgreSQL (simple select) | 5 ms | 50 ms | 5,000 ops/sec |
+| MySQL (simple select) | 5 ms | 100 ms | 3,000 ops/sec |
+| Elasticsearch (simple query) | 10 ms | 200 ms | 1,000 ops/sec |
+| External API call | 50 ms | 500 ms | 100 ops/sec |
+
+The gap between cache and database is 5x to 50x for simple operations and grows to 500x for complex queries or external APIs.
+
+### Latency Impact on User Experience
+
+```
+Request Path:
+  Browser -> CDN -> App Server -> Cache -> Database
+
+No caching:
+  Page load = 50ms (network) + 50ms (app) + 200ms (5 DB queries at 40ms each)
+            = 300ms total
+
+With 90% cache hit ratio:
+  Page load = 50ms (network) + 50ms (app) + (0.9 * 5 * 1ms) + (0.1 * 5 * 40ms)
+            = 50ms + 50ms + 4.5ms + 20ms
+            = 124.5ms total
+
+Saving: 175ms per page load (58% faster)
+```
+
+At 10 million page loads per day, a 175ms saving per page saves 486 hours of total user waiting time per day.
+
+### Cache-Aside vs Other Patterns
+
+Cache-aside is one of several caching patterns. The choice depends on whether reads or writes dominate, and whether the cache is embedded in the application or managed separately.
+
+**Cache-aside vs Read-through Cache:**
+
+In a read-through cache, the cache library or middleware automatically fetches data from the database on a miss. The application calls `cache.get(key)` and the cache handles the fallback transparently. The application never directly queries the database for data that flows through the cache.
+
+```
+Cache-aside:
+  result = cache.get(key)
+  if result is None:
+      result = db.query(...)
+      cache.set(key, result, ttl=300)
+  return result
+
+Read-through:
+  result = cache.get(key)
+  # Cache library queries DB on miss, populates cache, returns
+  return result
+```
+
+Read-through reduces application complexity but requires that the cache library has database access, which couples the cache to the data source. Cache-aside keeps the application in control, which is better for systems where the cache is an optimization layer that can be bypassed.
+
+**Cache-aside vs Write-through Cache:**
+
+In a write-through cache, every write goes to both the cache and the database synchronously. The application writes to the cache, and the cache writes to the database before acknowledging the write.
+
+```
+Cache-aside (write path):
+  db.write(key, new_data)
+  cache.delete(key)     # or cache.set(key, new_data)
+
+Write-through (write path):
+  cache.write(key, new_data)  # cache writes to DB internally
+```
+
+Write-through provides stronger consistency (the cache is always up-to-date) but adds latency to every write and couples the cache to the database for writes. Cache-aside's write path is faster (just delete the cache key) but creates a staleness window.
+
+**Cache-aside vs Write-behind (Write-back) Cache:**
+
+In a write-behind cache, the application writes to the cache, and the cache asynchronously writes to the database. This provides the fastest write path but risks data loss if the cache node crashes before the asynchronous write completes.
+
+Cache-aside never buffers writes -- the database is always the source of truth. This makes cache-aside safer for systems where data durability matters.
+
+## Summary
+
+Cache-aside is a simple, powerful caching pattern where the application manages the cache explicitly. It provides significant performance improvements for read-heavy workloads with eventual consistency semantics. The key parameters to tune are TTL duration, eviction policy, serialization format, and cache size. The main failure modes are thundering herds on cache miss for hot keys, stale data within the TTL window, and cold-start performance after a cache node restart.

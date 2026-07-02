@@ -1,0 +1,565 @@
+---
+id: memcached-architecture
+title: Memcached at Scale
+position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest possible Memcached deployment is a single instance on a single server. It works for small projects and early-stage products, but it fails in predictable ways as you grow.
+
+<AsciiDiagram
+  id="memcached/architecture-naive"
+  title="Single-Node Memcached Deployment"
+  alt="Simple diagram: one application server connected to one Memcached instance with 4 GB RAM and one database server"
+  caption="A single Memcached node is simple but fragile at scale"
+>{`
+┌──────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│ [App Server] │────>│  {Memcached}     │     │ ((PostgreSQL))   │
+│              │     │  4 GB RAM        │────>│  1 TB storage    │
+│  10K QPS     │     │  1 node          │     │  primary         │
+└──────────────┘     │  SPOF            │     └──────────────────┘
+                     └──────────────────┘
+`}</AsciiDiagram>
+
+### What Breaks at Each Scale Tier
+
+**At 1,000 DAU (Daily Active Users) — Fine.**
+
+The single-node setup works perfectly. Your working set fits in 4 GB, QPS is under 100, and a crash just means a few seconds of degraded performance while the cache warms up.
+
+**At 100,000 DAU — Three Problems.**
+
+Problem 1: **Single point of failure.** If the Memcached server crashes, all cache data is lost. Every request hits the database simultaneously — a thundering herd problem. Your database spike from 100 QPS to 10,000 QPS can cause a cascading failure.
+
+Problem 2: **Memory limit.** 4 GB might not hold your active working set. Your eviction rate climbs above 10%, meaning most "cached" data gets evicted before it can be reused. Your effective cache hit ratio drops to 40-60%, defeating the purpose of caching.
+
+Problem 3: **Single node throughput bottleneck.** One server can handle perhaps 200,000 QPS under ideal conditions. At 100,000 DAU with 50 requests per user per day (average for a social app), your peak QPS might hit 150,000. You are near the ceiling with no headroom.
+
+**At 10 million DAU — Complete Breakdown.**
+
+- Single node memory: impossible. A 10M DAU app with 200 bytes per user of cached data needs 2 GB for user data alone, plus sessions, content, and API responses. You need 100+ GB of cache.
+- Single node throughput: a single Memcached node cannot handle 2 million peak QPS.
+- SPOF: catastrophic. A crash takes down the entire site until the cache warms up (10-30 minutes of degraded performance).
+- Network: a single 10 Gbps link is saturated at approximately 200,000 QPS for 5 KB responses.
+
+The single-node setup is not viable beyond small scale. You need a cluster.
+
+## Production-Grade Architecture
+
+A production Memcached deployment distributes load across multiple nodes, adds a proxy layer for management, and builds resilience into the client library.
+
+<AsciiDiagram
+  id="memcached/architecture-production"
+  title="Production Memcached Cluster"
+  alt="Complex architecture: application servers with local L1 cache connect to proxy layer (Twemproxy/mcrouter/moxi), which routes to multiple Memcached nodes with per-node slab allocators and LRU"
+  caption="Production-grade Memcached with proxies, consistent hashing, and local caching"
+>{`
+┌─────────────────────────────────────────────────────────────────────┐
+│  Application Tier                                                   │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐│
+│  │ [App 1]     │  │ [App 2]     │  │ [App 3]     │  │ [App 4]     ││
+│  │ L1 local    │  │ L1 local    │  │ L1 local    │  │ L1 local    ││
+│  │ cache (LFU) │  │ cache (LFU) │  │ cache (LFU) │  │ cache (LFU) ││
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘│
+└─────────┼────────────────┼────────────────┼────────────────┼───────┘
+          │                │                │                │
+          └────────────────┼────────────────┼────────────────┘
+                           │                │
+              ┌────────────▼────────────────▼────────────┐
+              │  [Twemproxy / mcrouter]                   │
+              │  Proxy Layer                              │
+              │  ┌────────────────────────────────────┐   │
+              │  │ Consistent hashing                  │   │
+              │  │ Connection pooling                  │   │
+              │  │ Auto-failover                       │   │
+              │  │ Request coalescing                  │   │
+              │  │ Pool management (replication groups)│   │
+              │  └────────────────────────────────────┘   │
+              └──────┬──────────┬──────────┬────────┬────┘
+                     │          │          │        │
+          ┌──────────▼┐ ┌──────▼──────┐ ┌──▼───────┐ ┌─▼──────────┐
+          │ {mc-pool1}│ │ {mc-pool2} │ │{mc-pool3}│ │{mc-pool4}  │
+          │ Primary   │ │ Primary    │ │ Primary  │ │ Primary     │
+          │ ┌──────┐  │ │ ┌──────┐   │ │ ┌──────┐ │ │ ┌──────┐   │
+          │ │node A│  │ │ │node C│   │ │ │node E│ │ │ │node G│   │
+          │ │node B│  │ │ │node D│   │ │ │node F│ │ │ │node H│   │
+          │ │(repl)│  │ │ │(repl)│   │ │ │(repl)│ │ │ │(repl)│   │
+          │ └──────┘  │ │ └──────┘   │ │ └──────┘ │ │ └──────┘   │
+          └───────────┘ └────────────┘ └──────────┘ └────────────┘
+`}</AsciiDiagram>
+
+### Consistent Hashing on the Client Side
+
+The foundation of the production cluster is consistent hashing. Every client library (pymemcache, spymemcached, gomemcache) implements this. The client builds a ring of server positions, and each key is mapped to the nearest server clockwise on the ring.
+
+```python
+# pymemcache with consistent hashing
+from pymemcache.client.hash import HashClient
+
+client = HashClient([
+    ('mc1.prod.example.com', 11211),
+    ('mc2.prod.example.com', 11211),
+    ('mc3.prod.example.com', 11211),
+    ('mc4.prod.example.com', 11211),
+    ('mc5.prod.example.com', 11211),
+    ('mc6.prod.example.com', 11211),
+], use_pooling=True, connect_timeout=0.5, timeout=1.0)
+```
+
+When a node fails, the client library:
+1. Detects failure (connection timeout or connection refused).
+2. Removes the node from the consistent hash ring.
+3. Logs the failure (critical for alerting).
+4. Periodically attempts to reconnect (to catch restarts).
+5. Re-adds the node to the ring when connection succeeds.
+
+The key insight: during the failure period, the dead node's keys are redistributed to other nodes. When it comes back, the keys slowly migrate back as they are re-cached (cache-aside pattern). The client never blocks or throws exceptions — it just routes around failures.
+
+### Twemproxy (nutcracker)
+
+Twemproxy, built by Twitter, is a proxy that sits between application clients and Memcached servers. It provides:
+
+- **Protocol translation.** Accepts both ASCII and binary protocols.
+- **Consistent hashing.** Centralizes the distribution logic so clients do not need to implement it.
+- **Connection pooling.** Reduces the number of connections between app servers and cache nodes.
+- **Auto-failover.** Detects dead nodes and stops routing to them.
+- **Request pipelining.** Aggregates multiple requests to the same node into a single TCP write.
+
+```bash
+# twemproxy.yml — single YAML file controls routing
+defaults:
+  auto_eject_hosts: true
+  server_retry_timeout: 30000  # 30 seconds before retry
+  server_failure_limit: 3     # 3 failures → eject
+  timeout: 1000                # 1 second request timeout
+
+memcached_pool:
+  listen: 0.0.0.0:11211
+  hash: fnv1a_64               # hash function
+  distribution: ketama         # consistent hashing (ketama)
+  servers:
+    - mc1:11211:1 weight=100
+    - mc2:11211:1 weight=100
+    - mc3:11211:1 weight=100
+    - mc4:11211:1 weight=100
+```
+
+### mcrouter (Facebook)
+
+mcrouter is Facebook's Memcached proxy. It is more feature-rich than Twemproxy and handles much larger clusters. Key features:
+
+- **Sharding.** Routes keys to pools based on hash.
+- **Replication.** Each pool can have primary and replica nodes.
+- **Warmup.** When a new node joins, mcrouter routes misses to it but also reads from the old pool to populate it.
+- **Shadowing.** Duplicates requests to a shadow pool for testing.
+- **Cold-start handling.** Drains traffic slowly to avoid thundering herds.
+- **Rich routing rules.** Regex-based routing, prefix routing, pool selection per key pattern.
+
+```bash
+# mcrouter config fragment
+{
+  "pools": {
+    "main": {
+      "servers": ["mc1:11211", "mc2:11211", "mc3:11211"]
+    },
+    "replica": {
+      "servers": ["mc4:11211", "mc5:11211", "mc6:11211"]
+    }
+  },
+  "route": {
+    "type": "OperationSelectorRoute",
+    "default_policy": {
+      "type": "AllSyncRoute",
+      "children": [
+        {"type": "PoolRoute", "pool": "main"},
+        {"type": "PoolRoute", "pool": "replica"}
+      ]
+    },
+    "gets": {
+      "type": "RandomRoute",
+      "children": [
+        {"type": "PoolRoute", "pool": "main"},
+        {"type": "PoolRoute", "pool": "replica"}
+      ]
+    }
+  }
+}
+```
+
+In this config: SET operations go to both pools (main + replica), GET operations distribute randomly across all nodes (reading from either pool). This provides read scaling with write consistency.
+
+## Integration Patterns
+
+### Cache-Aside (Lazy Population)
+
+The most common pattern. The application checks the cache first, falls back to the database, and populates the cache on a miss.
+
+<AsciiDiagram
+  id="memcached/architecture-cache-aside"
+  title="Cache-Aside Pattern"
+  alt="Three-step sequence: application checks Memcached, database on miss, populates Memcached on result"
+  caption="Cache-aside: the application manages cache population explicitly"
+>{`
+                    ┌─────────────┐
+                    │ Check Cache │
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │ HIT        │            │ MISS
+              ▼            │            ▼
+         Return data       │    ┌──────────────┐
+                           │    │ Query DB     │
+                           │    └──────┬───────┘
+                           │           ▼
+                           │    ┌──────────────┐
+                           │    │ Populate     │
+                           │    │ Cache        │
+                           │    └──────┬───────┘
+                           │           ▼
+                           │    ┌──────────────┐
+                           │    │ Return data  │
+                           │    └──────────────┘
+                           │
+                           └────────────────────
+
+  Pros: simple, resilient to cache failures
+  Cons: cache miss adds latency (DB query + cache write)
+`}</AsciiDiagram>
+
+```python
+def get_user(user_id):
+    # Try cache first
+    data = cache.get(f"user:{user_id}")
+
+    if data is None:
+        # Cache miss — query database
+        data = db.fetch_one(
+            "SELECT * FROM users WHERE id = %s", user_id
+        )
+        # Populate cache for next request
+        cache.set(f"user:{user_id}", data, expire=3600)
+
+    return data
+```
+
+### Session Store
+
+Store user session data (authentication tokens, preferences, cart contents) in Memcached. Sessions are ephemeral by nature — losing a session on node failure is acceptable (user just re-logs in).
+
+<AsciiDiagram
+  id="memcached/architecture-session-store"
+  title="Session Store Pattern"
+  alt="Application servers storing and retrieving session data from Memcached cluster, with session ID as the key"
+  caption="Memcached as an ephemeral session store"
+>{`
+┌─────────────────────────────────────────────────────────────────────┐
+│  Session Store with Memcached                                      │
+│                                                                     │
+│  1. User logs in → app creates session                             │
+│                                                                     │
+│     session_id = uuid4()                                           │
+│     cache.set(                                                     │
+│         f"session:{session_id}",                                   │
+│         {user_id: 1234, role: "admin", expires: ...},              │
+│         expire=86400  # 24 hours                                   │
+│     )                                                              │
+│                                                                     │
+│  2. Each request → app reads session                               │
+│                                                                     │
+│     session = cache.get(f"session:{session_id}")                   │
+│     if session is None: redirect to login                          │
+│                                                                     │
+│  3. On logout or expiry → app deletes session                      │
+│                                                                     │
+│     cache.delete(f"session:{session_id}")                          │
+│                                                                     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                │
+│  │ [App 1]     │  │ [App 2]     │  │ [App 3]     │                │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘                │
+│         │                │                │                        │
+│         └────────────────┼────────────────┘                        │
+│                          │                                         │
+│              ┌───────────▼────────────┐                            │
+│              │ {Memcached Cluster}    │                            │
+│              │ session:abc → node:2  │                            │
+│              │ session:def → node:5  │                            │
+│              │ session:ghi → node:1  │                            │
+│              └───────────────────────┘                            │
+└─────────────────────────────────────────────────────────────────────┘
+`}</AsciiDiagram>
+
+### Page Cache
+
+Cache entire rendered HTML pages for anonymous traffic. This is how Wikipedia uses Memcached — cached page fragments reduce database load dramatically.
+
+```python
+def render_article(slug):
+    # Try cached page
+    html = cache.get(f"page:{slug}")
+
+    if html is None:
+        # Render from scratch
+        article = db.fetch_one("SELECT * FROM articles WHERE slug = %s", slug)
+        html = render_template("article.html", article=article)
+        # Cache for 5 minutes
+        cache.set(f"page:{slug}", html, expire=300)
+
+    return html
+```
+
+### API Response Cache
+
+Cache the serialized responses of expensive API calls. This is common in REST API backends and GraphQL resolvers.
+
+```python
+@app.get("/api/users/{user_id}/feed")
+def get_feed(user_id):
+    cached = cache.get(f"feed:{user_id}")
+    if cached:
+        return cached
+
+    feed = compute_personalized_feed(user_id)  # expensive operation
+    cache.set(f"feed:{user_id}", feed, expire=60)
+    return feed
+```
+
+### Database Query Cache
+
+Cache the results of expensive database queries. This reduces load on read replicas and improves query response time.
+
+```python
+def get_leaderboard():
+    data = cache.get("leaderboard:weekly")
+    if data is None:
+        data = db.fetch_all("""
+            SELECT user_id, score, rank()
+            OVER (ORDER BY score DESC)
+            FROM weekly_scores
+            LIMIT 100
+        """)
+        cache.set("leaderboard:weekly", data, expire=300)
+    return data
+```
+
+### Rate Limiter (Simple)
+
+Use Memcached's atomic increment operation for a simple sliding window rate limiter.
+
+```python
+def check_rate_limit(ip_address, max_requests=100, window_seconds=60):
+    key = f"ratelimit:{ip_address}:{int(time.time() / window_seconds)}"
+    count = cache.incr(key, 1)
+    if count == 1:
+        # First request in this window
+        cache.expire(key, window_seconds)
+    return count <= max_requests
+```
+
+Note: `incr` is atomic in Memcached, making this safe for concurrent requests. However, Memcached is not the ideal rate limiter store for production — Redis with sorted sets is more flexible.
+
+## Multi-Region Deployment
+
+Memcached has no built-in cross-region replication. This is intentional — replicating cache data across regions would add latency and complexity that contradicts Memcached's design philosophy.
+
+<AsciiDiagram
+  id="memcached/architecture-multi-region"
+  title="Multi-Region Memcached Deployment"
+  alt="Two geographic regions, each with its own app servers, Memcached cluster, and database, with async DB replication between regions"
+  caption="Each region has its own Memcached pool — no cross-region cache replication"
+>{`
+┌─────────────────── US-East ────────────────────┐
+│  ┌──────────────┐   ┌──────────────────────┐   │
+│  │ [App Servers] │──>│ {Memcached Pool}     │   │
+│  │   ASG        │   │  us-east-1a: mc1,mc2 │   │
+│  └──────┬───────┘   │  us-east-1b: mc3,mc4 │   │
+│         │           └──────────────────────┘   │
+│         ▼                                       │
+│  ┌──────────────┐                               │
+│  │ (( Aurora    │  Primary region               │
+│  │    Primary ))│                               │
+│  └──────┬───────┘                               │
+└─────────┼───────────────────────────────────────┘
+          │  async replication
+          │  (database-level, not cache)
+┌─────────▼─────────── EU-West ───────────────────┐
+│  ┌──────────────┐   ┌──────────────────────┐   │
+│  │ [App Servers] │──>│ {Memcached Pool}     │   │
+│  │   ASG        │   │  eu-west-1a: mc5,mc6 │   │
+│  └──────┬───────┘   │  eu-west-1b: mc7,mc8 │   │
+│         │           └──────────────────────┘   │
+│         ▼                                       │
+│  ┌──────────────┐                               │
+│  │ (( Aurora    │  Read replica                 │
+│  │    Replica ))│                               │
+│  └──────────────┘                               │
+└─────────────────────────────────────────────────┘
+
+  Key design points:
+  - Each region has independent Memcached pool
+  - No cache data crosses regions
+  - Cache is warm per-region (cold on failover or new region)
+  - Database async replication handles data movement
+  - Read-your-write: route user to region with their data
+`}</AsciiDiagram>
+
+The multi-region architecture for Memcached is straightforward: each region has its own independent cluster. When you failover to a different region, the cache in that region starts cold and warms up naturally through cache-aside requests. The database (which has cross-region replication) provides the source of truth.
+
+## Capacity Planning
+
+### 10 Million DAU — Worked Example
+
+Let us size a Memcached cluster for a social media application with 10 million daily active users.
+
+**Step 1: Estimate Request Pattern**
+
+| Data Type | Per-Request Size | Requests per User per Day | Total Daily QPS |
+|---|---|---|---|
+| User profiles | 2 KB | 20 | 200M |
+| News feed (cached) | 10 KB | 10 | 100M |
+| Session data | 512 B | 30 | 300M |
+| API responses | 4 KB | 50 | 500M |
+| Leaderboard | 50 KB | 5 | 50M |
+| Total | | 115 | 1.15B daily |
+
+Peak QPS = average QPS * 3 (peak-to-average ratio): approximately 40,000 QPS average, 120,000 QPS peak.
+
+**Step 2: Estimate Working Set**
+
+Not all data fits in cache. You need to identify the active working set — data accessed within the cache TTL (say 1 hour for most items).
+
+| Data Type | Active Items | Size per Item | Total Memory |
+|---|---|---|---|
+| User profiles (active 1h) | 2M | 2 KB | 4 GB |
+| News feed fragments | 500K | 10 KB | 5 GB |
+| Session data (active 1h) | 3M | 512 B | 1.5 GB |
+| API responses | 5M | 4 KB | 20 GB |
+| Leaderboard | 1 | 50 KB | 50 KB |
+| Overhead (slab + metadata) | | +12% | ~3.7 GB |
+| **Total working set** | | | **~34 GB** |
+
+**Step 3: Determine Cluster Size**
+
+You need enough memory to hold the working set with headroom (typically 2x working set for TTL variations and traffic spikes).
+
+| Parameter | Value |
+|---|---|
+| Working set | 34 GB |
+| Headroom factor | 2x |
+| Required memory | 68 GB |
+| Per-node memory | 32 GB |
+| Node count (memory) | 3 |
+| Per-node QPS capacity | 200,000 |
+| Peak QPS | 120,000 |
+| Node count (throughput) | 2 |
+| **Recommended nodes** | **4** (for N+1 redundancy) |
+
+**Step 4: Network Bandwidth**
+
+```
+Per-node peak QPS: 30,000 (evenly distributed across 4 nodes)
+Average response size: ~4 KB
+Per-node throughput: 30,000 × 4 KB = 120 MB/s ≈ 1 Gbps
+Total cluster throughput: 4 × 1 Gbps = 4 Gbps
+```
+
+With 10 Gbps NICs per node, you have substantial headroom.
+
+**Step 5: Final Cluster Specification**
+
+```
+4 nodes × 32 GB RAM = 128 GB total
+Memory headroom: 128 GB / 34 GB = 3.7x working set
+Peak QPS: 120,000 / 4 nodes = 30,000 QPS per node (15% of capacity)
+Network: < 10% utilization per link
+```
+
+## Deployment
+
+### Auto-Scaling Groups
+
+Deploy Memcached nodes in an auto-scaling group with a lifecycle hook. On scale-in, the node is drained (clients remove it from consistent hash ring) before termination. On scale-out, clients automatically add the new node to the ring.
+
+```terraform
+# Minimal Terraform for Memcached ASG
+resource "aws_autoscaling_group" "memcached" {
+  name               = "memcached-prod"
+  min_size          = 4
+  max_size          = 8
+  desired_capacity  = 4
+
+  # Lifecycle hook for graceful shutdown
+  initial_lifecycle_hook {
+    name                   = "drain-hook"
+    lifecycle_transition  = "autoscaling:EC2_INSTANCE_TERMINATING"
+    heartbeat_timeout     = 300
+    default_result        = "CONTINUE"
+  }
+}
+```
+
+### Rolling Upgrades
+
+To upgrade Memcached (e.g., version bump, configuration change):
+
+1. **Drain connections.** Remove the target node from the consistent hash ring (update DNS or proxy config). Wait for in-flight requests to complete.
+2. **Stop Memcached.**
+3. **Upgrade.** Replace binary or change config.
+4. **Start Memcached.** The node starts empty.
+5. **Allow warmup.** The cache-aside pattern populates the node over 5-15 minutes.
+6. **Re-add to ring.** Clients begin routing keys to the node again.
+
+```bash
+# Rolling upgrade script (pseudocode)
+for node in $(list_memcached_nodes); do
+    echo "Draining $node"
+    remove_from_dns "$node"   # or remove from proxy config
+    sleep 30                   # wait for connections to drain
+
+    echo "Upgrading $node"
+    ssh "$node" "systemctl stop memcached"
+    ssh "$node" "apt-get install memcached=1.6.x"
+    ssh "$node" "systemctl start memcached"
+
+    echo "Warming $node"
+    sleep 60                   # allow cache-aside to populate
+
+    echo "Re-adding $node"
+    add_to_dns "$node"         # or update proxy config
+    sleep 10                   # allow DNS/proxy propagation
+done
+```
+
+### Monitoring
+
+Every production Memcached deployment needs monitoring on these metrics:
+
+| Metric | How to Get | What to Watch |
+|---|---|---|
+| Hit ratio | `stats` command → `get_hits / get_misses` | Below 85% means cache is too small or TTLs are wrong |
+| Eviction rate | `stats` command → `evictions` per second | Above 0 means cache is full and working set exceeds memory |
+| Current connections | `stats` command → `curr_connections` | Approaching `-c` limit means connection saturation |
+| Memory usage | `stats` command → `bytes / limit_maxbytes` | Above 85% means high eviction risk |
+| Network throughput | `stats` command → `bytes_read / bytes_written` per second | Match against NIC capacity |
+| Item count | `stats` command → `curr_items` | Sudden drop means node restart or flush |
+| CAS hits/misses | `stats` command → `cas_hits / cas_misses` | High miss rate indicates CAS contention |
+
+```bash
+# Collect stats from all nodes
+for node in mc1 mc2 mc3 mc4; do
+    echo "=== $node ==="
+    echo -e "stats\r\nquit" | nc -w1 "$node" 11211 | \
+        grep -E "curr_items|get_hits|get_misses|evictions|bytes|curr_connections"
+done
+```
+
+### Restart Strategy
+
+Memcached restart is destructive — all cached data is lost. Plan for this:
+
+1. **Stagger restarts.** Never restart multiple nodes simultaneously.
+2. **Pre-warm critical keys.** Before restarting, identify your top-1000 most-accessed keys and pre-load them on other nodes (or on the restarting node after it comes up).
+3. **Expect a hit ratio drop.** After a restart, the cache hit ratio goes to 0% and climbs back to baseline over 10-30 minutes. Your database must handle the extra load during this period.
+4. **Monitor database load.** If database CPU exceeds 80% during cache warmup, reduce application traffic (e.g., shed load at the load balancer).

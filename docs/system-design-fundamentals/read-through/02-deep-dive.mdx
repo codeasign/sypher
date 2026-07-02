@@ -1,0 +1,826 @@
+---
+id: read-through-deep-dive
+title: Read-Through — Under the Hood
+position: 2
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A read-through cache looks simple from the outside — call `get(key)` and get a value — but internally it is a well-engineered system with six interacting components. Each component has a specific responsibility and a set of configurable parameters.
+
+<AsciiDiagram
+  id="read-through/internal-components"
+  title="Six internal components of a read-through cache"
+  alt="Block diagram of cache manager, loader registry, serialization layer, TTL manager, eviction policy, and circuit breaker"
+  caption="Every read-through cache is composed of these six internal subsystems."
+>
+{`
+  ┌────────────────────────────────────────────────────────────┐
+  │              {Read-Through Cache — Internal}                │
+  │                                                            │
+  │  ┌────────────────────────────────────────────────────┐   │
+  │  │  ① Cache Manager                                  │   │
+  │  │  ┌─────────┐ ┌──────────┐ ┌───────────┐          │   │
+  │  │  │ Request │ │ Hash     │ │ Miss      │          │   │
+  │  │  │ Router  │ │ Table    │ │ Detector  │          │   │
+  │  │  └─────────┘ └──────────┘ └───────────┘          │   │
+  │  └────────────────────────────────────────────────────┘   │
+  │                                                            │
+  │  ┌────────────────────────────────────────────────────┐   │
+  │  │  ② Loader Registry                                │   │
+  │  │  ┌──────────────┐ ┌──────────────────────────┐    │   │
+  │  │  │ Key Pattern  │ │ Loader Function Map      │    │   │
+  │  │  │ Matching     │ │ default -> fetchFromDB   │    │   │
+  │  │  │ user:* ->... │ │ user:* -> fetchUser      │    │   │
+  │  │  └──────────────┘ └──────────────────────────┘    │   │
+  │  └────────────────────────────────────────────────────┘   │
+  │                                                            │
+  │  ┌────────────────────────────────────────────────────┐   │
+  │  │  ③ Serialization Layer                             │   │
+  │  │  ┌──────────┐ ┌──────────┐ ┌──────────────┐      │   │
+  │  │  │ JSON     │ │ Protocol │ │ Compression  │      │   │
+  │  │  │ Codec    │ │ Buffers  │ │ (Snappy/Zstd)│      │   │
+  │  │  └──────────┘ └──────────┘ └──────────────┘      │   │
+  │  └────────────────────────────────────────────────────┘   │
+  │                                                            │
+  │  ┌────────────────────────────────────────────────────┐   │
+  │  │  ④ TTL Manager                                    │   │
+  │  │  ┌──────────────┐ ┌──────────────┐ ┌──────────┐  │   │
+  │  │  │ Fixed TTL    │ │ Refresh-     │ │ Stale-   │  │   │
+  │  │  │ Assignment   │ │ Ahead Timer  │ │ While-   │  │   │
+  │  │  │              │ │              │ │ Reval    │  │   │
+  │  │  └──────────────┘ └──────────────┘ └──────────┘  │   │
+  │  └────────────────────────────────────────────────────┘   │
+  │                                                            │
+  │  ┌────────────────────────────────────────────────────┐   │
+  │  │  ⑤ Eviction Policy                                │   │
+  │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐          │   │
+  │  │  │ LRU      │ │ LFU      │ │ FIFO     │          │   │
+  │  │  │ Eviction │ │ Eviction │ │ Eviction │          │   │
+  │  │  └──────────┘ └──────────┘ └──────────┘          │   │
+  │  └────────────────────────────────────────────────────┘   │
+  │                                                            │
+  │  ┌────────────────────────────────────────────────────┐   │
+  │  │  ⑥ Circuit Breaker & Retry Logic                  │   │
+  │  │  ┌──────────────┐ ┌──────────┐ ┌────────────┐    │   │
+  │  │  │ Failure      │ │ Retry    │ │ Fallback   │    │   │
+  │  │  │ Counter      │ │ Policy   │ │ Strategy   │    │   │
+  │  │  └──────────────┘ └──────────┘ └────────────┘    │   │
+  │  └────────────────────────────────────────────────────┘   │
+  │                                                            │
+  └────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### 1. Cache Manager
+
+The cache manager is the entry point. It receives every `get(key)` call and orchestrates the decision tree: lookup, miss detect, dedup, loader trigger, store, return.
+
+```javascript
+class CacheManager {
+  constructor(config) {
+    this.hashTable = new HashTable(config.maxSize);
+    this.dedupGate = new DedupGate();
+    this.ttlManager = new TTLManager(config.defaultTTL, config.refreshAheadWindow);
+    this.evictionPolicy = new LRUPolicy(config.maxSize);
+    this.serializer = config.serializer || new JsonSerializer();
+    this.circuitBreaker = new CircuitBreaker(config);
+    this.loaderRegistry = config.loaderRegistry;
+  }
+
+  async get(key) {
+    // 1. Hash table lookup
+    const entry = this.hashTable.get(key);
+
+    // 2. Hit or miss?
+    if (entry && !this.ttlManager.isExpired(entry)) {
+      return this.serializer.deserialize(entry.value);
+    }
+
+    // 3. Miss — dedup check
+    const inFlight = this.dedupGate.register(key);
+    if (inFlight.isExisting) {
+      return inFlight.wait();
+    }
+
+    // 4. Load
+    try {
+      const rawValue = await this.circuitBreaker.execute(() =>
+        this.loaderRegistry.load(key)
+      );
+      const serialized = this.serializer.serialize(rawValue);
+      const ttl = this.ttlManager.computeTTL(key, rawValue);
+      this.hashTable.set(key, { value: serialized, ttl, createdAt: Date.now() });
+      this.evictionPolicy.recordAccess(key);
+      return rawValue;
+    } finally {
+      this.dedupGate.release(key);
+    }
+  }
+}
+```
+
+### 2. Loader Registry
+
+The loader registry maps key patterns to loader functions. This allows a single cache instance to handle different data types with different loading strategies.
+
+<AsciiDiagram
+  id="read-through/loader-registry"
+  title="Loader registry mapping key patterns to loader functions"
+  alt="Diagram showing the loader registry with key patterns matched to specific loader functions"
+  caption="The loader registry enables type-specific loading strategies."
+>
+{`
+  ┌────────────────────────────────────────────────────────────┐
+  │              {Loader Registry}                              │
+  ├────────────────────────────────────────────────────────────┤
+  │  Pattern            │  Loader Function                     │
+  ├────────────────────────────────────────────────────────────┤
+  │  default            │  genericSQLFetch(key)                │
+  ├────────────────────────────────────────────────────────────┤
+  │  user:*             │  fetchUserFromDB(id)                 │
+  ├────────────────────────────────────────────────────────────┤
+  │  post:*             │  fetchPostFromDBWithAuthor(id)       │
+  ├────────────────────────────────────────────────────────────┤
+  │  feed:*             │  generateFeedFromMultipleQueries(id) │
+  ├────────────────────────────────────────────────────────────┤
+  │  leaderboard:*      │  computeLeaderboard(period)          │
+  ├────────────────────────────────────────────────────────────┤
+  │  config:*           │  fetchConfigFromFile(key)            │
+  └────────────────────────────────────────────────────────────┘
+
+  Matching algorithm:
+  1. Try exact key match (fastest)
+  2. Try wildcard pattern match (user:*)
+  3. Fall back to default loader
+`}
+</AsciiDiagram>
+
+### 3. Serialization Layer
+
+Data moving between your application and the cache, and between the cache and its internal storage, must be serialized. The serialization layer handles codec, compression, and schema evolution.
+
+```javascript
+class SerializationLayer {
+  constructor(config) {
+    this.codec = config.codec || 'json';  // json, msgpack, protobuf
+    this.compression = config.compression || 'snappy';  // none, snappy, zstd
+    this.schemaVersion = config.schemaVersion || 1;
+  }
+
+  serialize(value) {
+    let bytes = this.codec.encode(value);
+    // Add schema version header for backward compatibility
+    bytes = prependVersion(this.schemaVersion, bytes);
+    if (this.compression !== 'none') {
+      bytes = compress(bytes, this.compression);
+    }
+    return bytes;
+  }
+
+  deserialize(bytes) {
+    const version = extractVersion(bytes);
+    let data = removeVersion(bytes);
+    if (this.compression !== 'none') {
+      data = decompress(data, this.compression);
+    }
+    return this.codec.decode(data);
+  }
+}
+```
+
+### 4. TTL Manager
+
+The TTL manager determines when entries expire and coordinates refresh-ahead and stale-while-revalidate policies.
+
+<AsciiDiagram
+  id="read-through/ttl-buckets"
+  title="TTL bucket queue for efficient expiration scanning"
+  alt="Diagram showing a hierarchical timing wheel with TTL buckets for efficient expiration"
+  caption="A timing wheel organizes expirations into buckets so the cache can sweep expired entries without scanning the full hash table."
+>
+{`
+  ┌────────────────────────────────────────────────────────────┐
+  │              {TTL Timing Wheel (Hierarchical)}              │
+  │                                                            │
+  │  Second-level buckets (60 slots, 1s each):                 │
+  │  ┌───┬───┬───┬───┬───┬───┬───┬────┬───┐                   │
+  │  │ 0 │ 1 │ 2 │ 3 │...│ 58│ 59│    │   │                   │
+  │  └───┴───┴───┴───┴───┴───┴───┴────┴───┘                   │
+  │                           ▲                                │
+  │                    Current tick                            │
+  │                                                            │
+  │  Minute-level buckets (60 slots, 60s each):               │
+  │  ┌───┬───┬───┬───┬───┬───┬───┬────┬───┐                   │
+  │  │ 0 │ 1 │ 2 │ 3 │...│ 58│ 59│    │   │                   │
+  │  └───┴───┴───┴───┴───┴───┴───┴────┴───┘                   │
+  │                                                            │
+  │  Each bucket holds a set of keys that expire at that tick. │
+  │  When a tick fires, all keys in that bucket are evicted.   │
+  │  Expired entries are not proactively removed — they are    │
+  │  detected during lookup via TTL comparison.                │
+  └────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### 5. Eviction Policy
+
+When the cache reaches its maximum size, the eviction policy decides which entries to remove. The most common policies are LRU (Least Recently Used), LFU (Least Frequently Used), and FIFO (First In, First Out).
+
+```javascript
+class LRUPolicy {
+  constructor(maxSize) {
+    this.maxSize = maxSize;
+    this.list = new DoublyLinkedList();  // O(1) move-to-front
+    this.map = new Map();               // key -> node
+  }
+
+  recordAccess(key) {
+    if (this.map.has(key)) {
+      this.list.moveToFront(this.map.get(key));
+    }
+  }
+
+  evictIfNeeded() {
+    if (this.list.size >= this.maxSize) {
+      const lruKey = this.list.removeLast();
+      this.map.delete(lruKey);
+      return lruKey;
+    }
+    return null;
+  }
+}
+```
+
+### 6. Circuit Breaker and Retry Logic
+
+The circuit breaker protects the database from cascading failures when the loader function fails. It has three states: closed (normal operation), open (failing — short-circuit all requests), and half-open (testing if the database has recovered).
+
+<AsciiDiagram
+  id="read-through/circuit-breaker"
+  title="Circuit breaker state machine for loader protection"
+  alt="State diagram showing circuit breaker transitions between closed, open, and half-open states"
+  caption="The circuit breaker prevents cascading database failures by short-circuiting loader calls when errors exceed a threshold."
+>
+{`
+                      ┌──────────────┐
+                      │              │
+           ┌──────────│   CLOSED     │──────────┐
+           │          │  (normal)    │          │
+           │          │              │          │
+           │          └──────────────┘          │
+           │          failures > threshold       │
+           │                                     ▼
+           │                              ┌──────────────┐
+           │                              │              │
+           │                              │    OPEN      │
+           │  timeout elapsed             │  (rejecting) │
+           │                              │              │
+           │                              └──────────────┘
+           │                                     │
+           │          ┌──────────────┐           │
+           │          │              │◄──────────┘
+           └──────────│  HALF-OPEN   │
+                      │  (probing)   │
+                      │              │
+                      └──────────────┘
+                      probe succeeds:
+                      reset counter, go to CLOSED
+                      probe fails:
+                      increment, go to OPEN again
+
+  Configuration:
+  - threshold: 5 failures in 60s window
+  - openTimeout: 30s
+  - halfOpenMaxRequests: 3
+`}
+</AsciiDiagram>
+
+## Data Structures
+
+### Hash Table (Core Storage)
+
+The primary data structure is a hash table mapping string keys to cache entries. Each cache entry stores the serialized value plus metadata.
+
+```javascript
+class CacheEntry {
+  constructor(key, serializedValue, ttl) {
+    this.key = key;
+    this.value = serializedValue;       // serialized bytes
+    this.ttl = ttl;                     // seconds from creation
+    this.createdAt = Date.now();        // epoch ms
+    this.lastAccessed = Date.now();     // for LRU tracking
+    this.accessCount = 0;               // for LFU tracking
+    this.isLoading = false;             // dedup flag
+    this.loadPromise = null;            // for concurrent waiters
+  }
+
+  isExpired() {
+    return (Date.now() - this.createdAt) > (this.ttl * 1000);
+  }
+}
+```
+
+### Loader Function Registry (Trie or Map)
+
+The loader registry uses a trie or prefix map for efficient key-pattern matching.
+
+```javascript
+class LoaderRegistry {
+  constructor() {
+    this.exact = new Map();        // "user:42" -> loader
+    this.patterns = new Map();     // "user:*"  -> loader
+    this.defaultLoader = null;
+  }
+
+  register(key, loaderFn) {
+    if (key.includes('*')) {
+      this.patterns.set(key, loaderFn);
+    } else {
+      this.exact.set(key, loaderFn);
+    }
+  }
+
+  getLoader(key) {
+    // 1. Try exact match
+    if (this.exact.has(key)) return this.exact.get(key);
+    // 2. Try pattern match (sorted by specificity)
+    for (const [pattern, loader] of this.patterns) {
+      if (this.matchPattern(pattern, key)) return loader;
+    }
+    // 3. Fall back to default
+    return this.defaultLoader;
+  }
+}
+```
+
+### TTL Bucket Queue (Timing Wheel)
+
+A hierarchical timing wheel manages expiration efficiently without scanning all entries. Entries are placed in buckets corresponding to their expiration time. A background tick advances through buckets, expiring all entries in the current bucket.
+
+### LRU Doubly-Linked List
+
+The LRU eviction policy uses a doubly-linked list combined with a hash map for O(1) operations:
+
+- `get(key)`: move node to head of list (O(1))
+- `evict()`: remove tail node (O(1))
+- `set(key)`: add to head; if over capacity, evict tail (O(1))
+
+## Request Lifecycle
+
+A read-through cache request goes through twelve distinct stages. Let us trace each one.
+
+<AsciiDiagram
+  id="read-through/request-lifecycle-overview"
+  title="Complete 12-stage request lifecycle in a read-through cache"
+  alt="Flowchart showing all 12 stages of a cache request from arrival through routing, lookup, dedup, loader, store, and return"
+  caption="Every cache request passes through exactly these stages."
+>
+{`
+  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │ Stage 1  │    │ Stage 2  │    │ Stage 3  │    │ Stage 4  │
+  │ Request  │───>│ Key      │───>│ Hash     │───>│ TTL      │
+  │ Arrival  │    │ Parsing  │    │ Lookup   │    │ Check    │
+  └──────────┘    └──────────┘    └──────────┘    └──────────┘
+                                                      │
+                                              ┌───────┴────────┐
+                                              ▼                ▼
+                                        ┌──────────┐    ┌──────────┐
+                                        │ Stage 5  │    │ Stage 5a │
+                                        │ Miss     │    │ Hit      │
+                                        │ Detected │    │ Return   │
+                                        └─────┬────┘    └──────────┘
+                                              │
+                                        ┌──────┴──────┐
+                                        ▼             ▼
+                                  ┌──────────┐  ┌──────────┐
+                                  │ Stage 6  │  │ Stage 7  │
+                                  │ Dedup    │  │ Wait on  │
+                                  │ Register │  │ In-Flight│
+                                  └────┬─────┘  └──────────┘
+                                       │
+                                  ┌────┴─────┐
+                                  │ Stage 8  │
+                                  │ Loader   │
+                                  │ Invoke   │
+                                  └────┬─────┘
+                                       │
+                                  ┌────┴─────┐
+                                  │ Stage 9  │
+                                  │ DB Query │
+                                  └────┬─────┘
+                                       │
+                                  ┌────┴─────┐
+                                  │ Stage 10 │
+                                  │ Serialize│
+                                  │ Store    │
+                                  └────┬─────┘
+                                       │
+                                  ┌────┴─────┐
+                                  │ Stage 11 │
+                                  │ Eviction │
+                                  │ Check    │
+                                  └────┬─────┘
+                                       │
+                                  ┌────┴─────┐
+                                  │ Stage 12 │
+                                  │ Return   │
+                                  │ Value    │
+                                  └──────────┘
+`}
+</AsciiDiagram>
+
+### Stage-by-stage trace
+
+**Stage 1: Request Arrival** — Your application thread issues `cache.get("user:42")`. The call enters the cache client library. The library may be an in-process library (Caffeine, Guava) or a network client (Redis client, Memcached client). For in-process caches, this is a local function call. For distributed caches, this becomes a network round-trip.
+
+**Stage 2: Key Parsing** — The cache parses the key to extract routing information. For distributed caches, it hashes the key to determine the target shard: `shard = hash("user:42") % numShards`. For in-process caches, this step is a no-op.
+
+**Stage 3: Hash Lookup** — The cache performs an O(1) lookup in its internal hash table using the key hash. If the hash slot is empty, this is a definite miss. If the slot has an entry, the cache retrieves the `CacheEntry` object.
+
+**Stage 4: TTL Check** — The cache calls `entry.isExpired()` by comparing `(now - createdAt)` against `ttl * 1000`. If the entry is not expired, this is a cache hit — proceed to Stage 5a. If expired, the cache may serve stale data (stale-while-revalidate) or treat it as a miss.
+
+**Stage 5a: Hit Return** — The cache retrieves the serialized value from the entry, passes it through the deserialization layer, updates the LRU tracking (move this key to the front of the list), updates the hit counter metric, and returns the value to your application. Total time: 0.5-3ms for in-process, 1-5ms for network.
+
+**Stage 5: Miss Detected** — The entry does not exist or the TTL has expired. The cache increments the miss counter metric and prepares to load the data.
+
+**Stage 6: Dedup Register** — The cache checks its dedup gate: if another request is already loading this same key, it registers as a waiter and proceeds to Stage 7. If this is the first request for this key, it marks the key as "loading" and proceeds to Stage 8.
+
+**Stage 7: Wait on In-Flight** — The request subscribes to a promise or completion signal from the in-flight loader. When the loader completes, the cached value is returned directly without touching the loader again. This is critical for preventing the thundering-herd problem.
+
+**Stage 8: Loader Invoke** — The cache looks up the appropriate loader function from the Loader Registry (exact match, pattern match, or default). It calls the loader with the key as the argument. The loader may be synchronous or asynchronous. A timeout is applied: typically 5-30 seconds.
+
+**Stage 9: DB Query** — The loader executes its query against the database. This is the slowest stage. The database processes the query, fetches the row from disk or buffer pool, and returns the result set to the loader.
+
+**Stage 10: Serialize and Store** — The loader returns the raw value to the cache manager. The cache serializes the value using the configured codec (JSON, Protocol Buffers, etc.), optionally compresses it, and creates a new `CacheEntry` with the configured TTL. The entry is inserted into the hash table.
+
+**Stage 11: Eviction Check** — The cache checks whether the hash table has exceeded `maxSize`. If so, the eviction policy selects a victim (LRU tail, LFU minimum, etc.) and removes it from the hash table and the eviction tracking structure.
+
+**Stage 12: Return Value** — The cache returns the deserialized value to your application. All concurrent waiters from Stage 7 also receive the value. The entire miss cycle takes 10-200ms depending on loader execution time and database latency.
+
+<AsciiDiagram
+  id="read-through/stage-timeline"
+  title="Timeline of request lifecycle stages with typical latencies"
+  alt="Horizontal timeline showing each stage and its typical duration in milliseconds"
+  caption="The miss penalty is dominated by the database query time (Stage 9)."
+>
+{`
+  Request lifecycle timeline (typical latencies for a miss):
+
+  Stage 1: Request Arrival          | 0.01ms
+  Stage 2: Key Parsing              | 0.001ms
+  Stage 3: Hash Lookup              | 0.001ms
+  Stage 4: TTL Check                | 0.001ms
+  Stage 5: Miss Detected            | 0.001ms
+  Stage 6: Dedup Register           | 0.01ms
+  Stage 8: Loader Invoke            | 0.01ms
+  Stage 9: DB Query                 | 5-150ms  ← dominant cost
+  Stage 10: Serialize and Store     | 0.1-1ms
+  Stage 11: Eviction Check          | 0.001ms
+  Stage 12: Return Value            | 0.01ms
+
+  Total miss latency: 5-150ms
+  Total hit latency:  0.5-3ms
+`}
+</AsciiDiagram>
+
+### Stage 9 deep dive — the database query
+
+The loader function makes a database call. This is the most variable and highest-latency stage. The database spends time on:
+
+- **Connection acquisition**: getting a connection from the pool (0-5ms, or longer if pool is exhausted)
+- **Query parsing**: parsing the SQL and generating a query plan (0.1-2ms for simple queries)
+- **Disk I/O**: if the data is not in the database buffer pool (1-20ms for rotating media, 0.1-2ms for SSD)
+- **Network round-trip**: between the cache server and the database server (0.1-1ms in same region, 10-100ms cross-region)
+- **Row serialization and transfer**: converting the result to the wire format (proportional to result size)
+
+## Consistency and State
+
+### Loader failure with retry
+
+When the loader throws an error (database timeout, connection refused, deadlock), the cache must decide what to return to the waiting application.
+
+<AsciiDiagram
+  id="read-through/loader-failure"
+  title="Loader failure handling with retry and circuit breaker"
+  alt="Flowchart showing loader failure entering retry logic, optional stale fallback, and circuit breaker escalation"
+  caption="A loader failure triggers retry, then stale fallback, then circuit breaker."
+>
+{`
+  Loader throws error
+         │
+         ▼
+  ┌──────────────────┐
+  │ Retry 1 (100ms)  │────>  success ──> store in cache ──> return
+  └──────────────────┘
+         │ fail
+         ▼
+  ┌──────────────────┐
+  │ Retry 2 (500ms)  │────>  success ──> store in cache ──> return
+  └──────────────────┘
+         │ fail
+         ▼
+  ┌──────────────────────┐
+  │ Stale entry exists?  │────>  yes ──> return stale data
+  └──────────────────────┘              + log warning
+         │ no
+         ▼
+  ┌────────────────────────────────┐
+  │ Circuit breaker opens          │
+  │ (5 failures in 60s window)     │
+  └────────────────────────────────┘
+         │
+         ▼
+  Return error to application
+  Log alert: "cache loader failing"
+`}
+</AsciiDiagram>
+
+### Concurrent miss deduplication in detail
+
+When the database is slow and twenty requests for the same key arrive within a 50ms window, deduplication is the difference between one slow request and twenty slow requests plus twenty database connections.
+
+```javascript
+class DedupGate {
+  constructor() {
+    this.inFlight = new Map(); // key -> { promise, count }
+  }
+
+  register(key) {
+    if (this.inFlight.has(key)) {
+      // Another request is already loading this key
+      const entry = this.inFlight.get(key);
+      entry.count++;
+      return { isExisting: true, wait: () => entry.promise };
+    }
+
+    // First request for this key
+    let resolve, reject;
+    const promise = new Promise((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+
+    this.inFlight.set(key, { promise, resolve, reject, count: 1 });
+    return { isExisting: false, resolve, reject };
+  }
+
+  resolve(key, value) {
+    const entry = this.inFlight.get(key);
+    if (entry) {
+      entry.resolve(value);
+      this.inFlight.delete(key);
+    }
+  }
+
+  reject(key, error) {
+    const entry = this.inFlight.get(key);
+    if (entry) {
+      entry.reject(error);
+      this.inFlight.delete(key);
+    }
+  }
+}
+```
+
+The dedup gate must handle edge cases:
+
+- **Loader timeout with concurrent waiters**: if the loader times out, all waiters receive the timeout error, not just the first request. This prevents a cascade of individually timed-out loaders.
+- **Loader returns null/undefined**: the cache must decide whether to cache null values (negative caching) or treat them as failures. Negative caching prevents repeated misses for nonexistent keys but must be configured carefully.
+- **Dedup gate memory pressure**: if many keys are being loaded simultaneously, the in-flight map grows. Set a maximum size on the dedup gate to prevent memory exhaustion from slow loaders.
+
+### Database down scenario (stale fallback)
+
+When the database is unreachable, the cache should serve stale data if available. This is the most important resilience feature of read-through caching.
+
+<AsciiDiagram
+  id="read-through/db-down-fallback"
+  title="Stale fallback when the database is unreachable"
+  alt="Sequence diagram showing cache serving stale data when loader fails due to database outage"
+  caption="Serving stale data during a database outage maintains application availability."
+>
+{`
+  Normal operation:
+
+  [App] ---- get("user:42") --- {Cache} --- miss --- loader() --- ((DB))
+  [App] <-- value             <-- {Cache} <-- store/return
+
+  Database outage:
+
+  [App] ---- get("user:42") --- {Cache} --- hit (TTL expired, but stale entry exists)
+  [App] <-- stale value       <-- {Cache} <-- serves stale, schedules async retry
+
+  On the second request during outage:
+
+  [App] ---- get("user:42") --- {Cache} --- stale entry still exists
+  [App] <-- stale value       <-- {Cache} <-- serves stale (no retry within cooldown)
+
+  When DB recovers:
+
+  {Cache} retry timer fires --- loader() --- ((DB)) --- success
+  {Cache} updates entry --- next request gets fresh data
+`}
+</AsciiDiagram>
+
+The stale-fallback policy is controlled by two parameters:
+
+- **staleMaxAge**: the maximum age of stale data the cache will serve. Example: if TTL is 300s and staleMaxAge is 3600s, the cache serves stale data for up to 3600s after expiration.
+- **staleRetryInterval**: how often the cache retries the loader while in stale mode. Example: every 60s, one request triggers a loader retry to check if the database has recovered.
+
+### TTL race condition
+
+A subtle race condition occurs when two concurrent requests arrive just as an entry TTL expires:
+
+1. Request A reads the entry, TTL check reports expired.
+2. Request B reads the entry, TTL check reports expired.
+3. Both requests enter the dedup gate.
+4. Request A wins the dedup race and starts loading.
+5. Request B waits on Request A promise.
+6. Request A loader returns, stores the value, resolves the promise.
+7. Both requests get the fresh value.
+
+This works correctly because the dedup gate serializes concurrent misses for the same key. The race condition is resolved at the dedup level, not at the TTL level.
+
+## Performance Characteristics
+
+### Latency breakdown
+
+| Scenario | p50 | p95 | p99 | Notes |
+|----------|-----|-----|-----|-------|
+| Cache hit (in-process) | 0.5ms | 1ms | 3ms | Hash lookup + deserialize |
+| Cache hit (network, local) | 1ms | 3ms | 5ms | + network round-trip |
+| Cache hit (network, remote) | 3ms | 10ms | 20ms | + cross-region latency |
+| Cache miss, loader fast | 10ms | 20ms | 50ms | Simple query, index hit |
+| Cache miss, loader slow | 50ms | 150ms | 500ms | Complex query, full scan |
+| Cache miss, loader timeout | 5000ms | 10000ms | 30000ms | Configurable timeout |
+| Stale-while-revalidate | 0.5ms | 3ms | 10ms | Returns stale instantly |
+
+### Loader execution time factors
+
+The loader execution time is the sum of:
+
+1. **Database connection acquisition**: 0-10ms depending on connection pool availability
+2. **Query execution time**: 1-100ms depending on query complexity, index usage, and data volume
+3. **Data transformation time**: 0-20ms for post-query processing (aggregation, joining, formatting)
+4. **Serialization time**: 0.1-5ms depending on data size and codec
+5. **Network round-trip (if distributed)**: 0.1-10ms between cache node and database
+
+### Serialization overhead
+
+Serialization is not free. Different codecs have different performance profiles:
+
+```javascript
+// JSON serialization — human-readable, universally supported
+const jsonTime = benchmark(() => JSON.stringify(user));  // ~0.01ms for small objects
+
+// Protocol Buffers — binary, compact, schema-enforced
+const pbTime = benchmark(() => User.encode(user));  // ~0.005ms
+
+// MessagePack — binary, schema-less, compact
+const msgTime = benchmark(() => msgpack.encode(user)); // ~0.008ms
+```
+
+For most applications, JSON is sufficient. Switch to Protocol Buffers when:
+- Cache entry size exceeds 10KB per entry
+- Cache throughput exceeds 10,000 operations per second
+- Schema evolution across versions is required
+
+### Memory overhead per entry
+
+Each cache entry occupies more memory than just the serialized value:
+
+```javascript
+// Memory per cache entry (approximate) for in-process cache:
+
+const overhead = {
+  hashTableEntry: 32,       // pointer + hash code
+  keyObject: 40 + key.length * 2,  // String object + char array
+  valueReference: 8,        // pointer to serialized value
+  cacheEntryObject: 56,     // CacheEntry inner object
+  metadataFields: 32,       // timestamps, flags, counters
+  lruNode: 24,              // doubly-linked list node
+  total: 192 + key.length * 2 + serializedValue.length
+};
+
+// For a user object serialized to 500 bytes with a 20-char key:
+// 192 + 40 + 500 = 732 bytes per entry
+// 1 million entries approx 732 MB
+```
+
+## Configuration Reference
+
+### Essential parameters
+
+| Parameter | Default | Description | Impact |
+|-----------|---------|-------------|--------|
+| defaultTTL | 300s | Time-to-live for cache entries | Higher = better hit ratio but more staleness |
+| maxSize | 10000 | Maximum entries in cache | Higher = better hit ratio but more memory |
+| loaderTimeout | 5000ms | Max time for loader to complete | Higher = fewer timeouts but longer tail latency |
+| retryCount | 2 | Number of loader retries on failure | Higher = more resilience but slower failures |
+| retryBackoff | 100ms | Base backoff between retries | Exponential: 100ms, 500ms, 2500ms |
+
+### Advanced parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| staleWhileRevalidate | false | Serve stale data while refreshing in background |
+| staleMaxAge | 3600s | Maximum age of stale data to serve |
+| staleRetryInterval | 60s | How often to retry loader in stale mode |
+| refreshAheadWindow | 0s | How long before TTL expiry to refresh proactively |
+| refreshAheadBatchSize | 10 | Max keys to refresh in a single batch |
+| dedupEnabled | true | Enable concurrent miss deduplication |
+| circuitBreakerThreshold | 5 | Failures before circuit opens |
+| circuitBreakerWindow | 60s | Time window for counting failures |
+| circuitBreakerOpenDuration | 30s | How long circuit stays open |
+| batchLoaderMaxKeys | 100 | Max keys per batch loader invocation |
+| batchLoaderWindow | 10ms | Time window to collect keys for batching |
+
+### Tuning guidance
+
+Start with the defaults and adjust based on observed behavior:
+
+1. **Hit ratio under 80%**: increase maxSize or defaultTTL. Monitor memory usage — if memory is the constraint, increase maxSize gradually and watch the eviction rate.
+
+2. **Tail latency too high**: enable staleWhileRevalidate to eliminate miss penalty for p99 latency. Alternatively, use refreshAheadWindow for hot keys.
+
+3. **Database load too high**: increase defaultTTL to reduce miss rate. Enable batchLoader to combine multiple misses into single queries. Check that dedup is enabled.
+
+4. **Loader failures under load**: increase retryCount and adjust circuitBreakerThreshold. Consider adding a fallback database replica for the loader to query.
+
+5. **Cold start issue**: pre-warm the cache by running a script that calls cache.get() for the most frequently accessed keys before traffic arrives.
+
+### Sample production configuration
+
+```javascript
+const cache = new ReadThroughCache({
+  // Core settings
+  defaultTTL: 300,                // 5 minutes
+  maxSize: 500000,                // 500K entries
+  evictionPolicy: 'lru',
+
+  // Loader settings
+  loader: fetchFromDatabase,
+  loaderTimeout: 2000,            // 2 second timeout
+  loaderTimeoutStrategy: 'stale', // serve stale on timeout
+
+  // Resilience
+  retryCount: 2,
+  retryBackoffMs: 100,
+  circuitBreakerThreshold: 10,
+  circuitBreakerWindow: 60000,    // 1 minute
+
+  // Freshness
+  staleWhileRevalidate: true,
+  staleMaxAge: 1800,              // 30 minutes max stale
+  refreshAheadWindow: 30,         // refresh 30s before TTL expiry
+
+  // Dedup
+  dedupEnabled: true,
+  dedupMaxInFlight: 500,
+
+  // Monitoring
+  onHit: (key) => metrics.increment('cache.hit'),
+  onMiss: (key) => metrics.increment('cache.miss'),
+  onLoaderStart: (key) => metrics.timer('cache.loader.start'),
+  onLoaderComplete: (key, duration) => metrics.timer('cache.loader.duration', duration),
+  onError: (key, error) => metrics.increment('cache.error'),
+});
+```
+
+### The memory-TTL trade-off
+
+There is a fundamental trade-off between memory usage and cache hit ratio. Increasing TTL improves hit ratio but increases memory usage because entries live longer. Increasing maxSize improves hit ratio but costs memory.
+
+<AsciiDiagram
+  id="read-through/memory-ttl-tradeoff"
+  title="Memory-ttl trade-off curve for read-through cache"
+  alt="Graph showing cache hit ratio improving with TTL and memory, with diminishing returns"
+  caption="Hit ratio follows a logarithmic curve — the first 80 percent of hits comes from the first 20 percent of memory."
+>
+{`
+  Cache Hit Ratio vs. Max Size (fixed TTL=300s)
+
+  Hit %
+  100% ---
+        |                ------------------- 
+   90%  |           -----
+        |         ---
+   80%  |       ---
+        |      --
+   70%  |     --
+        |    --
+   60%  |   --
+        |  --
+   50%  | --
+        | |
+   40%  --+---+---+---+---+---+---+----
+        0  10K 50K 100K 500K  1M   5M
+                  Max Cache Entries
+
+  Key insight: 20 percent of the keys drive 80 percent of the traffic.
+  Caching the top 20 percent of keys gives you 80 percent hit ratio.
+  Caching all keys gives you 100 percent hit ratio at maximum memory cost.
+`}
+</AsciiDiagram>
+`

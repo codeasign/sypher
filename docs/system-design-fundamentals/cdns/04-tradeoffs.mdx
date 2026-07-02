@@ -1,0 +1,373 @@
+---
+id: cdns-tradeoffs
+title: CDNs — Trade-offs & Failure Modes
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Core Tension
+
+The fundamental trade-off in CDN design is **freshness versus performance**. Every millisecond you shave off response time by serving from a cache is a millisecond further from the origin's ground truth. The more aggressively you cache, the more likely a user sees stale content.
+
+This tension manifests in every design decision: TTL duration, cache key granularity, purge propagation speed, stale-while-revalidate window, and edge compute caching. There is no correct answer — only a spectrum between "fast but possibly stale" and "always fresh but potentially slow." Your application's tolerance for staleness determines where you sit on that spectrum.
+
+## Decision Matrix
+
+| Decision | Option A | Option B | Choose A When | Choose B When |
+|----------|----------|----------|---------------|---------------|
+| **TTL strategy** | Short TTLs (1-60s) | Long TTLs (hours-days) | Content changes frequently; freshness matters more than latency | Content is immutable; performance is the only concern |
+| **Cache key granularity** | Include all query params | Strip all query params | Different param values produce different responses | Params are tracking/UGC (utm_source, session_id); all produce identical responses |
+| **Cache invalidation** | Purge by URL pattern | Versioned URLs | Cannot change codebase; legacy system | Full control over build pipeline; can version assets |
+| **Stale serving** | stale-while-revalidate enabled | stale-while-revalidate disabled | Origin occasionally slow; user tolerance for slightly stale data | Data is transactional (prices, inventory, auth tokens) |
+| **Edge compute** | Cache at edge with compute | No edge compute, always proxy | Need personalization near user; can accept eventual consistency | Every response must be based on current database state |
+| **Shield deployment** | Multi-layer shield (edge → regional → global → origin) | Single-layer shield (edge → shield → origin) | Flash crowds are common; origin is single-region | Traffic is predictable; origin can scale horizontally |
+| **Storage tiering** | RAM + SSD + HDD (3-tier) | SSD only (2-tier) | Extreme performance requirements; large budget | Budget-constrained; SSD-only provides 95% of benefit at 60% of cost |
+| **Anycast vs DNS routing** | Anycast (BGP-based) | DNS-based Geo-routing | Need fastest possible failover; traffic is latency-sensitive | Need fine-grained traffic control; anycast can cause uneven load distribution |
+
+## CAP Theorem Positioning
+
+CDNs are **AP** (Available and Partition-tolerant) systems. They prioritize availability over strict consistency.
+
+<AsciiDiagram
+  id="cdns/cap-position"
+  title="CAP Theorem — CDN Positioned as AP System"
+  content={`
+                    ┌──────────────────┐
+                    │      CAP         │
+                    │   TRIANGLE       │
+                    └──────────────────┘
+
+         Consistency                Availability
+              ●                          ●
+              │                          │
+              │  ┌──────────────────┐   │
+              │  │     CDN          │   │
+              │  │                  │   │
+              │  │   AP System      │   │
+              │  │                  │   │
+              │  │  Strongly        │   │
+              │  │  AP (not CP)     │   │
+              │  └──────────────────┘   │
+              │                          │
+              └──────────●──────────────┘
+                    Partition Tolerance
+                        (non-negotiable)
+
+  During a network partition:
+  1. Edge POPs cannot reach each other or origin
+  2. Each POP continues serving cached content (availability)
+  3. Different POPs may serve different versions of the same URL (inconsistency)
+  4. The system does NOT block or fail requests to maintain consistency
+  5. When partition heals, convergence happens via TTL expiry and purge replay
+
+  Trade-off accepted: Stale reads during partitions.
+  What CDN sacrifices: Linearizability and strict serializability.
+  What CDN gains: 99.99% uptime for cached content.
+  `}
+  caption="CDNs sit firmly in the AP quadrant of the CAP triangle. Availability and partition tolerance are non-negotiable; consistency is eventual."
+/>
+
+### Partition Scenario Walkthrough
+
+Consider a partition between the Frankfurt POP and the origin in us-east-1:
+
+<AsciiDiagram
+  id="cdns/partition-scenario"
+  title="Network Partition — Timeline of an AP Decision"
+  content={`
+Timeline:
+t=0s    ─── Network partition: Frankfurt POP loses connectivity to us-east-1
+t=1s    ─── Frankfurt receives requests for /prices.json (TTL expired 10s ago)
+t=1s    ─── Frankfurt tries origin → connection times out (5s timeout)
+t=6s    ─── Frankfurt must decide: serve stale or return 502?
+            → AP Decision: serve stale (system chooses availability)
+t=6s    ─── User sees prices from 10 minutes ago
+t=60s   ─── Partition heals. Frankfurt retries: conditional GET succeeds
+t=61s   ─── Fresh prices cached. Next user gets correct prices.
+
+What would a CP system do?
+t=6s    ─── Return 502 Service Unavailable (sacrifices availability for consistency)
+t=60s   ─── Still returning 502 until partition heals
+
+Impact of CDN's AP choice:
+- Users see stale data for 60 seconds (acceptable for product catalog)
+- Users can still browse, add to cart, navigate (site feels operational)
+- Transactional writes would fail at the origin, but reads succeed
+  `}
+  caption="During a partition, the CDN serves stale content rather than returning errors. This is the defining AP characteristic."
+/>
+
+## Failure Modes
+
+### Failure 1: Cache Stampede (Thundering Herd)
+
+**What happens:** A popular cache entry expires. Thousands of concurrent requests miss simultaneously, all fetching from origin.
+
+**Root cause:** TTL is too long (content is popular → it is in cache for a long time → when it expires, many users need it simultaneously).
+**Blast radius:** Origin server CPU spikes to 100 percent. Response times increase 10x. The origin may crash under load, causing cascading failures.
+
+<AsciiDiagram
+  id="cdns/failure-stampede"
+  title="Failure Mode — Cache Stampede / Thundering Herd"
+  content={`
+Time:     t=3600s                       t=3600.1s                    t=3600.5s
+Normal:   │  Cache full                 │  TTL expires              │  Aftermath
+          │  10,000 req/s               │  POP has:                 │  Origin:
+          │  ┌──────────────────┐       │  cache miss               │  ┌────────┐
+          │  │  EDGE POP         │       │  ┌──────────────────┐    │  │  100%  │
+          │  │  10,000 HIT/s    │       │  │  EDGE POP         │    │  │  CPU   │
+          │  │  ┌──────────┐    │       │  │  10,000 req/s     │    │  │  500ms │
+          │  │  │  cached  │    │       │  │  ALL → MISS       │    │  │  p99   │
+          │  │  │  /index  │    │       │  │  ┌──────────┐    │    │  │        │
+          │  │  └──────────┘    │       │  │  │  empty   │    │    │  │  then  │
+          │  │  No origin load  │       │  │  └──────────┘    │    │  │  CRASH │
+          │  └──────────────────┘       │  └──────────────────┘    │  └────────┘
+          │                             │          │               │
+          │                             │  10,000 concurrent       │
+          │                             │  requests to origin      │
+          │                             │          │               │
+          │                             │          ▼               │
+          │                             │    ┌──────────┐          │
+          │                             │    │  ORIGIN  │          │
+          │                             │    │  SERVER  │          │
+          │                             │    └──────────┘          │
+          │                             │    DIES UNDER LOAD       │
+
+  Detection: Origin CPU > 80% AND cache hit ratio dropped > 10% in 1 minute
+  Prevention: Request coalescing (only 1 request goes to origin, 9,999 wait)
+  Mitigation: Stale-while-revalidate (serve stale, refetch in background)
+  Recovery: Restart origin, warm cache by replaying top 100 URLs
+  `}
+  caption="A cache stampede occurs when a popular object's TTL expires and all concurrent requests miss simultaneously, overwhelming the origin."
+/>
+
+### Failure 2: Cache Poisoning (Content Hijack)
+
+**What happens:** An attacker crafts a malicious HTTP response that gets cached and served to all users.
+
+**Root cause:** The CDN caches a response that does not belong to the origin. This can happen through header injection, unvalidated redirects, or compromised upstream DNS.
+**Blast radius:** All users who hit the poisoned cache entry receive the attacker's content (malware, phishing page, defaced website).
+
+<AsciiDiagram
+  id="cdns/failure-poisoning"
+  title="Failure Mode — Cache Poisoning"
+  content={`
+Normal flow (safe):
+Attacker ──→ CDN Edge ──→ Origin ──→ Response
+                                 │
+                                 │ Cache-Control validated
+                                 │ Host header matches origin
+                                 │ Response signed with origin key
+                                 ▼
+                         User gets legitimate content
+
+Poisoned flow (compromised):
+Attacker ──→ CDN Edge ──→[HEADER INJECTION]
+                           │
+                           │ Attacker injects:
+                           │ X-Cache-Key: /login
+                           │ Cache-Control: public, max-age=86400
+                           │
+                           ▼
+                    ┌──────────────────┐
+                    │  CDN caches      │
+                    │  attacker's page │
+                    │  under /login    │
+                    │  for 24 hours    │
+                    └──────────────────┘
+                           │
+                    All users requesting /login
+                    get attacker's phishing page
+
+  Detection: Content hash mismatch with expected checksum
+  Prevention: Validate origin response headers, sign origin responses
+  Mitigation: Purge all cached entries, rotate cache keys, patch header parsing
+  Recovery: Full cache flush; may take minutes for global propagation
+  `}
+  caption="Cache poisoning exploits header injection to store attacker-controlled content under a legitimate cache key."
+/>
+
+### Failure 3: Cold Cache After Deployment
+
+**What happens:** A new deployment includes a completely new set of static assets with new URLs. Every POP misses, creating 100 percent origin load.
+
+**Root cause:** The deployment changed every URL (hash-based filenames), invalidating every cache entry simultaneously.
+**Blast radius:** Origin receives 100x normal traffic for 5-15 minutes. If the origin cannot scale, the site goes down.
+
+```
+Detection: Cache hit ratio drops from 95% to 0% in 1 minute
+Prevention: Pre-warm caches by requesting all new URLs from every POP before deployment
+Mitigation: Scale origin cluster 5x before deployment, auto-scale back after
+Recovery: Reverse proxy at origin caches results, reducing origin compute load
+```
+
+### Failure 4: Stale CDN Configuration
+
+**What happens:** A misconfigured cache control header (`Cache-Control: public` on a private API endpoint) causes user-specific data to be cached and served to other users.
+
+**Root cause:** A developer adds `Cache-Control: public, max-age=3600` to an endpoint that returns user-specific data. The CDN faithfully caches the response and serves it to the next user.
+**Blast radius:** User A sees User B's dashboard data. This is a data breach.
+
+```
+Detection: User reports seeing another user's data
+Prevention: 
+  - Never set Cache-Control: public on authenticated endpoints
+  - CDN config: ignore Cache-Control on paths matching /api/user/*, /account/*
+  - Automated linting: CI pipeline scans for Cache-Control on authenticated routes
+Mitigation: Immediate purge of the affected cache keys
+Recovery: Add CDN bypass rule for the path pattern
+```
+
+### Failure 5: Poisoned DNS / BGP Hijack
+
+**What happens:** An attacker hijacks the BGP route to the CDN's IP prefix, redirecting traffic through their infrastructure.
+
+**Root cause:** Weak BGP security (no RPKI or BGP origin validation). An attacker announces a more specific route for the CDN's IP prefix.
+**Blast radius:** All traffic to the affected region routes through the attacker's infrastructure. Traffic can be intercepted, modified, or dropped.
+
+<AsciiDiagram
+  id="cdns/failure-bgp"
+  title="Failure Mode — BGP Hijack of CDN Anycast Prefix"
+  content={`
+Normal:
+┌────────────┐   Anycast IP 1.2.3.0/24   ┌────────────────┐
+│  ISP in    │ ──────────────────────────►│  Legitimate POP │
+│  Frankfurt │                            │  Frankfurt      │
+└────────────┘                            └────────────────┘
+
+During BGP hijack:
+┌────────────┐   Anycast IP 1.2.3.0/24   ┌────────────────┐
+│  ISP in    │ ──────────────────────────►│  Attacker's    │
+│  Frankfurt │   (more specific route     │  Server        │
+│             │    1.2.3.0/25 beats       │  (Russia)      │
+│             │    1.2.3.0/24)           │  ↑             │
+└────────────┘                            │  Traffic is    │
+                                          │  intercepted,  │
+                                          │  modified, or  │
+                                          │  MITM'd        │
+                                          └────────────────┘
+
+  Detection: 
+  - Traffic volume to legitimate POP drops unexpectedly
+  - Latency from Frankfurt jumps from 10ms to 250ms
+  - RTT to the anycast IP from Frankfurt should be under 10ms
+
+  Prevention:
+  - RPKI (Resource Public Key Infrastructure) on all prefixes
+  - BGP Flowspec for attack mitigation
+  - Multiple CDN providers as failover
+
+  Recovery:
+  - Announce more specific prefix to reclaim routing
+  - Switch DNS to alternative CDN provider
+  `}
+  caption="BGP hijack attacks redirect CDN traffic through attacker infrastructure by announcing a more specific IP prefix."
+/>
+
+## Anti-Patterns Hall of Shame
+
+### Anti-Pattern 1: Infinite Cache (TTL Never Expires)
+
+**The mistake:** Setting `Cache-Control: public, max-age=2147483647` (maximum 32-bit integer) on everything because "it never changes."
+
+**Why it seems reasonable:** Yes, some content truly changes rarely. Static assets with versioned URLs could theoretically never expire.
+
+**Production impact:** When content MUST change (security patch, emergency fix, legal compliance removal), the max-age makes it impossible to invalidate. Even if you purge, the browser cache (which also reads `max-age`) refuses to re-fetch. Users see old content for years.
+
+**Correct pattern:** Set `max-age=31536000` (1 year) for versioned static assets. Set `max-age=3600` (1 hour) for unversioned content. Never exceed 1 year — HTTP specifications allow it, but browser implementations behave unpredictably.
+
+### Anti-Pattern 2: Caching Everything (Including Auth Tokens)
+
+**The mistake:** Adding `Cache-Control: public` to every response without considering content sensitivity.
+
+**Why it seems reasonable:** More caching = better performance. A blanket rule is easier than auditing each endpoint.
+
+**Production impact:** User authentication tokens, API keys, and personal data get cached on shared CDN edges. Other users receive tokenized responses. This is a PCI-DSS, HIPAA, and GDPR violation in one configuration change.
+
+**Correct pattern:** Never cache responses that contain authentication tokens, session data, or personally identifiable information. Use `Cache-Control: private, no-store` on all authenticated routes. Explicitly opt-in to caching per endpoint.
+
+### Anti-Pattern 3: Purge-Only Invalidation (Instead of Versioned URLs)
+
+**The mistake:** Deploying new versions of assets to the same URL and relying on CDN purge to invalidate old content.
+
+**Why it seems reasonable:** Purge APIs exist. Why add versioning complexity to the build pipeline?
+
+**Production impact:** Purge propagation takes 1-30 seconds. During propagation, some users get old content, some get new content. If the purge fails silently (timeout, auth error, rate limit), old content serves indefinitely. A misconfigured purge regex can invalidate too much or too little.
+
+**Correct pattern:** Use versioned URLs (`style.v2.css`, `style.v3.css`). Old URLs expire naturally. No purge needed. The CDN treats each version as an independent object.
+
+### Anti-Pattern 4: Ignoring Cache Keys (Query Parameter Pollution)
+
+**The mistake:** Letting query parameters like `?utm_source=twitter`, `?session_id=abc123`, or `?timestamp=1680000000` become part of the cache key.
+
+**Why it seems reasonable:** The default behavior of most CDNs is to include the full URL (including query parameters) as the cache key.
+
+**Production impact:** Every unique tracking parameter creates a new cache entry. The same image served from two different ad campaigns creates two cache entries. Cache capacity fills with duplicates, hit ratio drops from 95% to 30%, and origin load triples.
+
+**Correct pattern:** Configure the CDN to cache key only on scheme + host + path + extension. Strip all query parameters that do not affect the response. If parameters do affect the response (e.g., `?format=json` vs `?format=xml`), include only that parameter.
+
+### Anti-Pattern 5: No Rate Limiting at the Edge
+
+**The mistake:** Relying solely on the origin server to handle request spikes and DDoS attacks.
+
+**Why it seems reasonable:** The CDN handles more traffic than the origin. Rate limiting adds latency. "The CDN will absorb it."
+
+**Production impact:** A DDoS attack with 10 million low-cost requests bypasses the cache (all requests go to new URLs, causing cache misses) and saturates the origin. The origin falls over. Legitimate users see 502 errors.
+
+**Correct pattern:** Configure rate limiting at the CDN edge. Limit by IP (1,000 req/s), by path (100 req/s on login), and by region. Set a global cap on requests to the origin (10,000 req/s). Beyond that, the CDN returns 429 Too Many Requests instead of proxying to the origin.
+
+### Anti-Pattern 6: Single-Region CDN Deployment
+
+**The mistake:** Deploying CDN POPs only in one continent and expecting global performance.
+
+**Why it seems reasonable:** Most users are in North America. A single-region CDN is cheaper and simpler to manage.
+
+**Production impact:** Users in other continents see worse latency than without a CDN because traffic routes to the single region and then to the user. A user in Australia connecting to a US-only CDN sees latency comparable to or worse than connecting directly to the origin.
+
+**Correct pattern:** Deploy in at least 3 continents (North America, Europe, Asia). Use anycast DNS so traffic routes naturally. Cloud CDNs provide global coverage without managing hardware. A minimum viable global footprint: 8-12 POPs across 4 regions.
+
+## When NOT to Use a CDN
+
+### Over-Engineering Signals
+
+You do not need a CDN when:
+
+1. **All users are in the same city as the origin.** If your application serves a single office building or campus, the latency benefit of a CDN is under 5ms. The added complexity of cache invalidation, purge management, and configuration is not justified.
+
+2. **Traffic is under 1,000 requests per minute.** A single optimized Nginx server with disk cache handles this easily. The CDN setup time and cost exceed the performance benefit.
+
+3. **Every response is unique and uncacheable.** Real-time dashboards, live chat, video conferencing signaling, and financial trading data change every millisecond. Caching provides zero benefit. The CDN adds latency by introducing an unnecessary proxy hop.
+
+4. **You have no cacheable static assets.** An API-only backend that returns JSON and has no images, CSS, or JS files cannot benefit from a CDN. (Unless you use edge compute for API aggregation — see Variant 2.)
+
+5. **Your budget is under $100/month.** Commercial CDN plans start around $20/month (Cloudflare Pro) for low traffic, but enterprise CDN pricing scales with bandwidth. For a side project, a single $5 VPS with Nginx cache is more economical.
+
+### Simpler Alternative: Reverse Proxy Cache
+
+Before reaching for a CDN, consider a single Nginx or Varnish cache in the same data center as your origin:
+
+| Constraint | Without CDN (Reverse Proxy) | With CDN |
+|------------|---------------------------|----------|
+| 1,000 users | $10/month VPS | $20-200/month |
+| 100,000 users | $100/month dedicated server | $200-2,000/month |
+| 10M users | Not feasible (global latency) | $2,000-20,000/month |
+| Setup time | 1 hour | 4-8 hours (config, DNS, testing) |
+| Maintenance | Low (single server) | Medium (multiple POPs, purge management) |
+
+### Scale Thresholds
+
+| DAU | Recommended Approach |
+|-----|---------------------|
+| Under 1,000 | No CDN. Single server with Nginx cache. |
+| 1,000 - 100,000 | Single-region CDN (Cloudflare, Fastly) or reverse proxy. |
+| 100,000 - 1 million | Multi-region CDN with 2-5 POPs. Monitor cache hit ratio. |
+| 1 million - 10 million | Full global CDN with 10-20 POPs. Origin shield. Dedicated control plane. |
+| Over 10 million | Custom CDN or multi-CDN strategy (2+ providers for redundancy). Edge compute. |
+
+Below 100,000 DAU, a single reverse proxy cache on a $40/month server achieves 90 percent of the performance benefit of a CDN for 10 percent of the cost. Scale the complexity with the user base.
+
+---
+
+Knowing when not to use a CDN is as important as knowing how to build one. The next page examines how real companies — Netflix, Uber, Cloudflare — use CDNs in production, including the specific decisions each company made and the lessons they learned.

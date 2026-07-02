@@ -1,0 +1,592 @@
+---
+id: reverse-proxies-deep-dive
+title: Reverse Proxies — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Under the Hood
+
+### Internal Architecture
+
+A production reverse proxy is comprised of several subsystems that operate concurrently. Understanding how these subsystems interact is essential for diagnosing performance problems and tuning configurations.
+
+<AsciiDiagram
+  id="reverse-proxies/internal-architecture"
+  title="Internal Architecture of a Production Reverse Proxy"
+  alt="Detailed diagram of all internal components: event loop, worker processes, connection manager, TLS engine, cache, and configuration"
+  caption="The proxy runs as a multi-process, event-driven system with shared memory for cache and rate limiting"
+>{` 
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│                      REVERSE PROXY INTERNAL ARCHITECTURE                                 │
+├──────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                         MASTER PROCESS (PID 1)                                    │   │
+│  │   ┌──────────────────┐  ┌───────────────────┐  ┌────────────────────────────┐    │   │
+│  │   │ Config Loader    │  │ Worker Manager    │  │ Signal Handler             │    │   │
+│  │   │ Parses .conf     │  │ Spawns/kills      │  │ SIGHUP -&gt; reload config    │    │   │
+│  │   │ Validates syntax │  │ workers on signal  │  │ SIGTERM -&gt; graceful shutdown│   │   │
+│  │   └──────────────────┘  └───────────────────┘  └────────────────────────────┘    │   │
+│  └──────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐   │
+│  │  WORKER PROCESS 1               WORKER PROCESS 2        ...    WORKER PROCESS N │   │
+│  │  (OS PID 1001)                  (OS PID 1002)                  (OS PID 100N)    │   │
+│  │                                                                                  │   │
+│  │  ┌────────────────────────────────────────────────────────────┐                 │   │
+│  │  │                    Event Loop (epoll/kqueue)                │                 │   │
+│  │  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐   │                 │   │
+│  │  │  │Accept  │ │Read    │ │Process │ │Write   │ │Close   │   │                 │   │
+│  │  │  │Socket  │ │Request │ │Pipeline│ │Response│ │Socket  │   │                 │   │
+│  │  │  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘   │                 │   │
+│  │  └────────────────────────────────────────────────────────────┘                 │   │
+│  │                                                                                  │   │
+│  │  ┌─────────────────────────────────────────────────┐                           │   │
+│  │  │  CONNECTION MANAGER                              │                           │   │
+│  │  │  ┌──────────────┐  ┌──────────────┐            │                           │   │
+│  │  │  │ Client       │  │ Backend Pool │            │                           │   │
+│  │  │  │ Connections  │  │ ┌──────────┐ │            │                           │   │
+│  │  │  │ fd[0..N]     │  │ │ 10.0.0.1 │ │            │                           │   │
+│  │  │  │              │  │ │:8080 (idle)││            │                           │   │
+│  │  │  │ Each has:    │  │ ├──────────┤ │            │                           │   │
+│  │  │  │  buf_in      │  │ │ 10.0.0.2 │ │            │                           │   │
+│  │  │  │  buf_out     │  │ │:8080 (busy)││            │                           │   │
+│  │  │  │  state       │  │ ├──────────┤ │            │                           │   │
+│  │  │  │  backend_fd  │  │ │ 10.0.0.3 │ │            │                           │   │
+│  │  │  └──────────────┘  │ │:8080 (idle)││            │                           │   │
+│  │  │                     │ └──────────┘ │            │                           │   │
+│  │  └─────────────────────┴──────────────┘            │                           │   │
+│  │                                                                                  │   │
+│  │  ┌─────────────────────────────────────────────────┐                           │   │
+│  │  │  TLS ENGINE (per-worker threads)                 │                           │   │
+│  │  │  ┌───────────┐  ┌───────────┐  ┌───────────┐    │                           │   │
+│  │  │  │ Context   │  │ Session   │  │ OCSP      │    │                           │   │
+│  │  │  │ Cache     │  │ Resumption│  │ Stapling  │    │                           │   │
+│  │  │  └───────────┘  └───────────┘  └───────────┘    │                           │   │
+│  │  └─────────────────────────────────────────────────┘                           │   │
+│  │                                                                                  │   │
+│  │  ┌─────────────────────────────────────────────────┐                           │   │
+│  │  │  CACHE LAYER                                     │                           │   │
+│  │  │  ┌────────────────┐  ┌──────────────────────┐   │                           │   │
+│  │  │  │ Shared Memory  │  │ Cache Key Index      │   │                           │   │
+│  │  │  │ [key][data]    │  │ md5(method + uri +   │   │                           │   │
+│  │  │  │ [key][headers] │  │     headers) -&gt; slot │   │                           │   │
+│  │  │  │ [key][meta]    │  │ LRU eviction list    │   │                           │   │
+│  │  │  └────────────────┘  └──────────────────────┘   │                           │   │
+│  │  └─────────────────────────────────────────────────┘                           │   │
+│  │  ┌─────────────────────────────────────────────────┐                           │   │
+│  │  │  RATE LIMITER     │  SHARED MEMORY ZONE          │                           │   │
+│  │  │  ┌───────────┐    │  ┌───────────┐ ┌─────────┐  │                           │   │
+│  │  │  │ Sliding   │    │  │ Shared    │ │ Mutex   │  │                           │   │
+│  │  │  │ Window    │    │  │ Metrics   │ │ Table   │  │                           │   │
+│  │  │  │ Counters  │    │  │ Counters  │ │         │  │                           │   │
+│  │  │  └───────────┘    │  └───────────┘ └─────────┘  │                           │   │
+│  │  └───────────────────┴──────────────────────────────┘                           │   │
+│  └──────────────────────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+The architecture has four critical design decisions:
+
+**Multi-process, not multi-threaded.** Each worker is an OS process with its own memory space. This avoids the Global Interpreter Lock and thread-safety issues. Workers accept connections from a shared listen socket (SO_REUSEPORT on Linux 3.9+). Each worker handles thousands of connections via an event loop. The master process manages worker lifecycle but does not touch connections.
+
+**Non-blocking I/O everywhere.** All I/O operations (accept, read, write, connect, DNS resolution) are non-blocking. The event loop uses epoll (Linux) or kqueue (FreeBSD/macOS) for O(1) readiness notification. A worker never blocks waiting for a single connection — it processes events for ready connections only. This enables tens of thousands of concurrent connections per worker.
+
+**Shared memory for coordination.** Workers share cache data, rate-limit counters, and metric aggregators through memory-mapped regions (mmap with MAP_SHARED). Mutexes or spinlocks protect critical sections. Without shared memory, each worker would maintain its own cache, causing duplication and reducing cache hit rates. With N workers, shared cache hit rate stays at baseline; without it, the effective cache hit rate drops by 1/N because each worker stores a disjoint subset.
+
+**Zero-copy transmission where possible.** The proxy uses the sendfile and splice system calls to transfer data between file descriptors without copying through userspace. When serving a cached file from disk, the proxy calls sendfile(disk_fd, socket_fd), bypassing userspace entirely. This reduces memory bandwidth usage by 50% to 80% for large static files.
+
+### Data Structures and Algorithms
+
+**Connection Table (Hash Map)**
+
+Each worker maintains a hash map keyed by file descriptor (fd) mapping to connection state objects. The state object includes: client address, TLS context (if encrypted), request buffer, response buffer, current state (reading, processing, proxying, writing), and backend connection fd.
+
+Insertion and lookup are O(1) average, O(N) worst case. The table is sized to 1.5x the maximum expected concurrent connections to maintain low load factor. With 10,000 concurrent connections, a load factor of 0.67 means the table has 15,000 slots. Each slot stores a pointer (8 bytes on 64-bit), so the table uses 120 KB.
+
+The table must handle fd reuse: when the kernel recycles an fd (e.g., fd 42 was connection A, then connection A closes, then connection B opens and gets fd 42), the stale entry must be cleared. This is handled by storing a generation counter in each connection state and incrementing it on close.
+
+<AsciiDiagram
+  id="reverse-proxies/connection-table"
+  title="Connection Table Data Structure"
+  alt="Hash map showing fd-to-connection-state mapping with generation counters"
+  caption="Each worker maintains an O(1) lookup table mapping file descriptors to connection states"
+>{` 
+┌─────────────────────────────────────────────────────────────────────┐
+│              CONNECTION TABLE (Hash Map, load factor 0.67)          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│   hash(fd) ───────────────────────────────┐                         │
+│                                            ▼                         │
+│   Buckets:  [0]  [1]  [2]  [3]  [4]  [5]  [6]  [7]  [8]  [9]      │
+│              │    │    │    │    │    │    │    │    │    │           │
+│              │    │    ▼    │    │    │    ▼    │    │    │           │
+│              │    │  ┌─────────┐ │    │  ┌─────────┐ │    │          │
+│              │    │  │fd: 42   │ │    │  │fd: 107  │ │    │          │
+│              │    │  │gen: 3   │ │    │  │gen: 1   │ │    │          │
+│              │    │  │client:  │ │    │  │client:  │ │    │          │
+│              │    │  │203.0.113│ │    │  │198.51.10│ │    │          │
+│              │    │  │state:   │ │    │  │state:   │ │    │          │
+│              │    │  │READ     │ │    │  │WRITE    │ │    │          │
+│              │    │  │buf_in:  │ │    │  │buf_out: │ │    │          │
+│              │    │  │0x7f...  │ │    │  │0x7f...  │ │    │          │
+│              │    │  │backend: │ │    │  │backend: │ │    │          │
+│              │    │  │fd: 12   │ │    │  │fd: NULL │ │    │          │
+│              │    │  └─────────┘ │    │  └─────────┘ │    │          │
+│              │    │              │    │              │    │           │
+│              ▼    ▼              ▼    ▼              ▼    ▼           │
+│           [NULL] [NULL]       [NULL] [NULL]       [NULL] [NULL]      │
+└─────────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+**Rate Limiter (Sliding Window with Logarithmic Buckets)**
+
+The rate limiter maintains a counter per key (client IP, API key, or user ID) per time window. A sliding window with sub-second precision uses logarithmic buckets: buckets represent time windows at powers of 2 (1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s). For each request, the limiter increments all buckets that cover the current time. To check the rate, it sums buckets covering the desired window (e.g., for a 60-second window, sum the 32s + 16s + 8s + 4s buckets).
+
+Memory: each (key, bucket) pair is a 64-bit integer (8 bytes). With 100,000 active keys and 9 buckets each, memory usage is 7.2 MB. This is orders of magnitude smaller than a full sliding window storing every request timestamp.
+
+The rate limiter uses approximate counting for high-traffic keys to keep memory bounded. A Count-Min Sketch data structure replaces exact per-key counters with probabilistic counters, reducing memory from O(N) to O(log N) with configurable error bounds.
+
+**Load Balancer Ring (Consistent Hash with Virtual Nodes)**
+
+For consistent hashing load balancing, the proxy builds a ring of 2^32 positions. Each backend server maps to 100 to 200 virtual node positions on the ring (spreading each server across the ring to handle uneven load). The ring is stored as a sorted array of (hash, server_id) pairs. Finding a server for a key requires binary search on the ring array.
+
+Space: 200 virtual nodes x 100 servers = 20,000 entries. Each entry is two 64-bit integers (hash + server_id) = 16 bytes. Total: 320 KB for the ring, negligible. Lookup time: O(log N) binary search on the ring, requiring approximately 15 comparisons for 20,000 entries.
+
+When a server is added or removed, only 1/N of keys are remapped (N = number of servers). With 100 servers and one removal, only 1% of cache keys are invalidated. This compares favorably with modulo-based hashing, which would remap 100% of keys.
+
+**TLS Session Cache (LRU Hash Map)**
+
+The TLS session cache stores session IDs or session tickets for session resumption. Each entry is 256 bytes (session data) plus 32 bytes key (session ID). The cache is size-limited (default 10,000 entries = 2.9 MB). When full, the least recently used entry is evicted. Lookups are O(1) amortized.
+
+The cache is shared across workers via shared memory, allowing any worker to resume a session started on another worker. Without shared session cache, the resumption rate drops from approximately 70% to 15% because client requests are distributed across workers, and the next request in the same session is unlikely to hit the same worker.
+
+### The Request/Write/Read Lifecycle
+
+**Phase 1: Socket Acceptance**
+
+The kernel's accept queue holds fully-established TCP connections (after the three-way handshake). Each worker's event loop calls accept() in a loop (up to `worker_connections` limit) to grab new connections. With SO_REUSEPORT, the kernel distributes incoming connections across workers in a round-robin fashion, reducing lock contention on the accept queue.
+
+**Phase 2: TLS Handshake**
+
+If the listening socket has TLS enabled, the worker performs the server-side TLS handshake. This is the most CPU-intensive phase. The worker reads the ClientHello, selects a cipher suite from its configured list, sends its certificate chain, performs the key exchange, and derives session keys. Each handshake involves:
+- Two asymmetric crypto operations (signing with the server private key, verifying the client's key exchange)
+- Symmetric key derivation (HKDF in TLS 1.3)
+- Certificate chain validation (may involve OCSP stapling check)
+
+On modern x86 hardware with AES-NI, a single TLS handshake takes 0.5 to 3 milliseconds of CPU time at default RSA 2048, or 0.2 to 0.5 milliseconds with ECDSA P-256.
+
+<AsciiDiagram
+  id="reverse-proxies/tls-handshake-cost"
+  title="TLS Handshake Cost Breakdown"
+  alt="Bar chart showing CPU time per component of TLS handshake"
+  caption="Certificate verification dominates handshake cost; full handshakes are 50-200x more expensive than resumed ones"
+>{` 
+TLS Handshake Cost Per Operation (microseconds CPU on 3.0 GHz Xeon)
+ 
+┌─────────────────────────────────────────────────────────────────┐
+│ Full Handshake (RSA 2048)                                       │
+│                                                                  │
+│ Server Cert Verify    ┌─────────────────────────────────────┐   │
+│                       │ 800 us                              │   │
+│                       └─────────────────────────────────────┘   │
+│ Key Exchange          ┌────────────────────────┐                │
+│                       │ 400 us                  │                │
+│                       └────────────────────────┘                │
+│ Symmetric Cipher Init ┌──────────┐                              │
+│                       │ 50 us    │                              │
+│                       └──────────┘                              │
+│ I/O + Framing         ┌────────────────────┐                    │
+│                       │ 500 us             │                    │
+│                       └────────────────────┘                    │
+│ Total: ~1,750 us per full handshake                             │
+└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│ Resumed Handshake (Session Ticket)                              │
+│                                                                  │
+│ Session Ticket Decrypt ┌─────┐                                  │
+│                        │ 15us│                                  │
+│                        └─────┘                                  │
+│ Key Derivation         ┌─────┐                                  │
+│                        │ 10us│                                  │
+│                        └─────┘                                  │
+│ I/O                    ┌──────┐                                 │
+│                        │ 80us │                                 │
+│                        └──────┘                                 │
+│ Total: ~105 us per resumed handshake                            │
+└─────────────────────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+**Phase 3: Request Read and Parse**
+
+The worker reads HTTP data from the socket into a growable buffer (initial size 4 KB, max `client_header_buffer_size` default 8 KB). Parsing proceeds statefully: method line (GET, POST, etc.), header lines (key: value), blank line delimiter, body (if Content-Length > 0). Each state transition is a small finite-state machine with O(1) processing per byte.
+
+Headers are stored in a fixed-size hash table within the connection state. Common header names (Host, Content-Type, Accept, Cookie) are interned at startup to avoid string comparisons. The parser rejects malformed requests with microsecond-level latency.
+
+**Phase 4: Request Validation and Routing**
+
+The worker inspects the parsed request against routing rules. Routing rules are compiled into a prefix trie (radix tree) at startup. Each node in the trie represents a path segment. Leaf nodes store the associated upstream name and any rewrite rules. Matching a path against the trie is O(K) where K is the path length. For a typical API path like `/api/v2/users/123`, the trie walk visits 4 nodes in 4 comparisons.
+
+Rate limit checks happen in parallel with routing. The worker increments the counter for the client's key in shared memory. If the counter exceeds the threshold, the worker returns 429 Too Many Requests with a Retry-After header.
+
+<AsciiDiagram
+  id="reverse-proxies/routing-trie"
+  title="Routing Trie for Path-Based Request Forwarding"
+  alt="Radix tree showing URL path routing decisions from root to leaf backends"
+  caption="A prefix trie enables O(path-length) routing without regular expression overhead"
+>{` 
+                          ┌──────┐
+                          │   /   │
+                          └──┬───┘
+                             │
+               ┌─────────────┼─────────────┐
+               │             │             │
+           ┌───▼───┐    ┌───▼───┐    ┌────▼────┐
+           │ api/  │    │static/│    │  auth/  │
+           └───┬───┘    └───┬───┘    └────┬────┘
+               │           │              │
+        ┌──────┼──────┐    │         ┌────┴────┐
+        │      │      │    │         │         │
+    ┌───▼──┐ ┌─▼──┐ ┌─▼──┐ │     ┌──▼──┐ ┌───▼───┐
+    │ v1/  │ │v2/ │ │v3/ │ │     │login│ │refresh│
+    └──┬───┘ └──┬─┘ └──┬──┘ │     │     │ │       │
+       │        │      │    │     └──────┘ └───────┘
+   ┌───▼───┐ ┌──▼───┐  │    │     
+   │users  │ │scores│  │    │     
+   │upstream│ │upstream │  │     
+   │api-v1 │ │api-v2 │  │    └─── Backend: static-servers
+   └───────┘ └──────┘  │
+                        │
+                    ┌───▼────┐
+                    │upstream │
+                    │api-v3   │
+                    └────────┘
+ `}
+</AsciiDiagram>
+
+**Phase 5: Cache Lookup and Freshness Check**
+
+The worker computes a cache key from the request method, URI, and relevant headers. The key is hashed using a fast non-cryptographic hash (xxHash or MurmurHash3) to produce a 64-bit index. The worker checks shared memory at this index:
+
+- If the slot is empty (no cached response), this is a cache miss.
+- If the slot has data but the `max-age` has been exceeded (stale), the worker optionally sends an `If-None-Match` or `If-Modified-Since` request to the backend for revalidation. If the backend returns 304 Not Modified, the proxy uses the cached value with a refreshed TTL.
+- If the slot has fresh data, the worker copies the response headers and body from shared memory to the connection's output buffer. This is a cache hit: typically under 100 microseconds.
+
+Cache eviction uses a simple approximation of LRU: each cache slot has a monotonic timestamp. When the cache is full (defined by `proxy_cache_path max_size=10g`), the worker scans a small window of slots (50-100) and evicts the oldest entry. This is called "clock eviction" or "second-chance" algorithm. It is not perfectly LRU but provides reasonable hit rates with O(1) overhead per eviction.
+
+**Phase 6: Upstream Selection and Connection**
+
+The worker selects a backend using the configured load balancing algorithm. For least-connections, it scans the upstream list (O(N) for N servers, typically 5-20). For consistent hash, it does binary search on the ring (O(log N)). For random, it picks one entry from an array (O(1)).
+
+The worker checks the connection pool for an idle connection to the selected backend. Idle connections are stored in a LIFO stack per backend (recently-used connections are most likely to still be alive). If the pool has an idle connection, the worker pops it (O(1)). If not, the worker initiates a non-blocking TCP connect to the backend. This connect is registered with the event loop; the worker can process other events while waiting for the TCP handshake to complete.
+
+If the pool is full (max 100-500 connections) and all connections are in use, the request is queued. The queue is a linked list of connection state pointers. When a backend connection becomes free, the first queued request is dequeued and assigned. Requests queue for at most `proxy_read_timeout` (default 60 seconds), after which they timeout with 504 Gateway Timeout.
+
+**Phase 7: Backend Request Forwarding**
+
+The worker writes the (possibly rewritten) request to the backend connection. The write is non-blocking: the worker calls write() and registers a "write ready" event for the remaining unsent bytes. It then returns to the event loop to process other connections.
+
+When the entire request has been sent, the worker registers a "read ready" event on the backend connection to receive the response. The worker records the time for upstream response time metrics.
+
+**Phase 8: Response Read and Buffer**
+
+The worker reads the backend's response in chunks. Headers are buffered separately from body (up to `proxy_buffer_size`, default 4 KB). The body is read into `proxy_buffers` (default 8 x 4 KB = 32 KB total). If the response exceeds the buffer, the worker either:
+- Buffers to a temporary file on disk (Nginx default), allowing the client to receive at its own pace without holding a backend connection
+- Streams directly to the client (with `proxy_buffering off`), avoiding disk I/O but holding the backend connection until the client finishes
+
+Both approaches have trade-offs. Buffering to disk allows the backend connection to be reused quickly but adds disk I/O latency. Streaming avoids disk writes but keeps backend connections occupied, potentially starving other requests of pool capacity.
+
+**Phase 9: Response Processing**
+
+The worker performs post-processing on the response:
+- Substitution: replaces strings in the response body (e.g., rewriting absolute URLs in HTML to use the proxy's domain)
+- Compression: if the client accepted gzip/brotli and the response is compressible (text, not pre-compressed binaries), the worker compresses it. Compression level 1-3 gives 70-80% of maximum compression with minimal CPU cost. Levels 6-9 add 5x CPU time for only 5-10% more compression.
+- Header insertion: adds X-Proxy-Cache (HIT/MISS/BYPASS), X-Response-Time (milliseconds backend took), and security headers (X-Content-Type-Options, X-Frame-Options, etc.)
+- Cache storage: if the response is cacheable, the worker writes the response to the shared memory cache. This is a synchronous operation — the worker blocks briefly (20-50 microseconds) to copy data into shared memory under a spinlock.
+
+<AsciiDiagram
+  id="reverse-proxies/response-pipeline"
+  title="Response Processing Pipeline Timing"
+  alt="Timeline showing each processing stage from backend response to client delivery with duration annotations"
+  caption="Response processing adds 2-50 ms of latency depending on buffering and compression choices"
+>{` 
+Response Processing Timeline (microseconds)
+ 
+Backend Response Ready                                                 
+       │                                                                 
+       ▼                                                                 
+┌─────────────────────────────────────────────────────────────────┐
+│ Read Headers (4KB buffer)         50 - 200 us                   │
+├─────────────────────────────────────────────────────────────────┤
+│ Read Body (32KB buffer, 1st chunk)  1,000 - 5,000 us           │
+├─────────────────────────────────────────────────────────────────┤
+│ Cache Freshness Check             5 - 20 us                     │
+├─────────────────────────────────────────────────────────────────┤
+│ Response Rewrite (header inject)  10 - 50 us                    │
+├─────────────────────────────────────────────────────────────────┤
+│ Compression Decision (check Accept-Encoding)   2 - 5 us        │
+├─────────────────────────────────────────────────────────────────┤
+│ gzip Level 3 Compression (32KB body)  500 - 2,000 us           │
+├─────────────────────────────────────────────────────────────────┤
+│ Cache Store (shared memory write)   20 - 50 us                  │
+├─────────────────────────────────────────────────────────────────┤
+│ Write to Client Socket (32KB)      200 - 800 us                 │
+└─────────────────────────────────────────────────────────────────┘
+       │                                                                 
+       ▼                                                                 
+Client Response Received (Total proxy overhead: 1.8 - 8.2 ms)           
+ `}
+</AsciiDiagram>
+
+**Phase 10: Response Delivery and Cleanup**
+
+The worker writes the processed response to the client socket. If the response is small (under 64 KB), the write is typically completed in a single event loop iteration. For large responses, the worker writes in chunks, registering for "write ready" events between each chunk.
+
+After the final byte is sent, the worker checks the Connection header. If `Connection: close`, the worker closes both the client and backend sockets. If keep-alive (default in HTTP/1.1), the worker resets the connection state to READ (reusing the buffers) and returns the backend connection to the pool.
+
+The worker updates metrics: request count, response time bucket, bytes sent, cache hit/miss, upstream time, and TLS handshake count. These metrics are atomically incremented in shared memory for global aggregation.
+
+### Consistency and State
+
+**Crash Scenario: Worker Process Dies Mid-Request**
+
+A worker crashes while processing a request (segfault, out-of-memory, or SIGKILL). The kernel closes all file descriptors owned by that worker. Clients see a connection reset (ECONNRESET) — the TCP connection drops with no response. The master process detects the worker's exit and spawns a replacement worker within 1-2 milliseconds. The new worker starts accepting connections from the shared listen socket.
+
+Impact: In-flight requests on that worker fail. Requests on other workers are unaffected. Clients must retry. If the client library has built-in retry logic (which all production HTTP clients should), the retry succeeds within the client's timeout window.
+
+Mitigation: Workers should handle signals gracefully and complete in-flight requests before exit. Graceful shutdown (`nginx -s quit` instead of `kill`) tells workers to stop accepting new connections and drain existing ones.
+
+**Partition: Network Split Between Proxy and Backend**
+
+The network between proxy and backend becomes unreliable. Packets are dropped or delayed beyond the timeout window. The proxy's TCP connections to backends time out after `proxy_read_timeout` (default 60 seconds) or `proxy_connect_timeout` (default 60 seconds).
+
+<AsciiDiagram
+  id="reverse-proxies/partition-failure"
+  title="Network Partition Between Proxy and Backend"
+  alt="Diagram showing proxy unable to reach backends during network partition, with timeouts and fallback paths"
+  caption="During a partition, the proxy returns 502 errors after timeout; clients see service disruption"
+>{` 
+                           Network Partition
+                          ┌──────────────┐
+                          │   INTERNET   │
+                          └──────┬───────┘
+                                 │
+                            ┌────▼────┐
+                            │ Reverse │
+                            │  Proxy  │
+                            └────┬────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    │                         │
+                    │      PACKET LOSS        │
+                    │     100% packet drop    │
+                    │                         │
+                    │      ┌──────────┐       │
+                    └──────│ SWITCH   │───────┘
+                           │ FAILURE  │
+                           └──────────┘
+                    ┌────────────┴────────────┐
+                    │                         │
+                    ▼                         ▼
+               ┌────────┐              ┌────────┐
+               │Backend │              │Backend │
+               │   A    │              │   B    │
+               │Running │              │Running │
+               │Alone   │              │Alone   │
+               └────────┘              └────────┘
+Timeline:
+T+0s: Network switch fails
+T+10s: Proxy first connections timeout (proxy_connect_timeout=10s)
+T+10s: Proxy marks all backends as DOWN (passive health check)
+T+60s: Proxy clears connection pool, stops sending traffic
+T+61s: All new requests get 502 Bad Gateway immediately
+T+120s: Switch restored, backends reconnect
+T+125s: Proxy health check passes (5 checks x 1s interval + 3 passes required)
+T+126s: Traffic resumes
+ `}
+</AsciiDiagram>
+
+**Concurrent Writes: Stale Cache After Backend Update**
+
+Two clients simultaneously PUT to the same resource. The requests arrive at different workers. Worker 1 forwards to Backend A. Worker 2 forwards to Backend B. Both backends process the write successfully, but the proxy's cache still holds the old value. Subsequent reads get stale data until the cache TTL expires.
+
+This is read-after-write inconsistency. Without cache invalidation, the window for stale reads equals the cache TTL. If `max-age=60`, reads return stale data for up to 60 seconds after every write.
+
+<AsciiDiagram
+  id="reverse-proxies/concurrent-write-stale-cache"
+  title="Concurrent Writes Create a Stale Cache Window"
+  alt="Timeline showing two write requests to different backends followed by a read that hits stale cache"
+  caption="Without cache invalidation, a write to the backend does not update the proxy cache, causing subsequent reads to return stale data"
+>{` 
+Timeline: Two Concurrent Writes, One Stale Read
+ 
+Client A            Proxy                    Backend A        Backend B       Cache
+  │                   │                         │               │             │
+  │ PUT /profile/1    │                         │               │             │
+  │ "name: Alice"     │                         │               │             │
+  │──────────────────&gt;│                         │               │             │
+  │                   │  Forward to Backend A   │               │             │
+  │                   │────────────────────────&gt;│               │             │
+  │                   │                         │               │             │
+  │                   │  DB Updated: name=Alice │               │             │
+  │                   │&lt;────────────────────────│               │             │
+  │                   │                         │               │             │
+  │    CACHE NOT UPDATED (max-age=60 still active)               │             │
+  │                   │                         │               │             │
+Client B              │                         │               │             │
+  │                   │                         │               │             │
+  │ PUT /profile/1    │                         │               │             │
+  │ "name: Bob"       │                         │               │             │
+  │──────────────────&gt;│                         │               │             │
+  │                   │  Forward to Backend B   │               │             │
+  │                   │───────────────────────────────────────&gt;│             │
+  │                   │                         │               │             │
+  │                   │  DB Updated: name=Bob   │               │             │
+  │                   │&lt;───────────────────────────────────────│             │
+  │                   │                         │               │             │
+  │    CACHE NOT UPDATED (stale: name=Original) │               │             │
+  │                   │                         │               │             │
+Client C              │                         │               │             │
+  │                   │                         │               │             │
+  │ GET /profile/1    │                         │               │             │
+  │──────────────────&gt;│                         │               │             │
+  │                   │                         │               │             │
+  │                   │  CACHE HIT (stale!)     │               │             │
+  │                   │────────────────────────────────────────────────&gt;│     │
+  │                   │  Returns "name=Original" │               │             │
+  │&lt;──────────────────│   (wrong! should be Bob) │               │             │
+  │                   │                         │               │             │
+  │                   │  Stale window: up to 60s│               │             │
+  │                   │  until TTL expires      │               │             │
+  │                   │                         │               │             │
+ `}
+</AsciiDiagram>
+
+Solutions:
+- Purge cache on write: the backend sends a `Cache-Tag` header, and the write endpoint triggers a cache purge for that tag. Requires explicit invalidation logic.
+- Short TTL for mutable resources: set `max-age=5` for frequently updated endpoints. Clients get slightly stale data but for only 5 seconds. Acceptable for most applications.
+- No cache for writes: use `Cache-Control: no-cache` or `no-store` on the write response, preventing the proxy from caching it. Reads of the same resource still cache unless explicitly invalidated.
+- Conditional reads: the proxy sends `If-None-Match` with the cached ETag. If the resource changed, the backend returns the new body. If unchanged, 304 Not Modified.
+
+**Stale Reads: Cache Poisoning**
+
+An attacker sends a request with a crafted header that the proxy uses as part of its cache key. For example, if the proxy includes the `X-Forwarded-Host` header in the cache key, an attacker sends `X-Forwarded-Host: malicious.com` along with a request to `/api/config`. The proxy caches the response under a key that includes `malicious.com`. When a victim's browser sends the same request without the malicious header, the proxy serves the attacker-triggered cached response.
+
+Mitigation: Never include client-controlled headers in cache keys unless they are validated. Strip or validate `X-Forwarded-*` headers before they reach cache logic. Use HTTP caching best practices: `Vary` header controls which request headers affect cacheability. Restrict cache key to `method + host + path + query`.
+
+### Performance Characteristics
+
+The following numbers are based on Nginx running on a 4-core Xeon E5-2680 v4 (3.0 GHz) with 16 GB RAM, 10 Gbit network, Linux 5.x kernel.
+
+**Latency (proxy overhead on a cache miss, excluding backend time)**
+
+| Operation | p50 | p99 | p999 |
+|-----------|-----|-----|------|
+| No compression, no TLS | 0.5 ms | 2 ms | 5 ms |
+| No compression, TLS | 2 ms | 8 ms | 20 ms |
+| gzip level 3, no TLS | 3 ms | 15 ms | 40 ms |
+| gzip level 3, TLS | 5 ms | 25 ms | 60 ms |
+| Cache hit (no backend call) | 0.1 ms | 0.5 ms | 2 ms |
+| TLS full handshake (RSA 2048) | 5 ms | 50 ms | 200 ms* |
+
+* p999 of TLS handshake is high due to entropy starvation (waiting for /dev/random) or OCSP responder latency. Mitigation: use ECDSA certificates (50-75% faster handshake) and enable OCSP stapling.
+
+**Throughput**
+
+| Configuration | Requests/second (4KB responses) |
+|---------------|--------------------------------|
+| HTTP only | 200,000 - 300,000 |
+| HTTPS (RSA, resumed sessions) | 80,000 - 120,000 |
+| HTTPS (ECDSA, resumed sessions) | 120,000 - 180,000 |
+| HTTPS (full handshake, RSA) | 5,000 - 15,000 |
+| HTTPS + gzip | 40,000 - 70,000 |
+| HTTP + caching (90% hit rate) | 500,000 - 800,000 |
+
+**Memory (per connection)**
+
+| Resource | Size | Notes |
+|----------|------|-------|
+| Connection state | 2.5 KB | Buffers, headers, TLS context |
+| Request buffer | 8 KB | Default, grows if larger request |
+| Response buffer | 32 KB | Default `proxy_buffers` |
+| TLS session cache entry | 256 B | Optional, shared across workers |
+| Total per connection | ~43 KB | 10,000 connections = 430 MB |
+
+**CPU (per 10,000 requests/second)**
+
+| Workload | CPU cores | Bottleneck |
+|----------|-----------|------------|
+| HTTP proxy only | 1.5 cores | System calls (read/write/accept) |
+| HTTPS proxy (ECDSA, 70% resumed) | 3 cores | TLS handshake for new sessions |
+| HTTPS proxy (RSA, 70% resumed) | 5 cores | RSA operations |
+| HTTPS + gzip (L3) | 7 cores | Compression + TLS |
+| HTTPS + caching (90% hit, ECDSA) | 2 cores | Memory copy from cache to socket |
+| HTTPS + caching + gzip | 5 cores | Compression dominates |
+
+Key insight: Compression and TLS together consume 5-7x more CPU than pure proxying. If your bottleneck is CPU, disable compression (use CDN for static content) or switch to ECDSA certificates and TLS 1.3 with session tickets.
+
+### Configuration and Tuning
+
+**worker_processes**
+
+Controls the number of worker OS processes. Safe default: `auto` (matches CPU core count). Change to `worker_processes 2 * CPU_cores` if the workload is I/O-heavy (serving large files, proxying to slow backends) where workers spend more time waiting than computing. Over-allocating for CPU-bound workloads causes context switching overhead without throughput gain. Maximum useful value: one per hardware thread.
+
+**worker_connections**
+
+Maximum simultaneous connections per worker. Default: 512. For production, set to 4096-8192 per worker. Total connections = worker_processes x worker_connections. With 4 workers at 4096 connections each, the proxy handles 16,384 concurrent connections. Each connection costs approximately 43 KB of memory, so 16,384 connections consume 700 MB. Increase only if you have sufficient RAM and expect high concurrency. Setting too high (over 10,000 per worker) can cause epoll event loop latency: each iteration scans all active FDs, and with 10,000 active FDs, a single iteration takes 1-2 milliseconds.
+
+**proxy_buffering**
+
+Controls whether the proxy buffers response bodies before sending to clients. Default: `on`. Set to `off` for streaming endpoints (SSE, large file downloads, WebSocket) where you want the client to receive data as it arrives. Buffering off means the backend connection stays occupied until the client finishes reading, so increase the connection pool size when disabling buffering. A common pattern: enable buffering for API responses, disable for media streaming.
+
+**proxy_cache_path**
+
+Configures cache storage location and limits. Example: `proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=my_cache:10m max_size=10g inactive=60m`. The `levels=1:2` creates a two-level directory structure to avoid one directory with millions of files (ext4 performance degrades past 100,000 files in a single directory). `keys_zone` size determines how many cache keys can be stored: 1 MB stores approximately 8,000 keys (each key is ~128 bytes), so `keys_zone=my_cache:10m` stores ~80,000 keys. `max_size=10g` limits total cached data to 10 GB. `inactive=60m` removes entries not accessed in 60 minutes regardless of TTL.
+
+**proxy_read_timeout**
+
+Maximum time the proxy waits for a response from the backend after sending the request. Default: 60 seconds. Reduce to 5-10 seconds for API endpoints where responses should be fast. Increase to 120-300 seconds for streaming or long-polling endpoints. Setting this too low (under 3 seconds) causes 504 errors during legitimate slow responses. Setting too high (over 300 seconds) accumulates unresponsive backend connections, potentially filling the connection pool.
+
+**proxy_connect_timeout**
+
+Maximum time to establish a TCP connection to the backend. Default: 60 seconds. This should be low: 5-10 seconds. If a backend does not accept a TCP connection in 2-5 seconds, it is likely down or overloaded. A 60-second timeout means each request to a down backend takes 60 seconds to fail.
+
+**proxy_send_timeout**
+
+Maximum time to send the request to the backend (between writes). Default: 60 seconds. Usually not a bottleneck for small requests. Increase only for very large uploads (>100 MB) on slow networks. Reduce to 10-30 seconds to detect hung backends more quickly.
+
+**gzip / gzip_comp_level**
+
+Controls response compression. `gzip on` enables compression; `gzip_comp_level` sets compression level (1-9). Level 1 is fastest (100 MB/s per core) but compresses less (60-70% reduction). Level 6 is the default (20 MB/s per core, 80-85% reduction). Level 9 is 10 MB/s per core but only 5-10% better than level 6. For dynamic API responses, use level 1-3 (fast, 70-80% reduction). For pre-compressed static assets, use `gzip_static on` to serve `.gz` files directly without runtime compression.
+
+**client_max_body_size**
+
+Maximum allowed request body size. Default: 1 MB. Increase to 10-100 MB for file upload endpoints. Deny requests with bodies larger than this limit with 413 Request Entity Too Large. Setting this too high (over 200 MB) allows memory exhaustion attacks where clients send large bodies that consume proxy buffers. Setting too low breaks file upload features.
+
+**limit_req_zone / limit_req**
+
+Configures request rate limiting. `limit_req_zone $binary_remote_addr zone=mylimit:10m rate=100r/s` creates a rate limit zone keyed by client IP with 100 requests per second and 10 MB of state (tracks ~80,000 IPs). The `burst=200` parameter allows short bursts up to 200 excess requests queued; requests beyond the burst receive 429 immediately. The `nodelay` option processes queued requests immediately instead of spacing them out.
+
+Tuning guidance:
+- API endpoints: 100-500 r/s per client IP, with burst = rate * 2
+- Login endpoints: 5-10 r/s per IP, 1-2 r/s per user ID (brute force protection)
+- Static assets: no rate limit, or very high (1000+ r/s) with generous burst
+- Health check endpoints: always excluded from rate limiting via `limit_except GET`
+
+**ssl_protocols / ssl_ciphers**
+
+Controls TLS configuration. Minimal safe default: `ssl_protocols TLSv1.2 TLSv1.3` (remove TLSv1.0, TLSv1.1). Cipher preference: `ssl_prefer_server_ciphers on` to use server's order, preventing downgrade attacks. Modern cipher string: `ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256`. Remove weak ciphers (CBC-mode, RC4, 3DES) to pass security audits.
+
+Tuning: Use ECDSA certificates (256-bit prime256v1 curve) instead of RSA 2048. ECDSA handshakes are 50-75% faster because the signing operation is elliptic-curve arithmetic rather than large-integer exponentiation. Enable `ssl_session_cache shared:SSL:10m` (10 MB shared cache for ~40,000 sessions) and `ssl_session_timeout 10m` to maximize session resumption rates.
+
+**upstream keepalive**
+
+Controls the connection pool size to backends. Example: `upstream backend { server 10.0.0.1:8080; server 10.0.0.2:8080; keepalive 32; }`. The `keepalive` directive sets the number of idle connections to maintain to each backend. Safe default: 16-64 per backend. Too low (under 8): backend connections are frequently cycled, re-establishing TCP handshakes on each request. Too high (over 256): idle connections consume memory and kernel resources (each idle TCP socket uses ~3 KB of kernel memory).
+
+The keepalive pool is per-worker. With 4 workers and `keepalive 32`, each backend receives 128 idle connections total. For backends that can handle many concurrent connections (Gunicorn with high `worker_connections`), increase keepalive. For backends with limited concurrency (e.g., pre-fork servers with 10 processes), keep keepalive low to avoid overwhelming the backend with pooled connections.

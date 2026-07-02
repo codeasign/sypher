@@ -1,0 +1,602 @@
+---
+id: vertical-scaling-architecture
+title: Vertical Scaling at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Vertical Scaling at Scale
+
+Vertical scaling is not a single architectural choice — it is a series of architectural patterns that evolve as the system outgrows each machine size. The naive implementation works for 1,000 users. The production-grade architecture handles 100,000 users. The multi-region variant pushes toward 1,000,000 users on a single-node stack. Each stage has specific patterns for storage, caching, deployment, and operations.
+
+## Naive Implementation
+
+The simplest vertical scaling architecture: everything on one machine. This is the starting point for most systems and is correct for small scale.
+
+<AsciiDiagram
+  id="vertical-scaling/architecture-naive"
+  title="Naive Single-Server Implementation"
+  content={`
+┌──────────────────────────────────────────────────────────┐
+│                     Single Server                        │
+│                                                          │
+│  ┌────────────────────────────────────┐                  │
+│  │  Nginx Reverse Proxy              │                  │
+│  │  - Serves static files            │                  │
+│  │  - Terminates TLS                 │                  │
+│  │  - Routes to app                  │                  │
+│  └────────────┬───────────────────────┘                  │
+│               │                                         │
+│  ┌────────────┴───────────────────────┐                  │
+│  │  Application Server (Python/Go)   │                  │
+│  │  - Handles HTTP requests          │                  │
+│  │  - Business logic                 │                  │
+│  │  - In-process cache (dict/map)    │                  │
+│  │  - Local file storage             │                  │
+│  │  - No connection pooling (direct) │                  │
+│  └────────────┬───────────────────────┘                  │
+│               │                                         │
+│  ┌────────────┴───────────────────────┐                  │
+│  │  Database (PostgreSQL)            │                  │
+│  │  - Stores all data                │                  │
+│  │  - Default config                 │                  │
+│  │  - No replication                 │                  │
+│  │  - Single data directory          │                  │
+│  └────────────────────────────────────┘                  │
+│                                                          │
+│  Storage: Local SSD (500 GB)                             │
+│  Network: Single public IP (port 80/443)                 │
+│  Backup: pg_dump cron job                               │
+│  Monitoring: top + df -h                                 │
+└──────────────────────────────────────────────────────────┘
+
+  User scale: 0 to 1,000
+  Cost: $20-50/month
+  P99 latency: 50-100ms
+  `}
+  alt="Single-server architecture showing Nginx reverse proxy, application server, and PostgreSQL database all on one machine with local SSD storage and basic monitoring"
+  caption="Naive implementation: everything on one machine — correct for 0-1,000 users"
+/>
+
+### What Breaks at Each Scale
+
+**At 1,000 users (breakpoint: database and app compete for resources)**
+Both the application and database run on the same machine. When the app spawns workers to handle requests, each worker uses memory and CPU that the database needs. A single slow query from a new feature can cause the app to time out because PostgreSQL consumed all available RAM for sorting. The database's `shared_buffers` and the application's memory footprint fight for the same pool.
+
+**At 100,000 users (breakpoint: single-machine limits)**
+The application and database now run on separate machines (the first vertical scaling upgrade). The database server is a large instance — 64 GB RAM, 16 vCPU. But the 64 GB RAM is only 60% of the working set. Queries that used to hit the buffer cache now hit disk. The cache hit ratio drops from 98% to 65%. Query latency jumps from 5ms to 200ms. The application server has spare CPU, but the database is the bottleneck. You upgrade to 128 GB RAM. Cache hit ratio returns to 98%. Problem solved — for another 12 months.
+
+**At 10,000,000 users (breakpoint: no larger instance exists)**
+The database is on a `r7g.16xlarge` (512 GB RAM, 64 vCPU) with `io2` Block Express volumes (256,000 IOPS). Cost: $4,000/month for the instance, $3,000/month for the storage. The working set is 480 GB — 94% of available RAM. Any growth pushes it over the edge. There is no larger memory-optimized instance in the current generation. You must either migrate to the `u-*` high-memory family (up to 24 TB RAM, but at $50,000+/month) or design a horizontal scaling architecture.
+
+## Production-Grade Architecture
+
+A production-grade vertically scaled system separates concerns into dedicated components on a single machine, using cgroups and systemd for resource isolation.
+
+<AsciiDiagram
+  id="vertical-scaling/architecture-production"
+  title="Production-Grade Vertical Scaling Architecture"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│              Production Single-Node Architecture                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  CloudFront / CDN (Edge caching of static assets)       │   │
+│  └────────────────────────┬────────────────────────────────┘   │
+│                           │                                     │
+│  ┌────────────────────────┴────────────────────────────────┐   │
+│  │  Elastic Load Balancer (ALB)                           │   │
+│  │  - TLS termination                                     │   │
+│  │  - Rate limiting (1,000 req/s per client)              │   │
+│  │  - Health check on /health                             │   │
+│  └────────────────────────┬────────────────────────────────┘   │
+│                           │                                     │
+│  ┌────────────────────────┴────────────────────────────────┐   │
+│  │  Nginx Reverse Proxy (on instance: port 80/443)        │   │
+│  │  - Static file serving                                 │   │
+│  │  - SSL termination (or pass through to ALB)             │   │
+│  │  - Request buffering                                   │   │
+│  │  - Rate limit per route                                │   │
+│  │  cgroup: cpu.shares=1024, memory=1GB                   │   │
+│  └────────────────────────┬────────────────────────────────┘   │
+│                           │                                     │
+│  ┌────────────────────────┴────────────────────────────────┐   │
+│  │  Application Server (Gunicorn + Python / Go binary)     │   │
+│  │  - 8 workers (Gunicorn) / 16 goroutines (Go)            │   │
+│  │  - Connection pool to database (size 20)                │   │
+│  │  - Redis client pool (size 10)                          │   │
+│  │  - Circuit breaker on DB (5 failures → 30s open)       │   │
+│  │  cgroup: cpu.shares=2048, memory=8GB                    │   │
+│  └────────────────────────┬────────────────────────────────┘   │
+│                           │                                     │
+│  ┌────────────────────────┴────────────────────────────────┐   │
+│  │  Redis Cache (in-memory session store + query cache)    │   │
+│  │  - 64 GB maxmemory, allkeys-lru eviction                 │   │
+│  │  - Persistence: RDB snapshots every 5 minutes           │   │
+│  │  - maxclients: 5,000                                    │   │
+│  │  cgroup: cpu.shares=512, memory=64GB                    │   │
+│  └────────────────────────┬────────────────────────────────┘   │
+│                           │                                     │
+│  ┌────────────────────────┴────────────────────────────────┐   │
+│  │  PostgreSQL Database                                   │   │
+│  │  - shared_buffers = 32 GB                              │   │
+│  │  - max_connections = 400                               │   │
+│  │  - Streaming replica in same AZ (async)                │   │
+│  │  - WAL archive to S3                                   │   │
+│  │  - Point-in-time recovery (7 day retention)            │   │
+│  │  cgroup: cpu.shares=2048, memory=128GB                 │   │
+│  └────────────────────────┬────────────────────────────────┘   │
+│                           │                                     │
+│  ┌────────────────────────┴────────────────────────────────┐   │
+│  │  Storage Layer                                         │   │
+│  │  - OS/data: /dev/nvme0n1 (NVMe, 2 TB, ext4)            │   │
+│  │  - WAL: /dev/nvme1n1 (NVMe, 500 GB, XFS, noatime)     │   │
+│  │  - Backups: /dev/xvdba (EBS gp3, 4 TB, nightly)       │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  Instance: r7g.8xlarge (32 vCPU, 256 GB RAM, EBS-optimized)   │
+│  Cost: ~$1,800/month (instance + storage + ALB + CDN)          │
+│  User scale: 50,000 to 200,000                                 │
+└─────────────────────────────────────────────────────────────────┘
+  `}
+  alt="Production-grade single-node architecture with CDN, load balancer, Nginx, application server, Redis cache, and PostgreSQL database — each with cgroup resource limits and separate storage volumes for OS, WAL, and backups"
+  caption="Production-grade architecture: separate storage volumes and cgroup isolation prevent resource contention between components"
+/>
+
+## Integration Patterns
+
+Vertical scaling succeeds or fails based on how the application integrates with external dependencies. Four critical integration patterns determine whether the system degrades gracefully or collapses under load.
+
+### Pattern 1: RDBMS Integration
+
+The database is the most common bottleneck in single-node architectures. Vertical scaling buys time, but the integration pattern matters.
+
+<AsciiDiagram
+  id="vertical-scaling/architecture-rdbms"
+  title="RDBMS Integration with Vertical Scaling"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│                  Database Vertical Scaling Path                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Stage 1: Database co-located with app                          │
+│  ┌─────────────────────────────────────┐                      │
+│  │ App + DB on same machine             │                      │
+│  │ Scale: t3.medium → c5.xlarge        │  <- 2x RAM, 4x CPU   │
+│  │ Limits: CPU contention at peak       │                      │
+│  └─────────────────────────────────────┘                      │
+│           │                                                    │
+│           ▼                                                    │
+│  Stage 2: Separate database server                             │
+│  ┌─────────────────────────────────────┐                      │
+│  │ App Server    DB Server              │                      │
+│  │ (c5.4xlarge)  (r5.4xlarge)          │                      │
+│  │ 16 vCPU       16 vCPU               │                      │
+│  │ 32 GB RAM     128 GB RAM            │                      │
+│  └─────────────────────────────────────┘                      │
+│           │                                                    │
+│           ▼                                                    │
+│  Stage 3: Database with read replica                          │
+│  ┌─────────────────────────────────────────────────────┐      │
+│  │ App Server ──> DB Primary ──> DB Read Replica       │      │
+│  │ (scale app   (r7g.8xlarge)  (r7g.4xlarge)           │      │
+│  │  vertically)                  ^ reads only          │      │
+│  └─────────────────────────────────────────────────────┘      │
+│           │                                                    │
+│           ▼                                                    │
+│  Stage 4: Database + caching layer                            │
+│  ┌────────────────────────────────────────────────────────┐   │
+│  │ App ──> Redis (cache 90% of reads) ──> DB (10% reads)  │   │
+│  │ Scale DB when cache hit ratio drops below 90%           │   │
+│  └────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  Integration rules:                                            │
+│    1. Use connection pooling (PgBouncer or app-level)          │
+│    2. Set statement_timeout = 30s (prevent runaway queries)    │
+│    3. Separate read and write connections in code              │
+│    4. Use EXPLAIN ANALYZE to find queries that exceed          │
+│       the vertical scaling budget                              │
+└─────────────────────────────────────────────────────────────────┘
+  `}
+  alt="Four-stage database scaling integration path: co-located, separate server, read replica, and caching layer — with specific instance types and RAM allocations at each stage"
+  caption="RDBMS integration: vertical scaling buys time, but the pattern shifts from co-location to caching over four stages"
+/>
+
+### Pattern 2: Cache Integration
+
+A single-node Redis or Memcached instance must be configured for vertical scaling. The key settings are memory limit, eviction policy, and persistence strategy.
+
+```
+Redis on r7g.4xlarge (128 GB RAM, allocation for Redis = 100 GB):
+  maxmemory: 100gb
+  maxmemory-policy: allkeys-lru
+  maxmemory-samples: 10
+
+  When memory fills: LRU eviction removes least-used keys
+  Target: eviction rate under 100 keys/second
+  At eviction > 500 keys/sec: too little RAM — vertical scaling needed
+
+Cache miss penalty:
+  Cache hit:   ~1ms (Redis read, local network)
+  Cache miss:  ~10ms (database query)
+  At 90% hit rate: average latency = 0.9*1ms + 0.1*10ms = 1.9ms
+  At 70% hit rate: average latency = 0.7*1ms + 0.3*10ms = 3.7ms
+  At 50% hit rate: average latency = 0.5*1ms + 0.5*10ms = 5.5ms
+
+  When hit rate drops below 80%, memory is the bottleneck.
+  Solution: vertical scaling of Redis instance or adding a Redis cluster.
+```
+
+### Pattern 3: Message Queue Integration
+
+A single-node message queue (RabbitMQ, Redis Streams, or Kafka on one broker) is simple but has clear limits.
+
+```
+Single-node queue limits:
+  RabbitMQ:    ~50,000 messages/sec (single queue, persistent)
+  Redis       ~100,000 messages/sec (Streams, non-persistent)
+  Streams:
+  Kafka:      ~200,000 messages/sec (single broker, 3 partitions)
+
+When these limits are hit on a single node:
+  - Add more partitions (Kafka) — still on one server, but more parallelism
+  - Add more consumer threads — uses more CPU
+  - Eventually: split queue across separate nodes (horizontal)
+
+Vertical scaling bottleneck for queues:
+  - Network throughput: 10 Gbps ENA max per instance
+  - Disk I/O: 16,000 IOPS gp3 max per volume
+  - Memory: queue backlog size limited by RAM
+```
+
+### Pattern 4: External API Integration
+
+When the application calls external APIs (third-party payments, SMS, email), the network I/O can saturate the instance's network throughput.
+
+<AsciiDiagram
+  id="vertical-scaling/architecture-ext-api"
+  title="External API Integration and Network Saturation"
+  content={`
+┌───────────────────────────────────────────────────────────────────┐
+│              Single-Node External API Call Path                   │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌──────────┐     ┌──────────────┐     ┌──────────────────────┐  │
+│  │ Users    │────>│ App Server   │────>│ External API (Stripe)│  │
+│  │ (10,000  │     │ (16 vCPU,    │     │ HTTP POST /charge    │  │
+│  │  req/s)  │     │  128 GB)     │     │ Payload: ~2 KB      │  │
+│  └──────────┘     └──────┬───────┘     │ RTT: 50-500ms       │  │
+│                          │              └──────────────────────┘  │
+│                          │                                         │
+│                 ┌────────┴────────┐                               │
+│                 │ Resource Usage  │                               │
+│                 │ per API Call    │                               │
+│                 │                 │                               │
+│                 │ TCP connection  │  1 fd                         │
+│                 │ TLS handshake   │  3 RTTs                       │
+│                 │ Request body    │  ~2 KB egress                 │
+│                 │ Response body   │  ~8 KB ingress                │
+│                 │ Total time      │  150-600ms                    │
+│                 └─────────────────┘                               │
+│                                                                   │
+│  At 500 concurrent API calls:                                    │
+│    File descriptors used:  500 (+200 DB + 100 cache = 800)      │
+│    Network bandwidth:      500 x 10KB = 5 MB/s (~40 Mbps)       │
+│    Open connections:       500 (TIME_WAIT + ESTABLISHED)        │
+│                                                                   │
+│  Bottleneck: Number of concurrent connections, not bandwidth     │
+│  Default ulimit -n: 1024                                         │
+│  Required: 800+  (within default, but close)                    │
+│  Fix: ulimit -n 65535 in systemd service file                   │
+│                                                                   │
+│  Scaling impact:                                                 │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │  More vCPU: Does NOT help (waiting on network RTT)        │  │
+│  │  More RAM:  Does NOT help (each connection ~50 KB)        │  │
+│  │  Fix: Connection keep-alive + connection pooling          │  │
+│  │  Or: async I/O (asyncio / eventlet) for non-blocking      │  │
+│  └───────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────────────┘
+  `}
+  alt="External API integration diagram showing an app server connecting to Stripe, with resource usage per API call and a bottleneck analysis showing file descriptors being the limiting factor not CPU or RAM"
+  caption="External API integration: the bottleneck is usually connection concurrency (file descriptors), not CPU or RAM"
+/>
+
+```
+External API call path on single node:
+  App thread ──> HTTP request ──> NIC egress (SYN)
+               ──> Network RTT (50-500ms)
+               ──> NIC ingress (response)
+
+  At 500 concurrent API calls:
+    Each call uses ~1 TCP connection (keep-alive)
+    Total connections: ~500
+    Bandwidth: ~50 MB/sec (typical API response ~100 KB)
+    Impact: Ethernet bandwidth at 400 Mbps of 10 Gbps max
+
+  Bottleneck: not bandwidth, but number of open file descriptors
+    Default ulimit -n: 1024
+    Required for 500 concurrent API calls + 200 DB connections
+      + 100 cache connections: at least 1000 open fds
+    Fix: ulimit -n 65535 in systemd unit file
+```
+
+## Multi-Region and Global Scale
+
+Vertical scaling across regions uses the same pattern — a single large instance per region — with global traffic routing.
+
+<AsciiDiagram
+  id="vertical-scaling/architecture-global"
+  title="Multi-Region Vertical Scaling Topology"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Global Traffic Manager (Route53)                  │
+│           Latency-based routing to nearest region                   │
+└─────────────────┬───────────────────────┬───────────────────────────┘
+                  │                       │
+                  ▼                       ▼
+┌──────────────────────────┐  ┌──────────────────────────┐
+│      US-East Region      │  │      EU-West Region      │
+│   (us-east-1, N. Virg.) │  │   (eu-west-1, Ireland)    │
+│                          │  │                          │
+│ ┌────────────────────┐   │  │ ┌────────────────────┐   │
+│ │ CDN (CloudFront)   │   │  │ │ CDN (CloudFront)   │   │
+│ └────────┬───────────┘   │  │ └────────┬───────────┘   │
+│          │               │  │          │               │
+│ ┌────────┴───────────┐   │  │ ┌────────┴───────────┐   │
+│ │ ALB (regional LB)  │   │  │ │ ALB (regional LB)  │   │
+│ └────────┬───────────┘   │  │ └────────┬───────────┘   │
+│          │               │  │          │               │
+│ ┌────────┴───────────┐   │  │ ┌────────┴───────────┐   │
+│ │ App Server          │   │  │ │ App Server          │   │
+│ │ (c7g.4xlarge)       │   │  │ │ (c7g.4xlarge)       │   │
+│ │ 16 vCPU, 32 GB     │   │  │ │ 16 vCPU, 32 GB     │   │
+│ └────────┬───────────┘   │  │ └────────┬───────────┘   │
+│          │               │  │          │               │
+│ ┌────────┴───────────┐   │  │ ┌────────┴───────────┐   │
+│ │ PostgreSQL Primary  │   │  │ │ PostgreSQL Replica │   │
+│ │ (r7g.8xlarge)       │   │  │ │ (r7g.8xlarge)      │   │
+│ │ 32 vCPU, 256 GB    │   │  │ │ 32 vCPU, 256 GB    │   │
+│ │ Writes in US-East   │   │  │ │ Async replication  │   │
+│ └────────────────────┘   │  │ │ from US-East        │   │
+│                          │  │ └────────────────────┘   │
+│  Active-Passive:         │  │                          │
+│  US-East handles writes  │  │  EU-West serves reads    │
+│  EU-West replica lag:    │  │  Lag: 50-500ms           │
+│  typically under 100ms  │  │                          │
+└──────────────────────────┘  └──────────────────────────┘
+
+  User capacity: 500,000 to 1,000,000 (across both regions)
+  P99 latency (US user): 50ms
+  P99 latency (EU user): 100ms (includes replication lag)
+  Cost: ~$4,000/month per region
+  `}
+  alt="Multi-region vertical scaling architecture with active-passive setup: US-East handles writes on a large PostgreSQL instance, EU-West serves reads from an async replica, with global traffic manager routing by latency"
+  caption="Multi-region vertical scaling: each region uses the largest practical instance, with async replication for cross-region reads"
+/>
+
+## Capacity Planning
+
+Capacity planning for vertical scaling answers one question: how long until the current instance is insufficient?
+
+### Capacity Math Example
+
+```
+System: Real-time analytics dashboard
+Current state:
+  Instance: r7g.4xlarge (16 vCPU, 128 GB RAM)
+  Working set: 80 GB (62% of RAM)
+  Cache hit ratio: 97%
+  Query throughput: 20,000 QPS
+  CPU at peak: 60%
+  Storage: 2 TB NVMe (55% used)
+  
+Growth projections:
+  Data growth: 15 GB/month (from new data ingestion)
+  Query growth: 8% month-over-month (from new users)
+
+Calculations:
+
+1. Memory saturation:
+   Current RAM: 128 GB
+   Working set: 80 GB
+   Growth: 15 GB/month
+   Time until working set = 80% of RAM (102 GB):
+     (102 - 80) / 15 = 1.47 months until cache pressure
+   Time until working set = 95% of RAM (121 GB):
+     (121 - 80) / 15 = 2.73 months until critical
+  
+   Next instance: r7g.8xlarge (256 GB RAM, $1,612/month)
+   Time until saturation on new instance:
+     (204 GB = 80%) in (204 - 80) / 15 = 8.3 months
+     (243 GB = 95%) in (243 - 80) / 15 = 10.9 months
+
+2. CPU saturation:
+   Current: 20,000 QPS at 60% CPU
+   Max at 80% (scale-out threshold): 26,667 QPS
+   Max at 100%: 33,333 QPS
+   Growth: 8% monthly
+   Time to 80%: 20,000 * 1.08^t = 26,667 => t = 3.8 months
+   Time to 100%: 20,000 * 1.08^t = 33,333 => t = 6.5 months
+  
+   Next instance: c7g.8xlarge (32 vCPU, ~40,000 QPS at 60%)
+   Time to 80%: 40,000 * 1.08^t = 53,333 => t = 4.0 months
+
+3. Storage saturation:
+   Current: 1.1 TB used of 2 TB (55%)
+   Growth: 15 GB/month
+   Time to 80% (1.6 TB): (1600 - 1100) / 15 = 33.3 months
+   Time to 95% (1.9 TB): (1900 - 1100) / 15 = 53.3 months
+   (Storage is not the immediate bottleneck)
+
+4. Upgrade decision:
+   Memory runs out in 2.7 months
+   CPU runs out in 6.5 months
+   Storage runs out in 33 months
+   
+   Recommendation: Upgrade to r7g.8xlarge in 2 months (memory)
+   That provides 8 more months of memory headroom.
+   CPU will need re-evaluation at that point.
+
+5. Cost analysis:
+   Current: r7g.4xlarge at $589/month
+   Proposed: r7g.8xlarge at $1,177/month
+   Cost increase: $588/month ($7,056/year)
+   
+   Alternative: Add Redis cache (r7g.xlarge at $147/month) 
+   to reduce working set pressure by caching query results.
+   Combined cost: $589 + $147 = $736/month
+   Extends memory timeline from 2.7 to ~8 months at lower cost.
+   
+   Recommendation: Add Redis cache first, delay instance upgrade.
+```
+
+### Capacity Planning Template
+
+```
+For your own system, track:
+
+  Current instance:          [type]
+  Current RAM:               [GB]
+  Current working set:       [GB] (pg_buffercache hit ratio < 95% means exceeded)
+  Current CPU utilization:   [%] at peak
+  Current query throughput:  [QPS]
+  Current storage used:      [GB] of [GB]
+  
+  Data growth rate:          [GB/month]
+  Query growth rate:         [%/month]
+  User growth rate:          [%/month]
+  
+  Memory exhaustion:         [months]
+  CPU exhaustion:            [months]
+  Storage exhaustion:        [months]
+  
+  Next instance option:      [type] at [$]/month
+  Estimated headroom:        [months]
+  
+  Cache alternative:         [type] at [$]/month
+  Estimated headroom:        [months]
+```
+
+## Deployment and Operations
+
+Vertical scaling requires specific operational patterns to avoid downtime and data loss.
+
+### Zero-Downtime Instance Upgrade
+
+Upgrading from one instance type to a larger one traditionally requires downtime. Here is the blue-green approach:
+
+```
+Zero-downtime database upgrade (PostgreSQL):
+
+  Phase 1: Provision new instance
+    1. Launch new instance (e.g., r7g.8xlarge) in same subnet
+    2. Configure PostgreSQL from template
+    3. Configure WAL streaming from old instance
+    4. Start PostgreSQL in recovery mode (replica)
+  
+  Phase 2: Sync data
+    1. Wait for replication lag to reach 0
+    2. Validate data: row count checksum on largest tables
+    3. Run ANALYZE on new instance (warm caches)
+  
+  Phase 3: Switch traffic
+    1. Pause application (connection drain — 30s window)
+    2. Promote new instance to primary (SELECT pg_promote())
+    3. Update DNS/connection string to new instance IP
+    4. Resume application traffic
+    5. Verify: query latency, cache hit ratio, connections
+  
+  Phase 4: Decommission old instance
+    1. Keep old instance running for 48 hours (rollback window)
+    2. Snapshot old data volume (final backup)
+    3. Terminate old instance
+
+  Total downtime: 30-60 seconds (connection drain window)
+```
+
+### Monitoring
+
+Key metrics for a vertically scaled node:
+
+```
+Critical alerts (P0 — page on-call):
+
+  1. memory.used_ratio > 90% for 5 minutes
+     - Working set exceeds RAM, cache misses increasing
+     - Action: Scale up or add cache layer
+  
+  2. cpu.utilization > 90% for 5 minutes
+     - CPU saturated, request queue growing
+     - Action: Scale up or move CPU-heavy work to async jobs
+  
+  3. disk.io_util > 80% for 10 minutes
+     - EBS IOPS limit being approached
+     - Action: Increase provisioned IOPS or move to NVMe
+  
+  4. postgresql.cache_hit_ratio < 90% for 15 minutes
+     - Buffer cache inadequate for working set
+     - Action: Increase shared_buffers or add RAM
+
+Warning alerts (P1 — Slack notification):
+
+  1. memory.used_ratio > 75% for 30 minutes
+  2. cpu.utilization > 75% for 15 minutes
+  3. disk.used_ratio > 80%
+  4. postgresql.connection_usage > 80%
+  5. redis.eviction_rate > 100/sec
+  6. query.p99_latency > 500ms for 5 minutes
+```
+
+### Debugging
+
+When a vertically scaled system misbehaves after an upgrade, trace through these steps:
+
+```
+Post-upgrade debugging checklist:
+
+  1. Is the bottleneck actually the resource you scaled?
+     - Check top/vmstat: CPU idle? iowait?
+     - Check free -h: memory used? swap activity?
+     - Check iostat -x: await high? queue depth?
+  
+  2. Did application configuration update correctly?
+     - Check shared_buffers: cat /proc/sys/kernel/shmmax
+     - Check connection pool size
+     - Check max_connections
+  
+  3. Is NUMA topology causing cross-socket penalties?
+     - Run: numastat -p postgres
+     - If "other_node" > 20% of total, NUMA pin the process
+  
+  4. Is the kernel I/O scheduler appropriate?
+     - Check: cat /sys/block/nvme0n1/queue/scheduler
+     - Should be "none" for NVMe, "none" or "mq-deadline" for EBS
+  
+  5. Did the instance retain previous EBS volume attributes?
+     - Check: aws ec2 describe-volumes | grep Iops
+     - If IOPS is lower than provisioned, EBS may be throttling
+  
+  6. Are application-level caches correctly sized?
+     - Redis maxmemory set correctly?
+     - Application in-memory cache limits?
+```
+
+### Upgrade Strategy Summary
+
+```
+Upgrade type              Method                    Downtime      Frequency
+─────────────────────────────────────────────────────────────────────────
+CPU/RAM                   Blue-green instance swap  30-60 sec     Every 6-18 months
+Disk (increase IOPS)      Modify volume (online)    0 sec         As needed
+Disk (increase size)      Modify volume + grow2fs   0 sec         As needed
+Database tuning           Reload config (pg_reload) 0 sec         After upgrades
+OS kernel update          Reboot                    30-90 sec     Quarterly
+PostgreSQL major version  pg_upgrade + blue-green   30-60 sec     Annually
+Redis upgrade             Replica promotion         5 sec         As needed
+```
+
+The architecture patterns described here — naive through multi-region — show that vertical scaling is never a one-time decision. Each stage of growth requires a specific architectural pattern, from co-located everything to separated components with cgroup isolation to multi-region active-passive deployments. The trade-offs and failure modes of these patterns are covered in the next article.

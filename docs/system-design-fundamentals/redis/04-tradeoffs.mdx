@@ -1,0 +1,408 @@
+---
+id: redis-tradeoffs
+title: Redis — Trade-offs & Failure Modes
+position: 4
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Core Tension
+
+**Redis trades persistence guarantees and memory cost for extreme speed and versatile data structures.**
+
+Every design decision in Redis reflects this trade-off. You choose Redis not because it has the strongest durability or the lowest memory cost — you choose it because, for the data that needs to be fast, nothing else comes close.
+
+### The Trade-Off Triangle
+
+<AsciiDiagram
+  id="redis/trade-off-triangle"
+  title="Redis Trade-Off Triangle"
+  alt="A triangle showing the three-way tension between speed, durability, and memory cost in Redis"
+  caption="You can optimize for at most two of three dimensions">
+{`
+                              ┌────────────┐
+                              │   Speed    │
+                              │            │
+                              │ Sub-ms     │
+                              │ latency    │
+                              └──────┬─────┘
+                                     │
+                         ┌───────────┼───────────┐
+                         │           │           │
+                         │           │           │
+                         │  Redis    │           │
+                         │  chooses  │           │
+                         │  speed    │           │
+                         │  first    │           │
+                         │           │           │
+                         ▼           │           ▼
+                  ┌────────────┐     │     ┌─────────────┐
+                  │ Persistence│     │     │ Memory Cost  │
+                  │            │     │     │             │
+                  │ fsync     │     │     │ RAM is      │
+                  │ overhead  │     │     │ expensive   │
+                  │ AOF rewrite│    │     │ vs disk     │
+                  └────────────┘     │     └─────────────┘
+                                     │
+                                     │
+          The tension: more durability = slower writes
+          More memory = more expensive cluster
+          More speed = less durability
+`}
+</AsciiDiagram>
+
+## Decision Matrix
+
+| Dimension | Redis | Memcached | Key-Value DB (RocksDB) | SQL (PostgreSQL) |
+|-----------|-------|-----------|----------------------|-------------------|
+| Data structures | Strings, hashes, lists, sets, sorted sets, streams, GEO, bitmaps, HyperLogLog | Strings only (with some serialization support) | Bytes only (application-level serialization) | Tables, indexes, JSON, arrays, ranges |
+| Persistence | RDB snapshots + AOF log | None (pure cache) | Write-ahead log with SST files | Full ACID with WAL |
+| Persistence latency | 1s (appendfsync everysec) to per-write (appendfsync always) | N/A | 10-100ms write amplification | 1-50ms per write |
+| Replication | Async primary-replica, Cluster native | No native replication (use client-side) | Multi-master, Raft consensus | Sync/async, log shipping, streaming |
+| Sharding | Native (16384 slots) or proxy | Client-side consistent hashing | Built-in (RocksDB shards) | Native (Citus, partitioning) |
+| Atomicity | Per-command atomic, MULTI/EXEC (no rollback) | Per-command atomic (CAS) | Per-key atomic | Full ACID with rollback |
+| Query language | Commands (200+) | Simple get/set/delete | Key-based operations | SQL (flexible, complex) |
+| Latency (p50) | 0.1-0.5ms | 0.1-0.5ms | 1-10ms | 1-50ms |
+| Throughput (single node) | 100K-1M ops/sec | 500K-2M ops/sec | 50K-200K ops/sec | 5K-50K ops/sec |
+| Memory cost per GB | RAM: ~$5-8/month | RAM: ~$5-8/month | SSD: ~$0.10/month | SSD: ~$0.10/month |
+| Use case | Cache, session, queue, leaderboard, rate limiter, pub/sub | Simple cache only | Persistent KV store, large datasets | Complex queries, joins, transactions |
+
+**Key insight**: Memcached is faster for simple key-value because its multi-threaded architecture uses all CPU cores. But Redis's data structures eliminate the serialization/deserialization overhead and reduce application code complexity, often making it faster for real workloads despite the single-thread limit.
+
+## CAP Theorem
+
+Redis's CAP classification depends on the deployment mode:
+
+<AsciiDiagram
+  id="redis/cap-theorem"
+  title="Redis in the CAP Theorem"
+  alt="A CAP triangle showing Redis standalone (CP), Redis with replication (CP with eventual consistency on replicas), and Redis Cluster (CP with partition tolerance)"
+  caption="Where Redis falls in the CAP theorem depending on deployment mode">
+{`
+                         ┌─────────────────┐
+                         │   Consistency    │
+                         │   (C)           │
+                         └────────┬────────┘
+                                  │
+                                  │
+                    ┌─────────────┼─────────────┐
+                    │             │             │
+                    │  Redis      │             │
+                    │  standalone:│             │
+                    │  CP         │             │
+                    │  (no        │             │
+                    │  partition) │             │
+                    │             │  Redis      │
+                    │  Redis +    │  Cluster:   │
+                    │  replicas:  │  CP/AP      │
+                    │  CP on      │  (depends   │
+                    │  primary,   │  on quorum) │
+                    │  eventual   │             │
+                    │  on replica │             │
+                    │             │             │
+                    └─────────────┼─────────────┘
+                                  │
+                                  │
+                         ┌────────┴────────┐
+                         │  Partition      │
+                         │  Tolerance (P)  │
+                         └─────────────────┘
+`}
+</AsciiDiagram>
+
+### Standalone Redis (single node)
+
+**CP — Consistent and Partition Tolerant** (no network partition possible since there is only one node).
+
+The server has strong consistency: every read sees the latest write. But if the server crashes, the system is unavailable until it restarts.
+
+### Redis with Replication (primary-replica)
+
+**CP on primary, eventual consistency on replicas**.
+
+- Writes go to the primary. Reading from the primary gives strong consistency.
+- Replicas may lag behind the primary. Reading from a replica can return stale data.
+- If the primary fails and a replica is promoted, the new primary may be missing the last few writes (async replication lag).
+- You can opt into stronger consistency using `WAIT` command: `WAIT 1 1000` blocks until at least one replica acknowledges.
+
+### Redis Cluster
+
+**CP with partition tolerance during network splits**.
+
+- Each shard has one primary and N replicas.
+- If a network partition isolates a minority shard (less than majority of primaries are reachable), the minority shard stops accepting writes after `cluster-node-timeout`.
+- The majority side continues operating normally.
+- When the partition heals, the minority side's data is discarded and it does a full resync from the majority side.
+
+## Failure Modes
+
+### Failure Mode 1: OOM Kill
+
+**What happens**: Redis has no `maxmemory` configured. Over hours or days, data grows. Eventually, Redis exhausts all available RAM. The Linux kernel's OOM killer terminates the Redis process. All data is lost (unless RDB/AOF was enabled).
+
+**Prevention**:
+- Always set `maxmemory` to 80% of available RAM
+- Configure an appropriate `maxmemory-policy` (never use `noeviction` for cache workloads)
+- Monitor `used_memory` and set alerts at 70%, 80%, and 90% of maxmemory
+
+### Failure Mode 2: Replication Lag Spiral
+
+**What happens**: A busy primary processes 100K writes/sec. The replica is on a slower machine or network. The replication buffer fills up. If the buffer overflows, the replica disconnects and does a full resync, which adds more load to the primary — creating a cascading failure cycle.
+
+<AsciiDiagram
+  id="redis/replication-lag-spiral"
+  title="Replication Lag Spiral"
+  alt="A feedback-loop diagram showing replication buffer overflow leading to full resync, which increases load on the primary"
+  caption="The replication lag spiral — a full resync triggered by an undersized backlog creates a negative feedback loop">
+{`
+┌─────────────────────────────────────────────────────────────────────┐
+│                   Replication Lag Spiral                             │
+│                                                                     │
+│  Step 1:                                                            │
+│  Primary writes: 100K/sec                                          │
+│  Replica applies: 50K/sec (slow disk or network)                   │
+│       ┌──────────┐                       ┌──────────┐             │
+│       │ Primary   │─── backlog grows ────▶│ Replica  │            │
+│       │           │     at 50K/sec        │          │            │
+│       └──────────┘                       └──────────┘             │
+│         │                                                           │
+│  Step 2:                                                           │
+│  repl-backlog-size = 1MB (~10K commands)                          │
+│  After 1 second: backlog overflows!                                │
+│                                                                     │
+│  Step 3: Replica disconnects                                       │
+│  Step 4: Replica reconnects → full resync                          │
+│                                                                     │
+│       ┌──────────┐                       ┌──────────┐             │
+│       │ Primary   │─── RDB dump (10GB) ──▶│ Replica  │            │
+│       │           │     (fork + I/O)      │ (unavail │            │
+│       │           │                       │  for 30s)│            │
+│       └──────────┘                       └──────────┘             │
+│         │                                                           │
+│  Step 5: Fork increases primary memory (COW)                      │
+│          RDB transfer increases network load                      │
+│          Replica unavailable for reads                             │
+│                                                                     │
+│  Step 6: If writes continue at 100K/sec during resync              │
+│          → backlog fills again immediately after resync            │
+│          → replica disconnects AGAIN                               │
+│          → perpetual resync loop                                   │
+│                                                                     │
+│  Prevention: Set repl-backlog-size to 10% of maxmemory             │
+│  at 24GB maxmemory → 2.4GB backlog → ~2 minutes of buffer          │
+└─────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+**Prevention**:
+- Set `repl-backlog-size` large enough to absorb peak write bursts: 10% of maxmemory as a starting point
+- Ensure replicas have equal or better hardware than the primary
+- Monitor `master_repl_offset` and `slave_repl_offset` from `INFO replication`
+- Set alerts when replication lag exceeds 10 seconds
+
+### Failure Mode 3: Sentinel Split-Brain
+
+**What happens**: A network partition separates the primary from the Sentinel cluster. Sentinels on the majority side promote a replica to primary. When the partition heals, there are two primaries serving writes. Clients connected to the old primary continue writing to it, while new writes go to the new primary. Data is diverged.
+
+<AsciiDiagram
+  id="redis/sentinel-split-brain"
+  title="Sentinel Split-Brain Scenario"
+  alt="A network partition separates the primary from three Sentinels; two Sentinels promote a replica while the old primary continues accepting writes from some clients"
+  caption="Sentinel split-brain — two primaries accepting writes simultaneously">
+{`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Sentinel Split-Brain Scenario                      │
+│                                                                     │
+│  Before partition:                                                   │
+│                                                                     │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐       │
+│  │Primary A │   │Sentinel 1│   │Sentinel 2│   │Sentinel 3│       │
+│  │:6379     │◀──│          │◀──│          │◀──│          │       │
+│  │          │   │quorum=2  │   │          │   │          │       │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────┘       │
+│       │                                                            │
+│       │ replication                                                │
+│       ▼                                                            │
+│  ┌──────────┐                                                      │
+│  │Replica B │                                                      │
+│  │:6380     │                                                      │
+│  └──────────┘                                                      │
+│                                                                     │
+│  Network partition:                                                 │
+│  ┌──────────────────────┐         ┌──────────────────────┐        │
+│  │  Side A              │         │  Side B              │        │
+│  │                      │         │                      │        │
+│  │  ┌──────────┐        │         │  ┌──────────┐       │        │
+│  │  │Primary A │        │  NET    │  │ Sentinel │       │        │
+│  │  │:6379     │        │  ✗✗✗✗  │  │ 2,3     │       │        │
+│  │  │(still    │        │  ✗✗✗✗  │  │          │       │        │
+│  │  │accepting │        │         │  └────┬─────┘       │        │
+│  │  │writes!)  │        │         │       │             │        │
+│  │  └──────────┘        │         │  ┌────▼─────┐       │        │
+│  │                      │         │  │Replica B │       │        │
+│  │  Clients on          │         │  │Promoted  │       │        │
+│  │  side A write        │         │  │to Primary│       │        │
+│  │  to Primary A        │         │  │B         │       │        │
+│  └──────────────────────┘         │  └──────────┘       │        │
+│                                    └──────────────────────┘        │
+│                                                                     │
+│  After partition heals: Two primaries, divergent data.             │
+│  Replica B's data wins (it was promoted by the majority).          │
+│  Primary A's writes during the partition are lost.                 │
+│                                                                     │
+│  Prevention: sentinel-avoid-protection-level (use majority)        │
+│  Use min-replicas-to-write and min-replicas-max-lag            │
+│  to stop writes when replication fails                            │
+└─────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+**Prevention**:
+- Configure `min-replicas-to-write 1` and `min-replicas-max-lag 10` on the primary: if the primary cannot reach at least one replica, it stops accepting writes
+- Use an odd number of Sentinels (at least 3) with quorum set to N/2 + 1
+- Monitor Sentinel events for failover notifications
+
+### Failure Mode 4: AOF Corruption
+
+**What happens**: Redis crashes during an AOF rewrite. The AOF file is left in an inconsistent state. On restart, Redis loads the AOF and encounters a corrupted command. With `aof-load-truncated yes` (default), Redis truncates the last partial command and starts successfully. With `aof-load-truncated no`, Redis refuses to start.
+
+**Prevention**:
+- Use `redis-check-aof --fix` to repair corrupted AOF files
+- Keep at least one RDB snapshot as a fallback recovery option
+- Enable both RDB and AOF for maximum recovery options
+- Test AOF recovery in staging environments
+
+### Failure Mode 5: Cluster Network Partition
+
+**What happens**: A network partition splits the Redis Cluster into two groups. The minority group (less than half of primaries) cannot achieve quorum for write operations. After `cluster-node-timeout` (default 15 seconds), the minority group stops accepting writes.
+
+<AsciiDiagram
+  id="redis/cluster-partition"
+  title="Redis Cluster Network Partition"
+  alt="Three shards are split by a network partition; the minority side stops accepting writes after cluster-node-timeout"
+  caption="Network partition in a Redis Cluster — the minority side enters a FAIL state">
+{`
+┌──────────────────────────────────────────────────────────────────────┐
+│                    Cluster Partition Scenario                         │
+│                                                                      │
+│  Normal state: 3 primaries, 3 replicas                              │
+│                                                                      │
+│  ┌──────────┐       ┌──────────┐       ┌──────────┐               │
+│  │ Primary A │       │ Primary B │       │ Primary C │              │
+│  │ Slots:    │       │ Slots:    │       │ Slots:    │              │
+│  │ 0-5460   │◀─────▶│ 5461-10922│◀─────▶│10923-16383│              │
+│  └────┬─────┘       └────┬─────┘       └────┬─────┘              │
+│       │                  │                  │                      │
+│  ┌────▼─────┐       ┌────▼─────┐       ┌────▼─────┐              │
+│  │Replica A1│       │Replica B1│       │Replica C1│              │
+│  └──────────┘       └──────────┘       └──────────┘              │
+│                                                                      │
+│  Partition occurs:                                                   │
+│                                                                      │
+│  ┌──────────────────────┐         ┌──────────────────────┐         │
+│  │  Majority side        │         │  Minority side        │         │
+│  │                      │         │                      │         │
+│  │  ┌──────────┐       │         │  ┌──────────┐       │         │
+│  │  │ Primary B │       │         │  │ Primary A │       │         │
+│  │  │ Primary C │       │         │  │ Replica A1│       │         │
+│  │  │ Replica B1│       │   NET   │  │          │       │         │
+│  │  │ Replica C1│       │   ✗✗✗   │  └──────────┘       │         │
+│  │  └──────────┘       │         │                      │         │
+│  │                      │         │  Primary A:          │         │
+│  │                      │         │  Cannot reach 2/3   │         │
+│  │  Majority (3 nodes)  │         │  of primaries        │         │
+│  │  continues normal    │         │  → fails after       │         │
+│  │  operation           │         │  cluster-node-timeout│         │
+│  └──────────────────────┘         │  → writes rejected   │         │
+│                                    └──────────────────────┘         │
+│                                                                      │
+│  When partition heals:                                               │
+│  Primary A gets a full resync from a majority-side primary          │
+│  All writes to A during the partition are lost (if any slipped      │
+│  through before cluster-node-timeout)                               │
+└──────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+**Prevention**:
+- Place cluster nodes across multiple availability zones within a region to reduce partition probability
+- Set `cluster-node-timeout` to a value that balances failover speed against false positives (10-30 seconds is typical)
+- Use at least 3 primaries with their replicas in different failure domains
+
+## Anti-Patterns
+
+### Anti-Pattern 1: Using Redis as the Primary Database
+
+**The mistake**: Storing all application data in Redis, including data that must survive failures with zero loss.
+
+**Why it is wrong**: Redis gives up persistence guarantees for speed. Async replication can lose writes. AOF with `appendfsync always` slows writes significantly. There is no rollback, no referential integrity, no query optimizer. Schema changes require application-level migration code.
+
+**What to do instead**: Use a dedicated database (PostgreSQL, MySQL) for the source of truth. Use Redis as a cache layer, session store, or specialized data structure store on top of it.
+
+### Anti-Pattern 2: Storing Large Values
+
+**The mistake**: Storing multi-megabyte values (images, large JSON blobs, file contents) in Redis.
+
+**Why it is wrong**: A 10MB value consumes 10MB of RAM. Retrieving it blocks the single-threaded event loop for 1-5ms (network I/O for the response). 100 concurrent requests for large values create 100-500ms of cumulative blocking time.
+
+**What to do instead**: Store large values in object storage (S3, GCS) and keep only the reference path in Redis. For medium-sized data (100KB-1MB), consider compression before storage.
+
+### Anti-Pattern 3: No Persistence in Production
+
+**The mistake**: Running Redis with `save ""` (no RDB) and `appendonly no` in production.
+
+**Why it is wrong**: A single crash loses all data. This includes sessions (all users logged out), cache (all databases get hammered), queues (all pending jobs lost), and rate limiter state (rate limits reset, potentially allowing abuse bursts).
+
+**What to do instead**: Enable AOF with `appendfsync everysec`. This adds under 5ms of write latency per second and ensures at most 1 second of data loss. The trade-off is worth it for any production deployment.
+
+### Anti-Pattern 4: No maxmemory
+
+**The mistake**: Running Redis without setting `maxmemory`.
+
+**Why it is wrong**: Redis grows unbounded until it exhausts system RAM. The kernel OOM killer terminates it. Even without crashes, a Redis instance using 90% of system RAM leaves no room for other processes, swap, or the OOM buffer during fork-based operations (AOF rewrite, RDB snapshot).
+
+**What to do instead**: Set `maxmemory` to 60-80% of available RAM. Set `maxmemory-policy` to `allkeys-lru` or `volatile-lru` depending on your workload.
+
+### Anti-Pattern 5: No Authentication in Production
+
+**The mistake**: Running Redis with no password on a publicly accessible or network-accessible port.
+
+**Why it is wrong**: Unauthenticated Redis is a favorite target for crypto-mining botnets and data exfiltration. Attackers scan for open Redis ports (6379) and use `CONFIG SET` to write SSH keys, cron jobs, or ransomware payloads.
+
+**What to do instead**:
+- Set `requirepass` with a 32+ character random password
+- Use `rename-command CONFIG ""` to disable `CONFIG` entirely
+- Bind Redis to localhost or private network interfaces only
+- Use a firewall to restrict access to known client IPs
+- Consider TLS encryption (`tls-port` with certificates)
+
+## When NOT to Use Redis
+
+### Data Larger Than Memory
+
+If your total dataset exceeds available RAM (times replication factor), Redis cannot store it efficiently. Swapping destroys performance. Even with Cluster, the combined memory of all nodes must exceed the dataset size.
+
+**Alternatives**: RocksDB (disk-based key-value store), ScyllaDB (wide-column database), or Memcached with LRU eviction if all you need is simple key-value caching.
+
+### Strong Consistency Across Shards
+
+Redis Cluster provides eventual consistency during re-sharding and partitions. If your application requires linearizable consistency across all keys — your database guarantees that once a write is acknowledged, every subsequent read sees it — Redis Cluster cannot provide it.
+
+**Alternatives**: PostgreSQL with synchronous replication, CockroachDB (globally distributed SQL with strong consistency), or ZooKeeper/etcd for coordination data.
+
+### Complex SQL Queries
+
+Redis has no query language, no JOINs, no WHERE clauses, no GROUP BY, no aggregation functions. You cannot query "all users who signed up last week and have made at least 3 purchases." You would need to store denormalized data structures and maintain them in application code.
+
+**Alternatives**: PostgreSQL, MySQL, or a purpose-built analytical database like ClickHouse.
+
+### Blob Storage
+
+Redis is not designed for large binary objects (images, videos, large documents). The in-memory cost is prohibitive, and the single-threaded event loop is blocked during large value transfers.
+
+**Alternatives**: S3, GCS, Azure Blob Storage, or a CDN for serving static assets.
+
+### Pub/Sub with Reliable Delivery
+
+Redis Pub/Sub offers no message persistence, no acknowledgment mechanism, no retry logic, and no replay capability. If a subscriber is offline during a publish, the message is lost forever.
+
+**Alternatives**: RabbitMQ (AMQP), Apache Kafka, or Redis Streams (which adds persistence and consumer groups to the pub/sub model).

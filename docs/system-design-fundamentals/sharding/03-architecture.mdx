@@ -1,0 +1,478 @@
+---
+id: sharding-architecture
+title: Sharding at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest sharding implementation is application-level routing with hardcoded shard addresses. This section shows how this naive approach breaks down as the system grows, and what a production-grade architecture looks like instead.
+
+### The Simplest Version: Application-Level Sharding
+
+In the simplest approach, the application itself computes the target shard and opens a direct database connection. No proxy, no router — just application code.
+
+```python
+# Naive application-level sharding (Python psycopg2)
+SHARDS = {
+    0: "host=shard0.db.internal port=5432 dbname=app",
+    1: "host=shard1.db.internal port=5432 dbname=app",
+    2: "host=shard2.db.internal port=5432 dbname=app",
+    3: "host=shard3.db.internal port=5432 dbname=app",
+}
+
+def get_shard(user_id):
+    return user_id % 4
+
+def get_connection(user_id):
+    shard_id = get_shard(user_id)
+    conn_string = SHARDS[shard_id]
+    return psycopg2.connect(conn_string)
+
+def get_user_profile(user_id):
+    conn = get_connection(user_id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
+    return cursor.fetchone()
+```
+
+This works for up to approximately 100,000 users. Each application instance manages its own connections. The shard count is hardcoded at 4. Changing to 8 shards requires redeploying every application instance. There is no connection pooling (each request opens a new TCP connection). There is no failover. There is no monitoring.
+
+<AsciiDiagram
+  id="sharding/architecture-naive"
+  title="Naive application-level sharding: the application computes the shard from user_id and opens a direct database connection"
+  alt="Architecture diagram: App server instance 1 contains embedded routing logic (user_id % 4 -> shard). It opens 4 direct connections to 4 PostgreSQL shards. No proxy, no pooling, no failover"
+  caption="Naive application-level sharding: simple but lacks pooling, failover, and operational visibility"
+  content={`
+  Naive Application-Level Sharding (4 shards)
+
+                    ┌──────────────────────┐
+                    │  App Server           │
+                    │                       │
+                    │  def get_shard(id):    │
+                    │    return id % 4      │
+                    │                       │
+                    │  shard 0 -> psycopg2  │
+                    │  shard 1 -> psycopg2  │
+                    │  shard 2 -> psycopg2  │
+                    │  shard 3 -> psycopg2  │
+                    └─────────┬────────────┘
+                              │
+          ┌───────────────────┼───────────────────┐
+          │                   │                   │
+     ┌────▼────┐        ┌────▼────┐        ┌────▼────┐
+     │ Shard 0 │        │ Shard 1 │        │ Shard 2 │
+     │ 100K usr│        │ 100K usr│        │ 100K usr│
+     │ No pool │        │ No pool │        │ No pool │
+     │ No repl │        │ No repl │        │ No repl │
+     └─────────┘        └─────────┘        └─────────┘
+                                               │
+                                          ┌────▼────┐
+                                          │ Shard 3 │
+                                          │ 100K usr│
+                                          │ No pool │
+                                          │ No repl │
+                                          └─────────┘
+
+  Problems at scale:
+  1K users: fine, simple, fast
+  100K users: connection overhead visible, no failover
+  10M users: connection storm, uneven load, single points of failure
+`}
+/>
+
+### What Breaks at 1,000 Users
+
+At 1,000 users, the naive approach works fine. Each shard has 250 users. Connection overhead is negligible. No monitoring needed.
+
+### What Breaks at 100,000 Users
+
+At 100,000 users with 25,000 per shard, three problems emerge:
+
+1. **Connection churn**: Each request opens and closes a database connection. Creating a TCP connection takes 1-5ms. At 500 requests per second, 2.5 seconds per second is spent on connection setup.
+2. **No connection pooling**: PostgreSQL's `fork()` model on each connection amplifies memory usage. Each connection consumes 10 MB. At 1,000 concurrent connections per instance: 10 GB of memory per app instance.
+3. **No read replicas**: All read traffic hits the primary. A weekly reporting query that scans 1 GB causes 500ms latency spikes for user-facing queries.
+
+### What Breaks at 10 Million Users
+
+At 10 million users with 2.5 million per shard, the naive approach fails completely:
+
+1. **Connections exhausted**: The 4 hardcoded shards each have `max_connections=500`. The application has 20 instances, each opening 50 connections = 1,000 connections per shard. Connections are refused.
+2. **No rebalancing**: One shard happens to get celebrity users and handles 40 percent of traffic while others handle 20 percent. The hot shard's CPU is at 95 percent. The cold shards are at 30 percent. No way to rebalance without application redeployment.
+3. **No failover**: One shard's server dies. The application keeps trying to connect, getting connection refused errors for 25 percent of users. There is no replica to promote.
+4. **No monitoring**: Nobody knows which shard is hot. The ops team discovers the issue when users complain.
+
+---
+
+## Production-Grade Architecture
+
+A production sharded system adds five components that the naive implementation lacks: a dedicated routing layer, connection pooling, health checking, monitoring, and automated failover.
+
+<AsciiDiagram
+  id="sharding/architecture-production"
+  title="Production-grade sharded architecture with connection proxy, query router, health checker, monitoring stack, and automated failover"
+  alt="Full architecture: Application servers connect to HAProxy, which routes to multiple VTGate router instances. VTGate maintains routing tables from etcd. Four shards each have a primary and two replicas. Patroni manages automatic failover. Prometheus, Grafana, and PagerDuty provide monitoring. The deployment pipeline is shown with blue-green shard updates"
+  caption="Production sharding adds a routing proxy, health checking, automated failover, and comprehensive monitoring"
+  content={`
+  Production-Grade Sharded Architecture
+
+                    ┌──────────────────────┐
+                    │  Application Servers  │
+                    │  (20 instances)       │
+                    └──────────┬───────────┘
+                               │
+                    ┌──────────▼───────────┐
+                    │  HAProxy (2 nodes)   │
+                    │  TCP load balancer   │
+                    └──────────┬───────────┘
+                               │
+          ┌────────────────────┼────────────────────┐
+          │                    │                    │
+     ┌────▼──────┐       ┌────▼──────┐       ┌────▼──────┐
+     │ VTGate 1  │       │ VTGate 2  │       │ VTGate 3  │
+     │ Router +  │       │ Router +  │       │ Router +  │
+     │ Pool      │       │ Pool      │       │ Pool      │
+     │ 50 conns  │       │ 50 conns  │       │ 50 conns  │
+     │ per shard │       │ per shard │       │ per shard │
+     └────┬──────┘       └────┬──────┘       └────┬──────┘
+          │                    │                    │
+     ┌────┴────────────────────┴────────────────────┴────┐
+     │  etcd (3 nodes)                                    │
+     │  Routing table: shard key ranges -> shard address  │
+     │  Watches: VTGate instances subscribe to changes   │
+     └──────────────────────┬─────────────────────────────┘
+                            │
+      ┌─────────────────────┼─────────────────────┐
+      │                     │                     │
+  ┌───▼────────┐      ┌────▼───────┐      ┌──────▼─────┐
+  │ Shard 0    │      │ Shard 1    │      │ Shard 2    │
+  │ Primary    │      │ Primary    │      │ Primary    │
+  │ - 12.5M    │      │ - 12.5M    │      │ - 12.5M    │
+  │   users    │      │   users    │      │   users    │
+  ├────────────┤      ├────────────┤      ├────────────┤
+  │ Replica A  │      │ Replica A  │      │ Replica A  │
+  │ Replica B  │      │ Replica B  │      │ Replica B  │
+  │ Patroni    │      │ Patroni    │      │ Patroni    │
+  └────────────┘      └────────────┘      └────────────┘
+                                               │
+                                          ┌────▼───────┐
+                                          │ Shard 3    │
+                                          │ Primary    │
+                                          │ - 12.5M    │
+                                          │   users    │
+                                          ├────────────┤
+                                          │ Replica A  │
+                                          │ Replica B  │
+                                          │ Patroni    │
+                                          └────────────┘
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  Monitoring & Operations                                 │
+  │  Prometheus + Grafana (per-shard latency, QPS, errors)  │
+  │  PagerDuty alerts on shard failure                      │
+  │  Blue-green deploy for shard schema changes             │
+  └─────────────────────────────────────────────────────────┘
+`}
+/>
+
+### Key Production Components
+
+**HAProxy (connection proxy).** Two HAProxy instances in active-passive configuration provide connection pooling and basic health checking. HAProxy runs a TCP health check on each VTGate instance every 5 seconds. If a VTGate instance fails 3 consecutive checks, HAProxy removes it from the pool.
+
+**VTGate (query router).** Three VTGate instances provide horizontal scaling of the routing layer. Each VTGate maintains a connection pool of 50 connections per shard (50 x 4 shards = 200 connections per VTGate). VTGate caches the routing table from etcd with a 10-second refresh interval.
+
+**etcd (metadata service).** A 3-node etcd cluster stores the authoritative routing table. The routing table maps shard key ranges to shard addresses. VTGate instances subscribe to etcd watch events for routing table changes. When a shard is added or removed, etcd pushes the change to all VTGate instances within seconds.
+
+**Patroni (failover manager).** Patroni runs on each shard's primary and replicas. It uses a distributed consensus algorithm (RAFT via etcd) to elect a primary. If the primary fails, Patroni promotes the most up-to-date replica within 10-30 seconds. The routing table in etcd is updated to reflect the new primary.
+
+**Prometheus + Grafana (monitoring).** Every component exposes metrics: VTGate exports query latency and error rates per shard. Each PostgreSQL shard exports connections, buffer pool hit rate, WAL lag, and replication lag. Grafana dashboards provide a single-pane view of the entire sharded system. Alerts fire when any shard's p99 latency exceeds 100ms or when replication lag exceeds 30 seconds.
+
+---
+
+## Integration Patterns
+
+Sharded databases do not exist in isolation. They interact with caches, message queues, external APIs, and other databases. Four integration patterns handle these interactions.
+
+### Pattern 1: Sharded Database + Cache
+
+A cache layer (Redis, Memcached) sits in front of the sharded database to reduce read load. The cache key includes the shard key.
+
+<AsciiDiagram
+  id="sharding/architecture-cache-pattern"
+  title="Cache-aside pattern with sharded database: cache key includes shard key, cache miss triggers shard-aware read"
+  alt="Sequence: App checks Redis cache with key 'user:48192:profile'. Cache miss. App computes shard (shard 2). App reads from shard 2 directly (or through router). Returns data. App writes to cache with TTL 300s"
+  caption="Cache-aside with sharding: the cache absorbs repeated reads, the sharded database handles writes and cache-miss reads"
+  content={`
+  Cache-Aside Pattern with Sharded Database
+
+  App                    Redis                  Shard 2
+   │                       │                      │
+   │── GET user:48192:prof │                      │
+   │<── (miss) ──────────│                      │
+   │                                                │
+   │  Compute shard: hash(48192) % 4 = 2             │
+   │                                                │
+   │──────────────────────────────SELECT * FROM users│
+   │                               WHERE user_id=48 │
+   │<─────────────────────────────{name, email, ...}│
+   │                                                │
+   │── SET user:48192:prof {data} EX 300 ──────────>│
+   │<── OK ────────────────────────────────────────│
+   │                                                │
+   │  Next read (within 300s):                      │
+   │── GET user:48192:prof ────────────────────────>│
+   │<── {data} ────────────────────────────────────│
+   │                                                │
+  Key design: cache key includes shard key (user_id)
+  Cache invalidation: on write, delete cache key
+`}
+/>
+
+**Design considerations:** The cache key must include the shard key to enable efficient cache clearing when data changes. Cache-aside (also called lazy loading) is the standard pattern: read through cache first, populate on miss. Write-through cache is also possible: write to cache synchronously with the database write.
+
+**Cache sizing:** A 64 GB Redis cluster can cache approximately 10 million user profiles at 6 KB each. The cache hit rate for social media applications is typically 85-95 percent, reducing database read load by a factor of 6-20x.
+
+### Pattern 2: Sharded Database + Message Queue
+
+A message queue (Kafka, RabbitMQ) decouples writes from the sharded database, enabling asynchronous processing and fan-out.
+
+<AsciiDiagram
+  id="sharding/architecture-queue-pattern"
+  title="Message queue pattern: writes go to Kafka topic partitioned by shard key, consumers process per-partition and write to the corresponding shard"
+  alt="Architecture: App publishes write events to Kafka topic partitioned by user_id modulo 4. Kafka has 4 partitions, one per shard. 4 consumer groups each read from their partition and write to their corresponding shard. Failed writes go to a dead-letter queue"
+  caption="Message queue decouples writes: Kafka partitions by shard key ensure each shard's writes are consumed in order"
+  content={`
+  Queue-Based Write Pattern
+
+                      ┌─────────────────────┐
+                      │  Kafka Topic         │
+                      │  "user_updates"      │
+                      │  4 partitions (N=4)  │
+                      │                     │
+                      │  P0: hash%4==0      │
+                      │  P1: hash%4==1      │
+                      │  P2: hash%4==2      │
+                      │  P3: hash%4==3      │
+                      └──┬──┬──┬──┬─────────┘
+                         │  │  │  │
+              ┌──────────┘  │  │  └──────────┐
+              │             │  │             │
+         ┌────▼───┐   ┌────▼───┐  ┌────▼───┐
+         │Consumer │   │Consumer │  │Consumer │
+         │ group 0 │   │ group 1 │  │ group 2 │
+         │         │   │         │  │         │
+         │Write to │   │Write to │  │Write to │
+         │shard 0  │   │shard 1  │  │shard 2  │
+         └────┬───┘   └────┬───┘  └────┬───┘
+              │            │           │
+          ┌───▼───┐   ┌───▼───┐  ┌───▼───┐
+          │Shard 0│   │Shard 1│  │Shard 2│
+          └───────┘   └───────┘  └───────┘
+`}
+/>
+
+**Design considerations:** Kafka's partition count should match or be a multiple of the shard count. Each partition is consumed by exactly one consumer in the group, ensuring that writes to the same shard key are processed in order. A dead-letter queue catches writes that fail after N retries.
+
+### Pattern 3: Sharded Database + External API Calls
+
+When a shard-key query needs data from an external API, the service must determine which data to fetch without a cross-shard query.
+
+**Design approach:** Embed the external data in the sharded database as a denormalized field, or fetch it asynchronously via an event-driven pipeline. Avoid scatter-gather patterns where each shard makes separate API calls — one slow API call blocks one shard, but scatter-gather means all shards wait for the slowest.
+
+### Pattern 4: Cross-Shard Joins via Materialized Views
+
+When two tables must be joined but cannot be co-located on the same shard, maintain materialized views or secondary indexes.
+
+<AsciiDiagram
+  id="sharding/architecture-join-pattern"
+  title="Cross-shard join resolution via materialized views: orders (sharded by order_id) and users (sharded by user_id) joined through a per-shard materialized view"
+  alt="Architecture: orders sharded by order_id on shards 0-3. users sharded by user_id on shards 0-3. A materialized view for orders_by_user is maintained on each shard, partitioned by user_id so the join prunes to one shard"
+  caption="Materialized views avoid cross-shard joins by pre-joining data and placing the result on the correct shard"
+  content={`
+  Cross-Shard Join via Materialized Views
+
+  Problem: JOIN orders ON users WHERE user_id = X
+           orders sharded by order_id
+           users sharded by user_id
+           -> must scatter-gather
+
+  Solution: Materialized view orders_by_user on each shard,
+            sharded by user_id, co-located with users table
+
+  Shard 0:                    Shard 1:
+  ┌──────────────────┐        ┌──────────────────┐
+  │ users (user_id)  │        │ users (user_id)  │
+  │ user_ids 0-25%   │        │ user_ids 25-50%  │
+  ├──────────────────┤        ├──────────────────┤
+  │ orders_by_user   │        │ orders_by_user   │
+  │ (user_id PK)     │        │ (user_id PK)     │
+  │ order data for   │        │ order data for   │
+  │ user_ids 0-25%   │        │ user_ids 25-50%  │
+  └──────────────────┘        └──────────────────┘
+
+  Query: SELECT * FROM users u JOIN orders_by_user o
+         ON u.user_id = o.user_id WHERE u.user_id=42
+  -> Router: hash(42)%4 = shard 0
+  -> Shard 0: local join, both tables on same shard
+  -> 1 shard hit, under 10ms
+`}
+/>
+
+---
+
+## Multi-Region and Global Scale
+
+A global sharded system distributes shards across geographic regions to reduce latency and comply with data residency requirements.
+
+<AsciiDiagram
+  id="sharding/architecture-multi-region"
+  title="Multi-region sharded topology: 3 regions (US-East, EU-West, AP-Southeast) each with a subset of shards and cross-region replication"
+  alt="Global map showing 3 AWS regions: us-east-1 (shards 0-3 primary, replicas for shards 4-15), eu-west-1 (shards 4-7 primary, replicas for shards 0-3, 8-15), ap-southeast-1 (shards 8-11 primary, replicas for shards 0-7, 12-15). Cross-region WAN replication shown with 35-200ms latency labels"
+  caption="Multi-region sharding places hot shards near users and uses cross-region replication for disaster recovery"
+  content={`
+  Multi-Region Sharding Topology
+
+                  ┌─────────────────────────────────────┐
+                  │   Global DNS / Traffic Director       │
+                  │   Route by geo: us-e1, eu-w2, ap-s1  │
+                  └──────┬──────────┬──────────┬─────────┘
+                         │          │          │
+              ┌──────────▼──┐ ┌─────▼─────┐ ┌─▼──────────┐
+              │ us-east-1   │ │ eu-west-2 │ │ ap-southeast│
+              │ (us-east)   │ │ (Ireland)  │ │ -1 (SG)    │
+              │             │ │           │ │            │
+              │ SHARDS:     │ │ SHARDS:   │ │ SHARDS:    │
+              │ 0,1,2,3  P  │ │ 4,5,6,7 P │ │ 8,9,10,11P│
+              │ 4,5,6,7  R  │ │ 0,1,2,3 R │ │ 0,1,2,3  R│
+              │ 8,9,10,11R  │ │ 8,9,10,11│ │ 4,5,6,7  R│
+              │ 12,13,14,15R│ │ 12,13,14,│ │ 12,13,14, │
+              │             │ │ 15   R   │ │ 15     P  │
+              ├─────────────┤ ├──────────┤ ├───────────┤
+              │ Latency:    │ │ Latency: │ │ Latency:  │
+              │ 5-20ms intra│ │ 35ms to  │ │ 150ms to  │
+              │ 80ms to EU  │ │ us-east  │ │ us-east   │
+              │             │ │ 35ms to  │ │ 150ms to  │
+              │             │ │ ap-southeast│ eu-west │
+              └─────────────┘ └──────────┘ └───────────┘
+
+  Routing: US users -> us-east-1 (shards 0-3)
+           EU users -> eu-west-1 (shards 4-7)
+           AP users -> ap-southeast-1 (shards 8-11)
+           Cross-region reads: failover to nearest region
+`}
+/>
+
+**Routing strategy:** Users are routed to the nearest region by DNS-based global traffic management. Within each region, the local router directs queries to the region's primary shards. Cross-region replication ensures that if a region fails, another region can serve its shards within minutes.
+
+**Data residency:** For GDPR and similar regulations, specific shards can be pinned to specific regions. EU user data lives exclusively on EU shards. The routing table enforces this: `WHERE user_id IN (eu_user_set)` routes only to EU-located shards.
+
+**Cross-region latency:** Replicating a write from us-east-1 to ap-southeast-1 takes 150-200ms. For this reason, cross-region replication is typically asynchronous. Each region's shards are the source of truth for their assigned data. In a disaster, the failover region may lose the last few seconds of writes.
+
+---
+
+## Capacity Planning
+
+A walk through capacity planning for a sharded database system serving a social media platform with 50 million active users.
+
+### Assumptions
+
+- Total users: 50 million
+- Active users per day: 25 million
+- Writes per active user per day: 5 (posts, likes, comments)
+- Average write size: 1 KB
+- Read-to-write ratio: 20:1
+- Target: each shard under 300 GB data, under 5,000 writes per second peak
+- Growth: user base growing 30 percent per year
+
+### Step 1: Calculate total data volume
+
+Daily write volume: 25M users x 5 writes x 1 KB = 125 GB/day.
+Yearly write volume: 125 GB x 365 = 45.6 TB/year.
+Data after 3 years: 45.6 TB x 3 = 136.8 TB (ignoring deletes).
+
+Plus indexes: approximately 30 percent overhead = 177.8 TB total data volume with indexes.
+
+### Step 2: Calculate required shard count
+
+Target per-shard data: 250 GB (comfortable on a server with 64 GB RAM, 500 GB NVMe).
+Shard count: 177.8 TB / 250 GB = 711 shards.
+
+Round to 1024 shards (next power of 2) for consistent hashing alignment.
+
+### Step 3: Verify write throughput
+
+Writes per second peak: 25M x 5 / 86,400 = 1,447 writes/second average.
+Peak-to-average ratio: 3:1 (evening peak) = 4,341 writes/second peak.
+Writes per shard per second: 4,341 / 1024 = 4.2 writes/shard/second.
+
+A single PostgreSQL instance handles 15,000 writes per second. At 4.2 writes/second per shard, the system is at 0.03 percent of write capacity. The bottleneck is data volume (250 GB per shard), not write throughput.
+
+### Step 4: Plan for growth
+
+30 percent yearly growth: each shard will grow from 250 GB to 325 GB in year 2, to 422 GB in year 3.
+
+Rebalancing trigger: when the largest shard exceeds 80 percent of the target per-shard storage (400 GB for a 500 GB disk), add shards.
+
+Add shards in power-of-2 increments: 1024 -> 2048 -> 4096.
+
+### Step 5: Hardware specification per shard
+
+**Medium shard (250 GB, 5 writes/s, 100 reads/s):**
+- 4 vCPU, 16 GB RAM, 500 GB NVMe SSD
+- 1 primary + 2 replicas for read scaling
+- Cost: approximately $100/month per shard (cloud instance + storage)
+
+**Large shard (500 GB, 20 writes/s, 500 reads/s):**
+- 8 vCPU, 32 GB RAM, 1 TB NVMe SSD
+- 1 primary + 3 replicas for read scaling
+- Cost: approximately $250/month per shard
+
+For 1024 medium shards: 1024 x 3 instances x $100 = $307,200/month.
+
+---
+
+## Deployment and Operations
+
+### Zero-Downtime Schema Migration
+
+Schema changes in a sharded system require a rolling deployment across all shards.
+
+1. **Prepare phase:** Write the migration as a reversible SQL script. Test it on a staging environment with the same shard topology. Measure the lock duration and data rewrite time.
+2. **Rollout phase:** Apply the migration to one shard at a time. Use a canary shard (the smallest or least active) first. Monitor query latency, error rates, and replication lag during the migration. If the canary migration causes issues, roll back.
+3. **Verification phase:** After all shards are migrated, run a verification query on each shard to confirm the schema change was applied correctly.
+4. **Rollback:** Have a rollback script ready for each shard. If a shard's migration fails, restore from a recent backup and reapply.
+
+### Monitoring Per-Shard Metrics
+
+Monitor these metrics per shard, not just as cluster averages:
+
+- **Query latency (p50, p95, p99):** Should be consistent across shards. A shard with 2x the p99 of the cluster average is hot.
+- **Disk usage:** Absolute GB and percentage of capacity. Alert at 80 percent. A shard at 85 percent while the cluster average is 40 percent means data skew.
+- **Writes per second:** Spike detection. A shard with 5x normal write volume may be under attack or have a buggy batch job.
+- **Replication lag:** Seconds behind primary. Lag over 30 seconds means the replica cannot keep up. Causes: slow network, heavy write load on primary, underprovisioned replica.
+- **Connection pool utilization:** Percentage of pooled connections in use. Utilization over 80 percent means the pool is too small.
+- **Active connections:** Number of active database connections. Spikes indicate connection leaks or traffic surges.
+
+### Debugging Common Sharding Issues
+
+**Issue: A query that should prune to one shard is hitting all shards.**
+Check the WHERE clause: does it include the shard key? Is the shard key wrapped in a function? Does the data type match? Run `EXPLAIN` on the query against the shard to confirm partition pruning.
+
+**Issue: One shard has 2x the data of others.**
+Calculate the expected data per shard: total_data / shard_count. If the shard has significantly more, check whether the shard key has poor distribution. A common cause: a monotonically increasing shard key (auto-increment, timestamp) with range-based sharding causing all new data to land on the last shard.
+
+**Issue: Scatter-gather queries are slow.**
+Identify the slowest shard in the scatter-gather response. Profile that shard's query execution. Add an index to support the non-shard-key query. Consider routing scatter-gather queries to read replicas instead of primaries.
+
+### Upgrades
+
+**Database version upgrades:** Upgrade one shard at a time. Use blue-green deployment: create new shard instances with the new version, replicate data from the old shards, cut over when replication catches up. This avoids downtime but doubles the infrastructure cost during the migration.
+
+**Hardware upgrades:** Vertical scaling (upgrading a shard's CPU/memory) is straightforward: stop the shard, upgrade the instance type, start the shard. This takes 5-15 minutes of downtime per shard. For zero-downtime hardware upgrades, use a blue-green approach: create new shard instances with better hardware, replicate, cut over.
+
+---
+
+This concludes the Architecture section. The next page, Sharding Trade-offs and Failure Modes, examines when sharding hurts more than it helps and what can go wrong.

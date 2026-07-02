@@ -1,0 +1,606 @@
+---
+id: optimistic-vs-pessimistic-locking-deep-dive
+title: Locking — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+Every relational database that supports transactions contains a **lock manager** — a subsystem responsible for granting, queuing, and releasing locks according to a concurrency control protocol. PostgreSQL and MySQL InnoDB implement lock managers with different trade-offs, but the core architecture is shared.
+
+### Lock Manager Components
+
+The lock manager consists of four subsystems:
+
+**Lock Table:** An in-memory hash table mapping a resource identifier (table ID + page number + row offset, or a hash of the query condition) to a list of lock requests. Each entry records the transaction ID, lock mode (shared/exclusive), and state (granted/waiting).
+
+**Lock Modes:** Each database supports at least four lock modes:
+
+| Mode | Symbol | Allows Reads | Allows Writes | Conflicts With |
+|---|---|---|---|---|
+| Access Share | AS | Yes | No | Access Exclusive |
+| Row Share | RS | Yes | No | Exclusive, Row Exclusive |
+| Row Exclusive | RX | No | Requires exclusive | RS, RX, Share, Exclusive |
+| Share | S | Yes (multiple) | No | Row Exclusive, Exclusive |
+| Share Row Exclusive | SRX | Yes | No | RS, RX, S, SRX, Exclusive |
+| Exclusive | X | No | Yes | All modes |
+
+**Lock Escalation:** When a single transaction acquires locks on many rows within the same table, the lock manager may escalate to a table-level lock to reduce memory overhead. InnoDB escalates at approximately 5,000 row locks. PostgreSQL avoids escalation entirely — it uses a fixed-size hash table and converts to table-level locks only for DDL operations.
+
+**Deadlock Detection:** A background process periodically builds a **wait-for graph** and checks for cycles. PostgreSQL runs deadlock detection when a lock request is added to the wait queue, not on a timer. InnoDB checks every second by default.
+
+<AsciiDiagram
+  id="optimistic-vs-pessimistic-locking/lock-manager-arch"
+  title="Lock Manager Internal Architecture"
+  alt="Diagram of a database lock manager showing the lock table hash map, per-row lock entries, granted vs waiting queues, and the deadlock detector component"
+  caption="The lock manager sits between the transaction layer and the buffer pool"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│                    Lock Manager Architecture                      │
+│                                                                   │
+│  ┌─────────────────────┐   ┌──────────────────────────────┐     │
+│  │  Transaction Layer   │   │  Lock Table (in-memory hash) │     │
+│  │                     │   │                                │     │
+│  │  Txn A ──> lock req │   │  Key: (db, rel, page, tuple)  │     │
+│  │  Txn B ──> lock req │   │                                │     │
+│  │  Txn C ──> lock req │   │  ┌────────────────────────┐    │     │
+│  └─────────┬───────────┘   │  │ hash_entry(42, 3, 7)   │    │     │
+│            │               │  │ ┌─────┬──────┬───────┐ │    │     │
+│            ▼               │  │ │ Txn │ Mode │ Status│ │    │     │
+│  ┌─────────────────┐       │  │ ├─────┼──────┼───────┤ │    │     │
+│  │ Lock Manager     │       │  │ │ A   │ X    │Granted│ │    │     │
+│  │                  │       │  │ │ B   │ X    │Waiting│ │    │     │
+│  │  ┌────────────┐  │       │  │ └─────┴──────┴───────┘ │    │     │
+│  │  │ Deadlock   │  │       │  └────────────────────────┘    │     │
+│  │  │ Detector   │  │       │                                │     │
+│  │  │ (DFS cycle)│  │       │  ┌────────────────────────┐    │     │
+│  │  └────────────┘  │       │  │ hash_entry(42, 3, 8)   │    │     │
+│  │                  │       │  │ ┌─────┬──────┬───────┐ │    │     │
+│  │  ┌────────────┐  │       │  │ │ C   │ S    │Granted│ │    │     │
+│  │  │ Lock Grant │  │       │  │ └─────┴──────┴───────┘ │    │     │
+│  │  └────────────┘  │       │  └────────────────────────┘    │     │
+│  └─────────────────┘       └──────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+### Lock Granularity Hierarchy
+
+Databases use a multi-level lock hierarchy to balance concurrency and overhead:
+
+```
+TABLE ──> PAGE ──> ROW
+```
+
+When a transaction requests a row lock, the database also acquires intention locks at the page and table levels. An intention lock signals "I intend to lock something finer-grained" and prevents another transaction from acquiring a conflicting table-level lock (e.g., `DROP TABLE` cannot proceed while any transaction holds an intention lock on the table).
+
+```
+Intent Share (IS):      "I may read individual rows"
+Intent Exclusive (IX):  "I may write individual rows"
+Share Intent Exclusive (SIX): "I am reading the table and may write rows"
+```
+
+---
+
+## Data Structures and Algorithms
+
+### Two-Phase Locking (2PL)
+
+Two-phase locking is the protocol that guarantees serializability. It has two phases:
+
+**Phase 1 — Expanding/Growing:** A transaction may acquire locks but may not release any.
+
+**Phase 2 — Shrinking:** A transaction may release locks but may not acquire any.
+
+```
+T1: LOCK(A) → LOCK(B) → READ(A) → WRITE(A) → READ(B) → WRITE(B) → UNLOCK(A) → UNLOCK(B)
+    └──────── Expanding Phase ────────┘ └───────── Shrinking Phase ─────────┘
+```
+
+A transaction that releases any lock enters the shrinking phase and cannot acquire new locks. This prevents a class of anomalies called **cascading aborts** — if T1 releases a lock on A before committing, T2 reads A, then T1 aborts, T2 has read uncommitted data and must also abort.
+
+**Strict 2PL** solves cascading aborts: a transaction holds all its exclusive locks until commit or abort. This is the protocol used by InnoDB and PostgreSQL's Serializable isolation level.
+
+<AsciiDiagram
+  id="optimistic-vs-pessimistic-locking/2pl-protocol"
+  title="Two-Phase Locking Protocol Phases"
+  alt="Timeline diagram showing the expanding phase where locks are acquired and the shrinking phase where locks are released, with the unlock point marking the transition"
+  caption="Strict 2PL holds all exclusive locks until commit"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│               Two-Phase Locking (Strict 2PL)                     │
+│                                                                   │
+│                     ┌────────────────────┐                       │
+│                     │   Growing Phase     │                       │
+│                     │  (acquire locks)    │                       │
+│                     └──────────┬─────────┘                       │
+│                                │                                  │
+│  LOCK(A) ──> LOCK(B) ──> LOCK(C) ──> READ(A) ──> WRITE(B)      │
+│     │            │            │            │            │          │
+│     ▼            ▼            ▼            ▼            ▼          │
+│  ┌────┐      ┌────┐      ┌────┐      ┌────┐      ┌────┐          │
+│  │ IX │      │ IX │      │ X  │      │READ│      │WRITE│          │
+│  │tbl │      │pg 3│      │row │      │ A  │      │ B  │          │
+│  └────┘      └────┘      └────┘      └────┘      └────┘          │
+│                                                  │                │
+│                      ┌───────────────────────────┘                │
+│                      ▼                                            │
+│             ┌────────────────────┐                                │
+│             │  Shrinking Phase    │                                │
+│             │  (release locks)    │                                │
+│             └──────────┬─────────┘                                │
+│                        │                                           │
+│              UNLOCK(C) ──> UNLOCK(B) ──> UNLOCK(A) ──> COMMIT    │
+│                                                                   │
+│  Strict 2PL adds: All exclusive locks held until COMMIT/ABORT     │
+│  Prevents: Cascading aborts, dirty reads                          │
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+### MVCC Implementation (Snapshot Isolation)
+
+MVCC avoids readers blocking writers by maintaining multiple versions of each row. When a transaction begins, it records a snapshot of all currently active transactions. It reads only row versions committed before that snapshot.
+
+PostgreSQL stores each row version as a tuple with `xmin` (creating transaction ID) and `xmax` (deleting/updating transaction ID). A row is visible to a transaction if:
+
+1. `xmin` is committed and `xmin` is before the transaction's snapshot
+2. `xmax` is null or `xmax` is not committed yet
+
+```sql
+-- Each row in PostgreSQL has hidden system columns
+SELECT ctid, xmin, xmax, tableoid, cmax, cmin, * FROM inventory;
+
+-- ctid: physical location (page, tuple index)
+-- xmin: creating transaction ID
+-- xmax: deleting/updating transaction ID (0 if current)
+```
+
+When an UPDATE occurs, PostgreSQL does not modify the row in place. It marks the old version as expired (sets xmax) and inserts a new version. Old versions are removed by `VACUUM` when no active snapshot can still see them.
+
+### Deadlock Detection Algorithm
+
+Deadlock detection runs on a **wait-for graph**. Each transaction is a node. A directed edge from T1 to T2 means "T1 is waiting for a lock held by T2."
+
+```python
+def detect_deadlock(wait_for_graph):
+    """
+    DFS-based cycle detection on the wait-for graph.
+    Returns the set of transactions in the cycle, or None.
+    """
+    visited = set()
+    recursion_stack = set()
+
+    def dfs(transaction):
+        if transaction in recursion_stack:
+            return True  # Cycle found
+        if transaction in visited:
+            return False
+        visited.add(transaction)
+        recursion_stack.add(transaction)
+        for blocker in wait_for_graph.get(transaction, []):
+            if dfs(blocker):
+                return True
+        recursion_stack.remove(transaction)
+        return False
+
+    for txn in wait_for_graph:
+        if dfs(txn):
+            return _break_deadlock(wait_for_graph)
+    return None
+
+
+def _break_deadlock(wait_for_graph):
+    """
+    Choose the youngest transaction (least work done) as the victim.
+    Abort it, release its locks, send it back to retry.
+    """
+    youngest = min(wait_for_graph.keys(),
+                   key=lambda t: t.started_at)
+    youngest.abort("deadlock detected — retry")
+    return youngest
+```
+
+PostgreSQL stores the wait-for graph in shared memory as a hash table mapping `(blocked_txn, blocking_txn)` pairs. When a lock request enters the wait queue, PostgreSQL traverses the graph from the newly blocked transaction. If it finds a cycle within `deadlock_timeout` (default 1 second), it aborts the transaction whose abort cost is lowest (typically the youngest).
+
+<AsciiDiagram
+  id="optimistic-vs-pessimistic-locking/wait-for-graph"
+  title="Wait-For Graph and Deadlock Cycle"
+  alt="Three transactions T1, T2, T3 in a circular wait: T1 holds A and waits for B held by T2, T2 holds B and waits for C held by T3, T3 holds C and waits for A held by T1"
+  caption="A cycle in the wait-for graph means deadlock — one transaction must be aborted"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│                    Wait-For Graph (Deadlock)                     │
+│                                                                   │
+│                    ┌─────────────────┐                           │
+│                    │   Resources      │                           │
+│                    │                  │                           │
+│                    │  ┌───┐  ┌───┐   │                           │
+│                    │  │ A │  │ B │   │                           │
+│                    │  └───┘  └───┘   │                           │
+│                    └────────┬────────┘                           │
+│                             │                                     │
+│  ┌──────────┐    holds A   │   waits for B                       │
+│  │  Txn 1   │──────────────┼────────────────>┌──────────┐        │
+│  │          │              │                  │  Txn 2   │        │
+│  │ balance  │<─────────────┼──────────────────│          │        │
+│  │ read     │  waits for A │   holds B        │ invoice  │        │
+│  └──────────┘              │                  │ read     │        │
+│       │                    │                  └────┬─────┘        │
+│       │                    │                       │              │
+│       │  waits for C       │        holds C        │              │
+│       └────────────────────┼───────────────────────┘              │
+│                            │                                       │
+│                    ┌───────┴────────┐                              │
+│                    │   Resource C   │                              │
+│                    └────────────────┘                              │
+│                                                                   │
+│  Cycle: T1 ──waits for──> T2 ──waits for──> T3 ──waits for──> T1 │
+│  Result: youngest transaction aborted (T3 in this case)           │
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+### Optimistic Concurrency Control (OCC) Validation Phase
+
+Optimistic Concurrency Control, proposed by Kung and Robinson (1981), has three phases:
+
+1. **Read Phase:** Transaction reads data and writes to a private workspace. No locks are held.
+2. **Validation Phase:** Transaction checks whether its reads and writes conflict with other concurrent transactions.
+3. **Write Phase:** If validation passes, the private workspace is made visible (written to the database). If validation fails, the transaction aborts and retries.
+
+Validation checks:
+
+```
+For each concurrent transaction Tj that committed during Ti's execution:
+  Check 1: Did Tj read any data that Ti wrote?
+  Check 2: Did Ti read any data that Tj wrote?
+  Check 3: Did Tj write any data that Ti wrote?
+If any check fails, Ti must abort and retry.
+```
+
+The time of validation determines when conflicts surface. In optimistic locking, validation happens at the update statement — a single row comparison rather than a full set comparison, making it practical for real-time systems.
+
+### Timestamp Ordering
+
+An alternative to locking: assign each transaction a timestamp at start time. All reads and writes carry the timestamp, and the database uses a conflict resolution rule:
+
+- Read Rule: A read from Ti is rejected if a younger transaction has already written the same item.
+- Write Rule: A write from Ti is rejected if a younger transaction has already read or written the same item.
+
+Timestamp ordering avoids locks entirely. It is used in distributed databases (Google Spanner uses TrueTime timestamps) where locking overhead across nodes is prohibitive. The downside: a rejected transaction must retry with a new timestamp, and cascading aborts are possible.
+
+---
+
+## The Query Lifecycle
+
+A transaction under pessimistic locking follows a well-defined lifecycle through the lock manager. Below is a 15-step walkthrough of two concurrent transactions.
+
+**Setup:** Transaction T1 and T2 both want to update the `orders` table row with `id=5001`. T1 arrives first.
+
+### Step-by-Step Lock Lifecycle
+
+| Step | Event | Lock Manager State |
+|---|---|---|
+| 1 | T1: `BEGIN` | Lock table empty |
+| 2 | T1: `SELECT * FROM orders WHERE id = 5001 FOR UPDATE` | Lock manager checks lock table: no locks on row 5001. Creates entry: `(row=5001, txn=T1, mode=X, status=GRANTED)`. Also adds intention lock on `orders` table: `(table=orders, txn=T1, mode=IX, status=GRANTED)` |
+| 3 | T1 reads row 5001 (status="pending", amount=500) | — |
+| 4 | T1 computes: new status = "confirmed" | — |
+| 5 | T2: `BEGIN` | — |
+| 6 | T2: `SELECT * FROM orders WHERE id = 5001 FOR UPDATE` | Lock manager checks lock table: T1 holds exclusive lock on row 5001. T2's mode X conflicts. Lock manager adds: `(row=5001, txn=T2, mode=X, status=WAITING)` |
+| 7 | Lock manager runs deadlock check | Current graph: T2 waits for T1. T1 waits for nothing. No cycle. T2 added to wait queue. |
+| 8 | T1: `UPDATE orders SET status='confirmed' WHERE id = 5001` | Write proceeds. Lock still held. |
+| 9 | T1: `COMMIT` | Lock manager releases all locks held by T1. Removes T1's entries from lock table. Wakes up waiting transactions. |
+| 10 | T2: lock granted | Lock manager updates T2's entry: `status=GRANTED`. T2 proceeds. |
+| 11 | T2 reads row 5001 (status="confirmed", amount=500) | — |
+| 12 | T2 computes: new status = "shipped" | — |
+| 13 | T2: `UPDATE orders SET status='shipped' WHERE id = 5001` | Write proceeds. |
+| 14 | T2: `COMMIT` | Lock manager releases T2's locks. |
+| 15 | Final row: status="shipped" | Both transactions executed safely. |
+
+If T2 had arrived at step 6 and waited for 30 seconds without T1 committing (perhaps T1 was waiting for user input), `lock_timeout` would fire: PostgreSQL raises error "canceling statement due to lock timeout" and T2 aborts.
+
+<AsciiDiagram
+  id="optimistic-vs-pessimistic-locking/query-lifecycle"
+  title="Transaction Lock Lifecycle Timeline"
+  alt="Timeline showing T1 acquiring lock, T2 queued, T1 commits and releases locks, then T2 acquires lock and proceeds"
+  caption="The lock lifecycle guarantees serial execution of conflicting transactions"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│                Transaction Lock Lifecycle                        │
+│                                                                   │
+│  T1                      Lock Manager        T2                  │
+│  │                          │                  │                  │
+│  │──BEGIN──────────────────>│                  │                  │
+│  │──SELECT...FOR UPDATE────>│                  │                  │
+│  │                          │──GRANT LOCK      │                  │
+│  │<──LOCK GRANTED───────────│                  │                  │
+│  │                          │                  │                  │
+│  │──READ row 5001           │                  │                  │
+│  │                          │                  │──BEGIN          │
+│  │                          │                  │──SELECT...      │
+│  │                          │                  │   FOR UPDATE    │
+│  │                          │<──LOCK REQUEST───│                  │
+│  │                          │──CHECK CONFLICT  │                  │
+│  │                          │──T2→WAITING      │                  │
+│  │                          │──CHECK DEADLOCK  │                  │
+│  │                          │──NO CYCLE        │                  │
+│  │                          │                  │<──QUEUED        │
+│  │                          │                  │                  │
+│  │──UPDATE                  │                  │                  │
+│  │──COMMIT─────────────────>│                  │                  │
+│  │                          │──RELEASE T1 LKS  │                  │
+│  │                          │──WAKE T2         │                  │
+│  │                          │                  │<──LOCK GRANTED  │
+│  │                          │                  │──READ row 5001  │
+│  │                          │                  │──UPDATE         │
+│  │                          │                  │──COMMIT         │
+│  └──────────────────────────┴──────────────────┴────time─────────┘
+`}
+/>
+
+---
+
+## Consistency and State
+
+Isolation levels directly determine which locking strategy is sufficient and which anomalies are tolerated.
+
+### Isolation Level Impact on Locking
+
+| Isolation Level | Pessimistic Locking Behavior | Optimistic Locking Behavior | Anomalies Allowed |
+|---|---|---|---|
+| Read Uncommitted | No locks on reads. Write locks held until commit. | Version check on write but dirty reads visible. | Dirty read, non-repeatable read, phantom |
+| Read Committed | Read locks released after `SELECT` completes. Write locks until commit. | Version check on write. Read snapshot at statement start. | Non-repeatable read, phantom |
+| Repeatable Read | Read locks held until commit (prevents updates to read rows). Write locks until commit. | Version check on write. Read snapshot at transaction start. | Phantom (in some databases) |
+| Serializable | All locks held until commit. Range locks on predicates (prevents phantoms). | Snapshot isolation + serialization failure detection (SSI). | None |
+
+### Lost Updates
+
+A lost update occurs when two transactions read the same value, both modify it, and the second write overwrites the first.
+
+```
+T1: READ(x=10)                  T2: READ(x=10)
+T1: x = x + 5   → 15           T2: x = x + 3   → 13
+T1: WRITE(x=15)                 T2: WRITE(x=13)  -- LOST T1's update
+```
+
+Pessimistic prevention: `SELECT FOR UPDATE` ensures T2 waits until T1 commits.
+
+Optimistic prevention: Version column. T2's update `WHERE version = 1` matches zero rows. T2 retries with fresh read (x=15, v=2) and computes correct value (x=18).
+
+### Write Skew
+
+Write skew is subtler than a lost update. Two transactions read overlapping data sets and each writes to a disjoint subset, but the combination violates an integrity constraint.
+
+```
+Constraint: At least one doctor must be on call at all times.
+
+T1: READ(on_call = {Alice, Bob})      T2: READ(on_call = {Alice, Bob})
+T1: Alice takes herself off call      T2: Bob takes himself off call
+T1: WRITE(on_call = {Bob})           T2: WRITE(on_call = {Alice})
+-- Final: on_call = {} -- constraint violated!
+```
+
+Neither transaction overwrites the other's write, so optimistic locking with a version column does not detect this. Both writes succeed. The fix requires either:
+
+- Serializable isolation (PostgreSQL's SSI detects the conflict via predicate locking)
+- Application-level constraint: `UPDATE doctors SET on_call = false WHERE ... AND (SELECT COUNT(*) FROM doctors WHERE on_call = true) > 1`
+
+### Phantom Reads
+
+A phantom read occurs when a query returns different results at two points in the same transaction because another transaction inserted or deleted rows matching the WHERE clause.
+
+```
+T1: SELECT COUNT(*) FROM orders WHERE amount > 100 → 5
+                              T2: INSERT INTO orders (amount=200) → commits
+T1: SELECT COUNT(*) FROM orders WHERE amount > 100 → 6  -- phantom!
+```
+
+Pessimistic prevention: **Range locks** (also called predicate locks or gap locks). InnoDB locks the index range covering `amount > 100`, preventing inserts into that range.
+
+Optimistic prevention: Serializable Snapshot Isolation (SSI) in PostgreSQL checks whether a concurrent transaction inserted a row that would have appeared in a re-executed query.
+
+---
+
+## Performance Characteristics
+
+### Lock Contention Under Load
+
+Lock contention is the primary throughput limiter in pessimistic systems. The relationship follows a queueing model:
+
+```
+Throughput = 1 / (service_time + wait_time)
+
+Where wait_time ≈ (utilization / (1 - utilization)) × service_time
+```
+
+At 50% lock utilization, wait time equals service time. At 80% utilization, wait time is 4x service time. At 95% utilization, throughput collapses.
+
+<AsciiDiagram
+  id="optimistic-vs-pessimistic-locking/contention-curve"
+  title="Throughput vs Contention for Pessimistic Locking"
+  alt="Graph showing throughput degrading exponentially as lock contention increases from 10% to 95%, with a steep drop after 70% utilization"
+  caption="Throughput collapses as locking utilization exceeds 70-80%"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│           Throughput vs Lock Contention (Pessimistic)            │
+│                                                                   │
+│  Throughput                                                      │
+│  │                                                               │
+│  100% ──┼─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬──       │
+│         │     │     │     │     │     │     │     │     │         │
+│   80% ──┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼─────┼──       │
+│         │     │     │     │     │     │     │     │     │         │
+│   60% ──┼─────┼─────┼─────┼─────┼─────┼─────■─────┼─────┼──       │
+│         │     │     │     │     │     │    /│      │     │         │
+│   40% ──┼─────┼─────┼─────┼─────┼─────■───┼──────┼─────┼──       │
+│         │     │     │     │     │    /│    │      │     │         │
+│   20% ──┼─────┼─────┼─────┼─────■───┼────┼──────┼─────┼──       │
+│         │     │     │     │    /│    │    │      │     │         │
+│    0% ──┼─────┼─────┼─────■───┼────┼────┼──────┼─────┼──       │
+│         │  10%│  20%│  30%│  40%│  50%│  60%│  70%│  80%│  90%  │
+│                                 Contention Rate                   │
+│                                                                   │
+│  ── Actual throughput    ■ Critical point (~70%)                  │
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+### Deadlock Rate vs Concurrency
+
+Deadlock frequency increases quadratically with the number of concurrent transactions contending for overlapping resources. In a system with N concurrent transactions each touching R random rows from a pool of M rows:
+
+```
+Expected deadlock rate ≈ (N² × R²) / (2 × M²)
+
+Example: M=1000 rows, R=2 rows each, N=50 concurrent:
+  Rate ≈ (2500 × 4) / (2 × 1,000,000) = 0.5% of transactions
+```
+
+This is why production systems set `deadlock_timeout` (PostgreSQL default: 1 second) — it bounds the time spent waiting on a deadlock before detection.
+
+### Retry Overhead for Optimistic Locking
+
+Optimistic locking trades waiting time for wasted work. When a transaction's update affects zero rows, the application typically:
+
+1. Re-reads the current state (1 query round trip)
+2. Re-computes the new state (application CPU)
+3. Re-issues the update (1 query round trip)
+
+The cost in latency is approximately 2x the read-phase time. If the transaction involved multiple reads (e.g., reading A to compute B), the retry must re-read everything to ensure consistency.
+
+```
+Optimistic retry cost = R × (read_latency + compute_time + write_latency)
+Where R = expected number of retries
+       = collision_rate / (1 - collision_rate) for low collision rates
+       = ~1.01 at 1% collision rate  →  1% overhead
+       = ~1.25 at 20% collision rate →  25% overhead
+```
+
+### Lock Wait Timeouts
+
+Setting `lock_timeout` is essential for production systems. Without it, a transaction waiting on a lock held by a long-running or stuck transaction will hang indefinitely:
+
+```sql
+-- Set lock timeout for the session (PostgreSQL)
+SET lock_timeout = '5s';
+
+-- Lock timeout fires as an error:
+-- ERROR: 57014: canceling statement due to lock timeout
+```
+
+The application must catch this error and retry the entire transaction.
+
+### Connection Pool Exhaustion
+
+Long-held locks cause a secondary disaster: connection pool starvation. If each connection takes 30 seconds instead of 50 milliseconds because of lock waits, the pool (typically 10-30 connections) saturates quickly. New requests queue outside the pool, increasing apparent latency for all operations — even those touching unrelated data.
+
+Best practice: keep transactions short. Acquire locks as late as possible, release as early as possible.
+
+---
+
+## Configuration and Tuning
+
+### PostgreSQL Lock Tuning Parameters
+
+| Parameter | Default | Description | When to Change |
+|---|---|---|---|
+| `lock_timeout` | 0 (disabled) | Max time a statement waits for a lock before aborting | Set to 5-10s in production |
+| `deadlock_timeout` | 1s | Time the deadlock detector waits before checking for cycles | Lower for high-contention workloads |
+| `max_locks_per_transaction` | 64 | Max lock objects per transaction before escalating | Increase if transactions hit many rows |
+| `idle_in_transaction_session_timeout` | 0 (disabled) | Kills sessions idle in a transaction for too long | Set to 30-60s to prevent orphaned locks |
+| `log_lock_waits` | off | Logs any lock wait exceeding `deadlock_timeout` | Enable in production for diagnostics |
+
+### MySQL InnoDB Lock Tuning
+
+| Parameter | Default | Description |
+|---|---|---|
+| `innodb_lock_wait_timeout` | 50s | Seconds a transaction waits for a row lock |
+| `innodb_deadlock_detect` | ON | Disabling makes deadlocking transactions wait until timeout |
+| `innodb_print_all_deadlocks` | OFF | Logs every deadlock to the error log |
+| `transaction_isolation` | REPEATABLE-READ | Lower to READ-COMMITTED for less locking overhead |
+
+### Retry Logic Parameters
+
+For applications using optimistic locking, retry configuration is critical:
+
+```python
+import time
+import random
+
+MAX_RETRIES = 5
+BASE_DELAY_MS = 50
+MAX_DELAY_MS = 2000
+
+def retry_on_conflict(fn):
+    for attempt in range(MAX_RETRIES):
+        try:
+            return fn()
+        except OptimisticLockException:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            delay = min(
+                BASE_DELAY_MS * (2 ** attempt) + random.randint(0, 50),
+                MAX_DELAY_MS
+            )
+            time.sleep(delay / 1000)
+    raise Exception("Max retries exceeded")
+```
+
+Key parameters:
+
+- `MAX_RETRIES`: 3-5 is typical. More than 5 suggests the collision rate is too high for optimistic locking.
+- `BASE_DELAY_MS`: 10-100ms. Must be longer than the typical commit time of the conflicting transaction.
+- `MAX_DELAY_MS`: 1000-5000ms. Upper bound prevents retries from taking too long.
+- **Jitter**: Random offset prevents retry storms (all clients retrying at the same time).
+
+<AsciiDiagram
+  id="optimistic-vs-pessimistic-locking/retry-backoff"
+  title="Exponential Backoff with Jitter for Retries"
+  alt="Graph showing retry delay increasing exponentially from 50ms to 2000ms over 5 attempts, with random jitter shown as shaded bands"
+  caption="Exponential backoff with jitter prevents retry storms in optimistic locking"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│              Retry Backoff: Exponential + Jitter                  │
+│                                                                   │
+│  Delay (ms)                                                      │
+│       │                                                          │
+│  2000 ─┼───────────────────────────────┬───┬──                    │
+│       │                               │   │                      │
+│  1000 ─┼───────────────────┬───────────┼───┼──                    │
+│       │                   │   │       │   │                      │
+│   500 ─┼─────────┬─────────┼───┼───────┼───┼──                    │
+│       │         │ │       │   │       │   │                      │
+│   250 ─┼───┬─────┼─┼───────┼───┼───────┼───┼──                    │
+│       │   │ │   │ │       │   │       │   │                      │
+│   125 ─┼─┬─┼─┼───┼─┼───────┼───┼───────┼───┼──                    │
+│       │ │ │ │   │ │       │   │       │   │                      │
+│    50 ─┼─┼─┼─┼───┼─┼───────┼───┼───────┼───┼──                    │
+│       │ │ │ │   │ │       │   │       │   │                      │
+│     0 ─┼─┼─┼─┼───┼─┼───────┼───┼───────┼───┼────────────────     │
+│         1   2     3        4    5        6    7                    │
+│                           Attempt #                               │
+│                                                                   │
+│  ── Base delay (2^attempt × 50ms)    │ Jitter band (0-50ms)      │
+│  Maximum delay capped at 2000ms                                   │
+└─────────────────────────────────────────────────────────────────┘
+`}
+/>
+
+---
+
+## Summary of Internals
+
+- The lock manager maintains an in-memory hash table mapping resources to lock queues. Each entry tracks transaction ID, lock mode, and grant status.
+- Two-Phase Locking (2PL) guarantees serializability: acquire in the growing phase, release in the shrinking phase. Strict 2PL holds exclusive locks until commit.
+- InnoDB and PostgreSQL implement MVCC differently: InnoDB stores rollback segments for undo; PostgreSQL stores multiple row versions using xmin/xmax system columns.
+- Deadlock detection uses DFS on the wait-for graph. PostgreSQL checks on each lock wait; InnoDB checks every second.
+- Optimistic locking validation compares version numbers on write. The zero-rows-updated check is the conflict signal.
+- Performance degrades non-linearly with contention. At 70%+ lock utilization, throughput collapses.
+- Deadlock rate grows quadratically with concurrent transactions sharing overlapping resources.
+- Exponential backoff with jitter is essential for optimistic retry logic. Timeouts prevent connection pool starvation.
+
+The architecture page builds on these internals to design locking at scale — handling multi-region deployments, distributed lock services, and capacity planning for millions of concurrent users.

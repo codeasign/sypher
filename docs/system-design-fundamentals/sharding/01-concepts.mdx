@@ -1,0 +1,521 @@
+---
+id: sharding-concepts
+title: Understanding Sharding
+sidebar_label: Mental Model
+sidebar_position: 1
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Problem Story
+
+A social media platform has 200 million registered users. The user table stores profiles, preferences, authentication tokens, and metadata. The database is a single PostgreSQL instance with 256 GB of RAM and 10 TB of NVMe storage. By month 18, the user table has grown to 1.2 TB. Queries for a single user by ID still return in under 10 milliseconds thanks to the primary key index. But writes are slowing down. The WAL writer cannot keep up with 12,000 concurrent inserts per second during peak hours. The checkpoint process takes 17 seconds to complete, during which write latency spikes from 8ms to 900ms.
+
+Worse: the authentication service needs to run a weekly batch job that scans all 200 million users to expire inactive accounts. The batch job runs a `SELECT * FROM users WHERE last_login < NOW() - INTERVAL '90 days'`. Without a partition key that isolates inactive users, the query scans the full 1.2 TB table. It takes 34 minutes and consumes 80 percent of the database's I/O bandwidth. During those 34 minutes, login requests that should take 15ms take 2.3 seconds. Users experience login failures. Customer support tickets spike. The VP of Engineering declares a site incident.
+
+The database has 256 GB of buffer pool. The active working set — recently logged-in users, hot profile data — is estimated at 180 GB. But the batch job forces the buffer pool to evict hot pages in favor of scanning cold pages. When the job finishes, the buffer pool is full of irrelevant data. It takes another 15 minutes for the hot pages to be paged back in. Total performance recovery time: 49 minutes. Every week.
+
+### The Hidden Cost: Connection Saturation
+
+The more insidious problem is connection limits. PostgreSQL's default `max_connections` is 100. Even cranked to 500, each connection consumes roughly 10 MB of shared memory. With 12,000 writes per second and each write averaging 20ms, the server needs 240 concurrent write connections — plus read connections for queries, plus connections for admin tasks, plus connections for the monitoring agent. The server runs out of available connections at peak. New connections are refused. The connection pooler (pgBouncer) queues requests, adding 50-150ms of queue wait. Engineers learn to schedule deployments, batch jobs, and maintenance outside of peak hours, shrinking the deploy window to 4 hours per night.
+
+This is when the engineering team realizes that a single database server, no matter how powerful, cannot scale vertically to meet their growth. They need to break the database into smaller, independent pieces that can each handle a fraction of the traffic. They need **sharding**.
+
+### Why Not Just Use Read Replicas?
+
+Read replicas solve the read throughput problem but not the write throughput problem. Every write still goes to the primary. The batch job that scans 200 million users still runs on the primary (or a replica, but still scans 1.2 TB). The buffer pool contention persists. The checkpoint spikes still happen. Read replicas are a partial solution — they address read scalability but leave write scalability and data volume untreated. Sharding addresses both.
+
+---
+
+## The Insight
+
+Sharding splits a database into multiple independent databases, each holding a subset of the data, with a routing layer that directs queries to the correct database. Each shard is a fully independent database instance with its own CPU, memory, storage, and connection pool.
+
+**Analogy: a single-file clerk line versus dedicated checkout lanes.** A grocery store with one checkout line serving 200 customers per hour creates a queue that backs up to the dairy aisle. Every customer waits behind every other customer. Now imagine the store converts to 10 dedicated lanes, each with its own clerk, register, and bagging area. Customers are assigned to a lane by the last digit of their loyalty card number. Customer 48192 goes to lane 2, pays, and leaves. Customer 17305 goes to lane 5. Nobody waits behind 50 people — they wait behind the 4-5 people in their assigned lane. The total throughput of the store increases tenfold.
+
+The same principle applies to databases. A single PostgreSQL instance with one connection pool, one WAL writer, and one buffer pool serves 12,000 writes per second at its limit. Sharded into 16 instances, each handles 750 writes per second with comfortable headroom. Each shard has its own buffer pool, its own WAL, its own checkpoint cycle. The batch job that scanned 200 million users now scans 12.5 million users per shard and runs in 2 minutes instead of 34 — across all 16 shards in parallel, completing in 2 minutes total.
+
+**A deeper analogy: a monolith library versus a branch library system.** A city with one central library housing 1 million books serves 5,000 visitors per day. The card catalog is enormous. The queue for the checkout desk is 15 minutes at lunch. Now the city opens 10 branch libraries, each stocking 100,000 books organized by neighborhood. A patron who lives in the North End visits the North End branch. The card catalog is 1/10 the size. The checkout queue is empty. Books can be requested between branches but take a day to arrive. The system serves 20,000 visitors per day without expanding any single building.
+
+---
+
+## Big Picture: Sharding at 10,000 Feet
+
+The following diagram shows a sharded database system compared to a monolithic database, illustrating how queries are routed to the correct shard and how maintenance operations run in isolation.
+
+<AsciiDiagram
+  id="sharding/concepts-big-picture"
+  title="Monolithic database compared to sharded database — single node vs 4 shards with a query router"
+  alt="Side-by-side comparison of a single monolithic PostgreSQL instance with 200M users versus a sharded system with 4 independent PostgreSQL instances, a query router, and a routing table mapping user ID ranges to shards"
+  caption="Sharding splits a single database into independent instances; a routing layer directs each query to exactly one shard"
+  content={`
+Monolithic Database                    Sharded Database (4 shards)
+
+┌──────────────────────┐           ┌──────────────────────────┐
+│  PostgreSQL Single   │           │  Query Router            │
+│  200M users          │           │  ┌────────────────────┐  │
+│  1.2 TB data         │           │  │ Routing Table       │  │
+│  256 GB RAM          │           │  │ users 0-50M -> S0  │  │
+│  12K writes/sec max  │           │  │ users 50M-100M->S1 │  │
+│  Buffer pool: 256GB  │           │  │ users 100M-150M->S2│  │
+│  WAL checkpoint:17s  │           │  │ users 150M-200M->S3│  │
+│  Batch scan: 34min   │           │  └────────────────────┘  │
+│                      │           └───┬──────┬──────┬───────┘
+│  Single point of     │               │      │      │
+│  failure             │         ┌─────┘      │      └─────┐
+│  Cannot scale writes │         │            │            │
+└──────────────────────┘    ┌────▼───┐  ┌────▼───┐  ┌────▼───┐
+                            │ Shard 0 │  │ Shard 1 │  │ Shard 2 │
+                            │ 50M usrs│  │ 50M usrs│  │ 50M usrs│
+                            │ 300GB   │  │ 300GB   │  │ 300GB   │
+                            │ 64GB RAM│  │ 64GB RAM│  │ 64GB RAM│
+                            │ 3K w/s  │  │ 3K w/s  │  │ 3K w/s  │
+                            │ 1/4 buf │  │ 1/4 buf │  │ 1/4 buf │
+                            └─────────┘  └─────────┘  └─────────┘
+                                              │
+                                         ┌────▼───┐
+                                         │ Shard 3 │
+                                         │ 50M usrs│
+                                         │ 300GB   │
+                                         │ 64GB RAM│
+                                         │ 3K w/s  │
+                                         └─────────┘
+
+Per-shard batch: 2 min (parallel) vs single 34 min scan
+`}
+/>
+
+---
+
+## Core Vocabulary
+
+Master these 22 terms before moving to the deep dive.
+
+**Shard** — An independent database instance that holds a subset of a dataset. Each shard runs on its own server or VM with its own CPU, memory, disk, and connection pool. Shards operate independently: a crash in shard 3 does not affect shard 1 or shard 2.
+
+**Shard Key** — The column or set of columns that determines which shard a row belongs to. The shard key is the single most important design decision in any sharded system. A good shard key has high cardinality (many distinct values), uniform distribution (each value has roughly equal traffic), and appears in the WHERE clause of 80 percent or more of queries.
+
+**Query Router** — The component that intercepts every database query, extracts the shard key from the WHERE clause, looks up the target shard in its routing table, and forwards the query. Stateless routers (Vitess VTGate, ProxySQL, HAProxy) can be scaled horizontally.
+
+**Routing Table** — An in-memory data structure that maps shard key ranges or hash values to specific shard addresses. The routing table is the source of truth for where data lives. It must be consistent across all router instances and updated atomically during topology changes.
+
+**Consistent Hashing** — A hashing technique that minimizes data movement when the number of shards changes. Each shard maps to multiple points on a hash ring. When a shard joins or leaves, only the nearest neighbor transfers data — not all shards. Used by Cassandra, DynamoDB, Riak, and Discord.
+
+**Virtual Nodes (vnodes)** — Multiple hash ring positions assigned to each physical shard. With 256 vnodes per shard, data movement during scaling is 1/256 of the dataset per vnode — fine-grained and fast. Cassandra uses 256 vnodes per node by default.
+
+**Rebalancing (Resharding)** — The process of moving data between shards when the distribution becomes uneven, or when shards are added or removed. Rebalancing is one of the hardest operations in distributed systems: data must move without downtime, consistency must be maintained, and the routing table must be updated atomically.
+
+**Hot Spot** — A single shard that receives disproportionate traffic because its shard key value is heavily accessed. A celebrity user on a sharded social network whose data all lands on one shard is a classic hot spot. Hot spots defeat the purpose of sharding — they create a bottleneck that limits overall throughput.
+
+**Cross-Shard Query** — A query whose predicate does not include the shard key. The query must be sent to all shards via scatter-gather. Cross-shard queries are expensive (N times the resource cost, latency of the slowest shard) and should be avoided in the request path.
+
+**Scatter-Gather** — A query execution pattern where a coordinator sends the same query to all shards, each computes a partial result, and the coordinator merges the results. Used when the query cannot be pruned to a single shard. The sysbench tool calls this "broadcast."
+
+**Dual Writes** — A migration strategy where new data is written to both the old system and the new shards simultaneously during a rebalancing or resharding operation. Dual writes ensure that both old and new locations have the latest data until the cutover is complete.
+
+**Shard-Independent Maintenance** — The property that maintenance operations (backups, VACUUM, REINDEX, schema migrations) run on one shard without affecting others. Shard-independence is the operational advantage of sharding — a schema change that locks a table for 5 minutes affects 1/N of users instead of all users.
+
+**Directory-Based Routing** — A routing strategy where a centralized metadata service (etcd, ZooKeeper, Consul) stores the authoritative mapping from shard key ranges to physical nodes. Routers watch the directory for changes. When the topology changes, the directory is updated and routers learn the new mapping within seconds.
+
+**Proxy-Based Routing** — A routing strategy where a database proxy (Vitess VTGate, ProxySQL, Citus coordinator) intercepts all traffic, inspects queries, and routes to shards. The proxy manages the routing table and connection pooling. Applications do not know the shard topology.
+
+**Application-Level Routing** — A routing strategy where the application code computes the target shard using a library or SDK. The application opens a direct connection to the correct shard. No proxy is involved. Faster (no proxy hop) but requires every service to implement the same routing logic.
+
+**Shard-Unaware Query** — A query that hits the wrong shard or all shards because it does not include the shard key. Shard-unaware queries are the primary source of performance issues in sharded systems. Monitoring for shard-unaware queries is a critical operational practice.
+
+**Global Transaction** — A transaction that spans multiple shards. Global transactions require two-phase commit (2PC) or a saga pattern. 2PC adds 10-50ms of latency and requires all participating shards to be available. Coordinating global transactions is the primary reason sharded systems sacrifice ACID guarantees.
+
+**Read-Your-Writes Consistency** — A consistency guarantee that once a write completes, subsequent reads from the same client see that write. In sharded systems, this requires routing reads for the same shard key to the shard that processed the write, potentially to the primary if replicas lag.
+
+**Fan-Out Write** — A single logical write operation that must be applied to multiple shards. Example: a new post by a celebrity is written to the timeline of every follower. If followers are on different shards, the write fans out to all those shards. Fan-out writes are expensive and must be carefully managed.
+
+**Shard Count Ceiling** — The practical maximum number of shards before coordination overhead outweighs benefits. For Vitess, the ceiling is approximately 128-256 shards per keyspace. For Cassandra, it is approximately 300-500 nodes (each node is a shard). Beyond these numbers, operational complexity grows faster than throughput.
+
+**Rebalancing Window** — The time window between initiating a rebalance and completing the data movement. During the rebalancing window, both old and new locations may contain relevant data. The routing table must support dual lookups: redirect new writes to the new location while serving reads from the old location until the move completes.
+
+**Shard Co-Location** — The practice of placing related data on the same shard to enable single-shard joins and transactions. Tables A and B are co-located if the join key is the shard key and matching keys are on the same shard. Vitess calls this "shard-scoped" tables. Co-location eliminates cross-shard joins.
+
+---
+
+## How Sharding Actually Works
+
+A sharded database system performs fifteen sequential operations to process a query. Each operation involves coordination between the application, the router, and the target shard.
+
+**Step 1: Application formulates a query.** The application builds a SQL query that includes the shard key in the WHERE clause. For a social media platform with shard key `user_id`, the application generates `SELECT * FROM posts WHERE user_id = 48192 AND created_at > '2024-01-01'`. The application does not know which shard will process this query — it sends the query to the router.
+
+<AsciiDiagram
+  id="sharding/concepts-step1-query"
+  title="Application sends a query with shard key user_id to the query router"
+  alt="Application server sends SELECT query to the query router; the query includes WHERE user_id = 48192 as the shard key"
+  caption="Step 1: the application includes the shard key in every query"
+  content={`
+  ┌──────────────┐
+  │  Application  │
+  │               │
+  │  SELECT *     │
+  │  FROM posts   │
+  │  WHERE        │
+  │  user_id=48192│
+  │  AND          │
+  │  created_at>  │
+  │  '2024-01-01' │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────────┐
+  │  Query Router     │
+  │  (e.g. VTGate)    │
+  └──────────────────┘
+`}
+/>
+
+**Step 2: Router parses the query.** The router parses the SQL text to identify the query type (SELECT), the target table (posts), and the WHERE clause predicates. The parser extracts the shard key value `user_id = 48192`.
+
+**Step 3: Router looks up the shard in the routing table.** The router computes the hash of the shard key value (or checks the range mapping) and finds the target shard. With consistent hashing, `hash(user_id=48192)` maps to vnode 142, which belongs to physical shard 3.
+
+<AsciiDiagram
+  id="sharding/concepts-step3-routing"
+  title="Router looks up user_id 48192 in the consistent hash ring and finds it maps to shard 3"
+  alt="The routing table or consistent hash ring is consulted: user_id 48192 hashes to a position that maps to shard 3"
+  caption="Step 3: the routing table maps each shard key value to exactly one shard"
+  content={`
+  ┌──────────────────────────────┐
+  │  Routing Table Lookup         │
+  │                               │
+  │  Input: user_id = 48192       │
+  │                               │
+  │  hash(48192) % N = 142        │
+  │                               │
+  │  ┌────────┐ ┌────────┐       │
+  │  │ Shard 0│ │ Shard 1│       │
+  │  │ vnodes │ │ vnodes │       │
+  │  │ 0-63   │ │ 64-127 │       │
+  │  ├────────┤ ├────────┤       │
+  │  │ Shard 2│ │ Shard 3│ ← 142 │
+  │  │ vnodes │ │ vnodes │       │
+  │  │ 128-191│ │ 192-255│       │
+  │  └────────┘ └────────┘       │
+  │                               │
+  │  Result: Shard 3 (10.0.1.103)│
+  └──────────────────────────────┘
+`}
+/>
+
+**Step 4: Router opens a connection to the target shard.** The router maintains a connection pool to each shard. It borrows a connection from the pool for shard 3. If all connections in the pool are in use, the router queues the request or opens a new connection (depending on pool policy).
+
+**Step 5: Router forwards the query to the target shard.** The router sends the original query (possibly rewritten to reference the shard-specific table name) to shard 3 over the borrowed connection.
+
+**Step 6: Target shard executes the query.** Shard 3's local PostgreSQL instance receives the query, checks its own buffer pool, and executes the query against its local data. Shard 3 stores only the subset of posts where `hash(user_id)` maps to its vnode range — 1/4 of the total data in a 4-shard system.
+
+**Step 7: Target shard returns results.** Shard 3 returns the matching rows to the router. The router streams the results back to the application.
+
+<AsciiDiagram
+  id="sharding/concepts-step7-return"
+  title="Shard 3 executes the query locally and returns results to the router, which streams them to the application"
+  alt="After the router forwards the query to shard 3, shard 3 runs the query against its local PostgreSQL instance, finds 15 matching rows, and returns them through the router to the application"
+  caption="Steps 4-7: the router connects, forwards, the shard executes, and results return"
+  content={`
+  ┌──────────────┐     ┌──────────────┐     ┌──────────────────┐
+  │  Application  │────>│  Router       │────>│  Shard 3         │
+  │               │     │  (VTGate)     │     │  10.0.1.103:5432 │
+  │  Receives 15  │<────│  Streams 15   │<────│  PostgreSQL      │
+  │  rows         │     │  rows back    │     │                  │
+  └──────────────┘     └──────────────┘     │  15 rows found    │
+                                            │  Buffer pool hit  │
+                                            │  Execution: 4ms   │
+                                            └──────────────────┘
+`}
+/>
+
+**Step 8: Application processes results.** The application receives the results and processes them normally. The application is unaware of the sharding — it treats the router as a regular database.
+
+**Step 9 (cross-shard case): Router detects missing shard key.** If the application sends a query without the shard key, the router detects this during parsing. Example: `SELECT COUNT(*) FROM posts WHERE created_at > '2024-01-01'` has no `user_id` filter.
+
+<AsciiDiagram
+  id="sharding/concepts-step9-scatter"
+  title="Cross-shard query: router detects no shard key, fan-outs to all shards, each returns partial results, coordinator merges"
+  alt="Query without shard key is received by the router, which fans out the query to all 4 shards, each shard returns a partial count, and the coordinator sums the counts"
+  caption="Step 9: cross-shard queries use scatter-gather — the router sends the query to every shard and merges partial results"
+  content={`
+  Query: SELECT COUNT(*) FROM posts WHERE created_at > '2024-01-01'
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │  Router       │
+                    │  No shard key │
+                    │  in WHERE     │
+                    └──────┬───────┘
+                           │
+         ┌─────────────────┼──────────────────┐
+         │                 │                  │
+         ▼                 ▼                  ▼
+  ┌──────────┐     ┌──────────┐     ┌──────────┐
+  │ Shard 0  │     │ Shard 1  │     │ Shard 2  │
+  │ 2.1M rows│     │ 1.9M rows│     │ 2.2M rows│
+  └──────────┘     └──────────┘     └──────────┘
+         │                 │                  │
+         └─────────────────┼──────────────────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │  Coordinator │
+                    │  Sum: 8.3M   │
+                    │  rows        │
+                    └──────────────┘
+`}
+/>
+
+**Step 10: Router fan-out to all shards.** The router sends the query to every shard in parallel. Each shard processes the query independently against its local data.
+
+**Step 11: Partial results return.** Each shard computes its partial result and returns it to the router's coordinator component. The total time is the maximum of all shard execution times (slowest shard determines latency).
+
+**Step 12: Coordinator merges results.** The coordinator merges the partial results according to the query semantics. For COUNT and SUM: simple addition. For ORDER BY ... LIMIT: merge-sort the top N from each shard. For GROUP BY: aggregate per-group across all shards.
+
+**Step 13: Return merged result.** The coordinator returns the merged result to the application. The application sees a single result as if from a single database.
+
+**Step 14 (write path): Router identifies target shard.** For INSERT and UPDATE queries, the router always needs the shard key. If the shard key is in the INSERT values or the UPDATE WHERE clause, the router routes to exactly one shard. If the shard key is missing from an INSERT, the query is rejected — the database cannot store a row without knowing which shard it belongs to.
+
+**Step 15: Write executes on target shard.** The target shard executes the write locally: acquires a row-level lock, writes to the WAL, updates the buffer pool, and returns success to the router.
+
+---
+
+## Variants and Flavors
+
+Sharding is not one technique — it is a family of strategies. The right choice depends on your data, query patterns, and operational constraints.
+
+### Variant 1: Range-Based Sharding
+
+Range-based sharding divides data by continuous ranges of the shard key. Each shard owns a contiguous segment of the key space.
+
+<AsciiDiagram
+  id="sharding/concepts-variant-range"
+  title="Range-based sharding: user IDs 0-50M on shard 0, 50M-100M on shard 1, 100M-150M on shard 2, 150M-200M on shard 3"
+  alt="Four shards each owning a contiguous range of user IDs: 0-50M on shard 0, 50M-100M on shard 1, 100M-150M on shard 2, 150M-200M on shard 3"
+  caption="Range-based sharding assigns contiguous key ranges to shards — simple but prone to hot spots on the active range"
+  content={`
+  Range-Based Sharding: users table by user_id
+
+  Shard 0         Shard 1         Shard 2         Shard 3
+  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │ user_id  │    │ user_id  │    │ user_id  │    │ user_id  │
+  │ 0 - 50M  │    │ 50M-100M │    │ 100M-150M│    │ 150M-200M│
+  │          │    │          │    │          │    │          │
+  │ 50M users│    │ 50M users│    │ 50M users│    │ 50M users│
+  │ 300 GB   │    │ 300 GB   │    │ 300 GB   │    │ 300 GB   │
+  └──────────┘    └──────────┘    └──────────┘    └──────────┘
+
+  Routing: user_id BETWEEN 0 AND 50000000 → shard 0
+           user_id BETWEEN 50000001 AND 100000000 → shard 1
+           ...
+
+  When to use:		When NOT to use:
+  - Auto-increment PKs	- Monotonically increasing keys
+  - Natural ranges		- Write-heavy workloads on latest range
+  - Predictable growth	- Hot spots on the high end
+`}
+/>
+
+**When to use:** Auto-increment primary keys or naturally ordered keys where the range boundaries are known in advance. Simple to implement — the application or router checks a set of inequalities.
+
+**When NOT to use:** Monotonically increasing keys (auto-increment, timestamps) create a hot spot on the last shard. All new user registrations go to the highest range shard. The last shard receives all write traffic while earlier shards sit idle. This defeats the purpose of sharding.
+
+**Trade-off:** Range-based sharding makes range queries on the shard key efficient — `SELECT * FROM users WHERE user_id BETWEEN 1000 AND 2000` hits exactly one shard. But it requires careful capacity planning: you must estimate future data distribution to set range boundaries.
+
+### Variant 2: Hash-Based Sharding
+
+Hash-based sharding applies a hash function to the shard key and uses the hash value modulo N to assign rows to shards.
+
+<AsciiDiagram
+  id="sharding/concepts-variant-hash"
+  title="Hash-based sharding: user_id is hashed, hash modulo 4 determines shard assignment, producing uniform distribution"
+  alt="Four user IDs (100, 48192, 70001, 99999) are hashed, then modulo 4 maps them to shards 0, 2, 3, and 1 respectively, showing uniform distribution"
+  caption="Hash-based sharding distributes rows uniformly — no hot spots from key ordering, but range queries hit all shards"
+  content={`
+  Hash-Based Sharding: users table by hash(user_id) % 4
+
+   user_id          hash(user_id)        hash % 4    Shard
+  ─────────         ──────────────       ─────────   ─────
+    100              hash(100)=8472      8472%4=0      0
+   48192             hash(48192)=         %4=2         2
+                    ...3271
+   70001             hash(70001)=         %4=3         3
+                    ...5448
+   99999             hash(99999)=         %4=1         1
+                    ...2683
+
+  Shard assignment: unique per user, uniform across shards
+
+  When to use:			When NOT to use:
+  - Uniform distribution needed	- Range queries on shard key
+  - Opaque/random keys (UUIDs)	- Ordered scans (ORDER BY
+  - No natural range key	  shard_key)
+  - Write-heavy workloads	- Data retention by time range
+`}
+/>
+
+**When to use:** Opaque keys (UUIDs, generated IDs, email addresses), scenarios requiring uniform distribution, write-heavy workloads where no shard should receive disproportionate traffic.
+
+**When NOT to use:** Queries that filter by range on the shard key. `SELECT * FROM users WHERE user_id BETWEEN 1000 AND 2000` must hit all shards because the hash function scatters contiguous IDs across all shards.
+
+**Trade-off:** Hash-based sharding provides excellent load distribution at the cost of range-query efficiency. This is the most common sharding strategy in production systems because uniform load distribution is usually more important than range-query efficiency on the shard key.
+
+### Variant 3: Directory-Based Sharding
+
+Directory-based sharding uses a lookup service to map each shard key value to a specific shard. The mapping is stored in an external directory (etcd, ZooKeeper, a database table).
+
+<AsciiDiagram
+  id="sharding/concepts-variant-directory"
+  title="Directory-based sharding: a lookup service stores the mapping table from tenant_id to shard, routers query it dynamically"
+  alt="Each tenant ID is explicitly mapped to a shard in a directory service: tenant A -> shard 0, tenant B -> shard 1, tenant C -> shard 1, tenant D -> shard 2, tenant E -> shard 0"
+  caption="Directory-based sharding provides explicit mappings — flexible routing at the cost of a directory lookup per query"
+  content={`
+  Directory-Based Sharding
+
+                      ┌─────────────────────┐
+                      │  Directory Service   │
+                      │  (etcd / ZooKeeper)  │
+                      │                      │
+                      │  tenant_A -> shard 0 │
+                      │  tenant_B -> shard 1 │
+                      │  tenant_C -> shard 1 │
+                      │  tenant_D -> shard 2 │
+                      │  tenant_E -> shard 0 │
+                      │  tenant_F -> shard 2 │
+                      └──────────┬──────────┘
+                                 │ lookup
+                                 │
+  ┌──────────────┐    ┌─────────▼────────┐
+  │  Application  │───>│  Router          │
+  │               │    │  caches mapping  │
+  │  WHERE        │    │  TTL: 60 seconds │
+  │  tenant_id =  │    └─────────┬────────┘
+  │  'tenant_B'   │              │
+  └──────────────┘    ┌──────────▼────────┐
+                      │  Shard 1          │
+                      │  (tenant_B,       │
+                      │   tenant_C)       │
+                      └───────────────────┘
+
+  When to use:				When NOT to use:
+  - Multi-tenant SaaS			- Single-tenant systems
+  - Uneven tenant sizes		- Homogeneous data distribution
+  - Manual data placement		- Systems requiring automatic
+  - Geo-location routing		  rebalancing
+`}
+/>
+
+**When to use:** Multi-tenant SaaS applications where tenants have different sizes and can be placed on specific shards. Systems where manual data placement is acceptable — you decide which tenant goes on which shard based on its size and traffic.
+
+**When NOT to use:** Single-tenant systems, homogeneous data where automatic distribution is preferred, systems that require automatic rebalancing.
+
+**Trade-off:** Directory-based sharding gives the most flexible routing — large tenants can be assigned dedicated shards or split across multiple shards. The cost is the directory lookup latency (1-5ms per query if not cached) and the operational complexity of maintaining the directory.
+
+### Variant 4: Consistent Hashing (Virtual Nodes)
+
+Consistent hashing with virtual nodes assigns each physical shard to multiple positions on a hash ring. Data movement during scaling is limited to the nearest neighbors on the ring.
+
+<AsciiDiagram
+  id="sharding/concepts-variant-consistent-hashing"
+  title="Consistent hashing ring with 4 physical shards and 16 virtual nodes showing data distribution and minimal movement during scaling"
+  alt="A circular hash ring with 16 labeled positions (vnodes). Each of 4 physical shards (S0-S3) owns 4 vnodes. A key hashes to a position and is assigned to the nearest clockwise vnode. When shard S1 is added, only 2 vnodes change ownership"
+  caption="Consistent hashing minimizes data movement — adding a shard rebalances only the nearest neighbors on the ring"
+  content={`
+  Consistent Hashing Ring (4 physical shards, 16 vnodes)
+
+               ┌───── S0 ─────┐
+               │   vnode 0    │
+         S3    │   vnode 4    │    S1
+      ┌─ vnode15──┐     ┌──vnode5 ─┐
+      │          │     │          │
+    vnode11      │     │          │ vnode1
+      │    ┌─────┘     └─────┐    │
+      │    │                 │    │
+      │    │                 │    │
+      │    └─ S2 ──┐  ┌─ S1 ─┘    │
+      │   vnode10──│──│──vnode6   │
+      │          │ │  │ │        │
+      └──────────┘ │  │ └────────┘
+                   │  │
+               S0  │  │  S2
+             vnode14 vnode7
+
+    Key K hashes to position X, assigned to next vnode clockwise
+    Adding shard S4: 4 vnodes transfer, 1/4 of data moves
+
+  When to use:				When NOT to use:
+  - Dynamic scaling (nodes join/leave)	- Fixed shard count systems
+  - Cassandra, DynamoDB, Riak		- Systems using SQL proxies
+  - Read-heavy with moderate writes	- Write-heavy with strict
+  - Cloud deployments (auto-scaling)	  ordering requirements
+`}
+/>
+
+**When to use:** Dynamic environments where nodes are added or removed regularly. Cassandra, DynamoDB, and Riak use consistent hashing natively. Cloud deployments where auto-scaling adds and removes nodes based on load.
+
+**When NOT to use:** Systems with fixed shard counts that never change. SQL-based sharded databases (Vitess, Citus) typically use range or hash sharding rather than consistent hashing.
+
+**Trade-off:** Consistent hashing provides the best operational experience for scaling — add a node and only 1/N of data moves. The cost is implementation complexity and the need for a distributed consensus service (Cassandra uses gossip; DynamoDB delegates to AWS).
+
+---
+
+## Mental Model Check
+
+Six questions to test your understanding before moving to the Deep Dive.
+
+**Question 1:** A ride-hailing company stores trips in a MySQL database. The trips table has 2 billion rows and grows by 10 million rows per day. Most queries are "show my last 20 trips" filtered by `rider_id`. What shard key and strategy would you choose?
+
+<details>
+<summary>Answer</summary>
+
+Shard by `rider_id` using hash-based sharding across 32 shards. Rider-level queries always include `rider_id` in the WHERE clause, so every query prunes to a single shard. Hash distribution ensures that even if some riders take 100 trips per day and others take 1 per month, the load distributes uniformly. The 32 shard target gives each shard roughly 62.5 million rows — well within a single MySQL instance's capacity. Within each shard, a secondary index on `(rider_id, created_at)` enables efficient "last 20 trips" queries.
+
+</details>
+
+**Question 2:** A logging system ingests 10 TB of application logs per day. Logs are queried by time range (past hour, past day) and occasionally by `trace_id` for debugging. Old logs are deleted after 30 days. What sharding strategy fits?
+
+<details>
+<summary>Answer</summary>
+
+Use time-based range sharding by `timestamp` with daily shards. Each shard holds approximately 10 TB — a large but manageable volume for a single clickhouse node or Elasticsearch cluster. Time-range queries prune to exactly the requested shards. Data retention is implemented by dropping entire shards: a metadata operation that takes milliseconds rather than a DELETE that scans terabytes. For trace_id lookups, add a secondary index on `trace_id` within each shard, but those queries must scatter-gather across all shards in the time range. The trade-off: the most recent shard is a hot spot for writes.
+
+</details>
+
+**Question 3:** A multi-tenant SaaS platform serves 500 tenants. Three tenants have 50 million records each. The remaining 497 tenants have under 100,000 records each. What sharding strategy prevents the large tenants from overwhelming the system?
+
+<details>
+<summary>Answer</summary>
+
+Use directory-based sharding. Assign each of the three large tenants to dedicated shards (one shard per large tenant). Distribute the remaining 497 small tenants across 8-16 shared shards. This prevents the large tenants from consuming all resources on a shared shard and starving the small tenants. Each large tenant gets predictable performance regardless of other tenants' traffic. The directory service maps `tenant_id` to the appropriate shard. The routing table should be cached with a short TTL (30-60 seconds) to avoid a directory lookup on every query.
+
+</details>
+
+**Question 4:** Your hash-sharded database with 8 shards is outgrowing capacity. You need to move to 16 shards. What is the data movement cost, and how do you execute it without downtime?
+
+<details>
+<summary>Answer</summary>
+
+Moving from `hash(key) % 8` to `hash(key) % 16` changes the shard mapping for approximately 50 percent of the rows. Each of the 8 old shards must move roughly half its data to the new shards. The process: (1) deploy 8 new empty shards (shards 8-15), (2) for each old shard, compute which keys now map to new shards using the 16 modulus, (3) stream those keys from old shards to new shards in the background using a consistent snapshot, (4) once the initial sync completes, start dual-writes: new writes go to both old and new shards, (5) verify data consistency by comparing checksums between old and new shards, (6) flip the routing configuration atomically to use the new 16-shard topology, (7) run a final reconciliation pass to catch any differences, (8) retire old shards after confirming all reads return correct data. The entire process can take days for terabytes of data. Consistent hashing avoids this problem entirely — only 1/N of data moves when adding a node.
+
+</details>
+
+**Question 5:** You notice that one shard in your 16-shard system has 10x the query latency of the other 15 shards. What could cause this, and how do you diagnose it?
+
+<details>
+<summary>Answer</summary>
+
+A single hot shard can have many causes. Diagnose by checking: (1) data size per shard — is this shard holding more data than others? Uneven hash distribution or range boundaries that were set incorrectly can cause some shards to store more data. (2) Shard key access frequency — a popular value (celebrity user, viral post, popular tenant) might land on this shard. Check the most frequent shard key values in your query logs. (3) Resource contention — is the shard's host running other workloads? Check CPU, memory, disk IOPS, and network bandwidth. (4) Connection pool saturation — is the shard's connection pool exhausted? Check active connections vs max_connections. (5) Replication lag — if routing reads to replicas, a replica on this shard might be lagging, causing queries to be routed elsewhere. Fixes: (a) split the hot shard into two shards, (b) move the hot key to its own dedicated shard, (c) add read replicas behind the hot shard to distribute read load, (d) rebalance the entire cluster if the distribution is fundamentally uneven.
+
+</details>
+
+**Question 6:** Your team is designing a sharded system for a global chat application like Discord. Messages are organized by guild (server) and channel. Most queries are "show messages in channel X." What shard key prevents hot spots?
+
+<details>
+<summary>Answer</summary>
+
+Shard by `channel_id` using hash-based sharding. Each query filters by channel, so every query prunes to exactly one shard. The challenge is that popular channels (a game server with 500,000 members chatting in a single channel) create a hot spot on the shard containing that channel. Discord's solution (from their engineering blog) was to shard by `guild_id` and within each guild, partition messages by channel. When a guild becomes too large, the guild's data is split across multiple shards using a "shard split" operation. The key insight: Discord originally used range-based sharding by guild_id, but found that a single large guild caused a hot spot. They migrated to consistent hashing with virtual nodes to allow gradual rebalancing.
+
+</details>
+
+---
+
+This concludes the Mental Model section. The next page, Sharding Deep Dive, explores the internal architecture of sharded databases, the request lifecycle, consistency models, and performance characteristics that make sharding work at scale.

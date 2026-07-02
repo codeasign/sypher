@@ -1,0 +1,477 @@
+---
+id: reliability-architecture
+title: Reliability — Architecture Patterns
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Reliability — Architecture Patterns
+
+The deep dive showed how individual reliability mechanisms work internally. This page shows how they compose into full system architectures — from a naive single-service deployment to a hardened multi-region production system.
+
+## Naive Architecture: No Reliability
+
+A startup launches their payment processing system. The architecture is simple: a single web service talks directly to a single database. There are no timeouts, no retries, no circuit breakers, no fallbacks.
+
+<AsciiDiagram
+  id="reliability/naive-arch"
+  title="Naive Architecture — No Reliability Mechanisms"
+  alt="Simple architecture showing a single client, single service, and single database with no reliability mechanisms."
+>{` 
+  ┌────────┐     ┌──────────┐     ┌──────────┐
+  │[Client]│────>│[Service] │────>│((DB))    │
+  │        │     │          │     │          │
+  │        │     │ No       │     │ No       │
+  │        │     │ timeouts │     │ replicas │
+  │        │     │ No       │     │ No backup│
+  │        │     │ retries  │     │          │
+  └────────┘     └──────────┘     └──────────┘
+ `}
+</AsciiDiagram>
+
+What happens when the database has a brief network blip? The service's TCP connection hangs. The client's HTTP connection hangs. The user sees a spinning loader. After 60 seconds (default browser timeout), the user gets a "Connection timed out" error. The user refreshes and tries again — but the first request never completed, and now there are two requests in flight.
+
+What happens when the database runs out of connections? The connection pool rejects new connections. The service throws an exception. The user sees a 500 error. Every user sees a 500 error. The entire system is down.
+
+What happens when a background job consumes 100% of the CPU? The service responds slowly. Timeouts begin. The connection pool fills with stuck connections. New requests cannot get connections. Cascade failure in 30 seconds.
+
+This naive architecture has no reliability mechanisms. Every transient failure becomes a user-visible outage.
+
+## Level 1: Timeouts and Retries
+
+The first step: add timeouts and retries to every outbound call.
+
+<AsciiDiagram
+  id="reliability/l1-arch"
+  title="Level 1 Architecture — Timeouts and Retries"
+  alt="Architecture showing a client, service with timeout/retry, and database read replica with retry logic."
+>{` 
+  ┌────────┐     ┌──────────────────┐     ┌──────────┐
+  │[Client]│────>│  [Service]       │     │((Primary │
+  │        │     │                  │     │  DB))    │
+  │        │     │ Timeout: 500ms   │────>│          │
+  │        │     │ Retry: 3x        │     └──────────┘
+  │        │     │ Backoff: 200ms   │            │
+  │        │     │                  │     ┌──────▼────┐
+  │        │     │ Idempotency key │     │((Replica  │
+  │        │     │ on mutations     │────>│  DB))     │
+  └────────┘     └──────────────────┘     └───────────┘
+ `}
+</AsciiDiagram>
+
+Configuration:
+
+- **HTTP read timeout**: 2 seconds
+- **gRPC deadline**: 1 second
+- **Retry count**: 3 attempts
+- **Backoff**: exponential, base 100ms, cap 5s, jitter 25%
+- **Idempotency**: every mutation operation gets a unique idempotency key
+
+This level handles transient failures — brief network blips, temporary CPU spikes, garbage collection pauses. The user sees a 200-300ms delay instead of an error page.
+
+But it does not handle persistent failures. If the database is down for 10 minutes, the service retries 3 times per request, gets 3 timeouts per request, and returns 500 to every user. The retries actually make things worse — they amplify the load on the database during its outage window.
+
+## Level 2: Circuit Breakers and Bulkheads
+
+Add circuit breakers to protect downstream services from retry storms. Add bulkheads to isolate resources between dependencies.
+
+<AsciiDiagram
+  id="reliability/l2-arch"
+  title="Level 2 Architecture — Circuit Breakers and Bulkheads"
+  alt="Architecture showing a service with circuit breakers on each dependency, bulkhead thread pools, and read replicas."
+>{` 
+  ┌────────┐     ┌──────────────────────────────────────┐
+  │[Client]│────>│  [Order Service]                     │
+  │        │     │                                      │
+  │        │     │  ┌──────────────────────────────┐    │
+  │        │     │  │ Bulkhead: DB (10 threads)    │    │
+  │        │     │  │ CB: threshold=50%, window=10s│───>│((Primary DB))
+  │        │     │  └──────────────────────────────┘    │
+  │        │     │                                      │
+  │        │     │  ┌──────────────────────────────┐    │
+  │        │     │  │ Bulkhead: Inv (5 threads)    │    │
+  │        │     │  │ CB: threshold=50%, window=10s│───>│[Inventory Svc]
+  │        │     │  └──────────────────────────────┘    │
+  │        │     │                                      │
+  │        │     │  ┌──────────────────────────────┐    │
+  │        │     │  │ Bulkhead: Pay (10 threads)   │    │
+  │        │     │  │ CB: threshold=30%, window=10s│───>│[Payment Svc]
+  │        │     │  └──────────────────────────────┘    │
+  │        │     │                                      │
+  │        │     │  Fallback: {Cache} ─> Default        │
+  └────────┘     └──────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+Key metrics to monitor:
+
+- **Circuit breaker state**: track open/closed/half-open per dependency. Alert on state transitions.
+- **Bulkhead utilization**: percentage of threads in use. Alert above 80%.
+- **Fallback rate**: how often fallbacks activate. A rising fallback rate signals a degrading dependency.
+- **Rejection rate**: requests rejected because the bulkhead pool is full. These are dropped requests.
+
+This level handles persistent failures. When the inventory service goes down, the circuit breaker opens after 10 seconds. All subsequent calls to inventory fail fast (under 1ms) instead of waiting 500ms for a timeout. The fallback serves cached data. Users see stale inventory counts but can still place orders.
+
+The payment service circuit breaker has a lower threshold (30%) because payment failures are more critical. If 30% of payment calls fail, something is fundamentally wrong — open the circuit faster.
+
+## Level 3: Redundancy and Health Checks
+
+Add multiple instances behind a load balancer. Add health checks so the load balancer routes traffic only to healthy instances. Add database read replicas with automatic failover.
+
+<AsciiDiagram
+  id="reliability/l3-arch"
+  title="Level 3 Architecture — Redundancy and Health Checks"
+  alt="Architecture showing multiple service instances behind a load balancer, health check probes, and a database with a read replica and failover."
+>{` 
+                     ┌────────────┐
+                     │[Load       │
+                     │ Balancer]  │
+                     │ health     │
+                     │ check /10s │
+                     └─────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+         ┌────▼────┐ ┌────▼────┐ ┌────▼────┐
+         │[Svc v1] │ │[Svc v2] │ │[Svc v3] │
+         │ healthy │ │ healthy │ │ DEGRADED│
+         │         │ │         │ │ CB:open │
+         └────┬────┘ └────┬────┘ └─────────┘
+              │            │
+              └─────┬──────┘
+                    │
+              ┌─────▼──────┐
+              │ ((Primary  │
+              │   DB))     │
+              │  region A  │
+              └─────┬──────┘
+                    │
+              ┌─────▼──────┐
+              │ ((Replica  │
+              │   DB))     │
+              │  region A  │
+              └────────────┘
+ `}
+</AsciiDiagram>
+
+Health check at the load balancer: `GET /health` returns `200 OK` with `{"status": "healthy"}`. The health check endpoint probes:
+
+- **Process health**: is the process running? Is it accepting connections?
+- **Dependency health**: are critical dependencies (database, cache, queue) reachable?
+- **Circuit breaker state**: are any circuit breakers open? Open circuits degrade health.
+- **Latency**: is the p99 response time under 2 seconds?
+
+A service with open circuit breakers returns `200 OK` with `{"status": "degraded", "circuit_breakers": ["inventory"]}`. The load balancer continues routing traffic to it but the monitoring system alerts. A service that fails the health check (cannot reach the database) returns `503 Service Unavailable`. The load balancer removes it from rotation.
+
+Database failover: if the primary database fails, the replica promotes to primary. The application detects the promotion via DNS update (TTL of 30 seconds) or connection string change pushed through configuration. The application retries the failed query against the new primary.
+
+## Level 4: Multi-Region Active-Active
+
+For the highest reliability, run in multiple geographic regions with active-active traffic distribution.
+
+<AsciiDiagram
+  id="reliability/l4-arch"
+  title="Level 4 Architecture — Multi-Region Active-Active"
+  alt="Two regions with active-active routing, each with a full service stack and cross-region database replication."
+>{` 
+                    ┌────────────┐
+                    │ [Global    │
+                    │  DNS/LB]   │
+                    │  Route53   │
+                    └─────┬──────┘
+                          │
+            ┌─────────────┼─────────────┐
+            │             │             │
+      ┌─────▼──────┐     │     ┌───────▼─────┐
+      │[Region A]  │     │     │ [Region B]  │
+      │            │     │     │             │
+      │ [Svc] [Svc]│     │     │ [Svc] [Svc] │
+      │    │  │    │     │     │    │  │     │
+      │ ((DB))    │     │     │ ((DB))      │
+      │ ((Repl))  │◄────┼────►│ ((Repl))    │
+      │            │ repl│     │             │
+      └────────────┘     │     └─────────────┘
+                         │
+                  ┌──────▼──────┐
+                  │ {Global     │
+                  │  Cache}     │
+                  └─────────────┘
+ `}
+</AsciiDiagram>
+
+Multi-region active-active provides the highest reliability but introduces complexity:
+
+**Cross-region latency.** Each inter-region round trip adds 30-100ms. Every operation that requires cross-region coordination adds this latency. Design the data model so most operations are region-local.
+
+**Conflict resolution.** Both regions accept writes. When the same record is modified in both regions simultaneously, conflicts occur. Resolution strategies:
+
+- **Last-writer-wins (LWW)**: timestamp-based. Simple but loses data. Use when the latest value is always correct (shopping cart item count).
+- **CRDTs**: conflict-free replicated data types. Mathematically merge concurrent updates without data loss. Use for counters, sets, and maps (number of likes on a post).
+- **Application-level merge**: the application defines conflict resolution logic. Use for complex data (document edits that need semantic merging).
+
+**Failover.** When one region fails completely:
+
+1. DNS health check detects the failure (30 seconds).
+2. DNS updates to route all traffic to the remaining region (TTL propagation: 60-300 seconds depending on configuration).
+3. The remaining region handles the full load.
+4. Each region must be sized for 2x capacity to handle failover.
+
+**Recovery.** When the failed region comes back online:
+
+1. New instances start and register with the load balancer.
+2. Database replication catches up from the remaining region's WAL.
+3. Active connections gradually shift back to balance traffic.
+4. Monitor for a "thundering herd" effect — new instances all hitting the database simultaneously. Use connection pooling and rate limiting on the database side.
+
+## Integration Patterns
+
+### Pattern 1: Request-Level Failover (Retry + Fallback)
+
+Every outbound call follows: try primary, on failure retry with backoff, on persistent failure fall back to secondary, on total failure return a degraded response.
+
+```python
+class PaymentService:
+    def __init__(self):
+        self.primary = StripeClient()
+        self.secondary = AdyenClient()
+        self.retry_policy = RetryPolicy(
+            max_attempts=3,
+            base_delay_ms=100,
+            jitter=0.25
+        )
+        self.circuit_breaker = CircuitBreaker(
+            threshold=0.5,
+            window_size=100
+        )
+
+    @retry_with_circuit_breaker
+    def charge(self, amount, currency, payment_method):
+        try:
+            return self.primary.charge(amount, currency, payment_method)
+        except ProviderUnavailable:
+            logger.warning("Primary provider unavailable, falling back to secondary")
+            return self.secondary.charge(amount, currency, payment_method)
+        except Exception:
+            return self.fallback_charge(amount, currency, payment_method)
+```
+
+### Pattern 2: Async Queue with Retry
+
+For operations that do not need synchronous responses, use a message queue with automatic retry.
+
+<AsciiDiagram
+  id="reliability/async-queue-retry"
+  title="Async Queue with Retry Pattern"
+  alt="Flow showing a message producer sending to a queue, a consumer processing with retries, and a dead-letter queue for poison messages."
+>{` 
+  ┌──────────┐     ┌─────────────┐     ┌──────────┐
+  │[Producer]│────>│ <Primary    │────>│[Consumer]│
+  │          │     │   Queue>    │     │          │
+  └──────────┘     └──────┬──────┘     └────┬─────┘
+                          │                 │
+                          │            retry│ 3x
+                          │                 │
+                          │           ┌─────▼──────┐
+                          │           │ <Dead      │
+                          └───────────│  Letter    │
+                                      │  Queue>    │
+                                      └────────────┘
+ `}
+</AsciiDiagram>
+
+The queue handles retries automatically. The consumer processes a message. If it fails, the queue redelivers after a configurable delay. After `max_retries` (typically 3-5), the message moves to the dead-letter queue for manual inspection.
+
+This pattern works for: sending confirmation emails, processing image uploads, generating reports, updating search indexes. These are operations where the user does not wait for the result.
+
+### Pattern 3: Staged Retry with Exponential Backoff
+
+Different retry stages use different timeouts and backoff strategies. Stage 1: immediate retry for transient failures (0-2s). Stage 2: delayed retry for partial recovery (30s-5m). Stage 3: long-delay retry for full recovery (10m-1h).
+
+```json
+{
+  "retry_stages": [
+    { "max_attempts": 3, "backoff": "exponential", "base_ms": 100, "max_ms": 2000 },
+    { "max_attempts": 5, "backoff": "exponential", "base_ms": 5000, "max_ms": 300000 },
+    { "max_attempts": 3, "backoff": "fixed", "delay_ms": 600000 }
+  ]
+}
+```
+
+Stage 1 handles transient failures. Stage 2 handles partial outages (database restarting, deployment rolling out). Stage 3 handles full recovery scenarios (region failover, major incident resolution).
+
+### Pattern 4: Retry Budget
+
+A retry budget limits the total number of retries a service can issue in a time window. Amazon uses this pattern extensively. The budget is calculated as:
+
+```
+retry_budget = request_volume * failure_rate * retry_multiplier
+```
+
+If a service sends 10,000 requests per minute with a 5% failure rate and a retry multiplier of 2: the retry budget is `10,000 * 0.05 * 2 = 1,000 retries per minute`. Once the budget is exhausted, no further retries are allowed — the service accepts failures and returns errors to clients.
+
+This prevents retry storms. When a dependency fails, the retry budget limits the amplification to 2x. Without the budget, 1,000 failed calls become 3,000 retries (if each retries 3 times), which becomes 9,000 calls against the failing service.
+
+### Pattern 5: Rate Limiting with Retry-After
+
+Rate limiting protects downstream services from being overwhelmed. When a service receives a 429 (Too Many Requests) response, it must respect the `Retry-After` header.
+
+```python
+def call_with_rate_limiting(dependency, request):
+    retry_after = 0
+    for attempt in range(3):
+        if retry_after > 0:
+            time.sleep(retry_after)
+
+        response = dependency.call(request)
+
+        if response.status_code == 429:
+            retry_after = parse_retry_after(response.headers.get("Retry-After"))
+            logger.warning(f"Rate limited, retry after {retry_after}s")
+            continue
+
+        return response
+
+    raise MaxRetriesExceeded("Dependency rate limited all retries")
+```
+
+The `Retry-After` header can be in seconds (integer) or a specific HTTP date. The client must parse both formats. If the header is missing, use exponential backoff starting at 1 second.
+
+Rate limiting and retry interact directly. A 429 response is not a service failure — the service is working correctly but needs the client to slow down. Do not count 429 responses in the circuit breaker failure rate.
+
+### Pattern 6: Saga Pattern for Distributed Transactions
+
+A saga is a sequence of local transactions. Each step has a compensating action that undoes the step. If a step fails, the saga executes the compensating actions of all completed steps (backward recovery).
+
+<AsciiDiagram
+  id="reliability/saga-pattern"
+  title="Saga Pattern with Compensating Actions"
+  alt="Flow showing a distributed transaction across order, payment, and inventory services, with compensating actions on failure."
+>{` 
+  Normal flow (all succeed):
+ 
+  [Order Service]  ──>  [Payment Service]  ──>  [Inventory Service]
+  Create order            Charge card             Reserve stock
+       │                       │                        │
+  Order created           Payment captured           Stock reserved
+ 
+  Failure at step 3 (compensate):
+ 
+  [Order Service]  ──>  [Payment Service]  ──X  [Inventory Service]
+  Create order            Charge card             FAIL: out of stock
+       │                       │
+  Order canceled        Payment refunded
+  (compensate)           (compensate)
+ `}
+</AsciiDiagram>
+
+Three saga patterns:
+
+**Choreography-based saga.** Each service publishes events. Other services listen and respond. No central coordinator. Simple but hard to trace.
+
+**Orchestrator-based saga.** A central orchestrator tells each service what to do. If a step fails, the orchestrator tells prior services to compensate. Easier to manage and monitor but introduces a single point of coordination.
+
+**State machine saga.** The orchestrator is a state machine with explicit states per order. Each state transition triggers an action. State machine sagas are easier to test and debug than general-purpose saga orchestrators.
+
+Saga retry: if a compensating action fails, the saga enters a manual resolution state. An operator reviews the state and resolves the inconsistency. Compensating actions must be idempotent — the orchestrator may retry them.
+
+### Pattern 7: Service Mesh Reliability
+
+A service mesh (Envoy, Linkerd, Istio) provides reliability mechanisms at the network layer, outside application code. The mesh intercepts all service-to-service traffic and applies:
+
+- **Retry**: automatic retry on 5xx responses, configurable per route
+- **Circuit breaking**: per-cluster circuit breaking at connection, request, and retry levels
+- **Timeouts**: per-route timeout and per-try timeout
+- **Bulkhead**: max connections, max pending requests per upstream cluster
+- **Outlier detection**: automatically eject unhealthy hosts from the load balancing pool
+
+Envoy configuration for retry and circuit breaking:
+
+```yaml
+routes:
+  - match: { prefix: "/api/inventory/" }
+    route:
+      cluster: inventory_cluster
+      timeout: 5s
+      retry_policy:
+        retry_on: "5xx,connect-failure,rate-limited"
+        num_retries: 3
+        per_try_timeout: 2s
+
+circuit_breakers:
+  thresholds:
+    - priority: DEFAULT
+      max_connections: 100
+      max_pending_requests: 1000
+      max_requests: 1000
+      max_retries: 3
+
+outlier_detection:
+  consecutive_5xx: 5
+  interval: 10s
+  base_ejection_time: 30s
+  max_ejection_percent: 10
+```
+
+Service mesh reliability offloads retry and circuit breaking from application code. The application focuses on business logic. The mesh handles failure recovery. However, the mesh adds latency (10-50 microseconds per hop) and operational complexity (sidecar management, configuration distribution).
+
+## Database Reliability Patterns
+
+Databases are the most common single point of failure. These patterns improve database reliability:
+
+**Read replicas.** Direct read queries to replicas. If a replica fails, route reads to other replicas or the primary. Use a load balancer or connection pool that supports replica discovery.
+
+**Connection pooling.** Use a connection pooler (PgBouncer, HikariCP) between services and the database. The pooler manages a fixed set of connections. When connections are exhausted, requests queue or fail fast instead of creating more database connections.
+
+**Query timeout.** Every database query has a timeout. A slow query runs forever without a timeout, consuming database resources. Set statement_timeout to 5 seconds for OLTP workloads and 60 seconds for batch workloads.
+
+**Circuit breaker for database calls.** If the database is failing (timeouts, connection errors), stop calling it and serve from cache. The circuit breaker for databases should have a longer window (60 seconds) because databases take longer to recover than stateless services.
+
+**Connection validation.** Validate database connections before using them. Run a lightweight query (`SELECT 1`) every 30 seconds per connection. If the query fails, close the connection and create a new one.
+
+## Capacity Planning for Reliability
+
+Reliability requires overprovisioning. If you run at 100% capacity, any failure causes an outage. The standard approach:
+
+**N+1 redundancy.** Run N instances to handle peak load. Provision N+1 instances so any single instance can fail without capacity loss.
+
+**Zone-aware distribution.** Across 3 availability zones, run `ceil(N * 1.5)` instances so one zone can fail and the remaining two zones handle the load.
+
+**Headroom target.** Run at no more than 60-70% capacity under normal load. The headroom absorbs traffic spikes and supports rolling deployments.
+
+## Deployment Strategy for Reliability
+
+Rolling deployments minimize reliability impact. Deploy one instance at a time, monitor for errors, roll back if the error rate increases.
+
+<AsciiDiagram
+  id="reliability/rolling-deploy"
+  title="Rolling Deployment with Health Verification"
+  alt="Timeline showing a rolling deployment across 6 instances, one at a time, with health checks and rollback triggers."
+>{`
+  Instance 1: [Current][Deploy][Health OK][In Service]
+  Instance 2: [Current]──>[Deploy][Health OK][In Service]
+  Instance 3: [Current]──────>[Deploy][Health OK]
+  Instance 4: [Current]──────────>[Deploy][Health OK]
+  Instance 5: [Current]──────────────>[Deploy][Health OK]
+  Instance 6: [Current]──────────────────>[Deploy][Health OK]
+  Time ───────────────────────────────────────────────>
+  Rollback triggers:
+  - Error rate +5% over 1-minute window
+  - P99 latency +50% over 1-minute window
+  - Any circuit breaker opens
+  - Health check fails
+	`}
+</AsciiDiagram>
+
+Deployment steps:
+
+1. Remove instance 1 from the load balancer (drain connections over 30 seconds).
+2. Deploy the new version to instance 1.
+3. Health check: instance 1 must pass health checks for 60 seconds.
+4. If healthy, add instance 1 back to the load balancer.
+5. Move to instance 2. Repeat.
+6. If any instance fails the health check, stop the deployment. Roll back all instances.
+
+The deployment adds a second of latency per instance (connection drain) plus 30-60 seconds for the health check grace period. A 10-instance deployment takes 5-10 minutes. The deployment doubles the headroom requirement — you run N+2 instances during the deployment to compensate for the instance being rotated out.
+
+Next, you will examine the tradeoffs involved in reliability decisions — when to retry versus fall back, how much latency is acceptable, and which anti-patterns to avoid.

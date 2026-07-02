@@ -1,0 +1,719 @@
+---
+id: redis-deep-dive
+title: Redis — Under the Hood
+position: 2
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+Redis's internal architecture is a study in elegant simplicity. The entire server runs on a single-threaded event loop with an I/O multiplexer at its core.
+
+<AsciiDiagram
+  id="redis/internal-architecture"
+  title="Redis Internal Architecture"
+  alt="A layered diagram showing client connections entering the I/O multiplexer, then the command parser, single-threaded event loop, data structure engine, persistence module, and replication"
+  caption="The layered internal architecture of Redis">
+{`
+┌──────────────────────────────────────────────────────────────────┐
+│                        Redis Server                                │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │              Client Connections (TCP :6379)               │    │
+│  │  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐ │    │
+│  │  │ FD7 │  │ FD8 │  │ FD9 │  │FD10 │  │FD11 │  │FD12 │ │    │
+│  │  └──┬──┘  └──┬──┘  └──┬──┘  └──┬──┘  └──┬──┘  └──┬──┘ │    │
+│  └─────┼────────┼────────┼────────┼────────┼────────┼──────┘    │
+│        │        │        │        │        │        │           │
+│  ┌─────▼────────▼────────▼────────▼────────▼────────▼──────┐    │
+│  │              I/O Multiplexer (ae.c)                      │    │
+│  │     epoll_create / epoll_wait / epoll_ctl                │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │    │
+│  │  │ Readable │  │ Writable │  │ Error    │              │    │
+│  │  │ Events   │  │ Events   │  │ Events   │              │    │
+│  │  └──────────┘  └──────────┘  └──────────┘              │    │
+│  └──────────────────────┬──────────────────────────────────┘    │
+│                          │                                       │
+│  ┌──────────────────────▼──────────────────────────────────┐    │
+│  │              Single-Threaded Event Loop (aeMain)        │    │
+│  │                                                          │    │
+│  │  ┌──────────────────────────────────────────────────────┐│    │
+│  │  │  while (!eventLoop->stop) {                          ││    │
+│  │  │    numEvents = aeProcessEvents(loop, AE_ALL_EVENTS); ││    │
+│  │  │    for (i = 0; i < numEvents; i++) {                 ││    │
+│  │  │      processEvent(loop->fired[i].fd);                ││    │
+│  │  │    }                                                  ││    │
+│  │  │    processTimeEvents();                               ││    │
+│  │  │  }                                                    ││    │
+│  │  └──────────────────────────────────────────────────────┘│    │
+│  └──────────────────────┬──────────────────────────────────┘    │
+│                          │                                       │
+│  ┌──────────────────────▼──────────────────────────────────┐    │
+│  │              Command Processing Pipeline                 │    │
+│  │                                                          │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐ │    │
+│  │  │ Protocol │  │ Command  │  │ Argument │  │ Handler │ │    │
+│  │  │ Parser   │─▶│ Lookup   │─▶│ Validation│─▶│ Dispatch│ │    │
+│  │  │ (RESP)   │  │ (dict)   │  │          │  │         │ │    │
+│  │  └──────────┘  └──────────┘  └──────────┘  └────┬────┘ │    │
+│  └──────────────────────────────────────────────────┼──────┘    │
+│                                                      │           │
+│  ┌──────────────────────────────────────────────────▼──────┐    │
+│  │              Data Structure Engine                       │    │
+│  │                                                          │    │
+│  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌──────┐ ┌─────────┐ │    │
+│  │  │SDS  │ │dict │ │zip- │ │quick│ │skiplist│ │ rax     │ │    │
+│  │  │     │ │hasht│ │list │ │list │ │+dict   │ │ (radix) │ │    │
+│  │  └─────┘ └─────┘ └─────┘ └─────┘ └──────┘ └─────────┘ │    │
+│  └──────────────────────┬──────────────────────────────────┘    │
+│                          │                                       │
+│  ┌───────────────┐ ┌────┴────┐ ┌───────────────┐            │
+│  │ Persistence   │ │Replic-  │ │ Pub/Sub       │            │
+│  │ RDB / AOF     │ │ation    │ │ Engine        │            │
+│  └───────────────┘ └─────────┘ └───────────────┘            │
+└──────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### The I/O Multiplexer
+
+Redis does not use threads per connection. Instead, it uses a single-threaded reactor pattern powered by the operating system's I/O multiplexing facilities:
+
+- **Linux**: `epoll_create`, `epoll_ctl`, `epoll_wait` — scales to hundreds of thousands of sockets
+- **macOS/BSD**: `kqueue` — comparable to epoll
+- **Fallback**: `select` / `poll` — works everywhere, but limits to FD_SETSIZE (typically 1024)
+
+The multiplexer registers interest in read/write events on each client socket. When a socket becomes readable (data arrived), or writable (buffer space available), the event loop wakes up and processes it.
+
+This design means one thread handles all connections, eliminating context-switch overhead and locking complexity. The downside: any slow operation blocks every client.
+
+### The RESP Protocol
+
+Redis clients communicate using RESP (Redis Serialization Protocol), a simple, human-readable protocol:
+
+```
+*3           ← Array of 3 elements
+$3           ← Bulk string of length 3
+SET          ← Command name
+$4           ← Bulk string of length 4
+name         ← Key
+$5           ← Bulk string of length 5
+Alice        ← Value
+```
+
+RESP types:
+- **Simple String**: `+OK\r\n` — non-binary, for status replies
+- **Error**: `-ERR unknown command\r\n` — error messages
+- **Integer**: `:1\r\n` — for counters, lengths
+- **Bulk String**: `$5\r\nhello\r\n` or `$-1\r\n` for nil — binary-safe
+- **Array**: `*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n` — nested collections
+- **Null**: `_\r\n` — RESP3 addition
+- **Double**: `,1.5\r\n` — RESP3 addition
+- **Big Number**: `(123456789\r\n` — RESP3 addition
+
+RESP3 (introduced in Redis 6) adds typed responses that eliminate client-side parsing for types like maps, sets, and timestamps.
+
+### Memory Management
+
+Redis has its own allocator (jemalloc by default) and tracks memory at multiple levels:
+
+- `used_memory`: total bytes allocated by Redis (via jemalloc)
+- `used_memory_rss`: resident set size as reported by the OS
+- `used_memory_peak`: peak memory usage since startup
+- `mem_fragmentation_ratio`: RSS / used_memory — ratio above 1.5 indicates fragmentation
+
+The `INFO memory` command exposes all of these. This is critical for capacity planning — a fragmentation ratio of 2.0 means you are using twice the RSS of your actual data.
+
+## Data Structures
+
+### String — SDS (Simple Dynamic String)
+
+Redis strings are not C strings. They use a custom structure called SDS that stores length and capacity alongside the character data.
+
+```
+struct sdshdr {
+    int len;     // Current string length
+    int free;    // Available free space
+    char buf[];  // Flexible array member
+};
+```
+
+**Benefits over C strings**:
+- O(1) length retrieval (no strlen loop)
+- Binary-safe (can store null bytes, images, serialized objects)
+- Prevents buffer overflows (automatic resizing)
+- Pre-allocates extra space to amortize append costs
+
+**Time complexity**: O(1) for get/set, O(N) for append (amortized O(1))
+
+**Encoding**: Strings under 44 bytes use **embstr** (embedded in the redisObject, single allocation). Strings 44 bytes and over use **raw** (separate allocation for SDS and redisObject). The 44-byte threshold arises from the 64-byte jemalloc allocation bucket minus redisObject (16 bytes) and SDS header overhead.
+
+**Memory**: `sizeof(robj) + sizeof(sdshdr) + len + 1` for raw strings; 64 bytes total for embstr strings.
+
+### Hash — ziplist / hashtable
+
+Redis hashes use two encodings depending on size:
+
+**Ziplist (small hashes)**:
+A contiguous memory block storing field-value pairs as a sequence of entries. Used when both the number of fields and the size of each field value are small (default: 512 entries, 64 bytes per entry).
+
+- Layout: `[zlbytes][zltail][zllen][entry1][entry2]...[entryN][zlend]`
+- Each entry: `[prev_len][encoding][data]`
+- O(N) operations since it requires linear scan
+- Extremely memory-efficient — no pointers, no hash table overhead
+
+**Hashtable (large hashes)**:
+Two parallel hash tables (for incremental rehashing). Each entry is a dictEntry struct (24 bytes) plus the key/value redisObjects and their SDS payloads.
+
+- Load factor: 1:1 by default, resizes at 5:1 (grow) or 0.1:1 (shrink)
+- O(1) average operations
+- Memory overhead: ~72 bytes per entry just for pointers and metadata
+
+<AsciiDiagram
+  id="redis/hash-encodings"
+  title="Redis Hash Encodings — Ziplist vs Hashtable"
+  alt="Side-by-side comparison of ziplist (compact linear array) and hashtable (hash table with buckets and chaining)"
+  caption="Ziplist encoding for small hashes, hashtable encoding for large hashes">
+{`
+┌──────────────────────────────────────────────────────────────────┐
+│  Small Hash (512 entries, 64 bytes each) → Ziplist              │
+│                                                                  │
+│  ┌─────┬──────┬──────┬───────┬──────┬───────┬──────┬──────┐    │
+│  │zlby-│zltail│zllen │prevlen│encod-│field1 │prev- │encod-│ ... │
+│  │tes  │      │= 2   │= 0    │ing   │data   │len   │ing   │    │
+│  └─────┴──────┴──────┴───────┴──────┴───────┴──────┴──────┘    │
+│                        └────────────┬──────────┘                │
+│                                     │                           │
+│                        ┌────────────┴──────────┐                │
+│                        │    prevlen│encoding    │               │
+│                        │    value1 (field2)     │               │
+│                        └────────────────────────┘               │
+│  O(N) lookup, but extremely compact (no pointers)              │
+│                                                                  │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Large Hash (>512 entries or >64 bytes) → Hashtable              │
+│                                                                  │
+│  ┌──────────────────────────────────────────────┐               │
+│  │              dict (hash table)                │               │
+│  │  ┌─────┐  ┌──────────────────────────────┐  │               │
+│  │  │ht[0]│──│  table: ┌────┬────┬────┬────┐│  │               │
+│  │  │ht[1]│  │         │    │    │    │    ││  │               │
+│  │  └─────┘  │         ├────┼────┼────┼────┤│  │               │
+│  │           │         │ k1 │    │ k2 │ k3 ││  │               │
+│  │           │         │ v1 │    │ v2 │ v3 ││  │               │
+│  │           │         ├────┼────┼────┼────┤│  │               │
+│  │           │         │    │    │    │    ││  │               │
+│  │           │         └────┴────┴────┴────┘│  │               │
+│  │           │  O(1) average, O(N) worst    │  │               │
+│  └───────────┴──────────────────────────────┘  │               │
+└──────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### List — Quicklist
+
+Redis lists use the **quicklist** data structure, which is a doubly-linked list of ziplist nodes. This hybrid combines the memory efficiency of ziplists with the insertion/deletion performance of linked lists.
+
+```
+typedef struct quicklist {
+    quicklistNode *head;   // First node
+    quicklistNode *tail;   // Last node
+    unsigned long count;   // Total entries
+    unsigned int len;      // Number of nodes
+    int fill;              // Fill factor (max ziplist size)
+    int compress;          // Compression depth
+} quicklist;
+```
+
+Each `quicklistNode` holds a ziplist of up to ~8192 entries (configurable via `list-max-ziplist-size`). Nodes at the edges can be partially filled to accommodate push/pop operations without rebalancing.
+
+**Time complexity**: O(1) for LPUSH/RPUSH/LPOP/RPOP at ends, O(N) for LINDEX/LSET with index (traverses from nearest end).
+
+**Compression**: The `list-compress-depth` parameter lets you compress interior nodes using LZF compression. With depth=2, the two nodes at each end remain uncompressed for fast access, while the middle nodes are compressed — a significant memory savings for long lists.
+
+### Set — intset / hashtable
+
+Redis sets use two encodings:
+
+**Intset (all integer members)**: A sorted array of integers (16-bit, 32-bit, or 64-bit). Binary search for lookups. Upgraded automatically when a larger integer is added.
+
+- Memory: `sizeof(intset) + (sizeof(type) * card)` — extremely compact
+- O(log N) for lookups due to binary search
+
+**Hashtable (any non-integer member)**: Standard dict with NULL values. O(1) average lookup, membership test, add, and remove.
+
+**Transition**: When the first non-integer member is added, or the set exceeds `set-max-intset-entries` (default 512), it converts from intset to hashtable.
+
+### Sorted Set — Skiplist + Hash Table
+
+Redis sorted sets use a **dual structure**: a skip list for ordered iteration and a hash table for direct member-score lookups.
+
+```
+typedef struct zset {
+    dict *dict;           // member → score mapping
+    zskiplist *zsl;       // ordered structure
+} zset;
+```
+
+**Skip list**:
+- A probabilistic data structure with multiple levels of linked lists
+- Each node has a random height (average ~1.33 levels for a 32-level max)
+- O(log N) for insert, delete, and search by rank or score
+- Span values at each level enable O(log N) rank computation
+
+<AsciiDiagram
+  id="redis/skiplist"
+  title="Redis Skip List Structure"
+  alt="A skip list diagram showing multiple levels of linked lists with head node at top and data nodes below"
+  caption="The skip list data structure powering Redis sorted sets">
+{`
+                          ┌─────────────────────────────┐
+                          │         Head (32 levels)     │
+                          └─────────────────────────────┘
+                                │    │    │    │    │
+    Level 3 ────────────────────┼────┼────┼────┼────┼────────────
+                                │    │    │    │    │
+    Level 2 ────────────────────┼────┼────┼────┼────┼────────────
+                                │    │    │    │    │
+    Level 1 ────────────────────┼────┼────┼────┼────┼────────────
+                                │    │    │    │    │
+    Level 0 ────────────────────┼────┼────┼────┼────┼────────────
+                                │    │    │    │    │
+                         ┌──────┴┐ ┌─┴───┐ ┌┴───┐ ┌┴──────┐
+                         │ Alice │ │ Bob │ │Dave│ │Eve    │
+                         │ 10.0  │ │ 20.5 │ │15.0│ │30.0   │
+                         │L3─────│ │L2─  │ │L1─ │ │L0──── │
+                         └───────┘ └─────┘ └────┘ └───────┘
+                         Node:         Node:    Node:   Node:
+                         score=10      score=20 score=15 score=30
+                         member=Alice  member=B member=D member=Eve
+`}
+</AsciiDiagram>
+
+### Stream — Radix Tree (Rax)
+
+Redis streams use a **radix tree** (compressed prefix tree, implemented as `rax`) for indexing entries by their millisecond-precision timestamps (entry IDs).
+
+- Each entry ID: `<timestamp>-<sequence_number>` (e.g., `1704067200000-0`)
+- The radix tree compresses common prefixes of entry IDs
+- Enables O(log N) range queries, O(1) append, O(1) trim
+- Consumer groups track their own state using a separate radix tree for pending entries (PEL)
+
+### HyperLogLog
+
+A probabilistic data structure for approximate cardinality counting. Uses 2^14 (16384) registers, each 6 bits, totaling 12KB.
+
+- **Standard error**: 0.81%
+- **Mergeable**: multiple HLLs can be merged with UNION
+- **O(1)** for PFADD, PFCOUNT, PFMERGE
+
+### Bitmap
+
+Strings operated on at the bit level using `SETBIT`/`GETBIT`/`BITCOUNT`/`BITOP`.
+
+- A 512MB string can represent ~4.3 billion bits
+- Offsets are O(1) for individual bit operations
+- BITCOUNT uses a variable-precision SWAR algorithm for high-performance population counting
+
+### GEO — Geohash
+
+Geospatial indexes are implemented on top of sorted sets. Coordinates are encoded as a 52-bit geohash integer and stored as the score in a zset.
+
+- **Encode**: latitude/longitude → 52-bit geohash integer via interleaving
+- **Decode**: geohash integer → bounding box → matching members
+- **Query**: GEORADIUS computes the geohash range covering the radius and scans the zset
+
+## Command Lifecycle
+
+Let's trace a complete `SET user:1000:name "Alice" EX 3600` command from client to response.
+
+<AsciiDiagram
+  id="redis/command-lifecycle"
+  title="Complete SET Command Lifecycle"
+  alt="The full lifecycle of a SET command from client socket to internal storage to response"
+  caption="Every step Redis takes to process a single SET command">
+{`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Command Lifecycle: SET user:1000:name "Alice"    │
+│                                                                     │
+│  1. Client sends RESP-encoded command over TCP socket               │
+│     └── *3\\r\\n$3\\r\\nSET\\r\\n$17\\r\\nuser:1000:name\\r\\n$5\\r\\nAlice\\r\\n    │
+│                                                                     │
+│  2. epoll_wait returns: FD 7 has data readable                      │
+│     └── Event loop calls readQueryFromClient(fd=7)                  │
+│                                                                     │
+│  3. Read from socket buffer into input buffer                       │
+│     └── buf = "*3\\r\\n$3\\r\\nSET\\r\\n$17\\r\\nuser:1000:name\\r\\n$5\\r\\nAlice\\r\\n"  │
+│                                                                     │
+│  4. RESP parser processes the buffer                                │
+│     └── Array(3) -> [Bulk("SET"), Bulk("user:1000:name"),          │
+│                      Bulk("Alice")]                                  │
+│                                                                     │
+│  5. Lookup command "SET" in command table                           │
+│     └── Found: setCommand handler, arity=3, flags=write+denyoom    │
+│                                                                     │
+│  6. Validate arguments (arity check, key pattern)                   │
+│     └── 3 args match: OK                                            │
+│                                                                     │
+│  7. setGenericCommand:                                              │
+│     a. Lookup key in main dict (ht[0]) → not found                  │
+│     b. Create new SDS for "Alice" (len=5)                           │
+│     c. Create redisObject with encoding OBJ_ENCODING_EMBSTR         │
+│        (since "Alice" is under 44 bytes)                            │
+│     d. Set TTL via setExpire(cache, key, 3600000ms)                 │
+│     e. Signal key modification to keyspace listeners                │
+│     f. Add to dirty counter for RDB/AOF tracking                    │
+│                                                                     │
+│  8. Prepare response: "+OK\\r\\n"                                    │
+│     └── Write to client output buffer                                │
+│                                                                     │
+│  9. On next event loop iteration, epoll_wait reports FD 7 writable  │
+│     └── sendReplyToClient(fd=7) writes buffered "+OK\\r\\n" to socket │
+│                                                                     │
+│  10. Client receives "+OK\\r\\n" and returns success                  │
+│                                                                     │
+│  11. If AOF enabled: appendfsync everysec →                        │
+│      └── Write "*3\\r\\n$3\\r\\nSET..." to AOF buffer                  │
+│      └── Background thread calls fsync() within 1 second            │
+└─────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Rehashing
+
+Redis uses incremental rehashing to avoid blocking the event loop during hash table resizes.
+
+```
+Periodic rehashing:
+  1. Redis has two hash tables: ht[0] (active) and ht[1] (resize target)
+  2. When ht[0] load factor exceeds threshold, allocate ht[1] at 2x size
+  3. Time event triggers rehash step: move up to N buckets (default 100) + process current bucket's chain
+  4. Each command also does a "rehash step" while it has ht[0] dict access
+  5. When ht[0] is empty, swap pointers and free ht[1]
+```
+
+This incremental approach means a 10-million-key rehash spreads across thousands of command executions rather than blocking for seconds.
+
+### Blocking Operations
+
+Certain Redis operations block the event loop:
+
+- **BRPOP/BLPOP**: Block until an element is available in a list. Internally, Redis adds the client to a blocking state and re-schedules it when data arrives.
+- **BZPOPMIN/BZPOPMAX**: Same for sorted sets.
+- **XREAD BLOCK**: Block until new stream data arrives. Uses similar mechanism.
+- **WAIT**: Block until N replicas acknowledge the write.
+
+Blocking operations do NOT block the entire server — only the requesting client. Redis achieves this by tracking blocked clients in a special list and waking them when the relevant key gets data pushed to it.
+
+<AsciiDiagram
+  id="redis/blocking-operations"
+  title="Blocking Operations in Redis"
+  alt="A client blocks on BRPOP while other clients continue to be served by the event loop"
+  caption="Blocking operations only block the requesting client, not the entire server">
+{`
+┌────────────────────────────────────────────────────────────────┐
+│                  Redis Event Loop (single-threaded)            │
+│                                                                │
+│  Time ────────────────────────────────────────────────────▶    │
+│                                                                │
+│  ┌─────┐      ┌─────┐      ┌─────┐      ┌─────┐             │
+│  │ GET │      │BRPOP│      │ SET │      │LPUSH│             │
+│  │ key1│      │queue│      │key2 │      │queue│             │
+│  │ FD7 │      │ FD8 │      │ FD9 │      │ FD10│             │
+│  └──┬──┘      └──┬──┘      └──┬──┘      └──┬──┘             │
+│     │            │            │            │                  │
+│     ▼            ▼            ▼            ▼                  │
+│  ┌──────┐   ┌─────────┐  ┌──────┐   ┌─────────┐            │
+│  │Return│   │Client   │  │Return│   │Push to  │            │
+│  │"val1"│   │blocked  │  │"OK"  │   │queue    │            │
+│  │      │   │on       │  │      │   │Wake FD8 │            │
+│  │      │   │"queue"  │  │      │   │         │            │
+│  └──────┘   └─────────┘  └──────┘   └────┬────┘            │
+│                                           │                  │
+│                                           ▼                  │
+│                                     ┌─────────┐            │
+│                                     │Return   │            │
+│                                     │"item"   │            │
+│                                     │to FD8   │            │
+│                                     └─────────┘            │
+│                                                                │
+│  Key insight: FD8 (BRPOP) blocks itself on an empty list,      │
+│  but FD9 and FD10 continue processing normally.                │
+│  When FD10 pushes to the queue, FD8 is awakened.              │
+└────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+## Consistency and State
+
+### Async Replication Lag
+
+In standard Redis replication, writes to the primary are asynchronous. This means:
+
+```
+Client → SET counter 100 → Primary (immediately OK)
+                           └── (50ms later) → Replica (eventually)
+```
+
+If the primary crashes between acknowledging the write and propagating it to the replica, the write is lost.
+
+`WAIT` command mitigates this: `SET counter 100\nWAIT 1 1000` tells Redis to block until at least 1 replica has acknowledged the write, with a 1-second timeout. This trades latency for durability.
+
+### Failover with Sentinel
+
+When the primary fails, Sentinel performs automatic failover:
+
+1. **Detection**: Multiple Sentinels must agree the primary is unreachable (quorum). Each Sentinel pings the primary every 1 second. If the primary does not respond within `down-after-milliseconds` (default 30 seconds), a Sentinel marks it as `sdown` (subjectively down). If `quorum` Sentinels agree, it becomes `odown` (objectively down).
+
+2. **Election**: Sentinels use a Raft-like consensus protocol to elect a leader for the failover. Each Sentinel can cast one vote per epoch. The first Sentinel to reach quorum votes becomes the leader.
+
+3. **Replica Selection**: The leader selects the best replica: lowest replication offset (most up-to-date), highest priority config, then lowest run ID.
+
+4. **Promotion**: The selected replica gets `SLAVEOF NO ONE`, making it a primary.
+
+5. **Reconfiguration**: All other replicas get `SLAVEOF <new_primary>` to follow the new primary.
+
+6. **Notification**: The new primary's address is propagated to all connected clients via pub/sub or periodic `SENTINEL get-master-addr-by-name` calls.
+
+<AsciiDiagram
+  id="redis/sentinel-failover"
+  title="Sentinel Failover Sequence"
+  alt="Three Sentinels detect primary failure, elect a leader, promote a replica, and reconfigure the cluster"
+  caption="The five-phase Sentinel failover sequence">
+{`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Sentinel Failover Sequence                        │
+│                                                                     │
+│  Phase 1: Detect                                                    │
+│  ┌────────┐   ┌────────┐   ┌────────┐   ┌────────┐               │
+│  │Primary │   │Sentinel│   │Sentinel│   │Sentinel│               │
+│  │✗ CRASH │   │  A     │   │  B     │   │  C     │               │
+│  └────────┘   └────────┘   └────────┘   └────────┘               │
+│                   │               │               │                │
+│                   │  "PING failed" │               │               │
+│                   ◄───────────────►│               │               │
+│                   │               │               │               │
+│       sdown ──────┼───────────────┴───────────────┤               │
+│                   │         odown: quorum=2/3    │               │
+│                   │                               │               │
+│  Phase 2: Elect Leader                                              │
+│                   │  Vote for B                    │               │
+│                   ├───────────────────────────────▶│               │
+│                   │              Vote for B        │               │
+│                   ├─────────────────────────────────────────────▶  │
+│                   │         B becomes leader (2 votes)            │
+│                   │                               │               │
+│  Phase 3: Select best replica                                      │
+│                   │   ┌────────┐   ┌────────┐    │               │
+│                   │   │Replica1│   │Replica2│    │               │
+│                   │   │offset  │   │offset  │    │               │
+│                   │   │= 99234 │   │= 99234 │    │               │
+│                   │   │prio=1  │   │prio=2  │    │               │
+│                   │   │runid=A │   │runid=B │    │               │
+│                   │   └────────┘   └────────┘    │               │
+│                   │  Winner: Replica1 (lower prio wins)          │
+│                   │                               │               │
+│  Phase 4: Promote                                                  │
+│                   │  SLAVEOF NO ONE               │               │
+│                   ├──────────────────────────────▶│               │
+│                   │                               │               │
+│  Phase 5: Reconfigure                                              │
+│                   │  SLAVEOF new_primary          │               │
+│                   ├──────────────────────────────▶│               │
+│                   │                               │               │
+└─────────────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Split-Brain in Cluster
+
+In Redis Cluster, nodes use a **gossip protocol** to exchange state. If a network partition splits the cluster, each side may continue operating independently:
+
+- **Minority side**: If less than half of the primary nodes are reachable, the minority side stops accepting writes after `cluster-node-timeout` (default 15 seconds).
+- **Majority side**: Continues normal operation. Replicas on the minority side may attempt to connect to primaries on the majority side.
+
+When the partition heals, the minority side's data is discarded (it gets a full resync from the majority). Writes to the minority side during the partition are lost.
+
+### AOF Rewrite Blocking
+
+AOF rewrite forks a child process. While the fork is running, the parent continues serving clients but tracks all modifications in a rewrite buffer. When the child completes, the parent merges the buffer with the child's output.
+
+The fork itself can be slow on large instances (a 10GB Redis instance takes ~100ms to fork on modern hardware), during which the event loop is paused.
+
+### OOM Kill
+
+If Redis exceeds its `maxmemory` and the eviction policy is set to `noeviction`, write commands return errors. If `maxmemory` is not set, Redis can grow until it exhausts system RAM, at which point the kernel's OOM killer terminates the Redis process.
+
+## Performance
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Throughput (GET/SET) | 100K - 1M ops/sec | Single node, pipelining improves 10x |
+| Latency p50 | 0.1 - 0.5ms | In-memory, no disk I/O |
+| Latency p99 | 1 - 5ms | Under normal load |
+| Latency p99.9 | 5 - 50ms | Under fork (RDB/AOF rewrite) |
+| Memory scan rate | ~1M keys/sec | SCAN command with cursor |
+| AOF fsync latency | 0.1 - 2ms | Depends on disk hardware |
+
+### Single-Threaded Implications
+
+Since Redis is single-threaded, a slow operation blocks all other clients:
+
+| Operation | Impact | Mitigation |
+|-----------|--------|------------|
+| `KEYS *` | Blocks for seconds on 10M keys | Use `SCAN` with cursor |
+| `SORT` on large list | Blocks for hundreds of ms | Use sorted sets instead |
+| `MGET` 10K keys | Blocks for ~1ms | Acceptable in most cases |
+| Large value (10MB GET) | Blocks for ~5ms (network I/O) | Keep values small |
+| AOF fsync with `always` | Blocks for 0.1-2ms per write | Use `everysec` |
+
+### Memory Efficiency by Data Type
+
+| Data Structure | Overhead per entry | 1M entries |
+|----------------|-------------------|------------|
+| String (10 chars, embstr) | ~56 bytes | ~56 MB |
+| String (100 chars, raw) | ~128 bytes | ~128 MB |
+| Hash (ziplist, 10 fields) | ~37 bytes per field | ~370 MB |
+| Hash (hashtable, 10 fields) | ~150 bytes per field | ~1.5 GB |
+| Set (intset, integers) | ~32 bytes | ~32 MB |
+| Set (hashtable, strings) | ~100 bytes | ~100 MB |
+| Sorted set | ~120 bytes per element | ~120 MB |
+
+## Configuration
+
+### Memory Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `maxmemory` | 0 (unlimited) | Maximum memory Redis can use. Set to 80-90% of available RAM to leave room for fragmentation and AOF buffer. |
+| `maxmemory-policy` | `noeviction` | Eviction strategy when memory limit is reached. `allkeys-lru` for caching, `volatile-lru` for mixed use, `noeviction` for database use. |
+| `maxmemory-samples` | 5 | Number of keys to sample for LRU/LFU eviction. Higher values give more accurate eviction at higher CPU cost. |
+
+### Persistence Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `save 900 1` | yes | RDB snapshot after 900 seconds if at least 1 key changed |
+| `save 300 10` | yes | RDB snapshot after 300 seconds if at least 10 keys changed |
+| `save 60 10000` | yes | RDB snapshot after 60 seconds if at least 10000 keys changed |
+| `stop-writes-on-bgsave-error` | yes | Stop accepting writes if BGSAVE fails |
+| `rdbcompression` | yes | Compress RDB files with LZF |
+| `rdbchecksum` | yes | CRC64 checksum at end of RDB file |
+| `appendonly` | no | Enable AOF persistence |
+| `appendfsync` | `everysec` | `always` (fsync per write), `everysec` (fsync per second), `no` (OS manages) |
+| `auto-aof-rewrite-percentage` | 100 | Rewrite AOF when it grows by this percentage |
+| `auto-aof-rewrite-min-size` | 64mb | Minimum AOF size for rewrite |
+| `aof-load-truncated` | yes | Load truncated AOF (last command may be incomplete) |
+
+### Network and Security Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `bind` | `127.0.0.1` | Interfaces to listen on. Change to `0.0.0.0` only with firewall. |
+| `port` | 6379 | TCP port for client connections |
+| `tcp-backlog` | 511 | TCP listen backlog |
+| `timeout` | 0 | Close idle connections after N seconds (0 = disabled) |
+| `tcp-keepalive` | 300 | TCP keepalive interval in seconds |
+| `requirepass` | (empty) | Password for AUTH command. Use strong password in production. |
+| `rename-command` | (none) | Rename or disable dangerous commands: `rename-command FLUSHALL ""` |
+
+### Replication Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `replicaof` | (none) | Make this instance a replica of another: `replicaof 192.168.1.100 6379` |
+| `replica-serve-stale-data` | yes | Replica serves stale data during sync with primary |
+| `replica-read-only` | yes | Replica accepts only read commands |
+| `repl-backlog-size` | 1mb | Size of the replication backlog (ring buffer) |
+| `repl-backlog-ttl` | 3600 | Seconds to keep backlog after primary loses all replicas |
+| `replica-priority` | 100 | Priority for Sentinel promotion (lower = preferred, 0 = never promoted) |
+
+### Client Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `maxclients` | 10000 | Max simultaneous client connections |
+| `client-output-buffer-limit normal` | 0 0 0 | Output buffer limit for normal clients (hard/soft/soft-seconds) |
+| `client-output-buffer-limit replica` | 256mb 64mb 60 | Stricter limits for replica clients |
+| `client-output-buffer-limit pubsub` | 32mb 8mb 60 | Limits for pub/sub clients (slow consumers get disconnected) |
+
+### Advanced Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `lazyfree-lazy-eviction` | no | Use async free (UNLINK) for evicted keys to avoid blocking |
+| `lazyfree-lazy-expire` | no | Use async delete for expired keys |
+| `replica-lazy-flush` | no | Use async flush during full resync |
+| `activedefrag` | no | Enable automatic memory defragmentation |
+| `active-defrag-threshold-lower` | 10 | Minimum fragmentation ratio to start defrag |
+| `active-defrag-threshold-upper` | 100 | Maximum fragmentation ratio for aggressive defrag |
+| `slowlog-log-slower-than` | 10000 | Log commands slower than N microseconds (10ms) |
+| `slowlog-max-len` | 128 | Max entries in slow log |
+
+### Tuning Checklist for Production
+
+1. Set `maxmemory` to 80% of available RAM
+2. Choose `maxmemory-policy`: `allkeys-lfu` for caching, `volatile-lru` for mixed workloads, `noeviction` for data you cannot lose
+3. Enable `appendonly yes` with `appendfsync everysec` for durability
+4. Set `requirepass` with a strong random password
+5. Rename or disable `FLUSHALL`, `FLUSHDB`, `CONFIG`, `KEYS`: `rename-command KEYS ""`
+6. Set `repl-backlog-size` to 10% of maxmemory for large replication windows
+7. Enable `activedefrag yes` for workloads with frequent key churn
+8. Set `slowlog-log-slower-than 10000` and monitor the slow log
+9. Set `timeout 300` to close idle connections
+10. Configure `client-output-buffer-limit` appropriately for your workload
+
+<AsciiDiagram
+  id="redis/config-tradeoffs"
+  title="Configuration Trade-Offs"
+  alt="A triangle diagram showing the trade-offs between performance, durability, and memory in Redis configuration"
+  caption="The three-way tension in Redis configuration choices">
+{`
+                               ┌─────────────┐
+                               │ Performance │
+                               │  (Speed)     │
+                               └──────┬──────┘
+                                      │
+                   appendfsync no     │     no persistence
+                   maxmemory 0        │     allkeys-lru
+                   no AOF rewrite     │     no replication
+                                      │
+          ┌───────────────────────────┼───────────────────────────┐
+          │                           │                           │
+          │                           │                           │
+          │                     ┌─────▼─────┐                     │
+          │                     │  Redis    │                     │
+          │                     │  Config   │                     │
+          │                     │  Triangle │                     │
+          │                     └─────┬─────┘                     │
+          │                           │                           │
+          │                           │                           │
+          │                           │                           │
+          └───────────────────────────┼───────────────────────────┘
+                                      │
+                appendfsync always    │     maxmemory set
+                AOF rewrite on        │     activedefrag yes
+                replication x3        │     RDB snapshots
+                                      │
+             ┌───────────────┐        │       ┌───────────────┐
+             │  Durability   │◄───────┼───────▶    Memory     │
+             │  (Safety)     │                │   Efficiency  │
+             └───────────────┘                └───────────────┘
+`}
+</AsciiDiagram>
+
+### Monitoring Commands
+
+| Command | What It Shows |
+|---------|---------------|
+| `INFO` | Comprehensive server stats, memory, replication, persistence, keyspace |
+| `INFO memory` | Memory breakdown: used, RSS, peak, fragmentation ratio |
+| `INFO stats` | Total connections, commands processed, keyspace hits/misses |
+| `SLOWLOG GET 10` | Last 10 slow commands with duration and timestamp |
+| `MONITOR` | Real-time stream of every command (heavy, use sparingly in production) |
+| `CLIENT LIST` | All connected clients with their state and buffer sizes |
+| `MEMORY STATS` | Detailed per-subsection memory breakdown |
+| `MEMORY DOCTOR` | Memory health analysis with recommendations |
+| `LATENCY LATEST` | Latest latency spikes by event type (fork, command, fsync) |
+| `LATENCY HISTORY` | Historical latency data for each event type |

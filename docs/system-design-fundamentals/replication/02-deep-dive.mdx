@@ -1,0 +1,404 @@
+---
+id: replication-deep-dive
+title: Replication — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Replication — Under the Hood
+
+Replication seems straightforward until you try to implement it. The hard part is not copying data — it is guaranteeing that every copy converges to the same state, even when servers crash, networks partition, and writes arrive concurrently. This page takes you inside the replication engine to examine the data structures, algorithms, and protocols that make replication work in production.
+
+## Internal Architecture
+
+A replication engine is not a single component. It is a pipeline of coordinated processes, each responsible for a specific phase of the data movement lifecycle.
+
+<AsciiDiagram id="system-design-fundamentals/replication/02-deep-dive/internal-architecture" title="Internal Architecture of a Replication Engine" alt="Detailed component diagram of a replication engine showing the client connection handler, log buffer, WAL writer, network sender on the primary, and the corresponding receiver, applier, and conflict resolver on the replica" caption="Figure 1: Internal components of a replication engine" content={`
+           PRIMARY-SIDE INTERNALS
+
+  ┌─────────────────────────────────────────┐
+  │           [Primary Node]                  │
+  │                                           │
+  │  ┌──────────┐  ┌──────────┐              │
+  │  │  Client  │  │  Client  │   ...         │
+  │  │  Handler │  │  Handler │              │
+  │  └─────┬────┘  └─────┬────┘              │
+  │        │              │                   │
+  │  ┌─────▼──────────────▼──────┐           │
+  │  │     Transaction Manager    │           │
+  │  │  (MVCC, Locks, Isolation)  │           │
+  │  └────────────┬───────────────┘           │
+  │               │                           │
+  │  ┌────────────▼───────────────┐           │
+  │  │     Write-Ahead Log (WAL)  │           │
+  │  │  ┌─────┐ ┌─────┐ ┌─────┐  │           │
+  │  │  │ LSN │ │ LSN │ │ LSN │  │  ← append │
+  │  │  │ 100 │ │ 101 │ │ 102 │  │    only    │
+  │  │  └─────┘ └─────┘ └─────┘  │           │
+  │  └────────────┬───────────────┘           │
+  │               │                           │
+  │  ┌────────────▼───────────────┐           │
+  │  │  WAL Sender Process        │           │
+  │  │  (streams to replicas)     │           │
+  │  │  ┌──────────┐             │           │
+  │  │  │ Replica  │  Replica 2  │           │
+  │  │  │ 1: LSN  │  LSN 98     │           │
+  │  │  │ 102     │             │           │
+  │  │  └──────────┘             │           │
+  │  └───────────────────────────┘           │
+  └─────────────────────────────────────────┘
+
+         REPLICA-SIDE INTERNALS
+
+  ┌─────────────────────────────────────────┐
+  │           [Replica Node]                  │
+  │                                           │
+  │  ┌────────────────────────────┐          │
+  │  │  WAL Receiver Process     │          │
+  │  │  (receives WAL from       │          │
+  │  │   primary, writes to      │          │
+  │  │   local WAL)              │          │
+  │  └────────────┬───────────────┘          │
+  │               │                           │
+  │  ┌────────────▼───────────────┐           │
+  │  │     Local WAL (replay)     │           │
+  │  │  ┌─────┐ ┌─────┐ ┌─────┐  │           │
+  │  │  │ LSN │ │ LSN │ │ LSN │  │  ← append │
+  │  │  │ 100 │ │ 101 │ │ 102 │  │           │
+  │  │  └─────┘ └─────┘ └─────┘  │           │
+  │  └────────────┬───────────────┘           │
+  │               │                           │
+  │  ┌────────────▼───────────────┐           │
+  │  │  WAL Applier Process      │           │
+  │  │  (replays log entries     │           │
+  │  │   into local storage)     │           │
+  │  └────────────┬───────────────┘           │
+  │               │                           │
+  │  ┌────────────▼───────────────┐           │
+  │  │  Local Storage Engine     │           │
+  │  │  (B-tree / LSM tree)      │           │
+  │  └────────────────────────────┘           │
+  └─────────────────────────────────────────┘
+`} />
+
+### Component Roles
+
+**Transaction Manager:** Coordinates concurrent writes, enforcing isolation levels (read committed, repeatable read, serializable). It assigns each write a log sequence number (LSN) and tracks which transactions are in-flight. No log entry is sent to replicas until the transaction commits.
+
+**Write-Ahead Log (WAL):** An append-only sequence of log entries on disk. Each entry has a monotonic LSN, the transaction ID, and enough information to replay the change. The WAL is the source of truth for replication — replicas are exactly caught up to the position they have read from the WAL.
+
+**WAL Sender Process:** A dedicated process per replica that reads the WAL from the current write position and streams it over the network. It tracks each replica's acknowledged LSN and can restart from any position if the replica disconnects and reconnects.
+
+**WAL Receiver Process:** On the replica side, receives the WAL stream and writes it to the local WAL file. This decouples network I/O from storage replay — the receiver can buffer incoming data while the applier catches up.
+
+**WAL Applier Process:** Reads from the local WAL and applies each entry to the replica's storage engine. It must maintain the same order of operations as the primary to produce an identical data state.
+
+## Data Structures and Algorithms
+
+### Replication Log (Append-Only Log)
+
+The replication log is the central data structure. Every replication system has one, and its design determines the performance characteristics of the entire system.
+
+**Structure:** A sequence of entries, each containing a monotonic sequence number, the transaction metadata, and the change payload. The log is stored on disk sequentially, enabling fast writes and efficient streaming.
+
+**Why this structure:** Append-only logs are the fastest possible write pattern on spinning disks and SSDs alike. Sequential writes avoid seek time and achieve 10-100x the throughput of random writes. The sequential nature also makes it trivial for replicas to stream from any position — they just send their current LSN and the primary responds with "here is everything from LSN+1 to the end."
+
+**Complexity:** Write to log is O(1) amortized (append). Read from position N is O(N) worst-case if scanning from the beginning, but in practice replicas request from their last known position, so it is O(1) — the primary starts streaming from the current WAL write head.
+
+### Log Sequence Number (LSN)
+
+Every log entry receives a monotonically increasing LSN. In PostgreSQL, the LSN is a 64-bit integer represented as two 32-bit hexadecimal values (e.g., `0/16B4F30`). The LSN serves as both a position identifier and a checkpoint marker.
+
+**Structure:** `LSN = (logFileId << 32) | offset`. The high 32 bits identify the WAL segment file; the low 32 bits identify the byte offset within that file.
+
+**Why this structure:** A single integer enables efficient comparison and range queries. The replica can say "I am at LSN 0/16B4F30" and the primary knows exactly where to start streaming. No complex cursors or hash lookups required.
+
+### Replication Slot
+
+A replication slot is a data structure on the primary that tracks how far each replica has consumed the WAL. It prevents the primary from discarding WAL segments that a replica may still need.
+
+**Structure:** Memory map of `{replica_id: last_acknowledged_lsn, snapshot: timestamp}`.
+
+**Why this structure:** Without slots, the primary's WAL retention policy is a guess — it may discard segments that a slow or disconnected replica has not yet consumed. The slot guarantees that the WAL is preserved at least until the replica acknowledges it. The trade-off is that a replica that goes offline for 24 hours causes the WAL to grow by 24 hours of data, potentially filling disk.
+
+<AsciiDiagram id="system-design-fundamentals/replication/02-deep-dive/data-structures" title="Replication Data Structures: LSN, WAL Segments, and Replication Slots" alt="Diagram showing the relationship between WAL segments, LSN pointers, and replication slots tracking each replica's position" caption="Figure 2: Key data structures in replication" content={`
+      REPLICATION DATA STRUCTURES
+
+  WAL Segment Files (16 MB each on disk)
+  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+  │WAL_0001  │ │WAL_0002  │ │WAL_0003  │ │WAL_0004  │
+  │LSN:      │ │LSN:      │ │LSN:      │ │LSN:      │
+  │0/0000000→│ │0/1000000→│ │0/2000000→│ │0/3000000→│
+  └──────────┘ └──────────┘ └──────────┘ └──────────┘
+       │             │             │            │
+       └─────────────┼─────────────┼────────────┘
+                     │             │
+          ┌──────────▼─────────────▼──────┐
+          │  Replication Slots Table      │
+          │                                │
+          │  Replica A: LSN 0/2500000     │
+          │  Replica B: LSN 0/1500000     │
+          │  Replica C: LSN 0/0500000     │ ← old, can't
+          │                                │    discard WAL_0001
+          └────────────────────────────────┘
+`} />
+
+## The Request/Write/Read Lifecycle
+
+### Step-by-Step: A Write Survives
+
+<AsciiDiagram id="system-design-fundamentals/replication/02-deep-dive/write-survive" title="A Write Surviving Full Replication Cycle" alt="Sequence diagram showing a client write flowing through the primary, replication log, synchronous replica, and asynchronous replica with acknowledgments at each stage" caption="Figure 3: A write through synchronous and asynchronous replication" content={`
+    WRITE WITH SYNC + ASYNC REPLICATION
+
+  Client    [Primary]    ((WAL))    (Sync Repl)    (Async Repl)
+    │          │           │            │              │
+    │  BEGIN   │           │            │              │
+    │─────────►│           │            │              │
+    │  INSERT  │           │            │              │
+    │─────────►│           │            │              │
+    │          │ 1. Write  │            │              │
+    │          │ to WAL    │            │              │
+    │          │──────────►│            │              │
+    │          │ 2. Flush  │            │              │
+    │          │ to disk   │            │              │
+    │          │◄──────────│            │              │
+    │          │           │            │              │
+    │          │ 3. Send   │            │              │
+    │          │ WAL entry │───────────►│              │
+    │          │           │            │              │
+    │          │           │ 4. Flush   │              │
+    │          │           │ to disk    │              │
+    │          │◄──────────│────────────│              │
+    │          │           │ ack        │              │
+    │          │ 5. Send   │            │              │
+    │          │ WAL entry │──────────────────────────►│
+    │  COMMIT  │           │            │              │
+    │◄─────────│           │            │              │
+    │          │           │ 6. Async   │              │
+    │          │           │ (no ack)   │              │
+    │  (client sees write committed)    │              │
+`} />
+
+**Step 1:** The client sends a `BEGIN; INSERT INTO posts VALUES (...); COMMIT;` to the primary.
+
+**Step 2:** The primary's transaction manager acquires a write lock on the affected rows, assigns LSN 0/16B4F30, and writes the log entry to the WAL buffer. The WAL writer flushes the buffer to disk.
+
+**Step 3:** The WAL sender process reads the new entry and transmits it to each connected replica. For the synchronous replica, it waits for an acknowledgment.
+
+**Step 4:** The synchronous replica's WAL receiver writes the entry to its local WAL and flushes to disk. The applier then replays the change into the local storage engine. The replica sends an ack back to the primary.
+
+**Step 5:** The primary receives the sync ack. For the asynchronous replica, the ack is not required — the primary continues without waiting.
+
+**Step 6:** The primary acknowledges the commit to the client. The write is durable on two nodes, guaranteeing zero data loss if the primary fails immediately.
+
+### Step-by-Step: A Read Hits a Replica
+
+**Step 1:** The application sends a `SELECT * FROM posts WHERE user_id = 42` to the read connection pool.
+
+**Step 2:** The pool router selects a replica based on the routing policy (round-robin, least-loaded, or session-sticky).
+
+**Step 3:** The replica's query executor checks its local MVCC snapshot. The snapshot reflects the database state as of the last applied LSN.
+
+**Step 4:** If the replica has applied LSN 0/16B4F30 (the user's write), the query includes the new post. If the replica is lagging, the query returns the old state.
+
+**Step 5:** The replica returns the result set. The application renders it to the user.
+
+## Consistency and State
+
+### Scenario 1: Primary Crash During Write
+
+<AsciiDiagram id="system-design-fundamentals/replication/02-deep-dive/crash-scenario" title="Primary Crash During Write with Asynchronous Replication" alt="Timeline showing a primary that crashes after acknowledging a write to the client but before the replica receives the WAL entry, resulting in data loss" caption="Figure 4: Data loss scenario with async replication" content={`
+      PRIMARY CRASH — ASYNC REPLICATION (DATA LOSS)
+
+  Time  Primary          Replica 1        Replica 2
+   │    │                  │                 │
+   │    │  Client: INSERT  │                 │
+   │    │◄──── w/ LSN 200 ─│                 │
+   │    │                  │                 │
+   │    │  WAL entry 200   │                 │
+   │    │─────────────────►│                 │
+   │    │  WAL entry 200   │                 │
+   │    │───────────────────────────────────►│
+   │    │                  │                 │
+   │   ─┤ CRASH ──►        │                 │
+   │    │                  │                 │
+   │   ─┤ FAILOVER ──►     │                 │
+   │    │  Replica 1       │                 │
+   │    │  promoted to     │                 │
+   │    │  primary         │                 │
+   │    │  LSN: 200        │                 │
+   │    │  (data safe)     │                 │
+   │    │                  │                 │
+   ▼    │  Replica 2:      │                 │
+        │  LSN: 200 also   │                 │
+        │  (data safe)     │                 │
+        ▼                  ▼                 ▼
+`} />
+
+**What happened:** The primary crashed after sending the WAL to both replicas but before they could acknowledge. With async replication, the primary committed the write to the client. The replicas actually received the data — they just had not sent the ack yet. In this scenario, no data is lost. The dangerous case is when the primary crashes before the WAL entry is transmitted at all.
+
+**Resolution:** The monitoring system detects the primary heartbeat is missing. Patroni or a similar coordinator promotes the replica with the highest LSN to primary. The application reconnects to the new primary. Clients that wrote data that was not yet replicated will see their writes disappear — a lost write.
+
+### Scenario 2: Network Partition (Split-Brain)
+
+<AsciiDiagram id="system-design-fundamentals/replication/02-deep-dive/split-brain" title="Split-Brain Scenario During Network Partition" alt="Two data centers isolated by a network partition, each promoting its own primary, resulting in two independent write streams that diverge" caption="Figure 5: Split-brain during a network partition" content={`
+      SPLIT-BRAIN SCENARIO
+
+          ┌────────────┐
+          │  Network   │
+          │  Partition │
+          └────────────┘
+
+    ┌─ DC1 ─────────────┐    ┌─ DC2 ─────────────┐
+    │                    │    │                    │
+    │  ┌──────────────┐  │    │  ┌──────────────┐  │
+    │  │  [Primary A]  │  │    │  │ [Primary B]  │  │
+    │  │  LSN: 500     │  │    │  │ LSN: 300     │  │
+    │  │  App: write   │  │    │  │ App: ERROR   │  │
+    │  │  user 42      │  │    │  │ → auto-promote│ │
+    │  │  post #5      │  │    │  │  to primary  │  │
+    │  └──────────────┘  │    │  └──────┬───────┘  │
+    │         │          │    │         │           │
+    │  ┌──────▼───────┐  │    │  ┌──────▼───────┐  │
+    │  │  (Replica)    │  │    │  │  (Replica)    │  │
+    │  │  LSN: 500     │  │    │  │  LSN: 300     │  │
+    │  └──────────────┘  │    │  └──────────────┘  │
+    │                    │    │                    │
+    │  Writes: user 42,  │    │  Writes: user 42,  │
+    │  post #5, #6, #7   │    │  post #5, #8, #9   │
+    │  (DIVERGENT!)      │    │  (DIVERGENT!)      │
+    └────────────────────┘    └────────────────────┘
+`} />
+
+**What happened:** A network partition isolates DC1 from DC2. DC2's replicas detect that the primary is unreachable and promote one of their own to primary. DC1's primary is still running. Now both DC1 and DC2 accept writes. When the partition heals, the two data sets have diverged — user 42's post #5 was edited in both DC1 and DC2, producing different versions.
+
+**Resolution:** Detection requires a quorum-based system (etcd, ZooKeeper, Patroni). If the partition splits a 3-node cluster into 2 and 1, the side with 2 nodes has quorum and continues. The side with 1 node stops accepting writes. This prevents split-brain entirely. Recovery from a real split-brain requires manual reconciliation: comparing the diverged data sets, choosing a winner (usually by timestamp or version vector), and applying the loser's changes that do not conflict.
+
+### Scenario 3: Concurrent Writes to the Same Key
+
+In multi-leader or leaderless replication, two clients can write to the same key simultaneously on different nodes. The system must detect and resolve the conflict.
+
+**Resolution strategies:**
+
+- **Last-writer-wins (LWW):** Each write is timestamped. The highest timestamp wins. Simple but loses data — the earlier write is silently discarded. Works when timestamps are synchronized (NTP with tight bounds) or use logical clocks.
+
+- **Version vectors:** Each node tracks incrementing version numbers per key. When a read returns data from multiple nodes, the application sees the version divergence and can merge them. This is how Dynamo and Riak handle conflicts.
+
+- **CRDTs (Conflict-free Replicated Data Types):** Data structures that mathematically guarantee convergence regardless of update order. Counters, registers, sets, and maps have CRDT variants. Used by Redis, Riak, and collaborative editing tools like Google Docs.
+
+<AsciiDiagram id="system-design-fundamentals/replication/02-deep-dive/concurrent-writes" title="Concurrent Write Conflict Resolution with Version Vectors" alt="Two clients writing to the same key on different nodes, showing version vector divergence and the three conflict resolution strategies" caption="Figure 6: Concurrent write conflict and resolution" content={`
+      CONCURRENT WRITE CONFLICT RESOLUTION
+
+  Client A writes "X=5" on Node 1
+  Client B writes "X=10" on Node 2
+  (simultaneously, no coordination)
+
+  After sync, both nodes see both versions:
+
+  Node 1:                      Node 2:
+  X=5 (v1)                     X=5 (v1)
+  X=10 (v2)                    X=10 (v2)
+
+  Conflicts! Which value for X?
+
+  ┌─────────────────────────────────────────┐
+  │  Resolution Strategies:                 │
+  │                                         │
+  │  1. LWW: pick latest timestamp          │
+  │     Node 1: 10:00:01 -> X=10            │
+  │     Node 2: 10:00:02 -> X=10            │
+  │     Result: X=10, writes to X=5 LOST    │
+  │                                         │
+  │  2. Version Vectors: return both        │
+  │     Application sees both values        │
+  │     and merges: X=10 (take max)         │
+  │                                         │
+  │  3. CRDT: commutative merge             │
+  │     G-Counter: value = max(5,10) = 10   │
+  │     PN-Counter: add increments, not set │
+  │     OR-Set: union of adds minus removes │
+  └─────────────────────────────────────────┘
+`} />
+
+### Scenario 4: Stale Reads Under Load
+
+When a replica falls behind the primary, reads return stale data. This is especially problematic when the application reads its own writes.
+
+**Resolution:**
+
+- **Read-after-write consistency:** After writing, the session reads from the primary for the next N seconds (or for the same session). This is the approach used by Facebook's TAO cache and many web frameworks.
+
+- **LSN-based routing:** Each write returns the LSN. The application stores the LSN. When reading, it checks the replica's current LSN. If the replica is behind, it either waits or reads from the primary. PostgreSQL supports this with `pg_current_wal_lsn()` and `pg_last_wal_replay_lsn()`.
+
+- **Synchronous replication for critical data:** Route writes that must be immediately visible to a synchronous replica. This increases write latency but guarantees the data is readable on the replica immediately after the write commit.
+
+## Performance Characteristics
+
+### Latency
+
+Replication adds latency to every write. The amount depends on the replication mode:
+
+| Mode | p50 Write Latency | p99 Write Latency | Cost |
+|------|-------------------|-------------------|------|
+| No replication | 1 ms | 5 ms | — |
+| Async (local replica) | 1.5 ms | 7 ms | +0.5 ms |
+| Async (same region) | 3 ms | 15 ms | +2 ms |
+| Async (cross-region, US-East to US-West) | 65 ms | 120 ms | +64 ms |
+| Sync (local replica) | 3 ms | 12 ms | +2 ms |
+| Sync (same region) | 5 ms | 25 ms | +4 ms |
+| Sync (cross-region) | 140 ms | 300 ms | +139 ms |
+
+These numbers assume a 1 KB write payload. Each additional KB adds approximately 0.1 ms to the primary's write time and 0.1 ms per replica.
+
+### Throughput
+
+Replication throughput is limited by three resources: network bandwidth, WAL write speed, and replica apply speed.
+
+**Network bandwidth:** A primary with a 10 Gbps NIC can transmit approximately 1.25 GB/s. With 1 KB writes, that is 1.25 million writes per second. Subtract overhead: approximately 900,000 writes per second to replicas. Each replica consumes the same bandwidth, so five replicas consume 5x the outbound bandwidth.
+
+**WAL write speed:** An NVMe SSD can write sequentially at 3 GB/s. With 1 KB entries, that is 3 million writes per second. The WAL writer is rarely the bottleneck for writes under 4 KB.
+
+**Replica apply speed:** The replica must decode and replay every log entry. This is CPU-bound, and replay is typically slower than the initial write on the primary. A single replica can apply approximately 500,000 to 1 million writes per second, depending on the storage engine. MySQL's single-threaded SQL thread is a notorious bottleneck — it can apply only as fast as one core.
+
+### Memory
+
+The WAL buffer on the primary consumes memory proportional to the maximum replication lag. A common configuration is 64 MB to 256 MB for the WAL buffer. Each replication slot adds approximately 100 bytes of memory overhead.
+
+Replicas need additional memory for the WAL receiver buffer (typically 64 MB default) and the local WAL segment cache. The storage engine's buffer pool is sized independently and should be equal to or larger than the primary's for consistent read performance.
+
+## Configuration and Tuning
+
+### PostgreSQL Example
+
+| Setting | Default | Recommended | When to Change |
+|---------|---------|-------------|----------------|
+| `wal_level` | replica | `logical` | Only when using logical replication |
+| `max_wal_senders` | 10 | `number_of_replicas + 5` | Add more if replicas frequently disconnect |
+| `wal_keep_size` | 0 | `4096` (MB) | Increase if replicas lag for hours |
+| `max_replication_slots` | 10 | `number_of_replicas + 2` | Same as wal_senders |
+| `synchronous_standby_names` | empty | `'FIRST 1 (replica1)'` | Set to enable sync replication |
+| `hot_standby` | on | on | Keep on to allow read queries on replicas |
+| `max_standby_streaming_delay` | 30s | 30s | Increase on replicas running long queries |
+
+### MySQL Example
+
+| Setting | Default | Recommended | When to Change |
+|---------|---------|-------------|----------------|
+| `server_id` | 0 | Unique per node | Required for replication to work |
+| `log_bin` | OFF | ON | Must be enabled for replication |
+| `binlog_format` | STATEMENT | ROW | Row-based avoids edge cases with non-deterministic functions |
+| `sync_binlog` | 1 | 1 | 0 increases throughput but risks data loss |
+| `slave_parallel_workers` | 0 | 4 | Increase for multi-core replicas to apply faster |
+| `relay_log_space_limit` | 0 | 0 (unlimited) | Set a limit to prevent disk full from slow replica |
+
+### What Breaks When You Change Settings
+
+**Increasing `wal_keep_size` to 100 GB:** The primary retains more WAL segments, using more disk space but allowing replicas to reconnect after longer outages. Disk fills up if replicas are down for extended periods.
+
+**Setting `synchronous_standby_names` with a slow replica:** Every write waits for the slow replica. Write latency spikes to the replica's speed. Production systems should only designate fast replicas as synchronous.
+
+**Reducing `max_wal_senders` below replica count:** New replicas cannot connect. Existing replicas that disconnect cannot reconnect. The system is effectively stuck.
+
+Replication is a carefully tuned machine. The next page applies these internal mechanisms to build production-grade replication architectures at scale, covering multi-region deployment, capacity planning, and operational patterns.

@@ -1,0 +1,524 @@
+---
+id: cache-invalidation-architecture
+title: "Cache Invalidation at Scale"
+position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+Every cache invalidation system starts somewhere. The simplest approach is TTL-only invalidation: set a TTL on every cache entry and let time handle the rest.
+
+<AsciiDiagram
+  id="cache-invalidation/architecture-naive-ttl"
+  title="Naive TTL-Only Cache Invalidation"
+  alt="Simple architecture diagram showing web servers, shared Redis cache with TTL-only invalidation, and backend database"
+>
+{`┌────────────────── Naive Architecture ───────────────────────┐
+│                                                              │
+│                         ┌──────────┐                         │
+│                    ┌───►│  Web     │───┐                     │
+│                    │    │  Server  │   │                     │
+│                    │    │  (1-16) │   │                     │
+│                    │    └──────────┘   │                     │
+│                    │                   │                     │
+│               ┌────┴────┐        ┌─────┴─────┐              │
+│               │  TTL     │        │            │              │
+│               │  only    │        │   Direct   │              │
+│               │  cache   │        │   DB query │              │
+│               │  {Redis} │        │   (miss)  │              │
+│               └────┬────┘        └─────┬─────┘              │
+│                    │                   │                     │
+│                    │                   ▼                     │
+│                    │           ┌──────────────┐              │
+│                    └──────────►│  Database    │              │
+│                                │  ((primary)) │              │
+│                                └──────────────┘              │
+│                                                              │
+│  Invalidation: TTL only                                      │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  Cache.set(key, value, ttl=300)                      │    │
+│  │  # Cache expires entry after 300 seconds             │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                                                              │
+│  Reads:                                                      │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  value = Cache.get(key)                              │    │
+│  │  if value is None:                                   │    │
+│  │    value = DB.query(key)                             │    │
+│  │    Cache.set(key, value, ttl=300)                    │    │
+│  │  return value                                        │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+This architecture works for small systems. The pattern is straightforward: read from cache, fall back to database on miss, write to cache with a TTL. No invalidation logic needed.
+
+### Where It Breaks
+
+**At 1K users.** The TTL window is too wide. A user updates their profile and expects to see the change immediately. With a 300-second TTL, they might wait up to five minutes. For a small social app this is annoying but survivable. Users refresh, complain, eventually the cache expires and they see the change.
+
+**At 100K users.** The invalidation storm problem emerges. Imagine a popular news article is published. The article's content is cached with a 300-second TTL. A correction is published five minutes later. All 100K readers who access the article in the next five minutes see the incorrect version. Worse, when the TTL finally expires, all 100K readers' requests hit the database simultaneously as their cached copies expire within a few seconds of each other. The database is overwhelmed.
+
+**At 10M users.** The problems compound. Cache nodes are replicated for scale, but TTL-only invalidation has no mechanism to coordinate invalidations across nodes. Node A expires an entry and re-queries the database. Node B still has the stale entry with a few seconds left on its TTL. Load balancers route some users to Node A (fresh data) and some to Node B (stale data). Users see inconsistent data depending on which node they hit. This is called cache node desynchronization.
+
+The stale data cascade makes everything worse: because users see inconsistent data, support tickets spike. Support tools also cache data, so support agents see stale data too. The debugging effort becomes a distributed system nightmare: nobody can tell if they are seeing fresh or stale data.
+
+<AsciiDiagram
+  id="cache-invalidation/architecture-naive-failures"
+  title="Failure Modes of Naive TTL-Only Invalidation"
+  alt="Diagram showing three failure modes of TTL-only invalidation: TTL window, invalidation storm, and cache node desync"
+>
+{`┌─────────── Failure Modes at Scale ───────────────────────────┐
+│                                                               │
+│  Failure 1: TTL Window Too Wide                               │
+│  ┌───────────────────────────────────────────────────────┐    │
+│  │  t=0:  Cache.set(article:999, "Version A", ttl=300)   │    │
+│  │  t=10: DB updated to "Version B"                      │    │
+│  │  t=10..300: All reads get "Version A" from cache       │    │
+│  │  t=300: Cache expires, readers finally see "Version B"  │    │
+│  │  Staleness = 290 seconds. Unacceptable.                │    │
+│  └───────────────────────────────────────────────────────┘    │
+│                                                               │
+│  Failure 2: Invalidation Storm (Thundering Herd)              │
+│  ┌───────────────────────────────────────────────────────┐    │
+│  │  t=299: 99,000 cache entries all expire within 1s     │    │
+│  │  t=300: 99,000 requests hit DB simultaneously          │    │
+│  │  DB connection pool exhausted (pool=1000)              │    │
+│  │  98,000 requests queue or timeout                      │    │
+│  │  Site becomes unresponsive                             │    │
+│  └───────────────────────────────────────────────────────┘    │
+│                                                               │
+│  Failure 3: Cache Node Desynchronization                      │
+│  ┌───────────────────────────────────────────────────────┐    │
+│  │  Cache cluster: Node A, Node B, Node C                 │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐             │    │
+│  │  │ Node A   │  │ Node B   │  │ Node C   │             │    │
+│  │  │ entry OK │  │ entry OK │  │ entry OK │             │    │
+│  │  │ TTL: 42s │  │ TTL: 87s │  │ TTL: 13s │             │    │
+│  │  │ VERSION A│  │ VERSION A│  │ VERSION A│             │    │
+│  │  └──────────┘  └──────────┘  └──────────┘             │    │
+│  │             ▲                         ▲               │    │
+│  │             │ DB updated to            │ DB updated to │    │
+│  │             │ VERSION B                │ VERSION C     │    │
+│  │             │ (node missed event)      │ (node missed  │    │
+│  │             │                          │  event)       │    │
+│  │  Users routed by hash: User1→A (stale), User2→C (stale)│    │
+│  └───────────────────────────────────────────────────────┘    │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+## Production-Grade Architecture
+
+A production-grade cache invalidation system replaces TTL-only invalidation with an event-driven pipeline. The pipeline connects the database to the cache through a series of reliable, asynchronous components.
+
+<AsciiDiagram
+  id="cache-invalidation/architecture-production-grade"
+  title="Production-Grade Cache Invalidation Pipeline"
+  alt="Architecture diagram showing DB change to CDC event to event bus to invalidation consumer to cache cluster purge"
+>
+{`┌────────── Production-Grade Invalidation Pipeline ───────────┐
+│                                                               │
+│  ┌──────────────┐                                             │
+│  │  Database    │                                             │
+│  │  ((primary)) │──────── WAL / CDC stream ───────────────┐   │
+│  └──────────────┘                                         │   │
+│                   ┌──────────────────────────────────┐    │   │
+│                   │  Change Data Capture (CDC)       │◄───┘   │
+│                   │  Debezium / Maxwell / custom      │        │
+│                   └───────────────┬──────────────────┘        │
+│                                   │                            │
+│                                   ▼                            │
+│                   ┌──────────────────────────────────┐         │
+│                   │  Event Bus                        │         │
+│                   │  <Kafka / RabbitMQ>               │         │
+│                   │  Topic: cache-invalidation        │         │
+│                   └───────────────┬──────────────────┘         │
+│                                   │                            │
+│                                   ▼                            │
+│                   ┌──────────────────────────────────┐         │
+│                   │  Invalidation Consumer Group       │         │
+│                   │  (partitioned, N consumers)       │         │
+│                   └───────────────┬──────────────────┘         │
+│                                   │                            │
+│          ┌────────────────────────┼────────────────┐           │
+│          ▼                        ▼                ▼           │
+│  ┌──────────────┐       ┌──────────────┐  ┌──────────────┐    │
+│  │  Cache Node  │       │  Cache Node  │  │  Cache Node  │    │
+│  │  {Redis A}   │       │  {Redis B}   │  │  {Redis C}   │    │
+│  └──────────────┘       └──────────────┘  └──────────────┘    │
+│          │                        │                │           │
+│          └────────────────────────┼────────────────┘           │
+│                                   │                            │
+│                                   ▼                            │
+│                   ┌──────────────────────────────────┐         │
+│                   │  Consistency Checker              │         │
+│                   │  (background verification)       │         │
+│                   └──────────────────────────────────┘         │
+│                                                               │
+│  Key components:                                               │
+│  ├─ CDC: captures every database change as an event            │
+│  ├─ Event bus: durable, ordered, replayable event storage     │
+│  ├─ Consumer: resolves keys, applies invalidation             │
+│  └─ Checker: detects and repairs missed invalidations         │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Multi-Cache Coherence Protocol
+
+In a production-grade system with multiple cache nodes, a coherence protocol ensures that all nodes eventually agree on which entries are valid.
+
+The protocol works as follows:
+
+1. **Version-stamped entries.** Every cache entry carries a monotonically increasing version number from the source database.
+2. **Invalidation via event broadcast.** Invalidations are broadcast to all cache nodes. Each node records the highest version it has seen for each key.
+3. **Read-time version check.** When a cache node receives a read request, it checks the entry's version against the highest invalidated version. If the entry version is lower than the invalidated version, the entry is considered stale.
+4. **Gossip-based reconciliation.** Nodes periodically exchange invalidation state with peer nodes. If Node A learns that Node B has invalidated a key at version 42, and Node A only knows about version 40, Node A processes the missed invalidation events.
+5. **Consensus on staleness.** If a node cannot reach a consensus on the latest invalidated version (for example, during a network partition), it falls back to a TTL safety net.
+
+This protocol provides eventual consistency with bounded staleness. The bound is determined by the gossip interval and the event propagation delay.
+
+## Integration Patterns
+
+Cache invalidation must integrate with the existing data infrastructure. The integration pattern you choose depends on your database technology, your tolerance for latency, and your existing event infrastructure.
+
+### Integration with SQL Database (CDC Triggers)
+
+For SQL databases, change data capture provides the most reliable invalidation pipeline. CDC reads the database's write-ahead log (WAL) and translates transaction records into invalidation events.
+
+<AsciiDiagram
+  id="cache-invalidation/architecture-sql-cdc"
+  title="SQL Database CDC Integration for Cache Invalidation"
+  alt="Architecture diagram showing SQL database WAL to Debezium connector to Kafka to invalidation consumer"
+>
+{`┌──────── MySQL/PostgreSQL CDC Integration ─────────────────┐
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  SQL Database                                          │  │
+│  │  ((primary))                                            │  │
+│  │                                                        │  │
+│  │  WAL: [txn:1234, INSERT INTO products (id=42, ...)]   │  │
+│  │  WAL: [txn:1235, UPDATE products SET price=9.99       │  │
+│  │                    WHERE id=42]                        │  │
+│  │  WAL: [txn:1236, COMMIT]                              │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │  WAL streaming                     │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Debezium Connector                                    │  │
+│  │                                                        │  │
+│  │  Reads WAL via logical replication slot                 │  │
+│  │  Filters: only cache-relevant tables/columns           │  │
+│  │  Transforms: raw WAL → structured invalidation event   │  │
+│  │  Output: {"table":"products","id":42,                  │  │
+│  │           "op":"update","before":{price:19.99},        │  │
+│  │           "after":{price:9.99}}                        │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │  Kafka message                     │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Kafka Topic: cache-invalidation.products               │  │
+│  │  Partitioned by product_id                              │  │
+│  │  1 partition = 1 consumer = ordered events per product  │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │                                    │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Invalidation Consumer                                  │  │
+│  │  Resolves cache keys: ["product:42:intl","product:42:  │  │
+│  │    us","category:electronics:products"]                 │  │
+│  │  Sends DELETE commands to Redis cluster                 │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+Advantages of CDC-based integration:
+
+- **Zero application changes.** The database emits events regardless of which application tier writes to it. Background jobs, ETL pipelines, and manual SQL queries all trigger invalidation.
+- **Complete coverage.** Every row change becomes an invalidation event. No writes are missed.
+- **Ordering guarantees.** WAL order preserves causal ordering of writes to the same row.
+
+Disadvantages:
+
+- **WAL overhead.** CDC adds CPU load to the primary database, typically 5-15%.
+- **Replication slot management.** PostgreSQL replication slots must be monitored to prevent WAL accumulation.
+- **Schema changes.** Altering a table may require reconfiguring the CDC connector.
+
+### Integration with Message Queue
+
+For systems already using a message queue, invalidation events can flow through the same infrastructure as other events.
+
+<AsciiDiagram
+  id="cache-invalidation/architecture-message-queue"
+  title="Message Queue Integration for Cache Invalidation"
+  alt="Architecture diagram showing application publishing invalidation events to RabbitMQ or Kafka, consumed by cache invalidation service"
+>
+{`┌────────────── Message Queue Integration ─────────────────┐
+│                                                              │
+│  ┌──────────┐     ┌──────────┐     ┌──────────┐            │
+│  │  App     │     │  App     │     │  App     │            │
+│  │  Service │     │  Service │     │  Service │            │
+│  │  A       │     │  B       │     │  C       │            │
+│  └────┬─────┘     └────┬─────┘     └────┬─────┘            │
+│       │                │                │                   │
+│       │  publish invalidation event      │                   │
+│       └────────────────┼────────────────┘                   │
+│                        ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Message Queue (RabbitMQ / Kafka)                       │  │
+│  │                                                        │  │
+│  │  Exchange/Topic: cache.invalidation                    │  │
+│  │  Routing key: user.updated, product.changed, etc.     │  │
+│  │                                                        │  │
+│  │  Message body: { "object_type": "user",                │  │
+│  │                  "object_id": 123,                      │  │
+│  │                  "action": "update",                    │  │
+│  │                  "changed_fields": ["avatar"] }        │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │                                    │
+│                         │  Consumer subscribes               │
+│                         ▼                                    │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Invalidation Consumer                                  │  │
+│  │  1. Parse message                                      │  │
+│  │  2. Resolve cache keys by type:                        │  │
+│  │     user.updated → ["user:123:profile",                │  │
+│  │                      "user:123:settings",               │  │
+│  │                      "feed:all:avatar"]                 │  │
+│  │  3. Dispatch deletes to cache cluster                  │  │
+│  │  4. Acknowledge message on success                     │  │
+│  │  5. On failure: retry with backoff (max 3)             │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+│  Pro: App controls when invalidation happens                 │
+│  Con: App must remember to publish events                   │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+The message queue pattern is simpler than CDC but relies on application discipline. Every service that writes data must also publish invalidation events. This is easy to forget, leading to stale data.
+
+### Event-Driven Invalidation with Tags
+
+For fine-grained invalidation, the event-driven approach uses tags to identify which cache entries are affected by a source data change.
+
+The flow:
+
+1. Writer publishes a structured event: `{"type": "product.updated", "id": 42, "tags": ["product:42", "category:electronics"]}`
+2. The invalidation consumer receives the event and looks up all cache entries with matching tags.
+3. All matched entries are invalidated.
+4. The consumer publishes an invalidation completion event for observability.
+
+Tag-based invalidation allows precise invalidation without the writer knowing the exact cache key structure. The writer only needs to know the tag identifiers, which are typically the database object IDs and related entity IDs.
+
+### Redis-Specific Invalidation with Keyspace Notifications
+
+Redis supports keyspace notifications: pub/sub messages that fire when keys are modified or expired. These can be used for invalidation, but with important limitations.
+
+```bash
+# Enable keyspace notifications for expired events
+CONFIG SET notify-keyspace-events Ex
+
+# Subscribe to expired events
+PSUBSCRIBE __keyevent@0__:expired
+```
+
+The limitations:
+
+- **No del notification guarantee.** Redis pub/sub is fire-and-forget. If no consumer is subscribed, the notification is lost.
+- **Event ordering not guaranteed.** If two keys expire simultaneously, the order of notifications is nondeterministic.
+- **Performance impact.** Enabling keyspace events adds overhead to every key operation.
+- **Cluster complexity.** In a Redis cluster, keyspace events are published only on the node holding the key.
+
+Despite these limitations, Redis keyspace notifications work well as a fallback mechanism for TTL-based invalidation.
+
+## Multi-Region Architecture
+
+When your application spans multiple geographical regions, cache invalidation must cross region boundaries.
+
+<AsciiDiagram
+  id="cache-invalidation/architecture-multi-region"
+  title="Multi-Region Cache Invalidation Architecture"
+  alt="Architecture diagram showing global invalidation with region-specific TTL, cross-region invalidation messages, and gossip protocol"
+>
+{`┌───────────────── Multi-Region Invalidation ─────────────────┐
+│                                                               │
+│  ┌────────── US-East ──────────────────────────────────┐      │
+│  │  ┌──────────────┐    ┌──────────────┐               │      │
+│  │  │  DB Primary  │    │  Invalidation │               │      │
+│  │  │  ((writer))  │───►│  Manager     │               │      │
+│  │  └──────────────┘    └──────┬───────┘               │      │
+│  │                             │                        │      │
+│  │                      ┌──────┴───────┐               │      │
+│  │                      │  Cache A     │               │      │
+│  │                      │  {Redis}     │               │      │
+│  │                      └──────────────┘               │      │
+│  └──────────────────────────┬──────────────────────────┘      │
+│                             │                                  │
+│              cross-region invalidation msg                     │
+│                             │                                  │
+│  ┌────────── EU-West ───────┴──────────────────────────┐      │
+│  │  ┌──────────────┐    ┌──────────────┐               │      │
+│  │  │  DB Replica  │    │  Invalidation │               │      │
+│  │  │  ((reader))  │    │  Consumer    │               │      │
+│  │  └──────────────┘    └──────┬───────┘               │      │
+│  │                             │                        │      │
+│  │                      ┌──────┴───────┐               │      │
+│  │                      │  Cache B     │               │      │
+│  │                      │  {Redis}     │               │      │
+│  │                      └──────────────┘               │      │
+│  └─────────────────────────────────────────────────────┘      │
+│                                                               │
+│  ┌────────── AP-Southeast ────────────────────────────┐       │
+│  │  ┌──────────────┐    ┌──────────────┐               │      │
+│  │  │  DB Replica  │    │  Gossip      │               │      │
+│  │  │  ((reader))  │    │  Agent       │               │      │
+│  │  └──────────────┘    └──────┬───────┘               │      │
+│  │                             │                        │      │
+│  │                      ┌──────┴───────┐               │      │
+│  │                      │  Cache C     │               │      │
+│  │                      │  {Redis}     │               │      │
+│  │                      └──────────────┘               │      │
+│  └─────────────────────────────────────────────────────┘      │
+│                                                               │
+│  Cross-region strategies:                                    │
+│  ├─ Global invalidation topic (Kafka cross-region mirror)    │
+│  ├─ Region-specific TTL overrides (shorter in remote)        │
+│  └─ Gossip protocol (nodes exchange invalidation state)     │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
+`}
+</AsciiDiagram>
+
+### Cross-Region Strategies
+
+**Global invalidation topic.** A single Kafka topic that spans all regions through mirroring. Invalidation events are published to the primary region's topic and mirrored to all other regions. Each region's invalidation consumer reads from the local mirror.
+
+Challenge: cross-region replication latency (50-200ms inter-continental) adds to the staleness window. Regions far from the primary have longer staleness.
+
+**Region-specific TTL overrides.** Each region configures its own TTL for cache entries. Remote regions use shorter TTLs to compensate for slower invalidation propagation. If the primary region uses a 300-second TTL, the Asia-Pacific region might use 60 seconds.
+
+Challenge: shorter TTLs increase cache miss rates and database load in remote regions.
+
+**Gossip protocol.** Cache nodes periodically exchange invalidation state with peers in other regions. Each node maintains a vector clock of the highest invalidation version it has seen for each key. Gossip converges over time.
+
+Challenge: gossip convergence time scales with cluster size and regional latency. During convergence, stale reads are possible.
+
+### Consistency in Multi-Region Deployments
+
+Multi-region cache invalidation is fundamentally limited by the speed of light. No matter how robust your invalidation pipeline, a user in Australia will see stale data for at least the round-trip time between Australia and the primary region (100-200ms).
+
+Accept this constraint and design accordingly:
+
+- Use shorter TTLs in remote regions to reduce staleness.
+- Pre-warm caches in remote regions with anticipated data (for example, temperature data when entering a region's business hours).
+- Display a "data freshness" indicator to users (for example, "Last updated 2 minutes ago").
+- Design the user experience to tolerate bounded staleness (for example, show cached data with a refresh button).
+
+## Capacity Planning
+
+For a system serving 10 million daily active users (DAU), here are the invalidation capacity requirements.
+
+### Invalidation Events Per Second
+
+Assume each user generates approximately 10 writes per day (posts, comments, likes, profile updates, etc.):
+
+- Total writes per day: 10M x 10 = 100M
+- Write peak factor: 5x (writes are not evenly distributed)
+- Peak writes per second: 100M / 86400 x 5 = ~5,800
+
+Each write may affect multiple cache entries. With an average fan-out of 5 cache entries per write (for example, a profile update affects the profile cache, the search index cache, the friend feed cache, the settings cache, and the avatar cache):
+
+- Peak invalidation events per second: ~5,800 x 5 = ~29,000
+
+### Event Backlog
+
+If the invalidation consumer goes down for 5 minutes:
+
+- Backlog = 29,000 events/sec x 300 seconds = 8.7 million events
+- At 10,000 events/sec consumption rate: catch-up time = 870 seconds (~15 minutes)
+
+This means a 5-minute outage results in 15 minutes of stale data catch-up. Mitigate by:
+
+- Running redundant consumers in different availability zones.
+- Using consumer groups with at-least-once delivery guarantees.
+- Setting up auto-scaling for the consumer group to handle backlogs faster.
+
+### Purge Throughput
+
+Each invalidation event results in a cache delete operation. At 29,000 events/sec each targeting 5 keys:
+
+- Cache delete operations per second: ~29,000 x 5 = ~145,000
+
+A single Redis node can handle approximately 100,000 operations per second (SET/GET/DEL). A Redis cluster of 4-6 nodes easily handles 145,000 DEL/s.
+
+### Network Bandwidth
+
+Each invalidation event as a Kafka message:
+
+- Average message size: 500 bytes (key, tags, metadata)
+- Bandwidth: 29,000 msgs/s x 500 bytes = 14.5 MB/s (116 Mbps)
+
+This is negligible for a modern data center network (typically 10-40 Gbps).
+
+The cache delete commands (key-only, small) use even less bandwidth.
+
+## Deployment
+
+### Zero-Downtime Deployment
+
+Deploying invalidation pipeline changes without downtime requires careful sequencing:
+
+1. **Deploy the event consumer first.** The new consumer reads from the same topics but writes to a new or secondary invalidation queue. It runs alongside the old consumer.
+2. **Validate the new consumer.** Check metrics: invalidation latency, throughput, error rate.
+3. **Switch traffic.** Update routing to send invalidation events to the new consumer. Keep the old consumer running as a backup.
+4. **Monitor.** Watch for increased staleness or failed invalidations during the switch.
+5. **Decommission the old consumer.** After the monitoring window (typically 30 minutes to 1 hour), remove the old consumer.
+
+### Monitoring
+
+Monitor these metrics to detect invalidation problems before they affect users.
+
+| Metric | What It Measures | Alert Threshold |
+|---|---|---|
+| Staleness window (p99) | Time from DB change to cache invalidation | > 10 seconds |
+| Invalidation latency (p99) | Time to process one invalidation event | > 100ms |
+| Purge queue depth | Number of pending invalidations | > 10,000 |
+| Failed invalidations | Invalidation operations that failed | > 0 in 5 minutes |
+| Cache hit rate | Fraction of reads served from cache | Drop > 5% |
+| Event bus lag | Events produced but not yet consumed | > 10,000 |
+| Consistency checker mismatches | Entries found stale by checker | > 10 per hour |
+
+### Recovery Procedures
+
+**Storm recovery.** If an invalidation storm is detected (purge queue depth spikes, cache hit rate drops):
+
+1. Pause non-critical invalidation events (rate-limit the event bus).
+2. Increase consumer parallelism (scale up consumer group).
+3. Increase database connection pool to handle the miss traffic.
+4. After recovery, gradually resume paused events.
+
+**Failed invalidation recovery.** If invalidations are failing (for example, cache node unreachable):
+
+1. Detect failed nodes and remove them from the invalidation target list.
+2. Route traffic away from the affected nodes.
+3. Repair or replace the failed nodes.
+4. Replay invalidation events from the invalidation log.
+5. Verify cache consistency before returning nodes to service.
+
+**Stale data cascade recovery.** If stale data has propagated through the system:
+
+1. Hard-purge all affected cache entries (not just TTL expiry — immediate delete).
+2. If stale data was served to users, invalidate downstream caches (CDN, browser caches).
+3. Identify the root cause: missed invalidation event? Failed consumer? Bug in key resolution?
+4. Add monitoring to detect similar patterns in the future.

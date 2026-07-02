@@ -1,0 +1,650 @@
+---
+id: partitioning-data-architecture
+title: Partitioning Data at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest partitioning approach uses mod-N hashing directly in the application code. Each application server has a hard-coded mapping of shard IDs to database connection strings. The mapping is defined in a configuration file.
+
+<AsciiDiagram
+  id="partitioning-data/arch-naive-modN"
+  title="Naive mod-N sharding architecture with hardcoded shard mappings in application servers"
+  alt="Two application servers each with a hardcoded config.json mapping shard IDs to connection strings, sending queries directly to the correct MySQL shard out of 8 shards"
+  caption="Naive architecture: each application server embeds the shard mapping and routes queries directly. Works at small scale but breaks during resharding."
+  content={`
+    App Server A                  App Server B
+  ┌────────────────────┐       ┌────────────────────┐
+  │ config.json        │       │ config.json        │
+  │ shard 0 -> db0     │       │ shard 0 -> db0     │
+  │ shard 1 -> db1     │       │ shard 1 -> db1     │
+  │ shard 2 -> db2     │       │ shard 2 -> db2     │
+  │ ...                │       │ ...                │
+  │ shard 7 -> db7     │       │ shard 7 -> db7     │
+  ├────────────────────┤       ├────────────────────┤
+  │  shard = user_id   │       │  shard = user_id   │
+  │  % 8               │       │  % 8               │
+  │  connect to dbN    │       │  connect to dbN    │
+  └────────┬───────────┘       └────────┬───────────┘
+           │                            │
+           │ shard 3                    │ shard 3
+           ▼                            ▼
+     ┌──────────┐               ┌──────────┐
+     │  MySQL   │               │  MySQL   │
+     │  Shard 0 │               │  Shard 1 │
+     │  db0     │               │  db1     │
+     ├──────────┤               ├──────────┤
+     │  ...     │               │  ...     │
+     ├──────────┤               ├──────────┤
+     │  MySQL   │               │  MySQL   │
+     │  Shard 7 │               │  Shard 7 │
+     │  db7     │               │  db7     │
+     └──────────┘               └──────────┘
+`}
+/>
+
+**How it works:** Each application server computes `shard_id = user_id % 8` for every database query. The result maps to a configured connection string. The query goes directly to that shard. There is no routing layer, no proxy, no coordinator.
+
+This architecture works well for the first 6 months. With 1 million users and 8 shards, each shard holds 125,000 users. Write throughput is 2,000 writes per second across all shards — 250 writes per shard. Every MySQL instance handles the load comfortably.
+
+**What breaks at scale:**
+
+**Breaking point 1: Resharding.** The system grows to 10 million users. Eight shards are no longer enough. The team decides to move to 32 shards. The formula changes from `user_id % 8` to `user_id % 32`. Every application server must be redeployed with the new configuration. But worse: the mapping for each user changes. User 42, who was on shard 42 % 8 = shard 2, is now on shard 42 % 32 = shard 10. All user 42's data must be moved from shard 2 to shard 10. Compounding the problem: for the duration of the migration, some queries use the old formula and some use the new one. The team must implement dual-reads, dual-writes, a backfill script, and a switch-over window. The migration takes 3 weeks of engineering effort and a weekend of downtime.
+
+**Breaking point 2: Hot spots.** One user becomes a viral influencer with 50 million followers. The app's most active user is user 42 — shard 42 % 8 = shard 2. Shard 2 now handles 40 percent of all read traffic. The other 7 shards sit at 10 percent utilization. Users on shard 2 experience timeouts. The team cannot move user 42 to a different shard without changing the formula, which triggers another resharding nightmare.
+
+**Breaking point 3: No cross-shard queries.** The product team wants a feature: "show total rides across all users in the last month." The naive architecture provides no way to aggregate across shards. The team builds a custom script that connects to all 8 shards sequentially, runs the query on each, and sums results. The script takes 90 seconds to run. The product team wants sub-second response times. The team is stuck.
+
+---
+
+## Production-Grade Architecture
+
+A production-grade partitioned system replaces hardcoded routing with a dedicated routing layer, replaces mod-N hashing with consistent hashing, and adds fault tolerance at every level.
+
+<AsciiDiagram
+  id="partitioning-data/arch-production-vitess"
+  title="Production-grade Vitess sharding architecture with VTGate proxy, topo server, and per-shard MySQL with replicas"
+  alt="Architecture diagram showing application servers connecting to VTGate routers, which query the topo server for shard mapping, then route to the correct MySQL shard, each shard having a primary and two replicas with VTTablet management"
+  caption="Vitess production architecture: VTGate provides a MySQL-compatible proxy, VTTablet manages each MySQL instance, and the topo service (etcd/ZooKeeper) stores the authoritative shard mapping"
+  content={`
+  Application                    Application
+    Server A                       Server B
+       │                              │
+       └──────────┬───────────────────┘
+                  │
+          ┌───────▼───────────────────────┐
+          │   VTGate Proxy (Stateless)    │
+          │   ┌─────────────────────────┐ │
+          │   │  SQL Parser + Route     │ │
+          │   │  Key to Shard Lookup    │ │
+          │   │  Cross-shard Merge      │ │
+          │   │  Connection Pool        │ │
+          │   └─────────────────────────┘ │
+          └────────┬──────────────────────┘
+                   │
+          ┌────────▼────────┐
+          │  Topo Service   │
+          │  (etcd / ZK)    │
+          │                  │
+          │  Routing Table:  │
+          │  0-10M  -> S0   │
+          │  10M-20M -> S1  │
+          │  20M-30M -> S2  │
+          │  ...            │
+          └─────────────────┘
+                   │
+     ┌─────────────┼──────────────┐
+     │             │              │
+┌────▼────┐  ┌────▼────┐  ┌──────▼──────┐
+│Shard 0  │  │Shard 1  │  │Shard 2      │
+│VTTablet │  │VTTablet │  │VTTablet     │
+├─────────┤  ├─────────┤  ├─────────────┤
+│MySQL S0P│  │MySQL S1P│  │MySQL S2P    │
+│MySQL S0R│  │MySQL S1R│  │MySQL S2R    │
+│MySQL S0R│  │MySQL S1R│  │MySQL S2R    │
+└─────────┘  └─────────┘  └─────────────┘
+     │             │              │
+     └─────────────┼──────────────┘
+                   │
+          ┌────────▼────────┐
+          │   Orchestrator   │
+          │   (Auto-failover)│
+          │   Replication    │
+          │   management     │
+          └─────────────────┘
+`}
+/>
+
+### Key Components
+
+**VTGate (Query Router).** Stateless proxies that accept MySQL protocol connections. Each VTGate instance maintains the routing table in memory, populated from the topo service. VTGate parses incoming SQL, extracts the shard key from the `WHERE` clause, looks up the target shard, and forwards the query. For queries without a shard key, VTGate fans out to all shards and merges results. Multiple VTGate instances run behind a load balancer for high availability.
+
+**Topo Service (etcd or ZooKeeper).** The single source of truth for the shard topology. Stores the mapping from key ranges to shards, shard health status, and replication configuration. All VTGate instances watch the topo service for changes. When a shard is added, removed, or split, the topo service updates and VTGates pick up the change within seconds.
+
+**VTTablet (Shard Manager).** Runs alongside each MySQL instance. Manages replication, takes snapshots, handles health checks, and reports to the topo service. When a primary fails, VTTablet coordinates the promotion of a replica through the Orchestrator.
+
+**Orchestrator (Raft-based).** Handles automated failover. Detects primary failure via health checks, promotes the most up-to-date replica to primary, and updates the topo service. Orchestrator uses Raft consensus to avoid split-brain across its own cluster nodes.
+
+### Production Deployment Configuration
+
+For a system serving 50 million users with 5 TB of ride data:
+
+- **10 physical shards**, each deployed in its own availability zone pair (primary in us-east-1a, replica in us-east-1b, replica in us-east-1c).
+- **Each shard:** 500 GB of data, MySQL 8.0 with 64 GB RAM and 8 vCPUs.
+- **4 VTGate instances** behind a Network Load Balancer. Each VTGate handles 5,000 queries per second.
+- **Topo service:** 5-node etcd cluster across 3 availability zones.
+- **Orchestrator:** 3-node Raft cluster.
+
+---
+
+## Integration Patterns
+
+Partitioning is not limited to databases. Every distributed data system uses partitioning at some abstraction level.
+
+### Database Sharding — Vitess and Citus
+
+**Vitess** shards MySQL using a keyspace ID derived from the primary key. It supports both range-based and hash-based sharding. Shard splitting is online: Vitess creates a new shard, streams data from the parent shard, verifies consistency, then updates the routing table atomically.
+
+**Citus** shards PostgreSQL using a distribution column. The Citus coordinator stores metadata about which node holds which ranges. Citus supports distributed queries that push down `WHERE` clauses to individual workers, co-located joins (tables sharded on the same column can join without data movement), and reference tables that are replicated to all workers.
+
+### Message Queue Partitioning — Kafka
+
+Kafka partitions topics into N partitions. Each partition is an ordered, immutable log. Producers write to a partition determined by the message key: `partition = hash(key) % N`. Consumers read from one or more partitions. Partitioning in Kafka provides parallelism: N partitions allow up to N consumers in the same consumer group to process messages concurrently.
+
+<AsciiDiagram
+  id="partitioning-data/arch-kafka-partitions"
+  title="Kafka topic partitioned into 4 partitions across 3 brokers with consumer group parallelism"
+  alt="Architecture showing a topic with 4 partitions distributed across 3 Kafka brokers, one producer writing to partition 2 based on key hash, and a consumer group with 3 consumers each assigned to one or more partitions for parallel processing"
+  caption="Kafka partition placement: partitions are distributed across brokers for fault tolerance; consumer group parallelism is capped by partition count"
+  content={`
+         Producer
+      key="order_42"
+      partition = hash("order_42") % 4 = 2
+           │
+           ▼
+  ┌──────────────────────────────────────────────┐
+  │              Kafka Cluster                    │
+  │  ┌────────────┐  ┌────────────┐  ┌─────────┐ │
+  │  │ Broker 1   │  │ Broker 2   │  │ Broker 3│ │
+  │  │            │  │            │  │         │ │
+  │  │ Partition 0│  │ Partition 2│  │Partition│ │
+  │  │ (Leader)   │  │ (Leader)   │  │ 1       │ │
+  │  │            │  │            │  │ (Leader)│ │
+  │  │ Partition 3│  │ Partition 1│  │         │ │
+  │  │ (Follower) │  │ (Follower) │  │Partition│ │
+  │  │            │  │            │  │ 3       │ │
+  │  └────────────┘  └────────────┘  │ (Leader)│ │
+  │                                   └─────────┘ │
+  └──────────────────────────────────────────────┘
+           │           │            │
+           └───────────┼────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        │              │              │
+  ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐
+  │ Consumer 1│  │ Consumer 2│  │ Consumer 3│
+  │ Part 0    │  │ Part 1,3  │  │ Part 2    │
+  └───────────┘  └───────────┘  └───────────┘
+  Consumer Group: "order-processors"
+`}
+/>
+
+**Key design decisions for Kafka partitioning:**
+- Partition count affects throughput: each partition can process roughly 10 MB/s (sequential I/O on modern hardware).
+- Partition count affects failover time: more partitions means longer leader re-election during broker failure.
+- Key-based partitioning ensures ordering within a partition: all messages with the same key arrive in order.
+- Increasing partitions after creation changes the hash mapping — same problem as mod-N database sharding.
+
+### Search Index Sharding — Elasticsearch
+
+Elasticsearch partitions indexes into shards. Each shard is a complete Lucene index. A document's routing (shard assignment) is determined by `routing = hash(_id) % N`. Queries are scatter-gather by default: the coordinating node sends the query to all shards, merges top results, and returns to the client.
+
+<AsciiDiagram
+  id="partitioning-data/arch-elasticsearch"
+  title="Elasticsearch cluster with 2 indexes, each with 4 primary shards and 2 replica shards distributed across 3 nodes"
+  alt="Architecture diagram showing an Elasticsearch cluster with 3 nodes: Index A has 4 primary shards and 4 replica shards distributed across nodes, Index B has 2 primary shards and 2 replica shards. A coordinating node receives a search query and fans out to all relevant shards."
+  caption="Elasticsearch shard distribution: each index's primary and replica shards are distributed across nodes. A coordinating node handles scatter-gather for search queries."
+  content={`
+Elasticsearch Cluster — 3 Nodes, 2 Indexes
+
+                    Search Request
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │ Coordinating Node    │
+              │  (round-robin)       │
+              │  Scatter-gather to   │
+              │  all shards in index │
+              └──────┬───────────────┘
+                     │
+     ┌───────────────┼───────────────┐
+     │               │               │
+     ▼               ▼               ▼
+┌───────────┐  ┌───────────┐  ┌───────────┐
+│ Node 1    │  │ Node 2    │  │ Node 3    │
+│           │  │           │  │           │
+│ Index A:  │  │ Index A:  │  │ Index A:  │
+│ P0  P3    │  │ P1        │  │ P2        │
+│ R1  R2    │  │ R0  R3    │  │ R0  R1    │
+│           │  │           │  │           │
+│ Index B:  │  │ Index B:  │  │ Index B:  │
+│ P0        │  │ P1        │  │ (none)    │
+│ R1        │  │ R0        │  │           │
+└───────────┘  └───────────┘  └───────────┘
+
+Key metrics for Index A (500 GB, 8 shards total):
+  Each primary shard: 500 GB / 4 = 125 GB
+  Recommended max: 50 GB per shard
+  Action needed: reindex with more shards (16)
+  Or: create new index with 16 shards, reindex data
+
+Hot-warm architecture (time-based indices):
+  logs-2024-07 (hot)  ──> 3 nodes, SSD, 16 shards
+  logs-2024-06 (warm) ──> 3 nodes, HDD, 8 shards
+  logs-2024-05 (cold) ──> 3 nodes, HDD, 4 shards (force merged)
+  logs-2024-04 (frozen) ─> S3 snapshot, no cluster nodes
+`}
+/>
+
+**Elasticsearch shard sizing:**
+- Target 20-50 GB per shard for optimal performance.
+- Maximum 1,000 shards per node (practical limit before cluster state becomes too large).
+- A 1 TB index with 40 GB shards = 25 shards minimum. With replication factor 1, 50 shards total.
+- Shard count cannot be changed after index creation. The `_split` API doubles shard count but requires the index to be read-only during the split.
+
+**Hot-warm architecture:** A common pattern stores recent data on hot nodes (SSD, high memory) and older data on warm nodes (HDD, less memory). Index aliases route queries to the appropriate set of shards. Time-based index patterns (`logs-2024-01`, `logs-2024-02`) combined with rollover automate this at scale. The hot tier handles the write-heavy recent data window. The warm tier handles read-only historical queries. The cold tier is snapshotted to S3 and removed from the cluster entirely.
+
+**Coordinating node fan-out.** A search query in Elasticsearch is sent by the coordinating node to all shards in the index (both primaries and replicas). Each shard executes the search locally and returns the top N results (shard-level top hits). The coordinating node merges the top results from all shards and returns the global top N. For aggregations, the coordinating node sends the aggregation to all shards, collects partial aggregation results, and computes the final aggregation. The coordinating node is the bottleneck for large fan-out queries — it must buffer results from all shards.
+
+### CDN Edge Caching — Partition by Region
+
+CDNs partition content by geographic region. Edge servers in North America cache content popular in North America. Edge servers in Asia cache content popular in Asia. This is a form of list partitioning by geographic region, controlled by DNS routing.
+
+**How it works:** DNS resolves `cdn.example.com` to different IP addresses depending on the requester's geographic location. Each IP address corresponds to a regional edge cache cluster. The edge cluster caches only the content requested by users in that region. Content popularity becomes geographically partitioned automatically.
+
+### Shard Key Anti-Patterns in Practice
+
+Beyond the well-known anti-patterns, three additional pitfalls appear regularly in production systems.
+
+**Anti-pattern: Using a compound primary key where the partition key is the second column.** In Cassandra, the partition key is the first element of the primary key. If the primary key is `PRIMARY KEY (org_id, user_id)`, then `org_id` is the partition key and `user_id` is the clustering key. If the primary key is `PRIMARY KEY ((org_id, user_id))`, then the composite `(org_id, user_id)` is the partition key. Accidentally making `user_id` the partition key by omitting the parentheses means all users of the same org are spread across different partitions — every org-specific query becomes a scatter-gather.
+
+**Anti-pattern: Partition key with date or time as the only dimension.** A partition key of just `created_date` means all rows written on the same date go to the same partition. If the system writes 100 million rows per day (approximately 10 GB), the daily partition is 10 GB — manageable. But a single day's data is 10 GB, and a query for "all rows from 3 PM to 4 PM" still scans the entire daily partition. Furthermore, all writes during peak hours (say, 2-5 PM) go to the same daily partition concurrently, creating a write hot spot within the partition. Always combine time with a high-cardinality key: `(created_date, some_high_cardinality_id)`.
+
+**Anti-pattern: Using the partition key as the clustering key.** In systems with composite primary keys (Cassandra, DynamoDB), the partition key determines data placement and the clustering key determines sort order within a partition. Using the same column for both means every partition has exactly one row. This wastes the clustering mechanism and creates one partition per unique key value. For a table with 10 million unique keys, this creates 10 million partitions — far exceeding Cassandra's recommended maximum of 1 million partitions per cluster. Always use a higher-level grouping as the partition key and the unique identifier as the clustering key.
+
+---
+
+## Multi-Region Partitioning
+
+Geo-partitioning keeps user data in the user's geographic region. This is required for compliance (GDPR, CCPA, data sovereignty laws) and improves latency by placing data close to the users who access it.
+
+<AsciiDiagram
+  id="partitioning-data/arch-multi-region"
+  title="Multi-region geo-partitioned deployment with data partitioned by region and cross-region replication for disaster recovery"
+  alt="Architecture showing three regions (US, EU, Asia) each with their own shard set, users partitioned to their home region, a cross-region replication pipeline kept at eventual consistency, and a global DNS router directing traffic to the correct region"
+  caption="Multi-region geo-partitioning: each region contains only its own users' data. Cross-region queries are rare and handled by a global replication pipeline."
+  content={`
+                    Global DNS / Traffic Manager
+                    (Route53 / Cloudflare)
+                           │
+            ┌──────────────┼──────────────┐
+            │              │              │
+            ▼              ▼              ▼
+  ┌─────────────────┐ ┌────────────┐ ┌───────────────┐
+  │  US Region       │ │ EU Region  │ │ Asia Region   │
+  │  us-east-1       │ │ eu-west-1  │ │ ap-southeast-1│
+  │                  │ │            │ │               │
+  │  ┌────┐ ┌────┐   │ │ ┌──┐ ┌──┐  │ │ ┌──┐ ┌──┐    │
+  │  │S0  │ │S1  │   │ │ │S0│ │S1│  │ │ │S0│ │S1│    │
+  │  │US  │ │US  │   │ │ │EU│ │EU│  │ │ │AS│ │AS│    │
+  │  └────┘ └────┘   │ │ └──┘ └──┘  │ │ └──┘ └──┘    │
+  │                  │ │            │ │               │
+  │  Replica:        │ │ Replica:   │ │ Replica:      │
+  │  eu-west-1       │ │ us-east-1  │ │ us-east-1     │
+  │  ap-southeast-1  │ │ ap-southeast│ │ eu-west-1    │
+  └─────────────────┘ └────────────┘ └───────────────┘
+            │              │              │
+            └──────────────┼──────────────┘
+                           │
+              ┌────────────▼────────────┐
+              │ Cross-Region Replication │
+              │ Pipeline                 │
+              │                          │
+              │ Debezium CDC → Kafka →   │
+              │ S3 → Materialize         │
+              │                          │
+              │ Consistency: Eventual    │
+              │ RPO: < 5 minutes         │
+              │ RTO: < 30 minutes        │
+              └─────────────────────────┘
+`}
+/>
+
+### Design Decisions for Geo-Partitioning
+
+**Data placement.** Each user's data is stored only in the region matching their home country or the region with the lowest latency to them. The partition key includes a region prefix: `region:user_id` becomes the shard key. All queries include the region prefix.
+
+**Cross-region replication.** Data is replicated across regions for disaster recovery, but the replica is used only for failover scenarios. During normal operation, reads and writes go to the home region.
+
+**Compliance with GDPR.** Article 44 of the GDPR restricts transfer of personal data outside the European Economic Area. Geo-partitioning ensures EU user data never leaves EU data centers. Cross-region replication must use data that is either anonymized or covered by Standard Contractual Clauses.
+
+**Consistency model.** Multi-region partitioned systems use eventual consistency across regions. Strong consistency across regions would require cross-continent coordination, adding hundreds of milliseconds to every write. Applications are designed to tolerate stale cross-region reads.
+
+### Avoiding Split-Brain in Cross-Region Deployments
+
+Split-brain occurs when a network partition causes two regions to believe they are the primary writer for the same shard. Prevention strategies:
+
+**Primary region assignment.** Each shard has a designated primary region. The routing table in each region knows which region is the primary for each shard. Writes to a non-primary shard are forwarded to the primary region. The primary region assignment is stored in a globally replicated metadata store (etcd cluster with a majority across regions). If the primary region becomes unreachable, the metadata store assigns a new primary region after a configurable timeout (30-60 seconds).
+
+**Lease-based write token.** Each shard primary holds a lease from the metadata store. The lease expires after a configurable duration (default 30 seconds). The primary must renew the lease periodically. If the lease expires (network partition prevents renewal), the metadata store can grant a new lease to a different region's replica. This ensures that only one region holds the write lease at any time.
+
+**Read-only mode on lease loss.** When a region loses its lease (network partition from metadata store), all shards in that region switch to read-only mode. Writes are rejected with a clear error indicating the region is not the current primary. The application should redirect writes to the new primary region.
+
+### Deploying Partitioned Systems on Kubernetes
+
+Kubernetes provides container orchestration that simplifies shard deployment, but introduces specific challenges for stateful partitioned systems.
+
+**StatefulSet for shard instances.** Each shard runs as a Kubernetes StatefulSet with a unique identity (shard-0, shard-1, etc.). Each StatefulSet has its own PersistentVolumeClaim (PVC) for the database data directory. The PVC ensures that when a shard pod restarts, it mounts the same volume and retains its data. StatefulSet guarantees stable network identities (shard-0.ns.svc.cluster.local) which are essential for the routing layer — the routing table contains DNS names that must remain stable across pod restarts. Use a StorageClass with `WaitForFirstConsumer` binding mode to ensure the PVC is provisioned in the same availability zone as the pod.
+
+**Pod anti-affinity for shard distribution.** Configure pod anti-affinity rules to ensure that no two shard pods from the same StatefulSet run on the same Kubernetes node. This prevents a single node failure from taking down both the primary and a replica of the same shard. For multi-AZ clusters, use `topologyKey: topology.kubernetes.io/zone` to ensure shard pods are spread across availability zones. Example: `requiredDuringScheduling: shard-0, shard-0-replica-1, shard-0-replica-2` must be in different zones.
+
+**Headless service for shard discovery.** A headless service (`ClusterIP: None`) allows the routing layer to discover shard pod IPs by DNS lookup. Each shard's pod gets a DNS entry: `shard-0.db-namespace.svc.cluster.local`. The routing layer uses this DNS to connect to shard primaries.
+
+**Operator pattern for shard management.** A Kubernetes Operator (custom controller) automates shard lifecycle: creating new shards when the cluster scales up, draining shards before node upgrades, and handling failover when a shard pod becomes unhealthy. Vitess has a Kubernetes Operator for automated shard management on Kubernetes. The operator monitors the topo service and reconciles the desired shard topology with the actual StatefulSet configuration.
+
+**Resource allocation per shard.** Each shard pod should have resource requests and limits for CPU, memory, and ephemeral storage. A typical configuration: 4 CPU cores, 32 GB RAM, 500 GB PVC for a mid-size shard. The Kubernetes scheduler places shard pods across different nodes and availability zones for fault tolerance.
+
+### Shard-Proxy Communication Protocols
+
+The communication protocol between the proxy and shard instances affects latency, connection management, and security.
+
+**MySQL protocol over TCP.** Vitess VTGate speaks the MySQL protocol on both sides: the application connects via MySQL protocol to VTGate, and VTGate connects via MySQL protocol to each MySQL shard. This means VTGate appears as a MySQL server to the application — no driver changes are needed. The application uses a standard MySQL client library. Any language that has a MySQL driver can use Vitess without additional libraries. This protocol compatibility is the primary reason Vitess was adopted by YouTube: the existing MySQL codebase required zero changes to work with Vitess.
+
+**PostgreSQL protocol over TCP.** Citus coordinator speaks the PostgreSQL protocol. The application connects to the Citus coordinator using a standard PostgreSQL client library (psycopg2 for Python, Npgsql for .NET, node-postgres for Node.js). The coordinator distributes queries to worker nodes using PostgreSQL's remote connection mechanisms. The application sees a single PostgreSQL endpoint. No driver changes are needed for basic queries. For distributed queries, the coordinator's PostgreSQL extension handles the fan-out transparently.
+
+### Shared-Nothing Architecture
+
+Partitioned systems follow the shared-nothing architecture: each shard (node) owns its data independently and does not share storage, memory, or caching with other shards. This is the opposite of shared-disk architectures (Oracle RAC, AWS Aurora) where all nodes access the same underlying storage.
+
+**Advantages of shared-nothing for partitioning:**
+- No contention for shared resources. Each shard has exclusive access to its CPU, memory, and disk. A query on shard 0 never waits for a lock held by shard 1.
+- Linear scalability. Adding shards adds compute, memory, and storage in proportion. No shared bottleneck limits the cluster's growth.
+- Independent fault domains. A disk failure on shard 0 affects only the data on shard 0. The other 99 shards continue operating normally.
+- Independent upgrades. Each shard can be upgraded, patched, or backed up independently. Rolling upgrades across shards provide zero-downtime maintenance.
+
+**Disadvantages of shared-nothing for partitioning:**
+- Uneven resource utilization. Some shards may have more data or traffic than others, leading to underutilized resources on other shards. Shared-disk architectures can dynamically rebalance resources because all nodes share the same storage pool.
+- Rebalancing overhead. Moving data between shards requires copying data over the network. In a shared-disk architecture, rebalancing is a metadata operation only — the data is already accessible to all nodes.
+- Cross-shard queries are network-bound. A scatter-gather query sends data over the network from all shards to the coordinator. In a shared-disk architecture, the coordinator can access any data directly without network transfer.
+- Capacity planning is harder. Each shard must be provisioned for its peak load. If one shard needs 64 GB of memory and 16 CPU cores while another needs only 16 GB and 4 CPU cores, both must be provisioned independently. Shared-disk architectures can pool resources across nodes.
+
+**When shared-nothing is the right choice:** For systems where write throughput is the bottleneck (more shards = more write capacity), where independent fault isolation is required (one shard's failure should not affect others), and where the workload is partitionable (80 percent+ of queries can be routed to a single shard).
+
+**When shared-disk may be better:** For systems where storage utilization is the primary concern (data is large but query volume is low), where dynamic resource allocation is needed (workload patterns change frequently), and where cross-partition queries are common.
+
+**Custom binary protocol.** Cassandra uses a custom binary protocol (CQL binary protocol v4/v5) for client communication. The driver is a thrift-based or protobuf-based library that handles node discovery using the gossip protocol, connection pooling, and query routing. The driver maintains a local copy of the cluster topology and routes queries directly to the node that owns the partition key's token range. This removes the need for a separate proxy layer — the driver acts as the router. The tradeoff is that every application language needs a compatible driver implementation. Java (DataStax driver), Python (cassandra-driver), and Go (gocql) all have mature implementations.
+
+**HTTP/REST protocol.** Elasticsearch uses HTTP/REST for all client communication. The application sends HTTP requests to any node in the cluster (the coordinating node). The coordinating node determines which shards to query based on the index and routing value, fans out the query to the relevant shards, collects and merges results, and returns the final response. HTTP/REST is language-agnostic and easy to debug with tools like curl. The overhead of HTTP headers and JSON serialization adds 1-3ms per query compared to binary protocols.
+
+**Protocol choice impact.** MySQL and PostgreSQL protocols enable transparent proxy deployment — no driver changes, no code changes for basic queries. Custom binary protocols (Cassandra, ScyllaDB) enable smarter client routing (the driver can route to the correct node without a proxy hop) at the cost of requiring driver integration. HTTP/REST enables platform independence at the cost of serialization overhead. For most production systems, MySQL/PostgreSQL protocol compatibility is the deciding factor for choosing Vitess or Citus over custom sharding, because it reduces the application code change required to adopt partitioning.
+
+---
+
+## Capacity Planning
+
+A structured capacity planning exercise for a hypothetical social platform with 100 million users.
+
+### Assumptions
+
+- 100 million users
+- 1 KB of user profile data per user
+- 100 MB of media per user (photos, videos)
+- Growth rate: 20 percent year-over-year
+- Planning horizon: 2 years
+- Read-to-write ratio: 80:20
+- Peak read throughput: 100,000 reads per second
+- Peak write throughput: 25,000 writes per second
+
+### Query Pattern Analysis for Partition Key Selection
+
+Before any capacity planning, analyze the actual query patterns to identify the best partition key. Use database monitoring tools to capture real query logs.
+
+**PostgreSQL query analysis:** Query `pg_stat_statements` for the top 50 queries by total execution time and by execution count. Extract the WHERE clause predicates for each query. For a rides table, the output might look like:
+
+| Query Pattern | Frequency | Candidate Partition Key |
+|---|---|---|
+| `SELECT * FROM rides WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50` | 45 percent | user_id |
+| `SELECT * FROM rides WHERE user_id = $1 AND created_at > $2` | 30 percent | user_id |
+| `INSERT INTO rides (user_id, ...) VALUES ($1, ...)` | 15 percent | user_id |
+| `SELECT COUNT(*) FROM rides WHERE driver_id = $1 AND created_at > $2` | 5 percent | driver_id |
+| `SELECT SUM(fare) FROM rides WHERE created_at > $1` | 3 percent | None (full scan) |
+| Various admin queries | 2 percent | None (full scan) |
+
+**Analysis:** user_id appears in 90 percent of queries (45+30+15). driver_id appears in only 5 percent. The partition key should be user_id. The 3 percent time-range query and 2 percent admin queries will be scatter-gather — acceptable given their low frequency.
+
+**MySQL query analysis:** Query `performance_schema` or `sys.statement_analysis` for the same information. MySQL Workbench's Performance Reports provide a similar breakdown.
+
+**Application-level query logging:** If database monitoring is not available, add logging at the application layer. Log the SQL query and the query parameters for a representative sample of traffic (1 percent sampling is sufficient). Analyze the logs to identify the most common WHERE clause columns.
+
+**Key insight from query analysis:** Do not assume you know the dominant access pattern. Many systems have a different access pattern than the engineering team expects. Uber's data showed that 90 percent of queries filter by city — a pattern that was not obvious from the database schema alone. Only query log analysis revealed the true partition key.
+
+### Step 1: Total Data Size Today
+
+User data: 100M users x 1 KB = 100 GB
+Media data: 100M users x 100 MB = 10,000 TB (10 PB)
+Total: 10.1 PB
+
+### Step 2: Growth Projection (2 Years)
+
+Year 1: 10.1 PB x 1.20 = 12.1 PB
+Year 2: 12.1 PB x 1.20 = 14.5 PB
+
+### Step 3: Shard Count
+
+Target shard size: 200 GB for relational data, 1 TB for blob storage.
+User data shards: 100 GB / 200 GB = 1 shard (trivial, keep on one node).
+Media data shards: 10,000 TB / 1 TB = 10,000 shards. With 20 percent growth for 2 years: 14,500 shards needed.
+
+This is too many shards for practical management. Use a composite strategy:
+
+- **Storage tier 1:** User profiles and metadata (100 GB) — single shard with replicas. Negligible for partitioning.
+- **Storage tier 2:** User media partitioned by user_id hash into 256 shards. Each shard holds 10,000 TB / 256 = 39 TB at peak. This is large but feasible for object storage (S3) fronted by a caching layer.
+- **Storage tier 3:** Metadata indexes (who uploaded what, when) partitioned into 64 shards. Each shard holds manageable index data.
+
+### Step 4: Throughput Per Shard
+
+25,000 writes per second across 256 media shards = 98 writes per second per shard. 100,000 reads per second = 391 reads per second per shard. Each shard must handle ~500 IOPS for its local data. Modern SSDs handle 10,000+ IOPS. Headroom is ample.
+
+### Detailed Cost Estimation for a 100-Shard System
+
+Beyond capacity planning, understanding the infrastructure cost of a partitioned system is essential for budgeting and vendor comparison.
+
+**Compute cost.** Each shard needs its own compute resources. For a MySQL shard handling 5,000 queries per second: 4 vCPU, 16 GB RAM. For 100 shards: 400 vCPU, 1.6 TB RAM. At AWS r6g.large prices ($0.1008/hour): 100 x $0.1008 = $10.08/hour = $7,258/month. With replication factor 3 (primary + 2 replicas per shard): 300 instances = $21,774/month.
+
+**Storage cost.** 100 shards x 200 GB = 20 TB primary storage. With RF=3: 60 TB total. At EBS gp3 prices ($0.08/GB/month): 60 TB x $0.08 = $4,800/month. Provisioned IOPS for transactional workloads: 16,000 IOPS per shard at $0.005/provisioned IOPS/month = 16,000 x 100 x $0.005 = $8,000/month.
+
+**Network cost.** Data transfer between shards (replication, rebalancing, cross-shard queries): estimate 5 TB/month of inter-shard traffic. At AWS inter-AZ transfer rates ($0.01/GB): 5 TB x $0.01 = $50/month. Negligible compared to compute and storage.
+
+**Proxy layer cost.** VTGate proxies (4 instances): 4 x 4 vCPU, 16 GB RAM = $1,200/month. Topo service (etcd, 5 nodes): 5 x 2 vCPU, 8 GB RAM = $600/month. Orchestrator (3 nodes): 3 x 2 vCPU, 8 GB RAM = $360/month.
+
+**Total monthly cost estimate:** $21,774 (compute) + $12,800 (storage + IOPS) + $2,160 (proxy + metadata) = approximately $36,734/month. Compare to a single monolithic database with 64 vCPU, 512 GB RAM, 20 TB storage: approximately $8,000/month. The partitioned system costs 4.6x more for the same raw storage capacity, but provides 100x the write throughput and enables 99.99 percent availability.
+
+### Step 5: Capacity Planning Summary
+
+| Tier | Partition Strategy | Shard Count | Data/Shard | Growth Plan |
+|---|---|---|---|---|
+| User profiles | Hash by user_id | 1 (replicas: 3) | 120 GB | Scale vertically |
+| Media storage | Hash by user_id | 256 | 39 TB | Add shards at 80% fill |
+| Media metadata | Hash by user_id | 64 | 3 GB | Fixed (index only) |
+
+---
+
+## Deployment: Online Resharding
+
+Resharding without downtime is the hardest operational challenge in partitioned systems. Vitess implements a proven approach.
+
+### Vitess Vertical Split
+
+1. Identify a subset of columns to move to a new keyspace.
+2. Create the new keyspace with the target schema.
+3. Start a streams-based copy: VTTablet on the source shard streams row changes to the destination shard using Vitess's VReplication protocol.
+4. Run a consistency check: compare checksums on a sample of rows.
+5. Switch traffic: update the routing table so new writes go to the new keyspace. The VTGate proxy handles the transition atomically via the topo service.
+
+### Vitess Horizontal Shard Split
+
+1. Add new shards to the topology. For splitting shard 0 into shard 0 and shard 1, both new shards have the same schema.
+2. Start VReplication from the source shard to both destination shards. Each destination receives all rows and filters based on its new key range.
+3. Monitor replication lag. Wait for lag to reach near-zero seconds.
+4. Initiate the cutover: VTGate marks the source shard as read-only, waits for VReplication to drain, flips the routing table to point at the new shards, and marks the source shard as available for retirement.
+5. Drop the source shard after confirming all queries route correctly.
+
+### Materialized Views and CQRS for Partitioned Systems
+
+When cross-partition queries are expensive, a common pattern is to precompute results using materialized views or the Command Query Responsibility Segregation (CQRS) pattern.
+
+**Materialized views per partition.** Each partition maintains its own materialized views of aggregated data. For example, a rides table partitioned by user_id can have per-partition materialized views that precompute "total rides per day" for the users in that partition. A query for "total rides yesterday across all users" must still scatter-gather across all partitions, but each partition returns a precomputed aggregate instead of scanning raw rows. This reduces query time from 30 seconds to 100ms.
+
+**CQRS for cross-shard queries.** Separate the write model (partitioned by user_id for fast writes) from the read model (partitioned differently for fast reads). The write model accepts write operations and publishes events to a change data capture (CDC) stream. The read model subscribes to the CDC stream and materializes data in a format optimized for the dominant read queries. For example, a "total rides per city" read model is partitioned by city_id instead of user_id. The read model is updated asynchronously from the CDC stream. Queries for "total rides in San Francisco" hit the city-partitioned read model in milliseconds instead of scatter-gathering across all user-id partitions.
+
+**When to use CQRS with partitioning:** When the read model needs a different partition key than the write model, when read throughput requirements exceed what the write model can support, or when the read model needs to be in a different storage technology (Elasticsearch for search, Redis for caching, ClickHouse for analytics).
+
+**Tradeoff:** CQRS introduces eventual consistency between the write model and the read model. The read model may lag behind the write model by seconds or minutes depending on the CDC pipeline's throughput. For systems where eventual consistency is acceptable, CQRS provides dramatically better read performance for cross-shard queries.
+
+### Zero-Downtime Partition Migration Steps
+
+1. **Pre-migration:** Add capacity. Ensure destination shards have sufficient storage and compute.
+2. **Dual-write:** Configure the application to write to both old and new shard locations. Reads use the old location.
+3. **Backfill:** Copy existing data from old to new shards. Use parallel workers and rate-limiting to avoid saturating the source shard.
+4. **Verify:** Run consistency checks on migrated data. Sample 1 percent of rows and compare checksums.
+5. **Switch reads:** Update the routing table to read from the new shard. Keep dual-writes active for rollback.
+6. **Switch writes:** Remove the old location from the write path. Dual-writes become single writes to the new shard only.
+7. **Cleanup:** After monitoring for 24-48 hours without issues, retire the old shard and reclaim its resources.
+
+<AsciiDiagram
+  id="partitioning-data/arch-resharding-steps"
+  title="Online resharding process from 2 shards to 4 shards showing dual-write, backfill, switch, and cleanup phases"
+  alt="Timeline showing 7 phases: initial state with 2 shards, dual-write enabled to 4 shards, backfill from old to new, consistency verification, read switch, write switch with old shards disabled, and final cleanup"
+  caption="Online resharding from 2 to 4 shards: dual-write and backfill phases overlap, followed by atomic switch and cleanup"
+  content={`
+Timeline of resharding 2 shards -> 4 shards
+
+Phase 1: Initial state
+  App ──> ┌─── S0 ───> [0-50M users]
+          └─── S1 ───> [50M-100M users]
+
+Phase 2: Add new shards + dual-write
+  App ──> ┌─── S0 ───> [0-50M] ──dual──> S2 [0-25M], S3 [25M-50M]
+          └─── S1 ───> [50M-100M] ─dual─> S4 [50M-75M], S5 [75M-100M]
+
+Phase 3: Backfill (parallel, rate-limited)
+  S0 ──backfill──> S2, S3   (2M rows/sec each)
+  S1 ──backfill──> S4, S5   (2M rows/sec each)
+
+Phase 4: Consistency check
+  Compare checksums on 1% sample
+  If mismatch -> pause, investigate, re-backfill
+
+Phase 5: Read switch (atomic via topo update)
+  App ──> S0,S1 (read-only) + S2,S3,S4,S5 (active)
+
+Phase 6: Write switch (remove old from routing)
+  App ──> S2,S3,S4,S5 (all reads and writes)
+
+Phase 7: Cleanup
+  Drop S0, S1 shards
+  Return storage to pool
+
+Total time: ~4-8 hours for 5 TB data on 10 Gbps links
+`}
+/>
+
+---
+
+## Monitoring and Observability for Partitioned Systems
+
+Partitioned systems require monitoring at a finer granularity than monolithic databases. Cluster-level metrics hide partition-level problems. A cluster with average latency of 10ms might have one partition at 500ms and the rest at 2ms — the average hides the hot spot.
+
+### Critical Per-Partition Metrics
+
+**Query latency (p50, p95, p99).** Track for each shard independently. Alert when any shard's p99 exceeds 2x the cluster median p99 for the same query pattern. This catches hot spots before they cause user-facing timeouts.
+
+**Disk usage (absolute and growth rate).** Partition imbalance grows slowly. Track both the absolute usage in GB and the weekly growth rate. Alert when a partition exceeds 150 percent of the average partition size, or when the growth rate of one partition exceeds 2x the cluster average. This catches data skew caused by uneven write distribution.
+
+**Replication lag.** For each shard, track the seconds behind primary for each replica. Alert when lag exceeds 10 seconds for transactional workloads or 60 seconds for analytical workloads. High replication lag during rebalancing or peak traffic indicates that replicas cannot keep up with write load.
+
+**Cache hit ratio (buffer pool).** A shard with a declining cache hit ratio indicates that its working set exceeds available memory. This is a leading indicator of a hot spot: the shard needs more memory, or its data should be redistributed.
+
+**Active connections and connection queue depth.** A shard with a growing connection queue is a bottleneck. Connections pile up because the shard cannot process queries fast enough. Alert when the connection queue exceeds 10 for any shard for more than 30 seconds.
+
+### Alerting Thresholds
+
+| Metric | Warning | Critical | Action |
+|---|---|---|---|
+| Partition size vs average | > 150 percent | > 200 percent | Rebalance or split partition |
+| p99 latency vs cluster median | > 2x | > 5x | Investigate hot key, add cache |
+| Replication lag | > 10 seconds | > 60 seconds | Check replica health, throttle writes |
+| Disk usage | > 70 percent | > 85 percent | Add capacity or rebalance |
+| Cache hit ratio | < 95 percent | < 85 percent | Increase buffer pool or redistribute |
+| Connection queue depth | > 10 for 30s | > 50 for 10s | Scale shard or shed load |
+
+### Observability Tooling
+
+**Prometheus + Grafana.** The standard stack for partitioned system monitoring. Each shard exposes metrics via a Prometheus exporter (mysqld_exporter for MySQL, postgres_exporter for PostgreSQL, cassandra_exporter for Cassandra). Grafana dashboards show per-shard metrics on a shared time axis. A heatmap panel shows all shards' latency on a color scale — a single red column immediately identifies the hot shard. Configure heatmap thresholds: green (< 50ms), yellow (50-200ms), red (> 200ms). A single red column stands out immediately against a field of green.
+
+**Distributed tracing (Jaeger, Zipkin).** For cross-shard queries, tracing shows the fan-out to each shard and the time spent waiting for each. A scatter-gather query that takes 500ms might show 400ms waiting on shard 3 and 50ms on each of the other 7 shards. This immediately identifies the straggler shard. Add trace annotations for partition key extraction, routing table lookup, and result merge phases. This helps identify whether the bottleneck is in the router, the shard, or the coordinator.
+
+**Structured logging.** Each query should log: shard ID, query latency, rows returned, whether partition pruning was used, and the partition key value (hashed for privacy). Aggregate logs by shard ID to track per-shard query volume, error rate, and average latency over sliding windows of 1 minute, 5 minutes, and 1 hour. Alert on any shard with a 2x increase in error rate over the 5-minute window. A 10x increase in queries to a single shard without an increase in total traffic is a routing bug — queries that should be distributed are being sent to one shard.
+
+### Monitoring the Routing Table
+
+The routing table is the single source of truth for partition assignment. Monitoring its health is as important as monitoring shard health.
+
+**Routing table staleness detection.** The proxy should periodically (every 60 seconds) verify that its cached routing table matches the authoritative metadata service. If a mismatch is detected, the proxy should log a warning, reload the routing table from the metadata service, and increment a staleness counter metric. A non-zero staleness counter indicates that routing updates are not propagating correctly through the system. Investigate if the counter stays non-zero for more than 5 minutes.
+
+**Routing table change audit log.** Every change to the routing table (shard added, shard removed, partition split, partition merge) should be logged with: timestamp, change type, affected key range, old shard assignment, new shard assignment, and the operator or automation that triggered the change. This audit log is essential for debugging data inconsistency issues. If a user reports missing data, the audit log can show whether the data was moved during a rebalancing operation and whether the routing table was updated correctly at the time of the query.
+
+**Graceful routing degradation.** If the metadata service is unreachable, the proxy should continue operating with its last known routing table. The proxy should not reject queries because it cannot refresh the routing table. Set a maximum staleness threshold (default: 24 hours). If the proxy's routing table is older than the threshold, reject new queries and alert on-call. This prevents the proxy from operating with an out-of-date routing table after a topology change has occurred.
+
+---
+
+## Backup and Disaster Recovery for Partitioned Systems
+
+Backup strategies differ significantly between partitioned and monolithic databases. The key insight: partitions can be backed up in parallel, which dramatically reduces the backup window.
+
+### Per-Partition Backup Strategy
+
+1. **Snapshot each shard independently.** Each shard takes a snapshot (pg_dump, mysqldump, or filesystem snapshot) of its local data. Snapshots run in parallel across all shards. For 50 shards with 100 GB each, 50 parallel backups complete in the time it takes one serial backup of 5 TB — potentially reducing an 8-hour backup window to 15-30 minutes.
+
+2. **Use incremental backups between snapshots.** After the initial full snapshot, each shard captures only the WAL or binary log changes since the last snapshot. For a shard that processes 100 MB of changes per day, an incremental backup captures 100 MB instead of 100 GB. Incremental backups run every 15-60 minutes.
+
+3. **Store backup metadata in a global catalog.** The backup catalog records: which shard each backup belongs to, the snapshot timestamp, the WAL position at snapshot time, and the cluster-wide routing table at that point in time. The routing table is critical for restore — without it, you know what data is in each shard backup but cannot reconstruct which keys map to which shard.
+
+### Restore Scenario: Single-Shard Failure
+
+1. Identify the failed shard from the routing table (shard 3, holding user IDs 40M-60M).
+2. Select the most recent full snapshot for shard 3. Apply any incremental backups since the snapshot.
+3. Provision a new shard instance. Restore the snapshot. Replay the WAL to the latest available position.
+4. Register the new shard in the routing table. The proxy begins routing queries for user IDs 40M-60M to the new shard.
+5. Verify: run a consistency check comparing the restored shard's checksums against a replica of a neighboring shard for a sample of user IDs.
+
+### Restore Scenario: Full Cluster Restore
+
+1. Stop all traffic to the cluster. This is necessary for a consistent restore point across all shards.
+2. Restore each shard from its most recent snapshot + WAL replay. Run restores in parallel.
+3. For each shard, verify that the restored data is consistent. Compare row counts against documented baseline values.
+4. Restore the routing table from the global backup catalog.
+5. Start traffic. Run a full consistency check: compare checksums across shard boundaries.
+6. RTO for a full cluster restore depends on the number of shards and backup size. For a 50-shard cluster with 5 TB total: approximately 2-4 hours if restores run in parallel, 20-40 hours if restores run sequentially.
+
+---
+
+## Bridging to Trade-offs
+
+This architecture section covered the progression from naive mod-N sharding to production-grade Vitess/Citus architectures, integration patterns for Kafka and Elasticsearch, multi-region geo-partitioning, capacity planning math for a 100M-user system, and step-by-step online resharding.
+
+The next page examines the hard choices: hash vs range key, few large vs many small shards, application-level vs database-level partitioning, and the failure modes that take down production systems.

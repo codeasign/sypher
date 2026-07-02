@@ -1,0 +1,583 @@
+---
+id: horizontal-scaling-deep-dive
+title: Horizontal Scaling — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Horizontal Scaling — Under the Hood
+
+## Internal Architecture
+
+A horizontally scaled system is a composition of several subsystems, each with its own internal architecture. Understanding the internals of each component is essential for tuning, debugging, and capacity planning.
+
+<AsciiDiagram
+  id="horizontal-scaling/deep-dive-internal-arch"
+  title="Internal Component Architecture of a Horizontally Scaled System"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│                   Node 1 — Application Server                     │
+│                                                                   │
+│  ┌────────────────────────┐  ┌──────────────────────────────┐   │
+│  │ Request Handler         │  │ Connection Pool Manager      │   │
+│  │                         │  │                              │   │
+│  │  ┌────────────────┐    │  │  ┌────────┐ ┌────────┐     │   │
+│  │  │ TLS Termination │    │  │  │ Shard  │ │ Redis  │     │   │
+│  │  ├────────────────┤    │  │  │ Pool   │ │ Pool   │     │   │
+│  │  │ HTTP Parser     │    │  │  │ (x20)  │ │ (x10)  │     │   │
+│  │  ├────────────────┤    │  │  ├────────┤ ├────────┤     │   │
+│  │  │ Rate Limiter    │    │  │  │ Shard  │ │ Queue  │     │   │
+│  │  │ (token bucket)  │    │  │  │ Pool 2 │ │ Pool   │     │   │
+│  │  ├────────────────┤    │  │  │ (x20)  │ │ (x5)   │     │   │
+│  │  │ Auth Validator  │    │  │  └────────┘ └────────┘     │   │
+│  │  └────────────────┘    │  └──────────────────────────────┘   │
+│  └────────────────────────┘                                      │
+│                                                                   │
+│  ┌────────────────────────┐  ┌──────────────────────────────┐   │
+│  │ Circuit Breaker Pool   │  │ Health Check Server          │   │
+│  │                        │  │                              │   │
+│  │  ┌────────────────┐    │  │  /health ──> return 200      │   │
+│  │  │ DB: OPEN (5/5) │    │  │  /ready ──> check dependencies│   │
+│  │  │ Redis: CLOSED   │    │  └──────────────────────────────┘   │
+│  │  │ Queue: CLOSED   │    │                                     │
+│  │  │ Payment: OPEN   │    │  ┌──────────────────────────────┐   │
+│  │  │ (10 failures)   │    │  │ Metrics Exporter              │   │
+│  │  └────────────────┘    │  │  (Prometheus /stats endpoint)  │   │
+│  └────────────────────────┘  └──────────────────────────────┘   │
+│                                                                   │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ Thread Pool: 50 worker threads, 200 queue depth            │  │
+│  │ Current: 32 active, 0 queued, 0% rejection                │  │
+│  └────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+  `}
+  alt="Internal architecture of a single application node showing request handler components (TLS termination, HTTP parser, rate limiter, auth validator), connection pools (shard, Redis, queue), circuit breaker states, health check server, metrics exporter, and thread pool"
+  caption="Every node in a horizontally scaled system contains multiple subsystems that must be tuned together"
+/>
+
+### Thread Pool
+
+Each application server has a fixed-size or dynamic thread pool. Incoming requests are dispatched to worker threads. The thread pool has a queue for requests that arrive when all threads are busy.
+
+**Configuration parameters:**
+- `core_pool_size`: Minimum threads kept alive (typically 10-50)
+- `max_pool_size`: Maximum threads allowed (typically 50-200)
+- `queue_capacity`: How many requests wait before rejection (typically 100-1000)
+- `keep_alive_time`: How long an idle thread survives (60 seconds default)
+
+**Thread pool exhaustion** occurs when all threads are busy and the queue is full. New requests receive HTTP 503. This is a leading indicator of a bottleneck downstream — the app is not too slow, the database or external service is.
+
+### Connection Pools
+
+Each downstream dependency (database shard, Redis, queue, external API) gets its own connection pool. Pool size must be calculated based on the dependency's capacity and the number of application nodes.
+
+**The connection budget calculation:**
+
+```
+PostgreSQL max_connections = 300
+Application nodes = 50
+Pool per node = ceil(300 * 0.7 / 50) = 5 connections per node
+Reserve 30% of database connections for maintenance, admin, and monitoring
+```
+
+<AsciiDiagram
+  id="horizontal-scaling/deep-dive-connection-budget"
+  title="Connection Budget Calculation Across Nodes"
+  content={`
+Database capacity: 300 connections total
+
+        Node Pool   Nodes   Total   Headroom
+DB:      5          50      250     50 (admin)
+Redis:   10         50      500     n/a (no hard limit)
+Queue:   5          50      250     n/a
+External: 3         50      150     n/a
+
+Total connections open per node: 5+10+5+3 = 23
+Total connections system-wide: 23 x 50 = 1,150
+
+Memory per connection (PostgreSQL): ~2MB
+Connection overhead on DB: 250 x 2MB = 500MB
+  `}
+  alt="Connection budget table showing pool sizes per node across 50 nodes for database (5), Redis (10), queue (5), and external API (3), with total connection count and memory overhead calculation"
+  caption="Connection pool sizing must account for the number of nodes and the dependency's capacity limits"
+/>
+
+### Circuit Breakers
+
+Each downstream dependency should have a circuit breaker. The breaker tracks failure counts over a sliding window and opens when the threshold is exceeded.
+
+```
+State machine:
+  CLOSED (normal) ──> failure_count >= threshold ──> OPEN (fast fail)
+  OPEN (fast fail) ──> recovery_timeout elapsed ──> HALF_OPEN (test)
+  HALF_OPEN ──> test succeeds ──> CLOSED (reset)
+  HALF_OPEN ──> test fails ──> OPEN (extended timeout)
+```
+
+Circuit breakers prevent cascading failures. If the database is slow, the thread pool fills with waiting queries. Without circuit breakers, every node fills its thread pool simultaneously, and the entire cluster collapses.
+
+## Data Structures and Algorithms
+
+### Consistent Hashing
+
+**What it is**: A hash ring that maps keys to nodes, minimizing rebalancing when the node set changes.
+
+**Why this structure**: Traditional modulo sharding (`key % N`) requires moving `N-1/N` of data when a node is added or removed. Consistent hashing moves only `1/N` of keys.
+
+**How it works**:
+1. Create a circular ring of hash values (0 to 2^32-1)
+2. Each node is placed on the ring at one or more positions (using virtual nodes for better distribution)
+3. Each key is hashed, and you walk clockwise on the ring to find the nearest node
+
+**Time complexity**: O(log n) for locating a key (binary search on sorted ring positions). O(n) for adding/removing a node.
+
+**Space complexity**: O(v * n) where v is virtual nodes per physical node and n is the number of physical nodes.
+
+<AsciiDiagram
+  id="horizontal-scaling/deep-dive-consistent-hashing"
+  title="Consistent Hashing Ring with Virtual Nodes"
+  content={`
+                    Ring (0 to 2^32-1)
+                       0
+                  ┌─────────┐
+                  │         │
+      Node A:v2   │         │  Node B:v1
+          (0x8F2) │         │  (0x1A4)
+                  │         │
+    ──────────────┴─────────┴─────────────
+    │                                   │
+    │                                   │
+    │    Node C:v1          Node A:v1   │
+    │    (0xC7B1)          (0x4E2F)     │
+    │                                   │
+    │         Node B:v2                │
+    │         (0xF3A8)                 │
+    └───────────────────────────────────┘
+                  │
+                  │  Key "user_4231" hashes to 0x5C90
+                  │  Walk clockwise: next node = Node A:v1 (0x4E2F)? No
+                  │  Keep walking: next = Node B:v2 (0xF3A8)? Before key.
+                  │  Next: Node A:v2 (0x8F2)? Before key.
+                  │  Next: Node C:v1 (0xC7B1) — after key!
+                  │  Result: Node C
+                  ▼
+            ┌─────────────────────────────┐
+            │ When Node D joins:          │
+            │ Only keys in the arc        │
+            │ between D's predecessor     │
+            │ and D's position move.      │
+            │                             │
+            │ Without consistent hashing: │
+            │ 75% of keys must move       │
+            │ With consistent hashing:    │
+            │ ~10% of keys move (1/N)     │
+            └─────────────────────────────┘
+  `}
+  alt="Consistent hashing ring showing virtual nodes for nodes A, B, and C at various positions, with key user_4231 walking clockwise to find Node C, and illustration of minimal key movement when a new node joins"
+  caption="Consistent hashing reduces key rebalancing from O(N) to O(1/N) when nodes change"
+/>
+
+### Token Bucket for Rate Limiting
+
+**What it is**: An algorithm that maintains a bucket of tokens, refilled at a fixed rate. Each request consumes one token. If the bucket is empty, the request is rejected.
+
+**Why this structure**: In a horizontally scaled system, rate limiting must be coordinated across nodes. A local token bucket per node allows N times the intended global rate. A distributed token bucket requires consensus on token counts.
+
+**Time complexity**: O(1) per request. O(n) for distributed token synchronization.
+
+**Space complexity**: O(1) per rate-limited resource (a few integers).
+
+```
+local_bucket:
+  tokens: 100        # Current token count
+  capacity: 100      # Burst limit
+  refill_rate: 10    # Tokens per second
+  last_refill: now   # Last refill timestamp
+
+distributed_bucket (Redis-based):
+  key: "ratelimit:api:user_4231"
+  tokens: 100
+  last_refill: now
+  Atomic: EVAL script for read-decrement
+```
+
+### Leaky Bucket for Request Queuing
+
+**What it is**: A FIFO queue that processes requests at a fixed rate, regardless of arrival rate. Requests that arrive when the queue is full are dropped.
+
+**Why this structure**: In horizontally scaled systems with uneven load distribution, some nodes receive more traffic than others. A leaky bucket smooths out bursty traffic and prevents a single node from being overwhelmed.
+
+**Time complexity**: O(1) enqueue, O(1) dequeue. Implemented as a ring buffer.
+
+## The Request Lifecycle
+
+A single request in a horizontally scaled system traverses multiple layers. Each layer adds latency, and each layer can fail. Here is the complete lifecycle.
+
+### Phase 1: Client to Load Balancer
+
+<AsciiDiagram
+  id="horizontal-scaling/deep-dive-lifecycle-1"
+  title="Request Lifecycle Phase 1 — Client to Load Balancer"
+  content={`
+┌──────────┐    TCP Handshake (1.5 RTT)
+│  Client  │───> SYN ──────────────>
+│          │<─── SYN-ACK <──────────
+│          │───> ACK ──────────────>
+│          │                       │
+│          │    TLS Handshake (2 RTT)
+│          │───> ClientHello ─────>
+│          │<─── ServerHello <─────
+│          │<─── Certificate <────
+│          │───> KeyExchange ────>
+│          │<─── Finished <───────
+│          │───> HTTP Request ────>
+│          │<─── HTTP Response <──
+└──────────┘
+                                      In a horizontally scaled system:
+                                      LB terminates TLS, not the app.
+                                      Time spent on LB: 0.5-2ms
+                                      Time to first byte: 3-8ms
+  `}
+  alt="Request lifecycle phase 1 showing TCP handshake (SYN, SYN-ACK, ACK), TLS handshake (ClientHello, ServerHello, Certificate, KeyExchange, Finished), and HTTP request-response, with TLS terminated at the load balancer"
+  caption="Phase 1: The load balancer terminates TLS, freeing app servers from cryptographic overhead. This is a common source of 5-10ms latency if the LB is in a different AZ."
+/>
+
+### Phase 2: Load Balancer Routes to Application Server
+
+The load balancer selects a backend server based on the scheduling algorithm. With round robin, every server gets the same request count. With least connections, servers with longer-running requests get fewer new requests.
+
+### Phase 3: Connection Pool Access
+
+The application server's connection pool manager checks out a connection from the appropriate pool:
+
+<AsciiDiagram
+  id="horizontal-scaling/deep-dive-lifecycle-3"
+  title="Request Lifecycle Phase 3 — Connection Pool Checkout"
+  content={`
+App Thread ──> Pool Manager
+
+  Pool: db_shard_0
+    ┌──────────────────────────────────┐
+    │ idle: [conn1, conn2, conn3]     │ ←── Pop conn1
+    │ active: [conn4, conn5]          │ ←── Add conn1 to active
+    │ waiting: []                     │ ←── No waiters
+    │ max_size: 20                    │
+    │ timeout: 30s                    │
+    └──────────────────────────────────┘
+
+  If all conns active and pool full:
+    ┌──────────────────────────────────┐
+    │ idle: []                        │
+    │ active: [conn1..conn20]         │
+    │ waiting: [requestA, requestB]   │ ←── Enqueue
+    └──────────────────────────────────┘
+    Thread blocks for up to 30s
+    If timeout expires: "Connection pool timeout" error
+  `}
+  alt="Connection pool checkout flow showing idle connections, active connections, and waiting queue, with pool full scenario showing thread blocking and timeout behavior"
+  caption="Phase 3: Connection pool checkout is the first potential bottleneck. If the pool is exhausted, the request thread blocks."
+/>
+
+### Phase 4: Cache Check
+
+With the database connection acquired, the application checks the cache. Cache-aside pattern:
+
+1. Check Redis for key
+2. If hit: return data (0.3-1ms)
+3. If miss: query database (5-50ms), store in Redis with TTL (1ms), return data
+
+### Phase 5: Database Query
+
+If the cache missed, the application routes the query to the correct shard and performs the database operation:
+
+```
+Query: SELECT * FROM orders WHERE user_id = 4231 ORDER BY created_at DESC LIMIT 10
+
+Shard router: hash("4231") = shard 3
+Read from: shard_3_replica (rolled randomly from pool)
+Explain: Index scan on orders_user_id_idx (cost=0.28..12.42 rows=10)
+Latency: 3ms
+Rows: 10
+Bytes: 1.2KB
+```
+
+### Phase 6: Response Back
+
+The response travels back through the chain: app server writes to its socket, the load balancer forwards the response to the client, and the TLS session encrypts the data.
+
+**Total lifecycle time breakdown:**
+```
+DNS resolution:            1-5ms (cached after first request)
+TCP + TLS on LB:          5-10ms (amortized over keep-alive)
+LB to app routing:        0.5-2ms
+Auth token validation:    2-5ms (JWT decode or Redis lookup)
+Cache lookup:             0.5-1ms (hit) / 5-50ms (miss)
+Database query:           2-20ms (indexed read, under load)
+Response serialization:   0.5-2ms
+Network transit:          10-50ms (depending on geographic distance)
+
+Total (cache hit):        20-75ms
+Total (cache miss):       30-200ms
+```
+
+## Consistency and State
+
+Horizontal scaling introduces fundamental consistency challenges. Data must be replicated across nodes. Network partitions are inevitable. Here is how each scenario plays out.
+
+### Scenario 1: Database Write After Node Crash
+
+**What happens**: Node 3 crashes after a write to its local buffer but before flushing to disk. The load balancer detects the failure (3 missed health checks = 15 seconds) and stops routing traffic to Node 3.
+
+<AsciiDiagram
+  id="horizontal-scaling/deep-dive-consistency-crash"
+  title="Consistency — Write After Node Crash"
+  content={`
+Time ──────────────────────────────────────────────>
+       │
+       │ Node 3 receives POST /orders
+       │
+       ├── Request received at t=0ms
+       │   App in-memory buffer: order #4231
+       │
+       ├── t=2ms: Write to Postgres primary (shard 2)
+       │   Postgres: WAL written, committed (synchronous_commit=on)
+       │   App: buffer cleared
+       │
+       │ ┌─── CRASH ──── Node 3 loses power at t=5ms
+       │ │
+       │ │ If write was committed to DB before crash:
+       │ │   Data survived. Load balancer detects failure at t=20ms.
+       │ │   New requests go to Node 5. Next GET returns committed data.
+       │ │
+       │ │ If write was only in app buffer before crash:
+       │ │   Data LOST. Client received HTTP 200 at t=4ms.
+       │ │   Client retries. Order not found. Duplicate order or gap.
+       │ │
+       │ │ Resolution: Write to DB BEFORE sending 200 to client.
+       │ │ Never acknowledge a write before it is durable.
+       │ └────────────────────
+  `}
+  alt="Timeline of a node crash during a write operation, showing committed (safe) vs buffered-only (lost data) paths, with the resolution being to acknowledge writes only after database commit"
+  caption="Write acknowledgment before database commit is the most common data-loss bug in horizontally scaled systems"
+/>
+
+**Resolution**: The application must write to the database and receive acknowledgment before sending HTTP 200 to the client. If the database write fails, the client gets a 500 error and can retry.
+
+### Scenario 2: Network Partition (Split Brain)
+
+**What happens**: A network switch fails between two groups of database nodes. Group A (3 nodes) can see each other but not Group B (3 nodes). Both groups believe the other is dead.
+
+<AsciiDiagram
+  id="horizontal-scaling/deep-dive-consistency-partition"
+  title="Consistency — Network Partition / Split Brain"
+  content={`
+┌─────────────────────┐    ┌─────────────────────┐
+│   Group A           │    │   Group B           │
+│   (3 nodes)         │    │   (3 nodes)         │
+│                     │    │                     │
+│   Leader: node-1    │    │   Leader: node-4    │
+│   ┌────────────┐    │    │   ┌────────────┐    │
+│   │ node-1     │    │    │   │ node-4     │    │
+│   │ (leader)   │    │    │   │ (leader)   │    │
+│   └────────────┘    │    │   └────────────┘    │
+│   ┌────────────┐    │    │   ┌────────────┐    │
+│   │ node-2     │    │    │   │ node-5     │    │
+│   │ (follower) │    │    │   │ (follower) │    │
+│   └────────────┘    │    │   └────────────┘    │
+│   ┌────────────┐    │    │   ┌────────────┐    │
+│   │ node-3     │    │    │   │ node-6     │    │
+│   │ (follower) │    │    │   │ (follower) │    │
+│   └────────────┘    │    │   └────────────┘    │
+│                     │    │                     │
+│   Both accept       │    │   Both accept       │
+│   writes. Data      │    │   writes. Data      │
+│   diverges.         │    │   diverges.         │
+└─────────────────────┘    └─────────────────────┘
+
+Resolution:
+  1. Quorum-based writes require majority (4/6) nodes to acknowledge
+     Group A (3 nodes) can write. Group B (3 nodes) cannot.
+  2. Fencing: old leader must release its lock before new leader takes over
+  3. STONITH: former leader is forcibly shut down via BMC/IPMI
+  `}
+  alt="Split brain scenario showing two groups of 3 database nodes each electing their own leader and both accepting writes, with resolutions: quorum writes, fencing, and STONITH"
+  caption="Network partition without quorum leads to split brain — the most dangerous failure mode in horizontally scaled databases"
+/>
+
+**Resolution**: Use quorum-based writes. A write is accepted only if a majority of nodes (N/2 + 1) acknowledge it. In a 6-node cluster, majority is 4. Group A (3 nodes) cannot reach majority and stops accepting writes. Group B (3 nodes) also cannot reach majority. Both groups reject writes until the partition heals.
+
+### Scenario 3: Concurrent Writes to the Same Record
+
+**What happens**: Two requests, handled by different application servers, attempt to update the same database record simultaneously.
+
+<AsciiDiagram
+  id="horizontal-scaling/deep-dive-consistency-concurrent"
+  title="Consistency — Concurrent Write Conflict"
+  content={`
+Time ────────────────────────────────────────>
+
+App Server 1:         App Server 2:
+UPDATE inventory      UPDATE inventory
+SET count = 99        SET count = 1
+WHERE product=42;     WHERE product=42;
+
+┌────────────────┐  ┌────────────────┐
+│ Read count=100  │  │ Read count=100 │
+│ Write count=99  │  │ Write count=1  │
+│ Last write wins │  │ Last write wins│
+│ RESULT: count=1 │  │ RESULT: count=99
+└────────────────┘  └────────────────┘
+
+Without locking: one update is lost ("lost update problem")
+
+Resolution options:
+  1. Optimistic locking:
+     UPDATE inventory SET count = 99, version = 2
+     WHERE product = 42 AND version = 1;
+     (fails if version changed — retry)
+
+  2. Pessimistic locking:
+     SELECT ... FOR UPDATE
+     (slower, deadlock risk)
+
+  3. Conditional update:
+     UPDATE inventory SET count = count - 1
+     WHERE product = 42 AND count > 0;
+     (atomic, no lost update)
+  `}
+  alt="Concurrent write conflict showing two app servers reading the same value and writing different values, resulting in lost update, with resolution options: optimistic locking, pessimistic locking, and conditional update"
+  caption="Concurrent writes from different nodes require explicit conflict resolution — last-write-wins causes lost updates"
+/>
+
+**Resolution**: Use conditional updates (`UPDATE SET count = count - 1`) for atomic operations, or optimistic locking with version numbers for non-atomic operations. Never use read-modify-write without protection.
+
+### Scenario 4: Stale Reads from Replicas
+
+**What happens**: A user writes data to the primary, then immediately reads from a replica that has not yet received the update. The user sees stale data.
+
+```
+Write to primary at t=0ms
+Replication lag:
+  Replica 1: t=50ms (synchronous, local AZ)
+  Replica 2: t=200ms (asynchronous, same region)
+  Replica 3: t=2000ms (asynchronous, cross-region)
+
+User reads from Replica 3 at t=500ms → sees stale data
+User reads from Replica 1 at t=500ms → sees current data
+```
+
+**Resolution**:
+1. **Read-after-write consistency**: Route reads for a user's own writes to the primary for the first N milliseconds after a write
+2. **Session stickiness**: Pin a user to a specific replica for the duration of their session
+3. **Synchronous replication**: Accept the latency penalty for writes that must be visible immediately
+4. **Version stamps**: Include a write timestamp in the response; the client includes it in subsequent reads; if the replica data is older, it reads from the primary
+
+## Performance Characteristics
+
+### Latency at Scale
+
+In a horizontally scaled system, latency is the sum of:
+
+```
+Total latency = network_latency + queueing_delay + processing_time
+
+Under light load (10% utilization):
+  network_latency: 5-30ms (varies by geographic distance)
+  queueing_delay: 0ms (no queue)
+  processing_time: 10-50ms (cache hit) or 30-200ms (cache miss)
+  P50 total: 15-80ms
+  P99 total: 100-300ms
+
+Under high load (80% utilization):
+  network_latency: 5-30ms
+  queueing_delay: 20-100ms (requests queue in thread pools)
+  processing_time: 15-70ms (cache hit) or 50-300ms (cache miss)
+  P50 total: 50-200ms
+  P99 total: 500-3000ms
+```
+
+**The queueing delay is the dominant factor at high utilization.** This is Universal Scalability Law behavior: throughput flattens and latency goes vertical as utilization approaches 100%.
+
+### Throughput Scaling
+
+The ideal throughput curve is linear: 2 nodes handle 2x the requests. In practice, Amdahl's Law limits scaling due to the serial fraction — the portion of work that cannot be parallelized.
+
+```
+Throughput(N) = throughput(1) * N / (1 + serial_fraction * (N - 1))
+
+With 1% serial fraction (e.g., database write contention):
+  10 nodes: 9.2x throughput (92% of ideal)
+  50 nodes: 33.8x throughput (68% of ideal)
+  100 nodes: 50.3x throughput (50% of ideal)
+```
+
+### Memory Scaling
+
+Each application node needs enough memory for:
+- Application code and runtime: 256-512 MB
+- Thread stacks: 50 threads * 1 MB each = 50 MB
+- Connection pool buffers: 23 connections * 256 KB = 6 MB
+- Local cache (optional): 1-4 GB
+- Headroom for GC: 25% of heap
+
+Recommended instance sizes by workload:
+```
+Light (1,000-5,000 RPS per node):   2 vCPU, 4 GB RAM
+Medium (5,000-20,000 RPS per node): 4 vCPU, 8 GB RAM
+Heavy (20,000-50,000 RPS per node): 8 vCPU, 16 GB RAM
+```
+
+## Configuration and Tuning
+
+### Load Balancer Settings
+
+| Setting | Safe Default | When to Change | What Breaks |
+|---------|-------------|----------------|-------------|
+| Idle timeout | 60 seconds | Long-lived WebSocket connections | Connections drop prematurely |
+| Health check interval | 5 seconds | Reduce for faster failover, increase for lower cost | Slow failure detection vs excess traffic from checks |
+| Unhealthy threshold | 3 failures | Lower for faster recovery, higher to avoid flapping | Premature server removal vs slow failure isolation |
+| Connection draining timeout | 30 seconds | Increase for long-running requests | In-flight request failures vs delayed instance termination |
+| SSL policy | TLS 1.2+ | PCI/HIPAA compliance: TLS 1.3 only | Legacy client compatibility |
+
+### Connection Pool Tuning
+
+| Parameter | Safe Default | When to Change | What Breaks |
+|-----------|-------------|----------------|-------------|
+| pool_size | 10 | Increase for higher concurrency, decrease for limited DB connections | Connection exhaustion at DB / low throughput |
+| max_overflow | 10 | Increase for burst traffic, set to 0 for stable workloads | Database overload during bursts |
+| pool_timeout | 30 seconds | Decrease for fast-fail behavior | Spurious timeouts during normal load spikes |
+| max_lifetime | 30 minutes | Decrease if you see connection drops from firewalls (GCP, AWS NLB drop idle conns at 350s) | Connection closure during long idle periods |
+
+### Auto-scaling Thresholds
+
+| Metric | Scale-Out Threshold | Scale-In Threshold | Cooldown |
+|--------|-------------------|-------------------|----------|
+| CPU utilization | Above 70% for 5 minutes | Below 30% for 10 minutes | 300 seconds |
+| Memory pressure | Above 80% for 5 minutes | Below 50% for 10 minutes | 300 seconds |
+| Request queue depth | Above 1,000 per node for 2 minutes | Below 100 per node for 10 minutes | 180 seconds |
+| P99 latency | Above 500ms for 3 minutes | Below 200ms for 10 minutes | 300 seconds |
+
+**What breaks with wrong thresholds:**
+- Thresholds too low: thrashing (instances start and stop, each costing minutes of initialization)
+- Cooldown too short: rapid scale oscillation
+- Single-metric rules: CPU at 70% may be fine if P99 latency is 100ms (batch processing)
+- No scheduled scaling: predictable peaks (lunch rush, product launches) hit cold-start latency
+
+### Thread Pool and Timeout Tuning
+
+```python
+# Gunicorn configuration for a horizontally scaled Python app
+import multiprocessing
+
+bind = "0.0.0.0:8000"
+workers = multiprocessing.cpu_count() * 2 + 1  # 9 for 4 vCPU
+worker_class = "uvicorn.workers.UvicornWorker"
+timeout = 30                                    # Worker timeout before restart
+keepalive = 5                                   # HTTP keep-alive between requests
+max_requests = 10000                            # Restart worker after N requests (memory leak mitigation)
+max_requests_jitter = 2000                      # Jitter to prevent thundering herd restarts
+```
+
+This configuration deepens as you move from a single node to a production cluster. The next section shows how these internals compose into a full production architecture with specific integration patterns, multi-region deployment, and capacity planning.

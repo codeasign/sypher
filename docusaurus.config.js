@@ -14,7 +14,11 @@ const config = {
   baseUrl: '/',
 
   onBrokenLinks: 'warn',
-  onBrokenMarkdownLinks: 'warn',
+  markdown: {
+    hooks: {
+      onBrokenMarkdownLinks: 'warn',
+    },
+  },
 
   i18n: {
     defaultLocale: 'en',
@@ -47,6 +51,7 @@ const config = {
                                 { type: 'docSidebar', sidebarId: 'playwrightMastery', position: 'left', label: 'Playwright Mastery' },
                                 { type: 'docSidebar', sidebarId: 'pythonForAi', position: 'left', label: 'Python for AI' },
                                 { type: 'docSidebar', sidebarId: 'agenticAiFundamentals', position: 'left', label: 'Agentic AI Fundamentals' },
+                                { type: 'docSidebar', sidebarId: 'systemDesignFundamentalsSidebar', position: 'left', label: 'System Design' },
         // === /TOPICS ===
       ],
     },

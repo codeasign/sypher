@@ -1,0 +1,246 @@
+---
+id: distributed-counters-tradeoffs
+title: Distributed Counters — Trade-offs and Failure Modes
+sidebar_position: 4
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Core Tension
+
+**Distributed counters trade perfect accuracy for unbounded write throughput — you can increment faster than you can verify the result, and the two will never converge within the same clock cycle.**
+
+Every design decision in a distributed counter system is a compromise between how fast you can write and how sure you are that the total is correct. Increasing throughput means sharding more, which increases the staleness window. Decreasing staleness means coordinating more, which decreases throughput. There is no architecture that achieves both sub-10-millisecond staleness and 10-million increments per second.
+
+---
+
+## Decision Matrix
+
+Six key decisions when designing a distributed counter system.
+
+| Decision Point | Option A | Option B | Choose A when | Choose B when |
+|---|---|---|---|---|
+| **Storage engine** | Redis (in-memory) | PostgreSQL or MySQL (on-disk) | Write throughput exceeds 5,000 ops/sec per counter; sub-millisecond latency needed | Counter values must survive a power failure within 1 second; budget constraints limit in-memory costs |
+| **Sharding strategy** | Consistent hashing | Range-based partitioning | Shard count changes frequently (auto-scaling); even distribution is critical | You can pre-shard by a natural key (region, tenant) and never rebalance |
+| **Replication** | Asynchronous (primary-replica) | Synchronous (majority quorum / Raft) | Write throughput is the priority; losing the last 50ms of increments is acceptable | You cannot lose even one increment; counters back billing or inventory |
+| **Conflict resolution** | CRDT (merge commutative) | Last-writer-wins (LWW with wall clock) | Counters support both increments and decrements; network partitions are expected | Counters only increment; no decrements; clock skew between nodes is under 1ms |
+| **Read consistency** | Eventual (cache TTL + fan-out) | Strong (read from primary shard) | Read-to-write ratio over 100:1; users do not notice 100ms staleness | Users see the counter immediately after their own increment; financial or inventory counters |
+| **Busy counter optimization** | Pre-shard into N micro-shards per key | Batch increments with local buffer | Single hot key receives over 50,000 increments/sec (viral post) | Write volume is evenly distributed across keys; no single key dominates |
+
+---
+
+## CAP Theorem Positioning
+
+A distributed counter system is **AP** (Available and Partition-tolerant) by default. During a network partition, every shard continues accepting increments. The system prioritizes availability over consistency.
+
+<AsciiDiagram
+  id="distributed-counters/cap-position"
+  title="CAP Positioning: AP with Tunable Consistency via Read Mode"
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│              CAP POSITIONING FOR DISTRIBUTED COUNTERS         │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │            NETWORK PARTITION ACTIVE                   │   │
+│  │                                                      │   │
+│  │  Side A            X            Side B               │   │
+│  │  (Shards 1-512)    X    (Shards 513-1024)            │   │
+│  │                                                      │   │
+│  │  [Writes accepted]  X  [Writes accepted]             │   │
+│  │  [Reads served]     X  [Reads served]                │   │
+│  │                                                      │   │
+│  │  Counter value      X  Counter value                 │   │
+│  │  diverges           X  diverges                      │   │
+│  │                                                      │   │
+│  │  Available: YES     X  Available: YES                │   │
+│  │  Consistent: NO     X  Consistent: NO                │   │
+│  │                                                      │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                              │
+│  After partition heals: CRDT merge converges                │
+│  Both sides converge to: sum(all increments from both)      │
+│                                                              │
+│  Tunable read modes:                                        │
+│  ┌──────────┬─────────────┬─────────────────────┐          │
+│  │ Mode     │ Consistency  │ Latency             │          │
+│  ├──────────┼─────────────┼─────────────────────┤          │
+│  │ Eventual │ Best-effort │ 0.1-2ms (cache)     │          │
+│  │ Read-repair │ High     │ 5-15ms (fan-out)    │          │
+│  │ Strong   │ Linearizable│ 50-200ms (quorum)   │          │
+│  └──────────┴─────────────┴─────────────────────┘          │
+└──────────────────────────────────────────────────────────────┘
+  `}
+  alt="During partition both sides accept writes; after heal, CRDT merge converges. Table shows three read modes with their consistency and latency trade-off"
+  caption="CAP positioning: AP with three tunable read consistency modes"
+/>
+
+**Why AP, not CP**: Choosing consistency over availability would mean blocking writes during a partition — rejecting 50% of traffic until the partition heals. For most counter use cases (like counts, impressions, votes), losing 50% of writes is worse than temporarily disagreeing on the total by a small margin.
+
+**Tuning toward CP**: For counters that back billing or inventory, set the read mode to "strong" and the write mode to "quorum." A quorum write requires acknowledgment from a majority of replicas before confirming to the client. This adds 50-200ms of latency but guarantees that no increment is acknowledged until at least N/2+1 replicas have stored it. During a partition, only the majority side can write — the minority side rejects writes, preventing divergence.
+
+---
+
+## Failure Modes
+
+Five failure scenarios that corrupt, slow, or stall a distributed counter.
+
+### Failure 1: Hot Key Thundering Herd
+
+**What**: A viral post receives 500,000 likes in 60 seconds. The single Redis shard assigned to that post's counter reaches 100% CPU on its single core. All 500,000 INCR commands queue behind the single-threaded event loop. Latency per INCR balloons from 0.08ms to 50ms. The replica's replication lag increases from 5ms to 30 seconds because the primary is too busy executing INCRs to stream the replication buffer.
+
+**Why**: Redis is single-threaded. A single hot key cannot be parallelized — all increments for the same key must execute sequentially.
+
+**Blast radius**: Limited to the hot shard. Other 63 shards operate normally. However, any counter on the same shard as the viral post also experiences degraded latency.
+
+<AsciiDiagram
+  id="distributed-counters/failure-hotkey"
+  title="Hot Key Thundering Herd: Single Shard Overwhelmed"
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│                   HOT KEY THUNDERING HERD                      │
+│                                                              │
+│  500,000 likes in 60 sec                                     │
+│         │                                                    │
+│         ▼                                                    │
+│  ┌──────────────────────────────────────┐                   │
+│  │ [Consistent Hash Ring]               │                   │
+│  │  hash(viral_post) → shard 42         │                   │
+│  └──────────────────┬───────────────────┘                   │
+│                     │                                       │
+│         ALL traffic │ to shard 42                            │
+│                     ▼                                       │
+│  ┌──────────────────────────────────────┐                   │
+│  │ {Shard 42}    CPU: 100%              │                   │
+│  │  Queue depth: 12,000 pending INCRs   │                   │
+│  │  Per-INCR latency: 0.08ms → 50ms    │                   │
+│  │  Replication lag: 5ms → 30,000ms    │                   │
+│  └──────────────────────────────────────┘                   │
+│                                                              │
+│  Impact:                                                     │
+│  - This counter reads 15% lower than actual                 │
+│  - Other counters on shard 42 also degraded                 │
+│  - Replica promotion would lose 30s of increments           │
+└──────────────────────────────────────────────────────────────┘
+  `}
+  alt="500,000 likes route to shard 42; CPU hits 100%, queue depth 12,000, per-INCR latency rises from 0.08ms to 50ms, replication lag grows to 30 seconds"
+  caption="Failure 1: A single hot key overwhelms one shard, degrading latency and increasing replication lag"
+/>
+
+**Detection**: Shard CPU above 90%; queue depth above 1,000; replication lag above 1 second. All three alert together.
+
+**Recovery**: (1) Pre-shard the hot key into N sub-keys (e.g., `post:abc123:shard:0` through `post:abc123:shard:63`), each on a different physical shard. The total is the sum of all sub-keys. This distributes the 500,000 increments across 64 shards — 7,800 per shard each within capacity. (2) If pre-sharding was not implemented, the system must accept the degraded performance until the viral spike subsides.
+
+### Failure 2: Clock Skew in LWW Counter
+
+**What**: The system uses last-writer-wins (LWW) conflict resolution. Cluster node A's clock is 2 seconds ahead of node B's clock. Two clients increment the same counter at nearly the same instant. Client A's write, which happened first, has a timestamp 2 seconds in the future. Client B's write, which happened second, has a timestamp in the past. The merge picks the write with the higher timestamp — client A's write is accepted, and client B's increment is silently discarded.
+
+**Why**: LWW relies on synchronized clocks. NTP synchronization typically keeps clocks within 1-50ms of each other, but a single NTP failure or manual clock adjustment creates a window for lost increments.
+
+**Blast radius**: All counters written during the clock skew window are affected. If the skew persists, all writes from the fast-clock node will always win, discarding writes from other nodes.
+
+**Recovery**: (1) Use CRDT counters instead of LWW — CRDTs do not depend on clock synchronization. (2) Use hybrid logical clocks (HLC) instead of wall clocks. HLCs combine a physical clock component with a logical counter, guaranteeing monotonicity even when the physical clock jumps backward.
+
+### Failure 3: Cascading Shard Failure
+
+**What**: One shard's primary crashes. The system promotes the replica to primary. The new primary loads its state from disk (AOF) and begins accepting writes. However, during the 500ms failover window, the router has been sending increments to the old primary (which is dead). Those 25,000 increments are lost. The read aggregator, unaware of the failover, continues using a stale cached total. Users see the counter drop by 25,000.
+
+**Why**: Asynchronous replication means the replica may not have received the last 500ms of increments. The failover is lossy by design.
+
+**Blast radius**: The specific counters assigned to the failed shard. If the failed shard held 1/64th of all counters, the total undercount is bounded to 1/64th of the traffic during the failover window.
+
+**Recovery**: Idempotency-layer replay. The idempotency key cache (300-second TTL) allows the application to replay the lost increments. The retry logic detects that the original request received no 200 OK and retries with the same idempotency key. The new primary accepts the retry, applies the increment, and the counter recovers within 5 seconds of failover.
+
+### Failure 4: Split-Brain Counter Divergence
+
+**What**: A network partition splits the cluster into two groups, each believing it is the authoritative group. Both groups elect a new primary for the same shard. Both accept writes. When the partition heals, the two primaries have diverged, and merging reveals a conflict.
+
+**Why**: The system does not use a consensus protocol (Raft, Paxos) to prevent split-brain. Without consensus, any partition that isolates the primary can trigger a new election.
+
+**Blast radius**: All counters on the affected shard. The divergence equals the difference in increments accepted by each primary during the partition.
+
+**Recovery**: If using CRDT counters, the merge reconciles automatically — element-wise max preserves all increments from both sides, and the final value reflects the sum of all accepted increments. If using non-CRDT counters (plain Redis INCR with no vector merging), the recovery is manual: compare the two primaries' AOF logs, replay missing increments, and choose one as the new source of truth.
+
+### Failure 5: Tombstone Bloat (PN-Counter)
+
+**What**: A PN-Counter tracks both increments and decrements in separate grow-only vectors. Over months of operation, the tombstone vector for decrements grows without bound. Each counter's state grows from 128 bytes to 1,024 bytes. Memory usage across all 64 shards doubles from 64 GB to 128 GB. Cache hit rates drop because the larger state causes more evictions. Read latency increases by 30%.
+
+<AsciiDiagram
+  id="distributed-counters/failure-tombstone"
+  title="Tombstone Bloat: PN-Counter State Grows Without Bound"
+  content={`
+┌──────────────────────────────────────────────────────────────┐
+│                   TOMBSTONE BLOAT (PN-Counter)                │
+│                                                              │
+│  Day 1: 1,000 counters                                       │
+│  Vector per counter: 8 bytes × 64 nodes = 512 bytes         │
+│  Total state: 512 KB                                         │
+│                                                              │
+│  Day 30: 10M counters                                        │
+│  Vector per counter: 512 bytes (no growth)                   │
+│  Total state: 5.1 GB — fine                                  │
+│                                                              │
+│  Day 365: 100M counters, 10M decrements accumulated          │
+│  Tombstone GC not running:                                   │
+│  Vector per counter: 512 bytes + 10M tombstones per node ??? │
+│  Actually: Each node's contribution grows, not the vector.   │
+│  In a PN-Counter, the vector is fixed-length (64 elements).  │
+│  The VALUES grow — each element stores a larger integer.    │
+│  Tombstone GC zeros out elements for inactive nodes.        │
+│                                                              │
+│  Without GC: each element grows from 4 bytes to 8 bytes     │
+│  Memory increase: 4 bytes × 64 nodes × 100M = 25.6 GB     │
+│  Can be avoided with 24hr GC pass                           │
+└──────────────────────────────────────────────────────────────┘
+  `}
+  alt="PN-Counter vector elements grow over time without garbage collection; each element increases from 4 to 8 bytes, adding 25.6 GB across 100M counters"
+  caption="Failure 5: Tombstone bloat in PN-Counter state without garbage collection"
+/>
+
+**Why**: The G-Counter values for decrements are monotonic — they only increase. If nodes are continuously active, the values grow linearly with time. A counter that receives 1,000 decrements per second accumulates 86 million decrements per day, and the integer value grows accordingly.
+
+**Blast radius**: Gradual — memory usage increases by approximately 100 MB per day (assuming 100M counters and uniform distribution). The impact is on RAM cost and cache efficiency, not correctness.
+
+**Recovery**: (1) Schedule tombstone GC every 24 hours. (2) Use bucketed counters that reset daily (counters are stored with a date prefix: `post:abc123:2026-07-01`). (3) For long-lived counters, archive old tombstone data to a data warehouse and reset the active counter to the archived total plus recent delta.
+
+---
+
+## Anti-Patterns Hall of Shame
+
+Six anti-patterns observed in production systems.
+
+**Anti-Pattern 1: Counting with Autoincrement IDs.** Using a database `SERIAL` or `AUTO_INCREMENT` column as a counter. Each `INSERT` increments the sequence, and you `SELECT MAX(id)` to get the count. This breaks under concurrent inserts because `MAX(id)` can miss rows that are in uncommitted transactions or that had their IDs allocated but rolled back. The count is always approximate and often wrong. Use `COUNT(*)` or a dedicated counter column with `UPDATE ... RETURNING` instead.
+
+**Anti-Pattern 2: Application-Local Counter with Periodic Flush (no crash recovery).** The application stores counters in a `HashMap` in memory and writes them to the database every 60 seconds. A process crash in the middle of the 60-second window loses all counter increments. At 10,000 likes per minute, a crash at second 45 loses 7,500 increments. Mitigation: write-ahead log, or use Redis INCR with AOF enabled.
+
+**Anti-Pattern 3: Single Atomic Long on a Shared-Nothing Service.** Storing the counter as `AtomicLong` in a single Java service and routing all increments through that service. This creates a single-process bottleneck: the service handles at most 500K-1M increments per second on a single machine, and it is a single point of failure.
+
+**Anti-Pattern 4: Using Distributed Counter as a Source of Truth for Billing.** A sharded counter that loses 0.1% of increments (1 lost increment per 1,000) causes billing discrepancies of $500 per day for a system processing $500,000 in daily billable events. The distributed counter should be a real-time estimate. The authoritative billing count should come from an event log replayed through a deterministic batch pipeline.
+
+**Anti-Pattern 5: No Idempotency on Retry.** The client retries a timed-out increment request. The counter is incremented twice. Without idempotency keys, retries always overcount. A 1% network packet loss at 100,000 requests per second creates 1,000 overcounts per second.
+
+**Anti-Pattern 6: Resetting a Counter by Deleting the Key.** Instead of setting `counter = 0`, the application deletes the Redis key. Subsequent increments use `INCR` which treats a missing key as 0. This works correctly for fresh increments. However, during reconciliation with a replica that has not received the delete, the old value persists. In CRDT terms, a delete is a reset to zero, which is NOT commutative with increments — a concurrent increment after a delete can be lost. Use `SET key 0` instead of `DEL key`, or use a PN-Counter with an explicit reset mechanism.
+
+---
+
+## When NOT to Use a Distributed Counter
+
+Distributed counters are not a universal solution. Eight scenarios where you should choose a different mechanism:
+
+1. **Sub-cent billing**: If each increment represents a fraction of a cent, the accumulated error from lost increments (even 0.01%) exceeds acceptable thresholds. Use strongly consistent counters (single-node with WAL) or deterministic batch counting.
+
+2. **Auction or seat inventory with hard limits**: You cannot oversell tickets. A distributed counter with eventual consistency guarantees some overshoot. Use a single-node counter with pessimistic locking or a consensus-based counter (Raft) with at-most-once semantics.
+
+3. **Exact deduplication at high volume**: Counting unique visitors requires deduplication, not just increment. A Bloom filter or HyperLogLog sketch is more space-efficient than a counter with a set of seen IDs.
+
+4. **Counters that must survive region failure without data loss**: If the SLA requires zero data loss during a region failure, you need synchronous cross-region replication. The latency cost (200-500ms per write) likely defeats the purpose of a high-throughput counter.
+
+5. **Very low throughput (under 100 writes/second)**: A single PostgreSQL row with `UPDATE ... RETURNING` is simpler, cheaper, and provides stronger consistency. Do not introduce Redis, sharding, and CRDTs for a counter that gets 20 writes per second.
+
+6. **Counters with complex aggregation (ratios, averages, percentiles)**: Distributed counters track totals and counts. For computing average response time or p99 latency, use a distributed histogram (HDR Histogram, DDSketch) or time-series database.
+
+7. **Transactional counters**: A counter that must atomically increment within a multi-step database transaction (e.g., decrement inventory and insert an order row). The distributed counter cannot participate in the database transaction. Use the database's own counter within the transaction.
+
+8. **Compliance and audit counters**: Counters that must be auditable with proof of non-repudiation. Distributed counters with eventual consistency and lost increments do not satisfy audit requirements. Use an append-only event log with deterministic replay.
+
+---
+
+On the Real World page, you will see how Netflix, Discord, Uber, and Cloudflare each built production distributed counter systems — and the specific trade-offs each team made to match their workload.

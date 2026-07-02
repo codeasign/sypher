@@ -1,0 +1,606 @@
+---
+id: schema-design-real-world
+title: Schema Design in Production
+sidebar_label: Real World
+sidebar_position: 5
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Real-World Systems
+
+Production systems at scale have faced every schema design challenge. The following case studies show how leading companies made tradeoffs and what broke when they got them wrong.
+
+## Case Study 1: Stripe -- Immutable Event-Sourced Payment Schema
+
+Stripe processes payments for millions of businesses. Their fundamental data model is the payment object. Every payment goes through a series of states: created, succeeded, failed, disputed, refunded.
+
+### The Problem
+
+A traditional mutable schema for a payment would look like this:
+
+```sql
+-- Stripe's early schema (simplified)
+CREATE TABLE charges (
+    id            SERIAL PRIMARY KEY,
+    amount        BIGINT NOT NULL,
+    currency      CHAR(3) NOT NULL,
+    status        VARCHAR(20) NOT NULL,  -- Updates over time
+    dispute_id    INTEGER REFERENCES disputes(id),  -- Added later
+    refund_amount BIGINT DEFAULT 0,  -- Added later
+    failure_code  VARCHAR(50),  -- Added later
+    failure_message TEXT  -- Added later
+);
+```
+
+Every time a new payment lifecycle feature was added (disputes, partial refunds, fraud reviews), the `charges` table needed a migration. The schema grew from 10 columns to 40 columns over 5 years. Every migration risked breaking existing queries. The status column was updated multiple times per charge, making it impossible to audit the payment history.
+
+### The Solution
+
+Stripe redesigned their payment schema around an immutable event-sourced approach. Each payment is represented as a sequence of events, not a mutable row.
+
+```sql
+-- Event-sourced payment schema
+CREATE TABLE payment_events (
+    event_id      UUID PRIMARY KEY,
+    payment_id    UUID NOT NULL,
+    event_type    VARCHAR(50) NOT NULL,  -- 'charge.created', 'charge.succeeded', etc.
+    event_data    JSONB NOT NULL,  -- Type-specific payload
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+);
+
+CREATE INDEX idx_payment_events_payment ON payment_events(payment_id, created_at);
+
+-- The current state is derived from the event stream
+CREATE MATERIALIZED VIEW payment_state AS
+SELECT DISTINCT ON (payment_id)
+    payment_id,
+    last_value(event_data -> 'amount') AS amount,
+    last_value(event_data -> 'currency') AS currency,
+    last_value(event_data -> 'status') AS status
+FROM payment_events
+ORDER BY payment_id, created_at DESC;
+```
+
+Every mutation to a payment appends a new event. The event data is a JSON blob whose schema is governed by the event type, not the database. Adding a new event type does not require a migration. The current state is a materialized view that replays the event stream.
+
+### Schema Design Decisions
+
+- **Immutable events**: No UPDATE. Only INSERT. Schema changes are additive (new event types).
+- **Event-type-specific schemas**: Each event type defines its own data structure. The database stores it as JSONB. The code enforces the structure.
+- **Derived state**: The payment_state view is rebuilt from events. It is a cache of the latest state, not the source of truth.
+- **Expansion**: When a new payment feature requires new data, a new event type is added. Old event types are never changed.
+- **Versioning**: Each event type has a version field. When the structure changes, a new version is introduced. Old consumers process old versions gracefully.
+
+<AsciiDiagram
+  id="schema-design/realworld-stripe-events"
+  title="Stripe event-sourced payment schema: immutable events derive current state"
+  alt="Timeline showing a payment going through five event types (created, succeeded, disputed, resolved, refunded) with each event appended to the events table, then a materialized view aggregating the latest state per payment"
+  caption="Stripe stores payments as an immutable event stream; the current state is derived from the latest event per payment"
+  content={`Stripe event-sourced payment schema
+
+  Payment lifecycle as events:
+  ┌────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌───────────┐
+  │ charge │   │ charge   │   │ dispute  │   │ dispute  │   │ charge    │
+  │ .creat │   │ .succeed │   │ .created │   │ .resolved│   │ .refund   │
+  │ ed     │   │ ed       │   │          │   │          │   │ ed        │
+  └────┬───┘   └────┬─────┘   └────┬─────┘   └────┬─────┘   └─────┬─────┘
+       │            │              │              │               │
+       ▼            ▼              ▼              ▼               ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  payment_events table (append-only, never updated)                    │
+  │                                                                       │
+  │  payment_id: pay_123 | pay_123 | pay_123 | pay_123 | pay_123         │
+  │  event_type: created | succeeded | dispute.created | dispute.res     │
+  │             | refunded                                                │
+  │  event_data: {amount: 5000, ...} | {status: succeeded} | {reason:    │
+  │             fraud} | {outcome: won} | {amount: 5000}                 │
+  └─────────────────────────────────────────────────────────────────────┘
+                        │
+                        │ materialized view (replays events)
+                        ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  payment_state (materialized view)                                    │
+  │  payment_id: pay_123                                                  │
+  │  amount: 5000                                                         │
+  │  status: refunded (latest event)                                      │
+  │  dispute_status: resolved                                             │
+  │  dispute_outcome: won                                                 │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  Key design decision: To add a new payment feature (e.g., fraud hold),
+  add a new event type. No migrations. No schema changes. No downtime.
+`}
+/>
+
+### Lessons Learned
+
+- Immutable event schemas eliminate migration risk for existing data. New features mean new event types, not altered table structures.
+- Materialized views provide a familiar query interface over the event stream. Consumers do not need to understand event sourcing to read the data.
+- The tradeoff is storage: every mutation stores another event. For Stripe's volume, the storage cost was acceptable given the operational simplicity.
+
+---
+
+## Case Study 2: Uber -- From Monolithic MySQL to Microservice Schemas
+
+Uber started with a single MySQL database with 50+ tables for riders, drivers, trips, payments, and support tickets.
+
+### The Problem
+
+By 2015, the monolithic schema had reached its limits:
+
+- 80 tables in a single database, many with implicit cross-references.
+- Every schema migration required global coordination. A simple ALTER TABLE on a hot table caused 30 minutes of downtime.
+- Database connection limits (4000 connections in MySQL) were exhausted by the growing number of services.
+- A query performance problem in one table (e.g., looking up trips by rider) could cascade to other tables as the database CPU saturated.
+
+### The Solution
+
+Uber decomposed the monolithic schema into per-service schemas, each owned by a different team.
+
+```
+Monolithic schema (2014):
+uber_db/
+  ├── riders           (owned by nobody)
+  ├── drivers          (owned by nobody)
+  ├── trips            (owned by nobody)
+  ├── payments         (owned by nobody)
+  ├── invoices         (owned by nobody)
+  ├── support_tickets  (owned by nobody)
+  └── ... 74 more tables
+
+Microservice schemas (2016+):
+rider_service/
+  └── riders, rider_preferences, saved_addresses
+
+driver_service/
+  └── drivers, driver_vehicles, driver_documents, driver_bank_accounts
+
+trip_service/
+  └── trips, trip_events, trip_pricing
+
+payment_service/
+  └── payment_methods, payments, refunds, invoices
+
+dispatcher_service/
+  └── dispatch_requests, surge_zones, driver_assignments
+```
+
+### Schema Design Decisions
+
+- **Database per service**: Each microservice owns its database. No service directly accesses another service's database.
+- **Bounded contexts**: Each schema represents a single domain concept. The trip schema does not contain driver details -- it contains a driver_id that references the driver service's API.
+- **Data duplication**: Some data is duplicated across services. The trip service stores `driver_id` and `rider_id` but not their full profiles. The profile data lives in the rider and driver services.
+- **Event-driven synchronization**: When a driver updates their status (online, offline, on a trip), the driver service emits an event. The dispatcher service consumes the event and updates its schema.
+
+<AsciiDiagram
+  id="schema-design/realworld-uber-schemas"
+  title="Uber monolithic vs microservice schema decomposition"
+  alt="Left side shows a single database with 80 tables connected in a tangled web; right side shows five independent databases each with 3-4 tables, communicating via APIs"
+  caption="Uber decomposed a monolithic 80-table schema into five bounded-context microservice schemas"
+  content={`Uber schema evolution: monolithic to microservice
+
+  BEFORE (2014): Monolithic MySQL
+  ┌────────────────────────────────────────────────────────┐
+  │                  uber_db (80 tables)                    │
+  │ ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐│
+  │ │ riders   │  │ trips    │  │ drivers  │  │payments ││
+  │ │ id       │  │ id       │  │ id       │  │ id      ││
+  │ │ name     │  │ rider_id │  │ name     │  │ tripid  ││
+  │ │ email    │  │ driver_id│  │ phone    │  │ amount  ││
+  │ └──────────┘  │ status   │  │ status   │  │ status  ││
+  │  ... +76 more │ ...      │  │ ...      │  │ ...     ││
+  │  tables       └──────────┘  └──────────┘  └─────────┘│
+  │                                                        │
+  │ Problem: 4000 connection limit. 50+ teams.             │
+  │ Any ALTER TABLE blocks all queries.                    │
+  └────────────────────────────────────────────────────────┘
+
+  AFTER (2016+): Microservice schemas
+  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+  │  Rider Service   │  │  Trip Service    │  │  Driver Service  │
+  │  Database        │  │  Database        │  │  Database        │
+  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │
+  │ │ riders       │ │  │ │ trips        │ │  │ │ drivers      │ │
+  │ │ id           │ │  │ │ id           │ │  │ │ id           │ │
+  │ │ name         │ │  │ │ rider_id     │ │  │ │ name         │ │
+  │ │ email        │ │  │ │ driver_id    │ │  │ │ phone        │ │
+  │ └──────────────┘ │  │ │ pickup       │ │  │ │ status       │ │
+  │ ┌──────────────┐ │  │ │ dropoff      │ │  │ └──────────────┘ │
+  │ │ rider_prefs  │ │  │ └──────────────┘ │  │ ┌──────────────┐ │
+  │ │ rider_id     │ │  │ ┌──────────────┐ │  │ │ driver_vehic │ │
+  │ │ preferences  │ │  │ │ trip_events  │ │  │ │ driver_id    │ │
+  │ └──────────────┘ │  │ │ trip_id      │ │  │ │ model        │ │
+  └──────────────────┘  │ │ event_type   │ │  │ │ year         │ │
+                         │ └──────────────┘ │  │ └──────────────┘ │
+                         └──────────────────┘  └──────────────────┘
+  ┌──────────────────┐  ┌──────────────────┐
+  │  Payment Service  │  │  Dispatch Srvc  │
+  │  Database         │  │  Database        │
+  │ ┌──────────────┐ │  │ ┌──────────────┐ │
+  │ │ payments     │ │  │ │ dispatch_req │ │
+  │ │ id           │ │  │ │ trip_id      │ │
+  │ │ trip_id      │ │  │ │ driver_id    │ │
+  │ │ amount       │ │  │ │ surge_zone   │ │
+  │ │ status       │ │  │ │ assigned_at  │ │
+  │ └──────────────┘ │  │ └──────────────┘ │
+  └──────────────────┘  └──────────────────┘
+  No cross-service schema dependencies.
+  Each service manages its own migrations.
+`}
+/>
+
+### Lessons Learned
+
+- Database-per-service is the only way to scale schema management with team growth. A shared schema becomes a coordination bottleneck beyond 3-4 teams.
+- Bounded contexts prevent schema bloat. Each schema stays focused on one domain concept.
+- Data duplication across services is acceptable. The alternative (cross-service FK references) creates coupling that is worse than the duplication.
+- Event-driven synchronization replaces direct database access. Services emit events when data changes; other services consume events to update their own schemas.
+
+---
+
+## Case Study 3: Airbnb -- Dimensional Schema for Data Warehouse
+
+Airbnb built one of the largest data warehouses in the travel industry. Their schema design for analytics is a textbook star schema.
+
+### The Schema
+
+```
+Fact Tables:
+  fact_booking     : 5 billion rows. Measures: booking_value, nights, guest_count.
+  fact_inquiry     : 1 billion rows. Measures: inquiry_count, response_time.
+  fact_review      : 500 million rows. Measures: rating, review_length.
+  fact_host_earnings: 500 million rows. Measures: payout_amount, fees.
+
+Dimension Tables:
+  dim_listing      : 10 million rows. Attributes: name, city, country, room_type,
+                     price_tier, superhost_status.
+  dim_guest        : 100 million rows. Attributes: name, signup_date, nationality,
+                     traveler_type.
+  dim_date         : 50K rows. Attributes: year, month, week, day, is_holiday,
+                     is_peak_season.
+  dim_location     : 2 million rows. Attributes: city, neighborhood, zip_code,
+                     latitude, longitude.
+```
+
+### Schema Design Decisions
+
+- **Conformed dimensions**: `dim_date` and `dim_location` are shared across all fact tables. A date means the same thing in the booking fact table and the review fact table.
+- **Type-2 slowly changing dimensions**: When a listing changes its room type or price tier, the old dimension row is preserved (with a validity range) and a new row is inserted. Fact rows reference the version of the dimension that was current at the time of the fact.
+- **Degenerate dimensions**: Some attributes that look like dimensions are stored directly in the fact table. `booking_id` and `confirmation_code` are degenerate -- they have no additional attributes and exist only to identify the booking.
+- **Pre-aggregation**: The data team runs nightly jobs that pre-aggregate fact data into summary tables for common queries. A `monthly_booking_summary` table pre-computes bookings by city, room type, and price tier to serve the dashboard with sub-second latency.
+
+<AsciiDiagram
+  id="schema-design/realworld-airbnb-star"
+  title="Airbnb star schema with fact tables and conformed dimensions"
+  alt="Center fact_booking table surrounded by dim_listing, dim_guest, dim_date, dim_location, dim_host; arrows show FK relationships from fact to each dimension"
+  caption="Airbnb's star schema: fact_booking surrounded by five conformed dimension tables shared across all facts"
+  content={`Airbnb dimensional data warehouse schema
+
+  ┌─────────────────────────────────────────────────────┐
+  │                  dim_date                            │
+  │  date_sk (PK) │ year │ month │ day │ is_holiday    │
+  │  is_peak_season │ weekday │ week_number             │
+  └────────┬────────────────────────────────────────────┘
+           │
+           │
+  ┌────────┴────────────────────────────────────────────┐
+  │                  fact_booking                        │
+  │  booking_sk (PK)                                     │
+  │  date_sk (FK) ───────── dim_date                    │
+  │  listing_sk (FK) ────── dim_listing                 │
+  │  guest_sk (FK) ──────── dim_guest                   │
+  │  location_sk (FK) ───── dim_location                │
+  │  host_sk (FK) ───────── dim_host                    │
+  │  booking_value (measure)                             │
+  │  nights (measure)                                    │
+  │  guest_count (measure)                               │
+  │  discount_amount (measure)                           │
+  │  booking_id (degenerate dimension)                   │
+  └──────────────────────────────────────────────────────┘
+           │
+           │
+  ┌────────┴────────────────────────────────────────────┐
+  │                dim_listing                           │
+  │  listing_sk (PK) │ listing_id (natural key)          │
+  │  name │ city │ country │ room_type                   │
+  │  price_tier │ superhost_status │ created_at          │
+  │  valid_from │ valid_to (type-2 SCD)                 │
+  └──────────────────────────────────────────────────────┘
+
+  Sample query using star schema:
+  SELECT d.year, d.month, l.city, SUM(f.booking_value)
+  FROM fact_booking f
+  JOIN dim_date d ON f.date_sk = d.date_sk
+  JOIN dim_listing l ON f.listing_sk = l.listing_sk
+  WHERE d.year = 2024 AND l.country = 'US'
+  GROUP BY d.year, d.month, l.city;
+`}
+/>
+
+### Lessons Learned
+
+- Star schemas are the right pattern for analytics. The query pattern (aggregate across many rows, filter by dimensions) maps directly to the star structure.
+- Conformed dimensions prevent the most common data warehouse problem: two tables that should agree on a dimension but do not.
+- Type-2 slowly changing dimensions preserve historical accuracy. A booking from 2020 referenced the listing's 2020 attributes, even if those attributes changed in 2023.
+- Pre-aggregation is essential for dashboard performance. Computing aggregates from billions of rows on every dashboard load is not feasible.
+
+---
+
+## Case Study 4: Slack -- Schema for Real-Time Messaging at Scale
+
+Slack stores billions of messages across millions of channels. Their schema design prioritizes write throughput (sending a message) and channel-scoped reads (loading a channel's history).
+
+### The Schema
+
+```sql
+-- Simplified Slack schema
+CREATE TABLE channels (
+    id              UUID PRIMARY KEY,
+    team_id         UUID NOT NULL,
+    name            VARCHAR(80) NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL,
+    archived_at     TIMESTAMPTZ,
+    UNIQUE (team_id, name)
+);
+
+CREATE TABLE channel_members (
+    channel_id      UUID NOT NULL REFERENCES channels(id),
+    user_id         UUID NOT NULL,
+    joined_at       TIMESTAMPTZ NOT NULL,
+    last_read_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (channel_id, user_id)
+);
+
+CREATE TABLE messages (
+    id              UUID PRIMARY KEY,
+    channel_id      UUID NOT NULL REFERENCES channels(id),
+    user_id         UUID NOT NULL,
+    content         TEXT NOT NULL,
+    posted_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    edited_at       TIMESTAMPTZ,
+    deleted         BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- Critical index: fast message loading per channel
+CREATE INDEX idx_messages_channel_posted
+    ON messages(channel_id, posted_at DESC);
+```
+
+### Schema Design Decisions
+
+- **Channel-scoped storage**: Messages are indexed by `(channel_id, posted_at)`. Loading a channel's history is a range scan on a single B-tree. Adding a new channel does not affect existing queries.
+- **Soft deletes**: Messages are marked `deleted = TRUE` rather than deleted. This preserves continuity (the message position in the channel remains) and allows undelete.
+- **Denormalized last_read_at**: The `last_read_at` timestamp in `channel_members` tracks where each user has read up to. It is updated on every read and used to calculate unread counts. Denormalizing this into the channel_members table instead of a separate unread table avoids a join.
+- **Partition by team**: Channels and messages are partitioned by `team_id`. A team with 1 million messages does not affect the query performance of another team with 10 messages.
+- **Message ID is a time-ordered UUID (UUID v7)**: This allows cursor-based pagination without offset. The client sends the last message ID it received, and the server queries for messages with IDs after that point.
+
+<AsciiDiagram
+  id="schema-design/realworld-slack-messages"
+  title="Slack message schema with channel-scoped indexing and cursor pagination"
+  alt="Channels table connected to channel_members table and messages table; the messages index on (channel_id, posted_at DESC) enables fast channel history loading; cursor-based pagination uses time-ordered UUIDs"
+  caption="Slack's schema optimizes for two primary access patterns: send a message (write a row) and load channel history (range scan on channel_id + time)"
+  content={`Slack messaging schema and access patterns
+
+  Entity relationship:
+  ┌────────────────┐       ┌──────────────────┐
+  │    Channel      │       │  ChannelMember    │
+  │────────────────│       │──────────────────│
+  │ id (PK)        │1  N  │ channel_id (FK)   │
+  │ team_id        ┼───────│ user_id           │
+  │ name           │       │ joined_at         │
+  │ created_at     │       │ last_read_at      │
+  └────────────────┘       └──────────────────┘
+        │ 1
+        │
+        │ N
+        ▼
+  ┌────────────────┐
+  │    Message      │
+  │────────────────│
+  │ id (PK, UUIDv7)│
+  │ channel_id(FK) │
+  │ user_id        │
+  │ content (TEXT) │
+  │ posted_at      │
+  │ deleted (bool) │
+  └────────────────┘
+
+  Access Pattern 1: Load channel history
+  SELECT * FROM messages
+  WHERE channel_id = ? AND posted_at < ?
+  ORDER BY posted_at DESC
+  LIMIT 100;
+  → Index scan on idx_messages_channel_posted
+  → 3-5 index pages, 1-2 heap pages
+  → Typically under 5ms
+
+  Access Pattern 2: Calculate unread count
+  SELECT COUNT(*) FROM messages
+  WHERE channel_id = ?
+    AND posted_at > (
+      SELECT last_read_at FROM channel_members
+      WHERE channel_id = ? AND user_id = ?
+    );
+  → Range scan from last_read_at to now
+  → B-tree scan on posted_at index
+  → Typically under 2ms
+`}
+/>
+
+### Lessons Learned
+
+- Design for the two primary access patterns, not for all possible queries. Slack's schema is optimized for sending and reading messages. Analytics queries (e.g., "total messages sent by user X") are secondary and handled by a different schema.
+- Partitioning by tenant (team_id, workspace) prevents one noisy tenant from affecting others. Each team's data is physically or logically isolated.
+- Cursor-based pagination with time-ordered UUIDs is more efficient than offset-based pagination. No need to count skipped rows.
+- Denormalize read position into the membership table. The 2-byte savings from a separate unread table is not worth the join complexity.
+
+---
+
+## Open Source Tools
+
+### PostgreSQL information_schema
+
+PostgreSQL exposes schema metadata through standard `information_schema` views and PostgreSQL-specific `pg_catalog` tables.
+
+```sql
+-- List all tables in the public schema
+SELECT table_name, table_type
+FROM information_schema.tables
+WHERE table_schema = 'public';
+
+-- List all columns in the orders table
+SELECT column_name, data_type, is_nullable, character_maximum_length
+FROM information_schema.columns
+WHERE table_name = 'orders';
+
+-- List all indexes on the orders table
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'orders';
+```
+
+The `information_schema` is the standard way to introspect schema metadata programmatically. Migration tools, schema diff tools, and documentation generators all use these views.
+
+### dbt (Data Build Tool)
+
+dbt is the standard tool for transforming data in analytics warehouses. It applies software engineering practices to analytical schema design.
+
+```sql
+-- dbt model: dim_customer.sql
+-- This SQL defines a dimension table in the data warehouse
+
+WITH customers AS (
+    SELECT * FROM {{ ref('raw_customers') }}
+),
+
+first_orders AS (
+    SELECT
+        customer_id,
+        MIN(order_date) AS first_order_date
+    FROM {{ ref('raw_orders') }}
+    GROUP BY customer_id
+),
+
+customer_metrics AS (
+    SELECT
+        c.customer_id,
+        c.name,
+        c.email,
+        c.signup_date,
+        DATE_TRUNC('month', c.signup_date) AS signup_month,
+        fo.first_order_date,
+        CASE WHEN fo.first_order_date IS NULL THEN 'never_ordered'
+             ELSE 'ordered' END AS customer_status
+    FROM customers c
+    LEFT JOIN first_orders fo ON c.customer_id = fo.customer_id
+)
+
+SELECT * FROM customer_metrics
+```
+
+dbt handles materialization (table, view, incremental), testing (not null, unique, referential integrity), documentation (descriptions for each column), and CI/CD for schema changes.
+
+### Schema-as-Contract Formats
+
+**Apache Avro**: Compact binary format with JSON schema definition. Designed for serialization in data pipelines. Row-oriented.
+
+```json
+{
+  "type": "record",
+  "name": "Order",
+  "fields": [
+    {"name": "order_id", "type": "string"},
+    {"name": "customer_id", "type": "string"},
+    {"name": "amount", "type": "double"},
+    {"name": "items", "type": {"type": "array", "items": "string"}},
+    {"name": "created_at", "type": "long", "logicalType": "timestamp-millis"}
+  ]
+}
+```
+
+**Protocol Buffers**: Compact binary format with `.proto` definition file. Designed for high-performance RPC systems. Field numbers instead of field names in the binary encoding.
+
+```protobuf
+message Order {
+  string order_id = 1;
+  string customer_id = 2;
+  double amount = 3;
+  repeated string items = 4;
+  int64 created_at = 5;
+}
+```
+
+**Apache Thrift**: Similar to Protobuf but with richer type system (sets, maps, lists) and more language support. Used at Facebook, Uber, and Evernote.
+
+---
+
+## Cloud Providers
+
+### AWS DMS for Schema Migration
+
+AWS Database Migration Service handles schema migration between database engines. It can migrate tables, indexes, and data from one engine to another (Oracle to PostgreSQL, MySQL to Aurora, etc.).
+
+```
+DMS Schema Conversion:
+- Converts Oracle PL/SQL to PostgreSQL PL/pgSQL
+- Converts MySQL TINYINT(1) to PostgreSQL BOOLEAN
+- Handles sequence/auto-increment conversion
+- Creates indexes and foreign keys in the target database
+- Validates data integrity after migration
+```
+
+### GCP Datastore/Firestore Schemaless
+
+Google Cloud Datastore and Firestore are schemaless document databases. They do not require predefined schemas. Each document can have different fields.
+
+```
+Firestore document:
+  users/user_123
+    name: "Alice"
+    email: "alice@example.com"
+    orders: [...] (array of order references)
+
+  users/user_456
+    name: "Bob"
+    email: "bob@example.com"
+    phone: "+1-555-1234"  -- Bob has a phone field, Alice does not
+    preferences: { theme: "dark", notifications: true }
+```
+
+Firestore indexes are defined on specific fields or composite field combinations. If a query filters on a field that has no index, the query fails at read time, not write time.
+
+### Azure Schema Registry
+
+Azure Schema Registry is a centralized schema store for event-driven architectures using Event Hubs and Kafka. It enforces schema compatibility on produce and consume operations.
+
+```
+Schema groups:
+  orders-order-events-v1 (backward compatible)
+  orders-order-events-v2 (backward + forward)
+  payments-payment-events-v1 (full transitive)
+
+Each group specifies a compatibility mode:
+- None: schemas can change arbitrarily
+- Backward: new schema can read old data
+- Forward: old schema can read new data
+- Full: both backward and forward
+- Full transitive: every version compatible with every other version
+```
+
+---
+
+## Lessons Learned
+
+**Design for the access patterns, not the data shape.** The most common schema design mistake is starting with "what data do I have?" instead of "how will I read this data?" Stripe designed for event replay. Slack designed for channel-scoped message reads. Airbnb designed for dimensional analytics. Each schema looks completely different because each access pattern is different.
+
+**Schema changes are the most dangerous operations in a production database.** A schema migration can lock tables for hours, fill disk space, corrupt data, or block deployments. The Stripe and Uber case studies both show that avoiding schema changes (through immutability and decomposition) is more valuable than optimizing schema migrations.
+
+**Always plan the migration before creating the schema.** Before writing the first CREATE TABLE statement, answer: "What happens when we need to add a new column? When we need to change a data type? When we need to split this table into two?" If the migration plan is painful, the schema design needs revision.
+
+**The right schema depends on the scale.** A 10-row configuration table does not need indexing, partitioning, or normalization. A 10-billion-row event table needs all three. Schema design is not one-size-fits-all -- it adapts to the data volume, query pattern, and team structure.
+
+**Data duplication is cheaper than tight coupling.** Uber's database-per-service approach duplicates data across services. Airbnb's star schema duplicates dimension attributes across fact rows. Slack's denormalized last_read_at duplicates a timestamp across channel members. In all three cases, the duplication was intentional and accepted because the alternative was worse: tight coupling, complex queries, or poor performance.
+
+These production patterns inform the interview section, where these principles are applied to system design interview questions.

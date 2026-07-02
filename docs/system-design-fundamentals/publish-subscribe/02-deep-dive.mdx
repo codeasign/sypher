@@ -1,0 +1,582 @@
+---
+id: publish-subscribe-deep-dive
+sidebar_position: 2
+title: "Publish-Subscribe — Under the Hood"
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture of a Message Broker
+
+A production message broker is a distributed system with several cooperating subsystems. Understanding how these subsystems work helps you configure, tune, and debug pub-sub deployments.
+
+### Layered Architecture
+
+Most brokers follow a layered design: a networking layer accepts connections, a protocol layer parses messages, a routing layer matches messages to subscribers, a storage layer persists data, and a replication layer ensures durability.
+
+<AsciiDiagram
+  id="publish-subscribe/02-layered-architecture"
+  title="Message Broker Layered Architecture"
+  content={
+
+`┌──────────────────────────────────────────────────────────────────────┐
+│                        BROKER LAYERED ARCHITECTURE                     │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  ┌─────────────────────────────────────────────────────────────┐     │
+│  │  Layer 5: Replication & Consensus (Raft/Paxos/Zab)           │     │
+│  │  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐  │     │
+│  │  │ Leader Election │ │ Log Replication│ │ Cluster State  │  │     │
+│  │  └────────────────┘ └────────────────┘ └────────────────┘  │     │
+│  └─────────────────────────────────────────────────────────────┘     │
+│                                │                                      │
+│  ┌─────────────────────────────────────────────────────────────┐     │
+│  │  Layer 4: Storage Engine                                     │     │
+│  │  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐  │     │
+│  │  │ Write-Ahead    │ │ Segment Logs   │ │ Index Files    │  │     │
+│  │  │ Log (WAL)      │ │ (data files)   │ │ (offset maps)  │  │     │
+│  │  └────────────────┘ └────────────────┘ └────────────────┘  │     │
+│  │  ┌────────────────┐ ┌────────────────┐                      │     │
+│  │  │ Retention      │ │ Compaction     │                      │     │
+│  │  │ Manager        │ │ Engine         │                      │     │
+│  │  └────────────────┘ └────────────────┘                      │     │
+│  └─────────────────────────────────────────────────────────────┘     │
+│                                │                                      │
+│  ┌─────────────────────────────────────────────────────────────┐     │
+│  │  Layer 3: Routing Engine                                     │     │
+│  │  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐  │     │
+│  │  │ Topic Trie     │ │ Subscription  │ │ Matcher        │  │     │
+│  │  │                │ │ Index         │ │ (fan-out)      │  │     │
+│  │  └────────────────┘ └────────────────┘ └────────────────┘  │     │
+│  └─────────────────────────────────────────────────────────────┘     │
+│                                │                                      │
+│  ┌─────────────────────────────────────────────────────────────┐     │
+│  │  Layer 2: Protocol Handler                                   │     │
+│  │  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐  │     │
+│  │  │ Message Parser │ │ Serialization  │ │ Auth / ACL     │  │     │
+│  │  └────────────────┘ └────────────────┘ └────────────────┘  │     │
+│  └─────────────────────────────────────────────────────────────┘     │
+│                                │                                      │
+│  ┌─────────────────────────────────────────────────────────────┐     │
+│  │  Layer 1: Network Layer (TCP / HTTP2 / QUIC)                 │     │
+│  │  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐  │     │
+│  │  │ Connection Mgr │ │ TLS Terminator │ │ Rate Limiter   │  │     │
+│  │  └────────────────┘ └────────────────┘ └────────────────┘  │     │
+│  └─────────────────────────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────────────────────────┘
+`
+  }
+  alt="Five-layer architecture diagram of a message broker showing networking, protocol, routing, storage, and replication layers"
+/>
+
+### Networking Layer
+
+The networking layer manages TCP connections (or HTTP2/QUIC for cloud-native brokers). A typical broker handles 10,000-100,000 concurrent connections per node. Each connection consumes a goroutine or thread. Connections are multiplexed over a small number of acceptor sockets.
+
+Key concerns at this layer:
+
+- **Connection pooling**: reuse connections between publishers and the broker cluster to avoid TCP handshake overhead
+- **TLS termination**: decrypt traffic once at the edge, pass plaintext to internal layers
+- **Rate limiting**: per-client bandwidth caps prevent noisy neighbors from starving other clients
+- **Backpressure signaling**: when internal buffers fill, the network layer slows down or rejects incoming data
+
+```go
+// Pseudocode: connection management
+type ConnectionManager struct {
+    maxConnections  int
+    activeConns     map[string]*Connection
+    rateLimiter     *TokenBucket
+}
+func (cm *ConnectionManager) Accept(raw net.Conn) error {
+    if len(cm.activeConns) >= cm.maxConnections {
+        return ErrTooManyConnections
+    }
+    conn := NewConnection(raw, cm.rateLimiter)
+    cm.activeConns[conn.ID()] = conn
+    go conn.ReadLoop(cm.handleMessage)
+    return nil
+}
+```
+
+### Protocol Handler Layer
+
+The protocol handler parses incoming bytes into structured messages. Different brokers use different wire protocols:
+
+- Kafka uses a custom binary protocol over TCP
+- RabbitMQ uses AMQP 0-9-1 (binary) or AMQP 1.0
+- MQTT brokers use MQTT 3.1.1 or 5.0 (binary, compact)
+- Google Pub/Sub uses gRPC (HTTP2 + Protobuf)
+- Redis Pub/Sub uses RESP (Redis serialization protocol)
+
+The protocol handler validates message format, checksums, and schema conformance. It also handles authentication (SASL, OAuth2, client certificates) and authorization against access control lists (ACLs).
+
+```python
+# Protocol parsing (simplified)
+class Message:
+    def __init__(self, data: bytes):
+        # Wire format: [4-byte length][1-byte flags][topic][payload]
+        self.length = struct.unpack(">I", data[:4])[0]
+        flags = data[4]
+        self.is_persistent = bool(flags & 0x01)
+        self.has_headers = bool(flags & 0x02)
+        topic_end = data.index(b"\x00", 5)
+        self.topic = data[5:topic_end].decode("utf-8")
+        self.payload = data[topic_end+1:self.length+4]
+```
+
+## Data Structures
+
+The routing engine relies on three core data structures. Understanding these helps you predict broker behavior under load.
+
+### Topic Tree
+
+The topic tree is the primary index structure for topic matching. It organizes topics hierarchically, enabling fast wildcard and pattern matching.
+
+A trie (prefix tree) is the most common implementation. Each node represents a topic segment. Leaf nodes point to the list of subscribers for that topic. Wildcards use special marker nodes.
+
+```text
+Topic Tree (Trie):
+                    ┌──────┐
+                    │ root │
+                    └──┬───┘
+                       │
+               ┌───────┼───────────┐
+               ▼       ▼           ▼
+           ┌──────┐ ┌──────┐ ┌──────────┐
+           │orders│ │paymnt│ │inventory │
+           └──┬───┘ └──────┘ └──────────┘
+              │
+      ┌───────┼───────────┐
+      ▼       ▼           ▼
+  ┌───────┐ ┌───────┐ ┌───────┐
+  │created│ │shipped│ │canceld│
+  └───┬───┘ └───┬───┘ └───┬───┘
+      │         │         │
+      ▼         ▼         ▼
+  ┌──────┐ ┌──────┐ ┌──────┐
+  │S1,S2 │ │S2,S3 │ │S1,S4 │
+  └──────┘ └──────┘ └──────┘
+```
+
+When a message arrives on topic `orders.created`, the broker walks the trie one segment at a time: `root -> orders -> created -> [S1, S2]`. This lookup completes in O(d) where d is the topic depth (typically 2-5 segments).
+
+Wildcard subscriptions require additional logic. A subscription to `orders.*` inserts a wildcard node at `orders -> *`. When matching `orders.created`, the broker also checks the wildcard sibling. Multi-level wildcards (`orders.**`) require recursive traversal of all descendants.
+
+```python
+class TopicNode:
+    def __init__(self, segment: str):
+        self.segment = segment    # topic segment (e.g., "orders")
+        self.children = {}        # child segments -> TopicNode
+        self.wildcard = None      # single-level "*" match
+        self.multi_wildcard = None  # multi-level "**" match
+        self.subscribers = set()  # direct subscribers for leaf topics
+
+    def add_subscriber(self, topic_pattern: list[str], subscriber_id: str):
+        if not topic_pattern:
+            self.subscribers.add(subscriber_id)
+            return
+        segment = topic_pattern[0]
+        if segment == "*":
+            if not self.wildcard:
+                self.wildcard = TopicNode("*")
+            self.wildcard.add_subscriber(topic_pattern[1:], subscriber_id)
+        elif segment == "**":
+            self.multi_wildcard = subscriber_id
+        else:
+            self.children.setdefault(segment, TopicNode(segment))
+            self.children[segment].add_subscriber(topic_pattern[1:], subscriber_id)
+
+    def match(self, topic_parts: list[str]) -> set[str]:
+        result = set(self.subscribers)
+        if self.multi_wildcard:
+            result.add(self.multi_wildcard)
+        if not topic_parts:
+            return result
+        segment = topic_parts[0]
+        if segment in self.children:
+            result |= self.children[segment].match(topic_parts[1:])
+        if self.wildcard:
+            result |= self.wildcard.match(topic_parts[1:])
+        return result
+```
+
+### Subscription Index
+
+The subscription index maps from subscriber identity to their active subscriptions. This is used for lifecycle management: when a subscriber disconnects, the broker looks up all its subscriptions and removes them from the topic tree.
+
+```json
+{
+  "subscription_index": {
+    "email-service-vm-42": {
+      "subscriber_id": "email-service-vm-42",
+      "subscriptions": [
+        {"topic": "orders.created", "mode": "push", "endpoint": "https://email-svc/events"},
+        {"topic": "payments.completed", "mode": "push", "endpoint": "https://email-svc/events"}
+      ],
+      "connected_since": "2026-07-02T08:00:00Z",
+      "durable": true,
+      "offset": {"orders.created": 4418, "payments.completed": 9201}
+    },
+    "analytics-pipeline-1": {
+      "subscriptions": [
+        {"topic": "orders.*", "mode": "pull", "batch_size": 100},
+        {"topic": "payments.*", "mode": "pull", "batch_size": 100}
+      ],
+      "durable": true,
+      "offset": {"orders.created": 4419, "orders.shipped": 3321}
+    }
+  }
+}
+```
+
+### Routing Table
+
+The routing table is the in-memory structure that maps (topic, subscriber) pairs to delivery channels. When the broker reads a message from storage, it queries the routing table to find all delivery targets.
+
+```python
+class RoutingTable:
+    def __init__(self):
+        # topic -> [(subscriber, delivery_channel)]
+        self.table: dict[str, list[tuple[str, Channel]]] = {}
+
+    def add_route(self, topic: str, subscriber: str, channel: Channel):
+        self.table.setdefault(topic, []).append((subscriber, channel))
+
+    def remove_route(self, topic: str, subscriber: str):
+        routes = self.table.get(topic, [])
+        self.table[topic] = [
+            (s, c) for s, c in routes if s != subscriber
+        ]
+
+    def get_targets(self, topic: str) -> list[tuple[str, Channel]]:
+        return self.table.get(topic, [])
+```
+
+For high-throughput systems, the routing table is often a lock-free concurrent map (e.g., a striped hash map or a copy-on-write sorted list). Updates (subscriber connect/disconnect) are infrequent relative to lookups (every message), so the data structure is optimized for read performance.
+
+## Lifecycle of a Message
+
+Beyond the happy path, understanding the complete lifecycle helps debug failures.
+
+<AsciiDiagram
+  id="publish-subscribe/02-message-lifecycle"
+  title="Complete Message Lifecycle with Retry and Dead-Letter Paths"
+  content={
+
+`┌──────────────────────────────────────────────────────────────────────┐
+│                       MESSAGE LIFECYCLE                               │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  ┌─────────┐                                                         │
+│  │PUBLISHED│ ──────┐                                                 │
+│  └─────────┘       │                                                 │
+│                    ▼                                                 │
+│             ┌───────────┐                                            │
+│             │ STORED    │ ──────────────────┐                        │
+│             └───────────┘                   │                        │
+│                    │                        │                        │
+│                    ▼                        ▼                        │
+│             ┌───────────┐           ┌──────────────┐                 │
+│             │ ROUTED    │           │ STORAGE      │                 │
+│             └───────────┘           │ FULL / ERROR │                 │
+│                    │                └──────┬───────┘                 │
+│                    ▼                       │                         │
+│             ┌───────────┐                 ▼                         │
+│             │ DELIVERING│           ┌──────────┐                     │
+│             │ (in-flight)│          │ REJECTED │                     │
+│             └─────┬─────┘           └──────────┘                     │
+│                   │                                                  │
+│         ┌─────────┼─────────┐                                       │
+│         ▼         ▼         ▼                                       │
+│    ┌────────┐ ┌────────┐ ┌──────────┐                                │
+│    │ ACKED  │ │ NACK   │ │ TIMEOUT  │                                │
+│    │(done)  │ │(retry) │ │(retry)   │                                │
+│    └────────┘ └────┬───┘ └────┬─────┘                                │
+│                    │          │                                       │
+│                    ▼          ▼                                       │
+│             ┌──────────────────────┐                                 │
+│             │ Retry Counter        │                                 │
+│             │ attempts < max_retry │ ──────> DELIVERING (retry)      │
+│             └──────────────────────┘                                 │
+│                    │                                                  │
+│                    ▼ (attempts >= max_retry)                          │
+│             ┌──────────────┐                                        │
+│             │ DEAD LETTER  │                                        │
+│             │ QUEUE        │                                        │
+│             └──────────────┘                                        │
+└──────────────────────────────────────────────────────────────────────┘
+`
+  }
+  alt="State machine diagram showing message lifecycle from publish through delivery, ack, retry, and dead-letter queue"
+/>
+
+### Phase 1: Publish
+
+The publisher opens a connection, authenticates, and sends a message to a topic. The broker validates the message and assigns a message ID. The publisher receives a publish acknowledgment confirming the message was accepted.
+
+### Phase 2: Store
+
+The broker writes the message to the journal (write-ahead log) on the leader node. The leader replicates the message to N follower nodes. Once the configured number of replicas acknowledge, the message is considered committed.
+
+### Phase 3: Route
+
+The broker looks up the topic in the routing table, identifies all matching subscribers (including wildcard matches), and enqueues the message in each subscriber's delivery buffer.
+
+### Phase 4: Deliver
+
+For push subscribers, the broker sends the message to the subscriber's endpoint. For pull subscribers, the message sits in the subscriber's buffer until the subscriber pulls it. The message is now "in-flight."
+
+### Phase 5: Acknowledge
+
+The subscriber processes the message and sends an ack. The broker marks the message as delivered and advances the subscriber's offset.
+
+If the subscriber nacks (negative acknowledgment) or fails to ack within the timeout, the broker marks the message for retry. After exhausting retries, the message goes to the dead letter queue.
+
+## Consistency and Guarantees
+
+Pub-sub systems offer different consistency models. Understanding the guarantees is critical for correct system design.
+
+### At-Most-Once Delivery
+
+The broker delivers the message at most one time. It may be lost, but it will never be duplicated. This is the weakest guarantee but offers the best performance.
+
+Suitable for: metrics, sensor readings, heartbeats, any data where loss of some messages is acceptable.
+
+Implementation: broker sends the message once and does not track delivery. No acks, no retries.
+
+### At-Least-Once Delivery
+
+The broker delivers the message at least one time. It may be duplicated, but it will never be lost. The subscriber must handle duplicate messages (idempotent processing).
+
+Suitable for: notifications, order events, any data where loss is unacceptable but occasional duplicates are manageable.
+
+Implementation: broker tracks delivery, waits for ack, retries on timeout or failure.
+
+```python
+# Subscriber pattern for at-least-once with idempotency
+processed_ids = set()  # or Redis set, or DB unique constraint
+
+def handle_message(msg):
+    if msg.id in processed_ids:
+        return  # Already processed, skip duplicate
+    process(msg.payload)
+    processed_ids.add(msg.id)
+    broker.ack(msg.subscription_id, msg.id)
+```
+
+### Exactly-Once Delivery
+
+The broker delivers the message exactly one time. This is the strongest guarantee and the hardest to achieve in distributed systems. Most systems claim "effectively once" rather than true exactly-once.
+
+True exactly-once requires atomic commit protocols (two-phase commit, distributed transactions) or exactly-once semantics baked into the protocol (Kafka EOS with idempotent producers and transactional consumers).
+
+Suitable for: financial transactions, inventory deductions, any operation that cannot tolerate loss or duplication.
+
+Cost: 20-40% throughput reduction compared to at-least-once, plus higher complexity.
+
+### Ordering Guarantees
+
+- **No ordering**: messages may arrive in any order
+- **Per-topic ordering**: messages within a topic are delivered in publish order (common in Kafka with partitions)
+- **Per-key ordering**: messages with the same key are delivered in order (user-123 always receives events for user-123 in sequence)
+- **Global ordering**: all messages across all topics are delivered in order (rare, expensive, limits throughput)
+
+<AsciiDiagram
+  id="publish-subscribe/02-ordering-guarantees"
+  title="Ordering Guarantees in Pub-Sub Systems"
+  content={
+
+`┌──────────────────────────────────────────────────────────────────────┐
+│                      ORDERING GUARANTEES                               │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  No Ordering (fastest):                                               │
+│  Publish:  [A, B, C, D]                                               │
+│  Deliver:  [C, A, D, B]                                               │
+│                                                                       │
+│  Per-Topic Ordering:                                                  │
+│  Topic "orders":  [A1, A2, A3, A4]  -> deliver in order              │
+│  Topic "payments": [B1, B2, B3]     -> deliver in order              │
+│  But A4 may arrive before B1                                         │
+│                                                                       │
+│  Per-Key Ordering (Kafka partitions):                                 │
+│  Key "user-1": [A1, A2, A3] -> deliver in order                      │
+│  Key "user-2": [B1, B2, B3] -> deliver in order                      │
+│  A3 and B1 may interleave                                            │
+│                                                                       │
+│  Global Ordering (slowest, single partition):                        │
+│  All messages: [A1, B1, A2, C1, A3] -> exact publish order           │
+│  Requires single-threaded consumer, limited throughput                │
+└──────────────────────────────────────────────────────────────────────┘
+`
+  }
+  alt="Comparison diagram showing four levels of ordering guarantees from no ordering to global ordering"
+/>
+
+### Partitioning and Ordering in Kafka
+
+Kafka's model deserves special attention. Kafka topics are divided into partitions, which are the unit of parallelism and ordering:
+
+- Each partition is ordered (FIFO)
+- Messages with the same key go to the same partition
+- A consumer group shares partitions: each partition is consumed by exactly one member
+- Total ordering within a partition; no ordering guarantees across partitions
+
+If you publish messages for user-123 and user-456, and the topic has 3 partitions, all messages for user-123 go to the same partition (by key hash) in order. Messages for user-456 may go to a different partition. The consumer group can have up to 3 consumers, each handling one partition.
+
+```python
+# Kafka partitioning by key
+producer = KafkaProducer(bootstrap_servers="broker:9092")
+
+# Messages for same user go to same partition (ordered for that user)
+producer.send("user-events", key=b"user-123", value=b"event-1")
+producer.send("user-events", key=b"user-123", value=b"event-2")
+producer.send("user-events", key=b"user-456", value=b"event-1")
+```
+
+## Performance Characteristics
+
+Understanding the performance model helps you size brokers correctly.
+
+### Throughput Bottlenecks
+
+The primary bottlenecks in a pub-sub system are:
+
+1. **Disk I/O** (for persistent brokers): sequential writes are fast (200-500 MB/s per disk), but small messages amplify write overhead (each write has a fixed I/O cost regardless of message size)
+2. **Network bandwidth**: fan-out multiplies egress traffic. A topic with 100 subscribers requires 100x the bandwidth of a single-subscriber topic
+3. **Serialization/deserialization**: binary protocols (Kafka, MQTT) are faster than text-based protocols (HTTP)
+4. **Connection overhead**: TLS handshake, TCP connection setup
+
+### Latency Budget
+
+```
+Typical latency breakdown for a single message (persistent delivery):
+
+Publisher -> Broker (network):        0.5-2ms
+Broker -> WAL (disk write):           1-5ms    (sequential)
+Broker -> Replica (network + disk):   2-8ms    (for each replica)
+Broker -> Subscriber (network):       0.5-2ms
+Subscriber processing:                1-50ms   (application dependent)
+
+Total (1 replica, no queuing):        5-60ms
+```
+
+Under queuing (high load), latency increases due to buffer wait times. A broker running at 80% capacity typically shows 2-5ms additional queuing delay. At 95% capacity, queuing delay spikes to 50-200ms or more.
+
+### Batch and Batching Strategies
+
+Batching improves throughput by grouping multiple messages into a single network round trip and disk write. Most brokers support batching on both the publish side and the delivery side.
+
+```python
+# Kafka producer with batching
+producer = KafkaProducer(
+    bootstrap_servers="broker:9092",
+    batch_size=16384,        # 16KB batches
+    linger_ms=5,             # wait up to 5ms to fill a batch
+    compression_type="snappy"  # compress batches
+)
+
+# Each send adds to the current batch, not a separate network call
+producer.send("orders", value=order1)
+producer.send("orders", value=order2)
+producer.send("orders", value=order3)
+# All three may go in a single batch (if sent within 5ms of each other)
+```
+
+Recommended batch sizes: 1-10KB for low-latency systems, 16-64KB for throughput-optimized systems, 256KB-1MB for batch analytics pipelines.
+
+## Configuration Reference
+
+Key configuration parameters for production pub-sub systems.
+
+### Broker Configuration
+
+```yaml
+# broker-config.yaml (illustrative)
+broker:
+  # Network
+  port: 9092
+  max_connections: 50000
+  tls_enabled: true
+  tls_cert_path: "/etc/broker/certs/tls.crt"
+
+  # Storage
+  message_max_bytes: 1048576    # 1 MB max message size
+  log_segment_bytes: 1073741824  # 1 GB per log segment
+  log_retention_hours: 72       # keep messages for 3 days
+  log_retention_bytes: 107374182400  # or until 100 GB total
+
+  # Performance
+  batch_size: 16384             # batch messages up to 16KB
+  linger_ms: 5                  # wait 5ms to fill batch
+  compression: "snappy"
+
+  # Replication
+  default_replication_factor: 3
+  min_insync_replicas: 2
+  acks: "all"                   # wait for all replicas
+
+  # Delivery
+  max_retries: 5
+  retry_backoff_ms: 1000        # exponential backoff base
+  ack_deadline_ms: 30000        # 30 second ack timeout
+  dead_letter_topic: "__dlq"
+```
+
+### Subscriber Configuration
+
+```yaml
+# subscriber-config.yaml
+subscriber:
+  # Pull settings
+  pull_mode: true
+  max_messages_per_pull: 100
+  poll_timeout_ms: 5000        # long-poll for 5 seconds
+
+  # Push mode (if push is used)
+  push_endpoint: "https://myservice.example.com/events"
+  push_timeout_ms: 10000
+
+  # Processing
+  max_concurrent: 20           # process up to 20 messages concurrently
+  auto_ack: false              # manual ack (recommended)
+  retry_on_failure: true
+  max_retries: 3
+
+  # Offsets
+  auto_offset_reset: "earliest"  # start from beginning if no offset stored
+  enable_auto_commit: false    # manual offset commit (recommended)
+  commit_interval_ms: 5000     # commit offset every 5 seconds
+```
+
+## Observability
+
+A production broker must expose metrics for monitoring.
+
+### Key Metrics to Track
+
+Publish rate (messages/second) per topic: sudden drops indicate a publisher failure or network partition. Sudden spikes may indicate a bug or retry storm.
+
+Delivery rate (messages/second) per subscriber: divergence from publish rate indicates delivery lag or subscriber failure.
+
+Delivery latency (p99, p99.9): time from publish to subscriber ack. Rising latency indicates broker overload or slow subscribers.
+
+Pending messages per subscriber: queue depth. Growing depth means the subscriber cannot keep up.
+
+Consumer lag (for pull-based systems like Kafka): how far behind the consumer is from the latest message. Measured in messages or time. Lag above 0 means the consumer is not keeping up with the publish rate.
+
+Connection count: active connections. A sudden drop may indicate a network partition or broker failure.
+
+Disk usage: log segments. Approaching retention limits triggers log cleanup, which can cause I/O stalls.
+
+```yaml
+# Prometheus metric examples
+broker_messages_published_total{topic="orders.created"} 1420000
+broker_bytes_published_total{topic="orders.created"} 2840000000
+broker_delivery_latency_seconds{subscriber="email-svc"} {p50=0.012, p99=0.089, p99.9=0.520}
+broker_consumer_lag{subscriber="analytics", topic="orders.created"} 142
+broker_pending_messages{subscriber="email-svc"} 0
+broker_disk_usage_percent{node="broker-1"} 67
+```
+
+Alert thresholds: consumer lag > 5,000 messages for more than 60 seconds indicates a subscriber that needs scaling. Disk usage > 80% triggers a warning. Delivery latency p99 > 1 second for more than 5 minutes indicates broker overload.

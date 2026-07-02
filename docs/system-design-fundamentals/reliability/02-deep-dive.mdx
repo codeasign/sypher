@@ -1,0 +1,828 @@
+---
+id: reliability-deep-dive
+title: Reliability — Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Reliability — Deep Dive
+
+The concepts page covered what reliability mechanisms do. This page covers how they work internally — the data structures, state machines, consistency guarantees, performance characteristics, and configuration knobs that separate production-grade implementations from toy examples.
+
+## Internal Architecture of a Retry Queue
+
+A retry queue is not just a `while` loop with `sleep()`. Production retry queues are persistent, bounded, and observable. They have four internal components:
+
+<AsciiDiagram
+  id="reliability/retry-queue-internals"
+  title="Retry Queue Internal Architecture"
+  alt="Diagram showing the four internal components of a retry queue: message buffer, attempt counter, backoff calculator, and poison handler."
+>{` 
+  ┌─────────── Retry Queue ─────────────────┐
+  │                                         │
+  │  ┌─────────────────────────────────┐    │
+  │  │ <Message Buffer>               │    │
+  │  │  ┌─────┐ ┌─────┐ ┌─────┐      │    │
+  │  │  │Req A│ │Req B│ │Req C│ ....  │    │
+  │  │  │(rty)│ │(rty)│ │(rty)│      │    │
+  │  │  └─────┘ └─────┘ └─────┘      │    │
+  │  │  max_size: 10,000 entries     │    │
+  │  └─────────────────────────────────┘    │
+  │                                         │
+  │  ┌─────────────────────────────────┐    │
+  │  │ [Attempt Counter]              │    │
+  │  │  Req A: attempt 2 of 5        │    │
+  │  │  Req B: attempt 1 of 5        │    │
+  │  │  Req C: attempt 4 of 5        │    │
+  │  └─────────────────────────────────┘    │
+  │                                         │
+  │  ┌─────────────────────────────────┐    │
+  │  │ [Backoff Calculator]           │    │
+  │  │  base: 200ms                   │    │
+  │  │  cap:  30,000ms               │    │
+  │  │  jitter: 0.25                  │    │
+  │  │  wait = min(cap, base*2^a)    │    │
+  │  │       + random(0, jitter*wait)│    │
+  │  └─────────────────────────────────┘    │
+  │                                         │
+  │  ┌─────────────────────────────────┐    │
+  │  │ [Poison Handler]               │    │
+  │  │  max_attempts: 5               │    │
+  │  │  dead_letter_queue: <DLQ>      │    │
+  │  │  alert_threshold: 3            │    │
+  │  └─────────────────────────────────┘    │
+  └─────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Message Buffer
+
+The message buffer stores pending retries. It has three critical properties:
+
+- **Bounded capacity**: 5,000 to 100,000 entries depending on memory. When full, new retries are rejected rather than growing unbounded. The rejection triggers an alert — a full buffer signals a systemic problem.
+- **Persistence**: entries survive process restarts through an append-only write-ahead log (WAL). Each retry attempt appends to the WAL before modifying in-memory state. On restart, the WAL replays to reconstruct the buffer.
+- **Ordering**: entries are sorted by next-retry timestamp, not insertion order. A priority queue or sorted set (Redis: `ZADD` with timestamp as score) ensures O(log n) insertion and O(1) peek for the next retry.
+
+### Attempt Counter
+
+Each entry tracks: attempt number (0-indexed), first failure timestamp, last failure timestamp, and the error type of the last failure. The attempt counter feeds the backoff calculator and the poison handler.
+
+The counter uses atomic increments — two threads should never schedule the same retry attempt. If the system processes retries from multiple worker threads, the counter must be thread-safe or held in a concurrent data structure.
+
+### Backoff Calculator
+
+The backoff calculator computes the delay before the next attempt. The default algorithm is exponential backoff with jitter:
+
+```
+attempt = entry.attempt_count
+base_delay = min(cap, base * 2^attempt)
+jitter_range = base_delay * jitter_factor
+delay = base_delay + random(-jitter_range, jitter_range)
+next_retry_at = now + delay
+```
+
+With `base=200ms`, `cap=30s`, `jitter_factor=0.25`, and five max attempts:
+
+| Attempt | Base delay | With jitter | Cumulative wall time |
+|---|---|---|---|
+| 0 | 200ms | 150-250ms | ~200ms |
+| 1 | 400ms | 300-500ms | ~700ms |
+| 2 | 800ms | 600-1000ms | ~1.7s |
+| 3 | 1600ms | 1200-2000ms | ~3.7s |
+| 4 | 3200ms | 2400-4000ms | ~6.9s |
+
+Total worst-case wait: ~7 seconds before the poison handler fires. The system alerts if the operation does not succeed within this window.
+
+### Poison Handler
+
+When an entry exceeds `max_attempts`, it moves to the dead-letter queue (DLQ). The DLQ is a persistent queue that a human operator reviews. Poison messages indicate bugs — the operation will never succeed regardless of how many times you retry it.
+
+Common poison causes: invalid input data, deleted resource, revoked permission, schema mismatch between caller and callee. Each poison message includes full context (request body, response from each attempt, timestamps) so the operator can diagnose the root cause without reproducing the bug.
+
+<AsciiDiagram
+  id="reliability/retry-lifecycle"
+  title="Retry Lifecycle State Machine"
+  alt="State machine showing the lifecycle of a single retry entry from received, through scheduled, in-flight, completed, to dead-letter."
+>{` 
+               ┌──────────┐
+               │ RECEIVED │  First time the operation
+               └─────┬────┘  is seen by the system.
+                     │
+               ┌─────▼────┐
+               │ SCHEDULED│  Waiting in the retry queue
+               └─────┬────┘  for the backoff to elapse.
+                     │
+               ┌─────▼────┐
+               │ IN-FLIGHT│  Currently being executed
+               └─────┬────┘  by a worker thread.
+                     │
+           ┌─────────┼─────────┐
+           │         │         │
+      ┌────▼──┐ ┌───▼───┐ ┌───▼───┐
+      │SUCCESS│ │RETRY  │ │ DEAD  │
+      └───────┘ │SCHED  │ │LETTER │
+                └───┬───┘ └───────┘
+                    │           ▲
+                    └───────────┘
+                   (loops back)
+ `}
+</AsciiDiagram>
+
+## Circuit Breaker Internal State Machine
+
+The circuit breaker is a finite state machine with three states and explicit transitions. Production circuit breakers maintain a ring buffer of call outcomes per state and compute failure rates over sliding windows.
+
+### Data Structure: Ring Buffer
+
+The ring buffer (circular buffer) stores the outcomes of recent calls. For a buffer of size 100, each call records `SUCCESS`, `FAILURE`, or `TIMEOUT`. When the buffer is full, the oldest entry overwrites:
+
+```
+buffer: [SUCCESS, SUCCESS, FAILURE, SUCCESS, SUCCESS, ...]
+pointer: 42
+size: 100
+```
+
+To compute the failure rate: count the FAILURE entries and divide by the number of filled slots. This is O(n) but n is bounded and small (100-1000 entries). For high-throughput systems, maintain a running count — increment on FAILURE, decrement when evicting a FAILURE:
+
+```
+window_failures: atomic counter
+buffer: circular array of outcomes
+on success: buffer[index] = SUCCESS
+on failure: buffer[index] = FAILURE; window_failures++
+on eviction: if buffer[index] == FAILURE; window_failures--
+failure_rate = window_failures / buffer_size
+```
+
+<AsciiDiagram
+  id="reliability/circuit-breaker-ring-buffer"
+  title="Circuit Breaker Ring Buffer"
+  alt="Circular buffer showing 100 slots with a mix of success and failure outcomes, a pointer at index 42, and a running failure counter."
+>{` 
+  ┌─────────────────────────────────────────────────┐
+  │          Ring Buffer (size = 100)                │
+  │                                                   │
+  │   ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐      │
+  │   │S │S │F │S │T │S │S │F │F │S │S │S │S │ ...  │
+  │   └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘      │
+  │    ↑                                       ↑      │
+  │  index 0                              index 99    │
+  │                                                   │
+  │   Current pointer: 42                             │
+  │   Window failures: 8                              │
+  │   Window total: 100                               │
+  │   Failure rate: 8%                                │
+  │   Threshold: 50%                                  │
+  │   State: CLOSED                                    │
+  └─────────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Transition Logic
+
+The transition logic runs on every call completion:
+
+```
+on_call_complete(result):
+  if state == CLOSED:
+    buffer.add(result)
+    if failure_rate >= threshold:
+      state = OPEN
+      open_at = now()
+      alert("Circuit breaker opened for " + dependency)
+
+  if state == HALF_OPEN:
+    if result == SUCCESS:
+      buffer.clear()
+      state = CLOSED
+      alert("Circuit breaker closed for " + dependency)
+    else:
+      state = OPEN
+      open_at = now()
+      open_duration *= 2  // exponential backoff at circuit level
+
+  if state == OPEN:
+    if now() - open_at >= open_duration:
+      state = HALF_OPEN
+      allow_one_probe()
+```
+
+The `HALF_OPEN` state allows exactly one probe request through. While that probe is in-flight, all other requests are rejected. This prevents a stampede of probes from overwhelming the recovering dependency.
+
+### Configuration Parameters
+
+| Parameter | Default | Range | Effect |
+|---|---|---|---|
+| failure_threshold | 50% | 10-90% | Higher = more tolerant |
+| window_size | 100 calls | 10-10,000 | Larger = smoother, slower to react |
+| open_duration | 30s | 5-300s | Longer = more protection, longer outage |
+| half_open_max_calls | 1 | 1-10 | More probes = faster recovery, more risk |
+
+Setting `failure_threshold` too low (10%) causes the circuit breaker to trip on minor blips. Setting it too high (90%) means the circuit breaker rarely protects. A threshold of 50% with a window of 100 calls and 30-second open duration works for most services. Tune based on your dependency's normal failure rate and recovery time.
+
+## Bulkhead Pool Architecture
+
+Bulkhead pools isolate thread resources per dependency. Each pool is a bounded blocking queue with a fixed number of worker threads.
+
+### Data Structure: Semaphore-Based Pool
+
+The simplest bulkhead uses a semaphore:
+
+```
+class BulkheadPool:
+  semaphore: Semaphore(max_concurrent)
+  queue: Queue[Callable]
+  metrics: Counter[rejected, timed_out, completed]
+  timeout: Duration
+
+  def execute(request, fallback):
+    if not semaphore.try_acquire(timeout):
+      metrics.rejected++
+      return fallback(request)
+    try:
+      result = request()
+      metrics.completed++
+      return result
+    finally:
+      semaphore.release()
+```
+
+A semaphore-based bulkhead is lightweight — no thread creation overhead. Each request runs on the caller's thread. This works when requests are short (under 100ms). For longer requests, use a thread-pool-based bulkhead where a separate thread pool of N threads handles requests to that dependency.
+
+### Thread Pool vs Semaphore
+
+<AsciiDiagram
+  id="reliability/bulkhead-types"
+  title="Semaphore vs Thread Pool Bulkheads"
+  alt="Side-by-side comparison of a semaphore-based bulkhead and a thread-pool-based bulkhead, showing differences in resource isolation."
+>{` 
+  Semaphore Bulkhead:                  Thread Pool Bulkhead:
+  ┌────────────────────────┐          ┌────────────────────────┐
+  │ [Client Thread]        │          │ [Client Thread]        │
+  │   tryAcquire() ─── OK  │          │   submit() ─── OK      │
+  │   execute()            │          │   return immediately    │
+  │   release()            │          │                        │
+  └────────────────────────┘          │  ┌──────────────────┐  │
+                                      │  │ ┌─┬─┬─┬─┬─┬─┬─┐  │  │
+  Pros:                               │  │ └─┴─┴─┴─┴─┴─┴─┘  │  │
+  - No context switching              │  │ Worker pool: 5   │  │
+  - Lower latency overhead            │  └──────────────────┘  │
+  - Memory: ~100 bytes/perm          │                        │
+                                      │  Pros:                  │
+  Cons:                               │  - Full isolation       │
+  - Blocks client thread              │  - Independent exec     │
+  - No queue for pending              │  - Queuing capacity     │
+  - No timeout on queue wait          │                        │
+                                      │  Cons:                  │
+                                      │  - Higher overhead      │
+                                      │  - More memory          │
+                                      │  - Thread lifecycle     │
+  └────────────────────────┘          └────────────────────────┘
+ `}
+</AsciiDiagram>
+
+### Pool Sizing Formula
+
+A bulkhead pool size depends on the dependency's latency and the expected concurrency:
+
+```
+pool_size = expected_concurrency * (p99_latency / timeout)
+```
+
+For a dependency with p99 latency of 200ms, a timeout of 500ms, and expected concurrency of 50 requests per second: `50 * (0.2 / 0.5) = 20 threads`. This ensures the pool can handle the expected load without rejecting requests.
+
+Add a safety margin of 20-30%: `20 * 1.25 = 25 threads`. Monitor the pool utilization — if it regularly exceeds 70%, add more threads rather than rejecting requests.
+
+## Timeout Hierarchy
+
+Timeouts exist at every layer of the stack. A reliable system has explicit, non-overlapping timeouts at each layer:
+
+<AsciiDiagram
+  id="reliability/timeout-hierarchy"
+  title="Timeout Hierarchy Across Layers"
+  alt="Stack diagram showing timeout values at the client, API gateway, service, database connection, and DNS layers with overlapping constraints."
+>{` 
+  ┌────────────────────────────────────────────┐
+  │         Timeout Hierarchy                   │
+  │                                            │
+  │  ┌──────────────────────────────────┐      │
+  │  │ [Browser / Mobile Client]        │      │
+  │  │ HTTP timeout: 10s               │      │
+  │  └──────────────────────────────────┘      │
+  │              │                             │
+  │  ┌───────────▼──────────────────────┐      │
+  │  │ [API Gateway / Load Balancer]    │      │
+  │  │ Idle timeout: 30s               │      │
+  │  │ Connection timeout: 5s          │      │
+  │  └──────────────────────────────────┘      │
+  │              │                             │
+  │  ┌───────────▼──────────────────────┐      │
+  │  │ [Service]                        │      │
+  │  │ HTTP client timeout: 3s         │      │
+  │  │ gRPC deadline: 2s               │      │
+  │  │ Circuit breaker timeout: 500ms  │      │
+  │  └──────────────────────────────────┘      │
+  │              │                             │
+  │  ┌───────────▼──────────────────────┐      │
+  │  │ [Database Connection Pool]       │      │
+  │  │ Connection timeout: 1s          │      │
+  │  │ Query timeout: 500ms            │      │
+  │  │ Socket timeout: 2s              │      │
+  │  └──────────────────────────────────┘      │
+  │              │                             │
+  │  ┌───────────▼──────────────────────┐      │
+  │  │ [DNS Resolver]                   │      │
+  │  │ DNS timeout: 2s                 │      │
+  │  └──────────────────────────────────┘      │
+  └────────────────────────────────────────────┘
+ `}
+</AsciiDiagram>
+Note the constraint: each layer's timeout must be shorter than the layer above it. The service's 3-second HTTP timeout must fire before the API gateway's 5-second connection timeout. The database's 500ms query timeout must fire before the service's 2-second gRPC deadline. If the hierarchy is inverted, the outer timeout fires first and the inner system wastes work on requests the caller has abandoned.
+
+## Consistency Models for Reliability
+
+Fault tolerance and consistency interact directly. The more faults you tolerate, the harder consistency becomes.
+
+### Fail-Crash Model
+
+A fail-crash component either works correctly or stops completely. When it fails, it stops producing output. Crash faults are the easiest to handle — the component just disappears. The system detects the crash via timeout or heartbeat and reroutes traffic to a replica.
+
+Fail-crash recovery: restart the process, replay the WAL, resume serving. No data corruption, no partial state. Most stateless services fall into this category.
+
+### Fail-Silent Model
+
+A fail-silent component stops responding when faulty but does not produce incorrect output. This is similar to fail-crash but includes the failure mode where the component stops responding while still running (deadlocked thread, full GC pause, memory leak causing thrashing).
+
+Fail-silent is harder than fail-crash because the component consumes resources (CPU, memory, connections) while non-responsive. The system must detect silence and kill the unhealthy component — not just redirect traffic away from it.
+
+### Fail-Partition Model
+
+A fail-partition component experiences a network partition — it can communicate with some nodes but not others. The component continues running but operates with incomplete information.
+
+In a partition, a database replica may accept writes while the primary is unreachable. When the partition heals, you have conflicting writes. The system needs conflict resolution: last-writer-wins (LWW), causal consistency, or application-level merge.
+
+<AsciiDiagram
+  id="reliability/failure-models"
+  title="Three Failure Models"
+  alt="Three columns showing fail-crash (process stops), fail-silent (process hangs but consumes resources), and fail-partition (process works but network split isolates it)."
+>{` 
+  Fail-Crash:            Fail-Silent:          Fail-Partition:
+  ┌────────────┐        ┌────────────┐        ┌────┬──────┬────┐
+  │ [Service]  │        │ [Service]  │        │[A] │ (( ))|[B] │
+  │  pid=1234  │        │  pid=1234  │        │    │split │    │
+  │  status:   │        │  status:   │        │A writes   B writes
+  │  DEAD      │        │  HUNG      │        │to DB-1    to DB-2
+  │            │        │  CPU=100%  │        │            │
+  │ No output  │        │  Mem=95%   │        │ ┌────┐ ┌────┐
+  │ at all.    │        │  No output │        │ │DB-1│ │DB-2│
+  │            │        │  but alive │        │ └────┘ └────┘
+  │ Detect:    │        │            │        │  Conflict!
+  │ heartbeat  │        │ Detect:    │        │  Merge: LWW
+  │ timeout    │        │ health     │        │  or manual
+  │            │        │ check      │        │  resolution
+  └────────────┘        └────────────┘        └─────────────────┘
+ `}
+</AsciiDiagram>
+
+### Byzantine Fault Model
+
+A Byzantine fault component may produce arbitrary, malicious, or contradictory outputs. Byzantine components can lie — telling node A that a transaction committed while telling node B that it aborted.
+
+Byzantine fault tolerance (BFT) requires 3f+1 replicas to tolerate f faulty nodes. With 4 replicas, you tolerate 1 Byzantine fault. With 7 replicas, you tolerate 2. The Practical Byzantine Fault Tolerance (PBFT) algorithm requires three phases (pre-prepare, prepare, commit) and two-thirds honest majority.
+
+BFT is expensive. Each message is sent 3f+1 times. Each replica communicates with every other replica. Latency increases by 3-5x compared to crash fault tolerance. Most systems do not need BFT — use crash tolerance and trust your infrastructure. BFT is relevant for blockchain, financial settlement, and military systems where a compromised node is a realistic threat.
+
+## Performance Characteristics of Reliability Mechanisms
+
+Every reliability mechanism has a performance cost. Understanding these costs helps you make informed tradeoffs.
+
+### Retry Overhead
+
+A retry adds the full latency of the operation plus the backoff delay. The expected latency of an operation with retries is:
+
+```
+E[latency] = t_attempt + p_fail * (t_attempt + backoff_0)
+            + p_fail^2 * (t_attempt + backoff_1)
+            + ...
+```
+
+For a 50ms operation with a 10% failure rate and backoff starting at 100ms:
+
+```
+E[latency] = 50 + 0.1 * (50 + 100) + 0.01 * (50 + 200) + 0.001 * (50 + 400)
+= 50 + 15 + 2.5 + 0.45
+= 67.95ms
+```
+
+The retries add 36% to the expected latency. For operations where failures are rare (below 1%), the overhead is negligible. For operations where failures are common (above 5%), retries degrade latency significantly.
+
+### Circuit Breaker Overhead
+
+A circuit breaker adds minimal per-call overhead — a ring buffer write (memory store) and a conditional branch. Measured overhead is under 1 microsecond per call. The significant cost is the `HALF_OPEN` probe: one request per open-duration interval must succeed before normal traffic resumes.
+
+The circuit breaker's savings come from avoiding wasted work. If the circuit is open, each rejected call saves 500ms (the timeout you would have waited). For 1,000 calls during a 30-second outage: the circuit breaker saves 1,000 * 500ms = 500 seconds of cumulative wait time.
+
+### Bulkhead Overhead
+
+A semaphore-based bulkhead adds ~100 nanoseconds per acquire/release. A thread-pool-based bulkhead adds 50-200 microseconds for the thread handoff. The sizing is critical — undersized pools reject requests, oversized pools waste memory and thread overhead.
+
+## Configuration-Driven Reliability
+
+Production reliability mechanisms are configurable without code changes. A typical configuration file:
+
+```json
+{
+  "retry": {
+    "max_attempts": 5,
+    "base_delay_ms": 200,
+    "max_delay_ms": 30000,
+    "jitter_factor": 0.25,
+    "retry_on_timeout": true,
+    "retry_on_5xx": true,
+    "retry_on_4xx": false
+  },
+  "circuit_breaker": {
+    "failure_threshold": 0.5,
+    "window_size": 100,
+    "open_duration_ms": 30000,
+    "half_open_max_calls": 1
+  },
+  "bulkhead": {
+    "type": "semaphore",
+    "max_concurrent_calls": 25,
+    "max_wait_duration_ms": 10
+  },
+  "timeout": {
+    "connect_ms": 500,
+    "read_ms": 2000,
+    "write_ms": 2000
+  }
+}
+```
+
+This configuration covers all four mechanisms for one dependency. Each dependency in the system has its own configuration block. A centralized configuration service (like Consul, etcd, or AppConfig) pushes updates to all instances without restart.
+
+Configuration changes must be auditable. Every change to reliability configuration is logged with the old and new values, the operator who made the change, and the timestamp. Rollback is a single command: restore the previous version.
+
+## Lifecycle of a Fault-Tolerant Request
+
+Putting it all together, here is the full lifecycle of a request through a reliable system:
+
+<AsciiDiagram
+  id="reliability/full-lifecycle"
+  title="Complete Lifecycle of a Fault-Tolerant Request"
+  alt="End-to-end timeline showing a request passing through timeout, retry, backoff, circuit breaker, bulkhead, and fallback stages."
+>{` 
+  [Client]          [Service]          [Dep-A]          [Dep-B]
+     │                 │                 │                │
+     │── request ─────>│                 │                │
+     │                 │── call Dep-A ──>│                │
+     │                 │    timeout=500ms│                │
+     │                 │    bulkhead=acquire              │
+     │                 │    ... 450ms ...│                │
+     │                 │<────── timeout ─│                │
+     │                 │                 │                │
+     │                 │ retry 1: wait 200ms             │
+     │                 │    bulkhead=release+acquire      │
+     │                 │── call Dep-A ──>│                │
+     │                 │    ... 30ms ....│                │
+     │                 │<──── SUCCESS ───│                │
+     │                 │                 │                │
+     │                 │── call Dep-B ───────────────────>│
+     │                 │    circuit_breaker=check         │
+     │                 │    bulkhead=acquire              │
+     │                 │    ... 50ms ....│                │
+     │                 │<──────────────────── SUCCESS ───│
+     │                 │                 │                │
+     │<─── response ───│                 │                │
+     │                 │                 │                │
+ `}
+</AsciiDiagram>
+
+Each call to a dependency passes through: timeout check, circuit breaker check, bulkhead acquire, retry loop. Each stage can reject the call or trigger a fallback. The metrics from each stage feed dashboards and alerts.
+
+## Thread Safety and Concurrency Management
+
+Reliability mechanisms run in concurrent environments. Every data structure must be thread-safe.
+
+### Atomic Circuit Breaker State
+
+The circuit breaker state (CLOSED, OPEN, HALF_OPEN) is a single atomic variable. State transitions use compare-and-swap (CAS) to prevent race conditions. Two threads should never both transition the state.
+
+```java
+private final AtomicReference<CircuitState> state = 
+    new AtomicReference<>(CircuitState.CLOSED);
+
+public boolean tryAcquire() {
+    CircuitState current = state.get();
+    if (current == CircuitState.OPEN) {
+        return false;  // Fast reject
+    }
+    if (current == CircuitState.HALF_OPEN) {
+        // Only one probe allowed
+        return state.compareAndSet(
+            CircuitState.HALF_OPEN, CircuitState.HALF_OPEN_PROBING
+        );
+    }
+    return true;  // CLOSED — pass through
+}
+
+public void onResult(boolean success) {
+    while (true) {
+        CircuitState current = state.get();
+        CircuitState next = computeNext(current, success);
+        if (state.compareAndSet(current, next)) break;
+        // CAS failed — retry
+    }
+}
+```
+
+The atomic reference guarantees that only one state transition succeeds at a time. This prevents two threads from both thinking they are the half-open probe.
+
+### Lock-Free Ring Buffer
+
+The ring buffer for call outcomes uses an atomic index for head and tail pointers. Writers increment the tail atomically. Readers (for computing failure rate) snapshot the buffer without locking:
+
+```java
+public class RingBuffer {
+    private final AtomicInteger index = new AtomicInteger(0);
+    private final AtomicReferenceArray<Outcome> buffer;
+    private final AtomicInteger failureCount = new AtomicInteger(0);
+
+    public void record(Outcome outcome) {
+        int slot = index.getAndIncrement() % buffer.length();
+        Outcome previous = buffer.getAndSet(slot, outcome);
+        if (previous == Outcome.FAILURE) {
+            failureCount.decrementAndGet();  // Evicting an old failure
+        }
+        if (outcome == Outcome.FAILURE) {
+            failureCount.incrementAndGet();
+        }
+    }
+
+    public double getFailureRate() {
+        return (double) failureCount.get() / buffer.length();
+    }
+}
+```
+
+The `record` method is wait-free — threads never block each other. The failure rate computation is O(1) — it reads the running failure count without iterating the buffer.
+
+### Bulkhead Concurrency
+
+Semaphore-based bulkheads use `java.util.concurrent.Semaphore` or equivalent. The semaphore guarantees fairness through FIFO ordering:
+
+```java
+public class Bulkhead {
+    private final Semaphore semaphore = new Semaphore(MAX_PERMITS, true);
+    private final AtomicInteger maxActive = new AtomicInteger(0);
+
+    public boolean tryAcquire(Duration timeout) {
+        boolean acquired = semaphore.tryAcquire(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        if (acquired) {
+            int active = maxActive.incrementAndGet();
+            // Track peak concurrency for sizing
+            return true;
+        }
+        return false;
+    }
+
+    public void release() {
+        maxActive.decrementAndGet();
+        semaphore.release();
+    }
+}
+```
+
+Thread-pool bulkheads use `ThreadPoolExecutor` with a bounded queue and a rejection handler. The rejection handler triggers the fallback instead of throwing an exception:
+
+```java
+ThreadPoolExecutor executor = new ThreadPoolExecutor(
+    CORE_POOL_SIZE, MAX_POOL_SIZE, 
+    60, TimeUnit.SECONDS, 
+    new ArrayBlockingQueue<>(QUEUE_SIZE),
+    new ThreadPoolExecutor.AbortPolicy()
+);
+```
+
+## Testing Reliability Mechanisms
+
+Reliability mechanisms are tested differently from application logic. You must verify that the mechanism behaves correctly during failures, not just during normal operation.
+
+### Unit Testing a Circuit Breaker
+
+```python
+def test_circuit_breaker_opens_after_threshold():
+    cb = CircuitBreaker(threshold=0.5, window_size=10)
+
+    # 6 failures in 10 calls = 60% failure rate
+    for _ in range(6):
+        cb.record(Outcome.FAILURE)
+    for _ in range(4):
+        cb.record(Outcome.SUCCESS)
+
+    assert cb.state == CircuitState.OPEN
+```
+
+```python
+def test_circuit_breaker_stays_closed_below_threshold():
+    cb = CircuitBreaker(threshold=0.5, window_size=10)
+
+    # 4 failures in 10 calls = 40% failure rate
+    for _ in range(4):
+        cb.record(Outcome.FAILURE)
+    for _ in range(6):
+        cb.record(Outcome.SUCCESS)
+
+    assert cb.state == CircuitState.CLOSED
+```
+
+```python
+def test_half_open_probe_success_closes_circuit():
+    cb = CircuitBreaker(threshold=0.5, window_size=10)
+    cb.state = CircuitState.OPEN
+    cb.open_at = time.time() - 31  # Past the 30-second open duration
+
+    # Allow probe
+    allowed = cb.tryAcquire()
+    assert allowed == True
+
+    # Probe succeeds
+    cb.record(Outcome.SUCCESS)
+    assert cb.state == CircuitState.CLOSED
+```
+
+### Integration Testing a Retry System
+
+```python
+def test_retry_after_transient_failure():
+    service = MockService()
+    service.fail_count = 2  # Fail first 2 calls, succeed on 3rd
+
+    retry_policy = RetryPolicy(max_attempts=3, base_delay_ms=10)
+    client = RetryClient(service, retry_policy)
+
+    result = client.call()
+    assert result == "success"
+    assert service.call_count == 3  # Called 3 times, 2 failures + 1 success
+```
+
+```python
+def test_retry_exhaustion_triggers_fallback():
+    service = MockService()
+    service.fail_count = 100  # Always fail
+
+    retry_policy = RetryPolicy(max_attempts=3, base_delay_ms=10)
+    client = RetryClient(service, retry_policy, fallback=lambda: "fallback")
+
+    result = client.call()
+    assert result == "fallback"
+    assert service.call_count == 3  # All 3 attempts exhausted
+```
+
+### Chaos Testing
+
+Chaos testing validates that reliability mechanisms work under real failure conditions. Netflix's Chaos Monkey randomly kills instances. The Simian Army includes:
+
+- **Chaos Monkey**: randomly terminates instances during business hours.
+- **Latency Monkey**: introduces artificial delays in the network layer.
+- **Conformity Monkey**: finds instances that do not conform to best practices and shuts them down.
+- **Doctor Monkey**: finds instances reporting health issues and removes them from service.
+
+A chaos test for circuit breakers:
+
+1. Deploy two instances of Service A and two instances of Service B.
+2. Service A calls Service B with a circuit breaker (threshold 50%, window 10s).
+3. Kill one instance of Service B.
+4. Verify: Service A's circuit breaker opens, traffic routes to the surviving Service B instance.
+5. Restart the killed instance.
+6. Verify: the circuit breaker transitions to half-open, probes succeed, circuit closes.
+
+## Advanced Circuit Breaker Patterns
+
+### Per-Key Circuit Breaker
+
+A single circuit breaker for all calls to a dependency is too coarse. A failing endpoint within the dependency causes all calls to fail. Per-key circuit breakers track failure rates per endpoint, per customer, or per operation:
+
+```java
+public class PerKeyCircuitBreaker {
+    private final ConcurrentHashMap<String, CircuitBreaker> breakers = new ConcurrentHashMap<>();
+    private final int maxBreakers = 1000;
+
+    public CircuitBreaker getBreaker(String key) {
+        return breakers.computeIfAbsent(key, k -> {
+            if (breakers.size() >= maxBreakers) {
+                return new NoOpCircuitBreaker(); // Fall back to passthrough
+            }
+            return new CircuitBreaker(threshold=0.5, window_size=10);
+        });
+    }
+}
+```
+
+Use per-key circuit breakers when different customers or operations have different failure characteristics. A misbehaving tenant should not affect other tenants.
+
+### Consecutive Failure Circuit Breaker
+
+Instead of a sliding window, use consecutive failure count. Open the circuit after N consecutive failures. This is simpler and reacts faster to sudden failures:
+
+```python
+class ConsecutiveFailureBreaker:
+    def __init__(self, threshold=5, open_duration_ms=30000):
+        self.threshold = threshold
+        self.open_duration = open_duration_ms
+        self.consecutive_failures = 0
+        self.state = "CLOSED"
+        self.open_at = 0
+
+    def record(self, success):
+        if self.state == "OPEN":
+            if time.time() - self.open_at > self.open_duration / 1000:
+                self.state = "HALF_OPEN"
+            return
+
+        if success:
+            self.consecutive_failures = 0
+            if self.state == "HALF_OPEN":
+                self.state = "CLOSED"
+        else:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.threshold:
+                self.state = "OPEN"
+                self.open_at = time.time()
+                self.consecutive_failures = 0
+```
+
+Consecutive failure breakers work well for services that fail suddenly (network partition, crash) but poorly for services that degrade gradually (increasing latency, memory leak).
+
+### Adaptive Circuit Breaker
+
+An adaptive circuit breaker adjusts its threshold based on the dependency's historical failure rate. If the dependency normally has a 2% failure rate, the threshold is automatically set to 10% (5x normal). If the normal rate changes, the threshold adjusts:
+
+```python
+class AdaptiveCircuitBreaker:
+    def __init__(self, multiplier=5, min_threshold=0.05):
+        self.multiplier = multiplier
+        self.min_threshold = min_threshold
+        self.baseline_failure_rate = 0.01
+        self.adaptive_threshold = 0.05
+        self.window = SlidingWindow(size=1000)
+
+    def record(self, outcome):
+        self.window.add(outcome)
+        # Recalculate baseline every 100 requests
+        if self.window.size() % 100 == 0:
+            baseline = self.compute_baseline()  # Using EWMA
+            self.adaptive_threshold = max(
+                self.min_threshold,
+                baseline * self.multiplier
+            )
+```
+
+The adaptive threshold prevents false positives when the dependency's normal failure rate is temporarily elevated due to maintenance or load.
+
+## Reliability in Event-Driven Systems
+
+Event-driven systems have unique reliability requirements. Events cannot be retried on the caller's thread — they are processed asynchronously.
+
+### Consumer Retries
+
+A message consumer processes events from a queue. If processing fails, the consumer has several options:
+
+**Immediate retry.** The consumer catches the exception and retries the operation on the same thread. Use for transient failures (database timeout, network blip). Max 3 immediate retries.
+
+**Delayed retry with backoff queue.** The consumer publishes the event to a retry queue with a delay. Each retry queue has a different TTL:
+
+```
+retry-1s (1 second delay)
+retry-10s (10 second delay)
+retry-60s (60 second delay)
+dlq (dead-letter queue)
+```
+
+The consumer reads from the main queue. On failure, publish to `retry-1s`. The `retry-1s` consumer reads and retries. On failure again, publish to `retry-10s`. Continue through the chain. After all retries are exhausted, publish to the DLQ.
+
+**Exponential backoff with redrive policy.** AWS SQS supports redrive policies: max receive count (3-5) and dead-letter queue. Each time a message is received from the queue, the visibility timeout doubles (first attempt: 30 seconds, second: 60 seconds, third: 120 seconds). After the max receive count, the message moves to the DLQ.
+
+### Idempotent Consumers
+
+Event consumers must be idempotent. The same event may be delivered multiple times. Store processed event IDs in a deduplication cache (Redis with TTL).
+
+```python
+def process_event(event):
+    event_id = event["id"]
+    if redis.sismember("processed_events", event_id):
+        logger.info(f"Event {event_id} already processed, skipping")
+        return
+
+    # Process the event
+    result = do_work(event)
+
+    # Mark as processed (atomic with processing)
+    redis.sadd("processed_events", event_id)
+    redis.expire("processed_events", 86400)  # 24-hour TTL
+```
+
+The deduplication cache must be transactional with the processing logic. If the consumer crashes after processing but before marking as processed, the event is reprocessed. If the consumer crashes after marking as processed but before the transaction commits, the event is lost. Use a transactional outbox pattern to guarantee exactly-once processing.
+
+The deep dive showed you the internal workings of each reliability mechanism. Next, you will see how these mechanisms compose into full system architectures — from simple deployments to multi-region configurations with capacity planning.

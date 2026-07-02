@@ -1,0 +1,432 @@
+---
+id: key-value-databases-deep-dive
+title: Key-Value Databases — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Key-Value Databases — Under the Hood
+
+## Internal Architecture
+
+A key-value store looks like a black box from the outside: put key, get value, delete key. Inside, there are several subsystems working together to handle memory management, persistence, replication, eviction, and network I/O. The architecture differs significantly between in-memory stores (Redis, Memcached) and persistent stores (DynamoDB, RocksDB). Here is what lives inside the box.
+
+<AsciiDiagram id="key-value-databases/deepdive-architecture" title="Internal Architecture of a Key-Value Store" caption="The six main subsystems inside a key-value database engine: networking, command dispatch, data structures, persistence, replication, and eviction.">
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Key-Value Store Engine                      │
+│                                                              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │             Network Layer (epoll / kqueue / IOCP)     │  │
+│  │  Accept connections ──> Parse protocol ──> Dispatch  │  │
+│  └──────────────────────┬────────────────────────────────┘  │
+│                         │                                    │
+│                         ▼                                    │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │              Command Processor / Router               │  │
+│  │     GET ──> Read path    │     SET ──> Write path     │  │
+│  │     DEL ──> Delete path  │     EXPIRE ──> TTL path   │  │
+│  └──┬──────────────────────┬┴─────────────────────┬──────┘  │
+│     │                      │                       │         │
+│     ▼                      ▼                       ▼         │
+│  ┌────────────┐    ┌──────────────┐    ┌─────────────────┐  │
+│  │ Hash Table │    │  Expiry /    │    │  Eviction       │  │
+│  │ (Dict)     │    │  TTL Engine  │    │  Policy Engine  │  │
+│  │ O(1) lookup│    │  Lazy+Active │    │  (LRU/LFU/TTL)  │  │
+│  └─────┬──────┘    └──────┬───────┘    └────────┬────────┘  │
+│        │                  │                      │           │
+│        ▼                  ▼                      ▼           │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │            Persistence Layer (optional)               │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌──────────────────────┐  │  │
+│  │  │ RDB     │  │ AOF     │  │ LSM-Tree / WAL       │  │  │
+│  │  │ Snapshot│  │ Append  │  │ (RocksDB / LevelDB)  │  │  │
+│  │  └─────────┘  └─────────┘  └──────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │           Replication / Cluster Layer                 │  │
+│  │  Leader-Follower  │  Gossip Protocol  │  Failover    │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+**Legend:** [ ] = Subsystem layer. Data flows top-to-bottom for reads, left-to-right for background tasks.
+</AsciiDiagram>
+
+## Data Structures and Algorithms
+
+The hash table is the heart of nearly every key-value store, but the supporting data structures determine performance characteristics under different workloads.
+
+### Hash Tables — The Primary Structure
+
+A hash table maps keys to array indices using a hash function. Redis uses a dictionary (dict) with incremental rehashing. When the table grows beyond its load factor (default 1:1 ratio of entries to buckets), Redis does not stop the world to resize — it rehashes incrementally, moving a few buckets per millisecond of server time.
+
+<AsciiDiagram id="key-value-databases/deepdive-hashtable" title="Hash Table Internals with Chaining" caption="Keys are hashed to buckets; collisions are resolved with a linked list of entries in each bucket.">
+```
+┌──────────────────────────────────────────────────────────┐
+│                   Hash Table (Dict)                      │
+│                                                          │
+│  ┌───────┐                                               │
+│  │ Bucket│  Index: hash(key) % table_size                │
+│  │   0   │ ───> NULL                                     │
+│  ├───────┤                                               │
+│  │   1   │ ───> [key:"a:1"  val:"x"] ──> [key:"b:7"...] │
+│  ├───────┤                                               │
+│  │   2   │ ───> [key:"c:3"  val:"z"]                    │
+│  ├───────┤                                               │
+│  │   3   │ ───> NULL                                     │
+│  ├───────┤                                               │
+│  │   4   │ ───> [key:"m:9"  val:"q"] ──> [key:"x:2"...] │
+│  ├───────┤                                               │
+│  │   5   │ ───> NULL                                     │
+│  ├───────┤                                               │
+│  │   6   │ ───> NULL                                     │
+│  └───────┘                                               │
+│                                                          │
+│  Load factor: entries / buckets = 4 / 7 = 0.57          │
+│  Threshold for resize: 1.0 (Redis)                      │
+│  Collision at bucket 1 has 2 entries (chained).         │
+└──────────────────────────────────────────────────────────┘
+```
+**Legend:** Each bucket is either NULL or a pointer to a linked list of entries sharing that hash.
+</AsciiDiagram>
+
+### Skip Lists — Ordered Data
+
+Redis uses skip lists (not balanced trees) for sorted sets. A skip list is a layered linked list that provides O(log n) search, insert, and delete with simpler implementation than a red-black tree.
+
+<AsciiDiagram id="key-value-databases/deepdive-skiplist" title="Skip List Structure in Redis Sorted Sets" caption="Multiple layers of linked lists enable O(log n) searching. Each node has a tower of pointers.">
+```
+┌──────────────────────────────────────────────────────────┐
+│                    Skip List (Level 3)                   │
+│                                                          │
+│  Level 3 ──────────────────────────────────────────────> │
+│    ┌────┐                  ┌────┐                        │
+│    │head│ ─────────────────> │tail│                       │
+│    │ L3 │    ┌─────────┐    │ L3 │                       │
+│    └────┘    │score:50 │    └────┘                       │
+│  Level 2 ────│  "alice"│──────────────────────────────> │
+│    ┌────┐ ┌─>│         │──┐  ┌─────────┐                │
+│    │head│─┘  └─────────┘  └─>│score:75 │                │
+│    │ L2 │    ┌─────────┐    │"bob"   │──>               │
+│    └────┘ ┌─>│score:20 │    └─────────┘                 │
+│  Level 1 ─┘  │"charlie"│──>                              │
+│    ┌────┐    └─────────┘                                 │
+│    │head│──────────────────────────────────────────────> │
+│    │ L1 │    (all nodes at level 1)                      │
+│    └────┘                                                │
+│                                                          │
+│  Search for score 50: start at L3 head, follow           │
+│  forward until next > 50, then drop to L2, etc.         │
+└──────────────────────────────────────────────────────────┘
+```
+**Legend:** Boxed entries are skip list nodes. Each node appears at one or more levels based on random promotion.
+</AsciiDiagram>
+
+### LSM-Trees — Persistent Storage
+
+Persistent key-value stores like RocksDB and LevelDB use Log-Structured Merge Trees (LSM-trees). Writes go to an in-memory memtable first (fast), then flush to immutable SSTables on disk. Reads check the memtable, then search SSTables from newest to oldest. Bloom filters eliminate unnecessary SSTable reads.
+
+<AsciiDiagram id="key-value-databases/deepdive-lsm" title="LSM-Tree Write and Compaction Pipeline" caption="Data flows from memtable to SSTable files, with compaction merging levels in the background.">
+```
+┌──────────────────────────────────────────────────────────┐
+│                   LSM-Tree Pipeline                      │
+│                                                          │
+│  Write ──>                                            │
+│    │                                                     │
+│    ▼                                                     │
+│  ┌──────────┐     ┌──────────────────────────────────┐  │
+│  │ Memtable │ ──> │  Active memtable (in RAM)        │  │
+│  │ (RAM)    │     │  Sorted map: key ──> value       │  │
+│  │ size: 4MB│     │  Threshold: 64 MB ──> flush     │  │
+│  └────┬─────┘     └──────────────────────────────────┘  │
+│       │ flush                                            │
+│       ▼                                                  │
+│  ┌──────────┐     ┌──────────────────────────────────┐  │
+│  │ SSTable  │ ──> │  Level 0 (L0)                    │  │
+│  │ (disk)   │     │  Sorted String Table files       │  │
+│  │          │     │  Overlapping key ranges ok       │  │
+│  └──────────┘     └──────────────┬───────────────────┘  │
+│                                  │ compaction            │
+│                                  ▼                       │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  Level 1 (L1) — non-overlapping SSTables        │  │
+│  │  [a-c] [d-f] [g-j] ... (one file per range)     │  │
+│  │  10x larger than L0                             │  │
+│  └──────────────┬───────────────────────────────────┘  │
+│                 │ compaction                            │
+│                 ▼                                       │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  Level 2 (L2) — 10x larger than L1              │  │
+│  │  ... cascading compaction                        │  │
+│  └──────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+```
+**Legend:** LSM-trees batch writes into sorted files and merge them in the background during compaction.
+</AsciiDiagram>
+
+## Request Lifecycle — Read Path
+
+Here is the full read path for a key-value store, step by step.
+
+<AsciiDiagram id="key-value-databases/deepdive-readpath" title="Read Path — GET Request Lifecycle" caption="A GET request travels through network I/O, command parsing, hash table lookup, and response serialization.">
+```
+┌──────────────────────────────────────────────────────────┐
+│  GET "user:42:profile"                                   │
+│                                                          │
+│  Step 1: Client opens TCP connection to port 6379        │
+│                                                          │
+│  Step 2: Client sends: *2\r\n$3\r\nGET\r\n$18\r\n       │
+│          user:42:profile\r\n                              │
+│          (RESP protocol — 35 bytes)                       │
+│                                                          │
+│  Step 3: Server epoll_wait() wakes on readable socket    │
+│                                                          │
+│  Step 4: Read buffer → parse command → validate args     │
+│                                                          │
+│  Step 5: Look up key in dict:                            │
+│          hash = dictHashKey("user:42:profile")           │
+│          idx = hash & dict->ht[0].sizemask              │
+│          traverse chain at bucket idx                    │
+│                                                          │
+│  Step 6: If found → check TTL expiry                    │
+│          If expired → delete key → return nil            │
+│                                                          │
+│  Step 7: If not found → return nil                      │
+│                                                          │
+│  Step 8: Serialize value to RESP protocol                │
+│          Write to socket buffer → kernel sends to client │
+│                                                          │
+│  Latency breakdown:                                      │
+│    Network RTT:    200 μs (loopback) to 5 ms (remote)   │
+│    Parse command:  3 μs                                 │
+│    Hash lookup:    0.5 μs                               │
+│    Serialize:      1 μs                                 │
+│    Write socket:   2 μs                                 │
+└──────────────────────────────────────────────────────────┘
+```
+**Legend:** The majority of read latency is network I/O, not the actual hash table lookup.
+</AsciiDiagram>
+
+## Request Lifecycle — Write Path
+
+<AsciiDiagram id="key-value-databases/deepdive-writepath" title="Write Path — SET Request Lifecycle" caption="A SET request must update the hash table, handle TTL, persist to disk, and replicate to followers.">
+```
+┌──────────────────────────────────────────────────────────┐
+│  SET "session:99" "{\"user\":42}" EX 3600               │
+│                                                          │
+│  Step 1: Parse command (3 μs)                           │
+│          key="session:99", value=JSON, TTL=3600          │
+│                                                          │
+│  Step 2: Acquire write lock (single-threaded Redis)     │
+│          (0.1 μs — no contention in single-threaded)     │
+│                                                          │
+│  Step 3: Insert into hash table                          │
+│          dictAdd() → set key, value                      │
+│          (0.5 μs, may trigger rehashing)                │
+│                                                          │
+│  Step 4: Set expiry metadata                             │
+│          Add to expires dict with TTL timestamp          │
+│          (0.2 μs)                                        │
+│                                                          │
+│  Step 5: Append to AOF buffer (if AOF enabled)           │
+│          (0.3 μs — write to memory buffer)               │
+│                                                          │
+│  Step 6: Replicate to followers                          │
+│          Push command to replication buffer              │
+│          Followers apply asynchronously                  │
+│          (1-10 μs local, async to network)               │
+│                                                          │
+│  Step 7: Return OK to client                             │
+│                                                          │
+│  Step 8 (background): fsync AOF buffer to disk           │
+│          Every 1 second by default                       │
+│          (2-10 ms if fsync on every write)               │
+└──────────────────────────────────────────────────────────┘
+```
+**Legend:** Redis returns to the client before fsync completes, trading worst-case durability for speed.
+</AsciiDiagram>
+
+## Consistency and State Handling
+
+Distributed key-value stores face three hard problems: crashes, partitions, and concurrent writes. Here is how each is handled.
+
+### Crash Recovery with AOF
+
+<AsciiDiagram id="key-value-databases/deepdive-crash" title="Crash Recovery with AOF Log" caption="After a crash, Redis replays the AOF log to rebuild the in-memory state.">
+```
+┌──────────────────────────────────────────────────────────┐
+│  Timeline:                                                │
+│                                                          │
+│  t0: Server running, 50K keys in memory                  │
+│  t1: SET "a" 1 ──> hash table + AOF buffer              │
+│  t2: SET "b" 2 ──> hash table + AOF buffer              │
+│  t3: SET "c" 3 ──> hash table + AOF buffer              │
+│  t4: POWER FAILURE ──> Server dies                       │
+│                                                          │
+│  t5: Server restarts                                     │
+│      Step 1: Detect AOF file exists                      │
+│      Step 2: Read AOF: SET a 1 / SET b 2 / SET c 3     │
+│      Step 3: Replay each command into hash table         │
+│      Step 4: Server ready — all 3 keys restored          │
+│                                                          │
+│  What if fsync didn't happen before crash?              │
+│    → Only the last second of writes may be lost         │
+│    → "appendfsync everysec" = at most 1 second of data  │
+│    → "appendfsync always" = zero data loss, 100x slower │
+└──────────────────────────────────────────────────────────┘
+```
+**Legend:** AOF persistence offers a configurable trade-off between durability and write throughput.
+</AsciiDiagram>
+
+### Network Partition
+
+When a network partition splits a cluster, each side may continue accepting writes independently, creating divergent histories.
+
+<AsciiDiagram id="key-value-databases/deepdive-partition" title="Network Partition Scenario" caption="A partition splits 3 nodes into two groups. Each group accepts writes independently.">
+```
+┌──────────────────────────────────────────────────────────┐
+│                    BEFORE PARTITION                      │
+│                                                          │
+│    Client ──> [Node A] ──── [Node B] ──── [Node C]      │
+│                   ^                        ^             │
+│                   │      all connected      │            │
+│                   └────────────────────────┘             │
+│                                                          │
+│                    AFTER PARTITION                       │
+│                                                          │
+│    Group 1:                              Group 2:        │
+│    [Node A] ──> [Node B]                 [Node C]       │
+│       │            │                         │          │
+│    Client 1 writes:    │                  Client 2 writes:│
+│    SET "x" 1          │                  SET "x" 2       │
+│    SET "y" 3          │                                 │
+│                                                          │
+│  When partition heals:                                   │
+│  → Last-writer-wins (LWW) with timestamps               │
+│  → If "x" timestamp from Group 2 > Group 1:             │
+│    "x" = 2                                               │
+│  → "y" only exists in Group 1: kept                     │
+│  → Application must handle this divergence              │
+└──────────────────────────────────────────────────────────┘
+```
+**Legend:** Dynamo-style stores use vector clocks for causal consistency; Redis uses wall-clock timestamps for LWW.
+</AsciiDiagram>
+
+### Concurrent Writes
+
+Without transactions, two clients writing to the same key can race. The last write wins by default, which may not be correct for your application.
+
+<AsciiDiagram id="key-value-databases/deepdive-concurrent" title="Concurrent Write Race Condition" caption="Two clients increment a counter simultaneously, causing a lost update.">
+```
+┌──────────────────────────────────────────────────────────┐
+│  Race: Two clients incrementing "counter" (value=5)     │
+│                                                          │
+│  Time ──────────────>                                    │
+│                                                          │
+│  Client A               Client B            Server       │
+│    │                       │                    │        │
+│    │── GET "counter" ─────>│                    │        │
+│    │                       │── GET "counter" ──>│        │
+│    │<── 5 ─────────────────│                    │        │
+│    │                       │<── 5 ──────────────│        │
+│    │                       │                    │        │
+│    │── SET "counter" 6 ───>│                    │        │
+│    │  (A reads 5, adds 1) │                    │        │
+│    │                       │── SET "counter" 6 ─>│      │
+│    │                       │  (B reads 5, adds 1)│      │
+│    │                       │                    │        │
+│    │  Final value: 6 (should be 7!)            │        │
+│                                                          │
+│  Solutions:                                               │
+│  1. Atomic INCR command (Redis: INCR counter)           │
+│  2. Optimistic locking (WATCH + MULTI/EXEC)             │
+│  3. Redis Lua script (atomically executes)               │
+│  4. DynamoDB conditional updates                         │
+└──────────────────────────────────────────────────────────┘
+```
+**Legend:** Read-modify-write is not atomic without explicit server-side atomic operations.
+</AsciiDiagram>
+
+## Performance Characteristics
+
+Understanding performance numbers helps you size your key-value deployment correctly.
+
+<AsciiDiagram id="key-value-databases/deepdive-performance" title="Performance Characteristics by Store Type" caption="Latency percentiles and throughput for four common key-value stores under standard workloads.">
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Performance Comparison (4KB values, 1GB working set)        │
+│                                                              │
+│  Store          │ p50 GET   │ p99 GET   │ p999 GET  │ Ops/sec│
+│  ───────────────┼───────────┼───────────┼───────────┼─────── │
+│  Memcached      │ 45 μs     │ 120 μs    │ 400 μs    │ 1.8M   │
+│  (RAM only)     │           │           │           │        │
+│  ───────────────┼───────────┼───────────┼───────────┼─────── │
+│  Redis          │ 62 μs     │ 180 μs    │ 550 μs    │ 850K   │
+│  (with AOF)     │           │           │           │        │
+│  ───────────────┼───────────┼───────────┼───────────┼─────── │
+│  DynamoDB       │ 3 ms      │ 15 ms      │ 50 ms     │ 100K  │
+│  (eventual)     │           │           │           │        │
+│  ───────────────┼───────────┼───────────┼───────────┼─────── │
+│  RocksDB        │ 2 μs*     │ 500 μs    │ 5 ms      │ 200K  │
+│  (cached)       │           │           │           │        │
+│                                                              │
+│  *RocksDB reads from block cache (RAM hit)                  │
+│  Disk reads (cache miss) add 5-50 μs for SSD.               │
+│                                                              │
+│  Key insight: p999 is 5-10x p99 due to:                     │
+│  • Fork (copy-on-write) pauses (Redis RDB save)            │
+│  • Garbage collection / compaction pauses                   │
+│  • Network jitter in multi-tenant environments              │
+│  • Epoll wake-up latency under high connection count        │
+└──────────────────────────────────────────────────────────────┘
+```
+**Legend:** Latency varies by store type, persistence settings, and hardware. Always test with your own workload.
+</AsciiDiagram>
+
+### Memory Overhead
+
+Key-value stores have significant memory overhead beyond the raw data size. Redis stores each key with its type, encoding, LRU timestamp, reference count, and pointer metadata. A 20-byte key with a 100-byte value consumes approximately 200 bytes of RSS — roughly 60% overhead.
+
+## Configuration and Tuning
+
+Here are the most important knobs for tuning a key-value store.
+
+<AsciiDiagram id="key-value-databases/deepdive-tuning" title="Configuration Knobs and Their Impact" caption="Key configuration parameters for Redis, with defaults and aggressive tuning values.">
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Redis Configuration Parameters                              │
+│                                                              │
+│  Parameter           │ Default    │ Aggressive   │ Effect    │
+│  ────────────────────┼────────────┼──────────────┼───────────│
+│  maxmemory           │ unlimited  │ 80% of RAM   │ Prevents  │
+│                      │            │              │ OOM crash │
+│  ────────────────────┼────────────┼──────────────┼───────────│
+│  maxmemory-policy    │ noeviction │ allkeys-lru  │ Eviction  │
+│                      │            │              │ strategy  │
+│  ────────────────────┼────────────┼──────────────┼───────────│
+│  save (RDB)         │ 900 1      │ 3600 1       │ Snapshot  │
+│                      │ 300 10     │              │ frequency │
+│                      │ 60 10000   │              │           │
+│  ────────────────────┼────────────┼──────────────┼───────────│
+│  appendfsync         │ everysec   │ always       │ Durability│
+│  ────────────────────┼────────────┼──────────────┼───────────│
+│  hash-max-ziplist-   │ 512        │ 1024         │ Memory vs │
+│  entries             │            │              │ CPU       │
+│  ────────────────────┼────────────┼──────────────┼───────────│
+│  activedefrag        │ no         │ yes          │ Defrag    │
+│                      │            │              │ at scale  │
+│  ────────────────────┼────────────┼──────────────┼───────────│
+│  cluster-node-timeout│ 15000 ms   │ 5000 ms      │ Failover  │
+│                      │            │              │ speed     │
+│  ────────────────────┼────────────┼──────────────┼───────────│
+│  repl-backlog-size   │ 1 MB       │ 100 MB       │ Partial   │
+│                      │            │              │ resync    │
+│  ────────────────────┼────────────┼──────────────┼───────────│
+│  client-output-      │ 1 GB       │ 256 MB       │ Protect   │
+│  buffer-limit        │            │              │ memory    │
+└──────────────────────────────────────────────────────────────┘
+```
+**Legend:** Defaults favor safety. Aggressive values improve performance but require monitoring to prevent data loss.
+</AsciiDiagram>

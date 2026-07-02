@@ -1,0 +1,310 @@
+---
+id: load-balancers-tradeoffs
+title: Load Balancers -- Trade-offs & Failure Modes
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Core Tension
+
+**A load balancer must make fast, stateless routing decisions about traffic it does not fully understand, while allowing operators to tune behaviors they cannot predict.** The tension is between raw throughput and routing intelligence. Every feature you add to the load balancer (TLS termination, header inspection, rate limiting, path rewriting) adds microseconds to the hot path and megabytes to memory usage. The most performant load balancer is a piece of wire. The most useful load balancer is a full-featured proxy. You cannot have both at line rate.
+
+## Decision Matrix
+
+| Decision | Option A | Option B | Choose A When | Choose B When |
+|---|---|---|---|---|
+| **L4 vs L7** | L4 (TCP/UDP) | L7 (HTTP/HTTPS) | Max throughput needed. Game servers, DNS, database replicas. | Content-aware routing needed. Web APIs, microservices, auth enforcement. |
+| **Single vs multi-tier** | One LB layer | L4 edge + L7 internal | Under 5,000 req/s. Simplicity matters more than isolation. | Over 50,000 req/s. Need DDoS separation from app routing. |
+| **Active health vs passive health** | Probe on timer (HTTP GET) | Observe real traffic (5xx detection) | Predictable, low-noise environment. Backend has cheap health endpoint. | High-traffic environment where probes add noise. Slow failure detection is acceptable. |
+| **Sticky vs stateless** | Persist client to backend | No persistence, shared session store | Legacy app with local state. Migrating state store is too expensive. | New system. Can externalize session state to Redis. |
+| **Round-robin vs least-connections** | Equal distribution | Capacity-aware distribution | Backends are identical and request cost is uniform. | Request cost varies. Some requests take 1ms, others take 500ms. |
+| **Hash-based vs consistent hash** | `hash(key) % N` | `hash(key) → ring → backend` | Backend pool is fixed. No scaling events. | Backend pool changes (auto-scaling, failures, deploys). |
+| **Active-active vs active-standby** | Both LBs serve traffic | Standby does nothing | Can handle double load. Need max utilization. | Cannot handle double load. Need simplicity for failover. |
+| **Software vs hardware** | Nginx, HAProxy, Envoy | F5 BIG-IP, A10, Citrix ADC | Need flexibility, API-driven config, runs in cloud. | Need guaranteed throughput, FIPS compliance, existing vendor relationship. |
+| **Proxy vs DSR (Direct Server Return)** | LB terminates client + opens new backend conn | Backend sends response directly to client | Need TLS termination, header rewriting, request buffering. | Responses are large (video, files). LB bandwidth is bottleneck. Want half the traffic through LB. |
+| **Round-robin DNS + real LB vs anycast** | DNS returns multiple VIPs, client picks one | Same IP from all PoPs via BGP | Simple setup, don't need instant failover. | Need sub-second failover, want geographic routing. |
+
+## CAP Theorem Positioning
+
+Load balancers operate in the **CP** (Consistency + Partition Tolerance) zone for their own configuration state, and **AP** (Availability + Partition Tolerance) for the data plane.
+
+<AsciiDiagram
+  id="load-balancers/cap"
+  title="CAP Theorem -- Where Load Balancers Land"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    CAP Theorem for Load Balancers                     │
+│                                                                     │
+│                        ┌─────────────────┐                          │
+│                        │   Data Plane    │                          │
+│                        │  (every packet) │                          │
+│                        │                 │                          │
+│                        │       AP        │                          │
+│                        │   Must forward  │                          │
+│                        │   even if stale │                          │
+│                        │   even if split │                          │
+│                        │   Never drop    │                          │
+│                        └─────────────────┘                          │
+│                                                                     │
+│                        ┌─────────────────┐                          │
+│                        │  Control Plane  │                          │
+│                        │ (config, health)│                          │
+│                        │                 │                          │
+│                        │       CP        │                          │
+│                        │   Must agree on │                          │
+│                        │   which backends│                          │
+│                        │   are healthy   │                          │
+│                        │   Split-brain   │                          │
+│                        │   is dangerous  │                          │
+│                        └─────────────────┘                          │
+│                                                                     │
+│  What happens during a network partition:                           │
+│                                                                     │
+│    ┌────────┐                   ┌────────┐                          │
+│    │  LB    │    PARTITION      │  LB    │                          │
+│    │   A    │═══════════════════│   B    │                          │
+│    └────────┘                   └────────┘                          │
+│         │                           │                               │
+│         │   "Backend 3 is down"     │   "Backend 3 is up"           │
+│         ▼                           ▼                               │
+│    ┌────────┐                  ┌────────┐                           │
+│    │Backend │                  │Backend │                           │
+│    │   3    │                  │   3    │                           │
+│    └────────┘                  └────────┘                           │
+│                                                                     │
+│  LB A stops sending to Backend 3.                                    │
+│  LB B keeps sending to Backend 3.                                    │
+│  No data corruption (backends are stateless).                        │
+│  But: B may overload Backend 3.                                      │
+│  CP on control plane prevents inconsistent health state.            │
+└─────────────────────────────────────────────────────────────────────┘
+`}
+  caption="The data plane (forwarding packets) is AP -- it must keep working even during a partition. The control plane (health state, config) is CP -- split-brain health data can cause overload or accidental traffic blackholing."
+/>
+
+### Partition Scenario Walkthrough
+
+Two load balancers share health state via a consensus store (etcd, Zookeeper). A network partition isolates LB A from the store.
+
+1. LB A cannot update the store, but continues forwarding traffic based on its last known healthy backend list (AP behavior -- forward even if stale).
+2. LB B updates the store: "Backend 3 is DOWN" (from health probe results). LB A does not receive this update.
+3. LB A continues sending traffic to Backend 3. Backend 3 may be genuinely down, in which case LB A's clients see failures. Or Backend 3 may be healthy but unreachable from LB B's network vantage point.
+4. When the partition heals, LB A syncs the latest health state from the store. This is a CP reconciliation: the store's health data wins.
+
+The key insight: the data plane never blocks on the control plane. If the control plane is unreachable, the data plane uses its last good config. This is the correct CAP trade-off for load balancers.
+
+## Failure Modes
+
+### Failure 1: Cascading Backend Overload
+
+**What happens**: One backend becomes slow (memory leak, GC pause). The load balancer's least-connections algorithm routes new requests to the other backends, which now handle increased load and also slow down. All backends degrade together.
+
+<AsciiDiagram
+  id="load-balancers/cascade"
+  title="Cascading Backend Overload"
+  content={`
+Time ─────────────────────────────────────────────────────────────▶
+
+Phase 1: Backend A slows down
+┌──────┐  ┌──────┐  ┌──────┐
+│  A   │  │  B   │  │  C   │
+│slow  │  │ok    │  │ok    │
+│100ms │  │20ms  │  │20ms  │
+└──────┘  └──────┘  └──────┘
+
+Phase 2: LB sends fewer to A, more to B and C
+┌──────┐  ┌──────┐  ┌──────┐
+│  A   │  │  B   │  │  C   │
+│ 10%  │  │ 45%  │  │ 45%  │
+└──────┘  └──────┘  └──────┘
+
+Phase 3: B slows under extra load
+┌──────┐  ┌──────┐  ┌──────┐
+│  A   │  │  B   │  │  C   │
+│150ms │  │120ms │  │ 40ms │
+└──────┘  └──────┘  └──────┘
+
+Phase 4: C fails → all requests → A and B → system collapse
+┌──────┐  ┌──────┐  ┌──────┐
+│  A   │  │  B   │  │  C   │
+│down  │  │down  │  │down  │
+└──────┘  └──────┘  └──────┘
+
+  Root cause: No circuit breaker. Slow server absorbs same number of
+  requests while taking longer, which does not reduce its share enough.
+`}
+  caption="Without a circuit breaker, a slow backend causes load to redistribute to healthy backends, which then also slow down, causing a cascade. A circuit breaker would eject the slow backend entirely."
+/>
+
+**Detection**: p99 latency crossing a threshold (e.g., 500ms). Active connection count staying persistently high.
+
+**Recovery**: Enable circuit breakers. Set max connections per backend to 200. When a backend exceeds this, new requests queue briefly then fail over to other backends. The overloaded backend gets time to recover.
+
+### Failure 2: Health Check Amplification
+
+**What happens**: A backend is slow but still responds to health checks (the health endpoint is lightweight and does not exercise the full stack). The load balancer keeps routing traffic to the dying backend.
+
+**Root cause**: Health check does not represent actual application health. It checks "is process running" not "can it process a real request."
+
+**Blast radius**: Percentage of traffic routed to the slow backend multiplied by its failure rate. If 25% of traffic hits the slow backend and 50% of those requests fail, overall error rate is 12.5% -- possibly within SLO but degrading user experience.
+
+**Fix**: Health checks should exercise the full dependency chain: database ping, cache ping, disk write test (for file upload services). Add a synthetic transaction endpoint: GET /health/db pings Postgres and Redis before returning 200.
+
+### Failure 3: TLS Certificate Expiry
+
+**What happens**: The TLS certificate on the load balancer expires at midnight. All new TLS handshakes fail. Clients see SSL_ERROR_EXPIRED_CERTIFICATE.
+
+**Root cause**: No monitoring on certificate expiry. The certificate is stored in the load balancer config but scanning only checks file presence, not expiration date.
+
+**Blast radius**: 100% of HTTPS traffic. HTTP traffic (if enabled) still works, but most services redirect HTTP to HTTPS.
+
+**Detection**: Alert on certificate expiry at T-30 days, T-7 days, T-1 day. Most cert-manager tools (cert-manager, acme.sh) include this.
+
+**Recovery**: Deploy new certificate to load balancer and trigger a config reload. The seamless reload mechanism keeps existing connections alive. New connections use the new certificate.
+
+### Failure 4: Stale DNS After Failover
+
+**What happens**: The primary load balancer fails. DNS updates to point to the secondary. But clients that cached the old DNS record continue sending to the dead VIP for the duration of the TTL.
+
+<AsciiDiagram
+  id="load-balancers/dns-failover"
+  title="Stale DNS After Failover"
+  content={`
+Time ──────────────────────────────────────────────────────▶
+      │                 │                     │
+    Primary            Primary               DNS TTL
+    FAILS              LBaches               expires
+      │                 │                     │
+      ▼                 ▼                     ▼
+
+  ┌──────┐           ┌──────┐
+  │Client│───────────│ DNS  │  TTL = 300 seconds
+  │  A   │           │ Cache│  Cached: VIP 1.2.3.4
+  └──────┘           └──────┘
+      │                   │
+      │                   │  Time passes...
+      │                   │
+      ▼                   │
+  ┌──────┐   SEND REQ     │
+  │  LB  │◀────────────────┘
+  │DOWN  │  (dead)
+  │1.2.3.4│
+  └──────┘
+      │
+      │ timeout 30s
+      │ retry connection
+      │ timeout 30s
+      ▼
+  ERROR: Connection refused
+  (client waits ~60 seconds before giving up)
+  (when client retries DNS: 300 seconds later)
+
+  Solution: Set DNS TTL to 60 seconds.
+  Better: Use anycast BGP (failover in under 10 seconds, no client cache).
+`}
+  caption="DNS failover suffers from client-side caching. A 300-second TTL means five minutes of blackholed traffic. Anycast routing eliminates this by keeping the same IP across redundant load balancers."
+/>
+
+**Detection**: No traffic to new VIP. The monitoring system sees 100% error rate from clients that use the dead VIP.
+
+**Recovery**: Short DNS TTLs (30-60 seconds). Use BGP anycast so multiple load balancers share the same IP. Use health-checked DNS (Route 53, Google Cloud DNS) that automatically removes unhealthy IPs from DNS responses.
+
+### Failure 5: Port Exhaustion
+
+**What happens**: The load balancer opens a TCP connection to a backend for each request. Each connection uses an ephemeral source port. When all ephemeral ports are in use, new backend connections fail.
+
+**Root cause**: Each TCP connection between LB and backend uses a unique (LB_IP, LB_PORT, BACKEND_IP, BACKEND_PORT) tuple. The LB_PORT range is limited (typically 28,232 ports on Linux).
+
+**At scale**: If the load balancer handles 100,000 concurrent requests to one backend IP:port, and the operating system's ephemeral range is 28,232 ports, the first 28,232 requests succeed and the rest queue or fail.
+
+**Fix options**:
+1. Add more backend IPs (multiple backend machines)
+2. Add more backend ports (multiple ports per machine)
+3. Use multiple LB IPs (bind to multiple IPs per machine)
+4. Enable TCP keep-alive: fewer new connections per second
+5. Increase ephemeral port range: `net.ipv4.ip_local_port_range = 1024 65000`
+
+## Anti-Patterns Hall of Shame
+
+### Anti-pattern 1: Health Check That Only Checks the Process
+
+**Mistake**: `curl http://localhost:3000/health` returns 200 because the Node.js process is running, but the process is in an infinite GC loop and cannot serve requests.
+
+**Why reasonable**: Checking the process is the simplest health check. It works for 90% of failures (process crash, OOM kill).
+
+**Production impact**: 10% of failures go undetected. Users see timeouts while the load balancer thinks the backend is healthy.
+
+**Correct pattern**: Health endpoint queries Postgres (`SELECT 1`), Redis (`PING`), and checks internal request queue depth. Return 503 if any dependency is unhealthy.
+
+### Anti-pattern 2: Infinite Retries
+
+**Mistake**: Set `retries = 10` to "improve reliability."
+
+**Why reasonable**: If one attempt fails, retrying should eventually succeed. More retries = more reliable, right?
+
+**Production impact**: A failing backend receives 10x the request rate from retries alone. If 1000 clients all have retry=10, the failing backend gets 10,000 requests instead of 1000. The retry storm propagates to other backends as the retries time out and redirect.
+
+**Correct pattern**: retries = 2 for idempotent requests (GET, PUT, DELETE). retries = 0 for POST. Exponential backoff: first retry after 200ms, second after 1 second.
+
+### Anti-pattern 3: Single Load Balancer
+
+**Mistake**: One load balancer machine. "It's just a proxy, it never fails."
+
+**Why reasonable**: Load balancers are simple software. They handle millions of packets without crashing. A single machine is cheaper.
+
+**Production impact**: Network switch failure, power outage, OS kernel panic, or accidental config change takes down the entire service. Mean time to recovery: 10-30 minutes (DNS propagation + boot + config validation).
+
+**Correct pattern**: At least two load balancers in active-active mode. Use a health-checked anycast VIP or cloud NLB in front of them.
+
+### Anti-pattern 4: Sticky Sessions as a Crutch
+
+**Mistake**: "We need sticky sessions because our app stores session data in local memory. Adding Redis is too much work."
+
+**Why reasonable**: Sticky sessions require zero code changes. The load balancer handles it with a cookie or IP hash.
+
+**Production impact**: A backend failure loses all sessions on that server. Rolling deployments log users out. Auto-scaling events redistribute users unpredictably.
+
+**Correct pattern**: Externalize session state to Redis or Memcached. Use encrypted JWTs for stateless authentication. Only use sticky sessions as a last resort for legacy applications being decommissioned.
+
+### Anti-pattern 5: Crank Up `maxconn` to Infinity
+
+**Mistake**: Set `maxconn 100000` on every backend "to handle traffic spikes."
+
+**Why reasonable**: During a traffic spike, you want the backends to receive as much traffic as they can handle. The backend has auto-scaling, right?
+
+**Production impact**: Without per-backend connection limits, one slow backend accumulates tens of thousands of queued requests. Memory grows unbounded. The backend OOMs. The load balancer now has 40,000 pending connections to a dead server, consuming connection tracking resources.
+
+**Correct pattern**: Set `maxconn` per backend to 200-500. Set a queue timeout of 1-3 seconds. Beyond that, return 503. Auto-scaling should add backends before connections are exhausted, not after.
+
+## When NOT to Use This
+
+### Over-Engineering Signals
+
+**Signal 1**: Your service fits on one machine and has no redundancy requirement. Adding a load balancer adds latency (0.5-2 ms), cost (one more machine or cloud LB hourly fee), and complexity (one more thing that can fail).
+
+**Signal 2**: You are serving under 100 req/s and have no SLA. A single well-provisioned server with a reverse proxy (Caddy, Nginx, Caddy) handles this trivially. The reverse proxy can grow into a load balancer later.
+
+**Signal 3**: Your traffic is entirely read-only and cacheable. A CDN handles this better than a load balancer. Cloudflare, Fastly, or Akamai cache responses at the edge and absorb traffic before it reaches your origin.
+
+### Simpler Alternatives
+
+| Scale | Alternative to load balancer | Why it works |
+|---|---|---|
+| Under 100 req/s | Single server with Nginx reverse proxy | Nginx handles 10,000+ concurrent conns easily |
+| Under 1,000 req/s | Round-robin DNS with health checks | Clients retry on failure, DNS TTL ~60s |
+| Read-heavy under 10k rps | CDN + single origin | 90% cache hit absorbs traffic |
+| Small team, no ops | Cloud LB (AWS ALB/GCP HTTP LB) | Managed, auto-scaled, no config files |
+| Internal tools only | No LB, use client-side retry logic | A dozen internal users do not need distribution |
+
+### Scale Thresholds to Reconsider
+
+- **Below 50 req/s**: You do not need a load balancer. Run a single server with a process manager.
+- **Below 500 req/s**: A single Nginx instance as reverse proxy is sufficient. Skip the dedicated LB tier.
+- **Below 5,000 req/s**: One load balancer (active-passive with a hot standby). Cloud LB or self-managed.
+- **Above 50,000 req/s**: Multi-tier (L4 cloud LB + L7 self-managed). Multiple instances in active-active.
+- **Above 500,000 req/s**: Anycast with multiple PoPs. Custom kernel bypass (DPDK/XDP). Hardware acceleration.
+
+---
+**Next: See how real companies -- Netflix, Uber, Discord, and Cloudflare -- deploy load balancers at massive scale.**
