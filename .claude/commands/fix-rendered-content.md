@@ -19,15 +19,22 @@ Mojibake is not random — it means a write path somewhere is not forcing UTF-8,
 - **Python generation scripts:** every `open(path, "w")` that writes an `.mdx` file must pass `encoding="utf-8"` explicitly. On Windows, Python defaults to the system codepage (cp1252), which turns `─` into `â”€` — this is the single most common root cause. Search the pipeline for `open(` calls writing docs and confirm each has `encoding="utf-8"`.
 - **PowerShell fix/edit scripts:** every `Get-Content` and `Set-Content` touching `.mdx` must use `-Encoding UTF8`. A single script without it re-corrupts every file it touches.
 - **Node/JS scripts:** `fs.writeFileSync(path, data)` defaults to UTF-8 and is usually safe, but confirm no explicit `latin1`/`binary` encoding is set.
+- **AsciiDiagram children/content mismatch:** The component reads `props.content`, not `props.children`. If any `.mdx` file uses `>` followed by `{` backtick to open a diagram (children pattern), the diagram renders empty. Run `grep -rn '</AsciiDiagram>' docs/` to find all files using the children pattern — each occurrence is a Defect E.
 - **The model/API response itself:** if the pipeline pipes model output through a shell or intermediate buffer with a non-UTF-8 codepage (Windows console default is often cp437/cp1252), the corruption can happen before the file is even written. Setting the console to UTF-8 (`chcp 65001`) or writing bytes directly from the API response rather than through a decoded string avoids this.
 
 Report which write path is the likely leak. If the leak isn't fixed, note in the final report that cleanup will need re-running after the next generation batch — cleaning symptoms without fixing the source is a treadmill.
 
 ---
 
+### Defect E — AsciiDiagram children prop instead of content prop
+
+See detection and fix below in the defect list.
+
+---
+
 ## STEP 1 — SCOPE AND SCAN
 
-Read every `.mdx` file under `docs/$ARGUMENTS/` (or all courses if `all`). For each file, scan for the four defect classes below. Process in batches of 15–20 files, reporting findings per batch — do not disappear into one silent giant pass.
+Read every `.mdx` file under `docs/$ARGUMENTS/` (or all courses if `all`). For each file, scan for the five defect classes below. Process in batches of 15–20 files, reporting findings per batch — do not disappear into one silent giant pass.
 
 ### Defect A — Mojibake / gibberish characters
 Double-encoded UTF-8: box-drawing, arrow, and punctuation characters that got mangled into garbage.
@@ -48,6 +55,16 @@ An `<AsciiDiagram>` whose template-literal content is empty, only whitespace, or
 A fenced code block (```` ``` ````) with no content between the fences, or an opening fence with no closing fence (which can swallow following content or render blank).
 - **Detect:** two consecutive fence lines with only whitespace between them; an odd number of fence markers in the file (unclosed fence); a language-tagged fence (```` ```python ````) immediately followed by a closing fence with nothing between.
 
+### Defect E — AsciiDiagram children prop instead of content prop
+
+An AsciiDiagram passes content as JSX children (`>{``...``}` / `{``...``}</AsciiDiagram>`) instead of the `content` prop (`content={`...`} />`). The component reads only `content` from props (line 6 of `index.jsx`: `{id, content = '', ...}`) and ignores `props.children`. The diagram renders as an empty pre block.
+
+- **Detect:** An AsciiDiagram opening tag followed by `>{`` ``}` (children pattern) instead of `content={`` ``}`. Or grep for `</AsciiDiagram>` in any directory — self-closing `/>` is the correct form.
+- **Fix:** 
+  1. Replace `>` before the opening backtick with `content=` (e.g. `caption="..."`  `>{`` ` → `caption="..."`  `content={`` `).
+  2. Replace `</AsciiDiagram>` with `/>`.
+  3. 4 spaces of indent before `content={` to match other prop indentation.
+
 ### Defect D — Content that got eaten by an earlier defect
 When a code fence is unclosed or an AsciiDiagram lost its terminator, everything after it can be absorbed into that block and render as one blank or literal mass. If a file has a suspiciously short rendered body relative to its line count, or large runs of content that appear to be inside a never-closed fence/diagram, flag it.
 
@@ -64,7 +81,8 @@ Before fixing, decide per defect whether the original content can be recovered o
 - **Defect B, empty diagram:** **needs regeneration** — there is no original content to recover; the diagram was never written or was lost. The surrounding prose usually describes what the diagram should show — use that to regenerate a correct diagram.
 - **Defect C, empty code block:** **needs regeneration** if the surrounding text references code that should be there; **deletable** if it's a stray empty fence with no referent.
 - **Defect C, unclosed fence:** **recoverable** — add the missing closing fence at the correct boundary (where the code ends and prose resumes).
-- **Defect D:** depends on the root cause (B or C) — fix the root, and the eaten content usually reappears correctly.
+- **Defect D, content eaten by prior defect:** depends on the root cause (B or C) — fix the root, and the eaten content usually reappears correctly.
+- **Defect E, children vs content prop:** **recoverable** — mechanical find-and-replace across all files in the topic. Run `grep -rn '</AsciiDiagram>' docs/$SLUG/` to find all occurrences; each one needs the two-step fix above.
 
 ---
 
@@ -130,6 +148,7 @@ Defects found:
   C — empty/broken code blocks (regenerated/deleted): <count>
   C — unclosed fences (closed): <count>
   D — eaten content (recovered via root fix): <count>
+  E — AsciiDiagram children→content prop (converted): <count>
 
 Files still flagged NEEDS MANUAL REVIEW: <list>
 Build verified clean: yes/no
