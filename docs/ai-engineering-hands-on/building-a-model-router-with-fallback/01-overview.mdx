@@ -1,0 +1,900 @@
+---
+id: building-a-model-router-with-fallback-overview
+title: Building a Model Router with Fallback
+sidebar_label: Overview
+sidebar_position: 1
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Problem Story
+
+It is 3:14 PM on a Tuesday. Your AI-powered code review tool is serving
+engineers across your company. Then the Slack messages start:
+
+"Code review bot is down."
+"Getting 503 errors on the review endpoint."
+"My PR has been pending for 20 minutes."
+
+You check the logs. The upstream LLM provider returned a 429 rate limit
+response for the past 90 seconds. Your code calls a single endpoint with a
+hardcoded model string. When that endpoint fails, the whole feature fails.
+There is no second chance. There is no fallback.
+
+This scenario plays out every day at companies of every size. Providers have
+outages. Rate limits spike during peak hours. Models get deprecated without
+warning. A single point of failure in your AI pipeline creates cascading
+downtime across your product.
+
+The fix is not to find a more reliable provider. No provider is perfect. The
+fix is to build a **model router with fallback** that treats every LLM call as
+an attempt, not a guarantee.
+
+## The Concept
+
+A model router is an abstraction layer between your application and the LLM
+providers it uses. Instead of calling a specific provider directly, your code
+sends a request to the router, which decides which provider and model to use
+based on rules you define.
+
+Fallback means the router does not give up after the first failure. It tries
+the next provider in sequence, then the next, until one succeeds or the chain
+is exhausted.
+
+```text
+Application code
+     |
+     v
+  Model Router ---> Try Provider A (primary)
+     |                  |
+     |               success? --> return response
+     |                  |
+     |               failure? --> record error
+     |
+     +-------------> Provider B (fallback 1)
+     |                  |
+     |               success? --> return response
+     |                  |
+     |               failure? --> record error
+     |
+     +-------------> Provider C (fallback 2)
+                        |
+                     success? --> return response
+                        |
+                     failure? --> raise timeout / unavailable error
+```
+
+The router handles several failure modes:
+
+- **HTTP errors**: 429 rate limited, 500 server error, 503 unavailable
+- **Timeout errors**: Provider takes too long to respond
+- **Authentication errors**: Expired or invalid API keys
+- **Content filtering**: Model refuses the request
+- **Empty responses**: Model returns null or truncated output
+
+By routing around failures, your application stays online even when
+individual providers have problems. Users see slower responses during
+fallback but they see responses, not error pages.
+
+## API / SDK / CLI Reference
+
+This section covers the patterns and libraries involved in building model
+routers with fallback. The exact method signatures change as SDKs evolve,
+so focus on the concepts and adapt them to the current version of your
+tools.
+
+### Retry Logic Patterns
+
+Every HTTP-based LLM SDK supports some form of retry. The standard approach
+is exponential backoff with jitter:
+
+```python
+import time
+import random
+
+def retry_with_backoff(fn, max_retries=3, base_delay=1.0):
+    """Call fn with exponential backoff and jitter."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            last_error = e
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+            time.sleep(delay)
+```
+
+Key parameters:
+
+- `max_retries`: Number of retry attempts (typically 2 to 5)
+- `base_delay`: Initial wait time in seconds
+- `backoff_factor`: Multiplier applied each attempt (usually 2)
+- `jitter`: Random offset to prevent thundering herd
+
+### Timeout Handling
+
+Every provider call needs a timeout to prevent stuck requests from blocking
+your application indefinitely.
+
+```python
+import httpx
+
+client = httpx.Client(timeout=httpx.Timeout(
+    connect=10.0,    # Time to establish connection
+    read=60.0,       # Time to receive the full response
+    write=30.0,      # Time to send the request body
+    pool=5.0         # Time to wait for a connection from the pool
+))
+```
+
+The Anthropic SDK and OpenAI SDK both accept `timeout` as a parameter to
+their client constructors. A common pattern is to double the timeout for
+the primary provider and use a shorter timeout for fallbacks to surface
+failures faster.
+
+### Circuit Breaker Pattern
+
+A circuit breaker prevents repeated calls to a failing provider. It tracks
+consecutive failures and opens the circuit after a threshold, causing the
+router to skip that provider entirely for a cooldown period.
+
+```python
+from datetime import datetime, timedelta
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, cooldown_seconds=60):
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "closed"  # closed, open, half-open
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = datetime.now()
+        if self.failure_count >= self.failure_threshold:
+            self.state = "open"
+
+    def record_success(self):
+        self.failure_count = 0
+        self.state = "closed"
+
+    def allow_request(self):
+        if self.state == "open":
+            elapsed = (datetime.now() - self.last_failure_time).total_seconds()
+            if elapsed >= self.cooldown_seconds:
+                self.state = "half-open"
+                return True
+            return False
+        return True
+```
+
+Circuit states:
+
+- **Closed**: Normal operation, requests pass through
+- **Open**: Requests are blocked, provider is skipped
+- **Half-open**: Cooldown expired, a single test request is allowed
+
+### Provider Status Checking
+
+Before routing, check whether a provider is likely available. This can be a
+simple health endpoint ping or a lightweight model list fetch.
+
+```python
+import httpx
+
+async def check_provider_health(provider_config):
+    """Check if a provider endpoint is reachable."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                provider_config["health_url"],
+                timeout=5.0,
+                headers={"Authorization": f"Bearer {provider_config['api_key']}"}
+            )
+            return resp.status_code == 200
+    except (httpx.TimeoutException, httpx.ConnectError):
+        return False
+```
+
+Do not make health checks mandatory before every request. They add latency
+and can rate-limit you. Use them sparingly, such as before the primary call
+if it has been failing recently.
+
+### Fallback Chains
+
+A fallback chain is an ordered list of providers with their associated
+models. The router tries each one in sequence until a response is received.
+
+```python
+FALLBACK_CHAIN = [
+    {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-20250514",
+        "timeout": 60,
+        "priority": 1
+    },
+    {
+        "provider": "openai",
+        "model": "gpt-4o",
+        "timeout": 60,
+        "priority": 2
+    },
+    {
+        "provider": "openrouter",
+        "model": "anthropic/claude-3.5-sonnet",
+        "timeout": 90,
+        "priority": 3
+    },
+    {
+        "provider": "ollama",
+        "model": "llama3.2:latest",
+        "timeout": 120,
+        "priority": 4
+    }
+]
+```
+
+Design your chain so that:
+
+1. The primary provider is the fastest and most capable
+2. Fallbacks are progressively slower or less capable but reliable
+3. The last fallback is a local model with zero external dependency
+4. Each entry has reasonable timeouts tailored to that provider
+
+### Concurrent Attempts
+
+For latency-critical applications, the router can try multiple providers
+simultaneously and use the first successful response. This is called a
+race pattern.
+
+```python
+import asyncio
+
+async def race_providers(provider_calls, timeout=30.0):
+    """Try multiple providers concurrently, return first success."""
+
+    async def try_one(coro, provider_name):
+        try:
+            result = await asyncio.wait_for(coro, timeout=timeout)
+            return (provider_name, result)
+        except Exception as e:
+            return (provider_name, e)
+
+    tasks = [try_one(coro, name) for name, coro in provider_calls]
+
+    # Wait for first completion
+    done, pending = await asyncio.wait(
+        tasks,
+        return_when=asyncio.FIRST_COMPLETED,
+        timeout=timeout
+    )
+
+    # Cancel remaining tasks
+    for task in pending:
+        task.cancel()
+
+    # Check the first done task for success
+    for task in done:
+        name, result = task.result()
+        if not isinstance(result, Exception):
+            return name, result
+
+    raise RuntimeError("All providers failed")
+```
+
+Concurrent attempts consume tokens on multiple providers simultaneously.
+Use this only when latency is more important than cost.
+
+## Big Picture Diagram
+
+```ascii
+┌─────────────────────────────────────────────────────────────┐
+│                      Application Code                        │
+│  user_input ──> format_messages() ──> call_llm() ──> parse() │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+                          v
+┌─────────────────────────────────────────────────────────────┐
+│                      Model Router                            │
+│                                                              │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐  │
+│  │ Circuit  │   │  Retry   │   │ Timeout  │   │  Status  │  │
+│  │ Breaker  │──>│  Logic   │──>│ Handler  │──>│  Cache   │  │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────┘  │
+│         │             │              │             │         │
+│         v             v              v             v         │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │              Fallback Chain Decision                  │    │
+│  │  priority 1: try Provider A (primary)                │    │
+│  │  priority 2: try Provider B (fallback 1)             │    │
+│  │  priority 3: try Provider C (fallback 2)             │    │
+│  │  priority 4: try Provider D (local fallback)         │    │
+│  └──────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          v
+              ┌───────────────────────┐
+              │  Success? ──> return  │
+              │  Failure? ──> error   │
+              └───────────────────────┘
+```
+
+<AsciiDiagram
+  id="building-a-model-router-with-fallback/overview-flow"
+  title="End-to-end model router flow"
+  alt="Diagram showing application code calling a model router, which uses circuit breaker, retry logic, timeout handler, and status cache to decide which provider to try in priority order."
+  caption="The model router intercepts all LLM calls and applies circuit breaker, retry logic, timeout handling, and status caching before selecting a provider from the fallback chain." content={`┌─────────────────────────────────────────────────────────────┐
+│                      Application Code                        │
+│  user_input ──> format_messages() ──> call_llm() ──> parse() │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+                          v
+┌─────────────────────────────────────────────────────────────┐
+│                      Model Router                            │
+│                                                              │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐  │
+│  │ Circuit  │   │  Retry   │   │ Timeout  │   │  Status  │  │
+│  │ Breaker  │──>│  Logic   │──>│ Handler  │──>│  Cache   │  │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────┘  │
+│         │             │              │             │         │
+│         v             v              v             v         │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │              Fallback Chain Decision                  │    │
+│  │  priority 1: try Provider A (primary)                │    │
+│  │  priority 2: try Provider B (fallback 1)             │    │
+│  │  priority 3: try Provider C (fallback 2)             │    │
+│  │  priority 4: try Provider D (local fallback)         │    │
+│  └──────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          v
+              ┌───────────────────────┐
+              │  Success? ──> return  │
+              │  Failure? ──> error   │
+              └───────────────────────┘
+`} />
+
+## How It Works
+
+A model router processes each request through a sequence of stages. Each
+stage handles a specific failure mode and either returns a response or
+passes to the next fallback.
+
+### Stage 1: Circuit Breaker Check
+
+Every provider in the chain has an associated circuit breaker. Before
+attempting a call, the router checks whether the circuit is open for that
+provider.
+
+```python
+def get_available_providers(chain, circuit_breakers):
+    available = []
+    for entry in chain:
+        cb = circuit_breakers.get(entry["provider"])
+        if cb is None or cb.allow_request():
+            available.append(entry)
+    return available
+```
+
+If the circuit is open, the provider is skipped entirely. This prevents
+wasted time and tokens on a provider that is known to be failing.
+
+### Stage 2: Retry with Exponential Backoff
+
+Each provider attempt includes retry logic. The router distinguishes between
+retriable and non-retriable errors.
+
+**Retriable errors**:
+
+- 429 Too Many Requests (rate limited)
+- 500 Internal Server Error
+- 502 Bad Gateway
+- 503 Service Unavailable
+- Connection timeout
+- Read timeout
+
+**Non-retriable errors**:
+
+- 400 Bad Request (bad prompt format)
+- 401 Unauthorized (invalid API key)
+- 403 Forbidden (permission denied)
+- 404 Not Found (model not found)
+- 413 Payload Too Large (input exceeds context limit)
+- Content filter triggered
+
+```python
+RETRIABLE_STATUS_CODES = {429, 500, 502, 503}
+
+def is_retriable(error):
+    if hasattr(error, "status_code"):
+        return error.status_code in RETRIABLE_STATUS_CODES
+    if isinstance(error, (httpx.TimeoutException, httpx.ConnectError)):
+        return True
+    return False
+```
+
+The router retries only retriable errors with exponential backoff. Non-
+retriable errors skip retry and immediately advance to the next fallback.
+
+### Stage 3: Timeout Handling
+
+Timeouts are configured per provider. The router uses an overall timeout
+and a per-try timeout.
+
+```python
+import asyncio
+
+async def try_provider_with_timeout(coro, overall_timeout):
+    """Attempt a provider call with a hard timeout."""
+    try:
+        result = await asyncio.wait_for(coro, timeout=overall_timeout)
+        return result
+    except asyncio.TimeoutError:
+        raise TimeoutError("Provider did not respond in time")
+```
+
+Choose timeout values based on the provider's typical latency:
+
+- Cloud providers (Anthropic, OpenAI): 30 to 60 seconds
+- Aggregators (OpenRouter): 60 to 90 seconds
+- Local models (Ollama): 120 to 300 seconds
+
+### Stage 4: Rate Limit Detection
+
+Rate limit responses typically include a `Retry-After` header. The router
+can use this information to wait before retrying or to skip the provider
+temporarily.
+
+```python
+import time
+
+def get_retry_after(response_headers):
+    """Extract retry delay from response headers."""
+    retry_after = response_headers.get("Retry-After")
+    if retry_after is None:
+        return None
+    try:
+        return int(retry_after)
+    except ValueError:
+        # Parse HTTP-date format if needed
+        return None
+
+def handle_rate_limit(provider_name, retry_seconds, circuit_breakers):
+    """Record a rate limit and update circuit breaker state."""
+    cb = circuit_breakers.get(provider_name)
+    if cb:
+        cb.record_failure()
+        # Use max of retry-after and default cooldown
+        cb.cooldown_seconds = max(
+            cb.cooldown_seconds,
+            retry_seconds + 5 if retry_seconds else 60
+        )
+```
+
+### Stage 5: Fallback to Next Provider
+
+When a provider fails with a retriable error and all retries are exhausted,
+the router advances to the next provider in the chain.
+
+```python
+async def route_with_fallback(prompt, fallback_chain, circuit_breakers, providers):
+    """Try each provider in order until one succeeds."""
+    errors = []
+    for entry in fallback_chain:
+        provider_name = entry["provider"]
+        cb = circuit_breakers.get(provider_name)
+
+        if cb and not cb.allow_request():
+            errors.append((provider_name, "Circuit breaker open"))
+            continue
+
+        try:
+            client = providers[provider_name]["client"]
+            model = entry["model"]
+            timeout = entry.get("timeout", 60)
+
+            response = await try_provider_with_timeout(
+                client.send_message(prompt, model=model),
+                overall_timeout=timeout
+            )
+            if cb:
+                cb.record_success()
+            return response
+
+        except Exception as e:
+            if cb:
+                cb.record_failure()
+            errors.append((provider_name, str(e)))
+            continue
+
+    raise AllProvidersError("All providers failed", errors=errors)
+```
+
+### Stage 6: Error Aggregation and Logging
+
+When all providers fail, the router returns an aggregated error that lists
+each provider and the reason it failed. This information is critical for
+debugging and monitoring.
+
+```python
+class AllProvidersError(Exception):
+    def __init__(self, message, errors):
+        self.errors = errors
+        super().__init__(message)
+
+    def summary(self):
+        lines = ["All providers failed:"]
+        for provider, reason in self.errors:
+            lines.append(f"  - {provider}: {reason}")
+        return "\n".join(lines)
+```
+
+### Exception Types Diagram
+
+<AsciiDiagram
+  id="building-a-model-router-with-fallback/exception-types"
+  title="Hierarchy of exception types handled by model router"
+  alt="Diagram showing retriable errors (429, 500, 502, 503, timeouts) versus non-retriable errors (400, 401, 403, 404, 413, content filter) and how the router routes each to retry, fallback, or immediate failure."
+  caption="The router classifies errors into retriable and non-retriable categories. Retriable errors trigger backoff and retry; non-retriable errors immediately advance to the next fallback." content={`                        ┌─────────────────┐
+                        │  LLM Response    │
+                        │  Error           │
+                        └────────┬────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    v                         v
+           ┌────────────────┐       ┌──────────────────┐
+           │ Retriable       │       │ Non-Retriable     │
+           │                 │       │                   │
+           │ ┌─────────────┐ │       │ ┌───────────────┐ │
+           │ │ 429 Rate    │ │       │ │ 400 Bad       │ │
+           │ │  Limited    │ │       │ │  Request      │ │
+           │ ├─────────────┤ │       │ ├───────────────┤ │
+           │ │ 500/502/503 │ │       │ │ 401/403 Auth  │ │
+           │ │  Server     │ │       │ │  Error        │ │
+           │ ├─────────────┤ │       │ ├───────────────┤ │
+           │ │ Connection  │ │       │ │ 404 Model     │ │
+           │ │  Timeout    │ │       │ │  Not Found    │ │
+           │ ├─────────────┤ │       │ ├───────────────┤ │
+           │ │ Read        │ │       │ │ 413 Payload   │ │
+           │ │  Timeout    │ │       │ │  Too Large    │ │
+           │ └─────────────┘ │       │ └───────────────┘ │
+           └────────┬────────┘       └────────┬──────────┘
+                    │                         │
+                    v                         v
+           ┌────────────────┐       ┌──────────────────┐
+           │ Exponential    │       │ Skip to next     │
+           │  Backoff Retry │       │ provider in      │
+           │  (up to N      │       │ fallback chain   │
+           │   attempts)    │       │                  │
+           └────────┬────────┘       └──────────────────┘
+                    │
+                    v
+           ┌────────────────┐
+           │ All retries    │
+           │ exhausted?     │
+           │  yes ──> next  │
+           │  no  ──> retry │
+           └────────────────┘
+`} />
+
+### Timeout Strategy Diagram
+
+<AsciiDiagram
+  id="building-a-model-router-with-fallback/timeout-flow"
+  title="Timeout handling flow across providers"
+  alt="Diagram showing how different timeout values apply to each provider in the fallback chain, with cloud providers getting shorter timeouts and local models getting longer timeouts."
+  caption="Each provider has a tailored timeout. Cloud providers get short timeouts because they should respond quickly under normal conditions. Local models get longer timeouts because they run on potentially underpowered hardware." content={`Fallback Chain:
+┌─────────────┬──────────────┬─────────────┬────────────────┐
+│ Provider    │ Model        │ Timeout     │ Role           │
+├─────────────┼──────────────┼─────────────┼────────────────┤
+│ Anthropic   │ claude-sonnet│ 30 seconds  │ Primary        │
+│ OpenAI      │ gpt-4o      │ 30 seconds  │ Fallback 1     │
+│ OpenRouter  │ claude-sonnet│ 60 seconds  │ Fallback 2     │
+│ Ollama      │ llama3.2    │ 120 seconds │ Local fallback │
+└─────────────┴──────────────┴─────────────┴────────────────┘
+
+Timeline:
+0s       30s        60s         120s
+├─────────┼──────────┼───────────┼───────────>
+Anthropic
+          OpenAI
+                     OpenRouter
+                                Ollama
+
+Each provider attempt includes:
+┌──────────────────────────────────────────┐
+│ Single Provider Attempt                   │
+│                                           │
+│  ┌─────────┐   ┌───────────┐   ┌──────┐  │
+│  │ Connect │──>│ Send      │──>│ Read │  │
+│  │ (10s)   │   │ Request   │   │ Resp │  │
+│  │         │   │ (30s)     │   │ (30s)│  │
+│  └─────────┘   └───────────┘   └──────┘  │
+└──────────────────────────────────────────┘
+`} />
+
+### Circuit Breaker States Diagram
+
+<AsciiDiagram
+  id="building-a-model-router-with-fallback/circuit-breaker-states"
+  title="Circuit breaker state machine"
+  alt="Diagram showing the three circuit breaker states: closed (normal), open (blocked), and half-open (test), with transitions between them based on failure threshold and cooldown."
+  caption="The circuit breaker starts closed. After N consecutive failures it opens. After a cooldown period it transitions to half-open and allows a single test request. Success closes it; failure reopens it." content={`                  ┌─────────────────────────────┐
+                  │         CLOSED              │
+                  │  (Normal operation)          │
+                  │  Requests pass through       │
+                  │                              │
+                  │  failure_count < threshold   │
+                  └──────────┬──────────────────┘
+                             │
+                    N consecutive failures
+                             │
+                             v
+                  ┌─────────────────────────────┐
+                  │         OPEN                 │
+                  │  (Failing, requests blocked) │
+                  │  Provider is skipped         │
+                  │                              │
+                  │  Waiting: cooldown timer     │
+                  └──────────┬──────────────────┘
+                             │
+                    Cooldown expired
+                             │
+                             v
+                  ┌─────────────────────────────┐
+                  │      HALF-OPEN              │
+                  │  (Test request allowed)      │
+                  │                              │
+                  │  Allow one request           │
+                  └──────────┬──────────────────┘
+                    ┌────────┴────────┐
+                    v                 v
+               Success            Failure
+                    │                 │
+                    v                 v
+            ┌────────────┐    ┌────────────┐
+            │  CLOSED    │    │   OPEN     │
+            └────────────┘    └────────────┘
+`} />
+
+### Rate Limit Detection and Handling
+
+When a provider returns a 429 status code, the router needs to handle it
+differently than other failures. Rate limits are temporary and the provider
+may recover quickly.
+
+```python
+import time
+from datetime import datetime
+
+class RateLimitTracker:
+    def __init__(self, max_requests_per_minute=60):
+        self.max_requests_per_minute = max_requests_per_minute
+        self.request_timestamps = []
+
+    def is_rate_limited(self):
+        """Check if we are approaching the rate limit."""
+        now = time.time()
+        window_start = now - 60
+        self.request_timestamps = [
+            t for t in self.request_timestamps if t > window_start
+        ]
+        return len(self.request_timestamps) >= self.max_requests_per_minute
+
+    def record_request(self):
+        self.request_timestamps.append(time.time())
+
+    def get_wait_time(self):
+        """Return seconds to wait before next request."""
+        if len(self.request_timestamps) < self.max_requests_per_minute:
+            return 0
+        oldest = min(self.request_timestamps)
+        return max(0, 60 - (time.time() - oldest))
+```
+
+### Response Validation
+
+Before returning a response, the router validates that the output is
+well-formed and non-empty. This catches providers that return empty or
+malformed responses without raising an error.
+
+```python
+def validate_response(response, expected_format="text"):
+    """Check that the response is usable."""
+    if response is None:
+        return False, "Empty response"
+    if expected_format == "json":
+        import json
+        try:
+            json.loads(response)
+        except (json.JSONDecodeError, TypeError):
+            return False, "Invalid JSON response"
+    if expected_format == "text":
+        content = getattr(response, "content", response)
+        if not content or len(str(content).strip()) == 0:
+            return False, "Empty text response"
+    return True, response
+```
+
+## Cost, Limits, Safety
+
+### Cost Implications of Fallback
+
+Every fallback attempt costs money. If the primary provider fails on every
+request and you have three fallbacks, each request costs four times the
+normal amount. Over a day with thousands of requests, this adds up.
+
+Consider these cost scenarios:
+
+- **Primary succeeds**: Cost of one API call
+- **Primary fails, fallback 1 succeeds**: Cost of primary attempt (wasted)
+  plus fallback cost
+- **All providers fail**: Cost of all attempted calls, zero successful
+  responses
+
+Ways to control fallback costs:
+
+1. **Lower-cost fallbacks**: Use cheaper models as fallbacks. If GPT-4
+   fails, fall back to GPT-3.5 or a local model.
+2. **Short timeouts**: Fail fast on the primary so wasted calls are cheap.
+3. **Circuit breakers**: Skip providers that are known to be failing
+   instead of burning tokens on attempts.
+4. **Maximum cost limit**: Track the total cost per request and reject
+   requests that would exceed the budget.
+5. **Rate limit awareness**: If the primary provider is rate-limited, do
+   not waste fallback attempts on the same provider.
+6. **Caching**: Cache responses for identical prompts so you do not re-
+   attempt falling back for the same input.
+
+### Avoiding Infinite Retry Loops
+
+An infinite retry loop is the most dangerous failure mode of a model
+router. It can exhaust your API budget in minutes.
+
+Apply these safety measures:
+
+1. **Maximum retry count**: Hard limit of retries per provider
+2. **Maximum fallback chain length**: Limit to 3 or 4 providers
+3. **Global timeout**: Abort the entire request after X seconds regardless
+   of how many fallbacks are pending
+4. **Consecutive failure tracking**: If every provider fails for N
+   consecutive requests, stop retrying and return an error immediately
+5. **Budget tracking**: If the total token spend for a single user request
+   exceeds Y dollars, stop
+6. **Dead man switch**: A monitoring alert that fires if no successful
+   response has been returned for Z minutes
+
+```python
+class SafetyLimiter:
+    def __init__(self):
+        self.max_retries = 3
+        self.max_fallback_depth = 4
+        self.global_timeout_seconds = 300
+        self.max_cost_per_request = 0.50
+        self.consecutive_failure_threshold = 10
+        self.failure_counter = 0
+
+    def check_safety(self, request_context):
+        if self.failure_counter >= self.consecutive_failure_threshold:
+            raise SafetyLimitError("Too many consecutive failures")
+        if request_context.get("elapsed_seconds", 0) > self.global_timeout_seconds:
+            raise SafetyLimitError("Global timeout exceeded")
+        if request_context.get("accumulated_cost", 0) > self.max_cost_per_request:
+            raise SafetyLimitError("Cost limit exceeded")
+
+    def record_failure(self):
+        self.failure_counter += 1
+
+    def record_success(self):
+        self.failure_counter = 0
+```
+
+### API Key Safety
+
+Never hardcode API keys for fallback providers in your source code. Use
+environment variables or a secrets manager. A model router with multiple
+providers has multiple attack surfaces if keys are exposed.
+
+```python
+import os
+
+def load_provider_config():
+    return {
+        "anthropic": {
+            "api_key": os.environ.get("ANTHROPIC_API_KEY"),
+            "base_url": "https://api.anthropic.com/v1"
+        },
+        "openai": {
+            "api_key": os.environ.get("OPENAI_API_KEY"),
+            "base_url": "https://api.openai.com/v1"
+        },
+        "openrouter": {
+            "api_key": os.environ.get("OPENROUTER_API_KEY"),
+            "base_url": "https://openrouter.ai/api/v1"
+        },
+        "ollama": {
+            "api_key": None,  # Local, no key needed
+            "base_url": os.environ.get("OLLAMA_URL", "http://localhost:11434")
+        }
+    }
+```
+
+Each provider configuration is loaded at startup from environment variables
+so no secrets are stored in the codebase.
+
+## When to Use / When Not To
+
+### Use a Model Router with Fallback When
+
+- Your application needs high availability for LLM features
+- You serve users across multiple geographic regions where different
+  providers have different latency profiles
+- You are building a developer tool or API that other services depend on
+- You want to hedge against provider-specific outages or deprecations
+- You need to comply with data residency requirements (fall back to local
+  or region-specific providers)
+- Your application handles critical workflows where failure is not
+  acceptable
+
+### Do Not Use a Model Router with Fallback When
+
+- Your application runs a single experimental feature where downtime is
+  acceptable
+- The cost of fallback attempts exceeds the value of the feature
+- You are prototyping and the added complexity slows iteration
+- All providers use the same underlying model (no diversity in fallbacks)
+- Your application processes highly sensitive data that cannot be sent to
+  multiple third-party providers without additional agreements
+- You already have a load balancer or API gateway that handles routing at
+  the network level
+
+## Mental Model Check
+
+**Q1**: A provider returns a 401 Unauthorized error. Should the router
+retry with backoff or skip to the next provider?
+
+**A1**: Skip to the next provider. A 401 error indicates an authentication
+problem that will not resolve with retries. Only retriable errors (429,
+5xx, timeouts) should trigger backoff and retry.
+
+**Q2**: Your circuit breaker is in the open state for the primary
+provider. The cooldown period has expired. What state does the circuit
+transition to, and what happens on the next request?
+
+**A2**: The circuit transitions to half-open. The next request is allowed
+through as a test. If it succeeds, the circuit closes. If it fails, the
+circuit reopens and the cooldown restarts.
+
+**Q3**: What are the consequences of using a race pattern (concurrent
+providers) instead of a sequential fallback chain?
+
+**A3**: The race pattern reduces latency because the response comes from
+whichever provider responds first. However, it costs more because all
+providers are called simultaneously and most of those calls are wasted.
+The race pattern also consumes quota on all providers at once, which can
+trigger rate limits faster.
+
+**Q4**: You have four providers in your fallback chain. Each provider
+call costs approximately 1 cent in tokens. One thousand requests all
+fail on the primary provider and succeed on fallback 2. How much do these
+requests cost?
+
+**A4**: Each request costs 3 cents: 1 cent for the primary attempt
+(wasted), 1 cent for the first fallback (wasted), and 1 cent for the
+successful fallback. Total: 1,000 x 3 cents = 30 dollars. If the primary
+had succeeded, it would have cost 10 dollars. The fallback overhead cost
+20 dollars.
+
+**Q5**: Your local model (Ollama) takes 90 seconds to respond. Your
+global timeout is set to 60 seconds. What happens when the primary and
+all cloud fallbacks fail and the request reaches the local model?
+
+**A5**: The local model attempt will be cancelled by the global timeout
+before it can respond. The entire request will fail with a timeout error
+even though the local model would have succeeded given enough time. The
+fix is to set the global timeout to accommodate the slowest provider in
+the chain, or adjust the local providers timeout so it is not the
+slowest but the longest allowed.

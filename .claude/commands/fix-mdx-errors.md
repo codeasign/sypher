@@ -28,6 +28,8 @@ Never patch based on the error snippet alone — read the whole file so fixes re
 → Also check the diagram content for raw `<` / `>` (arrows, box corners). Replace with Unicode (`→ ← ↔ ↑ ↓ ↕`) or escape as `&lt;` / `&gt;`.
 
 **`ruleId: end-tag-mismatch`, `source: mdast-util-mdx-jsx`, reason "Expected a closing tag for `<AsciiDiagram>`" pointing at a single line near the end of the block**
+→ This is likely an orphaned `/>` from a bad `</AsciiDiagram>` → `/>` conversion. Check the closing line for `"/>` (a `>` closing the opening tag followed by orphaned `/>`). 
+→ Fix: Replace `"/>` with `" />` to make the tag self-closing.
 → The opening tag is non-self-closing (`<AsciiDiagram ...>`, ending in `>` not `/>`), but the block was terminated with a stray self-closing `` `} /> `` after the template literal instead of an explicit `</AsciiDiagram>`. MDX opened a tag expecting children and a real closing tag, never found one, and errors at whatever line comes next.
 → Detect: search the file for the pattern `<AsciiDiagram\b[^>]*>` (no trailing `/`) followed later by `` `} /> `` instead of `` `}</AsciiDiagram> ``.
 → Fix: replace the trailing `` `} /> `` with `` `}</AsciiDiagram> ``. Do not touch this pattern elsewhere in the file — only the immediate template-literal closer for that specific diagram block.

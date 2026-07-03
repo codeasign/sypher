@@ -1,0 +1,658 @@
+---
+id: building-a-model-router-with-fallback-practice
+title: Building a Model Router with Fallback &mdash; Practice Exercise
+sidebar_label: Let's build it
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Practice Exercise: Build a ModelRouter Class
+
+In this exercise you will build a `ModelRouter` class that tries three
+providers in sequence: Anthropic as the primary, OpenRouter as the first
+fallback, and a local Ollama instance as the final fallback.
+
+By the end of this exercise, your router will handle these scenarios:
+
+- Primary provider is available: return response from Anthropic
+- Primary is rate limited: retry twice, then fall back to OpenRouter
+- OpenRouter is down: fall back to local Ollama
+- All providers fail: raise a descriptive error with per-provider details
+
+### Setup Requirements
+
+Create a new Python file called `model_router.py`. You will need these
+dependencies installed:
+
+```bash
+pip install anthropic openai httpx
+```
+
+Create a `.env` file or set environment variables for your API keys:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-your-key-here"
+export OPENROUTER_API_KEY="sk-or-your-key-here"
+# Ollama runs locally -- no API key needed
+```
+
+**Important**: Never commit API keys to version control. Add `.env` to your
+`.gitignore` file.
+
+### Step 1: Define Provider Configuration
+
+Start by defining the structure for each provider in the fallback chain.
+Each entry needs a name, model identifier, timeout, and client factory.
+
+```python
+from dataclasses import dataclass, field
+from typing import Optional, Callable, Any
+import os
+import time
+import json
+from datetime import datetime, timedelta
+
+
+@dataclass
+class ProviderConfig:
+    """Configuration for a single LLM provider in the fallback chain."""
+    name: str
+    model: str
+    timeout: float = 60.0
+    max_retries: int = 2
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+
+
+def get_default_chain():
+    """Return the default fallback chain configuration."""
+    return [
+        ProviderConfig(
+            name="anthropic",
+            model="claude-sonnet-4-20250514",
+            timeout=60.0,
+            max_retries=2,
+            api_key=os.environ.get("ANTHROPIC_API_KEY"),
+            base_url="https://api.anthropic.com/v1"
+        ),
+        ProviderConfig(
+            name="openrouter",
+            model="anthropic/claude-3.5-sonnet",
+            timeout=90.0,
+            max_retries=1,
+            api_key=os.environ.get("OPENROUTER_API_KEY"),
+            base_url="https://openrouter.ai/api/v1"
+        ),
+        ProviderConfig(
+            name="ollama",
+            model="llama3.2:latest",
+            timeout=180.0,
+            max_retries=1,
+            api_key=None,
+            base_url=os.environ.get("OLLAMA_URL", "http://localhost:11434")
+        ),
+    ]
+```
+
+Notice that OpenRouter and Ollama have smaller `max_retries` values. This
+is deliberate: if the primary already consumed time on retries, the
+fallbacks should fail faster to avoid excessive total wait time.
+
+### Step 2: Implement a Circuit Breaker
+
+Add a circuit breaker to prevent repeatedly calling a failing provider.
+
+```python
+class CircuitBreaker:
+    """Tracks consecutive failures and opens the circuit when threshold is met."""
+
+    def __init__(self, failure_threshold: int = 3, cooldown_seconds: float = 30.0):
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self.failure_count = 0
+        self.last_failure_time: Optional[datetime] = None
+        self.state = "closed"  # closed, open, half-open
+
+    def allow_request(self) -> bool:
+        """Check if a request is allowed through the circuit."""
+        if self.state == "closed":
+            return True
+
+        if self.state == "open":
+            elapsed = (datetime.now() - self.last_failure_time).total_seconds()
+            if elapsed >= self.cooldown_seconds:
+                self.state = "half-open"
+                return True
+            return False
+
+        # half-open: allow the request
+        return True
+
+    def record_success(self):
+        """Record a successful call and reset the circuit."""
+        self.failure_count = 0
+        self.state = "closed"
+
+    def record_failure(self):
+        """Record a failed call and check if threshold is met."""
+        self.failure_count += 1
+        self.last_failure_time = datetime.now()
+        if self.failure_count >= self.failure_threshold:
+            self.state = "open"
+
+    def __repr__(self):
+        return f"CircuitBreaker(state={self.state}, failures={self.failure_count})"
+```
+
+Test your circuit breaker logic:
+
+```python
+# Quick assertion check
+cb = CircuitBreaker(failure_threshold=2, cooldown_seconds=1)
+assert cb.allow_request() is True
+cb.record_failure()
+cb.record_failure()
+assert cb.state == "open"
+assert cb.allow_request() is False
+# After cooldown it should allow a test request
+time.sleep(1.1)
+assert cb.allow_request() is True
+assert cb.state == "half-open"
+```
+
+### Step 3: Build the Error Classification System
+
+Different errors require different handling. Build a classifier that
+separates retriable errors from non-retriable ones.
+
+```python
+class RouterError(Exception):
+    """Base exception for model router errors."""
+
+
+class RetriableError(RouterError):
+    """An error that may resolve with a retry."""
+
+
+class NonRetriableError(RouterError):
+    """An error that will not resolve with a retry."""
+
+
+class AllProvidersFailedError(RouterError):
+    """All providers in the fallback chain have failed."""
+
+    def __init__(self, errors: list):
+        self.errors = errors
+        detail = "; ".join(f"{p}: {e}" for p, e in errors)
+        super().__init__(f"All providers failed: {detail}")
+
+
+def classify_error(error: Exception) -> RouterError:
+    """Classify an exception as retriable or non-retriable."""
+    import httpx
+
+    # HTTP status code based classification
+    if hasattr(error, "status_code"):
+        code = error.status_code
+        if code in {429, 500, 502, 503}:
+            return RetriableError(str(error))
+        if code in {400, 401, 403, 404, 413}:
+            return NonRetriableError(str(error))
+
+    # Timeout and connection errors are retriable
+    if isinstance(error, (httpx.TimeoutException, httpx.ConnectError)):
+        return RetriableError(str(error))
+
+    # Everything else is non-retriable by default
+    return NonRetriableError(str(error))
+```
+
+### Step 4: Implement Retry with Backoff
+
+Add a retry wrapper that uses exponential backoff with jitter. This
+function wraps a single provider call and handles retries internally.
+
+```python
+import asyncio
+import random
+
+
+async def attempt_with_retries(
+    coro_factory: Callable[[], Any],
+    max_retries: int = 2,
+    base_delay: float = 1.0,
+    backoff_factor: float = 2.0
+) -> Any:
+    """Execute a coroutine with retry logic.
+
+    Args:
+        coro_factory: A callable that returns a coroutine to execute.
+        max_retries: Maximum number of retry attempts.
+        base_delay: Initial delay in seconds before first retry.
+        backoff_factor: Multiplier for delay after each retry.
+
+    Returns:
+        The result of the successful coroutine.
+
+    Raises:
+        NonRetriableError: If the error is not retriable.
+        RetriableError: If all retries are exhausted.
+    """
+    last_error = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            coro = coro_factory()
+            return await coro
+        except Exception as e:
+            classified = classify_error(e)
+            if isinstance(classified, NonRetriableError):
+                raise
+
+            last_error = e
+            if attempt < max_retries:
+                delay = base_delay * (backoff_factor ** attempt)
+                jitter = random.uniform(0, 0.5 * delay)
+                await asyncio.sleep(delay + jitter)
+
+    raise RetriableError(
+        f"All {max_retries + 1} attempts failed. Last error: {last_error}"
+    ) from last_error
+```
+
+Test your retry logic with a mock that fails temporarily:
+
+```python
+async def test_retry_success():
+    call_count = 0
+
+    async def flaky_call():
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise httpx.HTTPStatusError(
+                "429 Too Many Requests",
+                request=None,
+                response=None
+            )
+        return "success"
+
+    result = await attempt_with_retries(flaky_call, max_retries=3)
+    assert result == "success"
+    assert call_count == 3
+    print("Retry test passed")
+```
+
+### Step 5: Build the ModelRouter Class
+
+Now assemble the components into the main router class.
+
+```python
+class ModelRouter:
+    """Routes LLM requests through a prioritized chain of providers."""
+
+    def __init__(self, chain: list[ProviderConfig] = None):
+        self.chain = chain or get_default_chain()
+        self.circuit_breakers = {
+            p.name: CircuitBreaker()
+            for p in self.chain
+        }
+        self.rate_limit_tracker = {}
+        self.stats = {
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "provider_calls": {},
+            "fallback_events": 0,
+        }
+        self._initialize_providers()
+
+    def _initialize_providers(self):
+        """Set up provider-specific HTTP clients."""
+        import httpx
+
+        for provider in self.chain:
+            headers = {}
+            if provider.api_key:
+                if provider.name == "anthropic":
+                    headers["x-api-key"] = provider.api_key
+                    headers["anthropic-version"] = "2023-06-01"
+                elif provider.name.startswith("open"):
+                    headers["Authorization"] = f"Bearer {provider.api_key}"
+
+            base_url = provider.base_url
+            client = httpx.AsyncClient(
+                base_url=base_url,
+                headers=headers,
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=provider.timeout,
+                    write=30.0,
+                )
+            )
+            setattr(self, f"_client_{provider.name}", client)
+
+    def _get_client(self, provider_name: str):
+        """Get the HTTP client for a given provider."""
+        return getattr(self, f"_client_{provider_name}", None)
+
+    async def _send_anthropic(self, messages: list, provider: ProviderConfig):
+        """Send a request to Anthropic API."""
+        client = self._get_client("anthropic")
+        payload = {
+            "model": provider.model,
+            "max_tokens": 1024,
+            "messages": messages,
+        }
+        response = await client.post("/messages", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return data["content"][0]["text"]
+
+    async def _send_openrouter(self, messages: list, provider: ProviderConfig):
+        """Send a request to OpenRouter API."""
+        client = self._get_client("openrouter")
+        payload = {
+            "model": provider.model,
+            "max_tokens": 1024,
+            "messages": messages,
+        }
+        response = await client.post("/chat/completions", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+
+    async def _send_ollama(self, messages: list, provider: ProviderConfig):
+        """Send a request to a local Ollama instance."""
+        client = self._get_client("ollama")
+        payload = {
+            "model": provider.model,
+            "messages": messages,
+            "stream": False,
+        }
+        response = await client.post("/api/chat", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return data["message"]["content"]
+
+    async def route(self, messages: list) -> str:
+        """Route a request through the fallback chain.
+
+        Args:
+            messages: A list of message dicts with 'role' and 'content' keys.
+
+        Returns:
+            The text content of the successful response.
+
+        Raises:
+            AllProvidersFailedError: If all providers fail.
+        """
+        self.stats["total_requests"] += 1
+        provider_errors = []
+
+        for provider in self.chain:
+            cb = self.circuit_breakers[provider.name]
+
+            # Step 1: Check circuit breaker
+            if not cb.allow_request():
+                provider_errors.append(
+                    (provider.name, f"Circuit breaker open (state={cb.state})")
+                )
+                continue
+
+            # Step 2: Map provider to send method
+            send_method = getattr(self, f"_send_{provider.name}", None)
+            if send_method is None:
+                provider_errors.append(
+                    (provider.name, "No send method configured")
+                )
+                continue
+
+            # Step 3: Attempt with retries
+            async def make_attempt(p=provider, sm=send_method, msgs=messages):
+                return await sm(msgs, p)
+
+            try:
+                response = await attempt_with_retries(
+                    make_attempt,
+                    max_retries=provider.max_retries,
+                )
+                cb.record_success()
+                self.stats["successful_requests"] += 1
+                self._record_provider_call(provider.name, True)
+                return response
+
+            except NonRetriableError as e:
+                cb.record_failure()
+                provider_errors.append((provider.name, f"Non-retriable: {e}"))
+                self._record_provider_call(provider.name, False)
+                continue
+
+            except RetriableError as e:
+                cb.record_failure()
+                provider_errors.append((provider.name, f"Retries exhausted: {e}"))
+                self._record_provider_call(provider.name, False)
+                self.stats["fallback_events"] += 1
+                continue
+
+        self.stats["failed_requests"] += 1
+        raise AllProvidersFailedError(provider_errors)
+
+    def _record_provider_call(self, provider_name: str, success: bool):
+        """Track per-provider call statistics."""
+        if provider_name not in self.stats["provider_calls"]:
+            self.stats["provider_calls"][provider_name] = {
+                "attempts": 0,
+                "successes": 0,
+                "failures": 0,
+            }
+        self.stats["provider_calls"][provider_name]["attempts"] += 1
+        if success:
+            self.stats["provider_calls"][provider_name]["successes"] += 1
+        else:
+            self.stats["provider_calls"][provider_name]["failures"] += 1
+
+    def get_stats(self) -> dict:
+        """Return routing statistics."""
+        return dict(self.stats)
+```
+
+### Step 6: Write the Main Entry Point
+
+Create a simple CLI entry point that tests the router with a user prompt.
+
+```python
+async def main():
+    """Run the model router with a user-provided prompt."""
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python model_router.py <prompt>")
+        sys.exit(1)
+
+    user_prompt = " ".join(sys.argv[1:])
+    messages = [
+        {"role": "user", "content": user_prompt}
+    ]
+
+    router = ModelRouter()
+    print(f"Router initialized with {len(router.chain)} providers.")
+    print(f"Chain order: {[p.name for p in router.chain]}")
+    print(f"Prompt: {user_prompt[:80]}...")
+    print("Routing...\n")
+
+    try:
+        response = await router.route(messages)
+        print("Response received:")
+        print(response[:500])
+        print(f"\nRouter stats: {json.dumps(router.get_stats(), indent=2)}")
+    except AllProvidersFailedError as e:
+        print(f"All providers failed. Details:")
+        for provider, reason in e.errors:
+            print(f"  - {provider}: {reason}")
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+```
+
+### Step 7: Add a Configuration File (Optional)
+
+For production use, store the fallback chain configuration in a JSON file
+so it can be updated without code changes.
+
+```json
+{
+  "fallback_chain": [
+    {
+      "name": "anthropic",
+      "model": "claude-sonnet-4-20250514",
+      "timeout": 60,
+      "max_retries": 2
+    },
+    {
+      "name": "openrouter",
+      "model": "anthropic/claude-3.5-sonnet",
+      "timeout": 90,
+      "max_retries": 1
+    },
+    {
+      "name": "ollama",
+      "model": "llama3.2:latest",
+      "timeout": 180,
+      "max_retries": 1
+    }
+  ],
+  "circuit_breaker": {
+    "failure_threshold": 3,
+    "cooldown_seconds": 30
+  }
+}
+```
+
+Load this configuration in a new constructor:
+
+```python
+@classmethod
+def from_json(cls, config_path: str) -> "ModelRouter":
+    with open(config_path) as f:
+        config = json.load(f)
+
+    chain = []
+    for entry in config["fallback_chain"]:
+        env_key = f"{entry['name'].upper()}_API_KEY"
+        provider = ProviderConfig(
+            name=entry["name"],
+            model=entry["model"],
+            timeout=entry.get("timeout", 60),
+            max_retries=entry.get("max_retries", 2),
+            api_key=os.environ.get(env_key),
+            base_url=entry.get("base_url"),
+        )
+        chain.append(provider)
+
+    return cls(chain=chain)
+```
+
+### Exercise Checkpoints
+
+Complete these checkpoints to verify your implementation:
+
+1. **Checkpoint 1**: Create a `ModelRouter` instance and verify it has
+   three providers in the correct order: anthropic, openrouter, ollama.
+
+2. **Checkpoint 2**: Mock a 429 response from the Anthropic provider and
+   verify the router retries before falling back.
+
+3. **Checkpoint 3**: Mock failures from all three providers and verify
+   that `AllProvidersFailedError` contains error messages for each one.
+
+4. **Checkpoint 4**: Send a real request with valid API keys and confirm
+   the response comes from the primary provider (Anthropic).
+
+5. **Checkpoint 5**: Set `failure_threshold` to 1 and make a request that
+   fails on Anthropic. Check the circuit breaker state is open, then
+   verify the router skips Anthropic on the next request.
+
+### Testing Without Real API Keys
+
+If you do not have API keys, you can still test the routing logic by
+creating mock providers:
+
+```python
+class MockModelRouter(ModelRouter):
+    """A test version that uses mock providers instead of real APIs."""
+
+    async def _send_mock_provider(
+        self, messages: list, provider: ProviderConfig
+    ) -> str:
+        """Simulate a provider response."""
+        provider_name = provider.name
+        if provider_name == "failing_primary":
+            raise httpx.HTTPStatusError(
+                "503 Service Unavailable",
+                request=None,
+                response=None,
+            )
+        return f"Mock response from {provider_name}"
+
+
+async def test_mock_routing():
+    """Test the router with mock providers."""
+    chain = [
+        ProviderConfig(name="failing_primary", model="mock", timeout=5),
+        ProviderConfig(name="backup", model="mock", timeout=5),
+    ]
+    router = ModelRouter(chain=chain)
+    router._send_failing_primary = lambda msgs, p: router._send_mock_provider(msgs, p)
+    router._send_backup = lambda msgs, p: router._send_mock_provider(msgs, p)
+
+    response = await router.route([{"role": "user", "content": "hello"}])
+    assert "Mock response from backup" in response
+    print("Mock routing test passed")
+
+
+asyncio.run(test_mock_routing())
+```
+
+### Extension Challenges
+
+If you finish the core exercise, try these extensions:
+
+1. **Concurrent race mode**: Modify the router to try the two cheapest
+   providers concurrently instead of sequentially.
+
+2. **Response validation**: Add a validation step that checks the
+   response length and content before returning it. If a provider returns
+   an empty or nonsensical response, treat it as a failure.
+
+3. **Cost tracking**: Add a cost tracking module that estimates token
+   usage and dollar cost for each provider call. Log the cumulative cost
+   per request.
+
+4. **Provider weighting**: Instead of a fixed priority order, assign
+   weights to each provider and randomize the order based on weights.
+   This distributes load across providers.
+
+5. **Caching layer**: Add an in-memory cache that stores responses by
+   prompt hash. If the same prompt is received within the cache TTL,
+   return the cached response without calling any provider.
+
+6. **Observability**: Add OpenTelemetry spans for each provider attempt
+   and each fallback event. Export the spans to a tracing backend.
+
+### Common Mistakes
+
+- **Missing timeout on fallbacks**: Without a timeout, a hung fallback
+  provider blocks the entire request until the global timeout kills it.
+- **Reusing the same API key format**: Anthropic uses `x-api-key` header,
+  OpenAI uses `Authorization: Bearer`. Each provider has different auth.
+- **Not distinguishing retriable from non-retriable**: Retrying a 400
+  Bad Request wastes time and tokens.
+- **Infinite retry loops**: Always cap retries and set a global timeout.
+- **Ignoring rate limit headers**: The `Retry-After` header tells you
+  exactly how long to wait. Respect it.
+- **Hardcoding model names**: Model names change and get deprecated.
+  Load them from configuration.

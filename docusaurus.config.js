@@ -6,6 +6,20 @@ const config = {
   tagline: 'Learn by building',
   favicon: 'img/favicon.ico',
 
+  plugins: [
+    [
+      '@docusaurus/plugin-client-redirects',
+      {
+        redirects: [
+          {
+            to: '/',
+            from: ['/docs', '/docs/'],
+          },
+        ],
+      },
+    ],
+  ],
+
   future: {
     v4: true,
   },
@@ -52,6 +66,7 @@ const config = {
                                 { type: 'docSidebar', sidebarId: 'agenticAiFundamentals', position: 'left', label: 'Agentic AI Fundamentals' },
                                 { type: 'docSidebar', sidebarId: 'systemDesignFundamentalsSidebar', position: 'left', label: 'System Design' },
                                                                 { type: 'docSidebar', sidebarId: 'gitGithubActionsSidebar', position: 'left', label: 'Git & GitHub Actions' },
+                                { type: 'docSidebar', sidebarId: 'aiEngineeringHandsOnSidebar', position: 'left', label: 'AI Engineering Crash Course' },
                                         // === /TOPICS ===
       ],
     },

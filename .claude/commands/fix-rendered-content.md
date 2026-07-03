@@ -28,6 +28,18 @@ Report which write path is the likely leak. If the leak isn't fixed, note in the
 
 See detection and fix below in the defect list.
 
+### Defect A5 — alt/caption props after template literal close
+
+The MDX parser chokes on `\`}"` — see detection and fix below. This is the most common build-breaking defect in new AsciiDiagram content. **Always run the A5 bulk fix (Step 4) before any other fix.**
+
+### Defect F — Orphaned `/>` from bad `</AsciiDiagram>` → `/>` conversion
+
+When an AsciiDiagram uses an explicit closing tag (`></AsciiDiagram>`) and a bulk replacement converts `</AsciiDiagram>` → `/>` without removing the preceding `>`, the result is `"/>` — the opening tag remains unclosed and `/>` is orphaned text. The MDX parser reports `Expected a closing tag for '<AsciiDiagram>' before the end of paragraph`.
+
+- **Detect:** Search for `"/>` pattern (a `>` closing an opening tag followed by orphaned `/>`). The build error message includes `Expected a closing tag for '<AsciiDiagram>'`.
+- **Fix:** Replace `"/>` with `" />` — the space before `/>` makes it a proper self-close: `" />`.
+- **Bulk fix:** `sed -i 's|"/> />|" />|g'` on affected files, or manually replace `"/>` → `" />` at each AsciiDiagram close.
+
 ---
 
 ## STEP 1 — SCOPE AND SCAN
@@ -83,8 +95,22 @@ An AsciiDiagram passes content as JSX children (`>{``...``}` / `{``...``}</Ascii
 - **Detect:** An AsciiDiagram opening tag followed by `>{`` ``}` (children pattern) instead of `content={`` ``}`. Or grep for `</AsciiDiagram>` in any directory — self-closing `/>` is the correct form.
 - **Fix:**
   1. Replace `>` before the opening backtick with `content=` (e.g. `caption="..."`  `>{`` ` → `caption="..."`  `content={`` `).
-  2. Replace `</AsciiDiagram>` with `/>`.
-  3. 4 spaces of indent before `content={` to match other prop indentation.
+  2. **Remove the orphaned `{`** on the line after `content={`` ` — the `content={`` ` already opens a JSX expression + template literal, so the `{` that used to start the children block is now a bare brace that causes `Could not parse expression with acorn` errors.
+  3. Replace `</AsciiDiagram>` with `/>`.
+  4. 4 spaces of indent before `content={` to match other prop indentation.
+  
+  **Example fix:**
+  ```mdx
+  <!-- BEFORE (children pattern — renders empty) -->
+  <AsciiDiagram id="..." title="...">
+  {`┌─────┐
+  └─────┘`}
+  </AsciiDiagram>
+  
+  <!-- AFTER (content prop — renders correctly) -->
+  <AsciiDiagram id="..." title="..." content={`┌─────┐
+  └─────┘`} />
+  ```
 
 ### Defect D — Content that got eaten by an earlier defect
 When a code fence is unclosed or an AsciiDiagram lost its terminator, everything after it can be absorbed into that block and render as one blank or literal mass. If a file has a suspiciously short rendered body relative to its line count, or large runs of content that appear to be inside a never-closed fence/diagram, flag it.
@@ -103,7 +129,8 @@ Before fixing, decide per defect whether the original content can be recovered o
 - **Defect C, empty code block:** **needs regeneration** if the surrounding text references code that should be there; **deletable** if it's a stray empty fence with no referent.
 - **Defect C, unclosed fence:** **recoverable** — add the missing closing fence at the correct boundary (where the code ends and prose resumes).
 - **Defect D, content eaten by prior defect:** depends on the root cause (B or C) — fix the root, and the eaten content usually reappears correctly.
-- **Defect E, children vs content prop:** **recoverable** — mechanical find-and-replace across all files in the topic. Run `grep -rn '</AsciiDiagram>' docs/$SLUG/` to find all occurrences; each one needs the two-step fix above.
+- **Defect A5, alt/caption after template literal close:** **recoverable** — mechanical regex replacement across all files in the scope. See Step 4 for the bulk-fix command.
+- **Defect E, children vs content prop:** **recoverable** — mechanical find-and-replace across all files in the topic. Run `grep -rn '</AsciiDiagram>' docs/$SLUG/` to find all occurrences; each one needs the three-step fix above (opening tag, remove orphaned `{`, closing tag).
 
 ---
 
@@ -139,6 +166,45 @@ Find where the code actually ends (where prose resumes) and insert the closing f
 **Defect D — fix root cause:**
 Once B/C are fixed, re-render and confirm the previously-eaten content now displays correctly.
 
+**Defect A5 — alt/caption after template literal close (bulk regex fix):**
+Run this as a bulk pass across all `.mdx` files in the scope. It moves `alt` and `caption` props from after the closing `` `} `` to before the `content` prop:
+
+```bash
+node -e "
+const fs = require('fs'), path = require('path');
+const scope = '$ARGUMENTS';
+const root = scope === 'all' ? 'docs' : 'docs/' + scope.replace(/\\\/?$/, '');
+function walk(dir) {
+  fs.readdirSync(dir, {withFileTypes: true}).forEach(e => {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) walk(p);
+    else if (e.name.endsWith('.mdx')) {
+      let c = fs.readFileSync(p, 'utf8');
+      const o = c;
+      c = c.replace(
+        /(<AsciiDiagram\\s+[^>]*?)(\\s+content=\\{)([\\s\\S]*?)(\\\`\\}\\s*\\\"\\s*alt=\\"([^\\"]*)\\"\\s*caption=\\"([^\\"]*)\\"\\s*\\/>)/g,
+        (_, b, cs, dc, cl, alt, cap) =>
+          b + ' alt=\"' + alt + '\" caption=\"' + cap + '\"' + cs + dc + '\\`} />'
+      );
+      if (c !== o) { fs.writeFileSync(p, c, 'utf8'); console.log('Fixed A5: ' + p); }
+    }
+  });
+}
+walk(root);
+console.log('A5 bulk fix complete.');
+"
+```
+
+After the bulk pass, re-scan for `\`}" alt=` patterns to confirm zero remain.
+
+**Defect E — children→content prop (bulk fix):**
+
+```bash
+grep -rn '</AsciiDiagram>' docs/$ARGUMENTS/ 2>/dev/null
+```
+
+For each file with matches, apply the three-step fix from Step 1's Defect E section: replace `>` before `{``} ` with `content=`, remove the orphaned `{`, replace `</AsciiDiagram>` with `/>`.
+
 Apply all project MDX safety rules while fixing: Unicode arrows in diagrams, explicit `</AsciiDiagram>` close, no internal blank lines in diagrams, no raw `{`/`}` in prose, correct fence languages.
 
 ---
@@ -147,8 +213,9 @@ Apply all project MDX safety rules while fixing: Unicode arrows in diagrams, exp
 
 After fixing each batch:
 1. Run `npm run check:mdx` — confirm no new MDX syntax errors introduced by the fixes.
-2. Spot-check by re-scanning the fixed files for the same defect patterns — confirm zero remaining mojibake sequences, zero empty diagrams, zero empty/unclosed fences.
-3. For regenerated diagrams and code, sanity-check that the new content actually matches what the surrounding prose says it should show — a regenerated diagram that's technically valid but describes the wrong thing is still a defect.
+2. Spot-check by re-scanning the fixed files for the same defect patterns — confirm zero remaining mojibake sequences, zero empty diagrams, zero empty/unclosed fences, zero `\`}" alt=` A5 patterns.
+3. Run `grep -rn '\`}" alt=' docs/$ARGUMENTS/ --include="*.mdx"` — if any matches remain, the A5 bulk fix missed them; re-run it or fix manually.
+4. For regenerated diagrams and code, sanity-check that the new content actually matches what the surrounding prose says it should show — a regenerated diagram that's technically valid but describes the wrong thing is still a defect.
 
 ---
 
@@ -165,6 +232,7 @@ Root-cause check (Step 0):
 Defects found:
   A — mojibake (single-layer, reversed): <count>
   A — mojibake (multi-layer, regenerated): <count>
+  A5 — alt/caption after template-close (reordered): <count>
   B — empty diagrams (regenerated): <count>
   C — empty/broken code blocks (regenerated/deleted): <count>
   C — unclosed fences (closed): <count>
@@ -186,3 +254,4 @@ Build verified clean: yes/no
 - Any bulk file rewrite must use `-Encoding UTF8` on read and write, or it will re-introduce the exact mojibake it's fixing.
 - Process in batches with per-batch reporting — never one silent pass across a whole course.
 - Do not run this against a course while it is still being generated in another session — file races will corrupt in-flight writes. Only run on a settled course.
+- **A5 bulk fix is mandatory on every run.** The `\`}" alt=` pattern is a build-breaking defect that the MDX parser cannot recover from. Always run the A5 bulk regex fix from Step 4 before any other fix, even if scanning showed no obvious A5 patterns — the regex is safe to run on clean files (no-op on non-matching content).
