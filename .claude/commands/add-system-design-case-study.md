@@ -1,4 +1,4 @@
-# /add-system-design-case-study
+﻿# /add-system-design-case-study
 
 Generate a complete FAANG-level system design case study for the Sypher platform.
 
@@ -408,11 +408,23 @@ Same MDX safety rules. No `<AsciiDiagram>` needed.
 
 ## Sidebar entry
 
-Determine the correct sidebar file based on SECTION:
-- "Beginner Case Studies" → `sidebars/system-design-beginner-cases.json`
-- "Intermediate Case Studies" → `sidebars/system-design-intermediate-cases.json`
-- "Advanced Case Studies" → `sidebars/system-design-advanced-cases.json`
-- "AI Case Studies" → `sidebars/system-design-ai-cases.json`
+Target file: `sidebars/system-design-case-studies.json` — single shared file for all tiers.
+
+If it does not exist, create it with this skeleton first:
+
+```json
+{
+  "systemDesignCaseStudiesSidebar": [
+    { "type": "category", "label": "Beginner Case Studies",      "collapsible": true, "collapsed": true, "items": [] },
+    { "type": "category", "label": "Intermediate Case Studies",  "collapsible": true, "collapsed": true, "items": [] },
+    { "type": "category", "label": "Advanced Case Studies",      "collapsible": true, "collapsed": true, "items": [] },
+    { "type": "category", "label": "AI Case Studies",            "collapsible": true, "collapsed": true, "items": [] },
+    { "type": "category", "label": "Capstone",                   "collapsible": false, "items": [] }
+  ]
+}
+```
+
+Locate the category whose `"label"` exactly matches `$SECTION`. Insert the topic sub-category into that object's `"items"` array only — never at top level, never create a duplicate category.
 
 Append:
 ```json
@@ -473,4 +485,19 @@ Print this summary table:
 | 06-evolution.mdx | N | N | ✅/❌ | ✅ |
 | 07-interview-simulation.mdx | N | N | ✅/❌ | ✅ |
 
-Then confirm `npm start` compiles clean.
+Then run the pre-flight validation:
+
+1. Build with `npm run start` and watch for MDX compilation errors in the terminal output.
+2. If any file fails, diagnose by the exact error (`ruleId`, file, line, column) from the build output.
+3. **Common MDX errors and their fixes:**
+
+   | Error pattern | Root cause | Fix |
+   |---|---|---|
+   | `Expected a closing tag for <word>` — any `<placeholder>` in prose | MDX treats `<word>` as a JSX component. Happens with placeholders, type params like `List<String>`, math comparisons | Wrap in backticks: `` `<placeholder>` ``. Or use `&lt;` and `&gt;`. |
+   | `Expected a closing tag for <details>` / `end-tag-mismatch` | A `<details>` block is missing its `</details>` closing tag | Count every `<details>` and verify a matching `</details>` exists for each. |
+   | `Expected a closing tag for <summary>` | A `<summary>` tag inside a `<details>` is missing `</summary>` | Add `</summary>` before the content after the summary line. |
+   | Bare `{` / `}` in prose (acorn parse error) | JSON, GraphQL, or code with `{}` outside fenced code blocks | Wrap in a fenced code block with the appropriate language tag. |
+   | **AsciiDiagram renders as blank/empty box** (no build error) | AsciiDiagram uses `>` `{` `` ` `` (children pattern) instead of `content={` `` ` `` (content prop) | Replace `>` before `{` `` ` `` with `content=`. Replace `</AsciiDiagram>` with `/>`. Run `grep -rn '</AsciiDiagram>' docs/` after generation. |
+
+4. Apply the matching fix and re-run the build. Repeat up to 3 times per file; flag anything still failing as `NEEDS MANUAL REVIEW`.
+5. Do not print the final summary table until every file builds clean or is explicitly flagged.

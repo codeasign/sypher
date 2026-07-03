@@ -1,0 +1,654 @@
+---
+id: metrics-deep-dive
+title: Metrics — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture Diagram
+
+Every metrics system is built from the same core components, regardless of which product you use. Understanding these components in detail lets you debug any metrics infrastructure, tune performance, and predict failure modes before they reach production.
+
+A metrics system has five layers: instrumentation, collection, aggregation, storage, and query. Each layer has its own data structures, performance characteristics, and failure modes. The layers are connected by well-defined interfaces: the instrumentation layer exposes a /metrics HTTP endpoint, the collection layer forwards a protocol buffers stream, the aggregation layer writes to a write-ahead log, and the storage layer provides a gRPC query interface.
+
+The layers are designed to be independently scalable. If the collection layer is the bottleneck, you add more collectors. If the storage layer is the bottleneck, you add more storage nodes. If the query layer is the bottleneck, you add more query frontends. The decoupling of layers is what makes metrics systems horizontally scalable.
+
+Each layer has a different performance profile:
+- **Instrumentation**: must be near-zero overhead because it runs on the hot path of every request. Target: under 100 nanoseconds per observation.
+- **Collection**: must handle thousands of concurrent scrape requests. Target: under 100 milliseconds per scrape.
+- **Aggregation**: must transform data at wire speed. Target: under 1 millisecond per sample.
+- **Storage**: must write at 100,000 samples per second per node. Target: under 10 milliseconds per write batch.
+- **Query**: must return results in under 1 second for the last hour. Target: under 100 milliseconds for index lookups.
+
+<AsciiDiagram
+  id="metrics/deepdive-internal-architecture"
+  title="Internal layered architecture of a metrics pipeline"
+  alt="Diagram showing five layers of a metrics pipeline: instrumentation, collection, aggregation, storage, and query"
+  caption="Each layer in the metrics pipeline has distinct data structures, performance characteristics, and failure modes"
+ content={`
+┌─────────────────────────────────────────────────────────┐
+│        Metrics System Internal Architecture              │
+│                                                         │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Layer 1: Instrumentation                        │   │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐         │   │
+│  │  │ Counter  │ │  Gauge   │ │Histogram│         │   │
+│  │  │ uint64   │ │  float64 │ │ buckets │         │   │
+│  │  │ atomic   │ │  atomic  │ │ []int64 │         │   │
+│  │  └──────────┘ └──────────┘ └──────────┘         │   │
+│  └──────────────────────────────────────────────────┘   │
+│                          │                               │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Layer 2: Collection                             │   │
+│  │  ┌─────────────────────┐ ┌────────────────────┐  │   │
+│  │  │ Scrape Manager      │ │ Push Receiver      │  │   │
+│  │  │ HTTP server         │ │ UDP listener       │  │   │
+│  │  │ TLS / mTLS          │ │ rate limiter       │  │   │
+│  │  └─────────────────────┘ └────────────────────┘  │   │
+│  └──────────────────────────────────────────────────┘   │
+│                          │                               │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Layer 3: Aggregation                            │   │
+│  │  ┌─────────────┐ ┌──────────────┐ ┌──────────┐  │   │
+│  │  │ Dedup       │ │ Downsample   │ │ Recording │  │   │
+│  │  │ Time window │ │ Rules        │ │ Rules     │  │   │
+│  │  └─────────────┘ └──────────────┘ └──────────┘  │   │
+│  └──────────────────────────────────────────────────┘   │
+│                          │                               │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Layer 4: Storage                                │   │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────┐  │   │
+│  │  │ WAL (write   │ │ Memory       │ │ Disk     │  │   │
+│  │  │ ahead log)   │ │ (memtable)   │ │ (SSTable)│  │   │
+│  │  └──────────────┘ └──────────────┘ └──────────┘  │   │
+│  └──────────────────────────────────────────────────┘   │
+│                          │                               │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Layer 5: Query Engine                           │   │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────┐  │   │
+│  │  │ PromQL /     │ │ Index        │ │ Chunk    │  │   │
+│  │  │ SQL parser   │ │ Inverted     │ │ Iterator │  │   │
+│  │  └──────────────┘ └──────────────┘ └──────────┘  │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+`} />
+
+### Layer 1: Instrumentation Libraries
+
+The instrumentation layer sits inside your application process. It maintains in-memory data structures that are updated on every request. These structures must be lock-free or near-lock-free because they are on the hot path.
+
+**Counter implementation**: A counter is an atomic uint64. Increment is a single CPU instruction. Reset is not supported — you create a new counter instance. The library exposes the counter value when the /metrics endpoint is scraped. The counter must handle concurrent increments from multiple goroutines or threads. The atomic increment operation is compare-and-swap (CAS) under the hood, which is safe for concurrent access but can cause cache line contention on heavily contended counters. For counters with millions of increments per second, sharding the counter into multiple atomic integers and summing them on read reduces contention.
+
+**Gauge implementation**: A gauge is an atomic float64. Set and get are atomic operations. Unlike counters, gauges can go down as well as up. The library exposes the latest value on scrape. Gauges are used for values that have a natural current state: number of active connections, queue depth, memory usage. The key behavioral difference from counters is that gauges represent snapshots, not accumulations. A gauge of 10 at one scrape and 20 at the next does not mean 10 units of work happened in between — it means the value changed from 10 to 20.
+
+**Histogram implementation**: A histogram is an array of atomic int64s, one per bucket, plus a total count. The observe operation computes the bucket index by comparing the value against bucket boundaries, then increments the appropriate bucket counter. The cost is O(log buckets) if bucket boundaries are sorted and you binary search, or O(1) if you use a precomputed index function. Most implementations use binary search because it is simpler and the bucket count is small (under 20).
+
+Prometheus histograms are cumulative: each bucket counter includes the count of all previous buckets. If bucket[0] has boundary 5ms and bucket[1] has boundary 10ms, then bucket[1] includes all observations under 10ms. This cumulative representation makes it easy to compute percentiles: the total count up to each bucket is the bucket value itself, not a separate counter.
+
+### Layer 2: Collection
+
+The collection layer receives metrics from instrumented applications. It runs as a separate process or as a built-in server inside the metrics server.
+
+**Pull collection**: An HTTP server listens on a configurable port (default 9090 for Prometheus). Each scrape request reads the current state of all metrics from the instrumentation layer and serializes it to the text-based exposition format. The server must handle concurrent scrapes, rate limiting, and TLS termination.
+
+**Push collection**: A UDP receiver listens for incoming metrics packets. The receiver must handle packet loss, out-of-order delivery, and high throughput. Since UDP is connectionless, the receiver cannot backpressure the sender. If the receiver cannot keep up, it drops packets silently.
+
+**Scrape lifecycle**: A scrape request arrives, the server acquires a read lock on the metric registry, serializes all metrics to text, releases the lock, and sends the response. The scrape duration is the time between request arrival and response completion. This duration is itself a critical metric: a scrape that takes longer than the scrape interval indicates the system is overloaded.
+
+### Layer 3: Aggregation
+
+The aggregation layer transforms raw metrics into a more useful form. It runs recording rules, downsampling, and deduplication.
+
+**Deduplication**: If two scrapers both hit the same target, the deduplicator detects duplicate time series by comparing (metric_name, label_set, timestamp). It keeps the first sample and discards the duplicate. Deduplication uses a sliding window: if two samples for the same series arrive within the deduplication window (typically 30 seconds), the second is discarded.
+
+**Downsampling**: Downsampling computes aggregates over time windows. For each window, it computes min, max, avg, sum, and count of raw samples. The downsampled data is stored in a separate retention tier. The downsampling window is configurable: 5 minutes, 1 hour, 1 day.
+
+**Recording rules**: Recording rules precompute expensive queries and store the results as new metrics. For example, a rule might compute the ratio of errors to total requests every 30 seconds and store it as error_ratio. This is a read-time versus write-time trade-off: writing the precomputed metric costs compute at ingestion time but saves compute at query time.
+
+### Layer 4: Storage
+
+The storage layer is a time-series database optimized for the write-heavy, append-only workload of metric data.
+
+**Write-Ahead Log (WAL)**: Every incoming sample is first written to the WAL on disk. The WAL provides durability: if the process crashes, the WAL is replayed on restart. The WAL is a sequential log, which is fast to write (sequential disk I/O is orders of magnitude faster than random I/O).
+
+**Memtable**: After the WAL write, the sample is inserted into an in-memory data structure called the memtable. The memtable stores samples grouped by time series. It is optimized for writes: inserting a sample is an O(1) append to the series buffer.
+
+**Compaction**: When the memtable reaches a configurable size (typically 64MB to 256MB), it is flushed to disk as a read-only SSTable (Sorted String Table). Multiple SSTables are periodically merged in a compaction process. Compaction reduces the number of SSTables that must be read during a query, and it is the main CPU cost in the storage layer.
+
+**Index**: The index maps metric names and label sets to the SSTables and chunk offsets that contain their data. The index is an inverted index: for each label name and value pair, it stores a list of time series that have that label. The index is stored in memory for fast lookups.
+
+<AsciiDiagram
+  id="metrics/deepdive-wal-to-sstable"
+  title="Write path from ingestion through WAL to SSTable storage"
+  alt="Diagram showing the write path of a time-series database: sample arrives, written to WAL, inserted into memtable, flushed to SSTable on disk"
+  caption="The write path uses a WAL for durability, memtable for buffering, and SSTables for persistent storage"
+ content={`
+┌─────────────────────────────────────────────────────────┐
+│              Write Path Through Storage                  │
+│                                                         │
+│  Incoming Sample: http_requests{method=GET,status=200}  │
+│  Timestamp: 1719876543  Value: 1                        │
+│                                                         │
+│                          │                               │
+│                          ▼                               │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Step 1: Write-Ahead Log (WAL)                   │   │
+│  │  ┌────────────────────────────────────────────┐  │   │
+│  │  │ seq=1 | ts=1719876543 | metric=0xAF | val=1│  │   │
+│  │  │ seq=2 | ts=1719876544 | metric=0xAF | val=1│  │   │
+│  │  │ seq=3 | ts=1719876545 | metric=0xB0 | val=1│  │   │
+│  │  └────────────────────────────────────────────┘  │   │
+│  │  Written sequentially, fsynced every 10 seconds  │   │
+│  └──────────────────────────────────────────────────┘   │
+│                          │                               │
+│                          ▼                               │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Step 2: Memtable (in-memory)                    │   │
+│  │  ┌────────────────────────────────────────────┐  │   │
+│  │  │ Series 0xAF: [3, 4, 5, 7, 8, 10, 11, 12] │  │   │
+│  │  │ Series 0xB0: [1, 2, 2, 3, 3, 4, 5, 6]    │  │   │
+│  │  └────────────────────────────────────────────┘  │   │
+│  │  When full (64MB), initiate flush to disk         │   │
+│  └──────────────────────────────────────────────────┘   │
+│                          │                               │
+│                          ▼                               │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Step 3: SSTable on Disk                         │   │
+│  │  ┌────────────────────────────────────────────┐  │   │
+│  │  │ ┌──────┬──────┬──────┬──────┬──────┐      │  │   │
+│  │  │ │Series│Chunk │Chunk │Chunk │Index │      │  │   │
+│  │  │ │List  │ 1    │ 2    │ N    │      │      │  │   │
+│  │  │ └──────┴──────┴──────┴──────┴──────┘      │  │   │
+│  │  │ Chunk: 128 compressed samples             │  │   │
+│  │  │ Format: XOR + delta-of-delta              │  │   │
+│  │  └────────────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────┘   │
+│                          │                               │
+│                          ▼                               │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Step 4: Compaction (background)                 │   │
+│  │  Merge multiple SSTables into one, remove        │   │
+│  │  overlapping ranges, build new index             │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+`} />
+
+### Layer 5: Query Engine
+
+The query engine parses metric queries, finds the relevant time series, and returns results. The query language is the primary interface for users of the metrics system.
+
+**Query parsing**: The query string is parsed into an abstract syntax tree (AST). The AST is validated and optimized. For example, PromQL queries are parsed into expression trees, and the optimizer applies algebraic simplifications.
+
+**Index lookup**: The query engine uses the inverted index to find all time series that match the label selector. An index lookup for method=GET returns all series with that label, then the intersection of multiple label selectors is computed. The index is in memory, so lookups are fast — typically under 1 millisecond for 1 million series.
+
+**Chunk reading**: Once the matching series are identified, the engine reads the relevant chunks from disk. Chunks are read in order of time range. The engine decompresses each chunk and iterates over the samples.
+
+**Aggregation**: If the query includes an aggregation function (sum, avg, rate, etc.), the engine applies it to the decompressed samples. Aggregation is the most CPU-intensive phase of query execution.
+
+## Data Structures and Algorithms
+
+The performance of a metrics system depends on the data structures used at each layer. Here are the critical ones.
+
+### The Hash Ring
+
+The hash ring (or consistent hash ring) maps time series to storage shards. When a metric sample arrives, the ingestion layer computes a hash of the metric name and label set, then finds the shard responsible for that hash.
+
+The hash ring is implemented as a sorted list of hash values, each associated with a shard ID. To find the shard for a metric, the system hashes the metric identity and finds the smallest hash value on the ring that is greater than or equal to the metric hash. This is called successor lookup.
+
+When a shard is added or removed, only the time series that map to the affected range of the hash ring are rebalanced. With N shards, adding or removing one shard causes a 1/N reshuffling. Without consistent hashing (simple modulus: hash % N), adding or removing one shard causes a full reshuffling — every time series must be reassigned.
+
+The hash ring is stored in a coordination service like etcd or Consul. Each shard watches the ring for changes and adjusts its time series assignment accordingly. The query frontend also watches the ring to know which shard to query for a given time series.
+
+### The Inverted Index
+
+The inverted index maps label values to time series IDs. It is the primary data structure for metric lookup.
+
+```
+Label: method=GET → Series IDs: [0xAF, 0xB0, 0xB1, 0xB2, ...]
+Label: method=POST → Series IDs: [0xB3, 0xB4, 0xB5, ...]
+Label: status=200 → Series IDs: [0xAF, 0xB3, 0xB6, ...]
+Label: status=500 → Series IDs: [0xB1, 0xB7, ...]
+```
+
+To find all series with method=GET AND status=200, the query engine intersects the two lists: [0xAF, 0xB0, 0xB1, 0xB2, ...] ∩ [0xAF, 0xB3, 0xB6, ...] = [0xAF, ...].
+
+The intersection of two sorted lists is O(n + m) — a linear scan of both lists. The index is stored in memory and updated when new time series appear. The index size is proportional to the number of unique label value combinations.
+
+### The B-Tree Index
+
+The storage layer also maintains a B-tree index mapping time ranges to chunk locations. Each time series has a B-tree where the key is the start timestamp of a chunk and the value is the chunk's file offset and length.
+
+The B-tree is stored in memory for fast lookups. It is updated when new chunks are flushed from the memtable to disk. The B-tree is the primary data structure for query execution: given a time range, the query engine uses the B-tree to find which chunks contain data for that range.
+
+The B-tree is balanced: all leaf nodes are at the same depth. Lookup is O(log N) where N is the number of chunks for the time series. For a time series with 10 million data points (1 year of 3-second data), the B-tree has roughly 20,000 chunks (512 points per chunk), and lookup is O(log 20,000) = roughly 15 comparisons.
+
+### The Chunk Format
+
+Chunks store compressed samples for a single time series. Each chunk holds 128 or 512 samples (configurable). The chunk format is the key to storage efficiency.
+
+**Timestamp encoding**: Timestamps are encoded using delta-of-delta. The first timestamp is stored as a raw 64-bit value. The second timestamp stores the delta from the first (d1 = ts2 - ts1). Subsequent timestamps store the delta of the delta (d2 = (ts3 - ts2) - (ts1 - ts0)). These values are small (often zero or single-digit), so they compress to 1-2 bits each.
+
+**Value encoding**: Values are encoded using XOR of consecutive floats. If the value changes slowly, the XOR has many leading and trailing zeros. The number of leading zeros, the number of trailing zeros, and the middle bits are stored. For constant values, the XOR is zero, which compresses to a single bit.
+
+### The Rate Function
+
+The rate function converts a counter (monotonically increasing) into a per-second rate. It is one of the most commonly used query functions.
+
+```
+rate(metric[5m]) = (last_value - first_value) / duration
+```
+
+The rate function handles counter resets: if the counter value decreases (because the process restarted), the rate function detects the reset and adjusts the calculation. It computes the rate for each consecutive pair of samples and returns the average over the window.
+
+### The Histogram Quantile Function
+
+The quantile function estimates a percentile from histogram bucket counts. It assumes samples are uniformly distributed within each bucket.
+
+```
+quantile(0.99, histogram_metric) = bucket_start + (rank - count_before) / count_in_bucket * bucket_width
+```
+
+Where rank = 0.99 * total_count. The function finds the bucket that contains the rank, then interpolates within that bucket. The interpolation assumes uniform distribution, which is a simplification. Real distributions are rarely uniform within a bucket, so the quantile estimate has error proportional to the bucket width.
+
+## Request Lifecycle
+
+A single metric observation travels through ten stages from application code to dashboard chart. Each stage introduces latency, potential data loss, and resource consumption.
+
+<AsciiDiagram
+  id="metrics/deepdive-request-lifecycle"
+  title="The 10-stage lifecycle of a single metric observation"
+  alt="Diagram showing a metric observation traveling through 10 stages from application code to dashboard rendering"
+  caption="A metric observation passes through 10 stages, each with its own latency, reliability, and resource profile"
+ content={`
+┌─────────────────────────────────────────────────────────┐
+│             Metric Observation Lifecycle                  │
+│                                                         │
+│  Stage 1:  [App Code] counter.inc()  -- 5ns            │
+│      │                                                   │
+│  Stage 2:  [In-Memory] atomic increment  -- 10ns        │
+│      │                                                   │
+│  Stage 3:  [Scrape] HTTP request to /metrics  -- 15ms  │
+│      │                                                   │
+│  Stage 4:  [Serialization] text format  -- 5ms          │
+│      │                                                   │
+│  Stage 5:  [Network] scrape response  -- 5ms            │
+│      │                                                   │
+│  Stage 6:  [Parse] ingest and validate  -- 1ms          │
+│      │                                                   │
+│  Stage 7:  [WAL] fsync to disk  -- 5ms                  │
+│      │                                                   │
+│  Stage 8:  [Memtable] in-memory insert  -- 0.1ms        │
+│      │                                                   │
+│  Stage 9:  [Query] PromQL evaluation  -- 10ms-10s       │
+│      │                                                   │
+│  Stage 10: [Render] dashboard chart  -- 100ms           │
+│                                                         │
+│  Total: 140ms to 10.1s from emission to visualization   │
+└─────────────────────────────────────────────────────────┘
+`} />
+
+### Stage 1: Emission
+
+Your application code calls counter.inc() or histogram.observe(). This is a function call into the metrics library. The library increments an atomic integer or updates a histogram bucket. The cost is roughly 5 nanoseconds for a counter, 50 nanoseconds for a histogram.
+
+### Stage 2: In-Memory Buffering
+
+The metric value sits in the library's memory until the next scrape. During this time, the value is not visible to the monitoring system. If the process crashes, the value since the last scrape is lost.
+
+The buffer duration is the scrape interval, typically 15 seconds. This is the window of potential data loss. For most applications, 15 seconds of missing data is acceptable. For latency-critical systems, you can reduce the scrape interval to 5 seconds, at the cost of more CPU and network overhead.
+
+### Stage 3: Scrape Initiation
+
+The metrics collector sends an HTTP request to the application's /metrics endpoint. The request includes headers for authentication, timeout, and content negotiation.
+
+The collector must handle: network timeouts, DNS resolution failures, connection refused errors, and TLS handshake failures. Each failure mode produces a different error signal. Scrape failures are themselves metrics that indicate infrastructure problems.
+
+### Stage 4: Serialization
+
+The application serializes the current state of all metrics into the text-based exposition format. The format is line-oriented: each line contains a metric name, label set, and value.
+
+The serialization cost is proportional to the number of active time series in the process. An application with 10,000 time series produces a /metrics response of roughly 500KB. Serialization and transmission of 500KB takes 5 to 10 milliseconds.
+
+### Stage 5: Network Transmission
+
+The serialized metrics traverse the network from the application to the collector. Network latency depends on the physical distance between the nodes. In the same datacenter, latency is under 1 millisecond. Across regions, it can be 50 to 100 milliseconds.
+
+Network congestion, packet loss, and TCP retransmission can increase latency. For high-volume metrics, network bandwidth can be a bottleneck. A single host emitting 10,000 time series produces roughly 500KB per scrape, or 57 kbps — negligible for most networks. But 10,000 hosts emitting at the same rate produce 5.7 Gbps, which is significant.
+
+### Stage 6: Parse and Validate
+
+The collector receives the response and parses the text format into internal data structures. Parsing validates: metric name format (must match regex), label name format, label value length, and timestamp sanity.
+
+Invalid samples are rejected with a parse error. Parse errors are counted and exposed as a metric (scrape_samples_post_metric_relabeling). A high rate of parse errors indicates misconfigured instrumentation.
+
+### Stage 7: WAL Write
+
+The parsed sample is written to the Write-Ahead Log. The WAL is a sequential append-only file. Each sample is written as a record with a sequence number, timestamp, and data.
+
+The WAL is fsynced periodically (every 10 to 30 seconds by default). fsync is the most expensive operation in the write path because it forces the operating system to flush the disk buffer. Without fsync, a crash could lose the last few seconds of ingested data.
+
+### Stage 8: Memtable Insert
+
+After the WAL write, the sample is inserted into the in-memory memtable. The memtable is an ordered map from time series ID to a list of samples. Insert is O(1) — append to the list for the series.
+
+The memtable is the fastest path in the write pipeline. It absorbs spikes in write throughput. When the memtable fills, it is flushed to disk as an SSTable. During the flush, writes continue to a new memtable.
+
+### Stage 9: Query Evaluation
+
+When a dashboard or alerting rule queries the system, the query engine must read data from multiple sources: the current memtable (in-memory, hot data), recent SSTables (on disk, warm data), and older SSTables (on disk, cold data).
+
+The query engine merges data from these sources, applies the query function, and returns the result. Complex queries over large time ranges can take seconds to evaluate.
+
+### Stage 10: Dashboard Rendering
+
+The dashboard server receives the query result and renders it as a chart. Rendering involves: scaling the axes, drawing the series lines, and compositing the chart image. The rendering step is typically fast (under 100 milliseconds) but can be slow for dashboards with dozens of panels.
+
+## Consistency and State
+
+Metrics systems face the same consistency challenges as any distributed system. Understanding how metrics systems handle failures helps you design reliable monitoring.
+
+### Crash Recovery
+
+When a metrics server crashes, it replays the WAL on restart. The WAL contains all samples written since the last checkpoint. Replay is sequential and fast: replaying 1 million samples takes roughly 1 second.
+
+However, the WAL only covers samples that were fully written to the log. Samples in the memtable that were not yet written to the WAL are lost. The window of loss is the WAL fsync interval, typically 10 to 30 seconds.
+
+```
+Crash at T=10s: WAL fsynced at T=5s, memtable has samples from T=5s to T=10s
+Replay at T=15s: samples T=0s to T=5s from WAL, samples T=5s to T=10s lost
+```
+
+### Partition Handling
+
+Network partitions in a pull-based system cause scrape failures. The partition is the source of truth: the collector cannot reach the target, so it records a scrape failure. The target continues running and serving traffic, but its metrics are not collected.
+
+When the partition heals, the next scrape succeeds. The gap in the metric data is a missing interval. The collector does not backfill — it has no way to retrieve historical data from the target. The gap is permanent.
+
+```
+Normal: scrape every 15s, data continuous
+Partition: 3 minutes of failed scrapes, gap in data
+Healed: scrape resumes, data continuous from this point
+```
+
+### Concurrent Writes
+
+Two scrapers hitting the same target is a misconfiguration, but it happens. The deduplication layer handles this by keeping the first sample and discarding duplicates within the deduplication window.
+
+The deduplication window is typically 30 seconds. If two scrapers both send a sample for the same series with timestamps within 30 seconds, the second is discarded. This is a simple last-writer-wins approach with a time fence.
+
+### Stale Reads
+
+A query that reads a gauge immediately after the scrape interval might see a stale value. The gauge was last updated at the previous scrape, and the value reflects the state at that time, not the current state.
+
+This is called staleness. The staleness bound is the scrape interval. For a 15-second scrape interval, any gauge value is at most 15 seconds old. For most use cases, this is acceptable. For real-time dashboards, you can reduce the scrape interval to match your freshness requirements.
+
+However, staleness also applies to counters. A counter value at a scrape reflects the total accumulation up to that instant. The rate over the last 5 minutes is computed from two scrape points: the oldest and the newest in that window. If the newest scrape is 15 seconds stale, the rate is computed from a value that is 15 seconds old. This introduces a systematic delay in rate detection of roughly half the scrape interval.
+
+### Stale Markers
+
+When a target stops being scraped (because the process died, the network is partitioned, or the service was decommissioned), the metrics system eventually marks the time series as stale. In Prometheus, a series is marked stale if no samples have been received for 5 minutes.
+
+Stale markers are important for query accuracy. Without them, a series that stopped reporting would show a flat line at its last value, which looks like a healthy service running at constant load. With stale markers, the series is excluded from queries after the staleness period. The chart shows a gap instead of a flat line, which correctly indicates that the service is not reporting.
+
+### Clock Skew
+
+Clock skew between the target and the metrics server causes timestamps to be wrong. If the target's clock is 30 seconds ahead of the server's clock, a metric emitted at server time T will have a client timestamp of T + 30. The metric appears to be from the future.
+
+Metrics systems handle clock skew by rejecting samples with timestamps too far in the future (more than 5 minutes ahead of the server clock) or too far in the past (more than 1 hour behind). Samples within the acceptable range are stored with their original timestamp. The query engine does not correct clock skew — the data is stored as received.
+
+The practical impact of clock skew is that data appears shifted in time. A latency spike at 10:00 AM appears on the chart at 10:00:30 AM if the target clock is 30 seconds ahead. For most monitoring purposes, this 30-second shift is acceptable. For high-frequency trading or real-time control, it is not.
+
+## Performance Characteristics
+
+The performance of a metrics system is measured in three dimensions: write throughput, query latency, and storage efficiency.
+
+<AsciiDiagram
+  id="metrics/deepdive-performance-characteristics"
+  title="Performance characteristics of a metrics system at different scales"
+  alt="Diagram showing p50, p99, and p999 latency for write, query, and storage operations at different scale"
+  caption="Performance characteristics vary by operation type and scale, with p999 write latency being the most critical bottleneck"
+ content={`
+┌─────────────────────────────────────────────────────────┐
+│           Metrics System Performance Characteristics     │
+│                                                         │
+│  Operation          p50      p99      p999    Max       │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │ Write (single)   1ms     10ms     50ms     200ms  │   │
+│  │ Write (batch)    5ms     25ms     100ms    500ms  │   │
+│  │ Query (last 1h)  10ms    100ms    1s       5s     │   │
+│  │ Query (last 7d)  50ms    500ms    5s       30s    │   │
+│  │ Scrape           5ms     50ms     200ms    1s     │   │
+│  │ Compaction       100ms   1s       5s       30s    │   │
+│  │ Index lookup     0.1ms   1ms      5ms      20ms   │   │
+│  │ WAL fsync        1ms     10ms     100ms    500ms  │   │
+│  │ Chunk decompress 1ms     5ms      20ms     50ms   │   │
+│  │ Graph render     50ms    200ms    500ms    2s     │   │
+│  └──────────────────────────────────────────────────┘   │
+│                                                         │
+│  At 1M active series, 100k samples/sec:                 │
+│  - Write throughput: sustained 100k samples/sec         │
+│  - Query latency: p99 under 500ms for last 1h           │
+│  - Storage: 16 bytes raw → 2 bytes compressed           │
+│  - Memory: 1GB for index, 2GB for memtables             │
+└─────────────────────────────────────────────────────────┘
+`} />
+
+### Write Throughput
+
+Write throughput is measured in samples per second. A single metrics server can handle 100,000 to 500,000 samples per second on modern hardware.
+
+The bottleneck is almost always disk I/O for the WAL. Each sample must be written to the WAL for durability. Sequential disk I/O on an SSD can handle 500,000 to 1,000,000 samples per second. Random I/O (which happens during compaction) is much slower at 10,000 to 50,000 operations per second.
+
+To increase write throughput: use faster disks (NVMe SSDs), batch WAL writes, increase the WAL fsync interval, or shard across multiple servers.
+
+### Query Latency
+
+Query latency depends on the time range, the number of time series, and the aggregation function.
+
+A query over the last hour that touches 1,000 time series returns in under 100 milliseconds. A query over the last 30 days that touches 100,000 time series might take 10 seconds. The difference is in the number of chunks that must be read from disk and decompressed.
+
+Query latency optimization techniques:
+- **Pre-aggregation**: compute and store aggregates at write time.
+- **Parallel query execution**: fan out queries across shards in parallel.
+- **Result caching**: cache frequent query results in memory.
+- **Downsampling**: query downsampled data for long time ranges.
+
+### Storage Efficiency
+
+Storage efficiency is measured in bytes per sample. Modern time-series databases achieve 1 to 2 bytes per sample on disk, down from 16 bytes raw.
+
+The compression ratio depends on the regularity of the data. Constant metrics (like a service that is always at 200 requests per second) compress extremely well: XOR of consecutive values is zero, compressing to a single bit. Spiky metrics (like a service with sudden traffic bursts) compress less well because the XOR of consecutive values has few leading or trailing zeros.
+
+Storage requirements for a production system:
+- 10,000 active series at 15-second intervals: 57,600 samples per day
+- At 2 bytes per sample: 115 KB per day
+- With 3 labels averaging 10 bytes each: 30 bytes per series, 300 KB index
+- Total: 415 KB per day, 12 MB per month, 146 MB per year
+
+At 100,000 active series: 1.15 MB per day, 34 MB per month, 418 MB per year.
+
+## Configuration and Tuning
+
+A metrics system has dozens of configuration parameters. Tuning them correctly is the difference between a system that runs smoothly and one that falls over during the first traffic spike.
+
+### Scrape Interval
+
+The scrape interval controls how often metrics are collected from each target. The default is 15 seconds. Tuning guidance:
+
+- **15 seconds** (default): good for most services. Catches the majority of anomalies.
+- **5 seconds**: for latency-sensitive services or high-frequency trading. Increases CPU and network overhead by 3x.
+- **30 seconds**: for stable, low-priority services. Reduces overhead by 50 percent.
+- **60 seconds**: for batch jobs or cron-like services. Not suitable for interactive services.
+
+### Storage Retention
+
+Retention controls how long data is kept at each resolution.
+
+- **Raw data (15-second resolution)**: 7 to 30 days. This is your primary debugging window.
+- **5-minute rollups**: 3 to 6 months. Useful for trend analysis and capacity planning.
+- **1-hour rollups**: 1 to 3 years. Required for compliance and year-over-year comparisons.
+
+Set retention based on your SLAs and compliance requirements. SOC 2 typically requires 6 months of monitoring data. PCI DSS requires 1 year.
+
+### Cardinality Limits
+
+Cardinality limits prevent runaway label values from crashing the system. Set limits per metric and per label.
+
+- **Max series per metric**: 100,000. Above this, the metric is likely misconfigured.
+- **Max label value length**: 256 characters. Longer values are truncated.
+- **Max metrics per target**: 10,000. Above this, the target is emitting too many metrics.
+
+If a sample exceeds the cardinality limit, the system should reject it and increment a counter. The rejection should be visible in the metrics system itself (a meta-metric), so operators can detect the problem.
+
+### Resource Limits
+
+- **Memory**: 1 GB per 500,000 active series for the index, plus 2 GB per million for memtables.
+- **CPU**: 8 cores for 1 million samples per second throughput.
+- **Disk**: 100 GB for 1 billion samples (compressed). Plan for 2x headroom for compaction overhead.
+
+### Query Optimization
+
+Query performance is the most visible metric for users of the metrics system. Slow dashboards lead to frustrated engineers and slower incident response.
+
+**Recording rules**: Precompute expensive queries and store the results. A query like histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) computes the p99 latency across all endpoints. This query touches every bucket of the histogram and aggregates across all endpoints. Precomputing it as a recording rule every 30 seconds costs compute at write time but saves compute at query time. The trade-off is storage: the precomputed metric takes space.
+
+**Query caching**: Cache the results of frequent queries. A dashboard that refreshes every 30 seconds can cache query results for 25 seconds. The cache key is the query string and the time range. Cache invalidation is time-based: the cache entry expires after a configurable TTL. For the most common queries (last 1 hour, last 6 hours), caching can reduce query latency by 90 percent.
+
+**Parallel query execution**: Fan out a single query across all shards. Each shard executes the query against its subset of data, and the query frontend merges the results. This is the primary mechanism for scaling query performance: 10 shards each return results in 100ms, and the merged result is returned in 100ms plus merge overhead. The merge overhead is proportional to the number of shards, not the data volume.
+
+**Time range partitioning**: A query over the last 30 days can be split into 30 one-day queries, each executed against the appropriate chunk of data. The results are merged in the query frontend. This allows the query engine to skip chunks that do not contain data for the requested time range, reducing I/O.
+
+### Memory Management
+
+Memory is the most constrained resource in a metrics system. The index must fit in memory for fast queries. The memtable must fit in memory for fast ingestion.
+
+**Index memory**: The inverted index stores label-to-series mappings. Each series occupies roughly 256 bytes in the index. For 1 million series, the index is 256 MB. For 10 million series, the index is 2.5 GB. For 100 million series, the index is 25 GB. The index grows linearly with series count.
+
+**Memtable memory**: The memtable stores recent samples in memory before flushing to disk. Each sample occupies roughly 128 bytes in the memtable (uncompressed). For 1 million samples, the memtable is 128 MB. The memtable flush threshold is configurable: a larger threshold reduces compaction frequency but requires more memory.
+
+**Query memory**: The query engine needs memory to decompress chunks and compute results. A query over 10,000 series needs to decompress 10,000 chunks, each roughly 1 KB decompressed. This is 10 MB of temporary memory per query. Complex queries (histogram_quantile over multiple series) need additional memory for intermediate results.
+
+**Memory pressure handling**: When the system runs low on memory, it should reduce the memtable size (flushing more frequently), evict index entries for less-frequently-queried series, and reject new queries with a 503 status code. The system should emit meta-metrics about memory pressure so operators can take action.
+
+### Networking Considerations
+
+The metrics pipeline is network-intensive. Every scrape is an HTTP request. Every aggregation step is a network transfer. Every query result is a network response.
+
+**Bandwidth**: Each scrape of a target returning 10,000 metrics with 500 total time series produces roughly 50 KB of text data. For 1,000 targets scraped every 15 seconds, the total bandwidth is 50 KB * 1,000 / 15 seconds = 3.3 MB/s per leaf scraper. For 10 leaf scrapers, the aggregation layer receives 33 MB/s. This is significant but manageable on a 10 Gbps network.
+
+**Latency**: The network round-trip time between the scraper and the target adds to the scrape duration. In the same datacenter, this is under 1ms. Across availability zones, it is 1-2ms. Across regions, it is 50-100ms. Cross-region scraping is not recommended for this reason.
+
+**Compression**: Use compression for all metric transfers. The text exposition format compresses well (text has high redundancy). Gzip compression typically reduces the payload by 5x. The HTTP Accept-Encoding header enables compression automatically.
+
+**Connection pooling**: The scraper maintains a pool of HTTP connections to frequently-scraped targets. Connection reuse avoids the overhead of TLS handshakes and TCP slow start. The pool size is configurable: too small and connections queue, too large and memory is wasted.
+
+### Advanced Configuration: Alertmanager Tuning
+
+Alertmanager is the alerting component of the Prometheus ecosystem. It receives alerts from Prometheus servers, deduplicates them, and sends notifications through various channels (email, PagerDuty, Slack, etc.).
+
+Key configuration parameters:
+
+- **Group by**: alerts are grouped by labels. Grouping p99 latency alerts by service means you get one notification per service, not one per alert rule. This prevents notification storms when a single service triggers multiple alerts.
+- **Group interval**: how long to wait before sending a notification for a group. A 30-second group interval batches alerts from the same group into a single notification.
+- **Repeat interval**: how long to wait before resending a notification for a continuing alert. A 4-hour repeat interval means the on-call engineer is not paged every 5 minutes for a continuing incident.
+- **Inhibit rules**: suppress lower-severity alerts when a higher-severity alert is firing. If the service is down (P0), inhibit the disk space alert (P1) for that service.
+
+### Query Execution Deep Dive
+
+Understanding how a single PromQL query executes helps you design efficient queries and debug slow dashboards.
+
+Consider the query: `rate(http_requests_total{status="500"}[5m])`. This computes the per-second rate of HTTP 500 errors over the last 5 minutes.
+
+**Step 1: Series selection**. The query engine finds all time series matching `http_requests_total{status="500"}`. It queries the inverted index and gets a list of series IDs. If there are 10 matching series, the query will process 10 time series.
+
+**Step 2: Time range resolution**. The query has an implicit time range based on the dashboard's time range. If the dashboard shows the last 1 hour, the query resolves to the time range [now - 1h, now]. The query engine finds all chunks for each matching series that overlap with this time range.
+
+**Step 3: Chunk reading**. For each matching series, the query engine reads the relevant chunks from disk. Each chunk contains 128 or 512 compressed samples. The engine decompresses the chunks into in-memory arrays of (timestamp, value) pairs.
+
+**Step 4: Rate computation**. For each series, the engine applies the rate function: it computes the per-second rate between consecutive samples, handling counter resets. The result is a new time series of rate values.
+
+**Step 5: Aggregation**. The engine computes the sum of rates across all matching series. This produces the final result: a single time series showing the aggregate rate of HTTP 500 errors.
+
+**Step 6: Result formatting**. The engine formats the result as a JSON response for the dashboard to render. The response includes the timestamps and values for each data point, plus metadata about the query (series count, sample count, execution time).
+
+Each step has a different cost profile:
+- Series selection: fast (under 1ms for 1,000 series in the index).
+- Chunk reading: slow (10-100ms per series, depending on disk speed).
+- Decompression: moderate (1-5ms per chunk).
+- Rate computation: fast (under 1ms per series).
+- Aggregation: moderate (1-10ms for 1,000 series).
+- Result formatting: fast (under 1ms).
+
+The total query time is dominated by chunk reading and decompression. Reducing the number of series in the query (by using more specific label selectors) and reducing the time range are the most effective optimizations.
+
+### Effective Compression Strategies
+
+The compression ratio of time-series data depends on the data's characteristics. Understanding these characteristics helps you estimate storage requirements accurately.
+
+**Regular data (every sample at exactly the scrape interval)**: These compress extremely well. The delta-of-delta for timestamps is consistently zero. The XOR for values is small because consecutive values change slowly. Expected compression: 1.2 bytes per sample.
+
+**Irregular data (gaps, delayed samples)**: If the target occasionally takes longer to respond, samples arrive at irregular intervals. The delta-of-delta for timestamps varies, requiring more bits to encode. Expected compression: 2.5 bytes per sample.
+
+**Spiky data (sudden value changes)**: If the metric value changes dramatically between samples (traffic spikes, GC pauses), the XOR encoding has fewer leading and trailing zeros. Expected compression: 3.5 bytes per sample.
+
+**Counter resets**: When a process restarts, the counter resets to zero. The reset causes a large XOR value (the previous value was, say, 1,000, and the new value is 0). Counter resets also produce negative delta-of-delta values for timestamps (the restart takes time). Expected compression during resets: 5 bytes per sample.
+
+For capacity planning, use 2 bytes per sample as a baseline and add 50 percent headroom for irregularities. This gives 3 bytes per sample as a conservative estimate.
+
+### Configuring Histogram Buckets
+
+Histogram bucket configuration is one of the most impactful tuning decisions. Bad bucket selection leads to inaccurate percentiles. Good bucket selection gives you accurate percentiles with minimal storage overhead.
+
+**Rule 1: Cover the expected range**. The largest bucket before the infinity bucket should be 10x the expected p99. If your p99 latency is 200ms, set the largest bucket at 2000ms. This ensures that the p99 falls well within the bucket range and is not in the infinity bucket.
+
+**Rule 2: More buckets in the critical range**. If most requests take 10-100ms, add more buckets in that range: 10ms, 20ms, 30ms, 50ms, 75ms, 100ms. This gives you accurate percentiles in the range where most requests fall.
+
+**Rule 3: Exponential spacing for wide ranges**. For services with variable latency (100ms to 10s), use exponential spacing: 1ms, 2ms, 4ms, 8ms, 16ms, 32ms, 64ms, 128ms, 256ms, 512ms, 1024ms, 2048ms, 4096ms, 8192ms. Each bucket is roughly 2x the previous bucket. This gives uniform relative error across the range.
+
+**Rule 4: Test with real data**. Deploy a test histogram with many buckets (20+) and observe the actual distribution. Then reduce the buckets to the minimum number that still captures the distribution accurately. Most services need 10-15 buckets.
+
+### Global Defaults
+
+Set these defaults for all services in your organization:
+
+- **Metric naming**: snake_case, suffix with _total for counters, _seconds for durations, _bytes for memory.
+- **Required labels**: service, environment, instance, region. These labels appear on every metric.
+- **Forbidden labels**: user_id, email, request_id, session_id. These have high cardinality.
+- **Bucket boundaries for latency histograms**: [1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1000ms, 2500ms, 5000ms].
+
+### PromQL vs. SQL: A Comparison
+
+Understanding the differences between PromQL (Prometheus Query Language) and SQL helps you understand the design philosophy of time-series query engines.
+
+**Data model**: SQL queries tabular data with rows and columns. PromQL queries time series with labels. A SQL table maps to a PromQL metric name. SQL columns map to PromQL labels.
+
+**Time awareness**: SQL has no built-in time-series operations. You must write explicit time comparisons (WHERE timestamp > NOW() - INTERVAL '1 hour'). PromQL has time as a first-class concept. Every query operates on a time range. The time range is implicit in the dashboard or alert configuration.
+
+**Aggregation**: SQL aggregates with GROUP BY on columns. PromQL aggregates with by(label) on series. SQL aggregation functions (SUM, AVG, COUNT) apply to column values. PromQL aggregation functions (sum, avg, count) apply to series values within the time range.
+
+**Rate calculation**: SQL does not have a native rate function. You must compute (last_value - first_value) / duration yourself and handle counter resets. PromQL has a built-in rate function that handles resets automatically.
+
+**Percentile calculation**: SQL calculates exact percentiles using ORDER BY and LIMIT or using the percentile_cont function. PromQL estimates percentiles from histogram buckets using histogram_quantile. The PromQL approach is approximate but far more efficient for large datasets.
+
+The practical implication is that PromQL queries are shorter and more intuitive for time-series analysis, but SQL is more flexible for non-time-series data. If your use case requires complex joins between metrics and non-metric data, SQL is the better choice.
+
+### Log-Structured Merge Tree (LSM Tree) in Detail
+
+The LSM tree is the storage engine underlying most time-series databases, including Prometheus, InfluxDB, and M3. Understanding its behavior helps you tune the storage layer.
+
+**Structure**: The LSM tree has two levels: the memtable (in-memory, sorted) and SSTables (on-disk, sorted). Writes go to the memtable first. When the memtable reaches a configurable size, it is flushed to disk as an SSTable. Over time, multiple SSTables accumulate for the same time series.
+
+**Read amplification**: A query must read from all SSTables that contain data for the requested time range. If 10 SSTables exist for a time series, the query reads from all 10 and merges the results. This is called read amplification. Read amplification increases as more SSTables are created.
+
+**Compaction**: To reduce read amplification, the LSM tree periodically merges SSTables into larger SSTables. This is called compaction. Compaction merges 10 SSTables into 1, reducing read amplification from 10x to 1x. Compaction is CPU-intensive and I/O-intensive. It is the primary background process in the storage engine.
+
+**Compaction strategies**:
+- **Size-tiered compaction**: compact SSTables when a threshold number of similar-sized SSTables exist. Simple but can cause write amplification during large compactions.
+- **Leveled compaction**: organize SSTables into levels. Each level is 10x larger than the previous level. SSTables from level 0 are compacted into level 1, then from level 1 to level 2, etc. More complex but produces less write amplification.
+- **Time-window compaction**: compact SSTables within the same time window. This is the best strategy for time-series data because queries are always over time ranges, and compacting by time window minimizes the number of SSTables that must be read for any query.
+
+### Bridge
+
+You now understand the internal machinery of metrics systems: the data structures, the write path, the query engine, and the tuning knobs. The next chapter shows how to build a metrics infrastructure that handles millions of time series across multiple regions, with capacity planning math and production deployment patterns.

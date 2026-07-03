@@ -78,4 +78,31 @@ Each topic is structured as a guided learning path:
 | [Vector Clocks](vector-clocks) | Tracking causal relationships between events without synchronized clocks |
 | [PACELC](pacelc) | Extending CAP Theorem — trade-offs during both partitions and normal operation |
 
+## Observability
+
+| Topic | What You'll Learn |
+|-------|------------------|
+| [SLIs](slis) | Service Level Indicators — measuring what matters in production |
+| [SLOs](slos) | Service Level Objectives — setting and meeting reliability targets |
+| [Metrics](metrics) | Collecting, analyzing, and acting on time-series data |
+| [Logging](logging) | Structured logs, log aggregation, and making sense of high-volume event data |
+| [Tracing](tracing) | Following requests across distributed services with trace context propagation |
+| [Alerting](alerting) | Defining alert rules, notification channels, and on-call best practices |
+| [Dashboards](dashboards) | Building effective visualizations for system health and performance |
+| [Error Budgets](error-budgets) | Balancing reliability velocity with actionable SLO-based budgets |
+| [Monitoring](monitoring) | End-to-end observability — collecting, correlating, and acting on telemetry |
+
+## Cloud and Infrastructure
+
+| Topic | What You'll Learn |
+|-------|------------------|
+| [Docker](docker) | Containerization — packaging applications with their dependencies for consistent deployment |
+| [Kubernetes](kubernetes) | Orchestrating containerized workloads at scale across clusters |
+| [Autoscaling](autoscaling) | Automatically adjusting compute resources based on demand |
+| [Serverless](serverless) | Running code without managing servers — functions, event triggers, and cold starts |
+| [Deployment Strategies](deployment-strategies) | Rolling, blue-green, canary, and feature-flag deployments for zero-downtime releases |
+| [Infrastructure as Code](infrastructure-as-code) | Managing infrastructure through declarative configuration files and version control |
+| [Disaster Recovery](disaster-recovery) | Planning and systems for recovering from catastrophic failures |
+| [Multi-Region](multi-region) | Deploying across geographic regions for latency, availability, and compliance |
+
 Let's begin.

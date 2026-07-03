@@ -1,0 +1,475 @@
+﻿---
+id: embeddings-architecture
+title: Embeddings at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest embedding search system is a script with a few hundred lines of Python. It reads documents, embeds them, and searches by brute force.
+
+<AsciiDiagram title="Naive Embedding System — Single Process" content={`
+  ┌─────────────────────────────────────────────────────┐
+  │               Single Python Process                  │
+  │                                                     │
+  │  pandas.DataFrame:                                  │
+  │  ┌──────────┬───────────────────┬──────────────┐    │
+  │  │ doc_id   │ text              │ embedding     │    │
+  │  ├──────────┼───────────────────┼──────────────┤    │
+  │  │ 1        │ "How to reset..." │ [0.23,...]   │    │
+  │  │ 2        │ "Password recov." │ [0.45,...]   │    │
+  │  │ ...      │ ...               │ ...          │    │
+  │  └──────────┴───────────────────┴──────────────┘    │
+  │                                                     │
+  │  Query: embed → cosine_similarity(all) → sort[:10]  │
+  └─────────────────────────────────────────────────────┘
+`} />
+
+**What breaks at 1,000 users:** Nothing. A single process handles 1,000 queries/day with ease. Brute-force comparison of 10,000 vectors takes about 10ms.
+
+**What breaks at 100,000 users:** The brute-force approach now compares 1 million vectors per query. Each search takes 500ms-1s. The system can't handle 100 QPS with 1s latency — requests queue up and time out. The process runs out of memory because all vectors are loaded in RAM.
+
+**What breaks at 10 million users:** The embedding model inference itself becomes the bottleneck. Without GPU acceleration, each query takes 50ms just to embed. The index holds 100M vectors — too large for a single machine. The brute-force search is completely infeasible (hours per query). The system needs:
+
+1. A proper ANN index (HNSW, IVF, DiskANN)
+2. GPU-accelerated model inference
+3. Horizontal sharding across multiple machines
+4. A query cache for frequently asked queries
+5. A re-ranking stage for accuracy
+
+## Production-Grade Architecture
+
+<AsciiDiagram title="Production Embedding System — Full Architecture" content={`
+  Clients ──> [Load Balancer] ──> [API Gateway]
+                                      │
+                         ┌────────────┼────────────┐
+                         v            v            v
+                    [Query Router] [Write Router] [Admin API]
+                         │            │
+                         v            v
+                    [Cache Layer]  [Embedding Service]
+                    (Redis)        (GPU cluster)
+                         │            │
+                         └────┬───────┘
+                              v
+                     ┌────────────────┐
+                     │  Vector Index   │
+                     │  (HNSW shards)  │
+                     └────────────────┘
+                              │
+                              v
+                     [Document Store]
+                     (DynamoDB/Cassandra)
+                              │
+                              v
+                     [Re-ranker]
+                     (Cross-encoder)
+                              │
+                              v
+                     [User ← Results]
+`} />
+
+### Component Breakdown
+
+**API Gateway:** Handles auth, rate limiting, request validation, and routing. Each request type (query, insert, delete, update) goes to a different internal service.
+
+**Query Router:** Determines which index shard(s) to query based on the request. For a global search, fans out to all shards. For a filtered search (e.g., "search only in category X"), routes to the subset of shards that hold that category.
+
+**Write Router:** Batches incoming documents into configurable-sized groups (typically 64 or 128) for efficient embedding inference. Sends batches to the embedding service.
+
+**Embedding Service:** Runs the embedding model on GPU. Accepts batched text, returns batched vectors. This is a stateless service that can scale horizontally (add more GPU nodes to handle more throughput).
+
+**Cache Layer:** Caches query vectors and search results for frequent queries. A Redis cluster with TTL-based eviction. Hit rate is typically 30-50% for production search systems.
+
+**Vector Index (HNSW Shards):** The index is partitioned across multiple shards. Each shard contains a subset of the total vectors and runs its own HNSW graph. The shard count determines both throughput (more shards = more parallelism) and recall (fewer vectors per shard = more focused search).
+
+**Document Store:** A key-value database mapping vector IDs to original documents and metadata. This is separate from the vector index. The document store holds the payload that gets returned to the user.
+
+**Re-ranker:** An optional cross-encoder that scores the top 100 results from the ANN search with higher accuracy. This adds 50-200ms but significantly improves result quality.
+
+## Integration Patterns
+
+### Integrating with a Relational Database
+
+Most embedding systems start with data already in a relational database like PostgreSQL. The integration pattern is a periodic ETL pipeline.
+
+<AsciiDiagram title="Embedding + PostgreSQL Integration" content={`
+  ┌──────────────────┐         ┌──────────────────────┐
+  │  PostgreSQL       │  cron  │  Embedding Pipeline   │
+  │                   │ ────>  │                      │
+  │  products table   │        │  1. SELECT * WHERE   │
+  │  ┌─────────────┐  │        │     updated_at > last │
+  │  │ id, name,   │  │        │  2. Embed each row   │
+  │  │ description│  │        │  3. Insert to index   │
+  │  │ category    │  │        │  4. UPDATE last_run   │
+  │  └─────────────┘  │        └──────────────────────┘
+  └──────────────────┘                    │
+                                          v
+                                  ┌────────────────┐
+                                  │  Vector Index   │
+                                  └────────────────┘
+`} />
+
+**What to watch for:** The ETL pipeline is only as fresh as its last run. For real-time applications (e.g., new product listings appearing in search immediately), you need a streaming integration instead of a batch pipeline. Use PostgreSQL's logical replication or a CDC tool like Debezium to stream changes to the embedding pipeline.
+
+### Integrating with a Cache Layer
+
+An embedding system without caching burns money on GPU inference and index queries. A cache layer sits between the query router and the embedding service.
+
+**Cache Strategy:**
+- Query text hash → embedding vector cache: Avoids re-embedding the same query
+- Query vector → results cache: Avoids re-searching the index for common queries
+- TTL-based eviction with sliding window (frequent queries stay cached)
+
+**What to watch for:** Cached results become stale when the underlying data changes. If a new document is added that would match a cached query, the cache won't know. Use cache invalidation on write — when new vectors are indexed, flush or tag-mismatch the affected queries.
+
+### Integrating with a Message Queue
+
+For high-throughput ingestion, documents should flow through a queue rather than being embedded synchronously.
+
+<AsciiDiagram title="Async Ingestion via Message Queue" content={`
+  [Web App] ──> [Kafka / SQS]
+                     │
+                     │ consume
+                     v
+              [Embedding Worker]
+              (GPU batch inference)
+                     │
+                     v
+              [Vector Index]
+                     │
+                     v
+              [Notification]
+              (index updated)
+                     │
+                     v
+              [Search becomes available]
+`} />
+
+**What to watch for:** The queue decouples ingestion speed from embedding speed. If the embedding service falls behind, the queue buffers the overflow. Monitor queue depth as a key alerting metric. If queue depth grows unbounded, add more embedding workers.
+
+### Integrating with External APIs
+
+Many systems use third-party embedding APIs (OpenAI, Cohere, Google) instead of self-hosting models.
+
+**What to watch for:**
+- API latency: External API calls add 100-500ms per query
+- Rate limits: Most providers cap requests per minute. Batch inserts can hit limits
+- Cost: At $0.13 per 1M tokens for text-embedding-3-small, embedding 100M documents costs thousands of dollars
+- Vendor lock-in: Different providers have different embedding spaces. You cannot mix them
+
+## Multi-Region and Global Scale
+
+### Global Topology
+
+<AsciiDiagram title="Multi-Region Embedding Deployment" content={`
+  Region A (us-east)              Region B (eu-west)
+  ┌─────────────────────┐        ┌─────────────────────┐
+  │ [API Gateway]       │        │ [API Gateway]       │
+  │       │             │        │       │             │
+  │ [Local Index]       │        │ [Local Index]       │
+  │       │             │        │       │             │
+  │ [Local Doc Store]   │        │ [Local Doc Store]   │
+  │       │             │        │       │             │
+  └───────┼─────────────┘        └───────┼─────────────┘
+          │                              │
+          └──────────[Cross-Region───────┘
+                       Replication]
+                          │
+                          v
+                    [Global Embedding
+                     Model (same weights)]
+`} />
+
+**Data Replication:** Vector indexes are replicated asynchronously between regions. Each region has its own copy of the index. Writes are accepted in any region and propagated via change data capture.
+
+**Latency:** Cross-region queries add 50-200ms of network latency. To avoid this, queries are always served from the nearest region. The trade-off is that results may be slightly stale in regions that haven't caught up with writes yet.
+
+**Consistency Trade-offs:** The system is eventually consistent. A document written in us-east may take 1-5 seconds to appear in eu-west searches. For applications that need read-after-write consistency (e.g., "I just added my product, where is it?"), route reads to the write region for that user.
+
+**Failover:** If a region goes down, traffic is routed to the nearest healthy region. The failover region must have enough capacity to handle the extra load (typically 2x normal for N+1 redundancy).
+
+## Capacity Planning
+
+### Scenario: Design for 10 Million Daily Active Users
+
+**Step 1: Estimate QPS**
+
+Assume each user performs 3 searches per day, and traffic is concentrated in 4 peak hours.
+
+10,000,000 users x 3 searches / day = 30,000,000 searches / day
+
+Peak hour traffic: 30,000,000 x 40% / 4 hours = 3,000,000 searches / hour
+
+Peak QPS: 3,000,000 / 3600 = 833 queries/second
+
+Buffer for spikes: 833 x 2 = ~1,700 QPS target
+
+**Step 2: Estimate Storage Requirements**
+
+Assume 100 documents per user (products, articles, profiles):
+
+Total documents: 10,000,000 x 100 = 1,000,000,000 documents
+
+Vector storage:
+- Embedding: 1536 dimensions x 4 bytes = 6,144 bytes per vector
+- Total vectors: 1B x 6 KB = 6 TB
+- HNSW index overhead (2x): 6 TB x 2 = 12 TB
+- Total: ~18 TB
+
+Document storage (text + metadata):
+- Average 2 KB per document
+- 1B x 2 KB = 2 TB
+
+**Step 3: Compute Requirements**
+
+GPU for embedding:
+- A10G GPU processes ~500 queries/second (batch inference)
+- Need: 1,700 / 500 = 4 GPU nodes
+- Add 2 for redundancy: 6 GPUs
+
+CPU for index search:
+- Single HNSW shard on c6i.2xlarge (8 vCPU) handles ~200 QPS
+- Need: 1,700 / 200 = 9 shards
+- With replication factor 2: 18 index nodes
+
+Memory per index node:
+- 1B / 9 shards = 111M vectors per shard
+- 111M x 6 KB = 666 GB RAM per node
+- Switch to PQ compression to reduce to 166 GB
+
+**Step 4: Network Bandwidth**
+
+Each query returns ~10 KB of result data.
+1,700 QPS x 10 KB = 17 MB/s outbound bandwidth.
+With replication and cross-region traffic: ~50 MB/s total.
+
+**Step 5: Cost Estimate (Monthly)**
+
+| Component | Count | Unit Cost | Total |
+|-----------|-------|-----------|-------|
+| GPU nodes (A10G) | 6 | $3,000/mo | $18,000 |
+| Index nodes (c6i.8xlarge) | 18 | $1,000/mo | $18,000 |
+| Document store (DynamoDB) | 2 TB | - | $5,000 |
+| Cache (Redis cluster) | 3 nodes | $500/mo | $1,500 |
+| Cross-region data transfer | - | - | $3,000 |
+| Embedding API (if external) | 1B docs | $0.13/1M tokens | ~$130,000 |
+| **Total (self-hosted)** | | | **$45,500** |
+| **Total (with API)** | | | **$175,500** |
+
+## Deployment and Operations
+
+### Zero-Downtime Deployment
+
+Embedding services are stateless — you can deploy new versions by swapping pods behind the load balancer. The vector index takes longer to update. Use a blue-green deployment for the index: build the new index on the new nodes while the old nodes still serve traffic, then switch DNS when the new index is ready.
+
+### Monitoring
+
+**Critical Metrics:**
+- **p50/p99 query latency:** Should stay under 100ms / 500ms
+- **Cache hit rate:** Below 20% means the cache is ineffective
+- **Recall@10:** What fraction of relevant results appear in top 10? Below 85% means the index needs tuning
+- **Index freshness:** Time between document insert and search availability
+- **GPU utilization:** Below 30% means you're over-provisioned; above 90% means you're hitting throughput limits
+- **Queue depth:** Growing backlog means ingestion is falling behind
+
+**Key Alerts:**
+- p99 latency exceeds 1s for more than 5 minutes
+- Cache hit rate drops below 10%
+- Index node memory exceeds 85%
+- Any shard is more than 30% larger than the others (skew)
+- Embedding API error rate exceeds 1%
+
+### Debugging
+
+When results are wrong, the debugging checklist is:
+1. Is the query embedding the same model as the index embeddings? Mixing models is the most common mistake.
+2. Is the query normalization matching the index normalization? Mismatched normalization silently degrades results.
+3. Are the new vectors actually in the index? Check the index build timestamp vs document insert timestamp.
+4. Is the efSearch parameter high enough? Low efSearch values cause missed results.
+5. Is the shard assignment correct? A query against the wrong shard set returns empty results.
+
+### Upgrades
+
+Upgrading the embedding model is the riskiest operation. A new model produces different vectors—you cannot mix old and new vectors in the same index. The standard procedure is dual-indexing: build a new index with the new model, run A/B tests comparing recall, then switch traffic to the new index. Never delete the old index until you're confident the new one works correctly.
+
+## Embedding as a Service Architecture
+
+Managed embedding services like OpenAI, Cohere, and Jina abstract away the infrastructure complexity of running embedding models at scale. Instead of provisioning GPU nodes, managing model versions, and scaling inference infrastructure, teams send text to an API endpoint and receive vectors back. Understanding what happens behind that API is essential for building reliable systems on top of these services.
+
+<AsciiDiagram id="embeddings/managed-service" title="Managed Embedding Service Internals" alt="Flow diagram showing how a managed embedding service processes requests from clients through load balancer, API gateway, ingestion queue, and GPU nodes to the vector index database" content={`
+  [Client Apps] ──> [Load Balancer]
+                       │
+                       v
+                  [API Gateway]
+                   (auth, rate limit)
+                       │
+                       v
+                <Ingestion Queue>
+                  (Kafka / SQS)
+                       │
+           ┌───────────┼───────────┐
+           v           v           v
+      [GPU Node 1] [GPU Node 2] [GPU Node N]
+      (A100, batch)  (A100)      (A100)
+           │           │           │
+           └───────────┼───────────┘
+                       v
+                ((Vector Index))
+                   (shared pool)
+`} />
+
+**Request Batching and Queuing:** The service collects incoming embedding requests into batches of configurable size (typically 64 or 128). Batching is critical because GPU inference is most efficient when processing a batch of inputs rather than one at a time. The queue decouples request arrival rate from batch processing — if requests arrive faster than the GPUs can drain them, the queue buffers the excess. The key metric is queue depth: a growing queue means you need more GPU capacity.
+
+**Load Balancing Across GPU Nodes:** The load balancer distributes batches across available GPU nodes. The strategy goes beyond simple round-robin. Each batch is dispatched to the node with the lowest queue depth, accounting for the fact that batch sizes vary. Some providers use a least-connections approach where each batch's token count (not just the request count) determines the load.
+
+**Autoscaling Policies:** Autoscaling is driven by queue depth, not CPU utilization. A typical policy: scale up when the queue depth exceeds 5,000 pending requests, and scale down when the queue has been empty for more than 5 minutes. The cooldown period prevents thrashing — GPU node provisioning takes 3-5 minutes, so rapid scaling up and down wastes money. Some providers use a predictive autoscaler that forecasts traffic based on historical patterns and pre-provisions capacity.
+
+**Cost Optimization Strategies:**
+- **Batch size tuning:** Larger batches improve GPU utilization and reduce per-vector cost. The optimal batch size depends on the model and GPU memory. For text-embedding-3-small on an A100, the sweet spot is typically 128-256 inputs per batch.
+- **Caching:** Identical text should never be embedded twice. A cache keyed on the text hash saves the full embedding pipeline. For production systems, cache hit rates of 30-50% are common.
+- **Model quantization:** Using half-precision (FP16) or int8 quantization reduces memory and compute requirements by 50-75% with minimal recall loss (typically less than 0.5%).
+- **Idle management:** GPU nodes are expensive when idle. Use spot/preemptible instances for non-critical batch workloads with checkpointing.
+
+---
+
+## Chunking Strategies Deep Dive
+
+The way you split documents into chunks is one of the most impactful design decisions in an embedding system. Chunking strategy directly affects both recall and precision — if chunks are too large, meaning is diluted; if too small, context is lost.
+
+<AsciiDiagram id="embeddings/chunking-strategies" title="Chunking Strategies Comparison" alt="Three rows comparing fixed-size chunking, semantic chunking, and recursive chunking approaches showing how each splits a document into chunks" content={`
+  Fixed-Size (512 tokens, 64 overlap):
+  ┌──────────────────────┬──────────────────────┐
+  │ [chunk 1│overlap ]  │ [overlap │chunk 2   ]│
+  │ tokens 0-512         │ tokens 448-960       │
+  └──────────────────────┴──────────────────────┘
+
+  Semantic (sentence boundaries):
+  ┌────────────────┬─────────────────┬───────────┐
+  │ [Sentence 1]   │ [Sentence 2-4]  │ [Sent 5]  │
+  │ topic shifts   │ coherent para   │ new topic │
+  └────────────────┴─────────────────┴───────────┘
+
+  Recursive (hierarchical split):
+  ┌──────────────────────────────────────────────┐
+  │ [Document section]                            │
+  ├──────────────────────┬───────────────────────┤
+  │ [paragraph 1]       │ [paragraph 2]         │
+  ├──────────┬──────────┼──────────┬────────────┤
+  │ [sent 1] │ [sent 2] │ [sent 3] │ [sent 4]   │
+  └──────────┴──────────┴──────────┴────────────┘
+`} />
+
+**Fixed-Size Chunking:** The simplest approach — split text into chunks of equal token count with a configurable overlap. The overlap ensures that the boundary between chunks doesn't split a meaningful phrase. Common overlap values are 10-20% of the chunk size. For a 512-token chunk, a 64-token overlap is typical. The trade-off is that fixed-size chunks may split sentences or paragraphs mid-thought, causing the embedding to capture an incomplete idea.
+
+**Semantic Chunking:** Instead of splitting at arbitrary token boundaries, semantic chunking respects natural language boundaries. The chunker uses sentence boundaries, paragraph breaks, or topic shift detection to determine where one chunk ends and the next begins. This produces chunks that are more coherent — each chunk represents a complete thought. The downside is variable chunk sizes: some chunks may be very short (a single sentence) while others are very long (a multi-paragraph section). Most implementations use a sentence tokenizer, group sentences into chunks, and split when the cumulative token count exceeds a threshold or a topic shift is detected.
+
+**Recursive Chunking:** A hybrid approach that splits hierarchically. The text is first split by the largest logical unit (e.g., document sections), then each section is split by paragraph, then by sentence if needed. The recursion continues until each chunk fits within the target token limit. Recursive chunking produces the most coherent chunks because it respects the document's natural hierarchy. It is the default strategy in LangChain and LlamaIndex.
+
+**Overlap Strategies:** The overlap between adjacent chunks serves two purposes: (1) it prevents the boundary from splitting a meaningful phrase, and (2) it ensures that a query can match either side of the boundary. Token-level overlap (fixed overlap of 10-50 tokens) is the simplest. Sentence-level overlap (the last 1-2 sentences of the previous chunk are included in the next chunk) is more coherent but wastes more tokens. The optimal overlap trades off between recall and storage cost — more overlap means higher recall but more vector storage.
+
+**Impact of Chunk Size on Recall:** Chunk size has a direct effect on search quality. Small chunks (128-256 tokens) produce focused embeddings that match specific queries well, but may miss the broader context. Large chunks (512-1024 tokens) capture more context but dilute the embedding signal. The common recommendation is to start with 512 tokens and tune based on your domain. Legal documents benefit from larger chunks (context matters), while code search benefits from smaller chunks (functions are short).
+
+**Chunk-to-Document Mapping:** When a user searches and finds a chunk, the result display needs to show the full document context, not just the 512-token chunk. Store a document ID in each chunk's metadata. When a chunk matches, look up the full document from the document store and display the relevant portion highlighted. The chunk index contains the vector plus metadata, while the document store contains the full text. This separation keeps the vector index lean and search fast.
+
+---
+
+## Production Readiness Checklist
+
+Shipping an embedding system to production requires more than just a vector index and a GPU. The following checklist covers the operational concerns that separate a prototype from a production service.
+
+<AsciiDiagram id="embeddings/deployment-pipeline" title="Embedding System Deployment Pipeline" alt="Four-stage deployment pipeline showing code promotion from development through staging, canary, and production with gates at each stage" content={`
+  [Dev] ──> [Staging] ──> [Canary] ──> [Production]
+    │           │            │             │
+    v           v            v             v
+  [Unit +    [Integration  [A/B Test    [Live Traffic]
+   Embedding  Tests +       with 5%       Full rollout
+   Quality    Performance   traffic]      Monitored]
+   Tests]     Benchmarks]
+    │           │            │             │
+    v           v            v             v
+  ((CI/CD Failed))  ((Quality Gate))  ((Rollback Ready))
+`} />
+
+**Security:**
+- **Embedding API authentication:** Use API keys or OAuth2 tokens for all embedding service endpoints. Never expose embedding endpoints to the public internet without authentication.
+- **Request validation:** Validate input text length, content type, and encoding before processing. A malicious user could send a large text string to your embedding service, causing OOM on the GPU.
+- **Rate limiting:** Implement per-user and per-tenant rate limits. Embedding APIs are expensive to run; a single user burning through the rate limit affects everyone.
+- **Input sanitization:** Strip or escape control characters, zero-width characters, and extremely long tokens from input text to prevent injection into the vector index.
+
+**Resiliency:**
+- **Circuit breakers:** If the embedding service returns errors for more than 5% of requests in a 1-minute window, trip the circuit breaker. The caller falls back to a cached result or a degraded search mode.
+- **Retry policies:** Use exponential backoff with jitter for retries. The sequence: 100ms, 500ms, 2s, 5s — with a maximum of 4 retries before giving up.
+- **Fallback paths:** If the primary embedding model is unavailable, fall back to a smaller model (e.g., text-embedding-3-small to ada-002) or a cached embedding. The fallback should be transparent to the end user.
+- **Graceful degradation:** If the vector index is unavailable, fall back to keyword search (BM25 or Elasticsearch). The results are lower quality, but the system stays up.
+
+**Monitoring:**
+- **Embedding dashboards:** Track p50/p95/p99 latency for embedding inference, batch size distribution, queue depth, GPU utilization, and memory pressure.
+- **Embedding alerts:** Alert on p99 latency exceeding 1 second, queue depth growing for more than 5 minutes, GPU memory exceeding 90%, and embedding API error rate above 1%.
+- **Quality dashboards:** Track recall@10, NDCG@10, cache hit rate, and index freshness (time from document insert to searchable). These metrics tell you if the system is working well, not just whether it is up.
+- **Cost dashboards:** Monitor embedding cost per query, per tenant, and per day. Embedding costs can grow unnoticed if not tracked.
+
+**Testing in CI/CD:**
+- **Embedding regression test suite:** Maintain a fixed set of 100-500 queries with known correct results. Run this suite against every new index build. The test passes if recall@10 is within 1% of the baseline.
+- **Model version tests:** When upgrading the embedding model, run the regression suite and compare results. A new model that degrades recall on your specific domain should not be deployed.
+- **Load tests:** Run a soak test that sends 10,000 queries per minute to the embedding service for 30 minutes. Monitor for memory leaks, GPU OOM, and latency degradation.
+- **Chaos tests:** Randomly kill embedding worker pods and verify that the system recovers without data loss or extended downtime.
+
+**Disaster Recovery:**
+- **Vector index backup:** Take periodic snapshots of the vector index. Store the snapshots in object storage (S3, GCS, Azure Blob) with a 30-day retention policy.
+- **Rebuild from source:** Keep the original document corpus and the embedding model version pinned. You should be able to rebuild the entire index from scratch in under 24 hours.
+- **Multi-region replication:** For critical systems, maintain a warm standby index in a second region. The standby accepts replicated writes and can serve traffic within 5 minutes of a primary failure.
+- **Backup testing:** Every quarter, perform a disaster recovery drill: tear down the primary index, restore from the backup, and verify that recall metrics match the pre-failure values.
+
+---
+
+## A/B Testing Embedding Systems
+
+Changing the embedding model or chunking strategy is a high-risk operation. A/B testing provides a data-driven way to validate changes before a full rollout.
+
+<AsciiDiagram id="embeddings/ab-testing-flow" title="A/B Testing Flow for Embedding Systems" alt="Traffic split diagram showing requests being routed to control and variant models, with results compared in an evaluation pipeline" content={`
+                    ┌─── 50% ──> [Model A (Control)]
+                    │              text-embedding-3-small
+                    │                    │
+  [Query Traffic] ──┤                    v
+                    │              ((Result Set A))
+                    │
+                    └─── 50% ──> [Model B (Variant)]
+                                 text-embedding-3-large
+                                       │
+                                       v
+                                 ((Result Set B))
+
+  [Evaluation Pipeline] ──> Compare A vs B
+    (recall@K, NDCG, CTR)        │
+                                 v
+                          [Decision: Rollout
+                           or Rollback]
+`} />
+
+**Setting Up the A/B Test:** The simplest approach is a shadow test — send every query to both models but only show the control model's results to users. The variant model's results are logged for comparison. More advanced setups use a true split test where a percentage of users see the variant model's results. This requires a user-scoped context that persists across requests.
+
+**Metrics to Compare:**
+- **Recall@K:** What fraction of known relevant documents appear in the top K results. This is the most important metric because it directly measures search quality. Compute it offline using a labeled query set.
+- **NDCG (Normalized Discounted Cumulative Gain):** Accounts for the ranking position of relevant results. A relevant document at position 1 is worth more than one at position 10. NDCG captures ranking quality, not just whether relevant results appear.
+- **CTR (Click-Through Rate):** For production systems, measure how often users click on search results. A higher CTR indicates that users find the results more useful. CTR is noisy but reflects real user behavior.
+- **User Satisfaction:** Measure p95 latency and error rate. A better model that is 500ms slower may reduce overall user satisfaction. Track user surveys or engagement metrics alongside quality metrics.
+- **Cost:** The new model may be more expensive (e.g., text-embedding-3-large costs 7x more than text-embedding-3-small). Factor cost into the decision.
+
+**Statistical Significance:** Run the A/B test until you have enough data to reach statistical significance. For recall@K, a minimum of 5,000 queries per variant is typically required. Use a two-tailed t-test or a bootstrap test to compare the mean recall of the two variants. A p-value below 0.05 indicates a statistically significant difference. If the difference is not significant after 50,000 queries, the models are likely equivalent for your use case.
+
+**Gradual Rollout Strategy:**
+1. **Shadow mode (1 week):** Run the new model in parallel, log results, no user impact. Validate recall and latency offline.
+2. **Canary launch (5% traffic, 1 week):** Route 5% of users to the new model. Monitor CTR, latency, and error rate. Compare against the control group.
+3. **Expansion (25% traffic, 1 week):** If the canary is stable, expand to 25%. Monitor for regressions in edge cases.
+4. **Full rollout (100%):** If all metrics are stable or improved, route all traffic to the new model.
+5. **Observation (2 weeks):** Keep monitoring for long-tail regressions. The old model's index is kept as a cold standby for 30 days.
+
+**Rollback Procedures:** If the new model degrades metrics at any stage, the rollback is simple: route traffic back to the old model. The old model's index is still running and serving queries. The key requirement is that you never delete the old index until the new model has been stable for at least 30 days. Document the rollback procedure and test it before the rollout.
+
+---
+
+On the next page, you'll explore the hard trade-offs every embedding system forces you to make — the core tension, failure modes, and anti-patterns that separate mature systems from fragile ones.

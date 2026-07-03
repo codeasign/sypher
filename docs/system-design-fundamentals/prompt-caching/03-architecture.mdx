@@ -1,0 +1,607 @@
+---
+id: prompt-caching-architecture
+title: Prompt Caching at Scale
+sidebar_label: Building at Scale
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest possible prompt cache is an in-memory dictionary. A Python `dict` that maps prefix strings to KV cache tensors. The implementation is a few dozen lines of code.
+
+```python
+class NaivePromptCache:
+    def __init__(self):
+        self.cache: dict[str, torch.Tensor] = {}
+        self.max_entries = 100
+
+    def get(self, prefix: str) -> torch.Tensor | None:
+        return self.cache.get(prefix)
+
+    def set(self, prefix: str, kv_cache: torch.Tensor) -> None:
+        if len(self.cache) >= self.max_entries:
+            self._evict_one()
+        self.cache[prefix] = kv_cache
+
+    def _evict_one(self) -> None:
+        self.cache.pop(next(iter(self.cache)))
+```
+
+This implementation works for a single-threaded prototype. It breaks in production for five reasons.
+
+**Reason 1: Memory Management.** The naive cache stores tensors in CPU memory. Each entry consumes gigabytes of memory. Without size limits per entry, a single large prefix can exhaust all available memory. Without proper eviction, the cache fills up within minutes. Without TTL, entries remain in memory indefinitely, even when the underlying prompt has changed. The naive cache has no mechanism to bound memory usage or handle the 10 GB per entry that a 70-billion-parameter model requires.
+
+**Reason 2: No Concurrency.** The naive cache uses a single lock for all operations. Under production load with 100 requests per second, the lock contention causes request queuing and timeout cascades. A single slow cache operation blocks all other operations. The Python Global Interpreter Lock (GIL) makes matters worse for CPU-bound operations.
+
+**Reason 3: No Distribution.** The naive cache lives in a single process on a single machine. A deployment with 10 inference servers requires 10 separate caches, each storing the same entries. The duplication wastes memory. Worse, a request served by server A cannot use a cache entry that was populated by server B. The effective cache size is divided by the number of servers.
+
+**Reason 4: No Persistence.** When the process restarts, the entire cache is lost. Every deployment triggers a cold start where all requests pay the full prefill cost. For a system serving 5,000 requests per minute, a deployment results in 5,000 cache misses in the first minute alone. The latency spike can trigger cascading timeouts.
+
+**Reason 5: No Prefix Matching.** The naive cache requires an exact string match. The prompt "You are a helpful assistant. Answer the user's question." is a different key than "You are a helpful assistant. Answer the user's question" (without the trailing period). A single character difference causes a cache miss. The naive cache does not support prefix matching, longest-prefix matching, or semantic matching.
+
+## Production-Grade Architecture
+
+A production-grade prompt caching system separates concerns into dedicated services, each horizontally scalable and fault-tolerant.
+
+<AsciiDiagram
+  id="prompt-caching/production-architecture"
+  title="Production-Grade Prompt Caching Architecture"
+  alt="Architecture diagram showing the distributed cache cluster, cache index service, prefix matching engine, cache warming pipeline, and monitoring stack with detailed component interactions"
+  caption="A production-grade system uses dedicated services for cache storage, indexing, matching, warming, and monitoring. Each service is independently scalable."
+  content={`┌───────────────────────────────────────────────────────────────────────────────────┐
+│                        Production Architecture (Multi-Node)                              │
+│                                                                                           │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                    Inference Cluster (8 GPU Nodes)                                   │   │
+│  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                  │   │
+│  │  │GPU 1│ │GPU 2│ │GPU 3│ │GPU 4│ │GPU 5│ │GPU 6│ │GPU 7│ │GPU 8│                  │   │
+│  │  └──┬──┘ └──┬──┘ └──┬──┘ └──┬──┘ └──┬──┘ └──┬──┘ └──┬──┘ └──┬──┘                  │   │
+│  │     │       │       │       │       │       │       │       │                       │   │
+│  │     └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───┐                   │   │
+│  │                          │ Cache Client Library (sidecar)         │                   │   │
+│  └──────────────────────────┼───────────────────────────────────────┘                   │   │
+│                             │                                                            │
+├─────────────────────────────┼────────────────────────────────────────────────────────────┤   │
+│                             ▼                                                            │   │
+│  ┌──────────────────────────────────────────────────────────────────────────┐             │   │
+│  │              Cache Cluster (6 Nodes, 2x Replication)                      │             │   │
+│  │                                                                          │             │   │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │             │   │
+│  │  │ Cache    │  │ Cache    │  │ Cache    │  │ Cache    │  │ Cache    │  │             │   │
+│  │  │ Node 1   │  │ Node 2   │  │ Node 3   │  │ Node 4   │  │ Node 5   │  │             │   │
+│  │  │ 64 GB    │  │ 64 GB    │  │ 64 GB    │  │ 64 GB    │  │ 64 GB    │  │             │   │
+│  │  │ RAM+SSD  │  │ RAM+SSD  │  │ RAM+SSD  │  │ RAM+SSD  │  │ RAM+SSD  │  │             │   │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │             │   │
+│  │  ┌──────────┐                                                          │             │   │
+│  │  │ Cache    │                                                          │             │   │
+│  │  │ Node 6   │                                                          │             │   │
+│  │  │ 64 GB    │                                                          │             │   │
+│  │  └──────────┘                                                          │             │   │
+│  └──────────────────────────────────────────────────────────────────────────┘             │   │
+│                             │                                                            │   │
+│  ┌──────────────────────────┼──────────────────────────────────────────┐                   │   │
+│  │              Cache Index Service (3 replicas, Raft consensus)        │                   │   │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐   │                   │   │
+│  │  │ Index Primary    │  │ Index Replica 1  │  │ Index Replica 2  │   │                   │   │
+│  │  │ (leader, writes) │  │ (reads only)     │  │ (reads only)      │   │                   │   │
+│  │  │ 8 GB RAM         │  │ 8 GB RAM         │  │ 8 GB RAM          │   │                   │   │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘   │                   │   │
+│  └──────────────────────────────────────────────────────────────────────┘                   │   │
+│                             │                                                            │   │
+│  ┌──────────────────────────┼──────────────────────────────────────────┐                   │   │
+│  │              Prefix Matching Engine (4 nodes, sharded by first token)│                   │   │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐           │                   │   │
+│  │  │ Trie 1   │  │ Trie 2   │  │ Trie 3   │  │ Trie 4   │           │                   │   │
+│  │  │ tokens   │  │ tokens   │  │ tokens   │  │ tokens   │           │                   │   │
+│  │  │ 0-32768  │  │ 32768-   │  │ 65536-   │  │ 98304-   │           │                   │   │
+│  │  │          │  │ 65535    │  │ 98303    │  │ 131071   │           │                   │   │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘           │                   │   │
+│  └──────────────────────────────────────────────────────────────────────┘                   │   │
+│                                                                                           │   │
+│  ┌──────────────────────────────────────────────────────────────────────────┐             │   │
+│  │              Cache Warming Pipeline                                        │             │   │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐        │             │   │
+│  │  │ Log Analyzer     │  │ Prefix Predictor │  │ Prefill Executor │        │             │   │
+│  │  │ (reads traffic   │  │ (ML model:       │  │ (runs prefill on │        │             │   │
+│  │  │  logs from S3)   │  │  predicts top-K  │  │  batch of GPUs)  │        │             │   │
+│  │  │ runs every hour  │  │  prefixes)       │  │  stores to cache │        │             │   │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘        │             │   │
+│  └──────────────────────────────────────────────────────────────────────────┘             │   │
+│                                                                                           │   │
+│  ┌──────────────────────────────────────────────────────────────────────────┐             │   │
+│  │              Monitoring Stack (Grafana + Prometheus + Alertmanager)      │             │   │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐        │             │   │
+│  │  │ Hit Ratio        │  │ Eviction Rate    │  │ Latency Tracing  │        │             │   │
+│  │  │ Dashboard + Alert│  │ Alert > 100/s    │  │ p50/p95/p99      │        │             │   │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘        │             │   │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐        │             │   │
+│  │  │ Memory Usage     │  │ Cache Node Health│  │ Replication Lag  │        │             │   │
+│  │  │ Alert > 90%      │  │ Alert on node    │  │ Alert > 60s      │        │             │   │
+│  │  │                  │  │ down             │  │                  │        │             │   │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘        │             │   │
+│  └──────────────────────────────────────────────────────────────────────────┘             │   │
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Cache Cluster
+
+The cache cluster is a distributed in-memory storage system. Each node stores a subset of the KV cache entries. The entries are distributed using consistent hashing so that adding or removing a node requires minimal data movement. Each node has a two-tier storage architecture: a RAM tier for hot entries and an SSD tier for warm entries. The cluster supports replication for fault tolerance. A replication factor of 2 ensures that each entry is stored on two nodes.
+
+### Cache Index Service
+
+The cache index service maintains the mapping from prefix hashes to entry metadata. The index is replicated across three nodes for high availability. The index uses Raft consensus to ensure consistency. Writes go to the leader. Reads can go to any replica. The index stores only metadata (hash, location, size, TTL, access count), not the full KV cache tensors. This keeps the index small and fast.
+
+### Prefix Matching Engine
+
+The prefix matching engine maintains the prefix trie for fast prefix matching. The engine is sharded across four nodes, each responsible for a subset of the prefix space. The sharding is based on the first token of the prefix. The engine supports longest-prefix matching and prefix validation. The engine is stateless and can be scaled horizontally.
+
+### Cache Warming Pipeline
+
+The cache warming pipeline precomputes cache entries for anticipated prefixes. The pipeline has three components. The log analyzer scans the previous day's traffic logs to identify the most common prefixes. The prefix predictor uses a light machine learning model to predict which prefixes will be popular in the next hour. The prefill executor runs the LLM prefill for each targeted prefix and stores the resulting KV cache in the cache cluster.
+
+### Metrics and Monitoring
+
+The monitoring stack tracks hit ratio, miss ratio, eviction rate, memory usage, lookup latency, and cache size. The metrics are exposed through a Grafana dashboard. Alerts fire when the hit ratio drops below a threshold, the eviction rate spikes, or the lookup latency exceeds a bound.
+
+## Integration Patterns
+
+### With LLM Inference Servers
+
+The prompt caching system integrates with LLM inference servers through a client library. The client library intercepts the prompt before it is sent to the inference server, performs the cache lookup, and either returns the cached KV cache or passes the prompt through for full inference. The client library is deployed as a sidecar process on each inference server.
+
+<AsciiDiagram
+  id="prompt-caching/inference-integration"
+  title="Integration with LLM Inference Servers"
+  alt="Diagram showing the cache client library deployed as a sidecar to each inference server, intercepting prompts for cache lookup before they reach the GPU engine"
+  caption="The cache client library runs as a sidecar on each inference server. It intercepts prompts, performs cache operations, and returns cached KV cache or passes through for full inference."
+  content={`┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Inference Server Node (Single Host)                         │
+│                                                                                 │
+│  ┌─────────────────────────────┐    ┌──────────────────────────────────────┐    │
+│  │   Application                │    │   Cache Client (sidecar process)      │    │
+│  │                              │    │                                       │    │
+│  │   User Request ─────────────▶│───▶│  1. Extract prefix (first N tokens)  │    │
+│  │                              │    │  2. Compute prefix hash              │    │
+│  │                              │    │  3. Check Bloom filter               │    │
+│  │                              │    │  4. If possible hit: query index     │    │
+│  │                              │    │  5. If hit: retrieve KV from cache   │    │
+│  │                              │    │  6. If miss: pass to LLM engine      │    │
+│  │                              │    │  7. After decode: store KV if miss   │    │
+│  │                              │    │                                       │    │
+│  │                              │    │  Communication with cache cluster:    │    │
+│  │                              │    │  - gRPC or RDMA for KV transfer      │    │
+│  │                              │    │  - HTTP/2 for index operations        │    │
+│  │                              │    │  - Batch requests for efficiency      │    │
+│  └──────────────────────────────┘    └──────────────┬───────────────────────┘    │
+│                                                      │                            │
+│                                                      ▼                            │
+│                                           ┌──────────────────────┐                │
+│                                           │   LLM Engine (GPU)   │                │
+│                                           │                      │                │
+│                                           │  Prefill + Decode    │                │
+│                                           │  or Decode Only      │                │
+│                                           │  (depends on cache)  │                │
+│                                           └──────────────────────┘                │
+└───────────────────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### With Model Routers
+
+Model routers distribute inference requests across multiple models and providers. The prompt caching system integrates with the router by adding cache awareness to the routing decision. The router considers the cache state when choosing a model. If the target model has a warm cache for the prompt prefix, the router prefers that model over an equally capable model with a cold cache.
+
+The cache-aware routing uses a cost function that balances model quality, latency, and cost. The cost of a cache miss includes the full prefill cost. The cost of a cache hit includes only the decode cost. The router selects the model with the lowest expected cost.
+
+### With Observability
+
+The prompt caching system exports metrics in OpenTelemetry format. Every cache operation is traced with a span that captures the lookup latency, the hit or miss result, and the entry size. The traces are exported to the observability backend (Jaeger, Grafana Tempo, or Datadog) for debugging and performance analysis.
+
+### With CI/CD
+
+The CI/CD pipeline includes a cache validation step. When the prompt templates change, the pipeline runs a batch of test prompts through the new templates and validates that the caching behavior is correct. The pipeline also triggers a cache warmup for the new prefixes before the deployment reaches production traffic.
+
+## Multi-Region and Global Scale
+
+### Cache Replication
+
+For multi-region deployments, the cache is replicated across regions. Each region has its own cache cluster that stores entries for prompts that are popular in that region. The replication is asynchronous. Entries created in region A are replicated to region B within 30 seconds. The replication uses a write-ahead log (WAL) that is shipped to the replica regions.
+
+### Regional Cache Affinity
+
+The system routes requests to the region that has the warmest cache for the prompt prefix. The routing decision is based on the cache hit ratio per region for the requested prefix. If region A has a 90 percent hit ratio and region B has a 30 percent hit ratio, the request is routed to region A. The affinity information is stored in the global cache index.
+
+### Cache Invalidation Across Regions
+
+When a cache invalidation is triggered in one region, the invalidation must propagate to all other regions within a bounded time. The invalidation uses a cross-region message bus. Each region subscribes to invalidation events from all other regions. On receiving an invalidation event, the region removes the affected entries from its local cache.
+
+### Warmup Strategies Per Region
+
+Each region has its own warmup strategy that reflects the regional prompt distribution. Region A may serve predominantly English prompts with a specific knowledge base. Region B may serve predominantly Japanese prompts with a different knowledge base. The warmup pipeline in each region analyzes the region-specific traffic logs and warms up the region-specific popular prefixes.
+
+## Capacity Planning
+
+### Estimating Cache Size
+
+The cache size depends on the number of distinct prompt prefixes, the average prefix length, and the model architecture. The formula is:
+
+```
+cache_size = num_prefixes * tokens_per_prefix * bytes_per_token * replication_factor
+```
+
+For a system with 500 distinct prefixes, 4,000 tokens per prefix, 2.6 MB per token, and a replication factor of 2:
+
+```
+cache_size = 500 * 4,000 * 2.6 MB * 2 = 10.4 TB
+```
+
+This is a large cache. The system needs approximately 10 TB of RAM across the cache cluster to store 500 prefixes with full replication.
+
+### Estimating QPS
+
+The query-per-second (QPS) estimate determines the number of cache nodes needed. Each cache node can handle approximately 10,000 lookups per second. For a system serving 1 million requests per day with 8 hours of peak traffic (approximately 35 requests per second), a single cache node is sufficient. For a system serving 1 billion requests per day (approximately 11,500 requests per second), the system needs at least 2 cache nodes.
+
+### Estimating Memory Per Entry
+
+The memory per entry is the product of the prefix length, the KV cache size per token, and the overhead for metadata. For a 4,000-token prefix with a 70-billion-parameter model:
+
+- KV cache tensors: 10.4 GB
+- Metadata (hash, location, TTL, access count): 256 bytes
+- Index entry: 128 bytes
+- Total per entry: approximately 10.4 GB
+
+The per-entry memory is dominated by the KV cache tensors. The metadata and index overhead are negligible.
+
+### Estimating Network Bandwidth
+
+The network bandwidth between the inference server and the cache cluster must support moving KV cache tensors at the request rate. For a cache hit, the system reads the full KV cache from the cache node to the inference server. For a 10.4 GB entry and 35 cache hits per second, the network bandwidth is:
+
+```
+bandwidth = 10.4 GB * 35 / 8 = 45.5 Gbps
+```
+
+This requires a 40 Gbps or 100 Gbps network link. For systems with high hit rates, the network bandwidth is often the bottleneck, not the compute or storage.
+
+## Deployment and Operations
+
+### Zero-Downtime Deployment
+
+The cache cluster supports zero-downtime deployment through a rolling update strategy. Nodes are updated one at a time. When a node is taken down for update, its entries are replicated to the remaining nodes. When the node comes back up, it rejoins the cluster and begins serving requests. The cache index is updated to reflect the node state changes.
+
+### Cache Warming on Deploy
+
+Every deployment triggers a cache warming phase. The warming runs in the background while the system serves traffic with reduced cache efficiency. The warming pipeline uses the previous day's traffic logs to predict the most common prefixes for the new deployment. The warming completes within 5 minutes for a typical deployment.
+
+### Monitoring
+
+The monitoring dashboard tracks the following metrics:
+
+- **Hit Ratio**: The percentage of requests served from cache. Alert if below 40 percent for 5 minutes.
+- **Miss Ratio**: The percentage of requests that miss the cache. Alert if above 80 percent for 5 minutes.
+- **Eviction Rate**: The number of entries evicted per second. Alert if above 100 per second for 5 minutes.
+- **Memory Usage**: The percentage of cache memory used. Alert if above 90 percent for 5 minutes.
+- **Lookup Latency**: The p50, p95, and p99 latency of cache lookups. Alert if p99 exceeds 50 milliseconds.
+- **Cache Node Health**: The number of healthy cache nodes. Alert if below the minimum threshold.
+- **Replication Lag**: The lag between primary and replica regions. Alert if above 60 seconds.
+
+### Debugging
+
+Common debugging scenarios include:
+
+- **Low Hit Ratio**: Check if the TTL is too short, the cache is too small, or the prompt diversity is too high.
+- **High Eviction Rate**: Check if the cache size is insufficient for the working set. Consider reducing the prefix length or increasing the cache size.
+- **Slow Lookups**: Check if the Bloom filter is saturated, the cache index is overloaded, or the network is congested.
+- **Stale Responses**: Check if the TTL is too long or the explicit invalidation is not working correctly.
+
+<AsciiDiagram
+  id="prompt-caching/monitoring-dashboard"
+  title="Monitoring Dashboard for Prompt Caching"
+  alt="Mock monitoring dashboard showing hit ratio gauge, miss ratio, eviction rate, memory usage, lookup latency percentiles, and cache node health status"
+  caption="The monitoring dashboard tracks the key metrics that indicate the health and efficiency of the prompt caching system. Alert thresholds are shown for each metric."
+  content={`┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                   Prompt Cache Monitoring Dashboard (Grafana)                           │
+├────────────────────────────────┬────────────────────────────────────────────────────────┤
+│  Hit Ratio (last 24h)          │  Miss Ratio (last 24h)                                   │
+│  ┌────────────────────────────┐│  ┌────────────────────────────┐                           │
+│  │      ██████████████████    ││  │      ████████              │                           │
+│  │      ██████████████████ 72%││  │      ████████           28%│                           │
+│  │      ██████████████████    ││  │      ████████              │                           │
+│  │  Alert: < 40%              ││  │  Alert: > 80%             │                           │
+│  └────────────────────────────┘│  └────────────────────────────┘                           │
+├────────────────────────────────┼────────────────────────────────────────────────────────┤
+│  Eviction Rate (entries/s)     │  Memory Usage (GB)                                       │
+│  ┌────────────────────────────┐│  ┌────────────────────────────┐                           │
+│  │      ████                  ││  │      ██████████████████████ │                           │
+│  │      ████       42/s       ││  │      ██████████████████████ │  187/200 GB (93.5%)     │
+│  │      ████                  ││  │      ██████████████████████ │                           │
+│  │  Alert: > 100/s            ││  │  Alert: > 90%              │                           │
+│  └────────────────────────────┘│  └────────────────────────────┘                           │
+├────────────────────────────────┼────────────────────────────────────────────────────────┤
+│  Lookup Latency (ms)           │  Cache Node Health: 6/6 healthy                           │
+│  ┌────────────────────────────┐│  ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐              │
+│  │ ██ p50: 2ms                ││  │ N1 │ │ N2 │ │ N3 │ │ N4 │ │ N5 │ │ N6 │              │
+│  │ ████████ p95: 8ms          ││  │ OK  │ │ OK  │ │ OK  │ │ OK  │ │ OK  │ │ OK  │              │
+│  │ ██████████████ p99: 15ms   ││  └────┘ └────┘ └────┘ └────┘ └────┘ └────┘              │
+│  │ Alert: p99 > 50ms          ││  Replication Lag: 2.3s (Alert: > 60s)                    │
+│  └────────────────────────────┘│                                                           │
+└────────────────────────────────┴───────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Debugging Tools
+
+The system provides several debugging tools. The cache inspector allows operators to view the contents of a specific cache entry. The trace viewer shows the full lifecycle of a single request, including the cache lookup decision. The simulation tool replays historical traffic against a hypothetical cache configuration to predict the hit ratio without affecting production traffic.
+
+## Operational Runbooks
+
+### Runbook 1: Low Hit Ratio
+
+**Symptoms**: Hit ratio drops below 40 percent for more than 5 minutes. Average latency increases by 500 milliseconds or more.
+
+**Investigation**:
+1. Check the cache node health. Are all 6 nodes healthy?
+2. Check the cache memory usage. Is the cache near capacity?
+3. Check the eviction rate. Is it higher than normal?
+4. Check the TTL configuration. Did the TTL change recently?
+5. Check the prompt templates. Did a prompt update change the prefix structure?
+6. Check the traffic log. Are there new prefix patterns that were not present before?
+
+**Resolution**:
+- If memory is near capacity: Increase cache size or reduce prefix length.
+- If eviction rate is high: Increase cache size or change eviction policy.
+- If TTL is too short: Increase TTL for the affected prefixes.
+- If prompt templates changed: Update cache warming to include new prefixes.
+
+### Runbook 2: Cache Node Failure
+
+**Symptoms**: One or more cache nodes are unresponsive. Hit ratio drops sharply.
+
+**Investigation**:
+1. Check the node's resource utilization (CPU, memory, disk, network).
+2. Check the node's logs for error messages.
+3. Check the network connectivity between the node and the cluster.
+4. Check the replication status. Did replicas take over?
+
+**Resolution**:
+- If the node is overloaded: Add more cache nodes to distribute the load.
+- If the node crashed: Restart the node. Verify it rejoins the cluster.
+- If the network is partitioned: Wait for the partition to heal.
+- If replication failed: Manually trigger replication from the surviving replicas.
+
+### Runbook 3: Cold Start After Deployment
+
+**Symptoms**: Immediately after a deployment, the hit ratio drops to near zero. Latency spikes.
+
+**Investigation**:
+1. Check if cache warming ran before the deployment.
+2. Check the warming logs. Did all prefixes warm up successfully?
+3. Check the cache index. Are the warmed entries present?
+4. Check the deployment timestamp. Did the deployment happen during peak traffic?
+
+**Resolution**:
+- If warming did not run: Run warming immediately. Consider rolling back the deployment.
+- If warming failed: Check the warming pipeline for errors. Fix and re-run.
+- If warming ran but entries are missing: Check the cache node allocation. Warmed entries may have been placed on nodes that were taken down.
+- Prevention: Schedule deployments during low traffic. Run warming 30 minutes before deployment.
+
+### Runbook 4: Stale Content Detection
+
+**Symptoms**: Users report incorrect responses. Investigation reveals that the responses are based on outdated knowledge.
+
+**Investigation**:
+1. Check the cache invalidation logs. Was the invalidation triggered?
+2. Check the knowledge base update timestamp. When was it last updated?
+3. Check the TTL of the affected cache entries.
+4. Check the version tag of the affected entries.
+
+**Resolution**:
+- If invalidation was not triggered: Fix the invalidation pipeline. Manually invalidate the affected entries.
+- If TTL is too long: Reduce TTL for dynamic content prefixes.
+- If version tag is missing: Add version tagging to all cache entries.
+- Prevention: Add automatic cache validation that periodically checks cache entries against the source of truth.
+
+## Security Considerations
+
+### Authentication and Authorization
+
+Cache operations must be authenticated and authorized. Read operations (cache lookup) require the same authentication as the LLM API. Write operations (cache population) require write authorization. Invalidation operations require admin authorization.
+
+### Data Isolation
+
+In a multi-tenant deployment, cache entries must be isolated between tenants. Each entry is tagged with a tenant ID. The cache index enforces tenant isolation: a request from tenant A can only access entries tagged with tenant A. The isolation is enforced at the index level, not just at the storage level.
+
+### Encryption at Rest
+
+KV cache tensors may contain sensitive information from the prompt. The tensors must be encrypted at rest in the cache storage tier. The encryption uses AES-256-GCM with a key that is specific to the cache node. The encryption keys are rotated every 24 hours.
+
+### Encryption in Transit
+
+KV cache tensors transferred between the cache cluster and the inference servers must be encrypted in transit. The transfer uses TLS or, for high-performance deployments, MACsec at the network layer. The encryption overhead is approximately 5 percent of the transfer bandwidth.
+
+### Cache Poisoning Prevention
+
+Cache poisoning is prevented through several mechanisms:
+- Input validation: All prompts are validated before cache population.
+- Rate limiting: Cache population is rate limited per tenant and per user.
+- Anomaly detection: Unusual cache population patterns trigger alerts.
+- Audit logging: All cache write operations are logged for forensic analysis.
+
+## Cost Modeling
+
+### Infrastructure Cost Components
+
+The total cost of ownership for a prompt caching system includes:
+
+**Cache Storage Cost**: The cost of RAM and SSD for storing KV cache entries. For a 10 TB cache using RAM at $8/GB/month: $80,000/month. Using SSD at $0.50/GB/month: $5,000/month. A tiered approach (20% RAM, 80% SSD) costs $20,000/month.
+
+**Cache Index Cost**: The cost of maintaining the cache index. For a 200 GB index in RAM: $1,600/month with replication factor 3: $4,800/month.
+
+**Network Bandwidth Cost**: The cost of moving KV cache tensors between cache nodes and inference servers. For 100 cache hits per second, each transferring 10.4 GB: 1,040 GB/s. At $0.01/GB: $10.40/second or approximately $27,000/month.
+
+**Cache Warming Cost**: The cost of running the warming pipeline. For 200 prefixes warmed 4 times per day on 4 GPU instances: 200 * 4 * 4 = 3,200 prefill runs per day. At $0.018 per prefill: $57.60/day or $1,728/month.
+
+**Operational Overhead**: The cost of monitoring, debugging, and maintaining the cache system. Estimated at 0.5 FTE: approximately $10,000/month.
+
+### Cost-Benefit Analysis
+
+The cost-benefit analysis compares the cache infrastructure cost against the token savings.
+
+For a system processing 1 million requests per day with an 8,000-token prompt and a 70 percent hit ratio:
+
+**Without Cache**:
+- Daily prefill tokens: 1M * 8,000 = 8 billion tokens
+- Daily input cost: 8B * $3/1M = $24,000
+- Monthly input cost: $720,000
+
+**With Cache**:
+- Daily cache misses (30%): 300K * 8,000 = 2.4B tokens
+- Daily cache hit new tokens (70%): 700K * 4,000 = 2.8B tokens
+- Daily cache hit cached tokens (70%): 700K * 4,000 * 0.1 = 280M token-equivalent
+- Total daily cost: (2.4B + 2.8B) * $3/1M + 280M * $0.3/1M = $15,600 + $84 = $15,684
+- Monthly token cost: $470,520
+
+**Cache Infrastructure**:
+- Cache storage (10 TB tiered): $20,000/month
+- Cache index (600 GB replicated): $4,800/month
+- Network bandwidth: $27,000/month
+- Warming: $1,728/month
+- Operations: $10,000/month
+- Total infrastructure: $63,528/month
+
+**Net Savings**: $720,000 - $470,520 - $63,528 = $185,952/month
+
+The cache pays for itself within the first week of operation and provides a 26 percent net cost reduction.
+
+### Break-Even Analysis
+
+The break-even point depends on the hit ratio. At a hit ratio of 0 percent (no cache hits), the cache provides no savings but incurs the full infrastructure cost. At a hit ratio of 50 percent, the token savings are $124,740/month against an infrastructure cost of $63,528/month, yielding a net savings of $61,212/month. The break-even hit ratio is approximately 23 percent.
+
+## Testing Strategy
+
+### Unit Testing
+
+Unit tests verify individual components in isolation:
+- Cache index operations (insert, lookup, update, delete)
+- Prefix matching (exact match, longest prefix match, no match)
+- TTL management (creation, extension, expiry)
+- Eviction policy (LRU, LFU, hybrid)
+- Bloom filter (insert, check, false positive rate)
+- Concurrency (thread safety, lock contention)
+
+### Integration Testing
+
+Integration tests verify interactions between components:
+- Full request lifecycle (ingress, cache lookup, prefill or decode, storage)
+- Cache warming pipeline (log analysis, prefix prediction, prefill execution)
+- Cross-region replication (entry propagation, invalidation propagation)
+- Monitoring and alerting (metric collection, alert firing)
+
+### Load Testing
+
+Load tests verify the system under production-level traffic:
+- Sustained load: 100, 500, 1,000 requests per second for 30 minutes
+- Spike load: 2x, 5x, 10x normal traffic for 5 minutes
+- Cache warmup: Measure hit ratio recovery time after cold start
+- Network bandwidth: Measure throughput at various cache hit ratios
+- Memory pressure: Measure behavior at 90%, 95%, 99% cache capacity
+
+### Chaos Testing
+
+Chaos tests verify the system's resilience to failures:
+- Node failure: Kill one cache node randomly during sustained load
+- Network partition: Isolate a cache node from the cluster
+- Latency injection: Add artificial latency to cache operations
+- Data corruption: Corrupt cache entries in storage
+- Slow index: Introduce delays in the cache index service
+
+## Alternative Architectures
+
+### Embedded Cache (In-Process)
+
+Some systems embed the cache directly in the inference server process. This eliminates network latency for cache operations but limits the cache to the server's local memory. Each inference server has its own cache, and caches are not shared across servers. This architecture is simple and fast but wastes memory and cannot handle cross-server cache hits.
+
+**Pros**: Zero network latency, simple deployment, no additional infrastructure.
+**Cons**: Memory fragmentation (each server duplicates entries), no cross-server cache sharing, cache lost on server restart.
+
+### Sidecar Cache (Per-Host)
+
+Each inference server host runs a cache sidecar process. The sidecar handles cache operations for the local server and communicates with other sidecars for distributed operations. This architecture provides local cache performance with the ability to query other hosts for cache entries.
+
+**Pros**: Lower latency than distributed cache, shared cache across local processes, easy to add caching to existing deployments.
+**Cons**: Cache capacity limited to per-host memory, cross-host queries add network latency, more complex than embedded cache.
+
+### Distributed Cache (Cluster)
+
+A dedicated cache cluster with multiple nodes, accessible by all inference servers over the network. This is the architecture described in detail in this file. It provides the largest cache capacity and the best fault tolerance.
+
+**Pros**: Large capacity, cross-server cache sharing, independent scaling, fault tolerance.
+**Cons**: Network latency for all cache operations, additional infrastructure cost, more complex operations.
+
+### Hierarchical Cache (Multi-Tier)
+
+Combines embedded, sidecar, and distributed caches in a hierarchy. L0 is the embedded cache in the GPU (fastest, smallest). L1 is the sidecar cache (fast, medium). L2 is the distributed cache (slower, largest). A cache request checks L0 first, then L1, then L2.
+
+**Pros**: Best latency for hot entries, large capacity for warm entries, graceful degradation.
+**Cons**: Complex cache coherency across tiers, more moving parts to operate.
+
+## Performance Tuning Guide
+
+### Tuning Knob 1: Prefix Length
+
+Increasing the prefix length captures more context but reduces the hit ratio. The optimal prefix length depends on the prompt structure.
+
+**Rule of thumb**: Set the prefix length to the 90th percentile of the shared prefix length across requests. Measure this from the traffic log.
+
+**Tuning process**:
+1. Log prompt prefixes for 7 days.
+2. Compute the hit ratio for prefix lengths of 128, 256, 512, 1024, 2048, and 4096 tokens.
+3. Compute the average latency savings for each prefix length.
+4. Select the prefix length that minimizes the average latency.
+
+### Tuning Knob 2: Cache Size
+
+Increasing the cache size increases the hit ratio but increases the cost.
+
+**Rule of thumb**: Set the cache size to 2x the working set size. The working set is the number of distinct prefixes that appear more than 10 times per day.
+
+**Tuning process**:
+1. Count the number of distinct prefixes per day.
+2. Compute the hit ratio for cache sizes of 0.5x, 1x, 2x, and 4x the working set.
+3. Compute the cost of each cache size.
+4. Select the cache size that maximizes net benefit (token savings minus storage cost).
+
+### Tuning Knob 3: TTL
+
+Increasing the TTL increases the hit ratio but increases the staleness risk.
+
+**Rule of thumb**: Set the TTL to 2x the average inter-arrival time of requests for the most popular prefixes. For a prefix that is accessed every 10 minutes, set the TTL to 20 minutes.
+
+**Tuning process**:
+1. Measure the inter-arrival time distribution for each prefix.
+2. Set the TTL for each prefix to 2x its median inter-arrival time.
+3. Monitor the staleness rate and adjust the TTL up or down.
+
+### Tuning Knob 4: Eviction Policy
+
+The eviction policy determines which entries are removed when the cache is full.
+
+**Rule of thumb**: Use LRU for workloads with temporal locality (most workloads). Use LFU for workloads with stable popularity distributions (e.g., system prompts that are always popular).
+
+**Tuning process**:
+1. Run the cache with LRU for 7 days and measure the hit ratio.
+2. Run the cache with LFU for 7 days and measure the hit ratio.
+3. Select the policy with the higher hit ratio.
+4. For workloads with mixed access patterns, use a hybrid policy (LRU with frequency weighting).
+
+### Tuning Knob 5: Bloom Filter Size
+
+The Bloom filter size determines the false positive rate.
+
+**Rule of thumb**: Allocate 10 bits per entry for a 1 percent false positive rate. Allocate 20 bits per entry for a 0.1 percent false positive rate.
+
+**Tuning process**:
+1. Measure the current false positive rate from the logs.
+2. If the false positive rate is above 1 percent, increase the Bloom filter size.
+3. If the Bloom filter memory usage is above 1 percent of the cache memory, the filter is too large.

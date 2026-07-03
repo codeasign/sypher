@@ -1,0 +1,534 @@
+---
+id: kubernetes-tradeoffs
+title: Kubernetes -- Trade-offs & Failure Modes
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Core Tension
+
+Kubernetes solves the problem of running containerized applications at scale, but it introduces a fundamental tension: **abstraction versus complexity**. Kubernetes abstracts away the details of individual machines, networking, and storage, allowing developers to deploy applications without knowing which machine they run on. However, the abstraction layer itself is enormously complex, with dozens of components, hundreds of configuration options, and a steep learning curve.
+
+The core tension manifests in several dimensions:
+
+**Operational overhead versus automation benefits**: A Kubernetes cluster requires significant operational expertise to set up, secure, and maintain. The control plane must be monitored, etcd must be backed up, nodes must be upgraded, and network policies must be configured. This overhead only pays off when you run enough workloads to justify the investment. A team running three services on three VMs does not benefit from Kubernetes.
+
+**Resource efficiency versus resource overhead**: Kubernetes enables efficient resource utilization through bin-packing, autoscaling, and node pooling. However, the Kubernetes control plane itself consumes resources: etcd uses CPU and disk I/O, the API server uses memory for caching, and kubelet/kube-proxy use CPU and memory on every node. For small clusters, this overhead can be 10-20 percent of total resources.
+
+**Developer velocity versus cognitive load**: Kubernetes enables developers to deploy, scale, and roll back applications without operations team involvement. But developers must understand pods, services, deployments, configmaps, secrets, ingresses, persistent volumes, network policies, RBAC, and dozens of other concepts. The cognitive load of Kubernetes is significant, especially for developers who just want to run their code.
+
+## Decision Matrix
+
+| Factor | Kubernetes | Nomad/Nomad + Consul | Docker Swarm | AWS ECS/Fargate | Google Cloud Run |
+|---|---|---|---|---|---|
+| Setup complexity | High | Medium | Low | Low | Zero |
+| Learning curve | Steep | Moderate | Gentle | Moderate | Gentle |
+| Scaling (nodes) | 5,000 nodes | 10,000 nodes | 1,000 nodes | Managed | Managed |
+| Scaling (pods) | 150,000 pods | Unlimited (agent-based) | 50,000 tasks | Managed | Managed |
+| Stateful workloads | Native (StatefulSet, PVC) | Limited (CSI support) | Limited | Limited (EFS) | Ephemeral only |
+| Multi-cloud support | Native (any CNI) | Native | Limited | AWS-only | GCP-only |
+| Networking flexibility | CNI plugins (Calico, Cilium, Flannel) | Consul Connect | Overlay only | AWS VPC | Serverless |
+| Upgrade complexity | High (control plane + nodes) | Medium | Low | Managed | Managed |
+| Community and ecosystem | Largest | Growing | Declining | AWS-centric | GCP-centric |
+| Cost (operational) | High (expertise + infrastructure) | Medium | Low | Low (managed) | Zero (serverless) |
+
+## CAP Theorem Positioning
+
+Kubernetes itself is not a distributed data system, so the CAP theorem applies primarily to its underlying consensus store: etcd.
+
+etcd is a **CP system** (Consistency and Partition Tolerance, but not Availability during a partition). When a network partition splits the etcd cluster, the partition containing the majority of nodes continues to serve reads and writes. The minority partition cannot accept writes because it cannot form a quorum. During this time, writes to the minority partition fail with a `EtcdleaderChange` error or timeout.
+
+From the perspective of the Kubernetes cluster as a whole, this means:
+
+**During a partition of the control plane**: The API server connected to the majority etcd partition continues to accept writes. The API server connected to the minority partition returns errors. Applications continue running because the kubelet on each worker node operates independently. However, new deployments, scaling events, and configuration changes are unavailable for the minority partition.
+
+**During a partition of worker nodes**: Worker nodes in the minority partition can still serve traffic, but their pods cannot be managed. The node controller in the kube-controller-manager marks unreachable nodes as `Unknown` and eventually evicts their pods (after the `pod-eviction-timeout` of 5 minutes). If the partition heals before the eviction timeout expires, no impact occurs. If the partition lasts longer than 5 minutes, pods are rescheduled on reachable nodes, and the original pods on the partitioned nodes may continue running (dual pod scenario) until the kubelet detects they are orphaned.
+
+<AsciiDiagram
+  id="kubernetes/tradeoffs-cap-theorem"
+  title="CAP theorem positioning of etcd showing CP behavior during partition, and the impact on Kubernetes cluster operations"
+  alt="Two panels. Panel 1: Normal operation (no partition) with all three etcd nodes communicating, quorum available, all writes accepted. Panel 2: Partitioned operation with 2 nodes on one side (quorum available, writes work) and 1 node on the other side (no quorum, writes fail). Below each panel, the impact on Kubernetes operations is listed"
+  caption="etcd as a CP system and its impact on Kubernetes during a network partition"
+  content={`
+    ┌─────────────── Normal Operation: CP ─────────────────┐
+    │                                                       │
+    │   ┌──────────┐   ┌──────────┐   ┌──────────┐        │
+    │   │ etcd A   │───│ etcd B   │───│ etcd C   │        │
+    │   │ leader   │   │ follower │   │ follower │        │
+    │   └────┬─────┘   └──────────┘   └──────────┘        │
+    │        │                                             │
+    │        │  Quorum (2/3) available                     │
+    │        │  Reads: consistent  Writes: accepted        │
+    │        │  API server: fully operational              │
+    │        ▼                                             │
+    │  Kubernetes: all operations work                      │
+    └─────────────────────────────────────────────────────┘
+
+    ┌─────────────── Partition: C is isolated ────────────┐
+    │                                                       │
+    │   ┌──────────┐              ┌──────────┐            │
+    │   │ etcd A   │───(NETWORK)──│ etcd C   │            │
+    │   │ leader   │   ✗          │ follower │            │
+    │   └────┬─────┘              └────┬─────┘            │
+    │        │                         │                   │
+    │   ┌────▼─────┐                   │                   │
+    │   │ etcd B   │                   │                   │
+    │   │ follower │                   │                   │
+    │   └──────────┘                   │                   │
+    │        │                         │                   │
+    │   Quorum (2/3) YES               │  Quorum (1/3) NO   │
+    │   Writes: ACCEPTED               │  Writes: REJECTED  │
+    │   Reads: consistent              │  Reads: stale only  │
+    │        │                         │                   │
+    │   API Server A+B                 │  API Server C     │
+    │   Deploy: works                  │  Deploy: FAILS    │
+    │   Scale: works                   │  Scale: FAILS     │
+    │   ConfigMap: works               │  ConfigMap: FAILS  │
+    └─────────────────────────────────────────────────────┘
+  `}
+/>
+
+## Failure Modes
+
+### Failure Mode 1: etcd Disk Space Exhaustion
+
+A misconfigured logging agent writes 50 GB of logs to the etcd data directory. The etcd disk reaches 95 percent utilization. etcd stops accepting writes. The API server cannot create, update, or delete any resources. Existing pods continue running, but no new deployments, scaling events, or configuration changes are possible.
+
+**Detection**: The API server returns `500 Internal Server Error` with the message `etcdserver: mvcc: database space exceeded`. The etcd health endpoint (`/health`) returns `false`. The `etcd_db_total_size_in_bytes` metric exceeds the quota.
+
+**Mitigation**: Increase the disk size or clean up the etcd data directory. Run `etcdctl defrag` to reclaim space. In extreme cases, restore from a recent etcd snapshot. Prevention: monitor disk usage, set `--quota-backend-bytes`, and configure log rotation.
+
+**Recovery time**: 5 minutes to identify, 30 minutes to restore from snapshot (assuming 4 GB database).
+
+### Failure Mode 2: API Server Overload
+
+A CI/CD pipeline deploys 200 microservices simultaneously. The API server receives 500 concurrent write requests. Admission webhooks add 50 ms latency to each request. etcd handles 2,000 writes per second. The API server's `--max-mutating-requests-inflight` limit (default: 200) is exceeded. The API server starts rejecting requests with `429 Too Many Requests`.
+
+**Detection**: API server metrics show `apiserver_request_total` with 5xx status codes rising. `apiserver_current_inflight_requests` exceeds the configured limit. The kubelet logs show `Failed to update node status: Timeout`.
+
+**Mitigation**: Increase `--max-mutating-requests-inflight` and `--max-requests-inflight`. Add admission webhook timeouts (context deadline exceeded). Throttle the CI/CD pipeline to limit concurrent deployments. Add API server horizontal autoscaling (in GKE and EKS, the control plane auto-scales).
+
+**Recovery time**: 2 minutes to detect, 5 minutes to increase limits and restart API server.
+
+### Failure Mode 3: Kubelet Heartbeat Loss
+
+A worker node experiences a network interface failure. The kubelet cannot reach the API server. Heartbeats stop. The node controller marks the node as `NotReady` after 40 seconds. After 5 minutes, the node controller evicts all pods from the failed node. Pods are rescheduled on other nodes.
+
+**Impact during the 5-minute window**: Pods on the failed node are unavailable. If the service has multiple replicas spread across nodes, traffic shifts to remaining pods. If the service has only 1 replica, the service is unavailable until the pod is rescheduled and starts on a new node (approximately 15 seconds for scheduling + 30 seconds for pod startup = 45 seconds after eviction).
+
+**Edge case**: If the failed node comes back before the 5-minute eviction timeout, pods resume normally. The node controller removes the `NotReady` taint, and the kubelet restarts pod health probes.
+
+### Failure Mode 4: Pod Disruption Budget Violation
+
+A node pool upgrade drains 5 nodes simultaneously. Each drain evicts all pods on the node. A critical service has a PodDisruptionBudget with `maxUnavailable: 1`. The drain controller respects the PDB and waits for replacement pods before draining the next node. However, a cluster autoscaler scales down a node pool immediately after the upgrade, evicting pods before replacement nodes are available.
+
+**Detection**: The PDB status shows `disruptionsAllowed: 0` and `currentHealthy: 2`. The drain command hangs with the message `Cannot evict pod as it would violate the pod's disruption budget`.
+
+**Mitigation**: Set `spec.replicas` to at least `minAvailable + 1` to handle node failures. Define PodDisruptionBudgets for all critical services. Configure the cluster autoscaler with `--skip-nodes-with-local-storage=false` and `--balance-similar-node-groups=true`.
+
+### Failure Mode 5: Image Pull Backoff Across All Nodes
+
+A new deployment references a container image tag that does not exist (`myapp:latest`). The kubelet on each node tries to pull the image. The pull fails with `ImagePullBackOff`. Every node attempts to pull the image, creating a thundering herd against the container registry. The registry rate-limits the cluster. All image pulls (including legitimate ones) fail.
+
+**Detection**: Pod status shows `ImagePullBackOff` or `ErrImagePull`. Container registry metrics show rate limiting errors. Node logs show repeated image pull attempts with exponential backoff.
+
+**Mitigation**: Validate image tags in CI/CD before deployment. Use image digests instead of tags for immutable deployments. Cache images on a local registry proxy. Configure the kubelet's `--serialize-image-pulls=false` for parallel pulls.
+
+<AsciiDiagram
+  id="kubernetes/tradeoffs-failure-image-pull"
+  title="Image pull backoff cascading failure across cluster nodes during a deployment with a nonexistent image tag"
+  alt="Timeline diagram showing: T0: deployment created with bad image tag. T1: 10 nodes start pulling from registry simultaneously. T2: registry rate-limits the cluster. T3: all new pods enter ImagePullBackOff state. T4: existing pods are not affected but new deployments fail. T5: recovery after fixing the image tag"
+  caption="Cascading image pull failure from a bad deployment"
+  content={`
+    Timeline: Image Pull Backoff Cascading Failure
+    
+    T0:  User creates Deployment with image "myapp:nonexistent"
+         |
+         ▼
+    T1:  Scheduler assigns pods to 10 nodes
+         Each kubelet starts pulling "myapp:nonexistent"
+         ┌─ Node1 pull ─┐ ┌─ Node2 pull ─┐ ... ┌─ Node10 pull ─┐
+         │   myapp:non  │ │   myapp:non  │     │   myapp:non   │
+         └──────────────┘ └──────────────┘     └───────────────┘
+         │
+         ▼
+    T2:  Container registry rate-limits the cluster
+         (200 pulls/minute per IP exceeded)
+         ┌──────────────────────────────────────────────────┐
+         │  Registry: TOOMANYREQUESTS (429)                 │
+         │  "You have reached the pull rate limit"          │
+         └──────────────────────────────────────────────────┘
+         │
+         ▼
+    T3:  All 10 nodes enter ImagePullBackOff
+         Each retries with exponential backoff
+         (10s, 20s, 40s, 80s, 160s, 300s max)
+         │
+         ▼
+    T4:  Other deployments on same cluster cannot pull images
+         Registry still rate-limiting due to backoff retries
+         ┌──────────────────────────────────────────────────┐
+         │  Cascading failure: ALL new pods fail to start   │
+         └──────────────────────────────────────────────────┘
+         │
+         ▼
+    T5:  Recovery after fixing image tag
+         kubectl set image deployment/myapp myapp=myapp:v1.0
+         Pods start successfully
+  `}
+/>
+
+## Anti-Patterns Hall of Shame
+
+### Anti-Pattern 1: Monolith in a Single Pod
+
+**What they did**: Deployed the entire application (frontend, backend API, worker queue consumer, database migration tool) as multiple containers in a single pod. The pod reaches 8 GB memory usage and cannot scale independently.
+
+**Why it fails**: The pod's resource requests must be set to the sum of all containers' requirements. If the frontend container spikes in CPU, all containers in the pod are throttled. You cannot scale the frontend independently from the backend.
+
+**Better approach**: Use separate Deployments for each logical service. Each deployment has its own resource requests, scaling policies, and update strategies.
+
+### Anti-Pattern 2: Hardcoded Service Names
+
+**What they did**: Application code contains hardcoded URLs like `http://10.96.0.50:8080/api` instead of using Kubernetes Service DNS names like `http://api-service:8080`.
+
+**Why it fails**: ClusterIPs change when services are recreated. Hardcoded IPs break on any service rotation. Environment-specific configuration requires code changes.
+
+**Better approach**: Always use DNS names (resolved by CoreDNS, which runs as a cluster addon). Use environment variables or ConfigMaps for configuration, never hardcoded IPs.
+
+### Anti-Pattern 3: Running Databases on Default Node Pools
+
+**What they did**: Deployed PostgreSQL and MySQL as regular Deployments on general-purpose node pools without dedicated SSDs, node taints, or backup configuration.
+
+**Why it fails**: Database pods can be evicted by the cluster autoscaler, rescheduled onto different nodes (losing local data), or compete with batch workloads for I/O bandwidth. Node reboots for upgrades cause database downtime.
+
+**Better approach**: Use StatefulSets with dedicated node pools (tainted with `database=true:NoSchedule`), local SSDs or dedicated persistent volumes, and PodDisruptionBudgets. Consider using managed database services (RDS, Cloud SQL) instead of running databases in Kubernetes.
+
+### Anti-Pattern 4: No Resource Limits
+
+**What they did**: Deployed pods without `resources.requests` and `resources.limits`. The BestEffort QoS class allows any pod to consume all available CPU and memory on the node.
+
+**Why it fails**: One memory-leaking pod can crash all other pods on the same node through OOM killing. A CPU-intensive job can starve other pods on the same node. The scheduler has no information about resource requirements, so it overcommits nodes.
+
+**Better approach**: Always set both `requests` (guaranteed resources) and `limits` (maximum allowed resources). Use the Guaranteed QoS class for critical workloads. Set resource quotas at the namespace level to prevent runaway resource consumption.
+
+```yaml
+spec:
+  containers:
+  - name: app
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+```
+
+### Anti-Pattern 5: Using `:latest` Tag in Production
+
+**What they did**: All deployments use `image: myapp:latest`. The CI/CD pipeline overwrites the `:latest` tag on every build.
+
+**Why it fails**: You cannot determine which version is running on any given pod. Rolling back means redeploying `:latest`, which gets the latest build (not the previous stable version). Node autoscaling may pull an unexpected version when scaling up.
+
+**Better approach**: Use immutable tags: Git commit hash, semantic version (v1.2.3), or build number (build-4567). Never overwrite a tag that is in use in production.
+
+## When NOT to Use This
+
+Kubernetes is not the right choice for every scenario. Consider alternatives when:
+
+**You run fewer than 10 services**: The operational overhead of Kubernetes (control plane management, etcd backup, node upgrades, monitoring) exceeds the benefits. Use a managed container service (AWS ECS, Google Cloud Run) or a simple VM deployment with Docker Compose.
+
+**Your team has no operations experience**: Kubernetes requires understanding of networking (CNI, DNS, ingress), storage (CSI, PV/PVC), security (RBAC, network policies, pod security), and monitoring. Without this expertise, the cluster will be insecure, unreliable, or both. Start with a managed Kubernetes service (EKS, GKE, AKS) that abstracts control plane management.
+
+**Your application is stateful and latency-sensitive**: Running latency-sensitive stateful workloads (databases, real-time caches) in Kubernetes adds overhead for storage networking (CSI drivers), node failures (pod rescheduling), and network latency (CNI overlay). For single-digit millisecond latency requirements, bare metal or dedicated VMs may be more predictable.
+
+**Your workload is batch processing with long-running jobs**: Kubernetes handles batch workloads through Jobs and CronJobs, but for very long-running jobs (hours or days), a node failure causes the job to restart from scratch (unless you implement checkpointing). For scientific computing and HPC workloads, consider dedicated batch scheduling systems (Slurm, AWS Batch, Google Batch).
+
+**You need compliance certification on the first day**: Kubernetes clusters require extensive configuration for compliance (HIPAA, SOC 2, PCI-DSS): audit logging, network isolation, encryption at rest, secrets management, and image scanning. A managed container service with built-in compliance certifications may be faster to market.
+
+<AsciiDiagram
+  id="kubernetes/tradeoffs-when-not-to-use"
+  title="Decision flowchart for choosing between Kubernetes, managed containers, and VM deployments based on workload count, team expertise, and requirements"
+  alt="Decision tree: Start with 'How many services?' Under 10 -> 'How much ops expertise?' None -> 'Use Cloud Run/ECS'. 10+ -> 'Stateful and low latency?' Yes -> 'Consider dedicated VMs'. No -> 'How fast to compliance?' Fast -> 'Use managed service'. Normal or flexible -> 'Use Kubernetes'. Each path has a recommendation box"
+  caption="Decision flowchart for when to adopt Kubernetes"
+  content={`
+    ┌─────────────────────────────────────┐
+    │  How many microservices do you have? │
+    └────────────────┬────────────────────┘
+                     │
+          ┌──────────┴──────────┐
+          │                     │
+         < 10                 10+ or growing
+          │                     │
+          ▼                     ▼
+    ┌────────────────┐   ┌─────────────────────┐
+    │  Any ops       │   │  Low-latency        │
+    │  experience?   │   │  stateful workload? │
+    └───────┬────────┘   └──────────┬──────────┘
+            │                       │
+     ┌──────┴──────┐          ┌─────┴──────┐
+     │             │          │            │
+    None         Some       Yes           No
+     │             │          │            │
+     ▼             ▼          ▼            ▼
+  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────────┐
+  │Cloud   │  │K8s is  │  │Dedicated│  │Compliance  │
+  │Run /   │  │viable  │  │VMs or  │  │required    │
+  │ECS     │  │option  │  │Bare    │  │fast?       │
+  │Fargate │  │        │  │Metal   │  └──────┬─────┘
+  └────────┘  └────────┘  └────────┘         │
+                                        ┌─────┴──────┐
+                                        │            │
+                                       Yes           No / flexible
+                                        │            │
+                                        ▼            ▼
+                                     ┌────────┐  ┌────────────┐
+                                     │Managed │  │ K8s is     │
+                                     │Service │  │ great fit  │
+                                     │(EKS,   │  │             │
+                                     │GKE,AKS)│  │             │
+                                     └────────┘  └────────────┘
+  `}
+/>
+
+## Detailed Failure Mode Analysis
+
+### Failure Mode 6: DNS Resolution Failure
+
+CoreDNS, the cluster DNS provider, can fail due to misconfiguration, resource exhaustion, or network policy restrictions. When CoreDNS is unavailable, all service DNS resolution fails. Pods that rely on DNS for service discovery cannot reach any service by name.
+
+**Symptoms**: Application logs show `connection refused` or `no such host` errors when connecting to services using DNS names. `kubectl exec` into a pod and running `nslookup kubernetes.default.svc.cluster.local` returns `server can't find kubernetes.default.svc.cluster.local: SERVFAIL`.
+
+**Causes**: CoreDNS pod is not running (OOM killed, node failure). CoreDNS ConfigMap is misconfigured (invalid Corefile syntax). Network policy blocks UDP port 53 traffic to CoreDNS pods. etcd is slow and CoreDNS cannot query the API server for service updates.
+
+**Mitigation**: Deploy CoreDNS with multiple replicas (at least 2) and pod anti-affinity to spread across nodes. Set resource requests and limits to prevent OOM kills. Configure liveness and readiness probes. Enable CoreDNS metrics and alert on high error rates. Use `ndots:5` or `single-request-reopen` in pod DNS config to avoid DNS timeouts for high-traffic services.
+
+### Failure Mode 7: Cluster Autoscaler Throttling
+
+The cluster autoscaler cannot provision new nodes because the cloud provider API rate-limits the account. This happens during large-scale deployments or when multiple clusters share the same AWS account.
+
+**Symptoms**: Pods remain in `Pending` state. The cluster autoscaler logs show `Throttling: Rate exceeded` or `EC2 API rate limit exceeded`. No new nodes are created even though unschedulable pods exist.
+
+**Causes**: The AWS account or GCP project has reached the EC2 or GCE API rate limit. This is typically 10-20 API calls per second per account. Each autoscaler decision (checking node group capacity, launching instances, describing instances) makes multiple API calls. With 10 clusters, each checking capacity every 10 seconds, the rate limit is easily exceeded.
+
+**Mitigation**: Request a rate limit increase from the cloud provider. Use dedicated AWS accounts per cluster. Increase the autoscaler's scan interval (`--scan-interval=30s` instead of 10s). Use a larger node pool so fewer scale-up events are needed. Pre-warm node groups with a buffer of 1-2 instances per Availability Zone.
+
+### Failure Mode 8: CNI Plugin IP Address Exhaustion
+
+The CNI plugin assigns IP addresses from the node's VPC subnet. When the subnet runs out of available IPs, new pods cannot be scheduled on the node.
+
+**Symptoms**: Pods stay in `ContainerCreating` state. The kubelet logs show `failed to allocate ip address: no available addresses`. The node has available CPU and memory but cannot create pods.
+
+**Causes**: The VPC subnet does not have enough IP addresses for the total number of pods. For a cluster using AWS VPC CNI, each pod consumes a VPC IP address. A /24 subnet has 256 IPs, but 5 are reserved by AWS, leaving 251. With 10 nodes and 25 pods per node, you need 250 IPs. A single subnet is almost exhausted.
+
+**Mitigation**: Use a larger subnet (/16 or /20) for pod IPs. Use custom networking with multiple secondary CIDR blocks. Use AWS VPC CNI with prefix delegation (each ENI gets a /28 prefix of 16 IPs, increasing the IP density per node). For GKE, use VPC-native clusters with Alias IPs. For self-managed clusters, use overlay networks (Calico IPIP, Flannel) that do not consume VPC IPs.
+
+## Risk Assessment Matrix
+
+| Risk | Probability | Impact | Mitigation |
+|---|---|---|---|
+| etcd disk full | Low | Critical | Monitor disk usage, set quota, auto-compaction |
+| API server overload | Medium | High | Increase inflight limits, add HA, throttle CI/CD |
+| Worker node failure | Medium | Medium | Spread pods, PDBs, cluster autoscaler |
+| CoreDNS failure | Low | Critical | Multi-replica, anti-affinity, monitoring |
+| CNI IP exhaustion | Medium | High | Large subnets, prefix delegation, overlay |
+| Secret leakage | Medium | Critical | Encryption at rest, external secrets, RBAC |
+| Image pull failure | Medium | Medium | Image caching, local registry proxy, digest pinning |
+| Cluster autoscaler throttling | Low | Medium | Rate limit increase, scan interval tuning |
+| Pod disruption budget violation | Medium | Low | Proper PDB sizing, coordination with drain operations |
+
+## Cost-Benefit Analysis
+
+### When Kubernetes Saves Money
+
+**High-density workloads**: Kubernetes bin-packing increases server utilization from 10-20 percent (typical VM deployment) to 40-60 percent. For a 100-node cluster at $2.00/hour per node, that is a savings of $40-80 per hour ($350,000-700,000 per year).
+
+**Development environments**: Developers can spin up namespaces for testing without provisioning new VMs. A single cluster serving 50 developers replaces 50 development VMs, saving $25,000-50,000 per year.
+
+**Autoscaling**: The cluster autoscaler turns off underutilized nodes during low-traffic periods (nights, weekends). For a 50-node cluster where 30 nodes are redundant overnight, that is savings of $60 per hour, 12 hours per day, 365 days per year = $262,800 per year.
+
+### When Kubernetes Costs More
+
+**Small deployments**: A 3-node cluster running 5 services still requires a control plane (3 nodes, each $0.10-0.50 per hour). The control plane costs $2,628-13,140 per year, plus the platform engineering time to maintain it.
+
+**Learning curve**: Training a team of 10 engineers on Kubernetes takes 3-6 months. At $150,000 per engineer per year, that is $375,000-750,000 in training costs.
+
+**Operational overhead**: A dedicated platform engineer can manage 50-100 VMs manually. The same engineer can manage 3-5 Kubernetes clusters. For a company with 10 clusters, that is 2-3 platform engineers at $200,000-300,000 per year each.
+
+## Migration Decision Framework
+
+When evaluating whether to adopt Kubernetes, use this structured framework to assess readiness:
+
+### Dimension 1: Workload Characteristics
+
+| Factor | Favors Kubernetes | Favors Alternatives |
+|---|---|---|
+| Number of services | 20+ | Under 10 |
+| Update frequency | Daily or more | Weekly or less |
+| Scaling needs | Auto-scaling required | Static capacity sufficient |
+| Statefulness | Mostly stateless | Heavily stateful (databases) |
+| Batch processing | Significant batch workload | All real-time services |
+
+### Dimension 2: Team Capabilities
+
+| Capability | Minimum for Kubernetes | Recommended for Success |
+|---|---|---|
+| Linux administration | 2+ years | 5+ years |
+| Networking (iptables, DNS, TLS) | Can configure basic services | Can debug packet captures |
+| Cloud infrastructure (AWS/GCP/Azure) | Can provision VMs | Can design VPCs and IAM |
+| CI/CD pipeline management | Can modify existing pipeline | Can design and build pipelines |
+| Monitoring and alerting | Can read dashboards | Can design and build dashboards |
+
+### Dimension 3: Organizational Readiness
+
+| Readiness Indicator | Green | Yellow | Red |
+|---|---|---|---|
+| Executive support | Funded platform team | Exploring with PoC | No interest |
+| Team size | 10+ engineers | 3-9 engineers | Under 3 engineers |
+| Time to value | 3-6 months | 6-12 months | 12+ months |
+| Risk tolerance | Can tolerate learning curve | Requires training period | Must maintain existing SLAs |
+| Existing containerization | Already using Docker | Using VMs, planning containers | Bare metal or legacy |
+
+## Migration Risk Assessment
+
+### Phase 1: Assessment (Weeks 1-4)
+
+**Activity**: Audit all services. Classify by statefulness, criticality, and deployment complexity. Identify services that are easy to migrate (stateless, no persistent storage), medium difficulty (stateful with external storage), and hard (stateful with local storage, legacy dependencies).
+
+**Risk**: Incomplete audit leads to surprises during migration. Mitigation: Run the audit in two passes. The first pass covers all services. The second pass deep-dives on services flagged as complex.
+
+### Phase 2: Foundation (Weeks 5-12)
+
+**Activity**: Deploy a non-production cluster. Set up CI/CD pipeline, monitoring, and logging. Migrate 5-10 low-risk services. Run load tests to validate performance.
+
+**Risk**: The non-production cluster does not match production characteristics. Mitigation: Use the same instance types, networking configuration, and storage classes in non-production as you plan for production.
+
+### Phase 3: Bulk Migration (Weeks 13-26)
+
+**Activity**: Migrate 50-100 services per month. Use a lift-and-shift approach for most services (same container image, same configuration, same storage). Only refactor services that have specific Kubernetes requirements.
+
+**Risk**: Migration velocity causes operational fatigue. Mitigation: Dedicate a migration team of 2-3 engineers. Each migrated service gets a 2-week monitoring period before the migration team moves on.
+
+### Phase 4: Optimization (Weeks 27-52)
+
+**Activity**: Right-size resource requests and limits based on actual usage data. Implement HPA for all services. Add PodDisruptionBudgets. Refine network policies. Implement cluster autoscaling.
+
+**Risk**: Optimization is deprioritized. Mitigation: Track resource utilization metrics and set targets (for example, increase cluster utilization from 25 percent to 50 percent within 6 months of migration).
+
+## Organizational Anti-Patterns
+
+### Anti-Pattern: Kubernetes as Ops Replacement
+
+Teams adopt Kubernetes thinking it eliminates operations work. In reality, Kubernetes shifts operations work from infrastructure configuration to platform engineering. The team must manage the control plane, node upgrades, etcd backups, networking configuration, and security policies.
+
+**Better approach**: Treat Kubernetes as a platform that requires dedicated operations investment. Hire or train platform engineers before adopting Kubernetes.
+
+### Anti-Pattern: Kubernetes Without CI/CD
+
+Teams deploy Kubernetes and continue using manual deployments (SSH into nodes, run docker commands). Without CI/CD, Kubernetes provides no benefit over VMs.
+
+**Better approach**: Implement GitOps (ArgoCD, Flux) before or simultaneously with Kubernetes adoption. The deployment pipeline should be in place on day one.
+
+### Anti-Pattern: Namespace as Environment
+
+Teams create namespaces for each environment (dev-ns, staging-ns, prod-ns) in the same cluster. A misconfigured RBAC rule or network policy can expose production data to development workloads.
+
+**Better approach**: Use separate clusters for environments. Development and staging can share a cluster (with namespace isolation), but production should always have a dedicated cluster with stricter security controls.
+
+### Anti-Pattern: No Resource Governance
+
+Teams deploy pods without resource requests, limits, or namespace quotas. Any pod can consume all node resources.
+
+**Better approach**: Enforce resource requests and limits from day one. Use LimitRange to set defaults. Use ResourceQuota to cap namespace consumption. Monitor and alert on resource utilization.
+
+### Anti-Pattern: Kubernetes as Database Platform
+
+Teams run all databases in Kubernetes (PostgreSQL, MySQL, Redis, Elasticsearch) because "Kubernetes handles everything." Database operators exist but require deep expertise to configure correctly.
+
+**Better approach**: Use managed database services (RDS, Cloud SQL, ElastiCache) for production databases. Only run databases in Kubernetes when you have a specific reason (on-premises requirement, cost optimization, or compliance).
+
+## Reliability Engineering Practices
+
+### Pod Anti-Affinity
+
+Spread pods across nodes and availability zones to tolerate single-node failures:
+
+```yaml
+spec:
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app: myapp
+          topologyKey: topology.kubernetes.io/zone
+```
+
+### PodDisruptionBudget
+
+Guarantee minimum available replicas during voluntary disruptions (node drain, cluster upgrade):
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: myapp-pdb
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: myapp
+```
+
+### Topology Spread Constraints
+
+Distribute pods evenly across failure domains:
+
+```yaml
+spec:
+  topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app: myapp
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app: myapp
+```
+
+The first constraint ensures pods are spread across zones with a maximum skew of 1 (no zone has more than 1 extra pod). The second constraint ensures pods are spread across nodes with a maximum skew of 1, but is a soft constraint (ScheduleAnyway) so the scheduler can place pods if node-level spreading is not possible.
+
+### Graceful Shutdown
+
+Configure pods to handle SIGTERM gracefully for zero-downtime deployments:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 60
+  containers:
+  - name: app
+    lifecycle:
+      preStop:
+        exec:
+          command:
+          - /bin/sh
+          - -c
+          - |
+            # Remove from load balancer
+            sleep 5
+            # Drain in-flight requests
+            curl -X POST http://localhost:8080/shutdown
+            sleep 10
+```
+
+The `preStop` hook runs before the container receives SIGTERM. It gives the application time to deregister from the load balancer and drain in-flight requests. The `terminationGracePeriodSeconds` sets the maximum time for graceful shutdown before SIGKILL is sent.

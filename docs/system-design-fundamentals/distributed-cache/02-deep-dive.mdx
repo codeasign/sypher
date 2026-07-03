@@ -1,0 +1,658 @@
+---
+id: distributed-cache-deep-dive
+title: Distributed Cache Pattern — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A distributed cache node, whether running Redis, Memcached, or a custom implementation, follows a common internal architecture. Understanding these internals helps you configure caches effectively and diagnose performance problems.
+
+### Memory Allocator
+
+The foundation of any cache node is its memory allocator. Redis uses jemalloc, which provides efficient allocation for the many small objects typical of cache workloads. Memcached uses a slab allocator that partitions memory into slabs of fixed-size chunks. Each slab holds entries of a specific size range.
+
+The slab allocator prevents memory fragmentation at the cost of internal fragmentation. A 45-byte value stored in a 64-byte slab wastes 19 bytes. Over millions of entries, this waste adds up. Redis with jemalloc has better memory efficiency for variable-size objects but can suffer from fragmentation over long-running instances.
+
+### Event Loop
+
+Commands arrive over TCP connections. The event loop multiplexes these connections using system calls like `epoll` (Linux) or `kqueue` (macOS). Redis uses a single-threaded event loop: it processes one command at a time, handling thousands of connections through non-blocking I/O.
+
+```
+Client 1 ──┐
+Client 2 ──┤
+Client 3 ──┼──> epoll ──> Command Queue ──> Parser ──> Executor ──> Reply Buffer ──> epoll ──> Client 1
+Client 4 ──┤                                                              │
+Client 5 ──┘                                                              └──> Client 2
+                                                                           └──> Client 3
+```
+
+The event loop never stalls unless a command blocks. Blocking commands like `BLPOP` and transaction blocks (`MULTI/EXEC`) hold the loop hostage. In Redis 6.0 and later, some blocking operations were moved to I/O threads to reduce latency under heavy load.
+
+### Data Structures Internally
+
+The core data store is a hash table mapping keys to values. Redis extends this with typed data structures: strings, lists, sets, sorted sets, hashes, bitmaps, and streams. Each type has an optimized internal encoding.
+
+**String encoding**: Small integers (under 10,000) use integer encoding (8 bytes). Short strings use embedded encoding directly in the Redis object structure (44 bytes or fewer). Longer strings use raw `sds` (Simple Dynamic String) allocation.
+
+**Hash encoding**: Small hashes (under 512 entries with entries under 64 bytes) use ziplist encoding, which stores entries as a contiguous byte array. Larger hashes convert to a hash table automatically.
+
+**List encoding**: Short lists use quicklist, a linked list of ziplist nodes. This balances memory efficiency with append/trim performance.
+
+### Persistence Layer
+
+Distributed caches are primarily in-memory, but many offer persistence options.
+
+**Redis RDB (Redis Database File)**: A point-in-time snapshot of the entire dataset, created by forking the main process and writing to disk in the background. RDB files are compact for backups but lose data written between snapshots.
+
+**Redis AOF (Append-Only File)**: Logs every write operation. AOF files are larger than RDB but offer finer-grained durability. With `appendfsync always`, every write is fsynced to disk immediately, limiting data loss to a single operation.
+
+**Redis RDB+AOF**: Redis can combine both: RDB for fast restart base, AOF for incremental writes. This is the recommended configuration for production.
+
+## Data Structures and Algorithms
+
+### Hash Table with Progressive Rehashing
+
+The hash table is the primary index for key lookups. Redis uses a hash table with two tables: one active and one for resizing. Resizing happens progressively across multiple operations to avoid latency spikes.
+
+<AsciiDiagram
+  id="distributed-cache/ht-rehashing"
+  title="Progressive Hash Table Rehashing"
+  alt="Two hash tables side by side, table 0 being migrated to table 1, with an index cursor showing partial migration"
+  caption="Progressive rehashing spreads the cost of hash table resize across many operations. Each command moves a small number of buckets."
+  content={`Operation 1: GET key "alpha"
+┌──── Hash Table 0 (4 buckets) ────┐    ┌──── Hash Table 1 (8 buckets) ────┐
+│ bucket 0: [beta] ─────────────────┼──► │ bucket 0:                        │
+│ bucket 1: [gamma]                 │    │ bucket 1: [beta]                 │
+│ bucket 2: [alpha] ◄── move ──────┼──► │ bucket 2: [alpha]                │
+│ bucket 3: [delta]                 │    │ bucket 3:                        │
+│ rehashidx: 0                      │    │ bucket 4:                        │
+└───────────────────────────────────┘    │ bucket 5:                        │
+                                          │ bucket 6:                        │
+                                          │ bucket 7: [delta]                │
+                                          └──────────────────────────────────┘
+
+Operation 2: SET key "epsilon"
+┌──── Hash Table 0 (4 buckets) ────┐    ┌──── Hash Table 1 (8 buckets) ────┐
+│ bucket 0: [beta] ─────────────────┼──► │ bucket 0: [epsilon]  (inserted)  │
+│ bucket 1: empty  ◄── move ───────┼──► │ bucket 1: [beta]                 │
+│ bucket 2: [alpha]                 │    │ bucket 2: [alpha]                │
+│ bucket 3: [gamma] ◄── move ──────┼──► │ bucket 3: [gamma]                │
+│ rehashidx: 4 (done, swap tables) │    │ bucket 4:                        │
+└───────────────────────────────────┘    │ bucket 5:                        │
+                                          │ bucket 6:                        │
+                                          │ bucket 7: [delta]                │
+                                          └──────────────────────────────────┘
+  `}
+/>
+
+The `rehashidx` field tracks progress. Initially -1 (no rehash). When load factor exceeds 1.0 and a child process is not forking for persistence, Redis starts rehashing. Each command moves one bucket plus a variable number of additional buckets (default 100) if the system is idle. The rehash completes in milliseconds for small tables and seconds for tables with millions of entries.
+
+### Skiplist for Sorted Sets
+
+Redis sorted sets use a skip list data structure, which provides O(log n) average complexity for insert, delete, and range queries. The skip list is a layered linked list where each higher layer skips more elements.
+
+<AsciiDiagram
+  id="distributed-cache/skiplist"
+  title="Skiplist Structure for Sorted Set Operations"
+  alt="Multi-level linked list where each level skips progressively more elements, showing search path for score 42"
+  caption="A skip list provides O(log n) search and insertion. Higher layers act as express lanes for quick navigation."
+  content={`Level 3: ┌────────────────────────────────────────────► ──► ──► ──► null
+           │
+Level 2: ┌─┼─────────────────► ────────────────► ────► ────────► null
+         │ │
+Level 1: ┌─┼─┼──► ────► ────────► ────────► ────► ────► ──► null
+         │ │ │
+Level 0: ┌─┼─┼───┼───► ───► ────► ──► ──► ────► ──► ──► null
+         │ │ │   │
+         ▼ ▼ ▼   ▼
+        [5][12][18][25] [33] [40] [48] [55] [62] [70] [78]
+
+        Searching for score 42:
+        Start at L3 [5] ──► jumps to [55] (too far)
+        Drop to L2 [5] ──► jumps to [33] ──► jumps to [55] (too far)
+        Drop to L1 [33] ──► jumps to [40] ──► jumps to [48] (too far)
+        Drop to L0 [40] ──► jumps to [42] (found!)
+  `}
+/>
+
+Each node is promoted to higher levels with probability p (typically 0.25). Redis caps the maximum level at 32, supporting up to 2^32 elements. The skip list is the backbone for leaderboard queries, rate limit windows, and range-based retrievals.
+
+### LRU Eviction Implementation
+
+True LRU requires tracking access time for every key and maintaining a sorted list. This is expensive for millions of keys. Redis uses an approximate LRU algorithm that samples a subset of keys and evicts the oldest among the sample.
+
+**Redis LRU algorithm**: When eviction is needed, Redis samples N keys from the keyspace (configurable via `maxmemory-samples`, default 5). It selects the key with the oldest access time among the sample. The pool of eviction candidates is maintained across multiple eviction cycles.
+
+Compare the accuracy of sampling different sizes:
+
+| Sample Size | Eviction Decision | CPU Cost | Memory Overhead |
+|-------------|------------------|----------|-----------------|
+| 1 | Random (poor) | Minimal | Zero |
+| 5 | Reasonable | Low | 24 bits per object |
+| 10 | Good | Moderate | 24 bits per object |
+| 50 | Near-perfect LRU | High | 24 bits per object |
+
+The default sample size of 5 approximates true LRU within 10 to 15 percent accuracy for most workloads. Increasing to 20 improves accuracy but increases CPU usage during eviction.
+
+### LFU with Decay
+
+Redis also supports LFU eviction using a Morris counter that tracks access frequency with logarithmic decay. Each object stores a 16-bit counter: 8 bits for the counter value, 8 bits for the timestamp of the last decrement.
+
+```
+LFU Counter (16 bits):
+┌──────────────┬──────────────┐
+│  8-bit time  │ 8-bit count  │
+│  (minutes)   │  (frequency) │
+└──────────────┴──────────────┘
+```
+
+The counter increments non-linearly. A single access at low frequency increases the counter sharply. As frequency grows, each access has diminishing effect on the counter. The counter decays based on the time since the last access. This prevents keys from accumulating high frequency and never being evicted.
+
+**LFU vs LRU**: LFU resists scan attacks where a burst of accesses to many keys pollutes the cache. LRU is simpler and works well for workloads with natural temporal locality.
+
+### Consistent Hashing
+
+Consistent hashing maps keys and nodes onto a hash ring. Each node appears at multiple virtual positions to improve load balance.
+
+<AsciiDiagram
+  id="distributed-cache/virtual-nodes"
+  title="Virtual Nodes in Consistent Hashing"
+  alt="A hash ring showing physical nodes A, B, C each appearing as multiple virtual points labeled A1, A2, B1, B2, C1, C2"
+  caption="Virtual nodes spread each physical node across the ring. When a node fails, its load distributes evenly across remaining nodes instead of cascading to one neighbor."
+  content={`                    Physical Node A
+                    ┌───────────┐
+                    │  vnode A2 │
+                    └─────┬─────┘
+                          │
+    vnode B2 ──┐          │          ┌── vnode C1
+               │          │          │
+               │    ┌─────┴─────┐    │
+               └────┤ Hash Ring ├────┘
+               ┌────┤           ├────┐
+               │    └───────────┘    │
+    vnode A1 ──┘          │          └── vnode B1
+                          │
+                    ┌─────┴─────┐
+                    │  vnode C2 │
+                    └───────────┘
+
+    Key mapping: hash(key) mod 2^32 → nearest vnode clockwise
+    Key "user:123" → hash = 0x7A3F → vnode A2 → physical node A
+    Key "post:456" → hash = 0x2B1C → vnode B1 → physical node B
+    Key "feed:789" → hash = 0xE4D8 → vnode C1 → physical node C
+  `}
+/>
+
+Without virtual nodes, when a physical node fails, its successor absorbs all its keys. This can overload the successor, causing cascading failure. With virtual nodes (typically 150 to 200 per physical node), the load of a failed node distributes across all remaining nodes proportionally.
+
+## Request Lifecycle
+
+A single cache request travels through layers of networking, parsing, lookup, serialization, and response. Here is the path in detail.
+
+### Step 1: Connection Establishment
+
+The application opens a TCP connection to the cache node. Connection pooling is essential: opening a new TCP connection per request adds 3 round trips (SYN, SYN-ACK, ACK) plus TLS handshake if encryption is enabled. Most Redis clients maintain a pool of 10 to 50 persistent connections per node.
+
+### Step 2: Command Serialization
+
+The application serializes the command into the Redis wire protocol (RESP). The command `GET user:profile:74321` becomes:
+
+```
+*2\r\n$3\r\nGET\r\n$19\r\nuser:profile:74321\r\n
+```
+
+This is RESP (REdis Serialization Protocol). `*2` means 2 arguments. `$3` means a 3-byte argument followed by `GET`. `$19` means a 19-byte argument followed by the key.
+
+### Step 3: Network Transmission
+
+The serialized command is written to the socket. TCP segmentation divides it into packets. For a typical AWS environment with placement groups, network latency between application and cache is 0.3 to 1.0 milliseconds within the same availability zone and 2 to 5 milliseconds across zones.
+
+### Step 4: Kernel Receive
+
+The Linux kernel receives the packets, reassembles the TCP stream, and places the data in the socket receive buffer. The event loop, waiting on `epoll_wait`, is notified that data is available.
+
+### Step 5: Command Parsing
+
+The Redis or Memcached parser reads bytes from the receive buffer and parses the RESP protocol. Parsing is streaming: the parser does not wait for the complete message before processing. For RESP, parsing completes when the parser has read the expected number of arguments and bytes.
+
+### Step 6: Command Dispatch
+
+The parsed command is dispatched to the appropriate handler function. Each command type (GET, SET, DEL, etc.) has a registered handler. The handler receives the parsed arguments and the client connection context.
+
+### Step 7: Key Lookup
+
+The handler looks up the key in the hash table. For a GET command:
+
+1. Compute hash of the key using the SipHash algorithm.
+2. Index into the hash table bucket array.
+3. Traverse the linked list at that bucket, comparing keys using `memcmp`.
+4. Check if the value has expired (lazy expiry).
+5. If expired, delete the entry and treat as miss.
+
+This is where the progressive rehashing check occurs. If rehash is active, the handler moves one bucked of the rehash.
+
+### Step 8: Value Retrieval
+
+On a hit, the handler retrieves the value object. Redis values have type information. For a string, the value is a byte array. The handler checks the type: if the client requested GET on a hash, Redis returns a type error.
+
+### Step 9: Response Serialization
+
+The handler serializes the response into the RESP wire format. A string value "John Doe" becomes:
+
+```
+$8\r\nJohn Doe\r\n
+```
+
+A null (miss) response is:
+
+```
+$-1\r\n
+```
+
+### Step 10: Response Transmission
+
+The serialized response is written to the socket send buffer. The event loop registers interest in write readiness. When the socket can accept data, the write callback flushes the buffer. The client reads the response and deserializes it.
+
+This diagram captures the entire lifecycle.
+
+<AsciiDiagram
+  id="distributed-cache/cmd-lifecycle"
+  title="Internal Command Execution Lifecycle"
+  alt="Flow from application through TCP, epoll, parser, hash lookup, value fetch, serializer, and back to application"
+  caption="Each GET or SET command traverses 10 distinct stages inside the cache node, from network I/O to hash table lookup to response serialization."
+  content={`Application                   Cache Node                       Memory
+    │                          │                                │
+    │──RESP command───────────>│                                │
+    │     "GET key"           │                                │
+    │                          │──TCP recv                      │
+    │                          │──epoll_wait trigger            │
+    │                          │──RESP parser: *2\\r\\n$3\\r\\nGET     │
+    │                          │──Command dispatch              │
+    │                          │──SipHash(key) ──────────────>  │
+    │                          │──Hash table lookup │           │
+    │                          │──Type check        │           │
+    │                          │──Expiry check      │           │
+    │                          │◄──Value pointer ─────────────  │
+    │                          │                                │
+    │                          │──RESP serializer               │
+    │                          │──TCP send                      │
+    │◄──RESP response─────────│                                │
+    │     "$8\\r\\nJohn\\r\\n"      │                                │
+  `}
+/>
+
+### Step 11 (Special Case): Pipeline
+
+Pipeline mode sends multiple commands without waiting for individual responses. The cache processes all commands sequentially and sends responses in bulk. This reduces round-trip overhead by amortizing network latency across many commands.
+
+```python
+# Without pipeline: N round trips
+for key in keys:
+    value = redis.get(key)
+
+# With pipeline: 1 round trip
+pipe = redis.pipeline()
+for key in keys:
+    pipe.get(key)
+values = pipe.execute()
+```
+
+Pipeline throughput can reach 1 million operations per second for a single Redis instance, compared to 100,000 operations per second without pipelining. The improvement factor equals the pipeline batch size.
+
+### Step 12 (Special Case): Transaction
+
+Redis transactions (`MULTI/EXEC/WATCH`) provide atomic execution of a command batch. All commands in the transaction are queued and executed together without interleaving. This is not a database ACID transaction: no rollback is possible. If a command fails, the remaining commands still execute.
+
+```python
+pipe = redis.pipeline(transaction=True)
+pipe.watch("account:42:balance")
+balance = pipe.get("account:42:balance")
+pipe.multi()
+pipe.decrby("account:42:balance", 100)
+pipe.incrby("account:99:balance", 100)
+pipe.execute()
+```
+
+## Consistency and State
+
+### Scenario 1: TTL-Based Eventually Consistent
+
+Most cache deployments accept eventual consistency. The TTL determines the maximum staleness window. A 5-minute TTL means all reads within 5 minutes of a write might see stale data.
+
+```
+Write: DB updated at T=0
+Cache: Old value served from T=0 to T=300
+Cache: Value expires at T=300 → miss → fetch new value
+Cache: New value served from T=300 onward
+```
+
+Staleness window: 300 seconds. Acceptable for profiles, product catalogs, configuration data.
+
+### Scenario 2: Write-Through Strong Consistency
+
+With write-through, every write goes to both cache and database in the same transaction. Reads see the latest value immediately.
+
+```
+Write: Client sends UPDATE at T=0
+Cache: Updates immediately at T=0.001
+DB: Updates at T=0.002
+Read: Client reads at T=0.003 → gets updated value
+```
+
+Downside: Write latency increases from 2ms (DB only) to 4ms (cache + DB). Write throughput is limited by the slower of the two systems.
+
+### Scenario 3: Event-Driven Invalidation
+
+A change-data-capture (CDC) pipeline detects database changes and sends invalidation events to the cache. This provides sub-second staleness without the latency penalty of write-through.
+
+<AsciiDiagram
+  id="distributed-cache/cdc-invalidation"
+  title="Event-Driven Cache Invalidation with CDC"
+  alt="Database write log feeds into CDC pipeline that publishes invalidation events to message queue, which cache nodes consume to evict stale keys"
+  caption="CDC-based invalidation achieves sub-second staleness. The cache sees invalidations within 100 to 500 milliseconds of the database write."
+  content={`Application          Database           CDC Pipeline          Queue          Cache
+    │                  │                    │                     │              │
+    │──UPDATE user────>│                    │                     │              │
+    │                  │──WAL commit────────>│                    │              │
+    │                  │                    │──Parse row change   │              │
+    │                  │                    │──Extract key        │              │
+    │                  │                    │──Publish ──────────>│              │
+    │                  │                    │                     │──Consumer    │
+    │                  │                    │                     │──DEL key────>│
+    │                  │                    │                     │              │
+    │──GET user───────────────────────────────────────────────────────────────>│
+    │◄──fresh value◄──────────────────────────────────────────────────────────│
+  `}
+/>
+
+Staleness window: 100 to 500 milliseconds. Suitable for content management systems, e-commerce inventory, and social feeds where near-real-time freshness matters.
+
+### Scenario 4: Cache-Aside with Stale Reads
+
+A stale read occurs when the cache holds an old value and the caller does not trigger a refresh. This happens when a write goes to the database but the cache is not invalidated.
+
+```
+Time  Application 1          Application 2         Cache          DB
+T=0   GET item:5 ─────────────────────────────────>│
+T=0                                                  │──HIT o──────│
+T=1                                                  │──value=o────│
+T=2   UPDATE item:5 = n ─────────────────────────────────────────>│
+T=3   GET item:5 ─────────────────────────────────>│
+T=3                                                  │──HIT o──────│  (stale!)
+T=3                                                  │──value=o────│
+```
+
+This is a read-your-write inconsistency. Application 2 writes `n` at T=2 but reads `o` at T=3. The fix is to invalidate the cache after every write:
+
+```python
+def update_item(item_id, new_value):
+    db.execute("UPDATE items SET value = %s WHERE id = %s", new_value, item_id)
+    cache.delete(f"item:{item_id}")  # Invalidate, don't update
+```
+
+## Performance Characteristics
+
+### Latency Breakdown
+
+A cache GET operation latency breaks down as follows in a well-tuned system:
+
+| Component | Median | p99 | p99.9 |
+|-----------|--------|-----|-------|
+| Application serialization | 5 microseconds | 15 microseconds | 50 microseconds |
+| Network round trip (same AZ) | 300 microseconds | 500 microseconds | 2 milliseconds |
+| Cache node processing | 50 microseconds | 100 microseconds | 500 microseconds |
+| Application deserialization | 5 microseconds | 15 microseconds | 50 microseconds |
+| **Total** | **360 microseconds** | **630 microseconds** | **2.6 milliseconds** |
+
+p99.9 tail latency spikes typically come from: garbage collection pauses in the application, network congestion, or a slow command blocking the event loop.
+
+### Throughput Scaling
+
+A single Redis instance on a modern server handles:
+
+- 100,000 to 150,000 GET operations per second (no pipelining)
+- 500,000 to 1,000,000 GET operations per second (with pipeline batch size 50)
+- 50,000 to 80,000 SET operations per second (no pipelining)
+- 200,000 to 400,000 SET operations per second (with pipeline)
+
+Throughput is limited by CPU (single core) because Redis is single-threaded. Scaling beyond one core requires clustering or sharding.
+
+<AsciiDiagram
+  id="distributed-cache/throughput-scaling"
+  title="Distributed Cache Throughput Scaling Curves"
+  alt="Line chart showing throughput in ops/sec as nodes increase from 1 to 16, with near-linear scaling for GETs and slight overhead for SETs"
+  caption="Throughput scales near-linearly with cluster size for read-heavy workloads. Write throughput sees sub-linear scaling due to replication overhead."
+  content={`Throughput (ops/s)
+  10M ┤
+      │                                   ┌─── GET (pipeline)
+   5M ┤                              ┌────┘
+      │                         ┌────┘
+   2M ┤                    ┌────┘
+      │               ┌────┘
+   1M ┤          ┌────┘
+      │     ┌────┘
+ 500K ┤────┘
+      │
+ 200K ┤                                   ┌─── SET (pipeline)
+      │                              ┌────┘
+ 100K ┤                         ┌────┘
+      │                    ┌────┘
+  50K ┤               ┌────┘
+      │          ┌────┘
+  20K ┤     ┌────┘
+      │────┘
+      └──────────────────────────────────────────────►
+        1    2    4    8    16    Nodes
+
+  Legend: ── GET (no pipeline)     ── GET (pipeline)
+          ── SET (no pipeline)     ── SET (pipeline)
+  `}
+/>
+
+### Memory Overhead
+
+Every key-value pair in Redis carries overhead beyond the data itself:
+
+- **RedisObject**: 16 bytes per key and per value (type, encoding, LRU, refcount, pointer)
+- **Dict entry**: 24 bytes per key-value pair (key pointer, value pointer, next pointer)
+- **Key string**: strlen(key) + 8 bytes (sds header)
+- **Value string**: strlen(value) + 8 bytes (sds header)
+- **Total overhead per entry**: approximately 80 bytes + key length + value length
+
+For a 1 KB value with a 32-byte key, total memory per entry is approximately:
+16 (key RedisObject) + 16 (value RedisObject) + 24 (dict entry) + 40 (key sds) + 1024 (value sds) = 1,120 bytes
+
+The overhead percentage is 120 bytes / 1,000 bytes = 12 percent. For small values (100 bytes), overhead is 120 bytes / 100 bytes = 120 percent. Store small values in batches or use hash data structures to reduce overhead.
+
+## Configuration and Tuning
+
+### Memory Limits
+
+Set `maxmemory` to prevent a cache node from consuming all system RAM. When `maxmemory` is reached, the eviction policy kicks in.
+
+```
+maxmemory 8gb
+maxmemory-policy allkeys-lru
+```
+
+Available eviction policies:
+
+| Policy | Behavior | Use Case |
+|--------|----------|----------|
+| `noeviction` | Return errors on writes when full | Guarantee no data loss |
+| `allkeys-lru` | Evict LRU from all keys | General-purpose caching |
+| `allkeys-lfu` | Evict LFU from all keys | Resist scan attacks |
+| `volatile-lru` | Evict LRU from keys with TTL | Cached data only |
+| `volatile-ttl` | Evict keys with shortest TTL | Prefer short-lived data |
+| `allkeys-random` | Evict random key | Testing, uniform access |
+
+### Network Tuning
+
+Disable transparent huge pages on Linux for Redis. THP causes memory allocation stalls up to 100 milliseconds, devastating for cache latency.
+
+```
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+Set the kernel TCP backlog to handle connection bursts:
+
+```
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+```
+
+### Connection Management
+
+Set an appropriate timeout to free idle connections:
+
+```
+timeout 300
+tcp-keepalive 60
+```
+
+Use connection pooling on the client side. The Python Redis client default pool size is 10. Scale to 50 for high-throughput applications:
+
+```python
+redis_client = redis.Redis(
+    connection_pool=redis.ConnectionPool(
+        max_connections=50,
+        socket_timeout=5,
+        socket_connect_timeout=2,
+    )
+)
+```
+
+### Persistence Configuration
+
+For cache-only use (data can be rebuilt), disable persistence entirely:
+
+```
+save ""  # Disable RDB
+appendonly no  # Disable AOF
+```
+
+For a cache that tolerates some data loss but wants faster warmup after restart:
+
+```
+save 900 1    # RDB snapshot after 900s if >=1 key changed
+save 300 10   # RDB snapshot after 300s if >=10 keys changed
+save 60 10000 # RDB snapshot after 60s if >=10000 keys changed
+appendonly no
+```
+
+For minimal data loss (near-cache durability):
+
+```
+save ""       # Disable RDB
+appendonly yes
+appendfsync everysec  # fsync every second
+```
+
+### Cluster Configuration
+
+For Redis Cluster, set up at least 3 master nodes and 3 replica nodes:
+
+```
+port 7000
+cluster-enabled yes
+cluster-config-file nodes.conf
+cluster-node-timeout 5000
+appendonly yes
+```
+
+Each shard in the cluster divides the keyspace into 16,384 hash slots. Keys are distributed across masters:
+
+```
+CLUSTER SLOTS output:
+1) 1) 0
+   2) 5460
+   3) 1) "10.0.0.1" 7000
+      2) "10.0.0.4" 7003
+2) 1) 5461
+   2) 10922
+   3) 1) "10.0.0.2" 7001
+      2) "10.0.0.5" 7004
+3) 1) 10923
+   2) 16383
+   3) 1) "10.0.0.3" 7002
+      2) "10.0.0.6" 7005
+```
+
+### Monitoring
+
+Track these metrics in production:
+
+**Cache-level metrics**:
+- Instantaneous ops/sec
+- Hit rate (hits / (hits + misses)) -- target over 90 percent
+- Evicted keys per second
+- Expired keys per second
+- Memory fragmentation ratio
+
+**Network metrics**:
+- Connected clients
+- Input/Output network bandwidth
+- Rejected connections (when `maxclients` is reached)
+
+**Latency metrics**:
+- Average command latency (use `redis-cli --latency`)
+- p99 and p99.9 latency percentiles
+- Slow log entries (`SLOWLOG GET 100`)
+
+**Cluster metrics**:
+- Cluster state (ok or fail)
+- Number of keys per node (detect hot spots)
+- Node health and failover events
+
+<AsciiDiagram
+  id="distributed-cache/monitoring-dashboard"
+  title="Cache Monitoring Dashboard Layout"
+  alt="Dashboard mockup showing hit rate gauge, ops/sec chart, latency percentiles, eviction rate, memory usage, and cluster health"
+  caption="A production cache dashboard tracks hit rate, latency, throughput, and evictions. Hit rate is the single most important health metric."
+  content={`┌─────────────────────────────────────────────────────────┐
+│              Distributed Cache Dashboard                      │
+├──────────────┬──────────────────┬────────────────────────────┤
+│  Hit Rate    │  Operations/sec  │  Latency (p50/p99/p999)    │
+│  97.3%       │  142,500         │  0.4ms / 2.1ms / 8.5ms    │
+│  ▲ +1.2%     │  ▲ +5,200        │  ━━━━━━━━━━━━━━            │
+├──────────────┼──────────────────┼────────────────────────────┤
+│  Evictions/s │  Expired Keys/s  │  Connected Clients         │
+│  42          │  1,230           │  1,847                     │
+│  ━━━━━━━     │  ━━━━━━━━━       │  ▲ +23                     │
+├──────────────┴──────────────────┴────────────────────────────┤
+│  Memory Usage: 5.2 GB / 8 GB (65%)                          │
+│  ━━━━━━━━━━━━━━━━━━━━━━░░░░░░░░░░░░░░░░░░░░░░░░░            │
+│  Cluster State: OK   Nodes: 6/6   Failovers: 0              │
+├──────────────────────────────────────────────────────────────┤
+│  Slow Log (last 60s): 3 entries                              │
+│  1. 185ms ZRANGEBYSCORE "leaderboard:global" ...             │
+│  2. 120ms KEYS "user:*"                                      │
+│  3. 95ms  SMEMBERS "follower_set:8421"                       │
+└──────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Proactive Tuning Checklist
+
+**Before production deployment**:
+- Set `maxmemory` to 70 percent of available RAM (leave room for OS and replication buffers).
+- Choose eviction policy based on use case.
+- Disable persistence if data is disposable.
+- Enable slow log with threshold of 10ms.
+- Configure connection pool sizes on each application server.
+
+**Under high load**:
+- Monitor eviction rate. If evictions exceed 1,000 per second, increase memory or scale out.
+- Monitor hit rate. A dropping hit rate indicates a shifting workload or an issue with key generation.
+- Watch for hot keys. Use `redis-cli --hotkeys` to identify them.
+- Check fragmentation ratio. Above 1.5 indicates need for restart or defragmentation.
+
+**For cost optimization**:
+- Right-size entries: compress values with snappy or zstd.
+- Use hash data structures for groups of related fields (reduces key overhead).
+- Use appropriate TTLs: do not cache data longer than necessary.
+- Consider tiered caching: a smaller, faster L1 cache (local memory) and a larger, slower L2 cache (Redis cluster).

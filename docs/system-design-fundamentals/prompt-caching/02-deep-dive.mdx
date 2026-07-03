@@ -1,0 +1,618 @@
+---
+id: prompt-caching-deep-dive
+title: Prompt Caching -- Under the Hood
+sidebar_label: Under the Hood
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+The prompt caching system is composed of several interacting subsystems working together to store, retrieve, and manage KV cache entries. Understanding the internal architecture is essential for building a production-grade caching system. Each subsystem has a specific responsibility and communicates with the others through well-defined interfaces.
+
+### System Overview
+
+The cache system has six major components. The cache index maintains the mapping from prefix hashes to entry metadata. The prefix trie performs fast prompt matching by traversing a tree of tokens. The TTL manager handles entry expiration. The eviction controller manages memory by removing entries when the cache is full. The storage system provides tiered access to KV cache tensors. The warming pipeline precomputes entries for anticipated prefixes.
+
+<AsciiDiagram
+  id="prompt-caching/internal-architecture"
+  title="Internal Architecture of Prompt Caching"
+  alt="Detailed architecture diagram showing the cache index, prefix trie, storage tiers, TTL manager, eviction controller, and their interactions with each other"
+  caption="The prompt caching system has six major components. Each component communicates through well-defined interfaces. The cache index and prefix trie are the two most performance-critical components."
+  content={`┌──────────────────────────────────────────────────────────────────────────────┐
+│                      Prompt Caching System Architecture                          │
+│                                                                                  │
+│  ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐           │
+│  │   Cache Index     │    │   Prefix Trie    │    │   TTL Manager    │           │
+│  │                   │    │                  │    │                  │           │
+│  │  hash_map:        │    │  root -> node    │    │  background      │           │
+│  │  hash -> metadata │    │  node -> child   │    │  thread: scan    │           │
+│  │    - location     │    │  token -> node   │    │  every 60s for   │           │
+│  │    - size         │    │  longest match   │    │  expired entries │           │
+│  │    - created_at   │    │  O(L) lookup     │    │  mark as stale   │           │
+│  │    - access_count │    │  O(L) insert     │    │                  │           │
+│  │    - ttl_expiry   │    │                  │    │                  │           │
+│  └────────┬─────────┘    └────────┬─────────┘    └────────┬─────────┘           │
+│           │                       │                       │                      │
+│           └───────────────────────┼───────────────────────┘                      │
+│                                   │                                               │
+│                                   ▼                                               │
+│                    ┌──────────────────────────────────────────┐                    │
+│                    │            Cache Storage                  │                    │
+│                    │                                          │                    │
+│                    │  ┌────────────────┐ ┌────────────────┐   │                    │
+│                    │  │  L1: RAM       │ │  L2: SSD       │   │                    │
+│                    │  │  (hot entries) │ │ (warm entries)  │   │                    │
+│                    │  │  access < 200us│ │ access < 5ms    │   │                    │
+│                    │  │  capacity: 20% │ │ capacity: 80%   │   │                    │
+│                    │  └────────────────┘ └────────────────┘   │                    │
+│                    └──────────────────────────────────────────┘                    │
+│                                   │                                               │
+│                                   ▼                                               │
+│                    ┌──────────────────────────────────────────┐                    │
+│                    │       Cache Warming Pipeline              │                    │
+│                    │                                          │                    │
+│                    │  Traffic Log ──▶ Prefix Predictor        │                    │
+│                    │  ──▶ Top-K Prefixes ──▶ Prefill Executor │                    │
+│                    │  ──▶ Store KV in Cache Cluster           │                    │
+│                    └──────────────────────────────────────────┘                    │
+│                                                                                  │
+│  ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐           │
+│  │   Metrics         │    │   Bloom Filter   │    │   Request        │           │
+│  │   Collector       │    │                  │    │   Router        │           │
+│  │                   │    │  bit array: 1M   │    │                  │           │
+│  │  hit ratio        │    │  hash funcs: 7   │    │  extract prefix  │           │
+│  │  eviction rate    │    │  false positive  │    │  compute hash     │           │
+│  │  memory usage     │    │  rate: 0.1%      │    │  route to cache  │           │
+│  │  latency percentiles│   │                  │    │  or skip         │           │
+│  └──────────────────┘    └──────────────────┘    └──────────────────┘           │
+└──────────────────────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Cache Index
+
+The cache index is a distributed hash map that maps prefix hashes to cache entry metadata. The metadata includes the storage location (which cache node, which tier, and which offset), the entry size in bytes, the creation timestamp, the access count, the TTL expiry timestamp, and the version tag. The index must be highly available and low-latency because every request performs a cache lookup. A typical implementation uses a replicated in-memory data store such as Redis or Memcached for the index, with a fallback to a database-backed index for durability.
+
+The index operations are:
+- **Lookup**: Given a prefix hash, return the entry metadata or null. Time complexity O(1).
+- **Insert**: Add a new entry with metadata. Time complexity O(1).
+- **Update**: Update the metadata (access count, TTL) for an existing entry. Time complexity O(1).
+- **Delete**: Remove an entry by hash. Time complexity O(1).
+
+The index is sharded across multiple nodes for horizontal scalability. The sharding uses consistent hashing so that adding or removing a node requires minimal rehashing. Each shard is a separate Redis instance or a Memcached server.
+
+### Prefix Trie
+
+The prefix trie is the core data structure for prompt matching. It stores cached prefixes as nodes in a tree structure. Each node represents a single token ID from the model's vocabulary. Each path from the root to a leaf represents a cached prefix. When a new prompt arrives, the system traverses the trie token by token to find the longest matching prefix. The trie supports exact prefix matching and longest-prefix matching.
+
+The trie is implemented as a hash map of token ID to child node. This provides O(1) child lookup. The root node is empty. Each node stores:
+- The token ID for this node
+- A pointer to the parent node
+- A hash map of token ID to child node
+- A flag indicating whether this node is the end of a cached prefix
+- A pointer to the cached KV cache entry (if this is a terminal node)
+
+### Storage Tiers
+
+The cache storage has two tiers that balance cost and access latency.
+
+L1 storage is RAM-backed and stores hot KV cache entries that are accessed frequently. L1 access latency is 50 to 200 microseconds. L1 capacity is limited by the available RAM. In a typical deployment, L1 stores 10 to 20 percent of the cache entries, accounting for 80 percent of the cache hits.
+
+L2 storage is SSD-backed and stores warm entries that are accessed less frequently. L2 access latency is 1 to 5 milliseconds. L2 capacity is 10 to 100 times larger than L1. L2 stores the remaining 80 to 90 percent of entries.
+
+Entries are promoted to L1 on access. When an entry is accessed from L2, the system checks if there is space in L1. If there is, the entry is copied to L1 and the next access is served from L1. If L1 is full, the least recently used L1 entry is demoted to L2.
+
+### TTL Manager
+
+The TTL manager runs a background thread that scans the cache index every 60 seconds. It identifies entries whose TTL has expired and marks them as stale. The TTL manager also handles TTL extension for frequently accessed entries. When an entry is accessed and the remaining TTL is less than 20 percent of the original TTL, the manager extends the TTL by the original duration. This prevents frequently accessed entries from expiring while ensuring that rarely accessed entries are cleaned up.
+
+### Eviction Controller
+
+The eviction controller runs when the cache reaches its capacity limit. It selects entries to evict based on the configured eviction policy. The default policy is LRU (Least Recently Used). The controller selects the entry with the oldest access timestamp and removes it. The removal process: delete the KV cache tensors from the storage tier, remove the metadata from the cache index, and remove the entry from the prefix trie.
+
+## Data Structures and Algorithms
+
+### Prefix Trie for Prompt Matching
+
+The prefix trie is a tree data structure where each node represents a token. The root node represents the empty prefix. Each child node adds one token to the prefix. A path from the root to a node represents the prefix formed by the concatenation of the tokens along the path.
+
+The trie supports the following operations with their time complexity:
+
+- **Insert**: Add a new prefix to the trie. Time complexity is O(L) where L is the number of tokens in the prefix. The algorithm traverses the trie, creating nodes as needed, and marks the final node as a terminal node.
+
+- **Search**: Find the longest matching prefix for an incoming prompt. Time complexity is O(L) where L is the number of tokens matched. The algorithm traverses the trie token by token, following the matching child nodes. It returns the deepest terminal node found.
+
+- **Delete**: Remove a cached prefix from the trie. Time complexity is O(L). The algorithm traverses to the terminal node and unmarks it. Nodes that are no longer part of any cached prefix are garbage collected.
+
+The trie is efficient because its time complexity depends on the prefix length, not the number of cached entries. With 10,000 cached prefixes, a lookup still takes only O(L) time where L is typically 128 to 4,096 tokens. The space complexity of the trie is O(N * L) where N is the number of cached prefixes and L is the average prefix length.
+
+Each node in the trie stores a hash map of token ID to child node. The hash map has a branching factor equal to the number of distinct tokens that follow the current prefix. In practice, the branching factor is small (2 to 10) for most nodes because the prefix constrains the possible next tokens. The total number of nodes in the trie is approximately the sum of the lengths of all cached prefixes.
+
+### LRU and LFU for Eviction
+
+The eviction policy determines which entries to remove when the cache is full. The two most common policies are LRU and LFU.
+
+**LRU (Least Recently Used)** removes the entry that was accessed least recently. LRU is based on the principle of temporal locality: entries that have been accessed recently are likely to be accessed again soon. LRU is simple, efficient, and provides good hit ratios for workloads with temporal locality.
+
+The LRU implementation uses a doubly-linked list and a hash map. The linked list maintains the access order: the most recently accessed entry is at the front, and the least recently accessed entry is at the back. The hash map provides O(1) access to any entry. On access, the entry is moved to the front of the list. On eviction, the entry at the back of the list is removed.
+
+**LFU (Least Frequently Used)** removes the entry that was accessed least frequently. LFU is based on the principle of frequency locality: entries that have been accessed frequently are likely to be accessed again. LFU is better for workloads with stable popularity distributions but suffers from cache pollution when popularity shifts.
+
+The LFU implementation uses a priority queue or a set of frequency buckets. The time complexity of LFU operations ranges from O(log N) for a heap-based implementation to O(1) for a bucket-based implementation.
+
+### Hash Maps for Cache Index
+
+The cache index uses a hash map to map prefix hashes to entry metadata. The hash map must support concurrent reads and writes because multiple inference servers may access the cache simultaneously. A sharded hash map divides the hash space into M shards, each protected by its own read-write lock. This allows concurrent access to different shards without contention.
+
+The number of shards is typically 16 to 64, depending on the number of CPU cores. Each shard is a separate hash map with its own lock. The shard is selected by the hash of the prefix: `shard_id = hash % num_shards`.
+
+### Bloom Filters for Fast Miss Detection
+
+A Bloom filter is a probabilistic data structure that answers the question "Is this prefix in the cache?" The Bloom filter uses a bit array of size M and k hash functions. To insert an entry, the k hash functions produce k positions in the bit array, and those positions are set to 1. To check if an entry is in the cache, the k hash functions are computed, and if all k positions are 1, the entry is probably in the cache. If any position is 0, the entry is definitely not in the cache.
+
+The Bloom filter enables fast cache miss detection without querying the cache index. For a cache with a 50 percent hit ratio, the Bloom filter eliminates 50 percent of cache index queries. The miss detection takes O(k) time where k is the number of hash functions, typically 3 to 7. The false positive rate is approximately (1 - e^(-kN/M))^k where N is the number of entries, M is the bit array size, and k is the number of hash functions.
+
+<AsciiDiagram
+  id="prompt-caching/bloom-filter"
+  title="Bloom Filter for Fast Miss Detection"
+  alt="Diagram showing a Bloom filter with three hash functions mapping a prefix to bits in a bit array, with one function hitting a zero bit indicating a definite miss"
+  caption="The Bloom filter quickly determines that a prefix is definitely not in the cache, saving the cost of a full cache index lookup. If all bits are set, the prefix is probably cached and the index is queried."
+  content={`Bloom Filter: Bit Array of 1,048,576 bits (128 KB)
+
+  Prefix: "You are a helpful assistant..."
+
+                Hash 1 ──────▶  Bit 7   ── Set (1)
+                Hash 2 ──────▶  Bit 23  ── Set (1)
+                Hash 3 ──────▶  Bit 42  ── Set (1)
+                Hash 4 ──────▶  Bit 91  ── Set (1)
+                Hash 5 ──────▶  Bit 155 ── Set (1)
+
+    All 5 bits set → "Probably in cache" → Query cache index
+    Index lookup: 2 ms (latency paid)
+    Result: CACHE HIT (or false positive → miss)
+
+  Prefix: "Translate the following..."
+
+                Hash 1 ──────▶  Bit 12  ── Not set (0)
+
+    Any bit not set → "Definitely NOT in cache"
+    Skip index lookup: saves 2 ms
+    → Direct to full inference
+
+  Performance:
+    Bloom filter check: 1 microsecond
+    False positive rate: 0.1% (with M=1M, N=10K, k=7)
+    Cache miss queries eliminated: 50-80%
+  `}
+/>
+
+## The Request Lifecycle
+
+The full lifecycle of a prompt caching request involves 12 distinct steps, from the moment the prompt arrives to the moment the response is returned.
+
+### Step 1: Prompt Ingestion
+
+The API gateway receives the prompt from the client. It validates the prompt format, extracts the authentication token, and logs the request metadata. The gateway then forwards the prompt to the cache router. The ingestion step is the entry point for all requests and must handle the full request rate.
+
+### Step 2: Prefix Extraction
+
+The cache router extracts the configurable prefix from the prompt. The prefix length is a system parameter, typically set to 4,096 tokens or the first half of the prompt, whichever is smaller. The extraction is a simple token count operation that takes approximately 1 microsecond.
+
+### Step 3: Bloom Filter Check
+
+The system computes the hash of the extracted prefix and checks it against the Bloom filter. If the Bloom filter returns "definitely not in the cache," the system skips directly to step 6 (full inference). This check eliminates up to 80 percent of cache miss index queries.
+
+### Step 4: Cache Index Lookup
+
+If the Bloom filter indicates the prefix might be in the cache, the system queries the cache index. The index lookup uses the prefix hash as the key. The index returns the entry metadata, including the storage location and the entry size.
+
+### Step 5: Cache Hit Path
+
+If the index lookup succeeds and the entry is not stale, the system retrieves the KV cache from the storage tier. The retrieval loads the KV cache tensors into GPU memory. The system then proceeds to the decode phase, skipping the prefill phase for the cached tokens.
+
+### Step 6: Cache Miss Path (Full Prefill)
+
+If the index lookup returns no result or the entry is stale, the system initiates full inference. The prompt is processed through the transformer's prefill phase. All tokens are processed through all attention layers. The KV cache is computed for every token.
+
+### Step 7: KV Cache Storage
+
+After the prefill phase completes, the system stores the KV cache for the prefix. The storage operation compresses the KV cache tensors (optional, configurable), writes them to the storage tier, and updates the cache index. The TTL is set based on the prefix's configured TTL.
+
+### Step 8: Response Generation
+
+The system proceeds to the decode phase, generating the response tokens one at a time. Each generated token attends to the full KV cache. The decode phase continues until the end-of-sequence token or the maximum response length is reached.
+
+### Step 9: Cache Promotion (L1/L2)
+
+If the KV cache was stored in L2 (SSD), the system may promote it to L1 (RAM) on the next access. The promotion is triggered by the number of accesses within a time window. The promotion moves the entry from SSD to RAM for faster future access.
+
+### Step 10: TTL Extension
+
+If the entry was a cache hit, the system extends the TTL. The extension policy is configurable. A common policy extends the TTL by the full TTL duration on each hit, up to a maximum extension count.
+
+### Step 11: Metrics Collection
+
+The system records metrics for the request: hit or miss, lookup latency, prefill latency, decode latency, response length, and cache entry size. The metrics are sent to the monitoring system for aggregation and alerting.
+
+### Step 12: Response Delivery
+
+The system formats the response and sends it back to the client through the API gateway.
+
+<AsciiDiagram
+  id="prompt-caching/request-lifecycle"
+  title="Full Request Lifecycle"
+  alt="Detailed flowchart showing the 12-step lifecycle of a prompt caching request from ingestion through Bloom filter, cache index, prefill or decode, and response delivery"
+  caption="The request lifecycle traces every step from prompt ingestion through cache check, inference, and response delivery. Steps 3 through 7 are the critical path."
+  content={`┌────────────┐
+│  Client    │
+│  Request   │
+└─────┬──────┘
+      │
+      ▼
+┌────────────┐
+│ Step 1:    │
+│ Ingestion  │
+│ (validate, │
+│  auth, log)│
+└─────┬──────┘
+      │
+      ▼
+┌────────────┐
+│ Step 2:    │
+│ Prefix     │
+│ Extraction │
+│ (first N   │
+│  tokens)   │
+└─────┬──────┘
+      │
+      ▼
+┌────────────┐        ┌───────────────────────┐
+│ Step 3:    │  Miss  │ Step 6: Full Prefill  │
+│ Bloom      │───────▶│ (all tokens, all       │
+│ Filter     │        │  layers, O(N^2))       │
+│ Check      │        └───────────┬───────────┘
+└─────┬──────┘                    │
+      │ Hit                      │
+      ▼                          │
+┌────────────┐                   │
+│ Step 4:    │                   │
+│ Cache      │                   │
+│ Index      │                   │
+│ Lookup     │                   │
+│ (hash map) │                   │
+└─────┬──────┘                   │
+      │                          │
+      ▼                          │
+┌────────────┐                   │
+│ Step 5:    │                   │
+│ Retrieve   │                   │
+│ KV Cache   │                   │
+│ (from L1   │                   │
+│  or L2)    │                   │
+└─────┬──────┘                   │
+      │                          │
+      └──────────┬───────────────┘
+                 │
+                 ▼
+          ┌────────────┐
+          │ Step 7:    │
+          │ Store KV   │
+          │ (if miss)  │
+          │ + Start    │
+          │ Decode     │
+          └─────┬──────┘
+                │
+                ▼
+          ┌────────────┐
+          │ Step 8:    │
+          │ Generate   │
+          │ Response   │
+          │ (autoregr.)│
+          └─────┬──────┘
+                │
+                ▼
+          ┌────────────┐
+          │ Step 9-12: │
+          │ Promote,   │
+          │ Extend TTL,│
+          │ Metrics,   │
+          │ Deliver    │
+          └────────────┘
+  `}
+/>
+
+## Consistency and State
+
+### Stale Cache
+
+When a cache entry is stale (TTL expired), the system treats it as a cache miss. The stale entry is not deleted immediately from storage. It is marked as stale in the index and remains in storage until the eviction controller reclaims the space. This lazy deletion approach avoids the overhead of immediate deletion while ensuring that stale data is never served. The stale entry is effectively invisible to the cache lookup but still consumes storage until reclaimed.
+
+### Cache Node Crash
+
+When a cache node crashes, all entries stored on that node are lost. The system detects the crash through a heartbeat mechanism that checks every 500 milliseconds. If a node fails to respond to 3 consecutive heartbeats, it is declared dead. The remaining nodes redistribute the cache index to exclude the crashed node. The cache index is updated to remove the entries from the crashed node. Subsequent requests that would have been served by the crashed node experience cache misses and fall through to full inference.
+
+The system can mitigate crash impact by replicating cache entries across multiple nodes. With a replication factor of 2, each entry is stored on two nodes. If one node crashes, the other node still serves the cache entry. The replication factor is configurable per cache tier.
+
+### Prompt Strategy Change
+
+When the prompting strategy changes (new system prompt, new knowledge base, new format, new model version), all cached prefixes that depend on the old strategy become invalid. The system handles this through a cache version tag. Each cache entry is tagged with the prompt strategy version. When the strategy version changes, the system performs a bulk invalidation of all entries with the old version tag.
+
+The bulk invalidation uses a versioned Bloom filter. Instead of clearing the entire Bloom filter, the system maintains two Bloom filters: the current version and the previous version. When the strategy version changes, the current filter becomes the previous filter, and a new current filter is created. The previous filter is gradually phased out as entries are invalidated.
+
+### Cache Warmup Failure
+
+Cache warming can fail for several reasons: the model is unavailable during warming, the warming process runs out of memory, or the warming data is incorrect. The system handles warmup failures gracefully by falling back to on-demand caching. When a request arrives for a prefix that failed to warm up, the system treats it as a regular cache miss and populates the cache as part of the normal request lifecycle.
+
+## Performance Characteristics
+
+### Cache Hit Latency
+
+A cache hit skips the prefill phase and starts directly at the decode phase. The latency savings depend on the prefix length and the model size. For a 70-billion-parameter model with a 4,000-token prefix, the prefill phase takes approximately 1,500 milliseconds. The decode phase takes approximately 50 milliseconds per token. With a cache hit, the first token latency drops from 1,500 milliseconds to 50 milliseconds.
+
+The cache lookup latency adds overhead. The Bloom filter check takes 1 microsecond. The cache index lookup takes 200 microseconds to 2 milliseconds. The KV cache retrieval from L1 takes 200 microseconds. The total cache lookup overhead is approximately 2 milliseconds for a cache hit. This is negligible compared to the 1,500 milliseconds saved.
+
+### Cache Miss Overhead
+
+The cache miss overhead includes the Bloom filter check and the cache index query. The total overhead is approximately 5 milliseconds for a cache miss. This overhead is incurred in addition to the full prefill latency. The overhead is small relative to the prefill time (1,500 milliseconds) and is a worthwhile investment for the 50 to 80 percent of requests that hit the cache.
+
+### Hit Ratio Impact
+
+The cache hit ratio is the most important performance metric. A hit ratio of 50 percent means the system saves 50 percent of prefill computation. A hit ratio of 80 percent saves 80 percent of prefill computation. The hit ratio depends on the prompt diversity, the prefix length, the cache size, and the TTL. In production systems, hit ratios of 50 to 80 percent are typical for well-tuned prompt caching.
+
+<AsciiDiagram
+  id="prompt-caching/performance-metrics"
+  title="Performance Characteristics of Prompt Caching"
+  alt="Comparison table showing cache hit versus cache miss latency, throughput, and cost metrics with concrete numbers for a 70B parameter model"
+  caption="Cache hits reduce first-token latency by 10x to 30x and reduce per-request cost significantly. The lookup overhead is small relative to the savings."
+  content={`┌──────────────────────────────────────────────────────────────────────────────┐
+│              Performance Comparison: Cache Hit vs Cache Miss                       │
+│              (70B parameter model, 4K token prefix, 2K new tokens)                 │
+├──────────────────────────────────┬──────────────────────────┬──────────────────────┤
+│          Metric                  │      Cache HIT           │     Cache MISS       │
+├──────────────────────────────────┼──────────────────────────┼──────────────────────┤
+│  p50 Lookup Latency              │     2 ms                 │     5 ms             │
+│  p99 Lookup Latency              │     10 ms                │     20 ms            │
+│  Prefill Time (4K tokens)        │     0 ms (skipped)       │     1,500 ms         │
+│  First Token Latency             │     52 ms (2+50)         │     1,525 ms (5+1500+20) │
+│  Total Response Time (200 tok)   │     10,052 ms            │     11,525 ms        │
+│  Input Token Cost                │     20% of full          │     100% of full     │
+│  GPU Memory for Prefill          │     0 GB                 │     80 GB            │
+│  Throughput (req/s per GPU)      │     100                  │     10               │
+│  Hit Ratio Range (typical)       │     50% to 80%           │     20% to 50%       │
+│  Network Transfer (per hit)      │     10.4 GB              │     0 GB             │
+│  Cache Entry Memory              │     10.4 GB              │     0 GB             │
+└──────────────────────────────────┴──────────────────────────┴──────────────────────┘
+  `}
+/>
+
+### Memory Per Cache Entry
+
+Each cache entry stores the KV cache tensors for the prefix. The memory consumption per entry depends on the model architecture and the prefix length. For a 70-billion-parameter model with 80 layers, 4,096-dimensional hidden state, 32 attention heads, and FP16 precision, each token consumes approximately 2.6 MB of KV cache. A 4,000-token prefix consumes approximately 10.4 GB. A 16,000-token prefix consumes approximately 41.6 GB. The memory consumption is the primary constraint on the number of cache entries.
+
+The memory consumption scales linearly with the number of layers and the hidden state dimension. A smaller model with 8 layers and 1,024-dimensional hidden state consumes only 32 KB per token, making caching much more memory-efficient.
+
+### TTL Effects
+
+The TTL determines how long a cache entry remains valid. Short TTLs (5 minutes) reduce the cache hit ratio because entries expire before they are reused. Long TTLs (24 hours) increase the hit ratio but risk serving stale data. The optimal TTL depends on the prompt update frequency and the tolerance for staleness. In practice, a TTL of 1 hour balances freshness and efficiency for most workloads.
+
+## Configuration and Tuning
+
+### Cache Size
+
+The cache size limits the total memory available for KV cache entries. The size is typically set as a fraction of the total available GPU memory. A common configuration allocates 20 to 30 percent of GPU memory for the KV cache and reserves the rest for model weights and scratch space. The cache size is measured in gigabytes and should be set based on the expected number of distinct prefixes and the per-entry memory consumption.
+
+### TTL Defaults
+
+The default TTL is a global setting that applies to all cache entries. Individual prefixes can override the default with a custom TTL. The default TTL is typically 1 hour. Custom TTLs range from 5 minutes for rapidly changing prompts to 24 hours for stable prompts. The TTL is set when the entry is created and extended on each cache hit.
+
+### Eviction Policies
+
+The eviction policy is configurable per cache shard. The default policy is LRU. LFU is available for workloads with stable popularity distributions. A hybrid policy (LRU with frequency weighting) is available for workloads with mixed access patterns. The policy is set at system startup and can be changed dynamically.
+
+### Prefix Granularity
+
+The prefix granularity determines the minimum prefix length for caching. A granularity of 128 tokens means the system caches prefixes in 128-token increments. A granularity of 512 tokens means the system caches prefixes in 512-token increments. Fine granularity increases the cache hit ratio but adds storage overhead due to more distinct prefixes. Coarse granularity reduces storage overhead but may miss partial prefix matches.
+
+### Warmup Strategies
+
+The warmup strategy determines which prefixes are precomputed. The simplest strategy is to warm up the N most common prefixes from the previous day's traffic log. More sophisticated strategies use machine learning to predict which prefixes will be popular and selectively warm them up. The warmup process can be scheduled (every hour) or triggered (on deployment).
+
+### Segment Size
+
+For segment-level caching, the segment size determines how the prompt is divided into independently cacheable chunks. A segment size of 512 tokens means the prompt is divided into 512-token chunks, each independently cached. The segment size must be tuned to balance flexibility against storage overhead. Smaller segments provide more flexibility but more storage overhead due to the per-segment metadata.
+
+## Memory Footprint Analysis
+
+### KV Cache Size Per Token
+
+The memory footprint per token in the KV cache is determined by the model architecture. For a transformer with L layers, H attention heads, and a hidden dimension of D, each token produces a key vector and a value vector for each layer and each head. The total memory per token is:
+
+```
+bytes_per_token = L * H * (D / H) * 2 * bytes_per_element * 2
+```
+
+The first multiplication by 2 accounts for both key and value. The second multiplication by 2 accounts for the KV cache being stored for both the prefill and the continuing decode.
+
+For the 70-billion-parameter Llama 3 model: L=80, H=64, D=8,192, bytes_per_element=2 (FP16):
+
+```
+bytes_per_token = 80 * 64 * (8192 / 64) * 2 * 2 * 2
+                 = 80 * 64 * 128 * 8
+                 = 5,242,880 bytes per token
+                 ≈ 5.2 MB per token
+```
+
+### Total Cache Size for a Deployment
+
+The total cache size for a deployment depends on the number of distinct prefixes, the prefix length, and the replication factor. For a deployment with 1,000 distinct prefixes of 4,096 tokens each and a replication factor of 2:
+
+```
+total_cache = 1,000 * 4,096 * 5.2 MB * 2
+             = 42.6 TB
+```
+
+This is a substantial memory requirement. The cache cluster must be provisioned with sufficient RAM to hold the working set. For comparison, a single NVIDIA A100 GPU has 80 GB of RAM. The 42.6 TB cache requires approximately 533 A100 GPUs worth of RAM. In practice, the cache is stored in CPU RAM and SSD, which are cheaper than GPU memory.
+
+### Memory Optimization Techniques
+
+Several techniques reduce the memory footprint of the KV cache:
+
+**KV Cache Quantization**: Quantizing the KV cache from FP16 to INT8 reduces memory by 50 percent with negligible quality loss. Quantization to INT4 reduces memory by 75 percent but may cause quality degradation for some models.
+
+**Layer-Specific Precision**: Early layers in the transformer tend to be more sensitive to quantization than late layers. Storing early layers in FP16 and late layers in INT8 reduces memory by approximately 30 percent with no measurable quality loss.
+
+**Shared Prefix Compression**: When multiple cached prefixes share a common prefix, the shared portion is stored once rather than duplicated. This is the key advantage of the radix tree approach used in SGLang's RadixAttention.
+
+**Selective Caching**: Not all layers need to be cached. The first few layers and the last few layers contribute less to the cache hit savings. Caching only the middle 60 percent of layers reduces memory by 40 percent while retaining 90 percent of the latency savings.
+
+### Memory Budget Planning
+
+When planning the cache memory budget, consider the following allocation:
+
+- Model weights: 50 percent of GPU memory
+- KV cache for ongoing generation: 20 percent of GPU memory
+- Prompt cache entries: 20 percent of GPU memory
+- Scratch space and overhead: 10 percent of GPU memory
+
+For a CPU-based cache cluster, the memory budget is simpler:
+
+- Cache entries: 80 percent of RAM
+- Cache index: 5 percent of RAM
+- Bloom filter: 1 percent of RAM
+- Overhead and buffers: 14 percent of RAM
+
+## Numerical Examples
+
+### Example 1: Cache Hit Ratio Calculation
+
+A system processes 50,000 requests per day. There are 200 distinct prefix patterns. The 10 most common patterns account for 70 percent of requests. Each of these top-10 patterns appears at least 500 times per day. The remaining 190 patterns each appear fewer than 100 times per day.
+
+With a cache that can hold 50 entries (sufficient for the top 10 plus 40 of the moderately common ones), the hit ratio is 70 percent (from the top 10) plus approximately 10 percent (from the moderately common ones), totaling 80 percent.
+
+### Example 2: Latency Impact
+
+A cache miss with a 4,000-token prefix takes 1,500 milliseconds for prefill plus 100 milliseconds for decode of a 2-token response. Total: 1,600 milliseconds.
+
+A cache hit on the same prompt takes 2 milliseconds for cache lookup plus 100 milliseconds for decode. Total: 102 milliseconds.
+
+The latency improvement factor is 1,600 / 102 = 15.7x. The average latency across all requests with an 80 percent hit ratio is:
+
+```
+avg_latency = 0.80 * 102 + 0.20 * 1,600
+             = 81.6 + 320
+             = 401.6 milliseconds
+```
+
+Without caching, the average latency is 1,600 milliseconds. The cache reduces average latency by 74.9 percent.
+
+### Example 3: Cost Savings
+
+A system processes 10,000 requests per day with an 8,000-token prompt. The LLM provider charges $3 per million input tokens. Without caching, the daily input token cost is:
+
+```
+daily_cost = 10,000 * 8,000 * $3 / 1,000,000 = $240
+```
+
+With caching and a 75 percent hit ratio, 2,500 requests require full prefill (8,000 tokens) and 7,500 requests use a 4,000-token cached prefix and 4,000 new tokens:
+
+```
+daily_cost = 2,500 * 8,000 * $3 / 1,000,000   (full prefill)
+           + 7,500 * 4,000 * $3 / 1,000,000   (new tokens)
+           + 7,500 * 4,000 * $0.3 / 1,000,000 (cached tokens at 90% discount)
+           = $60 + $90 + $9
+           = $159
+```
+
+Monthly savings: ($240 - $159) * 30 = $2,430. The cache storage cost for 200 entries at 10 GB each with $0.08/GB/month is $160. Net monthly savings: $2,270.
+
+## Advanced Topics
+
+### KV Cache Quantization for Storage
+
+KV cache quantization reduces the memory footprint of cached entries, enabling more entries within the same memory budget. The most common quantization schemes are:
+
+**INT8 Quantization**: Each FP16 value (16 bits) is quantized to INT8 (8 bits). The quantization is per-tensor with a scale factor. The memory reduction is 50 percent. The quality impact is negligible for most models, typically under 0.1 percent on standard benchmarks.
+
+**INT4 Quantization**: Each FP16 value is quantized to INT4. The memory reduction is 75 percent. The quality impact is 0.2 to 0.5 percent on benchmarks. Some attention heads are more sensitive to INT4 quantization than others.
+
+**NF4 Quantization**: Normalized Float 4 is a non-uniform quantization scheme that allocates more precision to values near zero, where most KV cache values cluster. NF4 provides better quality than uniform INT4 for the same memory footprint.
+
+The quantization increases cache lookup latency by 0.5 to 2 milliseconds due to the dequantization step. However, the memory savings enable storing 2x to 4x more cache entries, which increases the hit ratio by 10 to 20 percentage points.
+
+### Cache Coherency Protocols
+
+In a distributed cache cluster with replicated entries, the system must maintain coherency between replicas. Two protocols are commonly used:
+
+**Leader-Based Protocol**: One replica is the leader for each entry. All writes go to the leader, which propagates to followers. Reads can go to any replica. The leader is determined by consistent hashing. This protocol is simple but introduces write latency.
+
+**Quorum-Based Protocol**: Writes require a write quorum (W replicas), and reads require a read quorum (R replicas). W + R greater than N ensures strong consistency. W + R less than or equal to N provides eventual consistency. The quorum size is configurable per cache tier. For L1 (hot entries), W=1, R=1 provides weak consistency with minimal latency. For L2 (warm entries), W=2, R=2 provides stronger consistency.
+
+### Dynamic Cache Sizing
+
+The cache size can be dynamically adjusted based on traffic patterns. During peak hours, the cache is allocated more memory to handle the increased prefix diversity. During off-peak hours, the cache is shrunk to save memory for other workloads.
+
+The dynamic sizing uses a feedback loop:
+1. Monitor hit ratio and eviction rate every 5 minutes.
+2. If the eviction rate exceeds 50 entries per second, increase the cache size by 10 percent.
+3. If the eviction rate is below 10 entries per second for 30 minutes, decrease the cache size by 10 percent.
+4. The cache size is bounded by a minimum and maximum configured by the operator.
+
+### Prefix Prediction Models
+
+Advanced prompt caching systems use machine learning to predict which prefixes will be popular in the next hour. The prediction model takes the following features:
+
+- Historical access frequency of each prefix (last 1 hour, last 6 hours, last 24 hours)
+- Time of day and day of week (catching daily and weekly patterns)
+- User cohort (users in the same cohort tend to ask similar questions)
+- Trigger event (product launches, marketing campaigns, system updates)
+- Cached prefix similarity (prefixes similar to popular prefixes are likely popular)
+
+The prediction model is a lightweight gradient-boosted decision tree with 100 trees. The inference latency is under 1 millisecond per prefix. The model is retrained every 24 hours using the previous day's access logs.
+
+The prediction enables proactive cache warming: the system precomputes KV cache entries for prefixes that the model predicts will be popular in the next hour. This reduces the cold start lag from 10 minutes to under 1 minute.
+
+## Implementation Considerations for Production
+
+### Language and Framework Choice
+
+The cache system is typically implemented in a systems programming language for performance. C++ and Rust are common choices for the cache storage layer. Go is used for the cache index service. Python is used for the warming pipeline and monitoring integration.
+
+The choice of language affects performance characteristics:
+- **C++**: Maximum performance, direct memory management, GPU integration via CUDA
+- **Rust**: Memory safety, comparable performance to C++, growing ecosystem
+- **Go**: Good performance, fast compilation, excellent standard library for networking
+- **Python**: Slow for the hot path, used for control plane and warming
+
+### Caching Layer in the Software Stack
+
+The cache system integrates at multiple layers of the software stack:
+
+**Application Layer**: The cache client library intercepts API calls. This is the simplest integration point but requires modifying the application code.
+
+**Inference Server Layer**: The cache is integrated into the inference server (vLLM, TGI, SGLang). This is the most efficient integration point because the cache has direct access to the GPU memory.
+
+**Network Layer**: The cache operates as a reverse proxy or sidecar that intercepts network traffic. This is the most transparent integration point but adds network latency.
+
+### Observability Integration
+
+The cache system exports metrics in multiple formats:
+- **Prometheus**: For hit ratio, miss ratio, eviction rate, latency percentiles
+- **OpenTelemetry**: For distributed tracing of cache operations
+- **Structured logging**: For debugging individual cache operations
+
+The metrics are used for:
+- **Capacity planning**: Tracking cache size utilization and growth
+- **Performance optimization**: Identifying slow cache operations
+- **Cost tracking**: Measuring token savings from cache hits
+- **Alerting**: Detecting anomalies in cache behavior
+
+### Rollback Strategy
+
+If the cache system causes problems (increased latency, incorrect responses, stability issues), the system must support a fast rollback:
+
+1. **Feature flag**: The cache is toggled by a feature flag. Turning off the flag bypasses the cache entirely.
+2. **Gradual rollback**: The cache is disabled for 10 percent of traffic, then 25 percent, then 50 percent, monitoring for problems at each step.
+3. **Full rollback**: The cache cluster is drained and the inference servers are reconfigured to bypass the cache.
+4. **Data preservation**: The cache entries are preserved during the rollback for analysis, allowing the team to investigate the cause of the problem.

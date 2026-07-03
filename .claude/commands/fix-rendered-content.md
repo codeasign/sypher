@@ -19,11 +19,9 @@ Mojibake is not random — it means a write path somewhere is not forcing UTF-8,
 - **Python generation scripts:** every `open(path, "w")` that writes an `.mdx` file must pass `encoding="utf-8"` explicitly. On Windows, Python defaults to the system codepage (cp1252), which turns `─` into `â”€` — this is the single most common root cause. Search the pipeline for `open(` calls writing docs and confirm each has `encoding="utf-8"`.
 - **PowerShell fix/edit scripts:** every `Get-Content` and `Set-Content` touching `.mdx` must use `-Encoding UTF8`. A single script without it re-corrupts every file it touches.
 - **Node/JS scripts:** `fs.writeFileSync(path, data)` defaults to UTF-8 and is usually safe, but confirm no explicit `latin1`/`binary` encoding is set.
-- **AsciiDiagram children/content mismatch:** The component reads `props.content`, not `props.children`. If any `.mdx` file uses `>` followed by `{` backtick to open a diagram (children pattern), the diagram renders empty. Run `grep -rn '</AsciiDiagram>' docs/` to find all files using the children pattern — each occurrence is a Defect E.
 - **The model/API response itself:** if the pipeline pipes model output through a shell or intermediate buffer with a non-UTF-8 codepage (Windows console default is often cp437/cp1252), the corruption can happen before the file is even written. Setting the console to UTF-8 (`chcp 65001`) or writing bytes directly from the API response rather than through a decoded string avoids this.
 
 Report which write path is the likely leak. If the leak isn't fixed, note in the final report that cleanup will need re-running after the next generation batch — cleaning symptoms without fixing the source is a treadmill.
-
 ---
 
 ### Defect E — AsciiDiagram children prop instead of content prop
@@ -41,7 +39,6 @@ Double-encoded UTF-8: box-drawing, arrow, and punctuation characters that got ma
 - **Detect (box/arrow form):** any occurrence of these telltale byte-sequences: `â”`, `â•`, `â–`, `â†`, `Ã¢â‚¬`, `ÃƒÂ`, `Ã‚Â`, or any run of 3+ consecutive non-ASCII characters inside what should be an ASCII-art diagram.
 - **Detect (punctuation form — common and easy to miss):** corrupted em-dashes, en-dashes, curly quotes, and ellipses in prose, which show up as literal sequences like `?????s???,??`, `?£???`, `Ã¢â‚¬â€`, `Ã¢â‚¬â„¢`, or a stray `?` cluster mid-sentence where an em-dash (—), en-dash (–), curly apostrophe (’), or ellipsis (…) belongs. Scan prose for `?????` runs and for `?` characters wedged between two words with no spacing logic — these are corrupted punctuation, not literal question marks.
 - **Detect (multi-layer, unrecoverable):** long unbroken runs like `ÃƒÆ'Ã‚Â¢ÃƒÂ¢Ã¢â‚¬...` or `?£???,?????a??£???,?????` — triple-or-more-encoded; the original character is unrecoverable by simple reversal.
-
 ### Defect A3 — Bare `{`/`}` in prose ("Could not parse expression with acorn")
 Bare `{` and `}` characters in prose are interpreted by MDX as JSX expression boundaries, causing `Could not parse expression with acorn` build errors. This happens most often with GraphQL schemas (`type Query { ... }`), JSON examples (`{ "errors": [...] }`), and object destructuring patterns.
 - **Detect:** `Can't render static file` + `Could not parse expression with acorn` in build output. Search for bare `{` characters outside fenced code blocks.
@@ -84,7 +81,7 @@ A fenced code block (```` ``` ````) with no content between the fences, or an op
 An AsciiDiagram passes content as JSX children (`>{``...``}` / `{``...``}</AsciiDiagram>`) instead of the `content` prop (`content={`...`} />`). The component reads only `content` from props (line 6 of `index.jsx`: `{id, content = '', ...}`) and ignores `props.children`. The diagram renders as an empty pre block.
 
 - **Detect:** An AsciiDiagram opening tag followed by `>{`` ``}` (children pattern) instead of `content={`` ``}`. Or grep for `</AsciiDiagram>` in any directory — self-closing `/>` is the correct form.
-- **Fix:** 
+- **Fix:**
   1. Replace `>` before the opening backtick with `content=` (e.g. `caption="..."`  `>{`` ` → `caption="..."`  `content={`` `).
   2. Replace `</AsciiDiagram>` with `/>`.
   3. 4 spaces of indent before `content={` to match other prop indentation.
@@ -149,7 +146,7 @@ Apply all project MDX safety rules while fixing: Unicode arrows in diagrams, exp
 ## STEP 5 — VERIFY
 
 After fixing each batch:
-1. Run `npm run build` — confirm still green (these fixes shouldn't break compilation, but confirm).
+1. Run `npm run check:mdx` — confirm no new MDX syntax errors introduced by the fixes.
 2. Spot-check by re-scanning the fixed files for the same defect patterns — confirm zero remaining mojibake sequences, zero empty diagrams, zero empty/unclosed fences.
 3. For regenerated diagrams and code, sanity-check that the new content actually matches what the surrounding prose says it should show — a regenerated diagram that's technically valid but describes the wrong thing is still a defect.
 

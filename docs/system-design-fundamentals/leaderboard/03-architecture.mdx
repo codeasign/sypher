@@ -1,0 +1,897 @@
+---
+id: leaderboard-architecture
+title: Leaderboard Pattern at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The naive leaderboard implementation uses a single relational database table with an index on the score column. This works for small scale but breaks under load.
+
+### The Single-Table Approach
+
+```sql
+CREATE TABLE leaderboard (
+    player_id VARCHAR(64) PRIMARY KEY,
+    score INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_leaderboard_score_desc ON leaderboard (score DESC);
+
+-- Get top 100
+SELECT player_id, score FROM leaderboard ORDER BY score DESC LIMIT 100;
+
+-- Get player rank
+SELECT COUNT(*) + 1 AS rank FROM leaderboard
+WHERE score > (SELECT score FROM leaderboard WHERE player_id = 'player_42');
+
+-- Update score
+INSERT INTO leaderboard (player_id, score, updated_at)
+VALUES ('player_42', 15000, NOW())
+ON CONFLICT (player_id)
+DO UPDATE SET
+    score = GREATEST(leaderboard.score, EXCLUDED.score),
+    updated_at = NOW();
+```
+
+<AsciiDiagram
+  id="leaderboard/arch-naive"
+  title="Naive Single-Database Leaderboard Architecture"
+  alt="A single PostgreSQL database with a leaderboard table and B-tree index on score, showing clients querying directly and the database CPU spiking under load"
+  caption="The naive approach uses a single table with an index. It works below 100K players but fails at scale due to expensive rank queries."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  NAIVE LEADERBOARD ARCHITECTURE                                 │
+  │                                                                  │
+  │              ┌─────────────────────────┐                        │
+  │              │    Game Clients          │                       │
+  │              │  (10,000 concurrent)     │                       │
+  │              └──────────┬──────────────┘                        │
+  │                         │                                       │
+  │                         ▼                                       │
+  │              ┌─────────────────────────┐                        │
+  │              │    API Gateway           │                       │
+  │              │    (rate limit: none)    │                       │
+  │              └──────────┬──────────────┘                        │
+  │                         │                                       │
+  │                         ▼                                       │
+  │              ┌─────────────────────────┐                        │
+  │              │    Score Service         │                       │
+  │              │    (stateless)           │                       │
+  │              └──────────┬──────────────┘                        │
+  │                         │                                       │
+  │                         ▼                                       │
+  │              ┌─────────────────────────┐                        │
+  │              │   PostgreSQL (single)    │                       │
+  │              │                         │                       │
+  │              │  leaderboard table       │                       │
+  │              │  50M rows                │                       │
+  │              │  idx_score_desc (B-tree) │                       │
+  │              │                         │                       │
+  │              │  CPU: 95% during peak    │                       │
+  │              │  Connections: 500 max    │                       │
+  │              │  Rank query: 3.7 sec     │                       │
+  │              │  Top-100 query: 50ms     │                       │
+  │              └─────────────────────────┘                        │
+  │                                                                  │
+  │  PROBLEMS:                                                       │
+  │  ┌────────────────────────────────────────────────────────────┐ │
+  │  │ 1. Rank query requires full index scan (O(N))              │ │
+  │  │ 2. Single point of failure                                 │ │
+  │  │ 3. Connection pool exhausted at 500 connections            │ │
+  │  │ 4. Write throughput capped at ~5,000/sec                   │ │
+  │  │ 5. Rank query for low-scoring players is slowest           │ │
+  │  │ 6. No caching -- every request hits the database           │ │
+  │  └────────────────────────────────────────────────────────────┘ │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+This approach fails at approximately 100,000 active players. The rank query for a player in the bottom half takes over 1 second. The database cannot handle more than 5,000 concurrent score submissions per second. The connection pool of 500 is exhausted during peak hours, causing connection timeouts.
+
+### What Breaks First
+
+The rank query is the first thing to break. The `COUNT(*) WHERE score > X` query requires a full index scan. For a player with a score at the 50th percentile, this means scanning 25 million index entries. Even with a fast SSD, this takes hundreds of milliseconds.
+
+The second thing to break is the write throughput. Every score submission requires a write to the `leaderboard` table. At 5,000 writes per second, the database write-ahead log (WAL) becomes a bottleneck. Checkpointing falls behind, and the database spends more time flushing WAL segments than processing queries.
+
+The third thing to break is the connection pool. PostgreSQL has a practical limit of about 500 simultaneous connections. At 10,000 concurrent players submitting scores and querying the leaderboard, the connection pool is exhausted, and new connections are queued or rejected.
+
+---
+
+## Production-Grade Architecture
+
+A production-grade leaderboard architecture uses three tiers: Redis for the live sorted set, a cache for the top-N leaderboard, and a database for durable storage. The system is horizontally scalable at every tier.
+
+<AsciiDiagram
+  id="leaderboard/arch-production"
+  title="Production-Grade Leaderboard Architecture"
+  alt="Three-tier architecture with Redis primary and replicas for the sorted set, Redis cache for top-N, and PostgreSQL for durable storage, with a message queue between ingestion and processing"
+  caption="Production architecture separates write, read, and storage concerns into scalable tiers with a message queue decoupling ingestion from processing."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PRODUCTION-GRADE LEADERBOARD ARCHITECTURE                      │
+  │                                                                  │
+  │  ┌─────────────────────────────────────────────────────────┐   │
+  │  │                 INGESTION TIER                           │   │
+  │  │  ┌────────┐  ┌────────┐  ┌────────┐                     │   │
+  │  │  │ Game   │  │ Game   │  │ Game   │  (horizontal scale) │   │
+  │  │  │ Server1│  │ Server2│  │ ServerN│                     │   │
+  │  │  └────┬───┘  └────┬───┘  └────┬───┘                     │   │
+  │  │       └───────────┼───────────┘                          │   │
+  │  │                   ▼                                      │   │
+  │  │          ┌────────────────┐                               │   │
+  │  │          │  Message Queue  │  (Kafka / RabbitMQ)         │   │
+  │  │          │  topic: scores  │                              │   │
+  │  │          └────────────────┘                               │   │
+  │  └─────────────────────────────────────────────────────────┘   │
+  │                                                                  │
+  │  ┌─────────────────────────────────────────────────────────┐   │
+  │  │                 PROCESSING TIER                          │   │
+  │  │  ┌──────────────────────────────────────────────────┐   │   │
+  │  │  │  Score Workers (consumer group, horizontal scale) │   │   │
+  │  │  │  - Validate                                      │   │   │
+  │  │  │  - Compute final score                           │   │   │
+  │  │  │  - Deduplicate                                   │   │   │
+  │  │  └────────────────────┬─────────────────────────────┘   │   │
+  │  │                       │                                  │   │
+  │  │          ┌────────────┼────────────┐                     │   │
+  │  │          ▼            ▼            ▼                     │   │
+  │  │  ┌────────────┐ ┌──────────┐ ┌──────────┐              │   │
+  │  │  │ Redis      │ │ Redis    │ │ Redis    │              │   │
+  │  │  │ Primary    │ │Replica 1 │ │Replica 2 │              │   │
+  │  │  │ (sorted    │ │(read     │ │(read     │              │   │
+  │  │  │  set)      │ │ only)    │ │ only)    │              │   │
+  │  │  └────────────┘ └──────────┘ └──────────┘              │   │
+  │  │         │                                              │   │
+  │  │         ▼                                              │   │
+  │  │  ┌──────────────────────────────────────────────────┐  │   │
+  │  │  │  Cache Tier (Redis / Memcached)                  │  │   │
+  │  │  │  - Top-N leaderboard cache                       │  │   │
+  │  │  │  - Player rank cache                             │  │   │
+  │  │  │  - Top-N minimum score cache                     │  │   │
+  │  │  └──────────────────────────────────────────────────┘  │   │
+  │  └─────────────────────────────────────────────────────────┘   │
+  │                                                                  │
+  │  ┌─────────────────────────────────────────────────────────┐   │
+  │  │                 STORAGE TIER                             │   │
+  │  │  ┌──────────────────────────────────────────────────┐   │   │
+  │  │  │  PostgreSQL (source of truth)                    │   │   │
+  │  │  │  - Score history                                 │   │   │
+  │  │  │  - Player metadata                               │   │   │
+  │  │  │  - Historical analytics                          │   │   │
+  │  │  └──────────────────────────────────────────────────┘   │   │
+  │  │                                                          │   │
+  │  │  ┌──────────────────────────────────────────────────┐   │   │
+  │  │  │  Cold Storage (S3 / GCS)                        │   │   │
+  │  │  │  - Archived scores > 90 days                    │   │   │
+  │  │  │  - Historical leaderboard snapshots              │   │   │
+  │  │  └──────────────────────────────────────────────────┘   │   │
+  │  └─────────────────────────────────────────────────────────┘   │
+  │                                                                  │
+  │  ┌─────────────────────────────────────────────────────────┐   │
+  │  │                 SERVING TIER                             │   │
+  │  │  ┌────────┐  ┌────────┐  ┌────────┐                     │   │
+  │  │  │ API    │  │ API    │  │ API    │  (horizontal scale) │   │
+  │  │  │ Node 1 │  │ Node 2 │  │ Node N │                     │   │
+  │  │  └────┬───┘  └────┬───┘  └────┬───┘                     │   │
+  │  │       └───────────┼───────────┘                          │   │
+  │  │                   ▼                                      │   │
+  │  │          ┌────────────────┐                               │   │
+  │  │          │  Load Balancer  │                              │   │
+  │  │          └────────────────┘                               │   │
+  │  └─────────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Tier Specifications
+
+**Ingestion Tier:**
+- Autoscaling group of game servers behind a load balancer
+- Maximum 1 score submission per second per player
+- Ingestion limit: 50,000 requests per second
+
+**Message Queue:**
+- Apache Kafka with 12 partitions for parallel processing
+- Retains scores for 7 days for replay capability
+- Delivery guarantee: at-least-once
+
+**Processing Tier:**
+- Consumer group with up to 12 workers (one per Kafka partition)
+- Each worker maintains a connection to Redis primary
+- Maximum throughput: 50,000 score updates per second
+
+**Redis Tier:**
+- Primary node: `cache.r6g.xlarge` (32 GB memory)
+- Two read replicas in different availability zones
+- Replication lag: typically under 5ms
+- Persistence: AOF with fsync every second
+
+**Cache Tier:**
+- Redis cluster with 3 nodes for high availability
+- TTL for cached top-N: 30 seconds
+- Cache hit rate target: above 95 percent
+
+**Storage Tier:**
+- PostgreSQL RDS with Multi-AZ deployment
+- Automated backups with 35-day retention
+- Read replica for analytics queries
+
+**Serving Tier:**
+- Autoscaling API nodes (target CPU: 60 percent)
+- Response time SLA: p99 under 50ms
+- Global edge caching via CDN for static leaderboard pages
+
+---
+
+## Integration Patterns
+
+### Pattern 1: Real-Time Score Update with WebSocket Push
+
+When a player's score changes, the system pushes the update to connected clients via WebSockets. This provides a real-time experience without polling.
+
+```python
+# WebSocket push on score update
+async def handle_score_update(player_id: str, window_key: str, old_score: int, new_score: int):
+    # Compute the rank change
+    redis_key = f"leaderboard:daily:{window_key}"
+    new_rank = await redis.zrevrank(redis_key, player_id)
+
+    # Publish to Redis Pub/Sub for WebSocket distribution
+    update_message = json.dumps({
+        "type": "score_update",
+        "player_id": player_id,
+        "old_score": old_score,
+        "new_score": new_score,
+        "new_rank": new_rank + 1,
+        "timestamp": time.time()
+    })
+    await redis.publish("leaderboard:updates", update_message)
+```
+
+### Pattern 2: Scheduled Snapshot for Analytics
+
+A scheduled job captures a snapshot of the leaderboard at regular intervals for analytics and historical comparison.
+
+```python
+# Scheduled leaderboard snapshot (every 5 minutes)
+async def capture_leaderboard_snapshot(window_type: str = "daily"):
+    window_key = get_current_window_key(window_type)
+    redis_key = f"leaderboard:{window_type}:{window_key}"
+
+    # Get all entries (or top 10,000 for large leaderboards)
+    entries = await redis.zrevrange(redis_key, 0, 9999, withscores=True)
+
+    # Store snapshot in database
+    snapshot_id = str(uuid4())
+    await db.execute(
+        "INSERT INTO leaderboard_snapshots (id, window_type, window_key, captured_at) "
+        "VALUES ($1, $2, $3, NOW())",
+        snapshot_id, window_type, window_key
+    )
+
+    # Bulk insert entries
+    async with db.transaction():
+        for rank, (player_id, score) in enumerate(entries, 1):
+            await db.execute(
+                "INSERT INTO leaderboard_snapshot_entries "
+                "(snapshot_id, rank, player_id, score) "
+                "VALUES ($1, $2, $3, $4)",
+                snapshot_id, rank, player_id.decode(), int(score)
+            )
+
+    return snapshot_id
+```
+
+### Pattern 3: Event-Driven Score Processing with Kafka
+
+Using Apache Kafka as the message queue enables reliable, scalable score processing with exactly-once semantics.
+
+```python
+# Kafka producer for score events
+from aiokafka import AIOKafkaProducer
+
+producer = AIOKafkaProducer(
+    bootstrap_servers=['kafka-1:9092', 'kafka-2:9092', 'kafka-3:9092'],
+    value_serializer=lambda v: json.dumps(v).encode(),
+    acks='all',  # Wait for all in-sync replicas to acknowledge
+    retries=3,
+)
+
+async def publish_score_event(player_id: str, score: int, metadata: dict):
+    event = {
+        "event_type": "score_submitted",
+        "player_id": player_id,
+        "score": score,
+        "metadata": metadata,
+        "timestamp": time.time(),
+        "event_id": str(uuid4()),
+    }
+    # Partition by player_id for ordering guarantees
+    key = player_id.encode()
+    await producer.send("scores", key=key, value=event)
+```
+
+### Pattern 4: Multi-Game Leaderboard with Tenant Isolation
+
+A platform hosting multiple games needs tenant isolation. Each game gets its own Redis database or key prefix to prevent interference.
+
+```python
+# Multi-game leaderboard with key prefix isolation
+class MultiGameLeaderboard:
+    def __init__(self, redis_client, game_id: str):
+        self.redis = redis_client
+        self.prefix = f"game:{game_id}"
+
+    async def update_score(self, player_id: str, score: int, window_type: str):
+        key = f"{self.prefix}:leaderboard:{window_type}:{get_current_window_key(window_type)}"
+        await self.redis.zadd(key, {player_id: score})
+
+    async def get_top_n(self, window_type: str, n: int = 100):
+        key = f"{self.prefix}:leaderboard:{window_type}:{get_current_window_key(window_type)}"
+        return await self.redis.zrevrange(key, 0, n - 1, withscores=True)
+
+    async def get_player_rank(self, player_id: str, window_type: str):
+        key = f"{self.prefix}:leaderboard:{window_type}:{get_current_window_key(window_type)}"
+        return await self.redis.zrevrank(key, player_id)
+```
+
+### Pattern 5: Batch Score Reconciliation with Periodic Full Sync
+
+Mobile games with intermittent connectivity need to reconcile scores when players come back online. Score events are cached on the device, submitted as a batch, and validated server-side for tampering and duplicates.
+
+```python
+# Offline score cache on device (client-side pseudo-code)
+class OfflineScoreCache:
+    def __init__(self):
+        self.pending_scores: List[dict] = []
+        self.max_batch_size = 50
+
+    def record_score(self, score: int, game_state_hash: str):
+        self.pending_scores.append({
+            "score": score,
+            "game_state_hash": game_state_hash,
+            "device_timestamp": time.time(),
+            "session_id": self.current_session_id,
+        })
+
+    async def sync_batch(self, api_client):
+        response = await api_client.post(
+            "/v1/leaderboard/sync",
+            json={
+                "player_id": self.player_id,
+                "scores": self.pending_scores[-self.max_batch_size:],
+                "device_id": self.device_id,
+            }
+        )
+        if response.status == 200:
+            result = response.json()
+            self.pending_scores = [
+                s for s in self.pending_scores
+                if s["session_id"] not in result["reconciled_sessions"]
+            ]
+
+
+async def reconcile_batch(player_id: str, scores: List[dict], device_id: str):
+    # 1. Validate integrity of each score submission
+    validated_scores = []
+    for score_entry in scores:
+        if not verify_score_integrity(score_entry):
+            continue  # Skip tampered or invalid entries
+        validated_scores.append(score_entry)
+
+    # 2. Deduplicate by session_id to prevent double-counting
+    deduped = {}
+    for entry in validated_scores:
+        session_id = entry["session_id"]
+        if session_id not in deduped or entry["score"] > deduped[session_id]["score"]:
+            deduped[session_id] = entry
+
+    # 3. Apply reconciled scores via Redis pipeline
+    redis_key = f"leaderboard:daily:{get_current_window_key()}"
+    reconciled = []
+    async with redis.pipeline(transaction=True) as pipe:
+        for entry in deduped.values():
+            await pipe.zadd(redis_key, {player_id: entry["score"]})
+            reconciled.append(entry["session_id"])
+        await pipe.execute()
+
+    return {"reconciled_sessions": reconciled, "count": len(reconciled)}
+```
+
+This pattern ensures offline scores are not lost and the leaderboard remains consistent even with delayed submissions. The validation step is critical for preventing score injection attacks. The max batch size of 50 prevents a single client from overwhelming the server after a long offline period.
+
+### Pattern 6: Tiered Leaderboard with Percentile Buckets
+
+For games with millions of players, computing and displaying exact rank for every player is wasteful. Instead, group players into percentile buckets and show an approximate rank range. This reduces storage requirements and improves response times for the majority of players.
+
+```python
+# Tiered leaderboard with percentile buckets
+class TieredLeaderboard:
+    TIERS = [
+        {"name": "legendary",  "min_percentile": 0.00, "max_percentile": 0.01,
+         "label": "Top 1%"},
+        {"name": "elite",      "min_percentile": 0.01, "max_percentile": 0.05,
+         "label": "Top 5%"},
+        {"name": "platinum",   "min_percentile": 0.05, "max_percentile": 0.10,
+         "label": "Top 10%"},
+        {"name": "gold",       "min_percentile": 0.10, "max_percentile": 0.25,
+         "label": "Top 25%"},
+        {"name": "silver",     "min_percentile": 0.25, "max_percentile": 0.50,
+         "label": "Top 50%"},
+        {"name": "bronze",     "min_percentile": 0.50, "max_percentile": 1.00,
+         "label": "Bottom 50%"},
+    ]
+
+    def __init__(self, redis_client):
+        self.redis = redis_client
+
+    async def get_player_tier(self, player_id: str, window_type: str) -> dict:
+        window_key = get_current_window_key(window_type)
+        redis_key = f"leaderboard:{window_type}:{window_key}"
+        total_players = await self.redis.zcard(redis_key)
+        if total_players == 0:
+            return {"tier": "unranked", "rank": None, "total": 0}
+
+        rank = await self.redis.zrevrank(redis_key, player_id)
+        if rank is None:
+            return {"tier": "unranked", "rank": None, "total": total_players}
+
+        percentile = (rank + 1) / total_players
+        for tier in self.TIERS:
+            if tier["min_percentile"] <= percentile < tier["max_percentile"]:
+                return {
+                    "tier": tier["name"],
+                    "label": tier["label"],
+                    "rank": rank + 1,
+                    "total": total_players,
+                    "percentile": round(percentile * 100, 1),
+                }
+
+        return {"tier": "bronze", "label": "Bottom 50%",
+                "rank": rank + 1, "total": total_players}
+
+    async def get_tier_thresholds(self, window_type: str) -> list:
+        window_key = get_current_window_key(window_type)
+        redis_key = f"leaderboard:{window_type}:{window_key}"
+        total_players = await self.redis.zcard(redis_key)
+        thresholds = []
+
+        for tier in self.TIERS:
+            if tier["name"] == "bronze":
+                min_score = 0
+            else:
+                rank_index = int(total_players * tier["min_percentile"])
+                entry = await self.redis.zrevrange(
+                    redis_key, rank_index, rank_index, withscores=True
+                )
+                min_score = int(entry[0][1]) if entry else 0
+
+            thresholds.append({
+                "tier": tier["name"],
+                "label": tier["label"],
+                "min_score": min_score,
+            })
+
+        return thresholds
+```
+
+The tiered approach has three advantages: it reduces computation for rank lookups by an order of magnitude, it provides meaningful progress indicators for players in the lower half, and it allows the system to cache tier thresholds rather than individual ranks. For a game with 10 million players, the tiered leaderboard reduces storage from 64 bytes per player to 6 bytes per tier threshold -- a reduction of over 99.9 percent for the rank data.
+
+---
+
+## Multi-Region
+
+A global game with players in North America, Europe, and Asia requires a multi-region leaderboard. The challenge is maintaining a consistent global view while minimizing write latency for players in all regions.
+
+<AsciiDiagram
+  id="leaderboard/arch-multi-region"
+  title="Multi-Region Leaderboard with Active-Active Replication"
+  alt="Three regions (US-East, EU-West, AP-East) each with a local Redis primary and replicas, connected via cross-region replication, with a global merged leaderboard computed by a coordinator service"
+  caption="Multi-region leaderboards use active-active replication with conflict resolution. Each region accepts writes locally and propagates changes asynchronously."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  MULTI-REGION LEADERBOARD                                       │
+  │                                                                  │
+  │  ┌────────────────────┐  ┌────────────────────┐  ┌────────────┐ │
+  │  │  US-East           │  │  EU-West           │  │  AP-East   │ │
+  │  │                    │  │                    │  │            │ │
+  │  │  ┌──────────────┐  │  │  ┌──────────────┐  │  │ ┌────────┐│ │
+  │  │  │Redis Primary │  │  │  │Redis Primary │  │  │ │Redis   ││ │
+  │  │  │(write local) │  │  │  │(write local) │  │  │ │Primary ││ │
+  │  │  └──────┬───────┘  │  │  └──────┬───────┘  │  │ │(write) ││ │
+  │  │         │          │  │         │          │  │ └───┬────┘│ │
+  │  │  ┌──────┴───────┐  │  │  ┌──────┴───────┐  │  │ ┌───┴────┐│ │
+  │  │  │Redis Replica │  │  │  │Redis Replica │  │  │ │Redis   ││ │
+  │  │  │(read local)  │  │  │  │(read local)  │  │  │ │Replica ││ │
+  │  │  └──────────────┘  │  │  └──────────────┘  │  │ └────────┘│ │
+  │  └────────────────────┘  └────────────────────┘  └────────────┘ │
+  │         │                       │                       │        │
+  │         └───────────────────────┼───────────────────────┘        │
+  │                                 │                                │
+  │                    ┌────────────┴────────────┐                   │
+  │                    │  Global Coordinator     │                   │
+  │                    │  - Merge top-N from     │                   │
+  │                    │    each region          │                   │
+  │                    │  - Resolve conflicts    │                   │
+  │                    │  - Publish global view  │                   │
+  │                    └─────────────────────────┘                   │
+  │                                 │                                │
+  │                    ┌────────────┴────────────┐                   │
+  │                    │  Global Leaderboard     │                   │
+  │                    │  Cache (CDN edge)       │                   │
+  │                    └─────────────────────────┘                   │
+  │                                                                  │
+  │  Write latency: 5ms local, 200ms cross-region                   │
+  │  Replication: async, CRDT-based conflict resolution             │
+  │  Global staleness: typically under 2 seconds                    │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Active-Active Replication Strategy
+
+Each region has a Redis primary that accepts writes locally. Writes are replicated to other regions asynchronously. Conflict resolution uses a last-writer-wins strategy based on server-side timestamps.
+
+```python
+# Multi-region write with conflict resolution
+async def multi_region_write(player_id: str, score: int, region: str):
+    local_key = f"leaderboard:daily:{get_current_window_key()}"
+    local_ts = time.time()
+
+    # Write to local primary with region timestamp
+    await local_redis.zadd(local_key, {player_id: score})
+    await local_redis.set(f"ts:{player_id}", local_ts)
+
+    # Publish cross-region replication event
+    replication_event = {
+        "player_id": player_id,
+        "score": score,
+        "region": region,
+        "timestamp": local_ts,
+    }
+    await replication_producer.send("leaderboard.replicate", replication_event)
+
+    # Return immediately -- don't wait for cross-region replication
+    return {"status": "accepted", "region": region, "timestamp": local_ts}
+```
+
+### Cross-Region Merge for Global Top-N
+
+The global coordinator periodically fetches the top-N from each region and merges them into a single global leaderboard.
+
+```python
+# Global merge of regional top-N
+async def merge_global_leaderboard(top_n: int = 100):
+    regions = ["us-east", "eu-west", "ap-east"]
+    all_candidates = []
+
+    for region in regions:
+        redis_client = get_region_redis(region)
+        key = f"leaderboard:daily:{get_current_window_key()}"
+        region_top = await redis_client.zrevrange(key, 0, top_n - 1, withscores=True)
+        all_candidates.extend(region_top)
+
+    # Sort and deduplicate by player_id (keep highest score)
+    merged = {}
+    for player_id, score in all_candidates:
+        pid = player_id.decode() if isinstance(player_id, bytes) else player_id
+        if pid not in merged or score > merged[pid]:
+            merged[pid] = int(score)
+
+    # Sort by score descending
+    sorted_players = sorted(merged.items(), key=lambda x: -x[1])
+
+    # Return top-N
+    return [
+        {"rank": i + 1, "player_id": pid, "score": score}
+        for i, (pid, score) in enumerate(sorted_players[:top_n])
+    ]
+```
+
+---
+
+## Capacity Planning
+
+### Estimating Redis Memory
+
+The primary cost driver is Redis memory. Each entry in a sorted set consumes approximately 64 bytes plus the key and member size. For 10 million players:
+
+- 10,000,000 players at 64 bytes each = 640 MB for the skip list
+- Player IDs at 16 bytes average = 160 MB for the dictionary
+- Key overhead = negligible
+- Total: approximately 800 MB per sorted set
+
+For a system with daily, weekly, monthly, and all-time leaderboards:
+- 4 sorted sets at 800 MB each = 3.2 GB
+- Cache tier: 500 MB for top-N cache entries
+- Buffer for growth (20 percent): 750 MB
+- Total Redis memory required: approximately 4.5 GB
+
+### Estimating Throughput
+
+For 10 million daily active users with peak concurrency of 20 percent:
+
+```
+Peak concurrent players: 10,000,000 x 0.20 = 2,000,000
+Score submissions per second (1 per player per 60 seconds): 2,000,000 / 60 = 33,333
+Read requests per second (each player checks leaderboard every 30 seconds): 66,667
+Total requests per second: 100,000
+```
+
+Redis single-threaded throughput is approximately 100,000 to 200,000 operations per second. At 100,000 requests per second, a single Redis instance can handle the load. For higher throughput, shard the sorted set across multiple Redis instances.
+
+### Scaling Plan
+
+| Player Count | Redis Instances | Cache Nodes | DB Nodes | Peak Writes/sec |
+|---|---|---|---|---|
+| Under 100K | 1 primary + 1 replica | 1 | 1 | 500 |
+| 100K - 1M | 1 primary + 2 replicas | 2 | 1 primary + 1 replica | 5,000 |
+| 1M - 10M | 1 primary + 2 replicas | 3 | 1 primary + 2 replicas | 50,000 |
+| 10M - 50M | 3 shards + 2 replicas each | 6 | RDS Multi-AZ | 250,000 |
+| 50M+ | 10 shards + 2 replicas each | 10+ | RDS + read replicas | 1,000,000+ |
+
+### Detailed Cost Breakdown
+
+**Redis Instance Costs:**
+
+For the 1M to 10M player tier, you need 1 primary and 2 replicas using `cache.r6g.xlarge` at $0.324 per hour each:
+- 3 instances x $0.324 x 730 hours = $709.56 per month
+
+For 10M to 50M players: 3 shards plus 2 replicas each equals 9 instances using `cache.r6g.2xlarge` at $0.648 per hour:
+- 9 x $0.648 x 730 = $4,257.36 per month
+
+**Network Bandwidth:**
+
+Each score submission is approximately 200 bytes (payload plus headers). At 50,000 writes per second:
+- 50,000 x 200 bytes x 86,400 seconds = 864 GB per day inbound
+- CDN outbound for leaderboard reads: estimate 10 TB per month at $0.08 per GB = $800 per month
+
+**PostgreSQL RDS:**
+
+- `db.r6g.large` at $0.246 per hour: $179.58 per month for single-AZ
+- Multi-AZ deployment doubles the cost: $359.16 per month
+- Storage: 500 GB gp3 at $0.08 per GB per month = $40 per month
+- Read replicas for analytics: $179.58 per month each
+
+**Apache Kafka (MSK):**
+
+- 3 brokers `kafka.m5.large` at $0.276 per hour each: 3 x $0.276 x 730 = $604.44 per month
+- Storage: 1000 GB EBS gp3 at $0.08 per GB per month = $80 per month
+- Data transfer between brokers: included in the broker cost
+
+**Kubernetes (EKS):**
+
+- 6 nodes `m5.large` at $0.096 per hour each: 6 x $0.096 x 730 = $420.48 per month
+- EKS control plane: $73 per month
+
+**Total Monthly Operating Cost:**
+
+| Cost Category | 100K Players | 1M Players | 10M Players |
+|---|---|---|---|
+| Redis | $237 | $710 | $4,257 |
+| Cache nodes | $79 | $158 | $474 |
+| Database | $180 | $360 | $539 |
+| Kafka (MSK) | $302 | $604 | $1,208 |
+| Kubernetes | $247 | $420 | $840 |
+| Bandwidth and CDN | $40 | $200 | $800 |
+| **Total** | **$1,085** | **$2,452** | **$8,118** |
+
+These costs assume reserved instances with a 1-year term, which gives approximately a 30 percent discount. On-demand pricing would be approximately 40 percent higher. The biggest cost driver is the Redis tier, which accounts for roughly 50 percent of the total at scale. Consider using `cache.r6g.large` instances with 3-year reserved pricing for your baseline capacity to reduce this by another 15 percent.
+
+---
+
+## Operations
+
+### Deployment
+
+The leaderboard system is deployed as a set of microservices on Kubernetes.
+
+```yaml
+# Kubernetes deployment for the score processing service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: score-processor
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: score-processor
+  template:
+    metadata:
+      labels:
+        app: score-processor
+    spec:
+      containers:
+      - name: processor
+        image: game/score-processor:1.2.3
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+        env:
+        - name: REDIS_HOST
+          value: "redis-primary.internal"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: KAFKA_BROKERS
+          value: "kafka-cluster:9092"
+        - name: WINDOW_TYPE
+          value: "daily"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+```
+
+### Backup and Recovery
+
+```python
+# Automated leaderboard backup job
+async def backup_leaderboard():
+    window_types = ["daily", "weekly", "monthly"]
+    for window_type in window_types:
+        window_key = get_current_window_key(window_type)
+        redis_key = f"leaderboard:{window_type}:{window_key}"
+
+        # Dump sorted set to file
+        entries = await redis.zrevrange(redis_key, 0, -1, withscores=True)
+        backup_data = [
+            {"player_id": pid.decode(), "score": int(score)}
+            for pid, score in entries
+        ]
+
+        # Upload to S3
+        backup_key = f"leaderboard_backups/{window_type}/{window_key}_{int(time.time())}.json"
+        await s3.put_object(
+            Bucket="game-leaderboard-backups",
+            Key=backup_key,
+            Body=json.dumps(backup_data).encode(),
+        )
+
+        # Clean up old backups (keep last 30)
+        backups = await s3.list_objects(
+            Bucket="game-leaderboard-backups",
+            Prefix=f"leaderboard_backups/{window_type}/{window_key}"
+        )
+        backups_sorted = sorted(backups["Contents"], key=lambda x: x["LastModified"])
+        for old_backup in backups_sorted[:-30]:
+            await s3.delete_object(
+                Bucket="game-leaderboard-backups",
+                Key=old_backup["Key"]
+            )
+```
+
+### Disaster Recovery
+
+```yaml
+# Disaster recovery plan for leaderboard system
+Recovery Time Objective (RTO): 5 minutes
+Recovery Point Objective (RPO): 60 seconds
+
+Recovery steps:
+1. Promote Redis replica to primary if primary fails
+   - Automatic via Redis Sentinel
+   - Time: under 10 seconds
+
+2. Restore sorted set from AOF if both primary and replica fail
+   - Load latest AOF into new Redis instance
+   - Time: depends on AOF size (approximately 1 minute per GB)
+
+3. Rebuild sorted set from database if Redis is unrecoverable
+   - Query score_history table for the current window
+   - Bulk load into Redis with ZADD pipelining
+   - Time: approximately 5 minutes for 10 million players
+
+4. Warm the cache after Redis recovery
+   - First request for top-N triggers cache rebuild
+   - Time: under 100ms for the first request, then normal
+
+5. Verify data integrity
+   - Compare top-100 from Redis with top-100 from database
+   - Check total player count matches expected
+   - Alert if discrepancy exceeds 0.1 percent
+```
+
+---
+
+## Service Level Objectives
+
+Defining clear SLOs for the leaderboard system ensures you know when the system is healthy and when you need to intervene. Each SLO is backed by an SLI measured in production and a burn rate that triggers alerts.
+
+### Read Latency SLO
+
+The leaderboard read path must meet strict latency targets to avoid degrading the player experience.
+
+| Operation | Target | SLO | Measurement Method |
+|---|---|---|---|
+| Top-100 read | p50 under 10ms, p99 under 50ms | 99.9 percent | Distributed tracing span duration |
+| Player rank lookup | p50 under 5ms, p99 under 30ms | 99.9 percent | APM instrumentation on API handler |
+| Leaderboard page load | p95 under 200ms (CDN cached) | 99.5 percent | Synthetic check every 60 seconds from 3 regions |
+
+### Write Latency SLO
+
+Score submissions follow an asynchronous path through the message queue. The staleness between submitting a score and seeing it on the leaderboard is the key metric.
+
+| Operation | Target | SLO | Measurement Method |
+|---|---|---|---|
+| Score submission acknowledgment | p99 under 100ms | 99.95 percent | Application metric on ingest endpoint |
+| End-to-end score visibility | p99 under 2 seconds | 99.5 percent | Trace from ingest to sorted-set update |
+| Duplicate rejection | p99 under 50ms | 99.9 percent | Application metric on dedup logic |
+
+### Availability SLO
+
+Each component of the leaderboard system has its own availability target. The overall system availability is the product of the component SLOs along the critical path.
+
+| Component | Monthly Target | Annual Downtime Budget | Dependencies |
+|---|---|---|---|
+| Leaderboard read API | 99.99 percent | 52.56 minutes | Redis replicas, cache tier |
+| Score submission API | 99.95 percent | 4.38 hours | Kafka, Redis primary |
+| Redis sorted set | 99.995 percent | 26.3 minutes | Primary and replica health |
+| PostgreSQL | 99.99 percent | 52.56 minutes | Multi-AZ automatic failover |
+| Kafka cluster | 99.95 percent | 4.38 hours | Broker count at or above minimum ISR |
+
+The composite availability for the read path is 99.98 percent, which means approximately 1.75 hours of aggregate downtime per year. The write path composite availability is 99.90 percent, approximately 8.76 hours per year.
+
+### Freshness SLO
+
+Leaderboard data is eventually consistent. The system guarantees maximum staleness for each access pattern.
+
+| Access Pattern | Maximum Staleness | Mechanism |
+|---|---|---|
+| Real-time WebSocket push | 500ms | Redis Pub/Sub to WebSocket bridge |
+| Top-N leaderboard display | 60 seconds | Cache TTL with background refresh |
+| Player rank display | 30 seconds | Cache TTL with lazy invalidation |
+| Historical analytics | 5 minutes | Scheduled database snapshot job |
+
+### Precision SLO
+
+Not every leaderboard query requires exact precision. The system defines precision tiers to match the access pattern to the appropriate data source.
+
+| Precision Level | Error Margin | Data Source | Use Case |
+|---|---|---|---|
+| Exact | Rank is 100 percent correct | Redis sorted set primary | Tournament qualification, prize distribution |
+| Near-exact | Within 5 ranks | Redis sorted set replica | Player rank display in UI |
+| Approximate | Within percentile bucket | Tier cache | Lower-half player rank display |
+| Stale | Correct at snapshot time | Database | Analytics, historical reports |
+
+### Error Budget
+
+For a 99.99 percent availability SLO on the read path, the monthly error budget is calculated as follows:
+
+- 99.99 percent availability equals a 0.01 percent error rate
+- Monthly time budget: 30 x 24 x 60 x 0.0001 = 4.32 minutes of downtime
+- Monthly request budget at 100,000 requests per second: 100,000 x 86,400 x 30 x 0.0001 = 25,920,000 failed requests
+
+When the error budget falls below 20 percent remaining, the team enters a freeze period. No new features are deployed until reliability improvements reduce the error rate. Features that add capacity or improve resilience are exempt from the freeze.
+
+### SLI Measurement
+
+Each SLI is measured with a combination of three techniques:
+
+- **RED metrics**: Rate (requests per second), Errors (failed requests), Duration (latency distribution). Collected by Prometheus with 15-second scrape intervals and retained for 30 days at full resolution.
+
+- **Synthetic probes**: A probe running in each region submits a score and then reads the leaderboard every 60 seconds. The probe measures end-to-end latency, staleness, and correctness. If the probe detects a discrepancy exceeding the precision SLO, it fires a pager-level alert.
+
+- **Trace sampling**: Every score submission is traced at a 1:100 sampling rate for normal traffic. Traces that exceed the latency SLO are sampled at 1:1 (full sampling) for troubleshooting. Traces are exported to the tracing backend with 30-second export intervals and retained for 14 days.
+
+### Burn Rate Alerts
+
+Burn rate alerts tell you how quickly you are consuming the error budget. Multiple burn rates trigger different response actions.
+
+| Burn Rate | Duration to Deplete Budget | Alert Action |
+|---|---|---|
+| 2x (consumes budget 2x faster than expected) | 15 days | Page on-call engineer within 5 minutes |
+| 6x | 5 days | Auto-scale read replicas, page on-call team |
+| 30x | 1 day | Emergency traffic shift to secondary region, page engineering lead |

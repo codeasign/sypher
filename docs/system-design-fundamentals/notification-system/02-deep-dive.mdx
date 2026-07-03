@@ -1,0 +1,494 @@
+---
+id: notification-system-deep-dive
+title: Notification System — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+The notification system is not a single service. It is a distributed pipeline of specialized components, each with its own internal state, data structures, and failure modes. Understanding the internals of each component is what separates a candidate who can describe a notification system from one who can build one.
+
+<AsciiDiagram id="notification-deep-dive/internal-architecture" alt="A detailed component diagram showing the internal subcomponents of the notification system including buffers, caches, consumers, and workers" caption="Figure 1: Internal architecture of the notification system — each layer has dedicated subcomponents" content={`
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                   NOTIFICATION SYSTEM — INTERNAL ARCHITECTURE              │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── INGRESS LAYER ───────────────────────────────────────────────────────┐
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+  │  │  API Gateway   │  │  Validator    │  │  Rate Limiter│  │  Enricher     │ │
+  │  │  - HTTP/2      │  │  - JSON       │  │  - Token     │  │  - Cache      │ │
+  │  │  - Auth: JWT   │  │    Schema     │  │    Bucket    │  │    (Redis)    │ │
+  │  │  - TLS 1.3     │  │  - Required   │  │  - Sliding   │  │  - Batch      │ │
+  │  │  - CORS        │  │    Fields     │  │    Window    │  │    Fetcher    │ │
+  │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘ │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── DISPATCH LAYER ──────────────────────────────────────────────────────┐
+  │  ┌──────────────────────────────────────────────────────────────────┐  │
+  │  │  Kafka: raw-notification-events (50 partitions, 7d retention)    │  │
+  │  │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐        │  │
+  │  │  │ P0   │ │ P1   │ │ P2   │ │ P3   │ │ P4   │ │ P5   │  ...    │  │
+  │  │  │ 0-100│ │101-200│ │201-300│ │301-400│ │401-500│ │501-600│    │  │
+  │  │  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘        │  │
+  │  └──────────────────────────────────────────────────────────────────┘  │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── ROUTER LAYER ───────────────────────────────────────────────────────┐
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+  │  │  Consumer      │  │  Dedup        │  │  Template     │  │  Channel      │ │
+  │  │  Group         │  │  Filter       │  │  Engine       │  │  Selector    │ │
+  │  │  - 50 consumers│  │  - Bloom      │  │  - AST        │  │  - Rule       │ │
+  │  │  - Commit      │  │    Filter     │  │  - Pre-       │  │    Engine     │ │
+  │  │    every 100ms │  │  - Redis      │  │    compiled   │  │  - Config     │ │
+  │  │  - Rebalance   │  │  - TTL wins   │  │  - Locale     │  │  - Fallback   │ │
+  │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘ │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── DELIVERY LAYER ──────────────────────────────────────────────────────┐
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+  │  │  Push Worker   │  │  Email Worker │  │  SMS Worker   │  │  WebSocket    │ │
+  │  │  Pool          │  │  Pool         │  │  Pool         │  │  Worker Pool  │ │
+  │  │  8 HTTP/2 conn │  │  20 SMTP conn │  │  5 Twilio conn│  │  1000 ws conn │ │
+  │  │  100 streams ea│  │  50/s rate    │  │  10/s rate    │  │  broadcast    │ │
+  │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘ │
+  │  ┌──────────────────────────────────────────────────────────────────┐  │
+  │  │  Circuit Breaker (per-provider, per-region)                       │  │
+  │  │  Opens when: 5% error rate over 30s window, 100 minimum requests │  │
+  │  └──────────────────────────────────────────────────────────────────┘  │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── FEEDBACK LAYER ──────────────────────────────────────────────────────┐
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+  │  │  Receipt       │  │  Bounce       │  │  Analytics    │  │  Token       │ │
+  │  │  Processor     │  │  Handler      │  │  Aggregator  │  │  Cleanup    │ │
+  │  │  - Kafka       │  │  - Dump token │  │  - Prometheus │  │  - Periodic  │ │
+  │  │    consumer     │  │  - Flag user  │  │  - Grafana    │  │  - Batch     │ │
+  │  │  - 100 batch   │  │  - Alert team │  │  - 90d retention│  │  - Delete    │ │
+  │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘ │
+  └─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Data Structures and Algorithms
+
+### The Bloom Filter for Deduplication
+
+The Bloom filter is the most important data structure in the notification system. It provides a probabilistic answer to "Have I seen this notification before?" with a controlled false positive rate and minimal memory usage.
+
+**What it is:** A Bloom filter is a bit array of size `m` with `k` hash functions. To add an element, compute `k` hash values, each modulo `m`, and set the corresponding bits to 1. To check membership, compute the same `k` hashes and check if all corresponding bits are set. If any bit is 0, the element is definitely not in the set. If all bits are 1, the element is probably in the set.
+
+**Why this structure:** A Bloom filter uses roughly 10 bits per element for a 1 percent false positive rate. For 1 million notifications per day, you need 10 million bits = 1.2 MB of memory. A HashSet storing 1 million UUIDs (36 bytes each) would need 36 MB — 30x more memory. The Bloom filter fits entirely in L3 cache, providing sub-microsecond checks.
+
+**Time complexity:** O(k) — constant time for both insert and lookup, where `k` is typically 7 to 10 hash functions. Memory: O(m) where m = n * ln(p) / (ln(2))^2 bits, with n = expected elements and p = desired false positive rate.
+
+**What breaks if you skip it:** Without dedup, a retry storm can deliver the same notification 5 to 10 times to the same user. Users who receive duplicate notifications are 3x more likely to disable notifications entirely.
+
+### The Priority Queue for Channel Dispatch
+
+Each channel worker pool maintains a priority queue of pending notifications. The priority queue ensures that critical notifications are processed before normal ones, even within the same channel.
+
+**What it is:** A binary heap (min-heap or max-heap) where each node has a priority value. The highest-priority item is always at the root. Insert and extract-min operations both run in O(log n) time.
+
+**Why this structure:** A simple FIFO queue would process critical notifications at the same rate as marketing notifications. With a priority queue, a security alert (P0) is always delivered before a promotional email (P3), regardless of when each arrived. The heap ensures that the highest-priority item is always the next one processed.
+
+**Time complexity:** Insert O(log n), Extract-min O(log n), Peek O(1). With n = 10,000 items in the queue, each operation takes roughly 14 comparisons.
+
+<AsciiDiagram id="notification-deep-dive/bloom-filter-insert" alt="A diagram showing how 7 hash functions map a notification key to bits in a Bloom filter array" caption="Figure 5: Bloom filter insert operation — 7 hash functions set bits in a 10-million-bit array" content={`
+  Notification Key: "like:user_789:photo_456"
+
+  Hash Functions:
+  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+  │  h1(key)  │   │  h2(key)  │   │  h3(key)  │   │  h4(key)  │
+  │  → 847,291│   │  → 3,201   │   │  → 9,102,  │   │  → 5,500,  │
+  │           │   │           │   │   155     │   │   001     │
+  └─────┬─────┘   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘
+        │               │               │               │
+        ▼               ▼               ▼               ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  Bloom Filter Bit Array (10,000,000 bits ≈ 1.2 MB)              │
+  │                                                                  │
+  │  bit 0: 0  bit 1: 0  ...  bit 3,201: 1  ...  bit 847,291: 1    │
+  │  ...  bit 5,500,001: 1  ...  bit 9,102,155: 1  ...  bit 9,999,  │
+  │  999: 0                                                         │
+  │                                                                  │
+  │  All 7 bits set → duplicate detected → notification dropped     │
+  │  Any bit not set → unique notification → proceed to delivery    │
+  └─────────────────────────────────────────────────────────────────┘
+
+  False positive rate: p = (1 - e^(-kn/m))^k
+  With n=1M, m=10M, k=7 → p ≈ 0.8%
+`} />
+
+### The Token Bucket for Rate Limiting
+
+The token bucket algorithm controls the rate of notification delivery across multiple dimensions: per-user, per-channel, per-provider.
+
+**What it is:** A bucket that holds `capacity` tokens. Tokens are added at a rate of `rate` tokens per second, up to the bucket's capacity. Each notification consumes one token. If the bucket is empty, the notification is delayed or dropped.
+
+**Why this structure:** The token bucket allows bursts of traffic up to the bucket's capacity while enforcing a long-term average rate. This is important for notification systems because traffic is bursty — a viral post generates a sudden spike of like notifications. The token bucket absorbs the spike (up to capacity) while preventing sustained abuse.
+
+**Configuration example:** Per-user rate limit: capacity = 5 tokens, rate = 1 token/second. This allows a user to receive 5 notifications in a burst (a flurry of activity) but limits the long-term average to 1 notification per second (60 per minute). The bucket refills at 1 token per second, so a user who received 5 notifications in a burst must wait 5 seconds before receiving another.
+
+<AsciiDiagram id="notification-deep-dive/token-bucket" alt="A diagram showing token buckets for per-user, per-channel, and per-provider rate limiting with refill rates" caption="Figure 6: Token bucket rate limiter — three layers of rate limiting in the notification system" content={`
+  Each notification consumes 1 token from each layer:
+
+  Layer 1: Per-User (key: "ratelimit:user_789:push")
+  ┌────────────────────────────────────────────────────────────┐
+  │  Token Bucket: capacity=5, rate=1/s                        │
+  │  ┌───────┬───────┬───────┬───────┬───────┬───────┐         │
+  │  │  ●    │  ●    │  ●    │  ●    │  ●    │  ○    │         │
+  │  │  T1   │  T2   │  T3   │  T4   │  T5   │ empty │         │
+  │  └───────┴───────┴───────┴───────┴───────┴───────┘         │
+  │  5 tokens available → notification allowed                 │
+  │  After send: 4 tokens available                            │
+  └────────────────────────────────────────────────────────────┘
+
+  Layer 2: Per-Connection (key: "ratelimit:apns:conn_3")
+  ┌────────────────────────────────────────────────────────────┐
+  │  Token Bucket: capacity=600, rate=600/s                    │
+  │  ┌───────┬───────┬───────┬───────┬───────┬───────┬───      │
+  │  │  ●    │  ●    │  ●    │  ●    │  ●    │  ●    │  ...    │
+  │  │  T1   │  T2   │  T3   │  T4   │  T5   │  T6   │  ...    │
+  │  └───────┴───────┴───────┴───────┴───────┴───────┴───      │
+  │  412 tokens used this second → 188 remaining → allowed     │
+  └────────────────────────────────────────────────────────────┘
+
+  Layer 3: Per-Channel Global (key: "ratelimit:push:global")
+  ┌────────────────────────────────────────────────────────────┐
+  │  Token Bucket: capacity=10000, rate=10000/s                │
+  │  ┌───────┬───────┬───────┬───────┬───────┬───────┬───      │
+  │  │  ●    │  ●    │  ●    │  ●    │  ●    │  ●    │  ...    │
+  │  │  T1   │  T2   │  T3   │  T4   │  T5   │  T6   │  ...    │
+  │  └───────┴───────┴───────┴───────┴───────┴───────┴───      │
+  │  8,201 tokens used this second → 1,799 remaining → allowed │
+  └────────────────────────────────────────────────────────────┘
+
+  All 3 layers must pass for the notification to be sent.
+  Any layer fails → notification is deferred or queued.
+`} />
+
+### The Consistent Hash Ring for Token Distribution
+
+Device tokens are distributed across multiple shards of the token registry. The consistent hash ring maps each token to a shard without requiring a full rebalance when shards are added or removed.
+
+**What it is:** A ring of hash values from 0 to 2^32 - 1. Each shard is assigned to multiple points on the ring (virtual nodes). To find the shard for a token, hash the token ID and walk clockwise to the first shard node. When a shard is added, only the tokens between the new shard and the next shard on the ring need to be redistributed.
+
+**Why this structure:** Without consistent hashing, adding a shard requires rehashing every token, which means moving all data. With consistent hashing, adding a shard moves only 1/N of the data, where N is the number of shards. For a 50-shard token registry, adding a shard moves only 2 percent of the tokens.
+
+<AsciiDiagram id="notification-deep-dive/consistent-hash-ring" alt="A diagram showing a hash ring with 3 shards and 2 virtual nodes per shard, demonstrating how tokens are assigned to shards" caption="Figure 2: Consistent hash ring with 3 shards and 2 virtual nodes per shard" content={`
+                        ┌──────────────────────┐
+                        │      Hash Ring        │
+                        │  0 ─────────── 2^32   │
+                        │                        │
+                        │        [S1_v1]         │
+                        │       /        \\       │
+                        │      /          \\      │
+                        │  [S3_v2]       [S1_v2]  │
+                        │     │            │     │
+                        │     │   [S2_v1]   │     │
+                        │     │    / \\     │     │
+                        │     │   /   \\    │     │
+                        │     │  [S2_v2]   │     │
+                        │     │     │      │     │
+                        │     [S3_v1]      │     │
+                        │        \\        /      │
+                        │         \\      /       │
+                        │          [S3_v3]        │
+                        └────────────────────────┘
+
+  Token "fcm:abc123" → hash=847,291 → S1_v1 → shard 1
+  Token "apns:xyz789" → hash=2,147,483,648 → S2_v2 → shard 2
+  Token "fcm:def456" → hash=3,500,000,000 → S3_v3 → shard 3
+
+  Adding shard 4: tokens between S3_v1 and S1_v1 move to shard 4
+  (only 1/4 of tokens are redistributed)
+`} />
+
+## The Request/Write/Read Lifecycle
+
+### Full Lifecycle: A Like Notification
+
+Walk through exactly what happens when a user likes a photo on a social media platform. This is the most common notification flow in the system.
+
+#### Step 1: Like Service Generates Event
+
+The like service receives the HTTP request `POST /like?photo_id=456&user_id=123`. It writes the like to the database (photo_likes table), then constructs a notification event. The event is serialized as JSON and sent to the notification ingress endpoint `POST /api/v1/notifications/events`.
+
+**System state:** Raw event in transit. No notification created yet.
+
+#### Step 2: Ingress Accepts and Validates
+
+The API gateway validates the event: checks the API key (Bearer token in Authorization header), validates the JSON schema (required fields: event_type, actor_id, recipient_id, resource_id), and checks the rate limit (caller has used 456 of 1,000 allowed requests this second).
+
+**System state:** Event accepted. Rate limit counter incremented in Redis.
+
+#### Step 3: Enrichment Fetches Context
+
+The enricher looks up:
+- Recipient user profile (from user service cache, Redis key `user:789:profile`)
+- Recipient device tokens (from token registry, DynamoDB, query by `user_id = 789`)
+- Post title (from post service, Redis key `post:456:metadata`)
+- Actor display name (from user service, Redis key `user:123:name`)
+
+**System state:** Event enriched with: `recipient_name`, `recipient_locale`, `device_tokens: [push: fcm_token_1, apns_token_2]`, `post_title`, `actor_name`.
+
+#### Step 4: Event Written to Kafka
+
+The enriched event is serialized to Avro format and written to the `raw-notification-events` Kafka topic. The partition is chosen by `hash(recipient_id) % 50` to ensure all events for user 789 land in the same partition. The Kafka producer receives an acknowledgement from the partition leader (acks=all, meaning waiting for all in-sync replicas to confirm).
+
+**System state:** Event in Kafka partition 17, offset 1,423,001. Duration from event generation to Kafka persistence: 75ms.
+
+#### Step 5: Consumer Reads and Dequeues
+
+The router consumer group reads from partition 17 at offset 1,423,001. The consumer fetches a batch of 500 messages (max), deserializes from Avro, and processes each message. The consumer commits the offset after processing the batch.
+
+**System state:** Event pulled from queue. Processing started.
+
+#### Step 6: Preference Check
+
+The preference checker queries Redis key `prefs:789:type:like`. The result is `{"channel": "push", "quiet_hours": false, "max_daily": 50}`. The user has received 23 like notifications today, so the limit is not exceeded.
+
+**System state:** Preference check passed. Channel selected: push.
+
+#### Step 7: Dedup Check
+
+The dedup filter computes the composite key `like:789:photo_456`. It computes 7 hashes and checks the Bloom filter. All 7 bits are 0 — this is a new notification. The notification is added to the Bloom filter (7 bits set to 1).
+
+**System state:** Dedup passed. Bloom filter updated.
+
+#### Step 8: Template Rendering
+
+The template engine loads the `like_push` template (English locale, version 3). The template is: `"{{actor_name}} liked your post \"{{post_title}}\""`. The engine substitutes `actor_name = "Alice"` and `post_title = "Sunset at the beach"`. The rendered payload is:
+
+```json
+{
+  "aps": {
+    "alert": "Alice liked your post \"Sunset at the beach\"",
+    "badge": 12,
+    "sound": "default"
+  },
+  "data": {
+    "type": "like",
+    "actor_id": "123",
+    "post_id": "456"
+  }
+}
+```
+
+**System state:** Push payload rendered. 127 bytes total.
+
+#### Step 9: Rate Limit Check
+
+The rate limiter checks the per-user token bucket (key `ratelimit:789:push`, capacity 5, rate 1/s). The user has 3 tokens remaining. One token is consumed. The per-provider rate limiter checks the APNs connection bucket (key `ratelimit:apns:connection_3`, capacity 600/s). The connection has sent 412 requests in the current second. One more is allowed.
+
+**System state:** Rate limit passed. Tokens consumed: 1 user, 1 provider.
+
+#### Step 10: Channel Dispatch
+
+The notification is placed on the push delivery queue — a Kafka topic called `push-outbound`. The partition is chosen by `hash(device_token) % 10` to ensure all deliveries to the same device use the same partition.
+
+**System state:** Notification in push-outbound topic, partition 4.
+
+#### Step 11: Push Worker Sends to APNs
+
+The push worker reads from `push-outbound` partition 4. It opens a new stream on the existing HTTP/2 connection to APNs. The request includes the device token, the payload, and the APNs priority header (10 for immediate delivery). The worker waits for the response.
+
+**System state:** Request sent to APNs. Worker waiting for response.
+
+#### Step 12: APNs Returns Status
+
+APNs returns HTTP/2 status 200 with a JSON body: `{"apns-id": "ABC-123-DEF-456"}`. The notification was accepted. The push worker updates the notification status in the database: `status = "delivered"`, `provider_response = "ok"`, `provider_latency_ms = 187`.
+
+**System state:** Notification delivered. Status updated in notification_store table.
+
+<AsciiDiagram id="notification-deep-dive/full-lifecycle" alt="A sequence diagram showing the complete lifecycle of a like notification from event generation through 12 steps to delivery" caption="Figure 3: Complete lifecycle of a like notification — 12 steps from event to device" content={`
+  Time: 0ms                          Time: 500ms
+  │                                  │
+  ┌──────┐                           │
+  │ Like  │─── POST /like ──────────>│
+  │ Service│                         │
+  └──────┘                           │
+       │                             │
+       v                             │
+  ┌──────────┐                       │
+  │ Ingress   │─── validate ────────>│
+  │ Gateway   │   (200ms)            │
+  └──────┬───┘                       │
+         │                           │
+         v                           │
+  ┌──────────┐                       │
+  │ Enricher  │─── fetch user ──────>│
+  │           │   (50ms)             │
+  │           │─── fetch post ──────>│
+  │           │   (30ms)             │
+  └──────┬───┘                       │
+         │                           │
+         v                           │
+  ┌──────────┐                       │
+  │   Kafka   │─── write event ─────>│
+  │   Topic   │   (15ms)             │
+  └──────────┘                       │
+         │                           │
+         v                           │
+  ┌──────────┐                       │
+  │  Router   │─── check prefs ─────>│
+  │          │   (5ms)               │
+  │          │─── check dedup ──────>│
+  │          │   (2ms)               │
+  │          │─── render temp ──────>│
+  │          │   (3ms)               │
+  │          │─── check rate ───────>│
+  │          │   (2ms)               │
+  └──────┬───┘                       │
+         │                           │
+         v                           │
+  ┌──────────┐                       │
+  │   Push    │─── HTTP/2 to APNs ──>│
+  │  Worker   │   (187ms)            │
+  └──────────┘                       │
+         │                           │
+         v                           │
+  ┌──────────┐                       │
+  │   User    │ ─── notification ───>│
+  │  Device   │   arrives!           │
+  └──────────┘                       │
+  │                                  │
+  Total: ~500ms from like to notification
+`} />
+
+<AsciiDiagram id="notification-deep-dive/priority-queue-heap" alt="A binary heap diagram showing P0 critical notifications at the root with P3 marketing at the leaves" caption="Figure 4: Binary min-heap for priority queue — P0 notifications always bubble to the root" content={`
+  Root (smallest priority number = highest priority)
+  ┌───────────────────────────────────────────────────────────────────┐
+  │  P0: Security Alert     (priority: 0, enqueued: 10:00:01)        │  ← extracted next
+  └───────────────────────────────────────────────────────────────────┘
+                                │
+              ┌─────────────────┴─────────────────┐
+              ▼                                   ▼
+  ┌───────────────────────┐         ┌───────────────────────────────┐
+  │  P1: Payment Receipt   │         │  P1: Direct Message            │
+  │  (priority: 1,          │         │  (priority: 1,                 │
+  │   enqueued: 10:00:02)   │         │   enqueued: 10:00:03)         │
+  └───────────────────────┘         └───────────────────────────────┘
+              │                                   │
+      ┌───────┴───────┐                   ┌───────┴───────┐
+      ▼               ▼                   ▼               ▼
+  ┌───────────┐   ┌───────────┐       ┌───────────┐   ┌───────────┐
+  │ P2: Like    │   │ P2: Follow │       │ P3: Weekly │   │ P3: Promo  │
+  │ (priority:  │   │ (prior-   │       │ Digest     │   │ Email      │
+  │  2)         │   │  ity: 2)  │       │ (prior-    │   │ (prior-    │
+  │             │   │           │       │  ity: 3)   │   │  ity: 3)   │
+  └───────────┘   └───────────┘       └───────────┘   └───────────┘
+
+  Extract-min: O(log n) — promotes P1 to root
+  Insert: O(log n) — new P1 inserts at leaf, bubbles up
+`} />
+
+## Consistency and State
+
+### Scenario 1: Node Crashes Mid-Operation
+
+**What happens:** The router consumer crashes after reading a notification from Kafka but before writing the delivery status to the database. The notification was in a "processing" state but never completed.
+
+**Resolution:** The Kafka consumer group detects the crash via the session timeout (default 10 seconds). The partition is reassigned to another consumer. The new consumer reads from the last committed offset, which is before the crashed notification. The notification is reprocessed. This provides at-least-once semantics — the notification may be processed twice, but it will never be lost.
+
+**The dedup catch:** If the notification is reprocessed, the dedup check catches it. The Bloom filter still has the bits set from the first processing attempt. The second attempt is detected as a duplicate and dropped. This converts at-least-once queue semantics into approximately-once notification semantics.
+
+### Scenario 2: The Network Partitions
+
+**What happens:** The router service loses connectivity to the Redis cluster. The dedup filter and preference cache become unavailable.
+
+**Resolution:** The router enters a degraded mode. It skips the dedup check (allowing potential duplicates) and reads preferences directly from the database (at higher latency, 50ms vs 5ms). The circuit breaker trips after 10 consecutive Redis failures, preventing further timeouts. When Redis connectivity is restored, the circuit breaker closes, and normal operation resumes.
+
+**Impact:** During the partition, users may receive duplicate notifications. The system trades delivery correctness for availability. This is the AP (Available and Partition-tolerant) choice in the CAP theorem.
+
+### Scenario 3: Two Writes Happen Simultaneously
+
+**What happens:** Two router instances read the same notification from Kafka before the dedup filter is updated. Both instances pass the dedup check (neither has set the Bloom filter bits yet) and both proceed to send the notification.
+
+**Resolution:** The dedup filter is not sufficient for this race condition. The system uses a pessimistic lock in Redis for the composite key `lock:like:789:photo_456` with a TTL of 5 seconds. The first router instance acquires the lock and sends the notification. The second router instance fails to acquire the lock and skips the notification. This prevents the race condition.
+
+### Scenario 4: A Read Returns Stale Data
+
+**What happens:** The enricher reads the user's device token from the Redis cache. The token was updated 5 minutes ago (the user reinstalled the app), but the cache TTL is 10 minutes. The enricher sends the notification to the old, invalid token.
+
+**Resolution:** The delivery provider (APNs) returns a 410 status with `Unregistered` reason. The feedback processor receives this response, removes the old token from the registry, and marks the notification as "failed — invalid token." The notification is not retried (retrying an invalid token is pointless). The user's new device registers a new token on next app launch, and the token registry is updated.
+
+**Prevention:** The cache TTL for device tokens is set to 5 minutes. The token registry uses a write-through cache pattern: when a token is updated, the cache is invalidated immediately. However, distributed caches have eventual consistency, so stale reads can still occur within a 50ms to 100ms window.
+
+## Performance Characteristics
+
+### Latency Budget
+
+| Stage | P50 | P99 | P999 | Budget Share |
+|-------|-----|-----|------|-------------|
+| Event ingestion | 15ms | 50ms | 200ms | 10% |
+| Event enrichment | 50ms | 150ms | 500ms | 20% |
+| Kafka write | 15ms | 40ms | 100ms | 6% |
+| Queue read + route | 25ms | 80ms | 300ms | 10% |
+| Template render | 3ms | 10ms | 50ms | 2% |
+| Provider delivery | 200ms | 800ms | 2,000ms | 52% |
+| Feedback processing | 5ms | 20ms | 100ms | 2% |
+| **Total end-to-end** | **313ms** | **1,150ms** | **3,250ms** | 100% |
+
+### Throughput Limits
+
+| Component | Single Instance | Cluster (50 nodes) |
+|-----------|----------------|-------------------|
+| Ingress API | 10,000 req/s | 500,000 req/s |
+| Kafka topic | 50 MB/s | 2.5 GB/s |
+| Router consumer | 5,000 msg/s | 250,000 msg/s |
+| Push worker (APNs) | 2,000 msg/s | 100,000 msg/s |
+| Email worker | 500 msg/s | 25,000 msg/s |
+| SMS worker | 50 msg/s | 2,500 msg/s |
+
+### Memory Footprint
+
+| Component | Memory per Instance | Notes |
+|-----------|-------------------|-------|
+| Redis cache (dedup) | 12 MB | Bloom filter + overhead |
+| Redis cache (preferences) | 500 MB | User preferences for 1M users |
+| Redis cache (templates) | 200 MB | Pre-compiled ASTs |
+| Push worker connection pool | 64 MB | 8 HTTP/2 connections times 8 MB each |
+| Kafka consumer buffer | 256 MB | Fetch buffer + inflight messages |
+
+## Configuration and Tuning
+
+### Kafka Topic Configuration
+
+**num.partitions** — Controls parallelism. Default: 3 for dev, 50 for production. Each partition supports one consumer, so 50 partitions = 50 parallel consumers. Setting this too low (less than the number of consumer instances) leaves consumers idle. Setting it too high (more than 500) increases leader election time and file descriptor usage.
+
+**retention.ms** — How long messages are retained. Default: 7 days (604,800,000 ms). Longer retention (30 days) enables reprocessing of failed batches but increases storage cost. At 50 million events per day at 1 KB each, 7 days of retention uses 350 GB.
+
+**min.insync.replicas** — Minimum number of replicas that must acknowledge a write. Default: 2. Setting this to 1 increases write throughput but risks data loss if the partition leader crashes. Setting this to 3 (same as replication factor) provides maximum durability but reduces throughput by 15 percent.
+
+### Consumer Configuration
+
+**max.poll.records** — Maximum number of messages returned in a single poll. Default: 500. Increasing this improves throughput (fewer round trips) but increases memory usage and reprocessing time on failure. At 500 messages times 1 KB each = 500 KB per batch.
+
+**session.timeout.ms** — Time before the consumer group rebalances if a consumer stops heartbeating. Default: 10,000 ms. Lower values (5,000 ms) detect failures faster but cause more frequent rebalances. Higher values (30,000 ms) reduce rebalance frequency but increase the window for duplicate processing.
+
+**max.poll.interval.ms** — Maximum time between poll calls before the consumer is considered failed. Default: 300,000 ms (5 minutes). If processing a batch takes longer than this, the consumer is kicked out of the group. Increase this if template rendering is slow.
+
+### Rate Limiter Tuning
+
+**Per-user token bucket** — capacity = 5, refill_rate = 1/second. Safe for most apps. Aggressive: capacity = 10, refill_rate = 2/second. Conservative: capacity = 3, refill_rate = 0.5/second. The aggressive setting allows a user to receive 10 notifications in a burst but limits the average to 2 per second.
+
+**Per-provider connection limit** — APNs: 600 requests/second per connection. FCM: 600 requests/second per project. Twilio: 1 message/second per phone number. SES: 14 emails/second (starting limit, can be increased). These are provider-enforced limits. Exceeding them results in throttling responses (HTTP 429).
+
+**Per-channel global limit** — Default: 10,000 push/second, 1,000 email/second, 100 SMS/second. These limits protect the system from runaway retry storms. Set them below the total capacity of the provider connections to leave headroom for retries.
+
+### Retry Configuration
+
+**max.retries** — Maximum delivery attempts. Default: 3. Setting this to 0 disables retries (fire-and-forget). Setting this to 5 or higher increases delivery probability but risks queue congestion. At 3 retries with exponential backoff (10s, 60s, 5m), the total retry window is roughly 6 minutes.
+
+**backoff.base** — Base delay for the first retry. Default: 10 seconds. Shorter (1 second) for time-sensitive notifications. Longer (60 seconds) for rate-limited providers.
+
+**backoff.multiplier** — Multiplier for each subsequent retry. Default: 6x (10s, 60s, 360s). Exponential: 2x (10s, 20s, 40s). Aggressive: 10x (10s, 100s, 1000s).
+
+**dead.letter.ttl** — How long to keep items in the dead-letter queue. Default: 30 days. After this period, the notification is permanently deleted.
+
+---
+
+**Up next:** You understand the internal mechanics. Now see how this system fits into a real production architecture — from naive implementation to global scale.

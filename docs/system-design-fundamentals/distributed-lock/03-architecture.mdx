@@ -1,0 +1,724 @@
+---
+id: distributed-lock-architecture
+title: Distributed Lock Pattern at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+Every distributed lock system starts with a naive implementation. The naive approach uses a single shared database table with a `SELECT ... FOR UPDATE` query. This section walks through that implementation, identifies its eight failure modes, and then shows how to evolve it into a production-grade system.
+
+### The Database Table Approach
+
+The naive implementation creates a single table in a relational database:
+
+```sql
+CREATE TABLE distributed_locks (
+    resource_id VARCHAR(256) PRIMARY KEY,
+    owner_id VARCHAR(128) NOT NULL,
+    acquired_at TIMESTAMP NOT NULL,
+    ttl_seconds INT NOT NULL DEFAULT 30
+);
+```
+
+The application acquires a lock by starting a transaction and selecting the row with `FOR UPDATE`:
+
+```python
+def acquire_lock(resource_id, owner_id, ttl_seconds=30):
+    with db.transaction():
+        row = db.execute(
+            "SELECT * FROM distributed_locks "
+            "WHERE resource_id = %s FOR UPDATE",
+            [resource_id]
+        ).fetchone()
+        
+        if row is None:
+            db.execute(
+                "INSERT INTO distributed_locks "
+                "VALUES (%s, %s, NOW(), %s)",
+                [resource_id, owner_id, ttl_seconds]
+            )
+            return True
+        
+        if row.owner_id == owner_id:
+            return True  # Reentrant
+        
+        if (datetime.now() - row.acquired_at).seconds > row.ttl_seconds:
+            db.execute(
+                "UPDATE distributed_locks "
+                "SET owner_id = %s, acquired_at = NOW() "
+                "WHERE resource_id = %s",
+                [owner_id, resource_id]
+            )
+            return True
+        
+        return False  # Lock held by another
+```
+
+### Eight Failure Modes of the Naive Approach
+
+1. **Connection pool exhaustion**: Each held lock consumes a database connection. With 50 concurrent locks and a connection pool of 30, the system blocks indefinitely.
+
+2. **Session disconnect**: When a database connection breaks, the database releases all row locks. The application continues operating, believing it holds locks it no longer has.
+
+3. **No fencing tokens**: The database does not provide monotonically increasing tokens. A delayed writer can overwrite data after its lock expired.
+
+4. **Clock drift**: TTL expiry relies on the application server's clock. If the clock drifts, locks may expire early or late.
+
+5. **Single point of failure**: If the database goes down, the entire lock system is unavailable. No distributed system can make progress.
+
+6. **No fairness**: The first-come, first-served behavior depends on database locking order, which is not guaranteed under concurrent access.
+
+7. **No deadlock detection**: The database's lock wait timeout is the only deadlock detection mechanism. The default of 50 seconds is too long for most applications.
+
+8. **No observability**: The naive implementation provides no metrics on lock acquisition latency, contention, or lease expiry rates.
+
+<AsciiDiagram
+  id="distributed-lock/naive-architecture"
+  title="Naive Distributed Lock Architecture"
+  alt="A single database with a distributed locks table, multiple application servers connecting via a connection pool, with failure annotations showing connection pool exhaustion, session disconnect, and clock drift"
+  caption="Naive database-based lock architecture with eight identified failure modes"
+  content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    NAIVE DISTRIBUTED LOCK ARCHITECTURE                     │
+│                                                                           │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐                │
+│  │  App 1   │  │  App 2   │  │  App 3   │  │  App 4   │                │
+│  │  Lock:   │  │  Lock:   │  │  Lock:   │  │  Lock:   │                │
+│  │  held    │  │  waiting │  │  held    │  │  waiting │                │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘                │
+│       │             │             │             │                       │
+│       └─────────────┼─────────────┼─────────────┘                       │
+│                     │             │                                     │
+│                     ▼             ▼                                     │
+│          ┌──────────────────────────────┐                              │
+│          │      Connection Pool (30)     │                              │
+│          │  ┌────┬────┬────┬────┬────┐  │                              │
+│          │  │ C1 │ C2 │ C3 │ C4 │ C5 │  │  FAILURE MODES:             │
+│          │  ├────┼────┼────┼────┼────┤  │  1. Pool exhausted           │
+│          │  │ L1 │ L2 │ L3 │ L4 │ L5 │  │     (50 holds, 30 pool)     │
+│          │  └────┴────┴────┴────┴────┘  │  2. Session disconnect      │
+│          └──────────────────────────────┘  │     locks silently lost   │
+│                      │                     │  3. No fencing tokens     │
+│                      ▼                     │  4. Clock drift affects   │
+│          ┌──────────────────────────────┐  │     TTL expiry            │
+│          │     PostgreSQL Database       │  │  5. Single point of      │
+│          │  ┌────────────────────────┐  │  │     failure               │
+│          │  │ distributed_locks      │  │  │  6. No fairness           │
+│          │  │ ┌──────────────────┐   │  │  │  7. No deadlock detection│
+│          │  │ │ resource_A: pod1 │   │  │  │  8. No observability     │
+│          │  │ │ resource_B: pod3 │   │  │  └──────────────────────────┘
+│          │  │ │ resource_C: --   │   │  │                              │
+│          │  │ └──────────────────┘   │  │                              │
+│          │  └────────────────────────┘  │                              │
+│          └──────────────────────────────┘                              │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Production-Grade Architecture
+
+A production-grade distributed lock system addresses all eight failure modes through a combination of consensus protocol, dedicated lock service, fencing tokens, and observability infrastructure.
+
+### System Components
+
+1. **Lock Service Cluster**: A 3- or 5-node cluster running a consensus-based lock service such as etcd, ZooKeeper, or Consul. The cluster provides linearizable consistency for lock operations and survives node failures.
+
+2. **Client Library**: An embedded library that handles session management, lease renewal, and fencing token propagation. The client library is linked into each application. It abstracts the complexity of the lock protocol behind a simple `acquire()` and `release()` API.
+
+3. **Fencing Token Service**: A component that generates monotonically increasing fencing tokens. The fencing token is integrated into the lock record and propagated to the protected resource.
+
+4. **Monitoring and Alerting**: A Prometheus metrics endpoint and Grafana dashboards for lock acquisition latency, contention, lease expiry rate, and wait queue depth.
+
+5. **Health Check Endpoint**: A `/health` endpoint on the lock service that returns the cluster's leader status, replication lag, and queue depth.
+
+### Request Flow
+
+1. The application calls `acquire(resource_id, ttl)` on the client library.
+2. The client library opens a session with the lock service cluster.
+3. The lock service creates a lock record with a fencing token.
+4. The client library registers a lease and starts periodic renewal.
+5. The application accesses the protected resource, passing the fencing token.
+6. The protected resource validates the fencing token.
+7. The application calls `release()`.
+8. The client library sends a release request and stops renewal.
+
+<AsciiDiagram
+  id="distributed-lock/production-architecture"
+  title="Production-Grade Distributed Lock Architecture"
+  alt="A 3-node etcd cluster, client library embedded in application servers, fencing token service, and monitoring infrastructure with Prometheus and Grafana"
+  caption="Production-grade distributed lock architecture with consensus, fencing tokens, and observability"
+  content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│               PRODUCTION-GRADE DISTRIBUTED LOCK ARCHITECTURE                  │
+│                                                                               │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                   Application Servers                                 │   │
+│  │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐           │   │
+│  │  │   App 1      │    │   App 2      │    │   App 3      │           │   │
+│  │  │ ┌──────────┐ │    │ ┌──────────┐ │    │ ┌──────────┐ │           │   │
+│  │  │ │ Lock Lib │ │    │ │ Lock Lib │ │    │ │ Lock Lib │ │           │   │
+│  │  │ │ session  │ │    │ │ session  │ │    │ │ session  │ │           │   │
+│  │  │ │ renewals │ │    │ │ renewals │ │    │ │ renewals │ │           │   │
+│  │  │ └──────────┘ │    │ └──────────┘ │    │ └──────────┘ │           │   │
+│  │  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘           │   │
+│  └─────────┼───────────────────┼───────────────────┼────────────────────┘   │
+│            │                   │                   │                        │
+│            ▼                   ▼                   ▼                        │
+│  ┌──────────────────────────────────────────────────────────────────┐     │
+│  │                    Lock Service Cluster (etcd, 3 nodes)           │     │
+│  │                                                                   │     │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐│     │
+│  │  │  Node 1 (Leader)  │  │  Node 2          │  │  Node 3          ││     │
+│  │  │  ┌────────────┐  │  │  ┌────────────┐  │  │  ┌────────────┐  ││     │
+│  │  │  │ Raft       │  │  │  │ Raft       │  │  │  │ Raft       │  ││     │
+│  │  │  │ Leader     │  │  │  │ Follower   │  │  │  │ Follower   │  ││     │
+│  │  │  └────────────┘  │  │  └────────────┘  │  │  └────────────┘  ││     │
+│  │  │  ┌────────────┐  │  │  ┌────────────┐  │  │  ┌────────────┐  ││     │
+│  │  │  │ Lock       │  │  │  │ Lock       │  │  │  │ Lock       │  ││     │
+│  │  │  │ Registry   │  │  │  │ Registry   │  │  │  │ Registry   │  ││     │
+│  │  │  └────────────┘  │  │  └────────────┘  │  │  └────────────┘  ││     │
+│  │  │  ┌────────────┐  │  │  ┌────────────┐  │  │  ┌────────────┐  ││     │
+│  │  │  │ Token Gen  │  │  │  │ Token Gen  │  │  │  │ Token Gen  │  ││     │
+│  │  │  │ (1047)     │  │  │  │ (1047)     │  │  │  │ (1047)     │  ││     │
+│  │  │  └────────────┘  │  │  └────────────┘  │  │  └────────────┘  ││     │
+│  │  │  ┌────────────┐  │  │  ┌────────────┐  │  │  ┌────────────┐  ││     │
+│  │  │  │ Lease      │  │  │  │ Lease      │  │  │  │ Lease      │  ││     │
+│  │  │  │ Manager    │  │  │  │ Manager    │  │  │  │ Manager    │  ││     │
+│  │  │  └────────────┘  │  │  └────────────┘  │  │  └────────────┘  ││     │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘│     │
+│  └──────────────────────────────────────────────────────────────────┘     │
+│                                    │                                      │
+│                                    ▼                                      │
+│  ┌──────────────────────────────────────────────────────────────────┐     │
+│  │                    Protected Resources                             │     │
+│  │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐       │     │
+│  │  │  PostgreSQL  │    │  S3 Bucket   │    │  Redis Cache │       │     │
+│  │  │  token check │    │  token check │    │  token check │       │     │
+│  │  └──────────────┘    └──────────────┘    └──────────────┘       │     │
+│  └──────────────────────────────────────────────────────────────────┘     │
+│                                    │                                      │
+│                                    ▼                                      │
+│  ┌──────────────────────────────────────────────────────────────────┐     │
+│  │                    Monitoring (Prometheus / Grafana)               │     │
+│  │  lock_acquire_latency  lock_contention  lease_expired_count      │     │
+│  │  wait_queue_depth      registry_size     connection_count        │     │
+│  └──────────────────────────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Integration Patterns
+
+Distributed locks are not used in isolation. They integrate with other system components. The following four patterns describe common integration scenarios.
+
+### Pattern 1: Job Scheduler Integration
+
+A distributed job scheduler uses locks to ensure that each scheduled job runs on exactly one worker. The lock key is the job identifier. The worker that acquires the lock executes the job. Other workers skip the job.
+
+```python
+def process_scheduled_job(job_id):
+    lock = lock_service.acquire(f"job:{job_id}", ttl=300)
+    if not lock:
+        return  # Another worker is handling this job
+    
+    try:
+        job = job_repository.fetch(job_id)
+        if job.status == "completed":
+            return
+        execute_job(job)
+        job_repository.mark_completed(job_id)
+    finally:
+        lock_service.release(lock)
+```
+
+The TTL must be longer than the maximum job execution time. For a job that runs for 5 minutes, the TTL should be 6 minutes. The job should periodically refresh the lock for long-running jobs.
+
+### Pattern 2: Cache Rebuild Coordination
+
+A distributed cache has 80 replicas. Without a lock, all 80 replicas would simultaneously query the database to rebuild a cache entry. A distributed lock ensures that exactly one replica rebuilds the cache, and the other replicas wait for the result.
+
+```python
+def get_or_rebuild_cache(key):
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    
+    lock = lock_service.acquire(f"cache:rebuild:{key}", ttl=30)
+    if lock:
+        try:
+            # Double-check after acquiring lock
+            cached = cache.get(key)
+            if cached is not None:
+                return cached
+            value = expensive_computation(key)
+            cache.set(key, value, ttl=3600)
+            return value
+        finally:
+            lock_service.release(lock)
+    else:
+        # Another replica is rebuilding; wait for result
+        for _ in range(30):
+            sleep(1)
+            cached = cache.get(key)
+            if cached is not None:
+                return cached
+        raise TimeoutError("Cache rebuild timed out")
+```
+
+The double-check pattern is critical. Between the time the process checked the cache and acquired the lock, another process may have already rebuilt the cache. The double-check prevents redundant computation.
+
+### Pattern 3: Leader Election for HA Services
+
+A high-availability service runs three replicas, but only one replica should be active at a time. The active replica holds a distributed lock. The lock's TTL is set to 10 seconds, and the replica renews it every 3 seconds. If the active replica crashes, the lock expires and another replica acquires it.
+
+```python
+class LeaderElection:
+    def __init__(self, service_name, lock_service):
+        self.service_name = service_name
+        self.lock_service = lock_service
+        self.is_leader = False
+        self.renewal_thread = None
+    
+    def try_become_leader(self):
+        lock = self.lock_service.acquire(
+            f"leader:{self.service_name}",
+            ttl=10
+        )
+        if lock:
+            self.is_leader = True
+            self.renewal_thread = start_renewal_thread(lock)
+            return True
+        return False
+    
+    def resign_leadership(self):
+        self.is_leader = False
+        if self.renewal_thread:
+            self.renewal_thread.stop()
+```
+
+The leader election pattern is used by Kubernetes controllers, database failover managers, and configuration management systems.
+
+### Pattern 4: Distributed Rate Limiting
+
+A distributed rate limiter uses a lock to coordinate sliding window counters across multiple application servers. Each server acquires a lock on the rate limit key, reads the current count, and increments it.
+
+```python
+def check_rate_limit(client_id, max_requests=100, window_seconds=60):
+    lock_key = f"ratelimit:{client_id}"
+    lock = lock_service.acquire(lock_key, ttl=1)
+    if not lock:
+        # Fall back to local rate limiting
+        return local_rate_limiter.check(client_id, max_requests)
+    
+    try:
+        current = redis.get(f"counter:{client_id}") or 0
+        if current >= max_requests:
+            return False
+        redis.incr(f"counter:{client_id}")
+        redis.expire(f"counter:{client_id}", window_seconds)
+        return True
+    finally:
+        lock_service.release(lock)
+```
+
+The lock TTL of 1 second is short because the rate limit check is fast. The fallback to local rate limiting ensures that the system degrades gracefully if the lock service is unavailable.
+
+<AsciiDiagram
+  id="distributed-lock/integration-patterns"
+  title="Distributed Lock Integration Patterns"
+  alt="Four integration patterns shown side by side: job scheduler, cache rebuild, leader election, and rate limiting, each with its own lock acquisition and release flow"
+  caption="Four common integration patterns for distributed locks"
+  content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    DISTRIBUTED LOCK INTEGRATION PATTERNS                      │
+│                                                                               │
+│  PATTERN 1: JOB SCHEDULER          PATTERN 2: CACHE REBUILD                  │
+│  ┌────────────────────────────┐   ┌──────────────────────────────────┐      │
+│  │ Worker 1: acquires lock   │   │ Replica 1: acquires lock         │      │
+│  │ Worker 2: skips job       │   │ Replica 2-N: wait for result     │      │
+│  │                           │   │                                  │      │
+│  │  ┌──────┐                 │   │  ┌──────┐                        │      │
+│  │  │ Jobs │                 │   │  │ Cache│                        │      │
+│  │  │ Queue│                 │   │  │ Key  │                        │      │
+│  │  └──┬───┘                 │   │  └──┬───┘                        │      │
+│  │     │                     │   │     │                            │      │
+│  │     ▼                     │   │     ▼                            │      │
+│  │ ┌────────┐                │   │ ┌────────┐                       │      │
+│  │ │ Lock   │                │   │ │ Lock   │                       │      │
+│  │ │ job:42 │                │   │ │ cache:x│                       │      │
+│  │ └────────┘                │   │ └────────┘                       │      │
+│  │     │                     │   │     │                            │      │
+│  │     ▼                     │   │     ▼                            │      │
+│  │ ┌────────┐                │   │ ┌────────┐                       │      │
+│  │ │ Execute│                │   │ │ Compute│                       │      │
+│  │ └────────┘                │   │ └────────┘                       │      │
+│  └────────────────────────────┘   └──────────────────────────────────┘      │
+│                                                                               │
+│  PATTERN 3: LEADER ELECTION      PATTERN 4: RATE LIMITING                    │
+│  ┌────────────────────────────┐   ┌──────────────────────────────────┐      │
+│  │ Replica 1: leader          │   │ Server 1: acquires lock         │      │
+│  │ Replica 2: standby         │   │ Server 2: fallback to local     │      │
+│  │ Replica 3: standby         │   │                                  │      │
+│  │                           │   │  ┌────────┐                      │      │
+│  │  ┌────────┐               │   │  │ Request│                      │      │
+│  │  │ Leader │               │   │  └───┬────┘                      │      │
+│  │  │ Lock   │               │   │      │                           │      │
+│  │  │ 10s TTL│               │   │      ▼                           │      │
+│  │  └────────┘               │   │  ┌────────┐                      │      │
+│  │     │                     │   │  │ Lock   │                      │      │
+│  │     ▼                     │   │  │ 1s TTL │                      │      │
+│  │ ┌────────┐                │   │  └────────┘                      │      │
+│  │ │ Active │                │   │      │                           │      │
+│  │ │ Service│                │   │      ▼                           │      │
+│  │ └────────┘                │   │  ┌────────┐                      │      │
+│  │     │                     │   │  │Counter │                      │      │
+│  │     ▼                     │   │  │ incr   │                      │      │
+│  │ Renewals every 3s        │   │  └────────┘                      │      │
+│  └────────────────────────────┘   └──────────────────────────────────┘      │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Multi-Region Architecture
+
+Global systems require lock services that span multiple geographic regions. The multi-region architecture must balance consistency, latency, and availability.
+
+### Single-Region Lock Service with Global Access
+
+The simplest multi-region approach deploys the lock service in a single region and has all clients connect to it. The latency penalty is the cross-region round trip time.
+
+| Client Region | Lock Service Region | Round Trip Time | Total Acquisition Time |
+|---|---|---|---|
+| us-east-1 | us-east-1 | 0.5 ms | 5.6 ms |
+| us-west-2 | us-east-1 | 62 ms | 67 ms |
+| eu-west-1 | us-east-1 | 88 ms | 93 ms |
+| ap-southeast-1 | us-east-1 | 210 ms | 215 ms |
+
+This approach is acceptable for low-rate locks where the cross-region latency is a small fraction of the operation's total time. It is not acceptable for high-throughput systems.
+
+### Per-Region Lock Services with Resource Partitioning
+
+Each region has its own lock service instance. Resources are partitioned by region. A resource that belongs to the us-east-1 region is locked using the us-east-1 lock service.
+
+```yaml
+lock_regions:
+  us-east-1:
+    endpoints: ["lock-east-1a:2379", "lock-east-1b:2379", "lock-east-1c:2379"]
+    resources: ["trip:*", "user:*", "payment:*"]
+  us-west-2:
+    endpoints: ["lock-west-2a:2379", "lock-west-2b:2379", "lock-west-2c:2379"]
+    resources: ["job:*", "cache:*"]
+  eu-west-1:
+    endpoints: ["lock-eu-1a:2379", "lock-eu-1b:2379", "lock-eu-1c:2379"]
+    resources: ["order:*", "inventory:*"]
+```
+
+The resource partitioning must be deterministic. A resource identifier includes the region prefix. The resource `trip:847` belongs to the us-east-1 region. The resource `order:123` belongs to the eu-west-1 region.
+
+The challenge is that some resources are inherently global. For example, the resource `last_processed_order_id` is used by all regions. For global resources, use a consensus-based approach with a 5-node cluster spanning 3 regions.
+
+### Consensus Across Regions
+
+A 5-node lock service cluster spans three regions with nodes in us-east-1 (2 nodes), us-west-2 (2 nodes), and eu-west-1 (1 node). The Raft leader is in us-east-1. Write latency for a client in us-east-1 is determined by the majority of 3 nodes: the 2 us-east-1 nodes and 1 us-west-2 node. The us-west-2 link adds approximately 62 milliseconds.
+
+The write latency of 62 milliseconds is too slow for most use cases. The consensus approach is only suitable for global resources that are accessed infrequently, such as configuration changes, feature flags, and global locks.
+
+### Hierarchical Lock Services
+
+A hierarchical approach combines local and global lock services. Each region has a local lock service for high-throughput local locks. A global lock service handles cross-region coordination. The local lock service acquires a global lock only when the operation affects resources in multiple regions.
+
+```python
+def acquire_multi_region_lock(resource_id, regions):
+    # Acquire local lock first
+    local_lock = local_lock_service.acquire(resource_id, ttl=10)
+    if not local_lock:
+        return None
+    
+    try:
+        # Acquire global lock for cross-region coordination
+        global_lock = global_lock_service.acquire(resource_id, ttl=30)
+        if not global_lock:
+            local_lock_service.release(local_lock)
+            return None
+        
+        # Declare intent to all regions
+        for region in regions:
+            if region != current_region:
+                region_lock_service[region].declare_intent(resource_id)
+        
+        return CompositeLock(local_lock, global_lock)
+    except:
+        local_lock_service.release(local_lock)
+        raise
+```
+
+The hierarchical approach adds complexity but provides the best balance of performance and consistency. Local locks operate at microsecond latency. Global locks are used only for operations that span regions.
+
+<AsciiDiagram
+  id="distributed-lock/multi-region-architecture"
+  title="Multi-Region Lock Architecture"
+  alt="Three regions with local lock services, a global lock service spanning all regions, and hierarchical coordination between local and global services"
+  caption="Multi-region lock architecture with local, global, and hierarchical coordination strategies"
+  content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    MULTI-REGION LOCK ARCHITECTURE                             │
+│                                                                               │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                    GLOBAL LOCK SERVICE (5 nodes, 3 regions)           │   │
+│  │                                                                       │   │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐   │   │
+│  │  │ us-east-1 (2)    │  │ us-west-2 (2)    │  │ eu-west-1 (1)   │   │   │
+│  │  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │   │   │
+│  │  │ │ Raft Node 1  │ │  │ │ Raft Node 3  │ │  │ │ Raft Node 5  │ │   │   │
+│  │  │ │ (Leader)     │ │  │ │ (Follower)   │ │  │ │ (Follower)   │ │   │   │
+│  │  │ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │   │   │
+│  │  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │                  │   │   │
+│  │  │ │ Raft Node 2  │ │  │ │ Raft Node 4  │ │  │                  │   │   │
+│  │  │ │ (Follower)   │ │  │ │ (Follower)   │ │  │                  │   │   │
+│  │  │ └──────────────┘ │  │ └──────────────┘ │  │                  │   │   │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────┘   │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                         │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  us-east-1 Region              us-west-2 Region         eu-west-1    │   │
+│  │  ┌────────────────────────┐  ┌──────────────────────┐  ┌──────────┐  │   │
+│  │  │  Local Lock Service    │  │  Local Lock Service  │  │  Local   │  │   │
+│  │  │  (3-node etcd)        │  │  (3-node etcd)       │  │  Lock    │  │   │
+│  │  │                       │  │                       │  │  Service │  │   │
+│  │  │  Resources:           │  │  Resources:           │  │  (3-node)│  │   │
+│  │  │  trip:*               │  │  job:*                │  │          │  │   │
+│  │  │  user:*               │  │  cache:*              │  │Resources:│  │   │
+│  │  │  payment:*            │  │  analytics:*          │  │order:*   │  │   │
+│  │  └────────────────────────┘  └──────────────────────┘  │inventory:│  │   │
+│  │                              │                           └──────────┘  │   │
+│  │                              │                                         │   │
+│  │              ┌───────────────┴────────────────┐                       │   │
+│  │              │  Global Resource Locks          │                       │   │
+│  │              │  config:*, feature_flag:*       │                       │   │
+│  │              │  Acquired via global service    │                       │   │
+│  │              └────────────────────────────────┘                       │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                               │
+│  Key: Local locks: 1-5ms, Global locks: 60-150ms                           │
+│  Hierarchical: local lock first, then global only if needed                │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Capacity Planning
+
+Capacity planning for a distributed lock service requires estimating the workload and sizing the cluster accordingly.
+
+### Workload Estimation
+
+Estimate the following parameters:
+
+- **Number of resources**: The total number of distinct resource identifiers that will be locked.
+- **Lock acquisition rate**: The number of lock acquisitions per second across all resources.
+- **Lock concurrency**: The maximum number of concurrent locks held simultaneously.
+- **Critical section duration**: The average and maximum time the lock is held.
+- **Contention ratio**: The percentage of lock acquisitions that fail because the lock is held.
+
+### Cluster Sizing
+
+The cluster size depends on the lock service implementation and the workload.
+
+**For Redis (SETNX)**:
+- Single node can handle up to 50,000 ops/s.
+- For high availability, use a 3-node Redis Sentinel cluster.
+- Memory: each lock consumes 64 bytes. For 10,000 concurrent locks, 640 KB.
+
+**For etcd (3-node cluster)**:
+- Maximum throughput: 10,000 ops/s.
+- For high availability, 3 nodes tolerate 1 node failure.
+- Storage: each lock record consumes 192 bytes. For 10,000 locks per day, 1.9 MB per day.
+- etcd has a default database size limit of 2 GB. The lock service must be configured with automatic compaction.
+
+**For ZooKeeper (3-node cluster)**:
+- Maximum throughput: 8,000 ops/s.
+- For high availability, 3 nodes tolerate 1 node failure.
+- Storage: each lock record consumes 256 bytes. ZooKeeper's snapshot and log mechanism requires periodic cleanup.
+
+### Sizing Formulas
+
+```
+required_throughput = lock_acquisition_rate * 1.5 (headroom)
+required_nodes = 2 * f + 1 (where f is max tolerated failures)
+required_memory = concurrent_locks * bytes_per_lock * 2 (peak factor)
+```
+
+### Example: Payment Processing System
+
+A payment processing system with the following characteristics:
+
+- 1,000,000 resources (one per merchant)
+- 500 lock acquisitions per second
+- 200 concurrent locks at peak
+- 5 second average critical section duration
+- 20 percent contention ratio
+
+**Redis sizing**: 1 Redis master with 2 replicas. Memory: 200 * 64 * 2 = 25.6 KB. Negligible. Throughput: 500 * 1.5 = 750 ops/s. Redis handles this easily.
+
+**etcd sizing**: 3-node cluster. Throughput: 500 * 1.5 = 750 ops/s. Well within 10,000 ops/s limit. Storage: 500 * 192 * 86400 = 8.3 GB per day. This exceeds the 2 GB default limit. The system must implement automatic compaction with a retention period of 4 hours, or use a larger database size limit.
+
+**ZooKeeper sizing**: 3-node cluster. Throughput: 500 * 1.5 = 750 ops/s. Within limits. Storage: 500 * 256 = 128 KB per day for lock records. Negligible.
+
+## Operations
+
+Operating a distributed lock service requires monitoring, alerting, and incident response procedures.
+
+### Monitoring
+
+The following metrics must be monitored in production:
+
+- **Acquisition latency**: P50, P95, P99 latency for lock acquisition. Alert if P99 exceeds 100ms for Redis or 50ms for etcd.
+- **Contention rate**: Percentage of failed acquisitions. Alert if exceeds 30 percent.
+- **Lease expiry rate**: Number of leases expired per minute. Alert if exceeds 1 per minute.
+- **Wait queue depth**: Number of waiters per resource. Alert if exceeds 10 for any resource.
+- **Registry size**: Number of active locks. Alert if exceeds 80 percent of the expected maximum.
+- **Connection count**: Number of active client connections. Alert if exceeds 80 percent of the connection limit.
+- **Token generation rate**: Number of tokens generated per second. Alert if exceeds 90 percent of the maximum.
+
+### Alerting Thresholds
+
+| Metric | Warning | Critical | Action |
+|---|---|---|---|
+| Acquisition latency P99 > 100ms | 5 min | 15 min | Investigate lock service load |
+| Contention rate > 30 percent | 10 min | 30 min | Review lock granularity |
+| Lease expiry rate > 1/min | 5 min | 10 min | Investigate holder crashes |
+| Wait queue depth > 10 | 5 min | 15 min | Check for deadlock or slow holders |
+| Registry size > 80 percent | 10 min | 20 min | Scale up or review lock usage |
+| Connection count > 80 percent | 10 min | 20 min | Add more connections or scale |
+| Token generation rate > 90 percent | 5 min | 15 min | Scale token generator |
+
+### Incident Response
+
+**Scenario: Lock service leader crash**
+
+1. Verify that the leader election is in progress. The lock service should elect a new leader within 1 second.
+2. Check that all follower nodes are participating in the election.
+3. Verify that lock operations resume after the election.
+4. Investigate the cause of the leader crash. Check OOM killer logs, disk I/O, and network connectivity.
+5. If the leader crash is due to a pattern (crash-loop), consider scaling up or investigating the root cause.
+
+**Scenario: Lock contention spike**
+
+1. Identify the resource with high contention using the `wait_queue_depth` metric.
+2. Check which application servers are holding locks on that resource.
+3. Verify that the critical section duration is within expected bounds.
+4. If the holder is slow, investigate the holder's CPU, memory, and GC metrics.
+5. If the holder is crashed, the TTL will handle the release. Monitor the lease expiry rate.
+6. Consider increasing the lock granularity to reduce contention.
+
+**Scenario: Lease expiry storm**
+
+1. A lease expiry storm occurs when many leases expire simultaneously.
+2. This typically indicates a network partition or a lock service outage.
+3. Verify that the lock service cluster is healthy.
+4. Check for network connectivity issues between the lock service and the application servers.
+5. Verify that the application servers are still functioning. They may have entered a degraded mode.
+6. If the application servers are healthy, they should re-acquire their locks. Monitor the re-acquisition rate.
+
+### Maintenance Procedures
+
+**Upgrading the lock service**
+
+1. Deploy the new version to a follower node first.
+2. Verify that the follower is healthy and replicating correctly.
+3. Force a leader election to transfer leadership to the upgraded node.
+4. Verify that lock operations continue during the election.
+5. Upgrade the remaining follower nodes.
+6. Verify that the entire cluster is healthy after the upgrade.
+
+**Scaling the lock service**
+
+1. Add a new node to the cluster.
+2. Verify that the new node is healthy and replicating correctly.
+3. Update the client configuration to include the new node's endpoint.
+4. Monitor the lock acquisition latency after adding the new node.
+5. For a 3-node cluster, scaling to 5 nodes increases fault tolerance from 1 to 2 node failures.
+
+**Backup and restore**
+
+1. Lock state is ephemeral. A lock service restart should not require a backup.
+2. However, the fencing token counter must be persisted. If the token generator resets to zero, duplicate tokens could be issued.
+3. To prevent token reuse, periodically snapshot the fencing token counter to disk.
+4. On restore, read the last snapshot and start the token counter from the next value.
+5. Test the backup and restore procedure quarterly.
+
+<AsciiDiagram
+  id="distributed-lock/capacity-planning"
+  title="Capacity Planning for Distributed Lock Service"
+  alt="Chart showing throughput requirements, cluster sizing, memory estimation, and storage requirements for Redis, etcd, and ZooKeeper lock services"
+  caption="Capacity planning dimensions for distributed lock service deployment"
+  content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CAPACITY PLANNING FOR LOCK SERVICE                         │
+│                                                                               │
+│  Input Parameters:                                                           │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  Resources: 1,000,000   │  Acquisition rate: 500/s                   │   │
+│  │  Concurrency: 200        │  Critical section: 5s avg                 │   │
+│  │  Contention: 20 percent  │  Failure tolerance: 1 node                │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                               │
+│  RediS:                             etcd:                                     │
+│  ┌────────────────────────────┐    ┌──────────────────────────────────┐     │
+│  │ Throughput: 750/s required │    │ Throughput: 750/s required       │     │
+│  │ Capacity: 50,000/s         │    │ Capacity: 10,000/s               │     │
+│  │ Utilization: 1.5 percent   │    │ Utilization: 7.5 percent         │     │
+│  │                            │    │                                   │     │
+│  │ Memory: 25.6 KB needed     │    │ Storage: 8.3 GB/day              │     │
+│  │ Memory: negliglible        │    │ DB limit: 2 GB (default)         │     │
+│  │                            │    │ Compaction: required every 6h    │     │
+│  │ Nodes: 1 + 2 replicas     │    │ Nodes: 3                         │     │
+│  │ Fault tolerance: 1        │    │ Fault tolerance: 1               │     │
+│  └────────────────────────────┘    └──────────────────────────────────┘     │
+│                                                                               │
+│  ZooKeeper:                         Recommendation:                           │
+│  ┌────────────────────────────┐    ┌──────────────────────────────────┐     │
+│  │ Throughput: 750/s required │    │ Use etcd with auto-compaction    │     │
+│  │ Capacity: 8,000/s          │    │ Configure 4-hour retention       │     │
+│  │ Utilization: 9.4 percent   │    │ Set DB size limit to 8 GB       │     │
+│  │                            │    │                                   │     │
+│  │ Storage: 128 KB/day        │    │ Monitor: acquisition latency,    │     │
+│  │ Minimal storage impact     │    │ contention rate, lease expiry    │     │
+│  │                            │    │                                   │     │
+│  │ Nodes: 3                   │    │ Alert: P99 > 100ms for 5 minutes │     │
+│  │ Fault tolerance: 1         │    │ Alert: contention > 30 percent   │     │
+│  └────────────────────────────┘    └──────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Security Considerations
+
+### Authentication and Authorization
+
+The lock service must authenticate clients before processing lock operations. Authentication can be based on client certificates, API tokens, or mutual TLS. Each client is assigned a unique identity that becomes the owner identifier in lock records.
+
+Authorization controls which clients can lock which resources. A resource namespace model allows fine-grained access control:
+
+```yaml
+access_control:
+  - role: payment-service
+    resources: ["payment:*", "batch:*"]
+    permissions: ["acquire", "release", "renew"]
+  - role: cache-service
+    resources: ["cache:*"]
+    permissions: ["acquire", "release"]
+  - role: monitoring
+    resources: ["*"]
+    permissions: ["read"]
+```
+
+### Encryption
+
+All communication between clients and the lock service must be encrypted using TLS. The lock service should require TLS 1.3 or higher. The fencing token must be transmitted in plaintext within the TLS session -- it is not a secret but a safety mechanism.
+
+### Denial of Service Protection
+
+The lock service must protect against denial of service attacks. Rate limiting per client prevents a single client from overwhelming the service. A maximum lock hold time prevents a client from holding a lock indefinitely. A maximum lock count per client prevents a single client from consuming all lock resources.
+
+### Audit Logging
+
+All lock operations must be logged for audit purposes. The audit log includes the client identity, resource identifier, operation type, timestamp, and fencing token. The audit log is stored in a separate system and retained for at least 90 days.

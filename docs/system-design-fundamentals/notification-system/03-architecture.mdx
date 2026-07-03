@@ -1,0 +1,336 @@
+---
+id: notification-system-architecture
+title: Notification System at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest notification system is a few lines of code in your application server. When a user performs an action, the server directly calls the notification provider's API. This works for a hundred users. It fails catastrophically at scale.
+
+<AsciiDiagram id="notification-arch/naive" alt="A diagram showing the simplest notification setup where the app server directly calls APNs, FCM, and SendGrid" caption="Figure 1: Naive notification implementation — direct provider calls from the app server" content={`
+  ┌────────────────┐
+  │  App Server     │
+  │  [User Action]  │
+  │  - POST /like   │
+  └────┬───────┬────┘
+       │       │
+       │       │ (direct API calls)
+       │       │
+       v       v
+  [APNs]    [FCM]
+  (1 call)  (1 call)
+`} />
+
+### What Breaks at 1,000 Users
+
+At 1,000 users generating 10 notification events per user per day, the system handles 10,000 API calls per day. The app server makes 2-3 API calls per notification event (one per delivery channel). Response time increases by 200-500ms per API call. The app server's request handler blocks while waiting for the provider response. Users see slower page loads. Symptoms: page load times increase from 200ms to 1,000ms. The server can handle fewer concurrent users because threads are blocked on provider API calls.
+
+### What Breaks at 100,000 Users
+
+At 100,000 users generating 50 events per user per day, the system handles 5 million API calls per day. The app server's connection pool to the provider APIs is exhausted. Provider rate limits are hit — APNs throttles requests, SendGrid returns 429 Too Many Requests. The app server starts queuing requests in memory, which causes memory pressure. When the server restarts for deployment, the in-memory queue is lost. Symptoms: HTTP 503 errors from the app server, provider API keys revoked for abuse, notifications silently dropped.
+
+### What Breaks at 10 Million Users
+
+At 10 million users generating 100 events per day, the system handles 1 billion API calls per day. The app server cannot handle this volume. The notification logic has become tightly coupled with 15 different service integrations. A single provider outage causes cascading failures across the entire application. The system has no monitoring, no retry logic, and no fallback. The engineering team is on fire. Symptoms: 90th percentile latency over 10 seconds, 40 percent notification delivery failure rate, provider bills exceeding $500,000 per month, engineering team spending 60 percent of time on notification-related incidents.
+
+## Production-Grade Architecture
+
+The production-grade notification system is a distributed pipeline with dedicated services for each layer. Each layer is independently scalable, fault-isolated, and observable.
+
+<AsciiDiagram id="notification-arch/production-grade" alt="A comprehensive architecture diagram showing all components from ingress through delivery layers with redundancy and monitoring" caption="Figure 2: Production-grade notification system — each layer scales independently" content={`
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │                  PRODUCTION-GRADE NOTIFICATION SYSTEM                          │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── LAYER 1: INGRESS ───────────────────────────────────────────────────────┐
+  │  [Load Balancer] ──> [API Gateway (Kong/Envoy)] ──> [Ingress Service (x3)]  │
+  │         │                    │                        │                      │
+  │         │  (spread across   │  (rate limit,           │  (validate,          │
+  │         │    3 AZs)         │   auth, TLS)            │   enrich, publish)   │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── LAYER 2: DISPATCH ───────────────────────────────────────────────────────┐
+  │  [Kafka Cluster — 3 brokers, 50 partitions, RF=3]                            │
+  │  ├── raw-notification-events (all events)                                     │
+  │  ├── push-outbound (push-ready notifications)                                 │
+  │  ├── email-outbound (email-ready)                                             │
+  │  ├── sms-outbound (SMS-ready)                                                │
+  │  └── delivery-receipts (provider responses)                                   │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── LAYER 3: ROUTER ─────────────────────────────────────────────────────────┐
+  │  [Router Service (x10)]                                                      │
+  │  ├── Consumer Group (50 partitions → 10 consumers)                           │
+  │  ├── Dedup Filter (Redis Bloom Filter)                                       │
+  │  ├── Preference Check (Redis cache → DynamoDB)                               │
+  │  ├── Template Engine (Nunjucks/Handlebars → Redis cache)                     │
+  │  └── Channel Selector (Rule engine → config file)                            │
+  │  [Redis Cluster — 6 nodes, 3 shards]                                         │
+  │  ├── Dedup cache (Bloom filter, 12 MB per shard)                             │
+  │  ├── Preference cache (User prefs, 500 MB total)                             │
+  │  ├── Template cache (ASTs, 200 MB total)                                     │
+  │  └── Distributed locks (Redis Redlock, 5s TTL)                              │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── LAYER 4: DELIVERY ───────────────────────────────────────────────────────┐
+  │  [Push Service (x8)]    [Email Service (x4)]    [SMS Service (x2)]           │
+  │  ├── HTTP/2 pool        ├── SMTP pool          ├── Twilio pool              │
+  │  │   to APNs (8 conn)   │   to SES (20 conn)   │   (5 connections)          │
+  │  └── FCM pool (5 conn)  └── SendGrid (API)    └── Rate: 100/s              │
+  │  ┌────────────────────────────────────────────────────────────────────────┐ │
+  │  │  Circuit Breaker: per-provider, opens at 5% error rate over 30s        │ │
+  │  └────────────────────────────────────────────────────────────────────────┘ │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── LAYER 5: FEEDBACK ───────────────────────────────────────────────────────┐
+  │  [Receipt Processor (x3)]  [Bounce Handler]  [Analytics (x2)]               │
+  │  ├── Consumes delivery-   ├── Flags tokens  ├── Prometheus metrics          │
+  │  │   receipts topic       ├── Updates user  ├── Grafana dashboards          │
+  │  │   - Updates status     │   prefs         └── 90-day retention            │
+  │  │   - Publishes metrics  └── Alerts team                                   │
+  │  └── Triggers retry logic                                                    │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── MONITORING ──────────────────────────────────────────────────────────────┐
+  │  [Prometheus] ──> [Grafana] ──> [PagerDuty]                                  │
+  │  ├── Event rate, queue depth, delivery rate, error rate                      │
+  │  ├── Latency p50/p99/p999 per stage                                          │
+  │  ├── Consumer lag, circuit breaker state, provider health                    │
+  │  └── Alerts: dead-letter queue > 100, delivery rate drop > 5%, lag > 10k    │
+  └─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Integration Patterns
+
+### Integrating With a Relational Database
+
+The notification system reads from and writes to the database for preference storage, notification history, and template storage. The integration uses a dedicated database connection pool, separate from the application's main connection pool, to avoid resource contention.
+
+**Pattern:** The notification system uses a read-replica for preference lookups (high read volume, low write volume) and the primary database for notification status updates. The read replica supports up to 10,000 queries per second. The primary handles 1,000 writes per second for status updates.
+
+**Watch out for:** Connection pool exhaustion. The notification system can consume 50-100 connections from the pool. If the pool is shared with the application, a notification spike can starve the application of database connections. Solution: dedicated connection pool with a max of 50 connections and a queue timeout of 5 seconds.
+
+### Integrating With a Cache Layer
+
+The notification system depends on Redis for caching, deduplication, rate limiting, and distributed locks. This is the most performance-critical integration — every notification event makes 5-10 Redis calls during processing.
+
+**Pattern:** Redis Cluster with 3 shards and 2 replicas per shard. Each shard handles roughly 30,000 ops/second. The total cache capacity is 1.2 GB across all shards. Key eviction policy is LRU (least recently used) for caches and no-eviction for the dedup Bloom filter.
+
+**Watch out for:** Cache stampede. When the template cache expires, all consumer instances simultaneously try to reload the template. Solution: use a mutex lock (Redis SETNX) so only one consumer loads the template, while others wait.
+
+### Integrating With a Message Queue
+
+Kafka is the backbone of the notification system. Every event passes through at least one Kafka topic. The integration uses Avro serialization for schema evolution and exactly-once semantics for critical notifications.
+
+**Pattern:** The notification system uses 5 Kafka topics: `raw-notification-events` (ingress), `push-outbound`, `email-outbound`, `sms-outbound` (dispatch), and `delivery-receipts` (feedback). Each topic has 10-50 partitions depending on throughput requirements. The replication factor is 3 across 3 availability zones.
+
+**Watch out for:** Consumer lag. If the router service cannot keep up with the event production rate, consumer lag grows. At 50,000 lag, the notification delay is 10 seconds. At 500,000 lag, the delay is 100 seconds. Solution: auto-scaling based on consumer lag metrics. Add 1 consumer instance per 10,000 lag increase.
+
+### Integrating With External APIs and CDNs
+
+The notification system connects to 5-10 external providers: APNs, FCM, SendGrid, SES, Twilio, and possibly Slack, PagerDuty, or webhooks. Each provider has its own API contract, authentication, and rate limits.
+
+**Pattern:** Each provider integration is wrapped in a provider adapter. The adapter handles authentication (token refresh, certificate rotation), serialization (provider-specific JSON format), and error mapping (provider error codes to system error types). The adapter implements a circuit breaker that opens after 5 percent error rate over 30 seconds.
+
+**Watch out for:** Provider API version changes. APNs deprecated the legacy binary API in favor of HTTP/2. FCM deprecated the legacy XMPP protocol in favor of HTTP v1. Each provider migration requires adapter updates without disrupting the rest of the pipeline.
+
+## Multi-Region and Global Scale
+
+When the notification system spans multiple AWS regions or GCP zones, the architecture changes significantly. Data replication, latency, and failover become first-class concerns.
+
+<AsciiDiagram id="notification-arch/multi-region" alt="A diagram showing a notification system deployed across two AWS regions with active-active configuration and region-local delivery" caption="Figure 3: Multi-region deployment — active-active with region-local Kafka clusters" content={`
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │                        MULTI-REGION NOTIFICATION SYSTEM                       │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── US-EAST-1 ───────────────────────────────────────────────────────────────┐
+  │  [Services] ──> [Ingress] ──> [Kafka (us-east-1)] ──> [Router] ──> [APNs]    │
+  │       │            │              │                       │            │      │
+  │       │            │         [Replication]                │            │      │
+  │       │            │              │                       │            │      │
+  │       └────────────┴──────────────┴───────────────────────┴────────────┘      │
+  │                                                                               │
+  │  [Redis (us-east-1)] ── cross-region replication ──> [Redis (eu-west-1)]       │
+  │  (Bloom filter + prefs)                                  (read-only replica)  │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── EU-WEST-1 ───────────────────────────────────────────────────────────────┐
+  │  [Services] ──> [Ingress] ──> [Kafka (eu-west-1)] ──> [Router] ──> [APNs]    │
+  │       │            │              │                       │            │      │
+  │       │            │         [Replication]                │            │      │
+  │       │            │              │                       │            │      │
+  │       └────────────┴──────────────┴───────────────────────┴────────────┘      │
+  │                                                                               │
+  │  User Preference Store: Active-Active (DynamoDB Global Tables)                │
+  │  Device Token Registry: Active-Active (Cassandra multi-region)                │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  Key Design Decisions:
+  - Each region has its own Kafka cluster (no cross-region Kafka)
+  - Cross-region preference replication: eventual consistency, 2s lag
+  - Users are routed to the nearest region via Route53 latency-based routing
+  - Failover: if us-east-1 fails, traffic routes to eu-west-1
+  - Dedup Bloom filter: no cross-region dedup (duplicates possible across regions)
+`} />
+
+### Key Multi-Region Decisions
+
+**Data replication:** User preferences and device tokens are stored in DynamoDB Global Tables, which provides active-active replication across regions with sub-second latency. The Kafka clusters are regional — cross-region Kafka replication is avoided due to latency and complexity. Instead, each region has its own Kafka cluster with its own event stream.
+
+**Latency:** A user in London should be served by the eu-west-1 region, not us-east-1. Cross-region notification delivery adds 80-120ms of latency, which is noticeable for push notifications. DNS-based routing (Route53 latency records) directs users to the nearest region. Device tokens are also region-specific — a user's device registers with the nearest region, and that region handles delivery.
+
+**Consistency trade-offs:** The dedup Bloom filter is not replicated across regions. This means a user who triggers events in both regions (visiting the US and then the UK) might receive duplicate notifications. This is an acceptable trade-off — duplicate notifications are rare (cross-region travel is uncommon) and the impact is minor (one extra notification).
+
+**Failover behavior:** When a region fails, the DNS routing health check detects the failure (3 consecutive health check failures, 10-second interval). Traffic is rerouted to the remaining healthy region. The failover region inherits the event processing load from both regions. The system must be over-provisioned by 50 percent to handle failover load.
+
+## Capacity Planning
+
+<AsciiDiagram id="notification-arch/naive-breakdown" alt="A diagram showing what breaks at each scale milestone from 1,000 to 10 million users" caption="Figure 3: What breaks at each scale milestone — the progression from slow pages to cascading failures" content={`
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  SCALE MILESTONE          WHAT BREAKS                SYMPTOMS            │
+  ├─────────────────────────────────────────────────────────────────────────┤
+  │                        │                        │                       │
+  │  1,000 users           │  App server blocks     │  Page load time       │
+  │  10,000 events/day     │  on provider API       │  increases from       │
+  │  Direct calls          │  calls (+500ms)        │  200ms to 1,000ms    │
+  │                        │                        │                       │
+  ├────────────────────────┼────────────────────────┼───────────────────────┤
+  │                        │                        │                       │
+  │  100,000 users         │  Connection pool       │  HTTP 503 errors      │
+  │  5 million events/day  │  exhausted, provider   │  API keys revoked,    │
+  │  In-memory queue       │  rate limits hit,      │  notifications        │
+  │                        │  memory pressure       │  silently dropped     │
+  │                        │  on server restart     │                       │
+  ├────────────────────────┼────────────────────────┼───────────────────────┤
+  │                        │                        │                       │
+  │  10 million users      │  Tight coupling to     │  P99 latency > 10s    │
+  │  1 billion events/day  │  15+ services,         │  40% delivery failure │
+  │  No monitoring         │  cascading failures,   │  Monthly bill >       │
+  │  No retry              │  no fallback channels  │  $500,000             │
+  │                        │                        │  Team on fire         │
+  └─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Step 1: Estimate QPS From User Count
+
+You are designing for 10 million daily active users (DAU). Each user generates 50 notification events per day on average. Total events per day: 10,000,000 × 50 = 500,000,000.
+
+Peak hour factor: 4x (traffic is 4x higher during peak hours than average). Peak events per hour: 500,000,000 / 24 × 4 = 83,333,333. Peak events per second: 83,333,333 / 3600 = 23,148.
+
+The ingress layer must handle roughly 25,000 events per second at peak.
+
+### Step 2: Calculate Storage Requirements
+
+Each notification event is roughly 1.5 KB after enrichment. The enriched event is stored in Kafka for 7 days. Storage per day: 500,000,000 × 1.5 KB = 750 GB. Storage for 7 days: 750 GB × 7 = 5.25 TB.
+
+The notification history database stores a record for each notification sent. Each record is roughly 500 bytes (status, timestamps, provider response). Storage per day: 500,000,000 × 500 bytes = 250 GB. Storage for 90 days (retention period): 250 GB × 90 = 22.5 TB.
+
+### Step 3: Determine Network Bandwidth
+
+Ingress traffic: 25,000 events/s × 1.5 KB = 37.5 MB/s = 300 Mbps. Egress traffic to providers: each notification is sent to 1.5 channels on average (push + maybe email). Egress volume: 37.5 MB/s × 1.5 = 56.25 MB/s = 450 Mbps.
+
+Total network bandwidth needed: 750 Mbps per region. For two regions: 1.5 Gbps total.
+
+### Step 4: Size the Compute
+
+Each router instance handles 5,000 messages per second. To handle 25,000 events/s, you need 5 router instances. With 2x headroom for failover: 10 router instances.
+
+Each push worker instance handles 2,000 messages per second. With 15,000 push notifications/second (60 percent of events are push), you need 8 push worker instances. With 2x headroom: 16 instances.
+
+Each email worker instance handles 500 messages per second. With 5,000 emails/second (20 percent of events are email), you need 10 email worker instances. With 2x headroom: 20 instances.
+
+## Deployment and Operations
+
+<AsciiDiagram id="notification-arch/capacity-sizing" alt="A summary diagram showing the final compute, storage, and network estimates for 10 million DAU" caption="Figure 4: Capacity sizing summary — 10 million DAU notification system resources" content={`
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  CAPACITY SIZING SUMMARY — 10 Million DAU                                │
+  ├─────────────────────────────────────────────────────────────────────────┤
+  │                                                                          │
+  │  INGRESS                                                                  │
+  │  ┌─────────────────────────────────────────────────────────────────────┐ │
+  │  │  Peak events per second: 25,000                                      │ │
+  │  │  Ingress instances needed: 5 (plus 5 for headroom)                  │ │
+  │  │  API Gateway: 1 load balancer, 3 API gateway instances              │ │
+  │  └─────────────────────────────────────────────────────────────────────┘ │
+  │                                                                          │
+  │  STORAGE                                                                  │
+  │  ┌─────────────────────────────────────────────────────────────────────┐ │
+  │  │  Kafka (7 days): 5.25 TB total (3 brokers × 2.1 TB with RF=3)       │ │
+  │  │  Notification history (90 days): 22.5 TB                             │ │
+  │  │  Redis cache: 1.2 GB (dedup) + 500 MB (prefs) + 200 MB (templates)  │ │
+  │  └─────────────────────────────────────────────────────────────────────┘ │
+  │                                                                          │
+  │  COMPUTE                                                                  │
+  │  ┌─────────────────────────────────────────────────────────────────────┐ │
+  │  │  Router service: 10 instances (5 base + 5 headroom)                  │ │
+  │  │  Push workers: 16 instances (8 base + 8 headroom)                    │ │
+  │  │  Email workers: 20 instances (10 base + 10 headroom)                 │ │
+  │  │  SMS workers: 4 instances (2 base + 2 headroom)                      │ │
+  │  └─────────────────────────────────────────────────────────────────────┘ │
+  │                                                                          │
+  │  NETWORK                                                                  │
+  │  ┌─────────────────────────────────────────────────────────────────────┐ │
+  │  │  Ingress: 300 Mbps (37.5 MB/s)                                      │ │
+  │  │  Egress: 450 Mbps (56.25 MB/s)                                      │ │
+  │  │  Total per region: 750 Mbps, across 2 regions: 1.5 Gbps             │ │
+  │  └─────────────────────────────────────────────────────────────────────┘ │
+  │                                                                          │
+  │  COST ESTIMATE (per month, single region)                                 │
+  │  ┌─────────────────────────────────────────────────────────────────────┐ │
+  │  │  Compute: 50 instances × $200/instance = $10,000                     │ │
+  │  │  Kafka: 3 brokers × $1,000/broker = $3,000                           │ │
+  │  │  Redis: 6 nodes × $200/node = $1,200                                  │ │
+  │  │  Provider costs: $90,000 (email) + $15,000 (SMS) + $2,000 (push)    │ │
+  │  │  Total: $121,200/month                                               │ │
+  │  └─────────────────────────────────────────────────────────────────────┘ │
+`} />
+
+### Zero-Downtime Deployment
+
+The notification system is deployed as a set of microservices. Each service is deployed independently using rolling updates with a 30-second health check grace period. The deployment order is critical: feedback layer first (so receipts are processed), then delivery layer (so new workers pick up queued notifications), then router layer, then ingress layer.
+
+**Deployment steps:**
+1. Deploy feedback processor (1 minute)
+2. Deploy delivery workers (2 minutes per channel)
+3. Deploy router service (2 minutes)
+4. Deploy ingress service (1 minute)
+5. Verify: check consumer lag, delivery rate, error rate
+
+### Monitoring
+
+**Critical metrics (alert on these):**
+- Dead-letter queue depth: alert if > 100 (notifications are failing permanently)
+- Delivery success rate: alert if below 99 percent for push, 95 percent for SMS
+- Consumer lag: alert if > 10,000 (processing delay exceeds 10 seconds)
+- Circuit breaker state: alert if any circuit breaker is open
+- Provider error rate: alert if > 5 percent over 5 minutes
+
+**Diagnostic metrics (dashboard, no alert):**
+- Events per second per event type
+- Channel distribution (push vs email vs SMS)
+- Template render latency
+- Enrichment cache hit rate
+- Rate limit hit count per user
+
+### Debugging
+
+When something goes wrong, the notification system provides traceability through structured logging. Each notification has a `notification_id` (UUID) that is logged at every stage of the pipeline. The operations team can query the logs by `notification_id` to see the full lifecycle: when it was ingested, enriched, queued, routed, delivered, and acknowledged.
+
+**Common debugging queries:**
+- "Why did user 789 not receive the like notification?" — query by `recipient_id` + `event_type` + time range
+- "Why is the push delivery rate dropping?" — check provider circuit breaker state and APNs health
+- "Why is consumer lag increasing?" — check router CPU and Redis latency
+
+### Upgrades
+
+**Provider API upgrades:** When a delivery provider changes its API (APNs HTTP/2 migration, FCM v1 migration), the provider adapter is updated in isolation. The new adapter is deployed to a canary worker (5 percent of traffic) for 24 hours. After verifying delivery rates and error rates are within tolerance, the canary is promoted to production.
+
+**Template system upgrades:** Templates are versioned. When a template is updated, the new version is deployed alongside the old version. Notifications use the template version that was active when the event was created. This prevents breaking changes — a user who receives a notification 5 minutes after the event will see the same template version as a user who receives it immediately.
+
+---
+
+**Up next:** You have seen the architecture. Now understand the trade-offs — the hard choices that separate good designs from great ones.

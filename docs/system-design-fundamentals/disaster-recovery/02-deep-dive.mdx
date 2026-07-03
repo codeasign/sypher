@@ -1,0 +1,726 @@
+﻿---
+id: disaster-recovery-deep-dive
+title: Disaster Recovery -- Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Disaster Recovery -- Under the Hood
+
+## Internal Architecture of a Disaster Recovery System
+
+A production-grade disaster recovery system is not a single component. It is a layered architecture of monitoring, orchestration, replication, and networking components that work together to detect failures, shift traffic, and restore operations.
+
+<AsciiDiagram
+  id="disaster-recovery/internal-architecture"
+  title="Internal Architecture of a DR System"
+  alt="Layered diagram showing monitoring, orchestration, replication, networking, and application tiers in a DR system."
+ content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│              INTERNAL DR SYSTEM ARCHITECTURE                        │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  MONITORING LAYER                                                   │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐       │
+│  │ External  │  │ Synthetic │  │ CloudWatch│  │ Dataplane │       │
+│  │ Probes    │  │ Transacts │  │ /Metrics  │  │ Health    │       │
+│  │ (3 regions) │  │ (5 min)   │  │ (1 min)   │  │ (10 sec)  │       │
+│  └───────────┘  └───────────┘  └───────────┘  └───────────┘       │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │  aggregate
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  ORCHESTRATION LAYER (Decision Engine)                              │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │  DR Orchestrator (AWS Lambda / Step Functions / Custom)      │  │
+│  │                                                              │  │
+│  │  Inputs:  Health status, Alert history, Time since last fail │  │
+│  │  Rules:   Composite trigger, Cooldown timer, Approval gate   │  │
+│  │  Outputs: FAILOVER / DO NOT FAILOVER / MANUAL REVIEW         │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │  trigger
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  EXECUTION LAYER (Runbooks)                                         │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐       │
+│  │ DNS       │  │ DB        │  │ App Config│  │ Comm     │       │
+│  │ Failover  │  │ Promotion │  │ Reload    │  │ Notify   │       │
+│  │ Route53 / │  │ RDS /     │  │ Consul /  │  │ Slack /  │       │
+│  │ CloudDNS  │  │ Aurora    │  │ K8s Config│  │ PagerDuty│       │
+│  └───────────┘  └───────────┘  └───────────┘  └───────────┘       │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │  execute in parallel
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  INFRASTRUCTURE LAYER                                                │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐       │
+│  │ [Compute] │  │ ((DB))  │  │ <Queue> │  │ {Cache}  │       │
+│  │ EC2 / EKS │  │ RDS /     │  │ SQS /    │  │ Elasti-  │       │
+│  │ / Lambda  │  │ DynamoDB  │  │ Kafka    │  │ cache    │       │
+│  └───────────┘  └───────────┘  └───────────┘  └───────────┘       │
+└─────────────────────────────────────────────────────────────────────┘
+`} />
+
+The monitoring layer collects health signals from multiple vantage points. The orchestration layer evaluates those signals against failover rules and makes the decision. The execution layer runs the failover runbook, and the infrastructure layer is what actually moves.
+
+## Data Structures and Algorithms
+
+### 1. Replication Lag Tracking Data Structure
+
+The replication lag tracker maintains a sliding window of lag measurements. It is used to decide if the secondary is healthy enough to fail over to.
+
+```python
+class ReplicationLagTracker:
+    def __init__(self, window_size=300, max_lag_seconds=30):
+        self.window = deque(maxlen=window_size)  # 300 samples at 1s interval
+        self.max_lag_seconds = max_lag_seconds
+        self.last_sample_time = 0
+
+    def record_lag(self, lag_seconds, timestamp):
+        self.window.append({
+            "lag": lag_seconds,
+            "ts": timestamp
+        })
+
+    def is_healthy(self):
+        if len(self.window) < 10:
+            return False  # not enough data
+        recent = [s["lag"] for s in list(self.window)[-10:]]
+        p99_lag = sorted(recent)[-1]
+        return p99_lag < self.max_lag_seconds
+
+    def lag_trend(self):
+        """Returns 'stable', 'increasing', or 'decreasing' based on slope."""
+        if len(self.window) < 30:
+            return "stable"
+        samples = list(self.window)[-30:]
+        x = list(range(len(samples)))
+        y = [s["lag"] for s in samples]
+        slope = self._linear_regression_slope(x, y)
+        if abs(slope) < 0.1:
+            return "stable"
+        return "increasing" if slope > 0 else "decreasing"
+
+    def _linear_regression_slope(self, x, y):
+        n = len(x)
+        mean_x = sum(x) / n
+        mean_y = sum(y) / n
+        numerator = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+        denominator = sum((xi - mean_x) ** 2 for xi in x)
+        return numerator / denominator if denominator else 0
+```
+
+This tracker maintains a window of the last 300 lag measurements (5 minutes at 1-second intervals). It determines secondary health by checking if the p99 of the last 10 measurements stays under the configured threshold. The trend analysis helps predict whether the secondary is catching up or falling further behind.
+
+### 2. Weighted Health Score Algorithm
+
+The failover decision should not be binary. A weighted health score combines multiple signals into a single number, and the decision threshold is configurable.
+
+```python
+class HealthScoreCalculator:
+    WEIGHTS = {
+        "db_reachable": 0.30,
+        "db_replication_lag": 0.20,
+        "app_health_check": 0.25,
+        "cpu_load": 0.10,
+        "network_latency": 0.10,
+        "error_rate": 0.05,
+    }
+
+    def calculate(self, signals):
+        score = 0.0
+        details = {}
+        for metric, weight in self.WEIGHTS.items():
+            value = signals.get(metric, 0.0)
+            normalized = self._normalize(metric, value)
+            contribution = normalized * weight
+            score += contribution
+            details[metric] = {
+                "raw": value,
+                "normalized": normalized,
+                "contribution": contribution,
+            }
+        return {"score": score, "details": details}
+
+    def _normalize(self, metric, value):
+        """Normalize each metric to 0-1 scale where 1 = healthy."""
+        norm_map = {
+            "db_reachable": lambda v: 1.0 if v else 0.0,
+            "db_replication_lag": lambda v: max(0, 1 - (v / 30.0)),
+            "app_health_check": lambda v: 1.0 if v else 0.0,
+            "cpu_load": lambda v: max(0, 1 - (v / 90.0)),
+            "network_latency": lambda v: max(0, 1 - ((v - 10) / 490.0)),
+            "error_rate": lambda v: max(0, 1 - (v / 5.0)),
+        }
+        return norm_map.get(metric, lambda v: min(1.0, v))(value)
+
+
+# Usage
+calculator = HealthScoreCalculator()
+signals = {
+    "db_reachable": True,
+    "db_replication_lag": 12.4,  # seconds
+    "app_health_check": True,
+    "cpu_load": 65.0,  # percent
+    "network_latency": 42.0,  # ms
+    "error_rate": 0.3,  # percent
+}
+result = calculator.calculate(signals)
+print(f"Health score: {result['score']:.2f}")
+# Health score: 0.83
+```
+
+A score below 0.4 triggers failover. Between 0.4 and 0.6, the system alerts for manual review. Above 0.6, the system is considered healthy.
+
+### 3. Quorum-Based Commit Log
+
+For systems that require zero data loss (RPO = 0), a quorum-based commit protocol ensures a write is only acknowledged after it has been persisted on a majority of nodes across regions.
+
+```python
+class QuorumWrite:
+    def __init__(self, nodes):
+        self.nodes = nodes  # list of database endpoints
+        self.total = len(nodes)
+        self.quorum = (self.total // 2) + 1
+
+    def write_with_quorum(self, data):
+        """Write to all nodes, return success if quorum acknowledges."""
+        acks = 0
+        errors = []
+        timeout = 2.0  # 2 second timeout per node
+
+        for node in self.nodes:
+            try:
+                response = node.write(data, timeout=timeout)
+                if response.acknowledged:
+                    acks += 1
+            except Exception as e:
+                errors.append({"node": node.id, "error": str(e)})
+
+        if acks >= self.quorum:
+            return {
+                "status": "committed",
+                "acks": acks,
+                "quorum": self.quorum,
+                "errors": errors,
+            }
+        else:
+            return {
+                "status": "failed",
+                "acks": acks,
+                "quorum": self.quorum,
+                "errors": errors,
+            }
+```
+
+With 5 nodes across 3 regions and a quorum of 3, the system can tolerate 2 node failures without losing data. Every write is acknowledged by at least 3 nodes before returning success to the client.
+
+## Request Lifecycle: Disaster Detection to Failover
+
+### Step 1: External Health Probe Fails
+
+A health check endpoint in the primary region stops responding. The probe, running from a different region, records a timeout.
+
+### Step 2: Probe Aggregator Correlates
+
+The probe aggregator receives timeouts from probes in three different regions within a 30-second window. It cross-references application health checks, database health checks, and network latency measurements. All signals point to the primary region being unreachable.
+
+### Step 3: Composite Trigger Evaluates
+
+The failover orchestrator evaluates the composite trigger. The trigger requires:
+
+- Three consecutive failed health checks from at least two geographic regions
+- Confirmed secondary region health
+- No recent failover within the cooldown period (default: 4 hours)
+- Confirmation that the failure is not a network partition (secondary can reach primary subnet)
+
+<AsciiDiagram
+  id="disaster-recovery/failover-decision-tree"
+  title="Failover Decision Tree"
+  alt="Decision tree showing the criteria for declaring a disaster and initiating failover."
+ content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    FAILOVER DECISION TREE                            │
+└─────────────────────────────────────────────────────────────────────┘
+
+                    ┌───────────────────┐
+                    │  Health Check     │
+                    │  Failed?          │
+                    └────────┬──────────┘
+                             │
+                    ┌────────▼──────────┐
+                    │  Failed from      │  NO ──> Track but
+                    │  >= 2 regions?    │         do not alarm
+                    └────────┬──────────┘
+                             │ YES
+                             │
+                    ┌────────▼──────────┐
+                    │  Secondary        │  NO ──> Do NOT failover
+                    │  Region Healthy?  │         Alert oncall
+                    └────────┬──────────┘
+                             │ YES
+                             │
+                    ┌────────▼──────────┐
+                    │  In Cooldown      │  YES──> Alert oncall
+                    │  Period?          │         Manual review
+                    └────────┬──────────┘
+                             │ NO
+                             │
+                    ┌────────▼──────────┐
+                    │  Replication      │  NO ──> Alert oncall
+                    │  Lag Acceptable?  │         Manual review
+                    │  (under RPO)      │
+                    └────────┬──────────┘
+                             │ YES
+                             │
+                    ┌────────▼──────────┐
+                    │  DECLARE DISASTER │
+                    │  INITIATE FAILOVER│
+                    └───────────────────┘
+`} />
+
+### Step 4: Orchestrator Locks Failover State
+
+The orchestrator writes a "failover in progress" state to a distributed lock store (DynamoDB with conditional writes, or ZooKeeper). This prevents two orchestrators from initiating failover simultaneously.
+
+```python
+def acquire_failover_lock(lock_table, region_id, ttl=300):
+    try:
+        lock_table.put_item(
+            Item={
+                "lock_id": "disaster_recovery_failover",
+                "region": region_id,
+                "timestamp": int(time.time()),
+                "ttl": int(time.time()) + ttl,
+            },
+            ConditionExpression="attribute_not_exists(lock_id) OR #ttl < :now",
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={":now": int(time.time())},
+        )
+        return True
+    except ConditionalCheckFailedException:
+        return False
+```
+
+### Step 5: DNS Record Update
+
+The orchestrator calls the DNS provider's API to update the failover record. The primary record's weight is set to zero, and the secondary record's weight is set to 100. The health check association is updated.
+
+### Step 6: Database Promotion
+
+The orchestrator connects to the secondary database and promotes it. For an AWS RDS instance, this is a single API call:
+
+```python
+def promote_replica(rds_client, replica_identifier):
+    response = rds_client.promote_read_replica(
+        DBInstanceIdentifier=replica_identifier,
+        BackupRetentionPeriod=7,
+    )
+    return response["DBInstance"]["DBInstanceStatus"] == "available"
+```
+
+### Step 7: Application Configuration Reload
+
+Applications in the secondary region must be told about the new database endpoint. This is done through a configuration management system like AWS AppConfig, Consul, or Kubernetes ConfigMaps. The applications perform a rolling reload to pick up the new configuration without restarting.
+
+```python
+def reload_config(config_client, app_name, new_config):
+    config_client.update(app_name, new_config)
+    instances = config_client.get_instances(app_name)
+    for instance in instances:
+        instance.reload()
+    print(f"Config reloaded for {len(instances)} instances")
+```
+
+### Step 8: Cache Warm-Up
+
+The secondary region's cache (ElastiCache, Redis) is likely empty after a failover if cache replication was not active. The first requests will be slow as data is fetched from the database and cached. A cache warm-up is initiated by replaying recent read patterns:
+
+```python
+def warm_cache(cache_client, recent_queries):
+    for query in recent_queries:
+        key = query["cache_key"]
+        value = query["database_value"]
+        cache_client.set(key, value, ttl=3600)
+    print(f"Cached {len(recent_queries)} keys")
+```
+
+### Step 9: Traffic Validation
+
+Traffic begins flowing to the secondary site. The orchestrator runs a validation suite that executes synthetic transactions against the new primary. If validation fails, the orchestrator alerts the on-call team and does NOT declare the failover complete.
+
+```python
+def validate_failover(validation_endpoints):
+    results = []
+    for endpoint in validation_endpoints:
+        try:
+            response = requests.get(
+                f"https://{endpoint}/health",
+                timeout=5,
+            )
+            results.append({
+                "endpoint": endpoint,
+                "status": response.status_code,
+                "latency": response.elapsed.total_seconds(),
+                "healthy": response.status_code == 200,
+            })
+        except Exception as e:
+            results.append({
+                "endpoint": endpoint,
+                "status": "error",
+                "error": str(e),
+                "healthy": False,
+            })
+    return results
+```
+
+### Step 10: Notification and Documentation
+
+The orchestrator sends notifications to Slack, PagerDuty, and email. It creates a post-mortem template populated with the failover timeline, the measured RTO, and the measured data loss (replication lag gap).
+
+```python
+def notify_team(notifiers, failover_result):
+    message = (
+        f"DISASTER RECOVERY FAILOVER COMPLETE\n"
+        f"Region: {failover_result['new_primary']}\n"
+        f"RTO: {failover_result['rto_seconds']}s (target: {failover_result['rto_target']}s)\n"
+        f"Data Loss: {failover_result['replication_lag_seconds']}s\n"
+        f"Trigger: {failover_result['trigger_reason']}\n"
+    )
+    for notifier in notifiers:
+        notifier.send(message)
+```
+
+<AsciiDiagram
+  id="disaster-recovery/failover-timeline"
+  title="End-to-End Failover Timeline"
+  alt="Timeline showing the sequence of steps from health check failure to validation, with RTO breakdown."
+ content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    FAILOVER TIMELINE (TARGET: 300s RTO)              │
+└─────────────────────────────────────────────────────────────────────┘
+
+SECONDS:     0           15           45           75           120
+             │           │            │            │             │
+EVENT:   ┌───▼──┐  ┌────▼───┐  ┌────▼───┐  ┌────▼───┐  ┌─────▼────┐
+         │Health│  │Probe   │  │Composite│  │Failover│  │DNS       │
+         │Check │  │Correlat│  │Trigger │  │Lock    │  │Updated   │
+         │Times │  │-or     │  │Eval    │  │Acquired│  │Propagated│
+         │Out   │  │Confirms│  │Matches │  │        │  │(TTL=60s) │
+         └──────┘  └────────┘  └────────┘  └────────┘  └──────────┘
+         │        │           │            │             │
+         0-15s    15-30s      30-45s       45-60s        60-120s
+
+SECONDS:    120          180          240          300
+             │           │            │            │
+EVENT:  ┌────▼───┐  ┌────▼───┐  ┌────▼───┐  ┌────▼───┐
+        │DB Pro- │  │Config  │  │Traffic │  │Valida- │
+        │motion  │  │Reload  │  │Routing │  │tion    │
+        │        │  │Cache   │  │Starts  │  │Complete│
+        │        │  │Warmup  │  │Flowing │  │        │
+        └────────┘  └────────┘  └────────┘  └────────┘
+        │           │            │            │
+        120-180s    180-240s     240-270s     270-300s
+
+  TOTAL RTO: 300s (5 min)  |  DATA LOSS: ~15s (replication lag)
+  ├────────────────────────┤  ├──────────────────────────────────┤
+         Recovery Time                Recovery Point
+`} />
+
+## Consistency and State Management
+
+Disaster recovery introduces fundamental consistency challenges because data exists in multiple locations and may not be fully synchronized at the moment of failover.
+
+### Consistency Models and Their Impact on DR
+
+The choice of consistency model directly determines what DR strategies are possible and what failure modes you must handle.
+
+**Strong consistency**: Every read sees the effects of every preceding write. This requires synchronous replication. Writes are slower (added latency) but RPO is zero. This is the only consistency model that guarantees no data loss. However, it makes the system vulnerable to network partitions — if the secondary region becomes unreachable, writes to the primary must pause.
+
+**Eventual consistency**: Reads may return stale data for some period after a write. This allows asynchronous replication. Writes are fast but RPO is non-zero. This is the most common consistency model for cross-region DR. The replication lag determines the RPO.
+
+**Read-your-writes consistency**: A user always sees their own writes, even if other users see stale data. This is useful for social applications where each user cares about their own data. It can be implemented with session affinity (sticky sessions) that routes a user to the region that has their latest data.
+
+**Monotonic reads**: Once a user sees a particular version of data, they never see an older version. This prevents the "time travel" problem where refreshing a page shows older data. It is important during failover scenarios where a user might be routed to a secondary region that has slightly stale data.
+
+### Failure Scenario 1: Replication Lag Gap
+
+The primary processes writes after the secondary has acknowledged them. When the primary fails, the secondary is missing the most recent writes.
+
+**Impact**: Data loss equal to the replication lag gap. For a financial system using async replication with 15-second lag, up to 15 seconds of transactions are lost.
+
+**Mitigation strategies**:
+
+- **Application-level idempotency keys**: If every write includes a unique idempotency key, the application can safely retry the lost writes without creating duplicates.
+- **Transaction log inspection**: After failover, the recovery team inspects the primary's transaction log (if accessible) to identify the last committed transaction. Lost transactions can be manually reconstructed.
+- **Synchronous replication for critical writes**: Route payment transactions through synchronous replication while allowing async for non-critical data.
+
+```python
+class DualPathWrite:
+    """Critical writes go sync, non-critical go async."""
+    def write_critical(self, data):
+        sync_success = self.sync_replica.write(data)
+        async self.async_replica.write(data)
+        return sync_success
+
+    def write_non_critical(self, data):
+        self.async_replica.write(data)
+        return True
+```
+
+### Failure Scenario 2: Split-Brain During Failover
+
+The primary region is not actually dead — it is experiencing a network partition. The orchestrator cannot reach the primary, so it promotes the secondary. Now both regions believe they are primary, and both accept writes. When the network recovers, the two databases have divergent writes that conflict.
+
+**Impact**: Data inconsistency. Some customers have data on the old primary, some on the new primary, and some data exists on both but with conflicting values.
+
+**Mitigation strategies**:
+
+- **Fencing**: Before promoting the secondary, the orchestrator must ensure the primary cannot accept new writes. This is achieved by accessing a shared resource — a distributed lock in DynamoDB, a lease in ZooKeeper, or a STONITH (Shoot The Other Node In The Head) mechanism that powers off the primary's compute instances.
+- **Quorum-based commit**: If the system uses a quorum-based commit protocol, a split-brain is impossible because a write requires a majority of nodes to acknowledge it. The isolated minority cannot accept writes.
+- **Manual split-brain resolution**: If a split-brain occurs, the recovery team must reconcile divergent data. This requires comparing timestamps, merging conflict logs, and potentially rolling back transactions from the region with the least recent data.
+
+<AsciiDiagram
+  id="disaster-recovery/split-brain-scenario"
+  title="Split-Brain Scenario During Failover"
+  alt="Diagram showing a network partition causing both primary and secondary to accept writes independently."
+ content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    SPLIT-BRAIN FAILOVER SCENARIO                    │
+└─────────────────────────────────────────────────────────────────────┘
+
+PHASE 1: NETWORK PARTITION
+
+  ┌──────────────┐                       ┌──────────────┐
+  │  [Primary    │                       │  [Secondary  │
+  │   Region]    │                       │   Region]    │
+  │              │     X  X  X  X  X    │              │
+  │  Alive but   │<--- NOT REACHABLE --->│  Can reach   │
+  │  isolated    │                       │  DR Orchs   │
+  │              │                       │              │
+  │  Writes: YES │                       │  Writes: no  │
+  │  (local)     │                       │  (standby)   │
+  └──────────────┘                       └──────────────┘
+
+PHASE 2: SECONDARY PROMOTED (without fencing)
+
+  ┌──────────────┐                       ┌──────────────┐
+  │  [Primary    │                       │  [Secondary  │
+  │   Region]    │                       │   Region]    │
+  │              │                       │              │
+  │  Thinks:     │                       │  Thinks:     │
+  │  "I am the   │                       │  "I am now   │
+  │   primary"   │                       │   primary"   │
+  │              │                       │              │
+  │  Accepts:    │                       │  Accepts:    │
+  │  Write Txn_A │                       │  Write Txn_B │
+  │  Write Txn_C │                       │  Write Txn_D │
+  └──────────────┘                       └──────────────┘
+
+PHASE 3: NETWORK RECOVERS -- CONFLICT!
+
+  ┌──────────────┐                       ┌──────────────┐
+  │  [Primary    │── Network restored ──>│  [Secondary  │
+  │   Region]    │<── But data diverged─ │   Region]    │
+  │              │                       │              │
+  │  Has: Txn_A  │                       │  Has: Txn_B  │
+  │       Txn_C  │                       │       Txn_D  │
+  │              │                       │              │
+  │  Missing:    │                       │  Missing:    │
+  │  Txn_B, Txn_D│                       │  Txn_A, Txn_C│
+  └──────────────┘                       └──────────────┘
+
+  RESOLUTION: Manual reconciliation needed
+  Use Last-Writer-Wins or CRDT merge logic
+`} />
+
+### Failure Scenario 3: Cascading Failover
+
+The system fails over to the secondary region, but the secondary cannot handle the full production load. Response times degrade, retries increase, and the secondary's database becomes overloaded. The system enters a death spiral.
+
+**Impact**: Extended outage despite a technically successful failover. The secondary is up but unusable.
+
+**Mitigation strategies**:
+
+- **Capacity headroom**: The secondary region must run at no more than 50% capacity during normal operation to have room to absorb the primary's traffic during failover. For a pilot light setup, the auto-scaling policy must be aggressive — scaling from 1 to 100 instances in under 5 minutes.
+- **Graceful degradation**: Non-critical features are disabled during failover. The recommendation engine, analytics tracking, and notification services can be turned off to reduce load on the critical path.
+- **Load shedding**: Implement priority-based load shedding. Administrative requests are dropped before customer requests. Free-tier customers are throttled before paid customers. Read requests are served stale data before being dropped entirely.
+
+### Failure Scenario 4: Thundering Herd on Failover
+
+When the secondary region is promoted to primary, all clients simultaneously reconnect and begin sending traffic. This creates a thundering herd problem: the database is overwhelmed by the sudden influx of connections, the application servers are overwhelmed by the sudden traffic spike, and the cache starts cold, so every request hits the database.
+
+**Impact**: The system may fail within seconds of a successful failover. The database CPU spikes to 100%, queries queue up, and response times exceed timeouts. Clients retry, making the problem worse.
+
+**Mitigation strategies**:
+
+- **Connection pooling**: Pre-warm database connections in the secondary region. The connection pool stays active even during normal operation, so the database is ready for traffic.
+- **Gradual traffic ramp-up**: Instead of switching all traffic at once, gradually increase the traffic to the secondary region over 30-60 seconds. This gives the database time to warm its buffer pool and the cache time to populate.
+- **Request rate limiting on the application side**: Each application instance implements a token bucket rate limiter that prevents the instance from sending more than a configured number of database queries per second.
+
+```python
+class RateLimiter:
+    def __init__(self, max_queries_per_second):
+        self.tokens = max_queries_per_second
+        self.max_tokens = max_queries_per_second
+        self.refill_rate = max_queries_per_second
+        self.last_refill = time.time()
+
+    def acquire(self):
+        now = time.time()
+        self.tokens = min(
+            self.max_tokens,
+            self.tokens + (now - self.last_refill) * self.refill_rate,
+        )
+        self.last_refill = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False  # Rate limited
+```
+
+### Failure Scenario 5: Failing the Wrong Way
+
+An automation bug causes the failover orchestrator to promote the wrong database or route traffic to the wrong region. The system becomes unavailable even though the original disaster did not affect it.
+
+**Impact**: Self-inflicted outage caused by the DR system itself. This has happened in production at major companies — most notably when a DNS automation error caused a major airline's website to go down for hours.
+
+**Mitigation strategies**:
+
+- **Manual approval gate**: High-risk failovers require a human to approve the decision before execution. The orchestrator alerts the on-call team and waits for a confirmation.
+- **Gameday exercises**: Regular chaos engineering exercises validate that the automation works correctly. Teams practice failover during business hours when the full engineering team is available to fix issues.
+- **Rollback capability**: Every failover step must have a rollback procedure. If the DNS update causes issues, the old DNS record must be restorable. If the database promotion causes issues, the old primary must be recoverable.
+
+## Performance Characteristics
+
+Understanding the performance implications of disaster recovery is critical for capacity planning and cost management.
+
+### Replication Latency by Strategy
+
+| Strategy | Replication Latency (p50) | Replication Latency (p99) | Write Impact |
+|---|---|---|---|
+| No replication | 0ms | 0ms | None |
+| Async (same region) | 2-5ms | 15ms | None |
+| Async (cross-region, 800km) | 20-40ms | 100ms | None |
+| Sync (same region) | 2-5ms | 15ms | +2-5ms per write |
+| Sync (cross-region, 800km) | 60-80ms | 200ms | +60-80ms per write |
+| Sync (intercontinental) | 150-250ms | 500ms | +150-250ms per write |
+
+Synchronous replication across continents adds 150-250 milliseconds to every write. For a write-heavy workload, this is unacceptable. The solution is to use regional sharding (users in Europe write to eu-west-1, users in Asia write to ap-southeast-1) and replicate asynchronously between regions.
+
+### Failover Duration by Strategy
+
+| Strategy | Typical RTO | Cost Multiplier | Complexity |
+|---|---|---|---|
+| Backup and restore | 4-24 hours | 1.2x | Low |
+| Pilot light | 15-60 minutes | 1.5x | Medium |
+| Warm standby | 5-15 minutes | 1.8x | High |
+| Active-active | 0 seconds | 2.0x | Very high |
+
+### RPO by Replication Frequency
+
+| Replication Method | Typical RPO | Data Loss per Event |
+|---|---|---|
+| Daily backup | 24 hours | 24 hours of data |
+| Hourly backup | 1 hour | 1 hour of data |
+| Async cross-region replication | 5-30 seconds | 5-30 seconds of data |
+| Sync cross-region replication | 0 seconds | No data loss |
+
+### Cache and CDN Warm-Up
+
+After failover, the secondary region's caches are cold. CDN edge caches also need to be repopulated. This causes a temporary performance degradation known as "cache stampede" or "cold start."
+
+| Cache Type | Warm-Up Time (p50) | Impact Duration |
+|---|---|---|
+| Application cache (Redis, 50GB) | 5-15 minutes | 5-15 min of elevated latency |
+| CDN cache (10M objects) | 30-120 minutes | 1-2 hours of elevated miss rate |
+| Database buffer pool (100GB) | 10-30 minutes | Persistent I/O spike |
+
+## Configuration and Tuning
+
+### Failover Thresholds
+
+The most critical configuration parameters in a disaster recovery system are the failover thresholds. Set them too aggressively and you trigger false failovers. Set them too leniently and real failures take too long to detect.
+
+```json
+{
+  "failover": {
+    "health_check_interval_seconds": 10,
+    "unhealthy_threshold": 5,
+    "failed_region_probe_count": 3,
+    "probe_regions": ["eu-west-1", "ap-southeast-1", "us-west-2"],
+    "composite_decision_window_seconds": 60,
+    "cooldown_minutes": 240,
+    "min_replica_lag_seconds": 30,
+    "allow_manual_failover": true
+  }
+}
+```
+
+- **health_check_interval_seconds**: How often to probe the health endpoint. Lower is faster detection but costs more in probe traffic.
+- **unhealthy_threshold**: Number of consecutive failures before a health check is considered failed. Set to 5 for a 50-second detection window at 10-second intervals.
+- **failed_region_probe_count**: Number of geographically distributed probe regions that must agree the primary is down. Set to 3 to avoid false positives from regional network issues.
+- **composite_decision_window_seconds**: The total time window for the composite trigger to evaluate. If the window is too short, transient issues cause failover. If too long, real failures go undetected.
+- **cooldown_minutes**: Minimum time between automated failovers. Prevents flapping where the system fails back and forth.
+- **min_replica_lag_seconds**: Maximum acceptable replication lag to proceed with failover. If the secondary is too far behind, it may be better to wait for the primary to recover.
+
+### Database-Specific Configuration
+
+```sql
+-- PostgreSQL: Configure WAL for cross-region replication
+wal_level = 'logical'
+max_wal_senders = 10
+max_replication_slots = 10
+wal_keep_segments = 1000  -- Keep enough WAL for slow replicas
+hot_standby = on
+hot_standby_feedback = on
+```
+
+```json
+{
+  "mysql_replication": {
+    "binlog_format": "ROW",
+    "binlog_row_image": "FULL",
+    "expire_logs_days": 7,
+    "slave_parallel_workers": 4,
+    "slave_parallel_type": "LOGICAL_CLOCK"
+  }
+}
+```
+
+### Chaos Engineering Configuration
+
+The DR system should be regularly tested through automated chaos experiments:
+
+```json
+{
+  "chaos_experiments": {
+    "schedule": "0 14 * * 3",  // Every Wednesday at 2pm
+    "experiments": [
+      {
+        "name": "kill-primary-database",
+        "action": "stop_instance",
+        "target": "database-primary",
+        "assert": "failover-completes-under-300s"
+      },
+      {
+        "name": "network-partition-region",
+        "action": "block_network",
+        "target": "primary-region",
+        "duration": 120,
+        "assert": "secondary-absorbs-traffic"
+      },
+      {
+        "name": "corrupt-backup",
+        "action": "corrupt_file",
+        "target": "latest-snapshot",
+        "assert": "alert-fires-and-restore-fails-safely"
+      }
+    ]
+  }
+}
+```

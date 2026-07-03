@@ -1,0 +1,720 @@
+---
+id: dashboards-deep-dive
+title: Dashboards — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A dashboard platform is not a single service. It is a pipeline of four distinct layers, each with its own scalability characteristics and failure modes. Understanding these layers is essential for debugging slow dashboards, scaling to millions of data points, and designing systems that handle real-time query loads.
+
+<AsciiDiagram id="dashboards/architecture-layers" title="Dashboard Platform Internal Architecture — Four Layers" alt="Diagram showing four layers of dashboard architecture: collection, storage, query, and presentation" caption="Dashboard platform decomposed into four layers" content={`
+┌──────────────────────────────────────────────────────────────────┐
+│                    DASHBOARD PLATFORM ARCHITECTURE                │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  PRESENTATION LAYER                                        │    │
+│  │                                                             │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │    │
+│  │  │ Chart    │  │ Layout   │  │ Refresh  │  │ Drill-   │  │    │
+│  │  │ Renderer │  │ Engine   │  │ Scheduler│  │ Down     │  │    │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │    │
+│  └───────────────────┬────────────────────────────────────────┘    │
+│                      │ API calls (REST / GraphQL)                  │
+│  ┌───────────────────▼────────────────────────────────────────┐    │
+│  │  QUERY LAYER                                                │    │
+│  │                                                             │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │    │
+│  │  │ Query    │  │ Auth &   │  │ Cache    │  │ Rate     │  │    │
+│  │  │ Executor │  │ RBAC     │  │ Layer    │  │ Limiter  │  │    │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │    │
+│  └───────────────────┬────────────────────────────────────────┘    │
+│                      │ Query (PromQL / SQL)                        │
+│  ┌───────────────────▼────────────────────────────────────────┐    │
+│  │  STORAGE LAYER                                              │    │
+│  │                                                             │    │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │    │
+│  │  │ Time Series  │  │ Rollup       │  │ Inverted         │  │    │
+│  │  │ Engine       │  │ Engine       │  │ Index            │  │    │
+│  │  └──────────────┘  └──────────────┘  └──────────────────┘  │    │
+│  └───────────────────┬────────────────────────────────────────┘    │
+│                      │ Write path                                   │
+│  ┌───────────────────▼────────────────────────────────────────┐    │
+│  │  COLLECTION LAYER                                           │    │
+│  │                                                             │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │    │
+│  │  │ Scrape   │  │ Push     │  │ Agent    │  │ Service  │  │    │
+│  │  │ Manager  │  │ Gateway  │  │ Manager  │  │ Discovery│  │    │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                                   │
+│  Data flows bottom-to-top; requests flow top-to-bottom            │
+└──────────────────────────────────────────────────────────────────┘
+`} />
+
+**Collection Layer** handles getting metrics from services into the system. It manages scrape targets, push endpoints, and service discovery. A single collector can handle approximately 50,000 samples per second before it needs to be sharded.
+
+**Storage Layer** is the time series database that stores, compresses, and indexes metric data. It handles the write path (ingesting samples) and the read path (serving query results). The storage layer is the most performance-critical component: a query that scans a billion data points must return in under 5 seconds.
+
+**Query Layer** accepts dashboard queries, translates them into storage-level queries, applies caching and authentication, and returns results. It shields the storage layer from redundant work by caching popular query results for 30 to 60 seconds.
+
+**Presentation Layer** renders charts and layouts in the browser. It manages refresh timers, animation, drill-down navigation, and responsive layout. The presentation layer makes 50 to 200 API calls per dashboard load, each corresponding to one chart panel.
+
+## Data Structures and Algorithms
+
+### Time Series Storage Format
+
+A time series in storage is an ordered sequence of (timestamp, value) pairs. The storage format is optimized for compression and range scans.
+
+```
+Time Series ID: series_001
+Metric: http_requests_total
+Labels: {service="auth-api", method="GET", endpoint="/login", status="200"}
+
+Raw points:
+  (T=1000, V=42), (T=1001, V=44), (T=1002, V=47), (T=1003, V=49)
+
+After Gorilla compression (Chunk format):
+  Header: 16 bytes (series ID, metric name hash, label hash)
+  Timestamp delta-of-delta: first timestamp absolute (8 bytes),
+    subsequent timestamps as variable-length integer (1-3 bytes each)
+  Value XOR: first value as float64 (8 bytes),
+    subsequent values as XOR of previous value (1-4 bytes each)
+  ──────────────────────────────────────────────────────
+  Raw size: 4 points × 16 bytes = 64 bytes
+  Compressed size: ~6 bytes per point = 24 bytes
+  Compression ratio: 2.7x
+
+Chunks are 120 samples by default (~2 minutes at 1s resolution)
+The series ID is stored in the inverted index, not repeated per chunk
+```
+
+### Inverted Index
+
+The inverted index maps label key-value pairs to the set of time series IDs that carry those labels. It is a hash map of string → bitset, where each bitset represents the set of matching series IDs.
+
+```
+Index Structure (in memory, updated on every new series registration):
+
+  "service=auth-api"    → bitset{001, 002, 003, 004, 010, 015}
+  "service=payments"    → bitset{005, 006, 007, 008, 009}
+  "region=us-east-1"    → bitset{001, 003, 005, 007, 009, 011}
+  "method=POST"         → bitset{003, 004, 007, 008, 012}
+  "status=500"          → bitset{004, 008, 015, 019}
+
+Query: service="auth-api" AND region="us-east-1"
+  → bitset{001, 002, 003, 004, 010, 015} AND bitset{001, 003, 005, 007, 009, 011}
+  → bitset{001, 003}
+
+The intersection of two bitsets is a bitwise AND operation.
+With 64-bit words, intersecting two sets of 10,000 series takes ~156 CPU cycles.
+The index is purely in-memory and is rebuilt on startup from the series catalog.
+```
+
+### Rollup Engine
+
+The rollup engine reduces data resolution over time by aggregating older data points into coarser windows. It runs as a background compaction job that reads raw chunks, applies an aggregation function, and writes new, coarser chunks.
+
+```
+Raw Resolution    Retention        Rollup Window    Aggregation
+──────────────────────────────────────────────────────────────
+10 seconds        7 days           N/A (raw)
+1 minute          30 days          6 raw → 1 minute  avg, min, max, count
+1 hour            13 months        60 minute → 1 hour  avg, min, max, count
+1 day             7 years          24 hour → 1 day     avg, min, max, count
+
+Rollup computation:
+  For a 1-minute rollup window over 10-second raw data:
+    - Collect all raw points with timestamps in [T, T+60)
+    - Compute average: sum(values) / count(values)
+    - Compute min: minimum(value)
+    - Compute max: maximum(value)
+    - Compute count: count(values)
+    - Store the rollup record with timestamp = T (start of window)
+
+Rollups are stored in the same chunk format as raw data.
+Queries automatically select the lowest resolution that satisfies the time range.
+A 30-day range query against 1-hour rollups reads 720 chunks instead of 259,200.
+```
+
+### Aggregation Algorithms
+
+Dashboard queries rarely return raw data. They return aggregated data: sums, rates, percentiles. The aggregation is performed during query execution, not at write time, because different dashboards need different aggregations for the same data.
+
+```
+Type              Algorithm                    Complexity
+────────────────────────────────────────────────────────────
+Sum               Accumulate values            O(N)
+Average           Sum / count                  O(N)
+Count             Increment counter            O(N)
+Min/Max           Track extremum               O(N)
+Rate              (last - first) / duration    O(N)
+Increase          last - first                 O(N)
+p50 (median)      Sort values, pick middle     O(N log N)
+p95               Sort values, pick 95% index  O(N log N)
+p99               Sort values, pick 99% index  O(N log N)
+Histogram_quantile Interpolate from buckets    O(B) where B is bucket count
+
+Optimization: T-Digest
+  Approximate percentile computation using a data structure that merges
+  nearby centroids. Reduces memory from O(N) to O(K) where K = 100 clusters.
+  Accuracy: +/- 1% for p50, +/- 3% for p99.
+  Used when aggregating across millions of data points where sorting is
+  prohibitively expensive.
+```
+
+## Request Lifecycle
+
+When you open a dashboard, a carefully orchestrated sequence of operations unfolds. Each step introduces latency that accumulates into the total page load time. A well-tuned dashboard stack completes this cycle in under 2 seconds.
+
+<AsciiDiagram id="dashboards/request-lifecycle" title="Dashboard Request Lifecycle — 15 Steps" alt="Sequence diagram showing the 15-step lifecycle of a dashboard request from browser click to rendered chart" caption="Every dashboard load triggers this exact sequence of operations" content={`
+┌──────────────────────────────────────────────────────────────────┐
+│               REQUEST LIFECYCLE (15 Steps)                       │
+│                                                                   │
+│  Browser              Dashboard API          TSDB                 │
+│    │                       │                   │                  │
+│    │  1. Load HTML         │                   │                  │
+│    │──────────────────────>│                   │                  │
+│    │  2. Return SPA shell  │                   │                  │
+│    │<──────────────────────│                   │                  │
+│    │                       │                   │                  │
+│    │  3. Fetch dashboard   │                   │                  │
+│    │     definition.json   │                   │                  │
+│    │──────────────────────>│                   │                  │
+│    │  4. Return panels[]   │                   │                  │
+│    │<──────────────────────│                   │                  │
+│    │                       │                   │                  │
+│    │  5. For each panel:   │                   │                  │
+│    │     POST /api/query   │                   │                  │
+│    │──────────────────────>│                   │                  │
+│    │                       │  6. Auth check    │                  │
+│    │                       │  7. Cache lookup  │                  │
+│    │                       │  8. Parse query   │                  │
+│    │                       │  9. Resolve labels│                  │
+│    │                       │──────────────────>│                  │
+│    │                       │                   │  10. Index scan  │
+│    │                       │  11. Read chunks  │                  │
+│    │                       │<──────────────────│                  │
+│    │                       │  12. Aggregate    │                  │
+│    │                       │  13. Format JSON  │                  │
+│    │  14. Return panel data│                   │                  │
+│    │<──────────────────────│                   │                  │
+│    │                       │                   │                  │
+│    │  15. Render chart     │                   │                  │
+│    │                       │                   │                  │
+│    │  Total: 1.2-2.5 seconds for 12 panels     │                  │
+└──────────────────────────────────────────────────────────────────┘
+`} />
+
+### Step 1 — Load the Application Shell
+
+The browser requests the dashboard application HTML from the web server. The server returns a single-page application (SPA) shell — an HTML document with embedded JavaScript bundles and CSS. The SPA shell is cacheable and typically loads in 100-300 milliseconds from a CDN.
+
+### Step 2 — Fetch Dashboard Definition
+
+The SPA requests the dashboard definition from the dashboard API. The definition is a JSON document that describes every panel on the page: its position, size, query, visualization type, and refresh interval. A typical dashboard definition is 5-15 KB and returns in 20-50 milliseconds from the CDN or API cache.
+
+```json
+{
+  "id": "service-overview",
+  "title": "Service Overview",
+  "panels": [
+    {
+      "id": "panel-01",
+      "type": "stat",
+      "title": "Request Rate",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 3 },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total[5m]))",
+          "legendFormat": "requests/sec"
+        }
+      ]
+    },
+    {
+      "id": "panel-02",
+      "type": "timeseries",
+      "title": "P99 Latency",
+      "gridPos": { "x": 4, "y": 0, "w": 8, "h": 3 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Step 3 — Send Parallel Panel Queries
+
+The SPA examines the dashboard definition and creates one query request per panel. It sends all requests in parallel — a dashboard with 12 panels fires 12 simultaneous POST requests to the query API. Browsers typically allow 6-10 concurrent connections to a single origin, so queries are sent in batches, with the first batch of 6-10 going out immediately and the remaining queries starting as connections become available.
+
+### Steps 4-6 — Query API Processing
+
+Each query request arrives at the dashboard query API, which performs three operations before touching the database: authentication (validate the caller has access to this dashboard), authorization (validate the caller can see the requested metric names), and cache lookup (check if the query result for this exact query string and time range is already in cache). Cache hit rates for production dashboards range from 60% to 85%, depending on the refresh interval and the number of concurrent viewers.
+
+### Steps 7-9 — Label Index Scan
+
+If the query misses the cache, the query executor sends it to the time series database. The database first resolves the query through the inverted index: it finds all label matchers, looks up each label's bitset, and intersects the bitsets to find the set of matching time series IDs. This operation takes 50-500 microseconds for a typical query with 3-5 label matchers.
+
+### Step 10 — Chunk Read
+
+The database loads the compressed chunks for each matching time series from the block storage. Chunks are read in order of the query time range: if the query asks for the last 6 hours, the database reads only the chunks that overlap that time range. For a 6-hour query with 1-minute resolution, this means reading 360 chunks per time series. With the inverted index narrowing to 5 matching series, the database reads approximately 1,800 chunks. Each chunk read takes 50-200 microseconds from local SSD storage.
+
+### Step 11 — Decompression
+
+Each compressed chunk is decompressed using the Gorilla algorithm. Decompression reverses the delta-of-delta and XOR encoding: it starts from the base timestamp and value, then applies each delta to reconstruct the original data points. Decompression speed is approximately 100 nanoseconds per data point, so a 120-sample chunk decompresses in approximately 12 microseconds.
+
+### Step 12 — Aggregation
+
+The decompressed data points are aggregated according to the query function. If the query asks for `avg by (service)`, the executor groups all data points by their service label, computes the average for each group at each timestamp, and produces one output time series per group. This is the most CPU-intensive step: aggregating 100,000 data points into 10 time series requires approximately 1-2 milliseconds of CPU time.
+
+### Step 13 — Result Serialization
+
+The aggregated time series are serialized into a JSON response. Each data point is represented as a [timestamp, value] pair. A typical query response for a 6-hour window at 1-minute resolution contains 360 data points per time series. With 5 time series, the response is approximately 2,200 data points, serialized to roughly 60 KB of JSON.
+
+### Step 14 — Response Transmission
+
+The JSON response travels back through the query API, which may cache it for subsequent requests, then over the network to the browser. On a typical office or datacenter network with 20ms round-trip time, transmission takes 40-80ms for the response and 10-20ms for the request.
+
+### Step 15 — Chart Rendering
+
+The browser's charting library receives the data and renders it as a visual chart. The rendering pipeline is: compute the x-axis scale (time), compute the y-axis scale (value range), draw the axis labels and grid lines, draw the data series as paths, draw the legend, apply any threshold lines or annotations. For a rendering library that uses Canvas (not SVG), this completes in 5-15 milliseconds per panel. For SVG-based renderers, it takes 20-50 milliseconds per panel. With 12 panels rendered on canvas, the total render time is 60-180 milliseconds.
+
+## Consistency and State
+
+### Crash Recovery
+
+A time series database crash loses all in-memory data that has not been flushed to disk. The WAL protects against this: every ingested sample is written to the WAL before it is acknowledged. On recovery, the database replays the WAL to reconstruct the MemTable, then continues normal operation. WAL replay for a 10-second outage takes approximately 50-100 milliseconds.
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                    CRASH RECOVERY SEQUENCE                       │
+│                                                                  │
+│  ┌────────────┐    ┌──────────────┐    ┌──────────────────┐     │
+│  │ Crash      │    │ Replay WAL   │    │ Rebuild Inverted │     │
+│  │ occurs     │───>│ from last    │───>│ Index from       │     │
+│  │            │    │ checkpoint   │    │ series catalog   │     │
+│  └────────────┘    └──────────────┘    └──────────────────┘     │
+│                          │                       │              │
+│                          ▼                       ▼              │
+│                    ┌──────────────┐    ┌──────────────────┐     │
+│                    │ Flush        │    │ Resume scrape    │     │
+│                    │ MemTable to  │───>│ and query        │     │
+│                    │ disk         │    │ operations       │     │
+│                    └──────────────┘    └──────────────────┘     │
+│                                                                  │
+│  Data loss window: samples received but not yet WAL-committed    │
+│  at the moment of crash. Typically 0-100ms of data.             │
+│  All committed samples survive the crash.                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Partition (Network Split)
+
+During a network partition, one set of database nodes cannot communicate with another set. In a dashboard system that prioritizes availability over consistency (AP), each partition continues ingesting and serving data independently. When the partition heals, the database reconciles the divergent data by comparing timestamps: if both sides have data for the same time series at the same timestamp, the last-writer-wins rule determines which value survives.
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                    NETWORK PARTITION HANDLING                    │
+│                                                                  │
+│  Before partition:                                               │
+│  ┌──────────────┐              ┌──────────────┐                 │
+│  │ Node A       │◄───────────►│ Node B        │                 │
+│  │ series_001:5 │              │ series_001:5  │                 │
+│  └──────────────┘              └──────────────┘                 │
+│                                                                  │
+│  During partition:                                               │
+│  ┌──────────────┐    X X X X   ┌──────────────┐                 │
+│  │ Node A       │              │ Node B        │                 │
+│  │ series_001:7 │              │ series_001:9  │                 │
+│  │ (T=1005)     │              │ (T=1005)      │                 │
+│  └──────────────┘              └──────────────┘                 │
+│                                                                  │
+│  After partition heals — last-writer-wins:                       │
+│  Node A: series_001 at T=1005 = 7                                │
+│  Node B: series_001 at T=1005 = 9                                │
+│  Winner: 9 (later write wins if we assume T is monotonic)        │
+│  Loser: 7 is discarded                                           │
+│                                                                  │
+│  Impact: one data point lost during 30-second partition           │
+│  For most dashboard use cases, this is acceptable                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Concurrent Writes
+
+Multiple services may emit metrics with overlapping label sets, or multiple scrape agents may scrape the same endpoint. The time series database handles this with idempotent writes: if two writes arrive for the same (series ID, timestamp) pair, the database applies the last one received. This is safe because metrics are monotonic counters or gauges where the latest value supersedes the previous one.
+
+### Stale Reads
+
+A dashboard query may read data that is several seconds old because of the scrape interval and the rollup delay. A Prometheus-style setup scrapes every 15 seconds, so the most recent data point in the database is at most 15 seconds old. A dashboard that refreshes every 30 seconds may display data that is 5-45 seconds stale. For operational dashboards, this staleness is acceptable. For real-time dashboards (game scores, stock tickers), the scrape interval must be reduced to 1-2 seconds and the dashboard must use a push-based streaming pipeline instead of a pull-based scrape model.
+
+## Performance Characteristics
+
+### Query Latency by Data Volume
+
+Query latency depends on three factors: the number of time series scanned, the time range of the query, and the resolution of the data. The table below shows typical p50, p99, and p999 latencies for a production dashboard system with 500,000 active time series and 500GB of compressed data on SSD storage.
+
+```
+Query Pattern                Data Scanned    p50      p99      p999
+───────────────────────────────────────────────────────────────────
+Single series, last 1h       720 points      12ms     45ms     120ms
+Single series, last 7d       10,080 points   35ms     110ms    350ms
+10 series, last 1h           7,200 points    45ms     180ms    600ms
+100 series, last 1h          72,000 points   180ms    650ms    2.1s
+10 series, last 30d          432,000 points  420ms    1.8s     5.4s
+500 series, last 7d          5M points        2.1s     7.2s     18s
+Aggregate query (sum all)    50K points      55ms     200ms    700ms
+Percentile query (p99)       50K points      180ms    800ms    2.8s
+```
+
+Key observation: percentile queries are 3-4x slower than aggregate queries because they require sorting or T-Digest computation. Queries over 30+ days of raw data are prohibitively slow — they must use rollups to return in under 5 seconds.
+
+### Concurrency and Throughput
+
+```
+Concurrent Queries    CPU Usage    p50 Latency    p99 Latency    Errors
+───────────────────────────────────────────────────────────────────────
+10                   8%            45ms           110ms          0%
+50                   22%           55ms           180ms          0%
+200                  55%           95ms           420ms          0.1%
+500                  78%           210ms          1.8s           0.5%
+1000                 92%           550ms          4.2s           2.1%
+
+The system degrades gracefully up to 200 concurrent queries.
+Beyond 500 concurrent queries, latency grows superlinearly due to
+CPU contention and lock contention on the chunk cache.
+
+Mitigations:
+  - Query result caching reduces effective concurrency by 60-85%
+  - Read replicas double query capacity
+  - Query prioritization: dashboard queries > alert queries > ad-hoc queries
+```
+
+### Storage Sizing
+
+```
+Metric Volume    Raw (10s)     After Compress    After Rollup (1m)
+─────────────────────────────────────────────────────────────────────
+10K series       86M pts/day   118 MB/day        14 MB/day
+100K series      864M pts/day  1.18 GB/day       144 MB/day
+1M series        8.6B pts/day  11.8 GB/day       1.4 GB/day
+10M series       86B pts/day   118 GB/day        14 GB/day
+
+Compression ratios:
+  Raw TSDB storage: 1.37 bytes per point (Gorilla compression)
+  Rollup storage: 0.17 bytes per point (6x reduction)
+  Index overhead: ~100 bytes per unique series (labels + metadata)
+
+Example: 500K series, 30-day raw retention + 13-month rollup:
+  Raw (30d): 500K × 86,400 pts/day × 1.37 bytes × 30 days = 1.78 TB
+  Rollup (13mo): 500K × 1,440 pts/day × 0.17 bytes × 395 days = 48.3 GB
+  Index: 500K × 100 bytes = 50 MB
+  Total storage needed: ~1.83 TB
+```
+
+## Configuration and Tuning
+
+### Scrape Interval
+
+The scrape interval determines how quickly metric changes are visible in dashboards. A shorter interval means faster visibility but higher storage costs and more load on scraped services.
+
+```
+Scrape Interval    Freshness    Storage/Day (500K series)   CPU Overhead
+────────────────────────────────────────────────────────────────────────
+5 seconds          5s           3.4 TB                      5.2%
+15 seconds         15s          1.78 TB                     1.7%
+30 seconds         30s          890 GB                      0.9%
+60 seconds         60s          445 GB                      0.4%
+
+Recommendation: start with 15 seconds. Decrease to 5 seconds only for
+services that need real-time visibility (payment processing, auth).
+Increase to 30 seconds for services that change slowly (batch jobs, caches).
+```
+
+### Rollup Policy
+
+Rollup policies trade query speed for storage cost. Longer retention at higher resolution means faster queries over longer time ranges, but consumes more disk.
+
+```
+Rollup Config    Query Speed (30d)    Storage Cost    Use Case
+───────────────────────────────────────────────────────────────────
+Raw only        18s (p99)            1.78 TB         Forensic analysis
+1m rollup       2.1s (p99)           365 GB          Standard Ops
+5m rollup       800ms (p99)          255 GB          Cost-sensitive
+1h rollup       120ms (p99)          195 GB          Trend-only
+
+Recommendation: configure 1-minute rollups for standard operations.
+Add 5-minute rollups for services where you rarely need sub-minute
+resolution. Keep raw data for high-value services.
+```
+
+### Chunk Size
+
+The chunk size balances memory efficiency against query granularity. Larger chunks compress better but waste I/O when querying short time ranges.
+
+```
+Chunk Size    Compression Ratio    Query 1h Overhead    Memory per Series
+───────────────────────────────────────────────────────────────────────────
+60 samples    2.5x                 100% (must read full)  1.4 KB
+120 samples   2.7x                 200%                   2.8 KB
+240 samples   2.9x                 400%                   5.6 KB
+480 samples   3.0x                 800%                   11.2 KB
+
+Recommendation: 120 samples for most use cases. Increase to 240 for
+series with low query frequency (batch metrics). Decrease to 60 for
+series queried every few seconds (critical SLO metrics).
+```
+
+### Query Cache TTL
+
+The query cache TTL determines how long a query result is reused before the query must be re-executed. Longer TTLs reduce database load but increase the chance that the dashboard shows stale data.
+
+```
+Cache TTL    Cache Hit Rate    Max Staleness    DB Load Reduction
+───────────────────────────────────────────────────────────────────
+15 seconds   50%               15s              2x
+30 seconds   65%               30s              3x
+60 seconds   80%               60s              5x
+120 seconds  88%               2 min            8x
+300 seconds  93%               5 min            14x
+
+Recommendation: 30 seconds for operational dashboards (fast response
+to changes). 60 seconds for business dashboards (slow-changing metrics).
+120 seconds for executive dashboards (daily review, not real-time).
+```
+
+### Memory Tuning
+
+The TSDB's memory usage is dominated by the inverted index. Each unique time series consumes approximately 100 bytes in the index. With 500,000 active series, the index consumes 50 MB. This is manageable on any modern server. The problem arises when series churn creates millions of unique series over a day.
+
+```
+Series Churn Rate    Index After 1 Day    Index After 7 Days    Memory Impact
+──────────────────────────────────────────────────────────────────────────────
+Stable (10K/day)     10K x 100B = 1 MB   70K x 100B = 7 MB     Negligible
+Moderate (100K/day)  100K x 100B = 10MB  700K x 100B = 70MB   Noticeable
+High (1M/day)        1M x 100B = 100MB   7M x 100B = 700MB    Severe - OOM risk
+Extreme (10M/day)    10M x 100B = 1 GB   70M x 100B = 7 GB    Critical
+
+Mitigation: set a maximum series churn rate per scrape target.
+Reject labels with high cardinality (session IDs, user IDs).
+Restart the TSDB periodically to clear the index of stale series.
+Use VictoriaMetrics which handles churn better than Prometheus.
+```
+
+### Disk I/O Tuning
+
+The TSDB writes incoming samples sequentially to the WAL and reads historical data for queries. On a shared disk, writes and reads compete for I/O bandwidth. The solution is to separate the WAL and data directories onto different disks.
+
+```yaml
+# Prometheus storage configuration
+storage:
+  tsdb:
+    path: /data/prometheus          # Main data directory (SSD)
+    wal-compression: true            # Compress WAL to reduce I/O
+    retention:
+      time: 30d                      # Retention period
+      size: 500GB                    # Maximum disk usage
+  # WAL on separate disk for write isolation
+  wal-path: /wal/prometheus          # WAL directory (NVMe SSD)
+
+# Query tuning
+query:
+  max-concurrency: 20                # Max concurrent queries
+  timeout: 2m                        # Query timeout
+  max-samples: 50000000              # Max samples per query
+  lookback-delta: 5m                 # How far to look back for series
+```
+
+## Label Naming Conventions
+
+Consistent label naming is critical for dashboard usability. Inconsistent labels make it impossible to write cross-service queries and create dashboard panels that work for multiple services.
+
+### Standard Label Names
+
+The Prometheus community has converged on a set of standard label names that should be used across all services:
+
+- `job`: The name of the job or service that is being scraped (e.g., `auth-api`, `payment-processor`)
+- `instance`: The specific instance of the service (e.g., `host-01:8080`, `pod-abc123`)
+- `service`: The name of the service (same as `job` but used in multi-service environments)
+- `namespace`: The Kubernetes namespace or organizational unit
+- `region`: The cloud region (e.g., `us-east-1`, `eu-west-2`)
+- `zone`: The availability zone within a region (e.g., `us-east-1a`)
+- `host`: The hostname or node name
+- `method`: The HTTP method (e.g., `GET`, `POST`, `PUT`)
+- `endpoint`: The API endpoint path (e.g., `/users`, `/payments`)
+- `status`: The HTTP status code (e.g., `200`, `404`, `500`)
+- `status_class`: The HTTP status class (e.g., `2xx`, `4xx`, `5xx`)
+- `version`: The service version (e.g., `v1.2.3`)
+- `deployment`: The deployment identifier (e.g., `deploy-20260701-1200`)
+
+### Label Naming Anti-Patterns
+
+Avoid these label naming anti-patterns that break dashboard queries:
+
+**Anti-pattern 1: CamelCase labels.** Labels like `serviceName` and `errorCount` are inconsistent with the standard underscore convention. A dashboard query that uses `service_name` will not match metrics with `serviceName`. Always use `snake_case` for label names.
+
+**Anti-pattern 2: Label values with special characters.** Label values like `auth-api/v2` or `payment:processor` break PromQL queries because PromQL uses `/` and `:` as operators. Always use alphanumeric characters and hyphens for label values.
+
+**Anti-pattern 3: High-cardinality labels on frequently-used metrics.** Labels like `user_id`, `session_id`, `request_id`, and `transaction_id` create millions of unique time series. These labels should never be on metrics that are used in dashboard queries. If you need to track per-request metrics, use logs or traces instead of metrics.
+
+### Label Validation at Ingestion Time
+
+The ingestion pipeline must validate label names and values before they enter the TSDB. Invalid labels are either rejected (the metric is dropped) or sanitized (the label is renamed to a valid format).
+
+```yaml
+# Example label validation rules
+label_validation:
+  # Reject labels that are not in the allow list
+  allow_list:
+    - job, instance, service, namespace
+    - region, zone, host
+    - method, endpoint, status, status_class
+    - version, deployment
+  
+  # Reject label values that match these patterns
+  reject_patterns:
+    - ".*_id$"        # user_id, session_id, request_id
+    - ".*\\..*"       # labels with dots (used as operators)
+    - ".*:.*"         # labels with colons (used as operators)
+  
+  # Sanitize label values that contain invalid characters
+  sanitize_rules:
+    - replace: "/"
+      with: "_"
+    - replace: " "
+      with: "_"
+    - lowercase: true
+```
+
+## Write Path Analysis
+
+The write path is the pipeline that ingests metrics into the TSDB. Understanding the write path is essential for diagnosing ingestion bottlenecks and data loss.
+
+### Write Path Steps
+
+**Step 1: Scrape (15 seconds).** The scrape agent sends an HTTP GET request to the service's `/metrics` endpoint. The service returns a text response in Prometheus exposition format. The scrape agent parses the text, extracts each metric name, label set, and value, and creates a batch of samples.
+
+**Step 2: Buffer (in-memory, 1-2 seconds).** The scrape agent stores the batch in an in-memory buffer. The buffer is flushed to the TSDB on a timer or when it reaches a size threshold. If the TSDB is unavailable, the buffer holds the data until the TSDB recovers. If the buffer overflows (TSDB unavailable for more than 5-10 minutes), data is dropped.
+
+**Step 3: WAL Write (1-5 milliseconds).** The TSDB receives the batch and writes each sample to the Write-Ahead Log. The WAL is an append-only file on disk. Each write is a sequential write, which is fast on SSD. The WAL ensures that samples are not lost if the TSDB crashes before the MemTable is flushed to disk.
+
+**Step 4: MemTable Insert (1-5 microseconds per sample).** After the WAL write, the TSDB inserts each sample into the in-memory MemTable. The MemTable stores samples sorted by (series ID, timestamp). Insertion is O(log N) per sample because the MemTable is a balanced tree or skip list.
+
+**Step 5: Index Update (1-10 microseconds per new series).** If the sample is from a new time series (a new combination of labels), the TSDB updates the inverted index. This involves adding the new series ID to the bitsets for each label value. Index updates are the most expensive part of the write path because they require memory allocation and potential garbage collection.
+
+**Step 6: MemTable Flush (every 2-4 hours).** When the MemTable reaches its size limit, the TSDB flushes it to disk as a sorted block. The flush writes all samples in sorted order, creates an index for the block, and adds the block to the storage layer. After the flush, the MemTable is cleared and the WAL segment is truncated.
+
+### Write Path Bottlenecks
+
+**High series churn** causes the index update step to dominate the write path. If each scrape creates 1,000 new series, the index update takes 10 milliseconds per scrape. With 10 scrape targets, the index update takes 100 milliseconds per scrape cycle, consuming 10% of the CPU.
+
+**Slow WAL disk** causes the WAL write step to block. If the WAL is on a shared disk with high I/O contention, each WAL write takes 10-50 milliseconds instead of 1-5 milliseconds. The scrape agent buffer fills up and data is dropped.
+
+**Large MemTable** causes the flush step to take a long time. A 256 MB MemTable takes 2-5 seconds to flush to disk. During the flush, the TSDB can still accept writes, but query performance degrades because the CPU is busy with compaction.
+
+## Read Path Analysis
+
+The read path is the pipeline that serves dashboard queries. Understanding the read path is essential for diagnosing slow dashboard loads.
+
+### Read Path Steps
+
+**Step 1: Query Parsing (50-200 microseconds).** The query string is parsed into an AST. The AST is validated against the metric schema. Invalid queries are rejected at this stage.
+
+**Step 2: Index Lookup (100-1000 microseconds).** The AST's label matchers are resolved against the inverted index. The matching series IDs are returned as a bitset.
+
+**Step 3: Chunk Selection (1-10 milliseconds).** For each matching series, the storage layer finds the chunks that overlap the query time range. The chunk list is sorted by time, so a binary search finds the first overlapping chunk in O(log N) time.
+
+**Step 4: Chunk Read (10-500 milliseconds).** The selected chunks are read from disk. The chunk read is a sequential read of a compressed block. For a 6-hour query on 5 series, approximately 900 chunks are read, consuming 10-50 MB of disk I/O.
+
+**Step 5: Decompression (10-100 milliseconds).** Each chunk is decompressed using the Gorilla algorithm. Decompression reverses the delta-of-delta and XOR encoding. 900 chunks decompressed at 12 microseconds each takes approximately 11 milliseconds.
+
+**Step 6: Aggregation (10-200 milliseconds).** The decompressed data points are aggregated according to the query function. Rate computation, histogram quantile interpolation, and group-by operations are performed at this stage.
+
+**Step 7: Serialization (1-10 milliseconds).** The aggregated data is serialized to JSON or a binary format. The serialized result is returned to the query API.
+
+### Read Path Optimization
+
+**Query result caching** is the most effective optimization. A 30-second cache TTL eliminates 60-80% of read path executions. The cache stores the serialized query result, so the entire read path is skipped on a cache hit.
+
+**Concurrent query execution** speeds up dashboards with multiple panels. The dashboard frontend sends all panel queries concurrently. The TSDB processes them in parallel, using multiple CPU cores. A 12-panel dashboard on a 4-core TSDB completes in the time of the 3 slowest panels, not the sum of all 12.
+
+**Range query optimization** reduces the number of chunks read. If the query asks for "last 6 hours" and the data is stored in 2-hour blocks, the TSDB reads 3 blocks per series. If the data is stored in 4-hour blocks, the TSDB reads 2 blocks per series. Larger blocks reduce I/O but increase memory usage.
+
+## Memory Architecture
+
+The TSDB's memory is divided into three regions, each with different allocation patterns and garbage collection characteristics.
+
+**Inverted Index (in-memory, updated on every new series registration).** This is the most critical memory region. The index maps label-value pairs to bitsets of series IDs. It is rebuilt on startup by scanning the series catalog. Memory grows linearly with the number of unique series. A sudden cardinality spike (thousands of new series per minute) causes rapid memory growth and can trigger GC pauses.
+
+**Chunk Cache (in-memory LRU, holds recently accessed chunks).** The chunk cache keeps decompressed chunks in memory so that repeated queries (dashboard refreshes) do not need to read from disk. Typical cache hit rate is 70-85%. Cache size is configurable; a larger cache improves query speed but consumes more memory. Default: 25% of available RAM.
+
+**MemTable (in-memory, holds recently ingested samples before flush).** The MemTable buffers incoming samples and flushes them to disk as sorted blocks. The MemTable size determines how often flushes occur. A larger MemTable means fewer flushes (less write amplification) but higher memory usage and longer crash recovery time. Default: 256 MB.
+
+## Write-Ahead Log (WAL) Details
+
+The WAL is the foundation of TSDB durability. Understanding its behavior is essential for diagnosing data loss and performance issues.
+
+**WAL structure.** The WAL is an append-only file divided into segments. Each segment is 128 MB by default. When a segment reaches its size limit, the TSDB creates a new segment and truncates the old one after all data in it has been flushed to disk. Each write to the WAL is a batch of samples with a CRC32 checksum. The checksum detects corruption from disk failures or software bugs.
+
+**WAL write behavior.** WAL writes are synchronous by default: the write call does not return until the data is on disk. This guarantees durability but adds latency. For high-throughput systems, the WAL can be configured for asynchronous writes: the write call returns before the data is on disk, and the data is flushed to disk every 1 second. Asynchronous writes increase ingestion throughput by 5-10x but risk losing up to 1 second of data on a crash.
+
+**WAL replay on crash.** When the TSDB starts after a crash, it scans the WAL from the last checkpoint (the last successful MemTable flush). It reads each segment, validates the CRC32 checksum, and inserts each sample into the MemTable. WAL replay for a 10-second outage takes approximately 50-100 milliseconds. WAL replay for a 1-hour outage (e.g., a full disk) takes approximately 5-30 seconds.
+
+**WAL compression.** The WAL can be compressed using Snappy or LZ4 compression. Compression reduces WAL size by 3-5x but adds CPU overhead for compression and decompression. For systems where WAL I/O is the bottleneck, compression improves throughput by reducing the amount of data written to disk.
+
+## Query Execution Pipeline
+
+When a query enters the TSDB, it passes through five distinct stages. Each stage can be a bottleneck depending on the query pattern.
+
+**Stage 1: Query Parsing (50-200 microseconds).** The raw query string (PromQL or SQL) is parsed into an abstract syntax tree (AST). The AST is validated against the schema: metric names must exist, label names must be valid, functions must have the correct number of arguments. Invalid queries are rejected at this stage without touching the index or storage.
+
+**Stage 2: Index Resolution (100-1000 microseconds).** The AST is analyzed to extract label matchers. Each label matcher is looked up in the inverted index. The resulting bitsets are intersected or unioned according to the query logic. This produces a set of matching series IDs. For a typical query with 3-5 label matchers, this stage completes in under 500 microseconds.
+
+**Stage 3: Chunk Selection (1-10 milliseconds).** For each matching series ID, the database determines which chunks overlap the query time range. Each series stores its chunks in a list sorted by time. A binary search finds the first chunk that overlaps the query start time, then sequential reads collect all subsequent chunks until the query end time. For a 6-hour query with 120-sample chunks at 15-second resolution, this selects approximately 180 chunks per series.
+
+**Stage 4: Chunk Decompression and Scan (10-500 milliseconds).** Each selected chunk is decompressed from the Gorilla format. The decompressed data points are scanned and filtered. If the query asks for data points, they are returned as-is. If the query asks for an aggregation (sum, avg, rate), the aggregation is computed as the data points are scanned. For a 6-hour query on 5 series, this stage processes approximately 900 chunks (180 per series x 5 series), taking 100-300 milliseconds.
+
+**Stage 5: Post-Processing (1-10 milliseconds).** The results from step 4 are further processed: rate computations divide by the time window, histogram quantile computations interpolate from buckets, and results are sorted by timestamp. The final result is serialized to JSON or a binary format and returned to the caller.
+
+## Common Diagnostic Queries
+
+When debugging a dashboard issue, you need to understand what the TSDB is doing. These diagnostic queries help you identify bottlenecks.
+
+**Query: What is the current series churn rate?**
+```promql
+# Number of new time series created in the last 5 minutes
+increase(prometheus_tsdb_series_created_total[5m])
+```
+A high value (thousands per minute) indicates a cardinality explosion.
+
+**Query: What is the query latency distribution?**
+```promql
+# p50, p95, p99 query latency over the last 10 minutes
+histogram_quantile(0.50, rate(prometheus_engine_query_duration_seconds_bucket[10m]))
+histogram_quantile(0.95, rate(prometheus_engine_query_duration_seconds_bucket[10m]))
+histogram_quantile(0.99, rate(prometheus_engine_query_duration_seconds_bucket[10m]))
+```
+Compare these values to your SLO targets. If p99 exceeds 2 seconds, investigate further.
+
+**Query: What is the cache hit rate?**
+```promql
+# Cache hit rate as a percentage
+rate(prometheus_query_cache_hits_total[5m]) / (rate(prometheus_query_cache_hits_total[5m]) + rate(prometheus_query_cache_misses_total[5m])) * 100
+```
+A cache hit rate below 50% indicates the cache TTL is too short or the dashboard is refreshing too frequently.
+
+**Query: What are the slowest queries?**
+```promql
+# Top 5 slowest queries by max duration
+topk(5, max by (query) (prometheus_engine_query_duration_seconds))
+```
+This query returns the slowest queries in the TSDB engine. These are the queries that need optimization (recording rules, better indexing, or reduced time range).
+
+Now that you understand the internals of the time series database and query pipeline, the next section shows how to architect a dashboard platform that scales from a single service to millions of concurrent viewers across multiple regions.

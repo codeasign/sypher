@@ -1,0 +1,773 @@
+---
+id: monitoring-deep-dive
+title: Monitoring -- Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A monitoring system is a distributed data pipeline optimized for write throughput and recent-data query performance. Unlike a transactional database, a monitoring system accepts high-volume writes and supports read queries that aggregate over time ranges. The internal architecture reflects this write-heavy, append-dominant workload.
+
+<AsciiDiagram
+  id="monitoring/deep-dive-internal-arch"
+  title="Internal architecture of a production monitoring system"
+  alt="Diagram showing WAL, memtable, LSM-tree segments, inverted index, and query engine inside a time-series database"
+  caption="Time-series databases use log-structured merge trees optimized for high-volume sequential writes"
+ content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│              Time-Series Database Internal Architecture              │
+│                                                                       │
+│  Write Path                     Read Path                              │
+│  ──────────────────             ──────────────────                     │
+│  Metric Data ──▶  ┌────────┐   ┌────────┐ ◀─── Query                  │
+│                   │  WAL   │   │Query   │       (PromQL/SQL)           │
+│                   │ (Write │   │Engine  │                              │
+│                   │  Ahead │   └───┬────┘                              │
+│                   │  Log)  │       │                                   │
+│                   └───┬────┘       │                                   │
+│                       │            │                                   │
+│                       ▼            │                                   │
+│                  ┌──────────┐      │                                   │
+│                  │ MemTable │      │                                   │
+│                  │ (Sorted  │      │                                   │
+│                  │  In-     │      │                                   │
+│                  │  Memory) │      │                                   │
+│                  └────┬─────┘      │                                   │
+│                       │            │                                   │
+│            Flush when │ full       │                                   │
+│                       ▼            │                                   │
+│                  ┌──────────┐      │                                   │
+│                  │ Segment  │      │                                   │
+│                  │ File 1   │      │                                   │
+│                  │ (sorted, │      │                                   │
+│                  │  indexed)│      │                                   │
+│                  └──────────┘      │                                   │
+│                       │            │                                   │
+│            Compaction │            │                                   │
+│            merges     ▼            │                                   │
+│            segments ┌──────────┐   │                                   │
+│            ────────▶│ Segment  │   │                                   │
+│                     │ N (merged)│  │                                   │
+│                     └──────────┘   │                                   │
+│                                    │                                   │
+│  Metadata:  ┌─────────────────┐   │                                   │
+│  Inverted   │ [Inverted Index]│   │                                   │
+│  Index      │ label=value ──▶ │───┘                                   │
+│  (map label │ series list     │                                        │
+│   combos to │                 │                                        │
+│   series    │ {__name__=      │                                        │
+│   IDs)      │  http_reqs,     │                                        │
+│             │  method=GET}    │                                        │
+│             └─────────────────┘                                        │
+└─────────────────────────────────────────────────────────────────────┘
+`} />
+
+The write path has three stages. First, every incoming data point is appended to a write-ahead log (WAL) on disk. The WAL provides crash recovery -- if the database crashes, it replays the WAL on restart. Second, the data point is inserted into an in-memory table (memtable) that maintains data in sorted order. Third, when the memtable reaches a configurable size threshold (typically 64 to 256 MB), it is flushed to disk as an immutable segment file.
+
+The read path uses an inverted index to find the relevant time series. When a query requests `http_requests_total{method="GET", status="200"}`, the inverted index returns the list of series IDs that match all the label predicates. The query engine then reads data for those series IDs from all segment files, merging results and applying aggregation.
+
+## Data Structures and Algorithms
+
+### Time-Series Segment
+
+A segment is an immutable, sorted list of data points. Each data point is a tuple of (timestamp, value). Segments are organized by series ID, and within each series, data points are sorted by timestamp in ascending order.
+
+```text
+Segment file on disk:
+
+┌─────────────────────────────────────────────────────┐
+│ Header                                                │
+│   Magic: 0xTSDB                                      │
+│   Version: 2                                         │
+│   Segment time range: [1719000000, 1719072000]       │
+│   Number of series: 3                                 │
+├─────────────────────────────────────────────────────┤
+│ Series Index                                          │
+│   Series ID: 42 (http_requests_total{method="GET"})  │
+│     Offset: 1024,  Count: 15000                      │
+│   Series ID: 99 (http_requests_total{method="POST"}) │
+│     Offset: 20480, Count: 5000                       │
+│   Series ID: 156 (http_errors_total{code="500"})     │
+│     Offset: 25600, Count: 120                        │
+├─────────────────────────────────────────────────────┤
+│ Data Blocks                                          │
+│   [TS=1719000000, V=100] [TS=1719000010, V=102]     │
+│   [TS=1719000020, V=105] ... (for series ID 42)     │
+│   [TS=1719000000, V=50] [TS=1719000010, V=51] ...   │
+│   ... (for series ID 99)                             │
+├─────────────────────────────────────────────────────┤
+│ Bloom Filter (per series, for fast negative lookups) │
+│   Series 42: bitmap, Series 99: bitmap, ...          │
+├─────────────────────────────────────────────────────┤
+│ Footer: CRC32 checksum of all blocks                  │
+└─────────────────────────────────────────────────────┘
+```
+
+The segment format uses separate indexing and data blocks. The index block maps series IDs to byte offsets in the data block. When the query engine needs data for series 42 in this segment, it reads the index, jumps to offset 1024, and reads 15,000 data points. This design minimizes the number of disk seeks per query.
+
+### LSM Tree Compaction
+
+<AsciiDiagram
+  id="monitoring/deep-dive-compaction"
+  title="LSM tree compaction process merging small segment files into larger ones"
+  alt="Diagram showing four small segment files being read, sorted, and merged into one large segment file, with old segments deleted after the merge completes"
+  caption="Compaction reduces the number of segment files, improving query performance by reducing the number of file reads per query"
+ content={`
+┌──────────────────────────────────────────────────────────────────┐
+│                  LSM Tree Compaction Process                       │
+│                                                                     │
+│  Before Compaction (4 segments, query must merge all 4)            │
+│                                                                     │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐           │
+│  │ Segment 1    │   │ Segment 2    │   │ Segment 3    │           │
+│  │ [0h - 1h]    │   │ [1h - 2h]    │   │ [2h - 3h]    │    ...   │
+│  │ 64 MB        │   │ 64 MB        │   │ 64 MB        │           │
+│  │ Series: 42,99│   │ Series: 42,99│   │ Series: 42,99│           │
+│  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘           │
+│         │                  │                  │                    │
+│         └──────────────────┼──────────────────┘                    │
+│                            │                                       │
+│     Compaction reads all segments, sorts by series + timestamp     │
+│                            │                                       │
+│                            ▼                                       │
+│  ┌──────────────────────────────────────────────────────┐         │
+│  │              Merged Segment                           │         │
+│  │  [0h - 4h]  256 MB                                   │         │
+│  │  Series 42: [t=0, v=100] [t=1h, v=102] [t=2h, v=105]│         │
+│  │  Series 99: [t=0, v=50] [t=1h, v=51] [t=2h, v=53]  │         │
+│  └──────────────────────────────────────────────────────┘         │
+│                                                                     │
+│  After Compaction (1 segment, query reads 1 file)                  │
+│  Old segments (1-4) are deleted after merge completes              │
+│                                                                     │
+│  Write amplification: 1 data point written 4 times:                │
+│  WAL -> Memtable -> Initial Segment -> Merged Segment              │
+└──────────────────────────────────────────────────────────────────┘
+`} />
+
+Over time, many small segment files accumulate. Reading a query over a 24-hour range requires merging data from dozens of segments. Compaction solves this problem by merging several small segments into one large segment. During compaction, the database reads all data points from the input segments, sorts them by series ID and timestamp, and writes them to a new output segment. The input segments are deleted after the output segment is written.
+
+```text
+Before compaction:
+  seg-1: [0..1h] size=64MB
+  seg-2: [1h..2h] size=64MB
+  seg-3: [2h..3h] size=64MB
+  seg-4: [3h..4h] size=64MB
+  Total: 4 segments, query must merge 4 results
+
+After compaction:
+  merged-seg: [0..4h] size=256MB
+  Total: 1 segment, query reads 1 result
+```
+
+Compaction is a background process with configurable concurrency. A typical configuration uses two compaction threads. More threads speed up compaction but consume more CPU and disk IO. The key tradeoff is that compaction increases write amplification -- every data point is written once to the WAL, once to the memtable, once to the initial segment, and again during compaction. Write amplification of 3x to 5x is normal for time-series databases.
+
+### Inverted Index
+
+The inverted index maps label combinations to series IDs. It is the data structure that enables the query `http_requests_total{method="GET", status="200"}` to find the matching series in microseconds, even among millions of series.
+
+```text
+Inverted index structure:
+
+Label pairs ──────────▶ Series IDs
+─────────────────────────────────────
+__name__="http_requests_total"  ──▶ [42, 99, 156, 203, ...]
+method="GET"                     ──▶ [42, 203, 512, ...]
+method="POST"                    ──▶ [99, 156, ...]
+status="200"                     ──▶ [42, 99, 512, ...]
+status="500"                     ──▶ [156, ...]
+
+Query: {__name__="http_requests_total", method="GET", status="200"}
+  Intersection: [42, 99, 156, 203, ...] x [42, 203, 512, ...] x [42, 99, 512, ...]
+  Result: [42]
+```
+
+The intersection operation uses a hash set on the smallest result set. If `status="200"` matches 50,000 series and `method="GET"` matches 3,000 series, the algorithm iterates over the 3,000-series set and checks membership in the 50,000-series set using a hash lookup. This optimization keeps query latency proportional to the size of the smallest matching set rather than the largest.
+
+### Ring Buffer
+
+The agent-side ring buffer is a fixed-size circular array of event slots. Each slot holds one telemetry event. A write pointer and a read pointer track the buffer state.
+
+```python
+class RingBuffer:
+    def __init__(self, capacity=10000):
+        self.buffer = [None] * capacity
+        self.capacity = capacity
+        self.write_pos = 0
+        self.read_pos = 0
+        self.count = 0
+
+    def write(self, event):
+        self.buffer[self.write_pos] = event
+        self.write_pos = (self.write_pos + 1) % self.capacity
+        if self.count < self.capacity:
+            self.count += 1
+        else:
+            # buffer is full, drop oldest unread event
+            self.read_pos = (self.read_pos + 1) % self.capacity
+
+    def read_batch(self, batch_size):
+        batch = []
+        for _ in range(min(batch_size, self.count)):
+            event = self.buffer[self.read_pos]
+            self.buffer[self.read_pos] = None
+            self.read_pos = (self.read_pos + 1) % self.capacity
+            self.count -= 1
+            batch.append(event)
+        return batch
+```
+
+This tail-drop semantics mean that when the buffer fills, new events overwrite the oldest unread events. The agent never blocks waiting for space -- the application can always emit telemetry without being slowed by a full buffer. The cost is data loss under sustained backpressure, but data loss in monitoring is preferable to application slowdown.
+
+## Request Lifecycle
+
+A single metric increment travels through twelve distinct stages before it appears on a dashboard. Each stage introduces latency, risk of data loss, and resource overhead.
+
+<AsciiDiagram
+  id="monitoring/deep-dive-lifecycle-agent"
+  title="Request lifecycle steps 1 through 5: from application call to agent buffer flush"
+  alt="Diagram showing a metric increment moving from the application through the SDK into the agent ring buffer, then serialized and sent over the network"
+  caption="The first five steps of the monitoring pipeline happen on the application node itself"
+ content={`
+┌─────────────────────────────────────────────────────────────┐
+│     Steps 1-5: Application Node (Agent Side)                 │
+│                                                               │
+│   Step 1: Application code calls counter.inc()                │
+│   ┌────────────────────────────────────────────┐              │
+│   │ def handle_request(req):                   │              │
+│   │     request_counter.labels(                │              │
+│   │         method="GET", path="/api"          │              │
+│   │     ).inc()                                │              │
+│   │     process(req)                           │              │
+│   └────────────────┬───────────────────────────┘              │
+│                    │                                          │
+│   Step 2: SDK creates MetricPoint                             │
+│                    ▼                                          │
+│   ┌──────────────────────────────────────────┐                │
+│   │ MetricPoint:                              │                │
+│   │   name = "http_requests_total"            │                │
+│   │   labels = {method:"GET", path:"/api"}    │                │
+│   │   value = 1                               │                │
+│   │   timestamp = 1719000000123               │                │
+│   └────────────────┬─────────────────────────┘                │
+│                    │                                          │
+│   Step 3: SDK writes to ring buffer                           │
+│                    ▼                                          │
+│   ┌──────────────────────────────────────────┐                │
+│   │ Ring Buffer [capacity=50000]              │                │
+│   │ ┌────┬────┬────┬────┬────┬────┬────┬────┐│                │
+│   │ │MP1 │MP2 │MP3 │    │    │    │    │    ││                │
+│   │ └────┴────┴────┴────┴────┴────┴────┴────┘│                │
+│   │       write_ptr──▶          read_ptr──▶   │                │
+│   └────────────────┬─────────────────────────┘                │
+│                    │                                          │
+│   Step 4: Flush tick (every 10 sec) reads batch               │
+│                    ▼                                          │
+│   Step 5: Serialize to protobuf + compress with gzip          │
+│   ┌──────────────────────────────────────────┐                │
+│   │ Protobuf batch: 1000 MetricPoints        │                │
+│   │ Wire size: 45 KB (gzip), 500 KB (raw)    │                │
+│   └────────────────┬─────────────────────────┘                │
+│                    │                                          │
+│                    ▼ (network egress)                         │
+└─────────────────────────────────────────────────────────────┘
+`} />
+
+### Steps 1-3: Application to Ring Buffer
+
+When your code calls `counter.inc()`, the SDK increments a local counter in memory and periodically computes the delta. Most SDKs aggregate increments in a local map before creating a MetricPoint. This aggregation reduces the number of MetricPoints created by the ratio of increments to flush interval. At 10,000 requests per second with a 10-second flush interval, the SDK creates 1 MetricPoint per 100,000 increments, reducing downstream pipeline load by 99,999 percent.
+
+### Steps 4-5: Flush and Serialize
+
+Every flush interval, the agent reads a batch of MetricPoints from the ring buffer and serializes them. Serialization converts the in-memory objects into a compact binary format. Protobuf serialization with varint-encoded timestamps and label dictionaries compresses a metric point from approximately 200 bytes in JSON to 45 bytes in protobuf.
+
+```text
+Serialization comparison (per metric point):
+  JSON:    {"name":"http_reqs","labels":{"method":"GET"},"value":1,"ts":1719000000123}
+  Size:    72 bytes
+  Protobuf: <compressed binary with shared label dictionary>
+  Size:    16 bytes
+  Savings: 78 percent
+```
+
+### Steps 6-8: Aggregator Receive and Route
+
+<AsciiDiagram
+  id="monitoring/deep-dive-lifecycle-aggregator"
+  title="Request lifecycle steps 6 through 8: aggregator deserializes, validates schema, routes to storage"
+  alt="Diagram showing the aggregator receiving compressed batches, deserializing, validating against schema rules, and routing to partitioned TSDB backends"
+  caption="The aggregator is the critical bottleneck -- it must handle all writes from all agents simultaneously"
+ content={`
+┌─────────────────────────────────────────────────────────────┐
+│     Steps 6-8: Aggregator (Central Processing)              │
+│                                                               │
+│   ┌──────────────────────────────┐                            │
+│   │ Network: gzip protobuf POST  │                            │
+│   │ from Agent 42                │                            │
+│   │ Port 4318 (OTLP)             │                            │
+│   └──────────────┬───────────────┘                            │
+│                  │                                            │
+│   Step 6: Deserialize and decompress                          │
+│                  ▼                                            │
+│   ┌──────────────────────────────────────────┐                │
+│   │ Token bucket rate limiter                 │                │
+│   │ 500,000 MetricPoints/second per instance  │                │
+│   │ Reject if exceeded (HTTP 429)             │                │
+│   └────────────────┬─────────────────────────┘                │
+│                    │                                          │
+│   Step 7: Validate schema                                    │
+│                    ▼                                          │
+│   ┌──────────────────────────────────────────┐                │
+│   │ Schema checks:                            │                │
+│   │  - Metric name length under 256 chars     │                │
+│   │  - Label names match regex [a-zA-Z_:]+    │                │
+│   │  - Value is finite number                 │                │
+│   │  - Timestamp within 1h of wall clock      │                │
+│   │  - Cardinality: max 20 labels per metric  │                │
+│   └────────────────┬─────────────────────────┘                │
+│                    │                                          │
+│   Step 8: Route to partition                                  │
+│                    ▼                                          │
+│   ┌──────────────────────────────────────────┐                │
+│   │ Router (hash on metric name):             │                │
+│   │  - "http_*" ──▶  TSDB partition 0        │                │
+│   │  - "db_*"    ──▶  TSDB partition 1        │                │
+│   │  - "container_*" ──▶  TSDB partition 2    │                │
+│   │  - default   ──▶  TSDB partition 3        │                │
+│   └──────────────────────────────────────────┘                │
+└─────────────────────────────────────────────────────────────┘
+`} />
+
+### Steps 6-8: Deserialization, Validation, Routing
+
+The aggregator receives compressed protobuf batches from agents across the fleet. Each batch is decompressed, deserialized, and validated against a schema. Validation checks that metric names match expected patterns, label values are within cardinality limits, and timestamps are within a reasonable window of the current time. Invalid data is rejected with an error response that includes a human-readable reason for the rejection, so the agent team can fix their instrumentation.
+
+After validation, the router assigns each metric to a partition based on its name hash. Partitioning by metric name ensures that related metrics land in the same partition, enabling efficient queries. The aggregator is stateless, so you can scale it horizontally by adding more instances behind a load balancer. Each aggregator instance handles a roughly equal share of the agent fleet.
+
+### Steps 9-11: TSDB Write Path
+
+<AsciiDiagram
+  id="monitoring/deep-dive-lifecycle-storage"
+  title="Request lifecycle steps 9 through 11: WAL append, memtable insert, segment flush"
+  alt="Diagram showing the metric point being appended to the WAL, inserted into the in-memory memtable, and eventually flushed to a disk segment"
+  caption="The TSDB write path uses a WAL for durability and a memtable for fast in-memory sorting"
+ content={`
+┌─────────────────────────────────────────────────────────────┐
+│     Steps 9-11: TSDB Write Path                              │
+│                                                               │
+│   Metric data arrives at TSDB partition                       │
+│                    │                                          │
+│   Step 9: Append to Write-Ahead Log                          │
+│                    ▼                                          │
+│   ┌──────────────────────────────────────────┐                │
+│   │ WAL (sequential append to disk)           │                │
+│   │ [MP42@1719000000] [MP99@1719000010]       │                │
+│   │ [MP156@1719000020] [MP42@1719000030]      │                │
+│   │ Sequential write, no seeks needed         │                │
+│   │ Crash recovery: replay from last checkpoint│               │
+│   └────────────────┬─────────────────────────┘                │
+│                    │                                          │
+│   Step 10: Insert into MemTable (sorted)                     │
+│                    ▼                                          │
+│   ┌──────────────────────────────────────────┐                │
+│   │ MemTable (sorted by series ID + timestamp)│               │
+│   │ ┌─────────────┬─────────────┬───────────┐ │               │
+│   │ │ Series 42   │ Series 99   │ Series 156│ │               │
+│   │ │ 100, 102,   │ 50, 51,     │ 1, 0, 0   │ │               │
+│   │ │ 105, 110    │ 53, 54      │ 2, 1      │ │               │
+│   │ └─────────────┴─────────────┴───────────┘ │               │
+│   │ Size: 180 MB (threshold: 256 MB)          │               │
+│   └────────────────┬─────────────────────────┘                │
+│                    │                                          │
+│   Step 11: Flush to disk when memtable full                   │
+│                    ▼                                          │
+│   ┌──────────────────────────────────────────┐                │
+│   │ Segment File (immutable, sorted)          │                │
+│   │ seg-000042.tsdb  size: 256 MB             │                │
+│   │ Includes: series index, data blocks,      │                │
+│   │           bloom filter, CRC32 checksum    │                │
+│   └──────────────────────────────────────────┘                │
+└─────────────────────────────────────────────────────────────┘
+`} />
+
+### Step 12: Query Engine Serves Dashboard
+
+The final step in the lifecycle is serving the data to a dashboard. When a Grafana dashboard requests a time series, the query engine parses the query, resolves metric name and label filters through the inverted index, reads data from all relevant segment files, applies aggregation functions, and returns the result.
+
+```text
+Query lifecycle:
+  Grafana sends:    http_requests_total{status="200"}[5m]
+  Query engine:
+    1. Resolves __name__="http_requests_total"    ──▶ [42, 99, 156]
+    2. Resolves status="200"                       ──▶ [42, 99]
+    3. Intersection:                                ──▶ [42, 99]
+    4. For each segment file:
+       - Seek to series 42's data block
+       - Read data points within [now-5m, now]
+       - Seek to series 99's data block
+       - Read data points within [now-5m, now]
+    5. Merge results from all segments
+    6. Apply aggregation (sum per timestamp)
+    7. Return time series to Grafana
+  Total: 15-50 ms for 100 series over 5 minutes
+```
+
+## Consistency and State
+
+Monitoring systems use eventual consistency because the cost of strong consistency -- blocking writes while replicating to a quorum -- is unacceptable at ingest rates of millions of data points per second.
+
+### Crash: WAL Recovery
+
+When the TSDB crashes, it loses the contents of the in-memory memtable. On restart, the database replays the WAL from the last checkpoint. Every data point in the WAL is re-inserted into a new memtable. This process is safe because the WAL is written sequentially and the write syscall is flushed before acknowledging the write to the agent.
+
+```text
+Crash scenario:
+  1. Database receives data point, appends to WAL, inserts into memtable
+  2. Database crashes before memtable is flushed to segment
+  3. On restart: database reads WAL from checkpoint position
+  4. All data points in WAL are replayed into memtable
+  5. Memtable fills and flushes to segment as normal
+  6. Data that was in memtable but not in WAL is lost
+     (this should only happen for the last 1-2 ms of data)
+```
+
+The window for data loss is the WAL flush interval, typically 1 millisecond. If the database crashes between a WAL write and its flush to disk, that data is lost. This is a deliberate tradeoff: flushing every write to disk adds 2-5 milliseconds of latency per write, which is unacceptable at high ingest rates.
+
+### Partition: Network Split
+
+During a network partition, agents on one side of the split cannot reach the aggregator on the other side. In push-based systems, agents continue emitting telemetry into their ring buffers. If the partition lasts longer than the buffer capacity, data is dropped.
+
+```text
+Network partition scenario:
+  - Normal state: Agent sends data to primary aggregator every 10 seconds
+  - Partition: Agent cannot reach primary aggregator for 5 minutes
+  - Agent ring buffer: 50,000 events, 10,000 events/second
+  - Buffer fills in 5 seconds
+  - Remaining 295 seconds: all telemetry is dropped
+  - Impact: 5-minute gap in dashboards, no alert evaluation
+  - Recovery: When partition heals, agent sends buffered data
+  - But 99.9 percent of data was already dropped
+```
+
+Mitigation strategies include deploying aggregators in each availability zone so traffic does not cross AZ boundaries, and using a secondary aggregator in a different region as a fallback.
+
+### Concurrent Writes: Out-of-Order Data Points
+
+When two agents write the same metric simultaneously -- or the same agent retries a batch -- the TSDB receives concurrent writes for the same series. The TSDB must handle out-of-order data points gracefully. Most time-series databases accept out-of-order data by inserting it into the memtable directly, provided the timestamp is within a configurable window (typically 5 minutes of the current time).
+
+```text
+Out-of-order handling:
+  - Memtable contains: [(t=100, v=10), (t=110, v=12)]
+  - Incoming: (t=105, v=11)  -- out of order, but within window
+  - Memtable after insert: [(t=100, v=10), (t=105, v=11), (t=110, v=12)]
+  - Incoming: (t=90, v=9)   -- outside the 5-minute window
+  - Rejected: data point too old
+```
+
+Data points with timestamps outside the acceptance window are rejected. This prevents a misconfigured agent from flooding the database with old data that would pollute recent queries.
+
+### Stale Reads: Query Consistency
+
+Because segments are immutable and compaction is asynchronous, a query might see stale data. The query engine reads from whatever segments exist at query time. If compaction is in progress, the query might see data from both the old segments and the new merged segment -- but because the old segments are only deleted after the new segment is fully written, this results in duplicate data during a brief window.
+
+```text
+Stale read scenario:
+  - Step 1: Compaction reads seg-1 through seg-4
+  - Step 2: Compaction writes merged segment
+  - Step 3: Query arrives -- reads seg-1, seg-2, merged segment
+  - Result: data from seg-1 and seg-2 appears twice!
+  - Step 4: Compaction deletes seg-1 through seg-4
+  - Next query: reads only merged segment -- correct result
+```
+
+Monitoring queries are read-after-write eventually consistent. A query that runs during compaction might double-count some data points, but because monitoring aggregates over time windows, a brief period of slight overcounting is acceptable. This tradeoff enables the query engine to serve results without waiting for compaction to complete.
+
+## Performance Characteristics
+
+Understanding monitoring performance requires three numbers: p50, p95, and p999. These percentiles describe the latency distribution of each pipeline stage.
+
+<AsciiDiagram
+  id="monitoring/deep-dive-percentiles"
+  title="Performance characteristics of each pipeline stage at p50, p95, and p999"
+  alt="Bar chart comparing p50, p95, and p999 latencies for agent collection, aggregator processing, TSDB write, and query serving"
+  caption="The p999 is the most important number -- it determines how often your monitoring pipeline drops data"
+ content={`
+┌──────────────────────────────────────────────────────────────────┐
+│           Pipeline Stage Latency (p50/p95/p999)                  │
+│                                                                   │
+│   Stage              p50      p95      p999     Bottleneck        │
+│   ─────────────────────────────────────────────────────           │
+│   Agent Write        0.2ms    1ms      10ms     CPU cache miss    │
+│   Agent Serialize    2ms      5ms      50ms     Protobuf encode   │
+│   Network RTT        1ms      5ms      100ms    TCP congestion    │
+│   Aggregator Recv    0.5ms    3ms      50ms     Rate limiter     │
+│   Aggregator Route   0.1ms    0.5ms    5ms      Hash lookup      │
+│   TSDB WAL Write     0.3ms    2ms      20ms     fsync latency    │
+│   TSDB Mem Insert    0.1ms    0.5ms    5ms      Tree rebalance   │
+│   TSDB Flush         100ms    500ms    2s       Disk IO          │
+│   Query (100 series) 15ms     100ms    500ms    Segment merge     │
+│   Query (10K series) 200ms    2s       10s      Inverted index   │
+│   Alert Evaluation   50ms     200ms    1s       Rule matching    │
+│                                                                   │
+│   System-wide end-to-end latency: p50=25ms, p95=800ms, p999=15s  │
+└──────────────────────────────────────────────────────────────────┘
+`} />
+
+The p50 numbers show the happy path -- everything is working normally. The p95 numbers show performance under typical load spikes. The p999 numbers show what happens when things go wrong -- a slow disk, a network blip, or a compaction storm.
+
+The end-to-end p999 of 15 seconds means that 1 in 1,000 data points takes 15 seconds or more to travel from the application to the dashboard. For alerting, this means that even under normal conditions, the alert pipeline has a 1-in-1,000 chance of being delayed by 15 seconds. If your SLO requires alert notification within 60 seconds, this is acceptable. If your SLO requires 10-second notification, this is a problem.
+
+## Configuration and Tuning
+
+### Agent Configuration
+
+```yaml
+agent:
+  # Buffer capacity per telemetry type
+  ring_buffer_capacity: 50000     # events
+  flush_interval: 10s              # seconds between batch exports
+  batch_size: 1000                 # max events per batch
+  max_retries: 3                   # retry attempts before dropping
+  backoff_base: 1s                 # exponential backoff base
+  backoff_max: 30s                 # max backoff between retries
+
+  # Compression
+  compression: gzip                # gzip, snappy, or none
+  compression_level: 6             # 1 (fast) to 9 (small)
+
+  # Memory limits
+  max_memory_mb: 512               # max memory for all buffers
+  drop_policy: tail_drop           # tail_drop or block (never block)
+```
+
+The most important agent parameter is `flush_interval`. A shorter interval reduces data loss risk but increases network overhead. A longer interval increases batching efficiency but delays data availability. For most production systems, 10 seconds is the sweet spot -- it provides sub-minute data visibility with 100:1 batching efficiency.
+
+### Aggregator Configuration
+
+```yaml
+aggregator:
+  # Rate limiting
+  max_ingest_rate: 500000          # metric points per second
+  rate_limit_burst: 1000000        # burst capacity
+
+  # Validation
+  max_label_count: 20              # max labels per metric
+  max_label_name_length: 256       # max bytes per label name
+  max_label_value_length: 1024     # max bytes per label value
+  max_metric_name_length: 256      # max bytes per metric name
+  reject_out_of_order_window: 5m   # reject data points older than this
+
+  # Routing
+  partition_count: 4               # number of TSDB partitions
+  routing_algorithm: hash          # hash or consistent_hash
+
+  # Backpressure
+  backpressure_mode: rate_limit    # rate_limit or drop
+  drop_probability: 0.0            # 0.0 to 1.0, only used in drop mode
+```
+
+The aggregator's `max_ingest_rate` must be set to at least 2x the expected peak rate to handle traffic spikes without backpressure. A common mistake is setting it too close to the expected rate, causing cascading failures during traffic spikes.
+
+### TSDB Configuration
+
+```yaml
+tsdb:
+  # Memtable
+  memtable_size_mb: 256            # flush when memtable exceeds this
+  memtable_max_series: 1000000     # max series per memtable
+
+  # Compaction
+  compaction_interval: 1h          # run compaction every hour
+  compaction_threads: 2            # concurrent compaction workers
+  compaction_trigger_count: 4      # start compaction when N segments exist
+
+  # Retention
+  retention_period: 30d            # delete data older than this
+  downsampling_policy:
+    - after: 7d                    # after 7 days, downsample
+      resolution: 5m               # aggregate to 5-minute buckets
+      function: avg                # aggregation function
+    - after: 30d                   # after 30 days
+      resolution: 1h               # aggregate to 1-hour buckets
+      function: avg
+
+  # Query
+  max_query_series: 100000         # max series per query
+  max_query_range: 30d             # max time range per query
+  query_timeout: 30s               # kill queries exceeding this
+```
+
+Downsampling is the most important retention tuning parameter. Without downsampling, you need 100 percent of the storage for 100 percent of the retention period. With downsampling, you keep full resolution for 7 days, 5-minute resolution for 30 days, and 1-hour resolution for 1 year -- reducing storage requirements by 90 percent.
+
+## Memory Management
+
+Memory is the most constrained resource in a monitoring system. The TSDB keeps the inverted index, the memtable, and the most recent segment files in memory. Understanding memory allocation is critical for preventing OOM kills.
+
+### Inverted Index Memory
+
+The inverted index is the largest memory consumer in a typical TSDB. Each unique label pair consumes approximately 100 bytes in the index. For a system with 500,000 series and 5 labels per series, the inverted index requires 500,000 x 5 x 100 = 250 MB of memory.
+
+```text
+Inverted index memory calculation:
+  Unique label pairs: 2.5 million (500K series x 5 labels each)
+  Memory per entry: 100 bytes (key hash + series ID list pointer)
+  Total index memory: 250 MB
+  Postings list memory: 500 MB (series ID lists)
+  Total inverted index: 750 MB
+```
+
+When cardinality grows to 10 million series, the inverted index memory grows to 15 GB. This is why cardinality limits are essential -- without them, a single metric with a high-cardinality label can consume all available memory on the TSDB node.
+
+### Memtable Memory
+
+The memtable holds data points sorted by series ID and timestamp. Each data point in the memtable occupies approximately 40 bytes (16 bytes for timestamp, 8 bytes for value, and 16 bytes for the tree node overhead).
+
+```text
+Memtable memory calculation:
+  Memtable size threshold: 256 MB
+  Data points in memtable: 256 MB / 40 bytes = 6.4 million
+  At 16,000 DPS, memtable fills in: 6.4M / 16,000 = 400 seconds
+  Flush frequency: every 6.7 minutes
+```
+
+A memtable that fills too quickly causes frequent flushes, which increases disk IO and compaction pressure. A memtable that fills too slowly wastes memory that could be used for caching. The correct memtable size is determined by: how much memory you can allocate, how much data you ingest per second, and how long you can tolerate without flushing to disk.
+
+### File Cache Memory
+
+The operating system file cache holds recently accessed segment file pages in memory. When a query reads data from a segment file, the OS caches those pages for future queries. If the file cache is large enough to hold the most recent 24 hours of data, queries over recent data are served from memory with sub-millisecond latency.
+
+```text
+File cache sizing:
+  Data ingested per day: 18.4 GB (compressed)
+  File cache target: 24 hours = 18.4 GB
+  Available OS memory: 32 GB
+  Memory allocated: 750 MB (inverted index) + 256 MB (memtable) = 1 GB
+  Remaining for file cache: 32 GB - 1 GB = 31 GB
+  File cache can hold: 31 GB / 18.4 GB/day = 1.7 days of data
+
+  Result: queries over the last 1.7 days are served from memory.
+  Queries over older data require disk reads.
+```
+
+## Query Optimization Techniques
+
+Query performance is the most visible aspect of monitoring to end users. A dashboard that takes 30 seconds to load is a failed dashboard, regardless of how much data it displays.
+
+### Recording Rules
+
+Recording rules pre-compute expensive queries and store the results as regular metrics. Instead of computing `histogram_quantile(0.99, rate(request_duration_seconds_bucket[5m]))` on every dashboard load, run the query every 60 seconds and store the result in a metric called `job:request_duration_seconds:p99`.
+
+```yaml
+groups:
+  - name: recording_rules
+    interval: 60s
+    rules:
+      - record: job:request_duration_seconds:p99
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, job) (rate(request_duration_seconds_bucket[5m]))
+          )
+      - record: job:request_duration_seconds:p50
+        expr: |
+          histogram_quantile(0.50,
+            sum by (le, job) (rate(request_duration_seconds_bucket[5m]))
+          )
+```
+
+Recording rules reduce query time from 5 seconds to 5 milliseconds -- a 1,000x improvement. They should be used for any query that appears on multiple dashboards or is used in alerting rules.
+
+### Query Result Caching
+
+Query results should be cached with a TTL that matches the query's refresh interval. A dashboard that refreshes every 30 seconds should cache query results for 25 seconds. This prevents N users from all running the same query simultaneously.
+
+```yaml
+Query cache configuration:
+  Cache backend: Redis or Memcached
+  Default TTL: 60 seconds
+  Per-query TTL: query_refresh_interval - 5 seconds
+  Cache key: hash(query_string + time_range + series_filters)
+  Cache invalidation: on data ingestion (if real-time needed)
+```
+
+### Query Fan-Out Limits
+
+Queries that fan out to all partitions for all time series in the system should be prevented. Set a limit on the number of series a single query can scan.
+
+```yaml
+Query limits:
+  max_series_per_query: 100,000
+  max_time_range: 30d
+  max_aggregation_groups: 10,000
+  query_timeout: 30s
+  expensive_query_threshold: 10,000 series x 1 day
+```
+
+If a query exceeds these limits, the query engine returns an error with a suggestion: "Your query scans 1 million series over 7 days. Consider narrowing the time range, reducing the number of label selectors, or creating a recording rule."
+
+## Compression Algorithms
+
+The choice of compression algorithm has a significant impact on storage cost and query performance. Time-series data has unique compression properties that specialized algorithms exploit.
+
+### XOR Compression for Floating-Point Values
+
+Time-series values change slowly -- consecutive values are often very close to each other. XOR compression takes advantage of this by storing the XOR of consecutive values. When the values are close, the XOR has many leading and trailing zeros, which can be compressed efficiently.
+
+```text
+XOR compression example:
+  Value 1: 100.0  (binary: 0100000001011001000000000000000000000000000000000000000000000000)
+  Value 2: 100.5  (binary: 0100000001011001001000000000000000000000000000000000000000000000)
+  XOR:             0000000000000000001000000000000000000000000000000000000000000000
+
+  XOR result: 1 bit set out of 64 bits
+  Stored as: (leading_zeros=16, middle_bits=1, value=1)
+  Storage: 3 bytes instead of 8 bytes
+```
+
+Facebook's Gorilla paper demonstrated that XOR compression achieves an average of 1.37 bytes per data point for server metrics. This is a 5.8x improvement over uncompressed 8-byte floating-point values. Uber's M3 implementation achieves 1.5 bytes per data point with a slightly different encoding.
+
+### Delta-of-Delta Compression for Timestamps
+
+Timestamps in time-series data are typically evenly spaced. Delta-of-delta compression stores the difference between consecutive timestamp deltas, which is often zero or very small.
+
+```text
+Delta-of-delta compression example:
+  Timestamps: 1000, 1010, 1020, 1030, 1040
+  Deltas:     10, 10, 10, 10
+  Delta-of-delta: 0, 0, 0, 0
+
+  Stored as: 1 bit per timestamp (all zeros)
+  vs 64 bits per timestamp uncompressed
+  Compression ratio: 64:1
+
+  Real timestamps with jitter:
+  Timestamps: 1000, 1012, 1019, 1031, 1038
+  Deltas:     12, 7, 12, 7
+  Delta-of-delta: 5, -5, 5, -5
+  Stored as: 4 bits per delta-of-delta (zigzag encoding)
+  Compression ratio: 16:1
+```
+
+Combined with XOR compression for values, the total compression for a time-series data point is approximately 3.5 bytes per point: 1.5 bytes for the timestamp and 2 bytes for the value. This compares to 16 bytes for uncompressed storage -- a 4.6x improvement.
+
+### Dictionary Compression for Label Values
+
+Label values in time-series data are repeated across many data points. The label `status="200"` appears in every data point that has a successful HTTP response. Dictionary compression maps each unique label value to an integer ID and stores only the ID in the data point.
+
+```text
+Dictionary compression:
+  Label values encountered: {"200", "201", "204", "301", "302", "400", "401", "403", "404", "500"}
+  Dictionary: {"200"=0, "201"=1, "204"=2, "301"=3, "302"=4, "400"=5, "401"=6, "403"=7, "404"=8, "500"=9}
+
+  Original: status="200" (9 bytes) + method="GET" (7 bytes) = 16 bytes per data point
+  Compressed: status=0 (1 byte) + method=0 (1 byte) = 2 bytes per data point
+  Compression ratio: 8:1
+```
+
+Dictionary compression is most effective for low-cardinality labels (under 10,000 unique values). For high-cardinality labels like user IDs, the dictionary itself becomes large and the compression ratio approaches zero. This is another reason to avoid high-cardinality labels in metric dimensions.
+
+---
+
+The internal architecture of a monitoring system reveals why monitoring pipelines fail at scale: the gap between what you think you collect and what you actually collect is determined by buffer sizes, flush intervals, and compaction schedules. The next chapter shows how to build a monitoring architecture that handles 10 million concurrent users across three regions without losing data.

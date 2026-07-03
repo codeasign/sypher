@@ -1,0 +1,911 @@
+---
+id: url-shortener-pattern-architecture
+title: URL Shortener Pattern at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+Before examining a production-grade architecture, consider the simplest possible implementation: a single web server with a relational database. This naive approach reveals the scaling bottlenecks that motivate every architectural decision in a real system.
+
+### Single-Server Design
+
+The naive implementation consists of:
+
+- One application server (Python Flask, Ruby on Rails, or Node.js Express)
+- One relational database (SQLite or MySQL on the same machine)
+- No cache layer
+- No CDN
+- No analytics pipeline
+
+The application exposes two endpoints:
+
+```python
+@app.route('/shorten', methods=['POST'])
+def shorten():
+    url = request.json['url']
+    code = generate_short_code(url)
+    db.execute("INSERT INTO mappings (code, url) VALUES (%s, %s)", (code, url))
+    return {'short_url': f'https://short.link/{code}'}
+
+@app.route('/<code>')
+def redirect(code):
+    row = db.query("SELECT url FROM mappings WHERE code = %s", code)
+    if row:
+        return redirect(row['url'], code=302)
+    return 'Not found', 404
+```
+
+### Bottleneck Analysis
+
+This implementation fails under any real load. Let us analyze the bottlenecks:
+
+1. **Database CPU saturation**: A single MySQL instance handles approximately 10,000 simple queries per second. Beyond this, queries queue up and latency spikes. At 50,000 redirects per second, the database spends 80 percent of its time in context switching and row locking.
+
+2. **Connection pool exhaustion**: The application server uses a connection pool of 50 connections. At 10,000 req/s with a 5ms query time, 50 concurrent connections are saturated. New requests wait for a connection, adding queuing latency.
+
+3. **No cache, every request hits the database**: A popular short URL with 100,000 visits per hour generates 100,000 database queries. The database handles all of them, including repeated lookups for the same short code. The buffer pool may cache frequently accessed pages, but the database still does B-tree traversal for each lookup.
+
+4. **Single point of failure**: The application server fails, the system is down. The database fails, the system is down. The machine runs out of disk, the system is down. There is no redundancy at any layer.
+
+5. **No horizontal scaling**: A single server has a hard limit on CPU cores, memory, and network bandwidth. To handle more traffic, you must replace the server with a larger one (vertical scaling), which has a ceiling and is expensive.
+
+6. **No analytics**: Every click is a database update that contends with reads. The `click_count` column must be updated atomically, which locks the row and blocks concurrent reads:
+
+```sql
+UPDATE mappings SET click_count = click_count + 1 WHERE code = 'aB3xK9';
+```
+
+This UPDATE acquires a row-level lock. At high concurrency, writes queue behind the lock, and read queries are blocked by the dirty row in InnoDB's MVCC.
+
+<AsciiDiagram
+  id="url-shortener-pattern/architecture-naive"
+  title="Naive Single-Server Architecture"
+  alt="Single server with application and database colocated showing the bottleneck at the database"
+  caption="The naive implementation has a single bottleneck: every redirect request hits the database directly"
+  content={`
+  ┌──────────────────────────────────────────┐
+  │         Single Server Machine            │
+  │                                          │
+  │  ┌──────────────────────────────────┐   │
+  │  │  Application Server              │   │
+  │  │  Flask / Express / Rails         │   │
+  │  │                                  │   │
+  │  │  POST /shorten  ────────┐        │   │
+  │  │  GET /{code}    ────────┤        │   │
+  │  │                     │   │        │   │
+  │  │  Bottleneck 1:     │   │        │   │
+  │  │  Connection pool   │   │        │   │
+  │  │  (50 connections)  │   │        │   │
+  │  └─────────────────────│───┘        │   │
+  │                        │            │   │
+  │  Bottleneck 2:  ┌──────▼─────────┐  │   │
+  │  CPU saturation  │  MySQL DB     │  │   │
+  │  at 10K QPS     │  single node  │  │   │
+  │                 │               │  │   │
+  │  Bottleneck 3:  │  No cache     │  │   │
+  │  Row lock on    │  No replicas  │  │   │
+  │  click_count    │  No CDN       │  │   │
+  │                 └───────────────┘  │   │
+  │                                     │   │
+  │  Max throughput: ~10,000 req/s     │   │
+  │  Availability: single point of     │   │
+  │  failure                                │
+  └──────────────────────────────────────────┘
+`} />
+
+## Production-Grade Architecture
+
+A production-grade URL shortener decouples every concern into independently scalable components. The architecture follows a layered design with clear separation between the read path and the write path.
+
+### Layered Architecture
+
+The production architecture has five layers:
+
+1. **Edge Layer**: DNS routing, DDoS protection, CDN caching, TLS termination. This layer absorbs the majority of traffic for cached 301 redirects and shields the origin from attacks.
+
+2. **API Gateway Layer**: Request routing, authentication, rate limiting, request validation. This layer filters bad requests before they reach the application servers.
+
+3. **Application Layer**: Stateless application servers that handle shorten and redirect logic. These servers are horizontally scalable behind a load balancer.
+
+4. **Cache Layer**: Redis cluster providing sub-millisecond reads for the hot set of short codes. The cache layer is the primary read path, absorbing 95 percent or more of redirect traffic.
+
+5. **Data Layer**: Database cluster with a primary for writes and replicas for reads. This layer is the system of record and the fallback for cache misses.
+
+<AsciiDiagram
+  id="url-shortener-pattern/architecture-production"
+  title="Production-Grade Layered Architecture"
+  alt="Five-layer architecture showing edge, gateway, application, cache, and data layers with traffic flow"
+  caption="The production architecture decouples each concern into independently scalable layers"
+  content={`
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Edge Layer                                                 │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
+  │  │ Route 53 │  │ CloudFlare│  │  CDN     │                  │
+  │  │  DNS     │  │  DDoS     │  │  Edge    │                  │
+  │  └──────────┘  └──────────┘  └──────────┘                  │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+  ┌──────────────────────────▼──────────────────────────────────┐
+  │  API Gateway Layer                                          │
+  │  ┌──────────────────────────────────────────────────────┐  │
+  │  │  Kong / Envoy / AWS API Gateway                      │  │
+  │  │  Rate limiting │ Auth │ Request validation           │  │
+  │  └──────────────────────────────────────────────────────┘  │
+  └──────────────────────────┬──────────────────────────────────┘
+                             │
+  ┌──────────────────────────▼──────────────────────────────────┐
+  │  Application Layer (Stateless, Horizontally Scalable)       │
+  │                                                             │
+  │  ┌────────────┐  ┌────────────┐  ┌────────────┐            │
+  │  │ Shorten    │  │ Shorten    │  │ Shorten    │            │
+  │  │ Service A  │  │ Service B  │  │ Service C  │            │
+  │  └────────────┘  └────────────┘  └────────────┘            │
+  └──────────┬──────────────────┬───────────────────────────────┘
+             │                  │
+  ┌──────────▼──────┐  ┌───────▼───────────────────────────────┐
+  │  Cache Layer    │  │  Data Layer                            │
+  │  Redis Cluster  │  │  DB Primary     ┌──────────────────┐  │
+  │  16 nodes       │  │  (writes)      │ DB Replica 1     │  │
+  │  16 GB each     │  │  ┌──────────┐  │ (reads)           │  │
+  │  LRU eviction   │  │  │ Primary  │  └──────────────────┘  │
+  │  95%+ hit rate  │  │  └──────────┘  ┌──────────────────┐  │
+  └─────────────────┘  │               │ DB Replica 2     │  │
+                        │               │ (reads)           │  │
+                        │               └──────────────────┘  │
+                        │               ┌──────────────────┐  │
+                        │               │ DB Replica 3     │  │
+                        │               │ (reads)           │  │
+                        │               └──────────────────┘  │
+                        └──────────────────────────────────────┘
+`} />
+
+### Component Details
+
+**Edge Layer**: The edge layer is the first point of contact for every request. DNS routing uses latency-based routing to direct users to the nearest edge location. DDoS protection (Cloudflare, AWS Shield, or Google Cloud Armor) absorbs L3/L4 attacks and filters malicious traffic. The CDN caches 301 redirect responses at the edge, serving them without contacting the origin.
+
+**API Gateway**: The API gateway terminates TLS, authenticates API clients via API keys or OAuth2 tokens, enforces rate limits (100 shorten requests per minute per user), and validates request payloads. The gateway routes POST /shorten requests to the application layer and GET /{code} requests to the redirect engine.
+
+**Application Layer**: Application servers are stateless and horizontally scalable. Each server runs the shortener application code. The servers are deployed behind a load balancer (ALB, NLB, or HAProxy) that distributes traffic using round-robin or least-connections. Servers are auto-scaled based on CPU utilization (target 60 percent) and request queue depth (target 1000 requests).
+
+**Cache Layer**: The Redis cluster uses consistent hashing to distribute keys across nodes. Each node has a primary and two replicas for high availability. The cluster auto-fails over when a primary node becomes unreachable. Cache eviction uses the allkeys-lru policy.
+
+**Data Layer**: The database cluster uses MySQL or PostgreSQL with one primary and multiple read replicas. All writes go to the primary. Reads go to replicas, with the option to read from the primary for read-after-write consistency. Replication lag is monitored and alerts trigger at 5 seconds of lag.
+
+### Read Path vs Write Path
+
+The read path (redirect) and write path (shorten) have different latency and consistency requirements. The architecture treats them as separate concerns.
+
+**Read path flow**:
+1. Browser resolves DNS to CDN edge.
+2. CDN checks for cached redirect response. If cached (301), return immediately.
+3. CDN forwards to API gateway.
+4. Gateway validates rate limit (redirects are not rate-limited per code below 10,000 req/s).
+5. Application server extracts short code from path.
+6. Application checks local LRU cache (L1).
+7. On L1 miss, checks Redis cluster (L2).
+8. On L2 miss, queries database read replica (L3).
+9. Application constructs redirect response (301 or 302).
+10. Application emits click event to Kafka (async).
+11. Response is returned through the gateway and CDN to the browser.
+
+**Write path flow**:
+1. Client sends POST /shorten with authentication header.
+2. API gateway validates API key and rate limit.
+3. Application validates URL format and checks blocklist.
+4. Application generates short code (hash, sequential, or Snowflake).
+5. Application checks for collisions (hash-based only).
+6. Application INSERTs row into the database primary.
+7. Application writes cache entry (write-through).
+8. Application returns short URL to client.
+
+### Service Mesh Integration
+
+Beyond the layered architecture, a service mesh provides observability, security, and reliability features that benefit a distributed URL shortener. When deploying with a service mesh like Istio or Linkerd, the following capabilities become available:
+
+- **Mutual TLS**: All inter-service communication is encrypted and authenticated. The cache layer, database, and application servers verify each other's identity before accepting connections. This prevents man-in-the-middle attacks within the data center.
+
+- **Traffic splitting**: The service mesh can split traffic between two versions of the shortener for canary deployments. For example, 95 percent of traffic goes to the stable version and 5 percent goes to the new version for 15 minutes before a full rollout.
+
+- **Circuit breaking**: If the Redis cluster starts responding slowly, the service mesh circuit breaker trips and stops sending requests to the affected nodes. The application falls back to the database. After a cooldown period, the circuit breaker allows a probe request to test recovery.
+
+- **Distributed tracing**: Every request is assigned a trace ID that propagates through the application server, cache, database, and analytics pipeline. This enables end-to-end latency analysis and root cause identification for slow requests.
+
+- **Retry and timeout policies**: The service mesh handles retries for transient failures (network timeouts, connection resets) with exponential backoff. Timeouts at each hop prevent cascading failures.
+
+```yaml
+# Istio VirtualService for the shortener
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: shortener-redirect
+spec:
+  hosts:
+  - shortener.example.com
+  http:
+  - match:
+    - uri:
+        prefix: /api/shorten
+    route:
+    - destination:
+        host: shortener-api
+        port: 8080
+    timeout: 2s
+    retries:
+      attempts: 2
+      perTryTimeout: 1s
+  - match:
+    - uri:
+        regex: '^/[a-zA-Z0-9]{6,8}$'
+    route:
+    - destination:
+        host: shortener-redirect
+        port: 8080
+    timeout: 0.5s
+    retries:
+      attempts: 1
+      perTryTimeout: 0.3s
+```
+
+## Integration Patterns
+
+External systems integrate with the shortener through a REST API. This is the most common integration pattern. The client calls the API to create short URLs and potentially manages them through update and delete endpoints.
+
+```json
+POST /api/v1/shorten
+Authorization: Bearer <api_key>
+Content-Type: application/json
+
+{
+  "url": "https://example.com/long/path",
+  "custom_slug": "my-campaign",
+  "ttl_seconds": 604800,
+  "tags": ["campaign", "summer2025"]
+}
+```
+
+The API response includes the short URL and metadata for client-side display. The client stores the mapping locally or displays it to the user.
+
+API-based integration is suitable for:
+- Marketing platforms that shorten URLs in bulk
+- Content management systems that auto-shorten links in articles
+- Social media management tools that track link performance
+- Mobile apps that share links within the app
+
+### Pattern 2: Redirect-Only Integration
+
+In this pattern, the shortener acts as a transparent redirect service. The client never calls the API directly. Instead, the administrator pre-loads the shortener with mappings, and the shortener only serves redirects.
+
+This pattern is used for:
+- URL shortening services that provide a self-service web UI
+- Enterprise link management systems where only administrators create links
+- Static redirect tables generated from configuration files
+
+The redirect-only integration is simpler and more secure because there is no API surface for external clients to attack. All mapping changes go through an admin panel with authentication and audit logging.
+
+### Pattern 3: Embedding via SDK
+
+The shortener provides an SDK (JavaScript, Python, Ruby, Go) that clients integrate directly into their applications. The SDK wraps the API with retry logic, automatic token refresh, and batch operations.
+
+```javascript
+// JavaScript SDK example
+import ShortenerClient from '@shortener/sdk';
+
+const client = new ShortenerClient({
+  apiKey: process.env.SHORTENER_API_KEY,
+  baseUrl: 'https://shortener.internal.company',
+});
+
+// Create a short URL with one call
+const shortUrl = await client.shorten(
+  'https://example.com/long/path',
+  { ttl: 86400 }
+);
+
+// Create multiple short URLs in a batch
+const results = await client.shortenBatch([
+  { url: 'https://example.com/page1', tags: ['campaign-a'] },
+  { url: 'https://example.com/page2', tags: ['campaign-a'] },
+  { url: 'https://example.com/page3', tags: ['campaign-a'] },
+]);
+```
+
+The SDK handles:
+- Token-based authentication with automatic refresh
+- Request retries with exponential backoff (3 retries, 1s/2s/4s intervals)
+- Batch operations for bulk URL shortening
+- Local caching of recently created short URLs
+- Analytics event emission for tracking
+
+### Pattern 4: Webhook-Based Integration
+
+The shortener emits webhook events when specific actions occur. Webhooks enable event-driven integrations where external systems react to shortener events in real time.
+
+Supported webhook events:
+- `link.created`: Fired when a new short URL is created. Payload includes short code, long URL, owner, timestamp.
+- `link.clicked`: Fired when a short URL receives a click. Payload includes short code, timestamp, visitor IP, referrer, user agent.
+- `link.expired`: Fired when a short URL's TTL expires. Payload includes short code and original creation time.
+- `link.deactivated`: Fired when a short URL is manually deactivated. Payload includes short code and deactivation reason.
+
+Webhook delivery guarantees:
+- At-least-once delivery: Each event is delivered at least once. The receiver must deduplicate by event ID.
+- Retry with backoff: Failed deliveries are retried 5 times with 1-minute intervals.
+- Dead letter queue: Events that fail all retries are sent to a dead letter queue for manual inspection.
+
+```json
+// Webhook payload for link.clicked event
+POST https://client.example.com/shortener-webhook
+Content-Type: application/json
+
+{
+  "event_id": "evt_abc123",
+  "event_type": "link.clicked",
+  "timestamp": 1751500000123,
+  "data": {
+    "short_code": "aB3xK9",
+    "long_url": "https://example.com/page",
+    "visitor": {
+      "ip": "203.0.113.42",
+      "country": "US",
+      "user_agent": "Mozilla/5.0..."
+    },
+    "metadata": {
+      "campaign": "summer2025"
+    }
+  }
+}
+```
+
+### Pattern 5: Serverless Integration
+
+For low-to-medium volume use cases, the URL shortener can be deployed as a serverless function. AWS Lambda, Google Cloud Functions, or Cloudflare Workers provide the compute layer without managing servers. This is the simplest integration pattern for teams that do not want to operate infrastructure.
+
+```javascript
+// Cloudflare Worker as a URL shortener
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const code = url.pathname.slice(1);
+
+    // KV store lookup (sub-millisecond reads at edge)
+    const longUrl = await env.SHORTENER_KV.get(code);
+    if (longUrl) {
+      return Response.redirect(longUrl, 302);
+    }
+
+    return new Response('Not found', { status: 404 });
+  }
+};
+```
+
+Serverless integration considerations:
+- **Cold start latency**: The first request to a serverless function may take 100-500ms for initialization. Keep the function warm with a periodic ping (every 5 minutes).
+- **Execution duration limits**: Most serverless platforms limit execution to 15 seconds. This is sufficient for a single redirect but may constrain batch operations.
+- **Concurrency limits**: Account-level concurrency limits (1000 concurrent executions for Lambda) may be hit during viral traffic spikes.
+- **Stateful storage**: Use serverless-compatible storage: DynamoDB, Cloudflare KV, or Google Firestore. These services have their own latency and consistency characteristics.
+
+The serverless pattern is ideal for:
+- Internal team tools with fewer than 10,000 links
+- Prototype and MVP deployments
+- Event-driven integrations (shorten on file upload, shorten on form submission)
+- Edge computing use cases where sub-100ms global redirects are required
+
+## Multi-Region Architecture
+
+A global URL shortener must serve redirects with low latency from every geographic region. A single-region deployment adds 100-300 milliseconds of latency for users on other continents, which is unacceptable for a redirect service.
+
+### Data Partitioning Strategy
+
+As the dataset grows beyond 1 billion rows, the database must be partitioned to maintain query performance. Two primary partitioning strategies apply to URL shorteners.
+
+**Range partitioning by creation date**: Newer short URLs are accessed more frequently than older ones, following a power-law distribution. Partitioning by creation date allows the database to keep hot partitions in memory while cold partitions remain on disk.
+
+```sql
+CREATE TABLE url_mappings (
+    short_code VARCHAR(8) NOT NULL,
+    long_url VARCHAR(2048) NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    -- other columns
+) ENGINE=InnoDB
+PARTITION BY RANGE (TO_DAYS(created_at)) (
+    PARTITION p_2024_01 VALUES LESS THAN (TO_DAYS('2024-02-01')),
+    PARTITION p_2024_02 VALUES LESS THAN (TO_DAYS('2024-03-01')),
+    PARTITION p_2024_03 VALUES LESS THAN (TO_DAYS('2024-04-01')),
+    PARTITION p_2024_04 VALUES LESS THAN (TO_DAYS('2024-05-01')),
+    PARTITION p_2024_05 VALUES LESS THAN (TO_DAYS('2024-06-01')),
+    PARTITION p_future VALUES LESS THAN MAXVALUE
+);
+```
+
+**Hash partitioning by short code prefix**: Spreading data evenly across partitions using a hash function. This is the best strategy for uniform access patterns and avoids hot partitions.
+
+```sql
+CREATE TABLE url_mappings (
+    short_code VARCHAR(8) NOT NULL,
+    long_url VARCHAR(2048) NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (short_code, created_at) -- composite key for partition pruning
+) ENGINE=InnoDB
+PARTITION BY KEY (short_code)
+PARTITIONS 128;
+```
+
+The hash partitioning strategy with 128 partitions distributes data evenly across all partitions. Each partition contains approximately 0.78 percent of the total data. Queries with an equality condition on `short_code` prune 127 partitions and scan only one, achieving near-constant lookup time regardless of dataset size.
+
+### Active-Active Multi-Region
+
+In the active-active pattern, each region runs a full deployment of the shortener. Each region has its own application servers, cache cluster, and database primary. Data is replicated between regions asynchronously.
+
+```
+Region us-east-1:
+  Application: 20 servers behind ALB
+  Cache: Redis cluster (4 shards, 3 replicas)
+  Database: MySQL primary (writes for codes starting 1-4)
+
+Region eu-west-1:
+  Application: 15 servers behind ALB
+  Cache: Redis cluster (4 shards, 3 replicas)
+  Database: MySQL primary (writes for codes starting 5-8)
+
+Region ap-southeast-1:
+  Application: 15 servers behind ALB
+  Cache: Redis cluster (4 shards, 3 replicas)
+  Database: MySQL primary (writes for codes starting 9-C)
+```
+
+The short code prefix determines which region owns the code. The first character of the base-62 code maps to a region:
+
+- `0-3` (digits): us-east-1
+- `4-7` (digits): eu-west-1
+- `8-9`, `a-g` (digits + lowercase): ap-southeast-1
+- `h-z`, `A-Z` (lowercase + uppercase): us-west-2
+
+The CDN routes the redirect request to the region that owns the code using the first character of the path. This ensures that the redirect always hits the region with the mapping in its local database.
+
+### Read-after-Write Consistency in Multi-Region
+
+A challenging consistency problem in multi-region deployments is read-after-write consistency: a user creates a short URL in one region and immediately visits it from another region. The redirect request arrives at the second region before the replication completes, and the link appears not to exist.
+
+Solutions for this specific problem:
+
+1. **Region-sticky creation redirect**: After creating the short URL, the API response includes a redirect to the short URL that routes through the same region. The client follows this redirect before sharing the link, ensuring the cache in the local region is populated.
+
+2. **Write-forward on miss**: When a region receives a redirect for a code it does not own, it forwards the request to the owning region before responding. This adds 50-150ms of latency but ensures consistency.
+
+3. **Global cache with multi-region writes**: The cache layer uses a global replication mechanism (Redis CRDTs or Dynomite). Cache writes in any region propagate to all regions within 100ms. The redirect path reads from the local cache and rarely sees a miss.
+
+4. **Wait-for-replication API**: The create endpoint accepts a `wait_for_replication` parameter. When set to `true`, the API does not return until the data is replicated to N regions. This adds latency to the create path but guarantees read-after-write consistency.
+
+```python
+@app.route('/shorten', methods=['POST'])
+def shorten():
+    # ... generate code, insert into local DB ...
+    if request.json.get('wait_for_replication', False):
+        # Wait for replication to 2 additional regions
+        target_regions = ['eu-west-1', 'ap-southeast-1']
+        for region in target_regions:
+            wait_for_replication(code, region, timeout=5.0)
+    return {'short_url': short_url}
+```
+
+### Active-Passive with Global Database
+
+In the active-passive pattern, one region is active and serves all traffic. The passive region runs on standby with a replicated copy of the data. If the active region fails, DNS routing switches to the passive region.
+
+```
+Normal operation:
+  Traffic → CDN → us-east-1 (active) → local cache + DB
+  eu-west-1 (passive): warm standby, replicating from us-east-1
+
+Failover:
+  Traffic → CDN → eu-west-1 (now active) → local cache + DB
+  Replication direction reverses: eu-west-1 → us-east-1
+```
+
+The passive region runs the full application stack but receives no traffic. The database replica continuously applies changes from the active region's primary. The cache in the passive region is pre-warmed by replaying the last 24 hours of redirect traffic.
+
+### Cross-Region Data Replication
+
+Regardless of the pattern, cross-region data replication is essential. MySQL binary log replication streams all writes from the primary region to replica regions:
+
+```
+Region A (Primary)            Region B (Replica)
+    │                              │
+    │  INSERT url_mappings         │
+    │  ...                         │
+    │                              │
+    │  Binary log (binlog)         │
+    │  Capture changes             │
+    │                              │
+    │  ──────── binlog stream ────>│
+    │                              │
+    │                    Apply relay log
+    │                    INSERT url_mappings
+    │                    (same row)
+```
+
+Replication lag between nearby regions (us-east-1 to us-west-2) is typically 100-500 milliseconds. Between distant regions (us-east-1 to ap-southeast-1), lag is typically 1-3 seconds. The shortener must tolerate this lag: a user who creates a link in us-east-1 may experience a short window where the link is not visible in ap-southeast-1.
+
+<AsciiDiagram
+  id="url-shortener-pattern/architecture-multiregion"
+  title="Multi-Region Architecture"
+  alt="Three-region deployment showing active-active with code prefix routing and cross-region replication"
+  caption="Multi-region deployments use code prefix routing to ensure redirects are served from the owning region"
+  content={`
+                    ┌───────────────────────────┐
+                    │    Global DNS / CDN        │
+                    │    Route 53 / Cloudflare   │
+                    │                            │
+                    │  Route by short code       │
+                    │  prefix to nearest region  │
+                    └──┬────────────┬───────────┬─┘
+                       │            │           │
+          ┌────────────┘            │           └────────────┐
+          │                         │                        │
+  ┌───────▼────────┐     ┌─────────▼──────┐     ┌───────────▼──────┐
+  │ us-east-1      │     │ eu-west-1      │     │ ap-southeast-1   │
+  │                │     │                │     │                  │
+  │ Application    │     │ Application    │     │ Application      │
+  │ (20 servers)   │     │ (15 servers)   │     │ (15 servers)     │
+  │                │     │                │     │                  │
+  │ Redis Cluster  │     │ Redis Cluster  │     │ Redis Cluster    │
+  │ 16 GB x 4      │     │ 16 GB x 3      │     │ 16 GB x 3        │
+  │                │     │                │     │                  │
+  │ MySQL Primary  │     │ MySQL Primary  │     │ MySQL Primary    │
+  │ Codes: 0-3     │     │ Codes: 4-7     │     │ Codes: 8-C       │
+  │                │     │                │     │                  │
+  └────────────────┘     └────────────────┘     └──────────────────┘
+        │                       │                       │
+        └───────────────────────┼───────────────────────┘
+                                │
+                     ┌──────────▼──────────┐
+                     │  Async binlog       │
+                     │  Replication        │
+                     │  Full mesh between  │
+                     │  all region pairs   │
+                     └─────────────────────┘
+`} />
+
+## Capacity Planning
+
+### Traffic Projections
+
+Capacity planning starts with traffic projections. For a URL shortener serving 100 million monthly active users:
+
+| Metric | Daily | Monthly | Yearly |
+|--------|-------|---------|--------|
+| New short URLs created | 10 million | 300 million | 3.6 billion |
+| Redirect requests | 500 million | 15 billion | 180 billion |
+| Peak redirect rate (req/s) | 15,000 | -- | -- |
+| Click events generated | 500 million | 15 billion | 180 billion |
+| Cache hit rate target | 95% | 95% | 95% |
+| Storage growth (GB/day) | 3 GB | 90 GB | 1.1 TB |
+
+### Storage Projections
+
+Storage projections account for dataset growth over 5 years:
+
+| Component | Year 1 | Year 3 | Year 5 |
+|-----------|--------|--------|--------|
+| URL mappings table | 300 GB | 1 TB | 2 TB |
+| Indexes on mappings | 50 GB | 180 GB | 350 GB |
+| Click events (90 days) | 15 TB | 45 TB | 75 TB |
+| Aggregated analytics | 500 GB | 1.5 TB | 2.5 TB |
+| Cache memory | 16 GB | 32 GB | 64 GB |
+| **Total storage** | **16 TB** | **48 TB** | **80 TB** |
+
+### Server Sizing
+
+Based on the traffic projections, server sizing for each layer:
+
+| Layer | Server Type | Count | Capacity per Server | Total Capacity |
+|-------|------------|-------|-------------------|---------------|
+| Application | 8 vCPU, 16 GB RAM | 20 | 5,000 req/s | 100,000 req/s |
+| Redis cache | 16 vCPU, 32 GB RAM | 8 (4 primary + 4 replica) | 50,000 ops/s | 400,000 ops/s |
+| DB primary | 32 vCPU, 64 GB RAM, 4 TB SSD | 1 per region | 10,000 writes/s | 10,000 writes/s |
+| DB replica | 16 vCPU, 32 GB RAM, 2 TB SSD | 4 per region | 20,000 reads/s | 80,000 reads/s |
+| Kafka | 8 vCPU, 32 GB RAM, 2 TB SSD | 6 | 200 MB/s | 1.2 GB/s |
+
+### Database Connection Pool Architecture
+
+The database connection pool is a critical component that bridges the application and data layers. Proper sizing and management prevent cascading failures.
+
+Connection pool architecture:
+- **Primary pool**: Dedicated pool for write operations (shorten, update, delete). Size: 10 connections. All writes are routed through the primary database node.
+- **Read pool**: Shared pool for read operations (redirect lookups, analytics queries). Size: 75 connections. Read connections are distributed across read replicas using round-robin load balancing.
+- **Admin pool**: Separate pool for administrative queries (data export, bulk operations). Size: 5 connections. This pool is isolated to prevent admin queries from starving production traffic.
+
+Connection pool health checks:
+- Each connection is tested with a ping query every 30 seconds.
+- Connections that fail the ping are removed from the pool and replaced.
+- If the pool is exhausted, new requests wait in a queue with a 5-second timeout. If the timeout expires, the request returns a 503 Service Unavailable response.
+
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.pool import QueuePool
+
+# Primary pool: writes
+write_engine = create_engine(
+    'mysql://user:pass@primary:3306/shortener',
+    poolclass=QueuePool,
+    pool_size=10,
+    max_overflow=5,
+    pool_timeout=5,
+    pool_recycle=3600,
+    pool_pre_ping=True,
+)
+
+# Read pool: redirect lookups
+read_engine = create_engine(
+    'mysql://user:pass@replica-lb:3306/shortener',
+    poolclass=QueuePool,
+    pool_size=75,
+    max_overflow=20,
+    pool_timeout=5,
+    pool_recycle=3600,
+    pool_pre_ping=True,
+)
+```
+
+### Cost Estimation
+
+Monthly infrastructure cost estimate (3-region, production grade):
+
+| Service | Configuration | Monthly Cost |
+|---------|---------------|-------------|
+| Application servers | 20 x c5.2xlarge ($200 each) | $4,000 |
+| Redis cache | 8 x r5.xlarge ($250 each) | $2,000 |
+| Database primary | 1 x r5.8xlarge ($1,600) | $1,600 |
+| Database replicas | 4 x r5.4xlarge ($800 each) | $3,200 |
+| Kafka cluster | 6 x m5.4xlarge ($600 each) | $3,600 |
+| CDN + DNS | Cloudflare Enterprise | $500 |
+| Load balancers | 3 x ALB ($300 each) | $900 |
+| Data transfer | 500 TB/month egress | $5,000 |
+| **Total per region** | | **$9,200** |
+| **Total 3 regions** | | **$27,600** |
+
+This is a rough estimate for a mid-scale production deployment. Costs vary significantly based on cloud provider, reserved instance discounts, and negotiated rates.
+
+## Operations
+
+### Backup and Disaster Recovery
+
+A URL shortener's data is critical -- losing a mapping means all short URLs pointing to that mapping break permanently. Backup and disaster recovery strategy must account for this.
+
+**Backup schedule**:
+- **Full database backup**: Daily at 02:00 UTC. Retention: 30 daily backups, 12 monthly backups, 3 yearly backups.
+- **Binary log backup**: Continuous. Binlog files are streamed to S3/GCS with 1-minute granularity. Retention: 7 days.
+- **Configuration backup**: Every configuration change is versioned and stored in Git. Includes feature flags, rate limits, and routing rules.
+- **Analytics data backup**: Raw click events are stored in the data warehouse with 90-day retention. Aggregated data is backed up weekly.
+
+**Recovery point objective (RPO)**: The maximum acceptable data loss. For a URL shortener, losing 1 minute of data is acceptable (some recently created links would not be restored). RPO target: 1 minute.
+
+**Recovery time objective (RTO)**: The maximum acceptable downtime. For a production URL shortener, 1 hour of downtime means millions of broken links. RTO target: 30 minutes.
+
+**Recovery procedure**:
+1. Provision a new database instance from the latest full backup.
+2. Apply binary log backups up to the recovery point (1 minute before failure).
+3. Verify data integrity by sampling 1000 random short codes and confirming they resolve.
+4. Point application servers to the restored database.
+5. Warm the cache from the database by replaying the last 24 hours of redirect traffic.
+
+### Disaster Recovery Drills
+
+Quarterly disaster recovery drills validate the backup and recovery procedures:
+
+```text
+Drill: Database Region Failure
+Date: 2025-07-03
+Scope: Simulate complete loss of us-east-1 database primary
+
+Steps:
+1. Cut off network access to us-east-1 DB primary (simulate failure)
+2. Promote us-east-1 replica to new primary ─── 3 minutes
+3. Update DNS to point to new primary ─── 2 minutes
+4. Verify redirect path works ─── 1 minute
+5. Verify create path works ─── 1 minute
+6. Verify analytics pipeline still receiving events ─── 2 minutes
+Total recovery time: 9 minutes  (target: under 30 minutes)
+
+Lessons learned:
+- DNS cache caused 2-minute delay for some clients
+- Reduce TTL on shortener DNS records from 300s to 60s
+- Update runbook to include DNS TTL reduction step
+```
+
+### Deployment Strategy
+
+The shortener is deployed using a blue-green deployment strategy with zero downtime:
+
+1. **Blue environment**: The currently active deployment serving production traffic.
+2. **Green environment**: The new deployment, fully provisioned and tested but not receiving traffic.
+3. **Switch**: The load balancer switches traffic from blue to green.
+4. **Verify**: The green deployment is monitored for 15 minutes.
+5. **Cleanup**: The blue environment is decommissioned if the deployment is successful.
+
+Database schema changes follow a separate process:
+- **Forward-compatible changes**: Add columns, add indexes, create new tables. These changes are deployed to the database first, then the application is updated.
+- **Breaking changes**: Remove columns, rename columns, change column types. These follow a multi-step process: add new column, dual-write for one release cycle, migrate data, remove old column.
+
+### Auto-Scaling Configuration
+
+The application layer uses auto-scaling to handle traffic spikes. Auto-scaling is configured based on multiple metrics that together provide a reliable picture of demand.
+
+```yaml
+# AWS Auto Scaling configuration
+AutoScalingGroup:
+  MinSize: 10
+  MaxSize: 100
+  DefaultCooldown: 120
+
+  ScalingPolicies:
+    - Metric: CPUUtilization
+      TargetValue: 60
+      ScaleOutCooldown: 60
+      ScaleInCooldown: 300
+
+    - Metric: ALBRequestCountPerTarget
+      TargetValue: 5000
+      ScaleOutCooldown: 60
+      ScaleInCooldown: 300
+
+  ScheduledActions:
+    - Name: MorningPeak
+      Schedule: "cron(0 8 * * ? *)"
+      MinSize: 20
+      MaxSize: 150
+
+    - Name: EveningCooldown
+      Schedule: "cron(0 22 * * ? *)"
+      MinSize: 10
+      MaxSize: 100
+```
+
+The auto-scaling configuration includes:
+- **CPU-based scaling**: The primary metric for general load. Target 60 percent CPU utilization provides headroom for traffic spikes.
+- **Request-based scaling**: Secondary metric for sudden traffic changes. Target 5,000 requests per second per target.
+- **Scheduled scaling**: Anticipates known traffic patterns. Morning peak (8 AM local time) doubles the minimum instance count. Evening cooldown (10 PM) returns to the baseline.
+- **Scale-in protection**: Instances are protected from scale-in for 15 minutes after launch. This prevents rapid oscillation.
+- **Lifecycle hooks**: Instances being terminated drain connections for 30 seconds before shutting down. In-flight redirects complete successfully.
+
+### Monitoring Dashboards
+
+Five key dashboards monitor the health of the URL shortener:
+
+1. **Redirect Dashboard**: Request rate, latency (P50/P95/P99), error rate, cache hit rate, and status code breakdown. Updated every 15 seconds.
+2. **Create Dashboard**: Creation rate, validation errors, collision rate, key generation latency, and rate-limited requests. Updated every 30 seconds.
+3. **Cache Dashboard**: Memory usage, eviction rate, hit rate per node, CPU utilization, and network throughput. Updated every 10 seconds.
+4. **Database Dashboard**: Query throughput, replication lag, connection pool utilization, slow query log, and deadlock count. Updated every 30 seconds.
+5. **Analytics Dashboard**: Event throughput, Kafka consumer lag, stream processor latency, and warehouse ingestion rate. Updated every 60 seconds.
+
+### Incident Response
+
+Common incidents and their response procedures:
+
+| Incident | Symptoms | Response |
+|----------|----------|----------|
+| Cache cluster failure | Redirect latency spikes, error rate increases | Fail over to replica cluster. If no replica, scale database connection pool to absorb direct reads. |
+| Database primary failure | Create endpoint returns errors, writes fail | Promote replica to primary. Update connection pool configuration. Verify data integrity. |
+| CDN outage | Redirects return 502 from edge | Disable CDN caching. Route traffic directly to API gateway. Re-enable CDN after resolution. |
+| Hot key overload | Single short code causes database throughput | Add local L1 cache. Rate-limit per-code redirects. Serve 503 for excess requests. |
+| Replication lag spike | Read-after-write consistency violated | Route reads from replica to primary temporarily. Investigate binlog apply bottleneck. |
+
+### Security Architecture
+
+Security in a URL shortener spans multiple layers:
+
+**API Security**:
+- API keys are hashed with bcrypt before storage. Keys are prefixed with a key type identifier (`sk_live_`, `sk_test_`) for easy identification.
+- Rate limiting is applied per API key and per IP address. The rate limiter uses a sliding window algorithm (Redis sorted set) for accurate counting.
+- Request validation rejects URLs exceeding 2048 characters, URLs with invalid schemes (javascript:, data:, file:), and URLs pointing to internal IP addresses (169.254.x.x, 10.x.x.x, 172.16-31.x.x, 192.168.x.x).
+
+**Data Security**:
+- All data is encrypted at rest using AES-256. Database volume encryption, backup encryption, and cache encryption are all enabled.
+- Click event data is pseudonymized after 30 days. IP addresses are replaced with geolocation data. User agent strings are replaced with device type classifications.
+- Short codes use a non-predictable alphabet to prevent sequential enumeration of all short URLs.
+
+**Access Control**:
+- Administrative API endpoints require multi-factor authentication.
+- Read-only API keys are available for users who only need to create short URLs without managing them.
+- Audit logging records every API call: who created a link, when, from which IP, and what URL was shortened.
+
+### Runbooks
+
+Each incident has a runbook with step-by-step response procedures. The runbook for a cache cluster failure:
+
+```text
+Runbook: Cache-Cluster-Failure
+Severity: P1
+SLA: 5-minute response, 30-minute resolution
+
+Steps:
+1. Verify the incident: check Redis cluster health endpoint.
+   Command: curl -s http://redis-cluster:8001/health | jq .status
+2. If primary nodes are down, trigger replica promotion:
+   Command: redis-cli -h <replica-ip> -p 6379 FAILOVER
+3. If entire cluster is down, enable database fallback mode:
+   Action: Set feature flag cache_bypass=true in config service
+   Action: Scale database read replicas to 2x current count
+4. Monitor database load and redirect latency:
+   Check: Grafana dashboard "Cache and Database"
+5. Restore Redis cluster from RDB backup:
+   Command: redis-cli --cluster restore <backup.rdb>
+6. Warm cache with top 1 million short codes from analytics data:
+   Command: python scripts/warm-cache.py --count 1000000
+7. Disable database fallback mode:
+   Action: Set feature flag cache_bypass=false
+8. Verify cache hit rate returns to 95%+:
+   Check: Grafana dashboard "Cache Hit Rate"
+9. Document incident: write postmortem, identify root cause.
+```
+
+<AsciiDiagram
+  id="url-shortener-pattern/architecture-operations"
+  title="Operations Dashboard Layout"
+  alt="Mock dashboard layout showing the five key monitoring dashboards for a URL shortener"
+  caption="Operations dashboards monitor redirect latency, cache health, database performance, and analytics pipeline"
+  content={`
+  ┌───────────────────────────────────────────────────────────┐
+  │  URL Shortener Operations Dashboard                        │
+  ├──────────────┬──────────────┬──────────────┬──────────────┤
+  │ Redirects    │ Cache Hit    │ Error Rate   │ Active Codes │
+  │ 12,450 req/s │   96.2%      │   0.08%      │  142.5M      │
+  │ P99: 8.3ms   │  Miss: 3.8%  │  4xx: 0.06%  │  Created     │
+  │ P95: 4.1ms   │  Evictions   │  5xx: 0.02%  │  today:      │
+  │ P50: 1.8ms   │  0.01%/min   │              │  342,108     │
+  ├──────────────┴──────────────┴──────────────┴──────────────┤
+  │                                                           │
+  │  Redis Cluster Health       ┌─────────────────────────┐  │
+  │  Node │ Status │ Memory     │ Cache Hit Rate (24h)    │  │
+  │  r1   │ OK     │ 68%        │  ┌──────────────────┐   │  │
+  │  r2   │ OK     │ 72%        │  │  ████████████    │   │  │
+  │  r3   │ OK     │ 45%        │  │  96.2%           │   │  │
+  │  r4   │ WARN   │ 89%        │  └──────────────────┘   │  │
+  │                                                       │  │
+  ├───────────────────────────────────────────────────────┤  │
+  │  Database Replication Lag                             │  │
+  │  us-east-1: 0.2s  eu-west-1: 0.8s  ap-southeast: 2.1s │  │
+  └───────────────────────────────────────────────────────┘  │
+`} />
+
+### SLA and SLO Definitions
+
+The production architecture is designed to meet specific service level objectives. These SLOs are defined for each API endpoint and tracked in the monitoring dashboards.
+
+| Endpoint | Availability SLO | Latency SLO (P99) | Throughput SLO |
+|----------|-----------------|-------------------|----------------|
+| GET /{code} (redirect) | 99.99% | 20ms | 100,000 req/s |
+| POST /shorten (create) | 99.95% | 200ms | 5,000 req/s |
+| DELETE /{code} (deactivate) | 99.9% | 500ms | 100 req/s |
+| GET /api/v1/stats (analytics) | 99.9% | 2s | 100 req/s |
+
+The 99.99 percent availability target for redirects means the system can be unavailable for no more than 52.6 minutes per year (4.38 minutes per month). This target drives the redundancy requirements at every layer.
+
+Error budget calculation:
+```text
+Monthly error budget = total requests * (1 - availability target)
+Example:  15 billion redirects/month * 0.01% = 1.5 million errors/month
+```
+
+When the error budget is 50 percent consumed (750,000 errors in a month), deployments are halted and the team focuses on reliability improvements until the budget recovers.
+
+## Summary
+
+This chapter walked you from a naive single-server implementation to a production-grade, multi-region architecture serving billions of redirects per month. The key architectural lessons:
+
+- **Layer your system**: Each layer (edge, gateway, application, cache, data) is independently scalable and has distinct failure modes. Design each layer to degrade gracefully when the layer below it fails.
+
+- **Separate read and write paths**: The read path (redirects) handles 99 percent of traffic and must be fast. The write path (creates) handles 1 percent of traffic and can tolerate higher latency. Decouple them at every level.
+
+- **Cache in three tiers**: Process-local cache (L1), Redis cluster (L2), and CDN edge cache (L3) provide sub-millisecond reads with 99 percent hit rate. Each tier handles a portion of the traffic and protects the tier below it.
+
+- **Plan for multi-region from day one**: Even if you start with a single region, design the data model and key generation to support multi-region routing. Short code prefixes enable regional ownership and low-latency redirects.
+
+- **Capacity plan in advance**: Storage for a URL shortener grows linearly with usage and does not shrink. Plan for 5 years of growth. The database will be your largest cost driver.
+
+- **Operational readiness is architecture**: Deployment strategy, monitoring dashboards, incident response procedures, and runbooks are part of the architecture, not afterthoughts. Design them before you go to production.
+
+The next chapter examines the trade-offs and failure modes that emerge when this architecture meets real-world constraints.

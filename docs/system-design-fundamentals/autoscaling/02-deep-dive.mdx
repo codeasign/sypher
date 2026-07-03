@@ -1,0 +1,747 @@
+---
+id: autoscaling-deep-dive
+title: Autoscaling -- Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Autoscaling -- Under the Hood
+
+## Internal Architecture
+
+The autoscaling system is not a single monolithic component. It is a distributed control loop with several subsystems that communicate asynchronously. Understanding the internal architecture is essential for debugging scaling issues and tuning performance.
+
+<AsciiDiagram
+  id="autoscaling/deep-dive-internal-architecture"
+  title="Autoscaling Internal Architecture -- Subsystems and Communication"
+  alt="Detailed component diagram showing the metrics pipeline, scaling policy engine, capacity calculator, instance lifecycle manager, and load balancer integration"
+  content={`
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                        Autoscaling Internal Architecture                       │
+│                                                                               │
+│  ┌──────────────────────┐    ┌───────────────────────────────────────────┐   │
+│  │  Metrics Subsystem   │    │  Decision Subsystem                        │   │
+│  │                      │    │                                           │   │
+│  │  ┌────────────────┐  │    │  ┌─────────────────────────────────────┐  │   │
+│  │  │ Per-Instance   │  │    │  │  Policy Evaluator                   │  │   │
+│  │  │ Metrics Agent  │  │    │  │                                     │  │   │
+│  │  │                │  │    │  │  For each policy in ASG:            │  │   │
+│  │  │  CPU  Memory   │  │    │  │  1. Get aggregated metric value     │  │   │
+│  │  │  Disk Net      │  │    │  │  2. Compare against threshold       │  │   │
+│  │  │  Proc Count    │  │    │  │  3. Determine breach magnitude      │  │   │
+│  │  └────────┬───────┘  │    │  │  4. Compute scaling action          │  │   │
+│  │           │          │    │  └──────────────┬──────────────────────┘  │   │
+│  │           ▼          │    │                 │                          │   │
+│  │  ┌────────────────┐  │    │                 ▼                          │   │
+│  │  │ Aggregation    │  │    │  ┌─────────────────────────────────────┐  │   │
+│  │  │ Engine         │  │    │  │  Capacity Calculator                │  │   │
+│  │  │                │  │    │  │                                     │  │   │
+│  │  │  AVG, SUM, MIN,│  │    │  │  new_desired = clamp(               │  │   │
+│  │  │  MAX, p50, p99 │  │    │  │    policy_function(current_metric), │  │   │
+│  │  │                │  │    │  │    min_size,                        │  │   │
+│  │  │  Window: 5 min │  │    │  │    max_size                         │  │   │
+│  │  └────────┬───────┘  │    │  │  )                                  │  │   │
+│  │           │          │    │  └──────────────┬──────────────────────┘  │   │
+│  │           ▼          │    │                 │                          │   │
+│  │  ┌────────────────┐  │    │                 ▼                          │   │
+│  │  │ Alarm         │  │    │  ┌─────────────────────────────────────┐  │   │
+│  │  │ Evaluator     │  │    │  │  Cooldown State Machine             │  │   │
+│  │  │                │  │    │  │                                     │  │   │
+│  │  │  Compare metric│  │    │  │  State: idle | scaling | cooldown   │  │   │
+│  │  │  vs threshold  │  │    │  │                                    │  │   │
+│  │  │  State: OK /   │  │    │  │  cooldown_start = now               │  │   │
+│  │  │  ALARM / INSUF │  │    │  │  cooldown_end = now + 300s          │  │   │
+│  │  └────────┬───────┘  │    │  │  Skip if now < cooldown_end        │  │   │
+│  │           │          │    │  └─────────────────────────────────────┘  │   │
+│  └───────────┼──────────┘    └───────────────────┬───────────────────────┘   │
+│              │                                    │                           │
+│              ▼                                    ▼                           │
+│  ┌──────────────────────────────────────────────────────────────────────┐    │
+│  │  Execution Subsystem                                                 │    │
+│  │                                                                      │    │
+│  │  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────┐  │    │
+│  │  │ Instance Lifecycle  │  │ Load Balancer     │  │ Health Check   │  │    │
+│  │  │ Manager            │  │ Integration        │  │ Manager        │  │    │
+│  │  │                    │  │                    │  │                │  │    │
+│  │  │ Pending → InService│  │ Register targets   │  │ HTTP check     │  │    │
+│  │  │ InService → Drain  │  │ Deregister targets │  │ TCP check      │  │    │
+│  │  │ Drain → Terminate  │  │ Slow-start mode    │  │ Custom check   │  │    │
+│  │  │                    │  │                    │  │                │  │    │
+│  │  │ Launch API call    │  │ Connection drain   │  │ 3 fail →       │  │    │
+│  │  │ Terminate API call │  │ timeout config     │  │ replace        │  │    │
+│  │  └────────────────────┘  └────────────────────┘  └────────────────┘  │    │
+│  └──────────────────────────────────────────────────────────────────────┘    │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+Legend:
+  [ ] = Subsystem component
+  ──▶  = Data flow
+  ──▶  = Control flow
+`}
+  caption="The autoscaling system has three subsystems: Metrics (collection and aggregation), Decision (policy evaluation and capacity calculation), and Execution (instance lifecycle management)."
+/>
+
+## Data Structures and Algorithms
+
+### Algorithm 1: Target Tracking Proportional Control
+
+Target tracking autoscaling uses a proportional control algorithm. The controller calculates the desired capacity as a linear function of the error between the current metric and the target.
+
+```
+error = (current_metric - target_metric) / target_metric
+desired_capacity = current_capacity * (1 + error)
+```
+
+This is a P-controller (proportional-only) in control theory terms. It has no integral or derivative terms. The proportional gain is implicitly 1.0 -- the system responds proportionally to the error magnitude. A 20% error produces a 20% capacity adjustment.
+
+The absence of integral term means the system never fully eliminates steady-state error. If the target is 50% CPU and the actual CPU settles at 52%, the autoscaler will not further adjust. This is intentional -- the 2% error is within the acceptable tolerance band and avoiding unnecessary scaling actions prevents thrashing.
+
+The absence of derivative term means the system does not predict the rate of change. A CPU metric that is rapidly rising (from 30% to 70% in 30 seconds) triggers the same response as a CPU that has been steady at 70% for 10 minutes. This is a limitation -- a derivative term could detect the rapid rise and preemptively scale.
+
+### Algorithm 2: Step Scaling Decision Tree
+
+Step scaling uses a multi-threshold decision tree instead of a proportional formula. The policy defines a set of thresholds and corresponding actions.
+
+```
+function evaluate_step_scaling(metric_value, thresholds):
+    for tier in sorted(thresholds, descending):
+        if metric_value >= tier.upper_bound:
+            return tier.action   // e.g., add 4 instances
+        elif metric_value <= tier.lower_bound:
+            return tier.action   // e.g., remove 2 instances
+    return NO_ACTION
+```
+
+The thresholds are evaluated in order of severity. The most severe breach determines the action. If CPU is at 85%, the policy applies the "add 4 instances" action from the 80%+ tier, not the "add 2 instances" action from the 60% tier.
+
+The step scaling algorithm includes a "breach duration" parameter -- the metric must remain above the threshold for a specified number of evaluation periods before the action triggers. A 2-period breach duration means the metric must exceed the threshold for two consecutive 60-second evaluation periods before the autoscaler acts. This filters out transient spikes.
+
+### Algorithm 3: Predictive Scaling Forecasting
+
+Predictive scaling uses exponential smoothing with seasonality (Holt-Winters method) to forecast future metrics. The model decomposes the time series into three components:
+
+- **Level** (L): the baseline value at the current time
+- **Trend** (T): the directional movement of the series
+- **Seasonal** (S): periodic patterns at daily and weekly intervals
+
+The forecast for time t+h is:
+
+```
+F(t+h) = L(t) + h * T(t) + S(t+h - p)
+```
+
+Where p is the seasonal period (24 hours for daily, 168 hours for weekly). The model parameters (alpha, beta, gamma) control how quickly the model adapts to new data. AWS Predictive Scaling uses a default alpha of 0.3, which gives moderate weight to recent observations.
+
+The forecast is generated 24 hours ahead and updated every 30 minutes. The autoscaler compares the forecast against the target and pre-provisions capacity to match the predicted demand. If the forecast predicts 45% CPU at 2:00 PM, the autoscaler ensures enough instances are running to keep CPU at the target of 50%.
+
+## Request/Scaling Lifecycle
+
+### Complete Scaling Lifecycle -- 10 Steps
+
+The lifecycle from a traffic surge to capacity adjustment involves 10 distinct stages. Each stage has its own timing characteristics and failure modes.
+
+<AsciiDiagram
+  id="autoscaling/deep-dive-lifecycle"
+  title="Complete Scaling Lifecycle -- 10 Stages"
+  alt="Timeline showing the 10 stages of a scaling event from traffic surge to stable state, with timing annotations for each stage"
+  content={`
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│                       Complete Scaling Lifecycle                                        │
+│                                                                                         │
+│  Traffic     Metric      Alarm       Policy      Capacity    Launch      Warm-Up       │
+│  Surge       Collected   Evaluated   Evaluated   Calculated  Instances   Complete      │
+│    │            │            │           │           │           │           │         │
+│    ▼            ▼            ▼           ▼           ▼           ▼           ▼         │
+│  ┌────┐      ┌────┐      ┌────┐      ┌────┐      ┌────┐      ┌────┐      ┌────┐      │
+│  │ S1 │─────▶│ S2 │─────▶│ S3 │─────▶│ S4 │─────▶│ S5 │─────▶│ S6 │─────▶│ S7 │      │
+│  └────┘      └────┘      └────┘      └────┘      └────┘      └────┘      └────┘      │
+│    │            │            │           │           │           │           │         │
+│    ▼            ▼            ▼           ▼           ▼           ▼           ▼         │
+│  Instant     60s         60s         60s         10ms        5-10s       180s        │
+│  (0ms)       (60s)      (120s)      (180s)      (180s)      (190s)      (370s)       │
+│                                                                                         │
+│         ┌────┐      ┌────┐      ┌────┐                                                  │
+│         │ S8 │─────▶│ S9 │─────▶│ S10│                                                  │
+│         └────┘      └────┘      └────┘                                                  │
+│            │            │           │                                                    │
+│            ▼            ▼           ▼                                                    │
+│          10s          60s         300s                                                   │
+│        (380s)       (440s)      (740s)                                                   │
+│                                                                                         │
+│  S8: LB Registration (10s)                                                              │
+│  S9: Traffic Ramp-Up (60s)                                                              │
+│  S10: Metric Stabilization + Cooldown (300s)                                            │
+│                                                                                         │
+│  Total time from surge to stable: ~740 seconds (12.3 minutes)                          │
+│  Total time from surge to new capacity serving: ~380 seconds (6.3 minutes)              │
+└───────────────────────────────────────────────────────────────────────────────────────┘
+`}
+  caption="The complete scaling lifecycle spans 10 stages from traffic surge to stable state. The total time from surge to new capacity serving is approximately 6.3 minutes."
+/>
+
+### Stage 1: Traffic Surge
+
+A flash crowd or traffic spike causes a sudden increase in requests per second. The existing instances experience higher CPU, memory, and network utilization. The surge duration may be seconds (viral post) or hours (product launch).
+
+### Stage 2: Metric Collection
+
+The metrics agent on each instance samples CPU utilization at 1-second granularity and sends the average to the monitoring system every 60 seconds. The monitoring system stores the metric data point with a timestamp. If the metric agent is down or the instance is unreachable, no data point is emitted for that evaluation period.
+
+### Stage 3: Alarm Evaluation
+
+The alarm evaluator checks the aggregated metric against the threshold. With a 60-second evaluation period, the alarm transitions from OK to ALARM state after one period if the metric exceeds the threshold. The alarm state machine has three states: OK (metric below threshold), ALARM (metric above threshold), and INSUFFICIENT_DATA (no metric data received). The alarm triggers only on the OK-to-ALARM transition, not on the steady ALARM state.
+
+### Stage 4: Policy Evaluation
+
+The policy evaluator reads the alarm state and determines the appropriate scaling action. For target tracking, the evaluator reads the current metric value from the aggregation engine and applies the proportional control formula. For step scaling, the evaluator checks which tier the metric falls into and reads the corresponding action.
+
+### Stage 5: Capacity Calculation
+
+The capacity calculator applies the formula and clamps the result within the minimum and maximum bounds. The calculator also checks the cooldown timer -- if the last scaling action occurred within the cooldown window, the action is skipped.
+
+### Stage 6: Instance Launch
+
+The instance lifecycle manager calls the cloud provider API to launch instances. The API call includes the launch template ID, the number of instances to launch, and the subnet placement. The API returns immediately with instance IDs in Pending state.
+
+### Stage 7: Warm-Up
+
+The new instances boot the operating system, run initialization scripts, download application code, and connect to downstream services. The warm-up duration depends on the AMI size, the complexity of initialization scripts, and the speed of the application deployment. A container-based instance warms up in 30-60 seconds. A full VM with application deploy warms up in 3-5 minutes.
+
+### Stage 8: Load Balancer Registration
+
+The load balancer integration subsystem registers the new instances with the target group. The health checker sends HTTP or TCP probes to the instance's health check endpoint. After the instance passes 2-3 consecutive health checks (typically 10-30 seconds total), the load balancer marks it as Healthy and begins routing traffic.
+
+### Stage 9: Traffic Ramp-Up
+
+The load balancer gradually increases traffic to the new instance. In slow-start mode, the load balancer sends a small fraction of traffic initially (5-10%) and increases the share linearly over the slow-start duration (default 300 seconds in AWS ALB). This prevents a cold instance from being overwhelmed by a sudden traffic load.
+
+### Stage 10: Metric Stabilization
+
+After the new instances are serving traffic, the aggregate metrics begin to reflect the added capacity. The cooldown timer prevents the autoscaler from initiating another scaling action during this stabilization period. The system enters a steady state where the metric oscillates around the target value.
+
+## Consistency and State
+
+### Challenge 1: Metric Delay and Data Loss
+
+The metrics pipeline has inherent delays. A metric collected at time T is available for evaluation at time T + 60 seconds (the collection interval). If the metrics agent on an instance crashes, the system receives INSUFFICIENT_DATA for that instance. The alarm evaluator must decide how to handle missing data.
+
+**Scenario**: Three instances in an ASG. Two report 70% CPU. One instance's agent crashes and reports no data. The aggregation engine computes the average of the two available data points (70%). The autoscaler sees 70% CPU and scales out. Meanwhile, the third instance is also at 70% CPU but is not reporting. The autoscaler over-provisions because it is scaling based on partial data.
+
+**Mitigation**: Configure the alarm to require a minimum number of data points. Set the "evaluation periods" parameter to require 2 of 3 instances to report data before triggering an alarm. In AWS, the `EvaluateLowSampleCount` parameter controls whether INSUFFICIENT_DATA is treated as "ignore" or "last known state."
+
+### Challenge 2: Cooldown Race Conditions
+
+When two scaling policies are attached to the same autoscaling group, they can race. A target tracking policy for CPU triggers a scale-out based on 65% CPU. Simultaneously, a step scaling policy for request count triggers a scale-in based on falling request count. The autoscaler must resolve conflicting actions.
+
+**Scenario**: The ASG has two policies -- Policy A (target tracking, CPU target 50%) and Policy B (step scaling, request count). A traffic spike raises CPU to 75%, triggering Policy A to scale out from 4 to 8 instances. The new instances start serving traffic, which reduces the request count per instance. Policy B sees the reduced request count and triggers a scale-in from 8 to 6 instances. The two policies fight each other, creating thrash.
+
+**Mitigation**: Use a single policy per autoscaling group. If multiple metrics are needed, use a composite metric (e.g., a custom metric that combines CPU and request count into a single value). AWS recommends using one target tracking policy per ASG.
+
+### Challenge 3: Warm-Up Underestimation
+
+The autoscaler assumes that new instances begin affecting metrics immediately after they are launched. In reality, the warm-up period means the new instances have zero effect on metrics for 3-5 minutes. During this gap, the autoscaler sees that the metric is still elevated and may trigger additional scale-out actions.
+
+**Scenario**: Four instances at 80% CPU. The autoscaler calculates that 8 instances are needed and launches 4 new instances. The new instances take 3 minutes to warm up. During those 3 minutes, the existing 4 instances remain at 80% CPU. The autoscaler evaluates again at the next evaluation period, sees 80% CPU, and calculates 16 instances are needed. It launches 8 more. When the first batch of 4 instances comes online, CPU drops to 55%. When the second batch of 8 also comes online, CPU drops to 25%. The autoscaler has over-provisioned by 2x.
+
+**Mitigation**: Use a dynamic cooldown period that accounts for warm-up time. Set the cooldown to at least 2x the warm-up time. Use predictive scaling to pre-provision capacity before the spike, reducing the reactive scaling burden. Some autoscalers allow you to set a "warm-up" parameter that tells the autoscaler to ignore metric changes during the warm-up period.
+
+## Performance Characteristics
+
+### Scaling Latency Breakdown
+
+The table below shows the latency contributions of each stage in the scaling lifecycle for a typical VM-based deployment.
+
+| Stage | Duration | Cumulative | Notes |
+|-------|----------|------------|-------|
+| Metric collection interval | 60 s | 60 s | Configurable down to 1 s with detailed monitoring |
+| Alarm evaluation period | 60 s | 120 s | Typically 1-3 evaluation periods |
+| Policy evaluation | 10 ms | 120 s | Negligible compared to other stages |
+| Capacity calculation | 10 ms | 120 s | Negligible |
+| API call to launch | 5-10 s | 130 s | Cloud provider API latency |
+| Instance boot (VM) | 60-120 s | 250 s | OS boot, kernel init |
+| User data script | 30-60 s | 310 s | Package install, config |
+| Application start | 30-60 s | 370 s | Service init, DB connection |
+| Load balancer health check | 10-30 s | 400 s | 2-3 checks at 10 s intervals |
+| Slow-start ramp-up | 60-300 s | 700 s | Gradual traffic increase |
+| **Total (p50)** | | **~7 minutes** | From surge to full capacity |
+| **Total (p99)** | | **~12 minutes** | With retries and delays |
+
+### Container-Based Scaling
+
+Containers reduce warm-up time significantly compared to VMs. A container image that is already cached on the host node can start in 2-5 seconds. Kubernetes HPA with cluster autoscaler has a typical end-to-end latency of 60-120 seconds from metric breach to new pod serving traffic.
+
+| Stage | Duration (Container) | Duration (VM) |
+|-------|---------------------|---------------|
+| Metric collection | 15 s | 60 s |
+| Policy evaluation | 10 ms | 10 ms |
+| Pod/instance launch | 2-5 s | 60-120 s |
+| Application start | 5-15 s | 60-120 s |
+| Health check | 5-10 s | 10-30 s |
+| **Total** | **~30-45 s** | **~200-400 s** |
+
+### Scaling Efficiency
+
+Scaling efficiency measures how closely the actual capacity tracks the ideal capacity. The ideal capacity is the minimum number of instances needed to keep the metric at the target. The actual capacity is the number of instances running.
+
+```
+efficiency = 1 - |actual_capacity - ideal_capacity| / ideal_capacity
+```
+
+A perfectly efficient system has efficiency 1.0. In practice, efficiency ranges from 0.6 to 0.95. The main sources of inefficiency are:
+
+- **Reactive lag**: Capacity arrives after the spike, so the system is under-provisioned during the lag period.
+- **Over-provisioning guard**: Systems intentionally over-provision by 10-20% to absorb unexpected spikes.
+- **Cooldown periods**: The system cannot scale in immediately after a spike, leaving excess capacity running.
+- **Step granularity**: If the scaling step is 4 instances and the demand only requires 3, the system over-provisions by 1.
+
+## Configuration and Tuning
+
+### Critical Parameters
+
+**Evaluation Periods**: The number of consecutive periods the metric must breach the threshold before the alarm triggers. A value of 1 reacts quickly but is sensitive to noise. A value of 3 filters noise but adds 3 minutes of latency. For production systems, start with 2 periods and tune based on observed noise levels.
+
+**Cooldown Period**: The time after a scaling action during which the autoscaler will not perform another action. Set to at least 2x the warm-up time. For VM-based deployments with 3-minute warm-up, set cooldown to 300-600 seconds. For container-based deployments with 30-second warm-up, set cooldown to 60-120 seconds.
+
+**Scale-In Protection**: Enable on all instances that process long-running requests or maintain state. The application should remove scale-in protection when it is safe to terminate. Use lifecycle hooks to extend the draining window if needed.
+
+**Health Check Grace Period**: The time after an instance is launched during which health check failures are ignored. Set to the expected warm-up time plus 30 seconds. Without this grace period, the autoscaler could terminate instances that are still warming up.
+
+**Instance Warm-Up Parameter**: Some autoscalers (AWS) allow you to specify a warm-up time per instance. During this period, the instance's metrics are excluded from the aggregate metric calculation. This prevents new instances from skewing the aggregate and causing over-scaling.
+
+### Tuning Strategy
+
+Start with conservative settings and tighten based on observed behavior:
+
+1. Set target tracking at 50% CPU for the first week. This leaves headroom for spikes.
+2. Monitor the "instances in service" metric alongside the CPU metric. Look for oscillation patterns.
+3. If the system oscillates (scale-out, scale-in, scale-out), increase the cooldown period by 50%.
+4. If the system consistently under-performs during spikes (latency spikes, error rate increases), lower the target tracking value to 40%.
+5. After 2 weeks of stable operation, consider adding predictive scaling to pre-warm capacity.
+6. For seasonal traffic patterns, add scheduled scaling actions to handle the known peaks and let reactive scaling handle the unknown variations.
+
+### AWS-Specific Configuration
+
+```json
+{
+  "AutoScalingGroupName": "web-app-production",
+  "MinSize": 3,
+  "MaxSize": 50,
+  "DesiredCapacity": 6,
+  "LaunchTemplate": {
+    "LaunchTemplateName": "web-app-v3",
+    "Version": "$Default"
+  },
+  "VPCZoneIdentifier": "subnet-a,subnet-b,subnet-c",
+  "TargetGroupARNs": ["arn:aws:elasticloadbalancing:..."],
+  "HealthCheckType": "ELB",
+  "HealthCheckGracePeriod": 300,
+  "DefaultCooldown": 300,
+  "TerminationPolicies": ["OldestLaunchTemplate", "Default"],
+  "CapacityRebalance": true,
+  "MixedInstancesPolicy": {
+    "LaunchTemplate": {
+      "Overrides": [
+        {"InstanceType": "t3.large"},
+        {"InstanceType": "t3a.large"},
+        {"InstanceType": "m5.large"}
+      ]
+    },
+    "InstancesDistribution": {
+      "OnDemandPercentageAboveBaseCapacity": 50,
+      "SpotAllocationStrategy": "lowest-price"
+    }
+  }
+}
+```
+
+### Kubernetes HPA Configuration
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+  - type: Pods
+    pods:
+      metric:
+        name: requests_per_second
+      target:
+        type: AverageValue
+        averageValue: 500
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 4
+        periodSeconds: 15
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+```
+
+### GCP Managed Instance Group Configuration
+
+```yaml
+autoscaling:
+  mode: ON
+  minNumReplicas: 3
+  maxNumReplicas: 50
+  coolDownPeriodSec: 300
+  cpuUtilization:
+    target: 0.5
+  loadBalancingUtilization:
+    target: 0.6
+  metric:
+  - name: custom.googleapis.com/requests_per_second
+    target: 500
+  - name: custom.googleapis.com/queue_depth
+    target: 100
+    type: GAUGE
+  scaleInControl:
+    maxScaledInReplicas:
+      percent: 10
+      timeWindowSec: 3600
+```
+
+## Scaling Policy Evaluation Flow
+
+The complete decision flow for a single scaling evaluation cycle.
+
+<AsciiDiagram
+  id="autoscaling/deep-dive-decision-flow"
+  title="Scaling Policy Evaluation Decision Flow"
+  alt="Flowchart showing the decision tree from metric collection through capacity calculation, including cooldown checks, bound clamping, and execution"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Scaling Decision Flow                             │
+│                                                                     │
+│  START                                                                │
+│    │                                                                 │
+│    ▼                                                                 │
+│  ┌──────────────────────────────┐     YES                            │
+│  │ Is cooldown active?          │─────▶ Skip this cycle              │
+│  │ (now < cooldown_end)         │         │                          │
+│  └──────────────┬───────────────┘         │                          │
+│                 │ NO                      │                          │
+│                 ▼                         │                          │
+│  ┌──────────────────────────────┐         │                          │
+│  │ Get aggregated metric value  │         │                          │
+│  │ from metrics pipeline        │         │                          │
+│  └──────────────┬───────────────┘         │                          │
+│                 │                         │                          │
+│                 ▼                         │                          │
+│  ┌──────────────────────────────┐  NO     │                          │
+│  │ Is metric_data_sufficient?   │─────▶   │                          │
+│  │ (enough data points)         │         │                          │
+│  └──────────────┬───────────────┘         │                          │
+│                 │ YES                     │                          │
+│                 ▼                         │                          │
+│  ┌──────────────────────────────┐  NO     │                          │
+│  │ Does metric breach threshold?│─────▶   │                          │
+│  │ (metric > target + tolerance)│         │                          │
+│  └──────────────┬───────────────┘         │                          │
+│                 │ YES                     │                          │
+│                 ▼                         │                          │
+│  ┌──────────────────────────────┐         │                          │
+│  │ Determine scaling direction  │         │                          │
+│  │ and magnitude                │         │                          │
+│  │                              │         │                          │
+│  │  Scale-out: metric TOO HIGH  │         │                          │
+│  │  Scale-in:  metric TOO LOW   │         │                          │
+│  └──────────────┬───────────────┘         │                          │
+│                 │                         │                          │
+│                 ▼                         │                          │
+│  ┌──────────────────────────────┐         │                          │
+│  │ Calculate new desired        │         │                          │
+│  │ capacity                     │         │                          │
+│  │                              │         │                          │
+│  │  target_tracking: ceil(      │         │                          │
+│  │    current * metric / target)│         │                          │
+│  │                              │         │                          │
+│  │  step_scaling: add/remove    │         │                          │
+│  │    N instances per tier      │         │                          │
+│  └──────────────┬───────────────┘         │                          │
+│                 │                         │                          │
+│                 ▼                         │                          │
+│  ┌──────────────────────────────┐         │                          │
+│  │ Clamp to [min_size,          │         │                          │
+│  │ max_size] bounds             │         │                          │
+│  └──────────────┬───────────────┘         │                          │
+│                 │                         │                          │
+│                 ▼                         │                          │
+│  ┌──────────────────────────────┐  NO     │                          │
+│  │ Does new != old desired?     │─────▶   │                          │
+│  └──────────────┬───────────────┘         │                          │
+│                 │ YES                     │                          │
+│                 ▼                         │                          │
+│  ┌──────────────────────────────┐         │                          │
+│  │ Execute scaling action       │         │                          │
+│  │                              │         │                          │
+│  │  Update desired_capacity     │         │                          │
+│  │  Start cooldown timer        │         │                          │
+│  │  Log scaling event           │         │                          │
+│  │  Emit scaling metric         │         │                          │
+│  └──────────────┬───────────────┘         │                          │
+│                 │                         │                          │
+│                 ▼                         │                          │
+│               DONE ◄──────────────────────┘                          │
+└─────────────────────────────────────────────────────────────────────┘
+
+Legend:
+  ┌──┐ = Decision/Process
+  ──▶  = Flow direction
+`}
+  caption="The scaling decision flow checks cooldown status, evaluates metric data sufficiency, determines breach magnitude, calculates new capacity, clamps to bounds, and executes the scaling action."
+/>
+
+## Advanced: Mixed Instances and Spot Integration
+
+Modern autoscaling supports mixed instance types and spot instances to optimize cost and availability. The mixed instances policy specifies a base of on-demand instances (for capacity guarantees) and a percentage of spot instances (for cost savings). The autoscaler distributes the scaling action across instance types based on the allocation strategy.
+
+The spot instance lifecycle adds complexity to autoscaling. Spot instances can be reclaimed by the cloud provider with 2-minute notice. When a spot instance is reclaimed, the autoscaler must replace it. The capacity rebalance feature (AWS) proactively replaces spot instances that are at elevated risk of reclaimation.
+
+Mixed instances also affect the launch template. Instead of a single instance type, the autoscaler maintains a list of instance types and their weights. The capacity is measured in "units" rather than instance count. A t3.large may have a weight of 1, while an m5.xlarge has a weight of 2. The autoscaler calculates desired capacity in units and distributes across instance types to meet the target.
+
+## Monitoring and Observability
+
+Every autoscaling system should expose the following metrics for operational visibility:
+
+- **DesiredCapacity**: The current target capacity. Spikes indicate scaling events.
+- **InstancesInService**: The number of instances actually serving traffic. A gap between this and desired capacity indicates warm-up delay.
+- **InstancesPending**: Instances that are launching but not yet serving. A persistent non-zero value indicates slow warm-up.
+- **InstancesTerminating**: Instances that are being drained and terminated.
+- **ScalingActivity**: A log of every scaling action with timestamp, direction, magnitude, and reason.
+- **MetricAggregate**: The aggregated metric value being evaluated. Correlate with scaling activity to understand decisions.
+- **CooldownActive**: 1 when cooldown is active, 0 otherwise. Persistent cooldown indicates potential thrashing.
+
+## Advanced: Reserved Capacity and Capacity Reservations
+
+Cloud providers offer capacity reservations to guarantee that instance capacity is available when needed. This is critical for autoscaling during large events when the cloud provider's pool of available instances may be depleted.
+
+### On-Demand Capacity Reservations
+
+An on-demand capacity reservation reserves a specific number of instances in a specific AZ. The reservation does not launch instances -- it ensures that the capacity is available when you launch them. You pay for the reservation regardless of whether you use the capacity.
+
+Capacity reservations are useful for:
+- **Flash sales**: Guarantee that 500 instances are available for the 1-hour flash sale.
+- **Disaster recovery**: Guarantee that the failover region has capacity when the primary region fails.
+- **Compliance**: Guarantee that capacity is available in a specific region for data sovereignty requirements.
+
+### Dedicated Hosts vs. Capacity Reservations
+
+Dedicated hosts provide physical servers dedicated to your use. Capacity reservations provide guaranteed capacity within the shared pool. Dedicated hosts are used for licensing requirements (per-core licenses) and compliance. Capacity reservations are used for availability guarantees without the cost of dedicated hardware.
+
+### Integrating Reservations with Autoscaling
+
+The autoscaling group can be configured to use capacity reservations. When the autoscaler launches instances, it first uses instances from the capacity reservation. If the reservation is exhausted, it falls back to on-demand capacity from the general pool.
+
+```json
+{
+  "CapacityReservationSpecification": {
+    "CapacityReservationPreference": "open",
+    "CapacityReservationTarget": {
+      "CapacityReservationResourceGroupArn": "arn:aws:resource-groups:us-east-1:123456789012:group/capacity-reservation-group"
+    }
+  }
+}
+```
+
+## Advanced: Warm Pools
+
+A warm pool is a group of pre-initialized instances that are ready to join the autoscaling group quickly. The warm pool consists of instances in a "stopped" or "running but not in service" state. When a scale-out is needed, instances from the warm pool are moved to the autoscaling group instead of launching new instances from scratch.
+
+### Warm Pool Architecture
+
+The warm pool maintains a target number of pre-warmed instances. When the autoscaling group scales out, it takes instances from the warm pool. The warm pool then launches new instances in the background to replenish itself.
+
+The warm pool has two modes:
+
+**Stopped mode**: Instances in the warm pool are in a stopped state. They are fully configured (AMI, user data, attached volumes) but not running. When a scale-out is needed, the instances are started. The start time is 30-60 seconds, compared to 3-5 minutes for a full launch.
+
+**Running mode**: Instances in the warm pool are running but not registered with the load balancer. They are fully initialized and ready to serve traffic. When a scale-out is needed, the instances are registered with the load balancer and start serving traffic within seconds. Running mode is faster but more expensive because running instances incur compute charges.
+
+### Configuring a Warm Pool
+
+```json
+{
+  "WarmPool": {
+    "MinSize": 5,
+    "MaxGroupPreparedCapacity": 20,
+    "PoolState": "Running",
+    "InstanceReusePolicy": {
+      "ReuseOnScaleIn": true
+    }
+  }
+}
+```
+
+The `InstanceReusePolicy` determines whether instances that are scaled in are returned to the warm pool instead of being terminated. This preserves the warm investment and reduces the cost of re-warming.
+
+### When to Use Warm Pools
+
+Warm pools are beneficial when:
+- Warm-up time is long (5+ minutes)
+- Traffic spikes are sudden and unpredictable
+- The cost of running warm instances is acceptable (typically 20-30% of peak capacity)
+- You cannot use predictive scaling (no historical data for a new service)
+
+Warm pools are not beneficial when:
+- Warm-up time is short (under 60 seconds, as with containers)
+- Traffic is predictable and scheduled scaling covers the spikes
+- The cost of warm instances is prohibitive
+
+## Advanced: Lifecycle Hooks in Detail
+
+Lifecycle hooks are the mechanism for integrating custom actions into the autoscaling lifecycle. They are essential for stateful services, cache warming, and compliance workflows.
+
+### How Lifecycle Hooks Work
+
+When a lifecycle hook is configured for a specific transition, the autoscaler pauses the instance at that transition and sends a notification to an SNS topic or SQS queue. The notification includes the instance ID, the lifecycle hook name, and the transition. A custom process (Lambda function, EC2 instance, or external system) receives the notification, performs the custom action, and sends a complete signal to the autoscaler.
+
+The autoscaler waits for the complete signal or the heartbeat timeout (configurable, up to 48 hours) before continuing the transition. If the heartbeat timeout expires without a complete signal, the autoscaler uses the default result (ABANDON or CONTINUE).
+
+### Common Lifecycle Hook Patterns
+
+**Pattern: Pre-warm the application cache**: Before the instance is added to the load balancer, pre-populate the local cache with frequently accessed data from the database. This prevents the first requests to the new instance from experiencing cold cache misses.
+
+```
+Launch lifecycle hook → Lambda function → 
+  Query database for top 1000 popular items → 
+  Populate local Redis cache → 
+  Complete lifecycle action
+```
+
+**Pattern: Validate instance health with custom logic**: Run a suite of integration tests before the instance is allowed to serve traffic. The tests verify that the application can connect to the database, process a sample request, and return the expected response.
+
+```
+Launch lifecycle hook → Lambda function → 
+  Send test request to instance health endpoint → 
+  Verify response matches expected schema → 
+  Complete lifecycle action (or ABANDON if tests fail)
+```
+
+**Pattern: Graceful shutdown with state migration**: Before the instance is terminated, migrate any in-memory state to another instance. This is critical for stateful services like game servers, WebSocket handlers, and session stores.
+
+```
+Terminate lifecycle hook → Lambda function → 
+  Query instance for active sessions → 
+  Send session data to peer instances → 
+  Wait for acknowledgment from peers → 
+  Complete lifecycle action
+```
+
+**Pattern: Upload diagnostics before termination**: Before terminating a failing instance, collect diagnostic data (heap dumps, thread dumps, logs) and upload them to S3 for analysis.
+
+```
+Terminate lifecycle hook → Lambda function → 
+  Connect to instance via SSM → 
+  Run diagnostics script → 
+  Upload results to S3 → 
+  Complete lifecycle action
+```
+
+## Advanced: Handling Cloud Provider Capacity Shortages
+
+Cloud providers have finite capacity. During large events (Black Friday, Cyber Monday, COVID-19, product launches), the provider may run out of specific instance types in specific AZs. The autoscaler must handle this gracefully.
+
+### Strategies for Capacity Shortages
+
+**Multi-AZ distribution**: Do not use a single AZ. Distribute instances across 3 AZs. If one AZ runs out of capacity, the other two are available.
+
+**Multi-instance-type strategy**: Use multiple instance types in the autoscaling group. If t3.large is unavailable, the autoscaler falls back to t3a.large, m5.large, or c5.large. The mixed instances policy allows you to specify a prioritized list of instance types.
+
+**Spot instance fallback**: If on-demand capacity is unavailable, fall back to spot instances. Spot instances have a lower priority in the cloud provider's allocation, but they are often available when on-demand is not.
+
+**On-Demand allocation strategy**: Use "lowest-price" for cost optimization or "capacity-optimized" for availability. The "capacity-optimized" strategy selects the instance type that is most likely to have available capacity, even if it is slightly more expensive.
+
+**Regional failover**: If an entire region runs out of capacity, route traffic to another region. This requires a multi-region architecture with Route53 latency-based or geolocation routing.
+
+### The Capacity Shortage Scenario
+
+During a major event:
+
+1. Instance type t3.large runs out of capacity in us-east-1a.
+2. The autoscaler tries to launch a t3.large in us-east-1a and receives an InsufficientInstanceCapacity error.
+3. The autoscaler retries in us-east-1b (if the group has multiple AZs).
+4. If all AZs are out of t3.large, the autoscaler tries the next instance type in the mixed instances policy (t3a.large).
+5. If t3a.large is also unavailable, the autoscaler tries m5.large.
+6. If all instance types are unavailable, the scaling action fails and the autoscaler logs the failure.
+7. The autoscaler continues to retry the launch at each evaluation period.
+
+The autoscaler does not automatically fail over to a different instance type unless the mixed instances policy is configured. Without a mixed instances policy, the launch fails and the system remains under-provisioned.
+
+## Advanced: Autoscaling with Spot Instances
+
+Spot instances offer significant cost savings (60-90% discount) but can be reclaimed with a 2-minute notice. Autoscaling with spot instances requires careful handling of the reclaimation lifecycle.
+
+### Spot Instance Lifecycle
+
+1. The autoscaler launches a spot instance. The instance runs normally.
+2. The cloud provider needs the capacity back. It sends a 2-minute reclaimation notice.
+3. The instance receives a "rebalance recommendation" signal, indicating elevated risk of reclaimation.
+4. The autoscaler's capacity rebalance feature responds by launching a replacement instance.
+5. The original instance continues running for 2 minutes, then receives a termination signal.
+6. The application handles the termination signal gracefully (connection draining, state flush).
+7. The instance is terminated by the cloud provider.
+
+### Capacity Rebalance
+
+AWS Capacity Rebalance proactively replaces spot instances that are at elevated risk of reclaimation. The autoscaler monitors the rebalance recommendation signal. When a spot instance receives a rebalance recommendation, the autoscaler launches a replacement instance and waits for it to be healthy before terminating the original instance.
+
+This prevents the 2-minute termination window from causing a capacity shortage. The net effect is that the spot instance is replaced before it is reclaimed, maintaining the desired capacity.
+
+### Mixed Instances and Spot Allocation
+
+The mixed instances policy allows you to specify the percentage of on-demand and spot instances. A common configuration is 20% on-demand (base capacity) and 80% spot (cost-optimized capacity).
+
+```json
+{
+  "MixedInstancesPolicy": {
+    "LaunchTemplate": {
+      "LaunchTemplateSpecification": {
+        "LaunchTemplateName": "web-app-v3",
+        "Version": "$Default"
+      },
+      "Overrides": [
+        {"InstanceType": "t3.large"},
+        {"InstanceType": "t3a.large"},
+        {"InstanceType": "m5.large"},
+        {"InstanceType": "c5.large"}
+      ]
+    },
+    "InstancesDistribution": {
+      "OnDemandBaseCapacity": 10,
+      "OnDemandPercentageAboveBaseCapacity": 20,
+      "SpotAllocationStrategy": "capacity-optimized-prioritized"
+    }
+  }
+}
+```
+
+The "capacity-optimized-prioritized" allocation strategy selects the instance type from the prioritized list that is most likely to have available spot capacity. This reduces the probability of spot reclaimation.
+
+---FILE: docs/system-design-fundamentals/autoscaling/03-architecture.mdx---

@@ -1,0 +1,661 @@
+---
+id: slis-deep-dive
+title: SLIs — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+SLIs look simple on the surface: count good events, divide by total events, compare to a threshold. The implementation, however, involves careful data structures, distributed aggregation, window management, and consistency guarantees. This section opens the black box and shows you every gear inside.
+
+## Internal Architecture
+
+A production SLI pipeline has four layers: instrumentation, collection, aggregation, and evaluation. Each layer solves a specific set of problems.
+
+<AsciiDiagram
+  id="slis/internal-architecture"
+  title="SLI Pipeline Internal Architecture — Four Layers"
+  alt="Four-layer architecture diagram showing instrumentation agents, collection service, aggregation pipeline, and evaluation engine with data flow between each layer"
+ content={`
+┌──────────────────────────────────────────────────────────────────┐
+│              SLI Pipeline — Internal Architecture                 │
+│                                                                  │
+│  Layer 1: Instrumentation                                        │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  [Service A]─── (request latency, status code, size)    │    │
+│  │  [Service B]─── (query duration, row count, errors)     │    │
+│  │  [Service C]─── (cache hit, miss latency, evictions)    │    │
+│  └────────────────────────┬─────────────────────────────────┘    │
+│                           │ local aggregation (1s buckets)        │
+│                           ▼                                      │
+│  Layer 2: Collection                                             │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  <Collector Queue> ──> [Scraper] ──> [Deduplicator]     │    │
+│  │  <Retry Queue>      ──> [Validator] ──> [Partitioner]   │    │
+│  └────────────────────────┬─────────────────────────────────┘    │
+│                           │ partitioned by service + metric       │
+│                           ▼                                      │
+│  Layer 3: Aggregation                                             │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  ((Time-Series DB))   ((Sliding Window Store))          │    │
+│  │  [p50/p99/p999 Calc]  [Good/Total Counter]              │    │
+│  │  [Burn Rate Compute]  [Histogram Merger]                │    │
+│  └────────────────────────┬─────────────────────────────────┘    │
+│                           │ query: SLI value over window          │
+│                           ▼                                      │
+│  Layer 4: Evaluation                                              │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  [SLO Comparator] ──> [Error Budget Tracker]             │    │
+│  │  [Burn Rate Alert] ──> [Alert Router] ──> [Pager]       │    │
+│  │  [Dashboard]       ──> [On-Call View]                    │    │
+│  └──────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────┘
+`} />
+
+### Instrumentation Layer
+
+Every service instance emits metrics for each request it handles. This happens in-process, using a library that records three data points per request:
+
+- **Latency**: The wall-clock time from request receipt to response sent
+- **Status**: A boolean indicating success or failure
+- **Count**: Each request increments a counter by one
+
+The instrumentation library batches these measurements into 1-second buckets locally, reducing the volume of data that must be shipped to the collection layer. Instead of emitting one event per request, the library emits one summary per second containing the count of good events, the count of bad events, and a histogram of latency values.
+
+### Collection Layer
+
+A fleet of collector services receives the batched metrics from all instrumented services. The collectors validate the data, filter out events from excluded sources (health checks, known scrapers), and partition the data by service name and metric type.
+
+The collection layer must handle spikes in traffic. If your service normally processes 10,000 requests per second but spikes to 100,000 during a flash crowd, the collection layer must not drop data. This is typically achieved with a queue that buffers incoming metrics and a pool of workers that drain the queue.
+
+### Aggregation Layer
+
+The aggregation layer computes the actual SLI values. It maintains several data structures in parallel:
+
+- **Time-series database**: Stores the raw per-minute good/total counts and percentile histograms
+- **Sliding window store**: Maintains the rolling window over the SLO period (typically 30 days)
+- **Burn rate counters**: Track recent burn rates at multiple time scales (5 minutes, 30 minutes, 1 hour, 6 hours)
+
+The most challenging part of aggregation is the sliding window. Every time a new measurement arrives, the oldest measurement must be removed. This must be done efficiently because it happens for every SLO evaluation — which could be every 10 seconds in a fast-paced system.
+
+### Evaluation Layer
+
+The evaluation layer compares the aggregated SLI value against the SLO threshold. It computes the current error budget consumed and remaining, calculates the current burn rate, and decides whether to fire alerts.
+
+The evaluation runs on a timer, typically every 10 to 60 seconds. It is a stateless computation — it queries the aggregation layer, applies the SLO logic, and produces a pass/fail result plus alert status.
+
+## Data Structures and Algorithms
+
+The internals of an SLI system rely on several well-known data structures. Understanding them helps you debug performance issues and tune the system.
+
+### HdrHistogram
+
+The most common data structure for latency SLIs is the High Dynamic Range Histogram, or HdrHistogram. It records percentile values without storing every individual measurement.
+
+An HdrHistogram works by maintaining an array of buckets. Each bucket covers a range of latency values. When a request completes with a latency of 47 milliseconds, the system finds the bucket that covers 47 milliseconds and increments that bucket's counter.
+
+The clever part is the bucket sizing. Buckets are narrower at low values and wider at high values. This gives you precise measurements at the p50 (where most requests fall) while still being able to represent the p99.999 without needing infinite buckets.
+
+```
+Bucket 0:    0.000ms - 0.001ms   (1 microsecond resolution)
+Bucket 1:    0.001ms - 0.002ms
+...
+Bucket 1000: 5.000ms - 5.100ms   (100 microsecond resolution)
+...
+Bucket 5000: 100.0ms - 110.0ms   (10 millisecond resolution)
+...
+Bucket 10000: 5000ms - 5500ms    (500 millisecond resolution)
+```
+
+To compute the p99, you iterate through the buckets from lowest to highest, accumulating the count until you have reached 99 percent of the total. The bucket you land on, interpolated with the next bucket, gives you the p99 latency.
+
+<AsciiDiagram
+  id="slis/hdrhistogram-structure"
+  title="HdrHistogram Bucket Structure for Percentile Latency SLIs"
+  alt="Diagram showing how an HdrHistogram organizes latency values into variable-width buckets, with narrow buckets at low latencies and wider buckets at high latencies, and how the p99 is computed by accumulating counts across buckets"
+ content={`
+┌──────────────────────────────────────────────────────────────────┐
+│              HdrHistogram Bucket Structure and p99 Computation    │
+│                                                                  │
+│  Each request falls into one bucket. The p99 is the bucket       │
+│  where cumulative count reaches 99% of total.                    │
+│                                                                  │
+│  Latency (ms)    0   1   2   4   8   16   32   64   128   256    │
+│                   ┌───┬───┬───┬───┬───┬────┬────┬────┬────┬────┐ │
+│  Count per bucket │ 45│ 38│ 12│ 50│ 22│ 15 │ 8  │ 4  │ 2  │ 1  │ │
+│                   └───┴───┴───┴───┴───┴────┴────┴────┴────┴────┘ │
+│  Cumulative %    20% 37% 42% 64% 74% 81%  85%  87%  88%  88%    │
+│                                                                  │
+│  Total requests: 197      p50 target: 50% → bucket 3 (4ms)       │
+│  p99 target: 99%          99% of 197 = 195                       │
+│                                                                  │
+│  Cumulative count after bucket 9: 197 (100%)                     │
+│  Cumulative count after bucket 8: 196 (99.5%)                    │
+│  p99 = 256ms (interpolated between bucket 8 and bucket 9)        │
+│                                                                  │
+│  Key insight: narrow buckets at low values give precise p50,     │
+│  wider buckets at high values capture rare p99 events.           │
+└──────────────────────────────────────────────────────────────────┘
+`} />
+
+### Sliding Window
+
+The sliding window is implemented as a circular buffer of fixed-size time buckets. For a 30-day window with 1-minute resolution, the buffer has 43,200 slots (30 days x 24 hours x 60 minutes).
+
+Each slot stores the good count and total count for that minute. When a new minute of data arrives, it overwrites the slot that is exactly 30 days old.
+
+```
+Circular Buffer: [0][1][2]...[43199]
+
+Index 0: minute 0 (current)
+Index 1: minute 1
+...
+Index 43199: minute 43199 (30 days ago, being overwritten)
+
+Total good events = sum(good[0..43199])
+Total valid events = sum(total[0..43199])
+SLI = total_good / total_valid
+```
+
+The challenge is that summing 43,200 slots every evaluation is slow. You can optimize with a segment tree or a prefix sum array that updates in O(log N) time and queries in O(1) time.
+
+<AsciiDiagram
+  id="slis/sliding-window-buffer"
+  title="Sliding Window Circular Buffer for 30-Day SLI Computation"
+  alt="Diagram showing a circular buffer of 43,200 slots representing 30 days of 1-minute buckets, with a write pointer that overwrites the oldest slot and a read pointer that sums all slots for the SLI value"
+ content={`
+┌──────────────────────────────────────────────────────────────────┐
+│              Sliding Window Circular Buffer (30 days)             │
+│                                                                  │
+│  Buffer has 43,200 slots. Each slot = 1 minute.                  │
+│  When a new minute arrives, the oldest slot is overwritten.      │
+│                                                                  │
+│  Write Pointer ──────────────────────────────────────────────────│
+│       ▼                                                          │
+│  ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐  │
+│  │ M  │ M  │ M  │ M  │ M  │ M  │ M  │ M  │ M  │ M  │ M  │ M  │  │
+│  │ 0  │ 1  │ 2  │ 3  │ 4  │ 5  │... │... │... │... │... │ 29 │  │
+│  │0930│0931│0932│0933│0934│0935│    │    │    │    │    │    │  │
+│  │ g:3│ g:5│ g:2│ g:4│ g:6│ g:1│    │    │    │    │    │    │  │
+│  │ t:3│ t:5│ t:2│ t:4│ t:6│ t:1│    │    │    │    │    │    │  │
+│  └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘  │
+│  │                                                              │
+│  │  Day 0 (today)    Day 1        Day 2        ...    Day 29    │
+│  │  ────────────────────────────────────────────────────────    │
+│  │  1,440 slots      1,440 sl.    1,440 sl.        ...          │
+│  │                                                              │
+│  │  SLI = sum(good[0..43199]) / sum(total[0..43199])            │
+│  │                                                              │
+│  │  Optimization: Segment tree allows O(log N) update            │
+│  │  and O(1) range sum query.                                   │
+│  │                                                              │
+│  │  Each slot: 8 bytes good + 8 bytes total = 16 bytes          │
+│  │  Total buffer: 43,200 x 16 = 691 KB per service              │
+│  └──────────────────────────────────────────────────────────────┘
+`} />
+
+### Burn Rate Counter
+
+A burn rate counter tracks the rate at which failures are accumulating compared to the allowed rate. It is computed as:
+
+```
+allowed_failure_rate = total_valid_events × (1 - SLO) / window_duration
+actual_failure_rate = bad_events_in_window / window_duration
+burn_rate = actual_failure_rate / allowed_failure_rate
+```
+
+The challenge is that burn rate is noisy at short windows. A 5-minute burn rate can spike to 100 if one minute has a burst of failures, but the system might recover quickly and stay within budget. The standard approach is to use multiple windows: a short window for fast detection of catastrophic failures, and a longer window for slower detection of chronic issues.
+
+<AsciiDiagram
+  id="slis/burn-rate-multi-window"
+  title="Multi-Window Burn Rate Computation and Alert Thresholds"
+  alt="Diagram showing three monitoring windows (5 minutes, 30 minutes, 1 hour) with their burn rate thresholds, illustrating how catastrophic failures are caught by the short window and chronic degradation by the long window"
+ content={`
+┌──────────────────────────────────────────────────────────────────┐
+│              Multi-Window Burn Rate Alerting                      │
+│                                                                  │
+│  Three monitoring windows catch different failure patterns.      │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Window 1: 5 minutes  ──  Threshold: burn rate > 6       │   │
+│  │  Catches: catastrophic failures, full outages             │   │
+│  │  Example: 100% error rate for 2 minutes → burn rate 2000 │   │
+│  │  Alert fires within 2 minutes of outage start             │   │
+│  │  Action: Page on-call engineer immediately                │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Window 2: 30 minutes ──  Threshold: burn rate > 3       │   │
+│  │  Catches: moderate degradation, partial failures          │   │
+│  │  Example: 5% error rate for 10 minutes → burn rate 100   │   │
+│  │  Alert fires within 10 minutes of degradation start      │   │
+│  │  Action: Page on-call engineer, investigate root cause   │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Window 3: 6 hours  ──  Threshold: burn rate > 1.5       │   │
+│  │  Catches: slow degradation, chronic issues                │   │
+│  │  Example: 0.2% error rate for 3 hours → burn rate 4      │   │
+│  │  Alert fires within 30 minutes of crossing threshold     │   │
+│  │  Action: Create ticket, investigate during business hours │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  Each window is evaluated independently. If any window          │
+│  exceeds its threshold, an alert fires. This catches both       │
+│  fast catastrophic failures and slow chronic degradation.       │
+└──────────────────────────────────────────────────────────────────┘
+`} />
+
+### T-Digest for Percentile Approximation
+
+Alternative to HdrHistogram, the T-Digest is a probabilistic data structure that approximates percentile values with bounded error. It uses less memory than HdrHistogram and can be merged across distributed nodes more easily.
+
+The T-Digest works by clustering nearby values and representing each cluster as a centroid — a pair of (mean, count). When a new value arrives, it is merged into the nearest centroid, which updates that centroid's mean. The centroids are spaced such that accuracy is higher at the tails (near p99 and p01) and lower in the middle.
+
+## Request Lifecycle
+
+Let us trace a single request through the entire SLI pipeline. Watch how one customer request becomes an SLI value on a dashboard.
+
+<AsciiDiagram
+  id="slis/request-lifecycle"
+  title="A Single Request Through the SLI Pipeline"
+  alt="Step-by-step flow showing how one HTTP request from a user generates latency and status data that flows through instrumentation, batching, collection, aggregation, and into the SLO evaluation engine"
+ content={`
+┌──────────────────────────────────────────────────────────────────┐
+│              Complete SLI Lifecycle for One Request               │
+│                                                                  │
+│  Step 1-5: Request Processing                                    │
+│  ┌──────┐   ┌──────────┐   ┌──────────┐   ┌──────┐   ┌───────┐ │
+│  │Client │──>│  Load    │──>│ Service  │──>│ DB   │──>│Resp.  │ │
+│  │       │   │  Balancer│   │    A     │   │      │   │       │ │
+│  └──────┘   └──────────┘   └────┬─────┘   └──────┘   └───────┘ │
+│                                   │                               │
+│                             ┌─────▼─────┐                        │
+│                             │ Instrument │                        │
+│                             │ latency:   │                        │
+│                             │ 47ms       │                        │
+│                             │ status: 200│                        │
+│                             └─────┬─────┘                        │
+│                                   │                               │
+│  Step 6-7: Local Batching                                        │
+│                          ┌────────▼────────┐                     │
+│                          │  1-second bucket │                     │
+│                          │  good: 15        │                     │
+│                          │  total: 15       │                     │
+│                          │  histogram: [...]│                     │
+│                          └────────┬────────┘                     │
+│                                   │                               │
+│  Step 8-10: Collection & Aggregation                              │
+│  ┌─────────┐   ┌──────────┐   ┌──────────────┐                  │
+│  │ Queue   │──>│Scraper   │──>│ Aggregator    │                  │
+│  │         │   │          │   │ [service_a]   │                  │
+│  └─────────┘   └──────────┘   │ good+=(15)    │                  │
+│                                │ total+=(15)   │                  │
+│                                │ update histo  │                  │
+│                                └──────┬───────┘                  │
+│                                       │                           │
+│  Step 11-12: SLO Evaluation & Alerting                            │
+│  ┌──────────────────┐   ┌─────────────────────┐                 │
+│  │ SLO Evaluator     │──>│ Burn Rate Computer   │                 │
+│  │ SLI: 99.95%       │   │ burn rate: 0.3      │                 │
+│  │ SLO: 99.9%        │   │ threshold: 2        │                 │
+│  │ Pass ✅            │   │ No alert            │                 │
+│  └──────────────────┘   └─────────────────────┘                 │
+└──────────────────────────────────────────────────────────────────┘
+`} />
+
+### Step 1: Client Sends Request
+
+A mobile app sends an HTTP GET to your API at `https://api.example.com/users/12345`. The request enters the load balancer, which selects a healthy backend instance.
+
+### Step 2: Load Balancer Routes
+
+The load balancer forwards the request to Service A, instance 3. The load balancer's health check status does not directly affect the SLI, but if the health check were to fail, the instance would be removed from rotation and no user requests would reach it. This is important for SLI quality — you do not want to measure requests to a dead instance.
+
+### Step 3: Service Processes Request
+
+Service A receives the request, queries a database for user data, and formats the response. The instrumented library in Service A records the start time and stop time, computing a latency of 47 milliseconds.
+
+### Step 4: Response Sent
+
+Service A sends the response with status code 200. The instrumentation records the status code as success.
+
+### Step 5: Instrumentation Records Data
+
+For this single request, the instrumentation library records three raw values:
+- latency: 47 milliseconds
+- duration: 47 milliseconds (same as latency in this case)
+- status: 200
+
+### Step 6: Local Batching
+
+The instrumentation library does not send each request's data individually. Instead, it maintains a 1-second batch. Every second, it emits a summary for that batch. If Service A processed 15 requests in that second, the batch summary contains:
+- good_count: 15 (all returned HTTP 2xx)
+- total_count: 15 (all are valid user requests)
+- latency_histogram: merged HdrHistogram of all 15 latencies
+
+Batching reduces the data volume by a factor equal to the requests per second. At 10,000 requests per second, batching reduces the data stream from 10,000 events per second to 1 event per second.
+
+### Step 7: Batch Sent to Collection
+
+The batch is sent to a collector endpoint, typically via HTTP or gRPC. The instrumented service uses a background thread to send batches asynchronously, so the batch transmission does not add latency to user requests.
+
+### Step 8: Collector Validates
+
+The collector receives the batch. It checks:
+- Is the service name valid and expected
+- Is the timestamp within an acceptable range (not more than 60 seconds in the past or 5 seconds in the future)
+- Are the counts sane (good_count is less than or equal to total_count)
+- Is the histogram structurally valid
+
+If validation passes, the batch is forwarded to the partitioner. If validation fails, the batch is logged and dropped.
+
+### Step 9: Partitioner Routes
+
+The partitioner routes the batch to the appropriate aggregation shard based on the service name. All batches for Service A go to the same shard. This ensures that the sliding window for Service A is updated on a single node, avoiding coordination overhead.
+
+### Step 10: Aggregator Updates
+
+The aggregation shard receives the batch and updates its data structures:
+- The good counter is incremented by good_count
+- The total counter is incremented by total_count
+- The latency histogram is merged into the sliding window histogram
+- The burn rate counters are updated
+
+### Step 11: SLO Evaluator Queries
+
+Every 10 seconds, the SLO evaluator queries each aggregation shard for the current SLI value. It computes:
+
+```
+availability = good_total / total_total
+latency_p99 = histogram.value_at_percentile(99.0)
+```
+
+It compares these values against the SLO targets.
+
+### Step 12: Burn Rate Computed
+
+The burn rate computer calculates the current burn rate across multiple windows. For our example, with 47 milliseconds latency and no errors, the burn rate is well below 1. No alert fires.
+
+### Step 13: Histogram Percentile Computation
+
+Periodically (every 10 seconds), the aggregator computes the latency percentiles from the accumulated histogram. It walks through the histogram buckets from lowest to highest, accumulating the count until it reaches the target percentile. For the p50, it stops when the accumulated count reaches 50 percent of the total. For the p99, it stops at 99 percent.
+
+The computation is O(B) where B is the number of buckets in the histogram. A standard HdrHistogram has approximately 3,600 buckets, so the computation takes fewer than 100 microseconds on modern hardware.
+
+### Step 14: Storage Write
+
+The aggregation shard writes the current bucket's good/total counts and the percentile values to the time-series database. This write happens every 60 seconds, regardless of how many batches were received. The storage write is asynchronous — the aggregator does not block on it.
+
+The write includes:
+- The bucket's timestamp (rounded to the minute)
+- The service name and shard identifier
+- The good count and total count for this minute
+- The p50, p95, p99, and p999 latency values
+- The burn rate for each monitored window (5 min, 30 min, 1 hr, 6 hr)
+
+### Step 15: SLO Dashboard Update
+
+The SLO evaluation engine queries the time-series database to build the dashboard view. It computes the SLI value over the full 30-day window, the error budget consumed and remaining, and the current burn rate.
+
+The dashboard also shows the trend: how the SLI has changed over the last 7 days, 30 days, and 90 days. A slowly declining SLI trend — from 99.95 percent to 99.92 percent — is a warning sign even if the SLO is still met.
+
+### Step 16: Historic Data Rollup
+
+At the end of each day, the aggregation layer rolls up the high-resolution 1-minute data into lower-resolution 5-minute and 1-hour buckets. This reduces storage requirements for historical data that is queried less frequently.
+
+The rollup process:
+- Reads all 1-minute buckets for the day
+- Groups them into 5-minute and 1-hour aggregates
+- Computes the combined good/total counts for each aggregate
+- Stores the aggregates in the time-series database
+- Marks the 1-minute buckets as eligible for deletion
+
+### Step 17: Data Retention Enforcement
+
+The system enforces retention policies to prevent unbounded storage growth. The standard retention policy retains:
+- 1-minute resolution data for 7 days
+- 5-minute resolution data for 90 days
+- 1-hour resolution data for 2 years
+
+Retention is enforced by a background job that runs daily. The job queries the time-series database for data older than the retention period and deletes it. The deletion is batched to avoid overwhelming the database.
+
+### Step 18: SLO Compliance Report Generation
+
+At the end of each SLO window (typically the end of the month), the system generates a compliance report for each service. The report includes:
+- The SLI value for the window
+- Whether the SLO was met
+- The error budget consumed as a percentage
+- The number of burn rate alerts that fired
+- The top 5 incidents that consumed the most error budget
+- A trend comparison with the previous 3 windows
+
+This report is the primary artifact for the SLO review meeting. It provides a data-driven basis for decisions about whether to tighten or relax SLOs, invest in reliability improvements, or adjust operational practices.
+
+## Consistency and State
+
+SLI systems operate in a distributed environment where failures are normal. How does the system handle crashes, network partitions, concurrent writes, and stale reads?
+
+### Crash Recovery
+
+When an aggregation node crashes, it loses the in-memory portion of the sliding window. The durable portion is stored in the time-series database. On recovery, the node reads the last 30 days of data from the database into memory and continues from where it left off.
+
+The gap between the last database write and the crash — typically a few seconds to a minute — represents lost data. The system handles this by marking the SLI as having "insufficient data" for that gap. If the gap is small relative to the 30-day window (less than 0.1 percent), the impact on the SLI is negligible.
+
+### Network Partition
+
+When the network splits, some batches may arrive at the collector but not reach the aggregator. The collector detects this by tracking which batches have been acknowledged. If a batch is not acknowledged within a timeout, the collector retries. If the partition heals, the retried batches are processed and the aggregator catches up.
+
+The key insight is that SLI data is idempotent. Duplicate batches — receiving the same batch twice — are handled by deduplication based on a batch ID. If the deduplication fails and a batch is counted twice, the effect is small because each batch represents only one second of data out of 2,592,000 seconds in a 30-day window.
+
+### Concurrent Writes
+
+In a multi-threaded or multi-process aggregation node, multiple batches can arrive simultaneously. The aggregator uses a sharded lock strategy: each service's window has its own lock, so concurrent batches for different services do not contend.
+
+For batches arriving concurrently for the same service, the aggregator serializes them with a lock on that service's shard. Because each batch is small and the lock is held for microseconds, contention is rare even at high throughput.
+
+### Stale Reads
+
+When the SLO evaluator queries the aggregator, it may receive data that is slightly stale — the aggregator might have received a batch 200 milliseconds ago that it has not yet incorporated. This is acceptable because SLI windows are measured in days, and a 200-millisecond staleness is negligible.
+
+The system explicitly supports stale reads by not requiring synchronous replication between the collection and aggregation layers. If the evaluator reads data that is 2 seconds stale, the SLI calculation is off by 0.002 seconds out of 2,592,000 seconds — a fraction of a percent.
+
+### Clock Skew
+
+In a distributed system, every server has its own clock. If Service A's clock is 5 seconds ahead of the aggregation node's clock, batches from Service A will be timestamped 5 seconds in the future. The aggregation node must handle this skew.
+
+The collector layer checks each batch's timestamp against the current time. If the timestamp is more than 60 seconds in the future, the batch is rejected as invalid. If the timestamp is within 60 seconds of the current time, it is accepted with a warning. The batch is placed in the correct time bucket based on its own timestamp, not the aggregator's clock.
+
+This means that the sliding window may have "future" buckets that are not yet full. The SLO evaluator must handle this by excluding buckets that are more than 60 seconds in the future from the SLI calculation. The standard approach is to exclude the last 2 minutes of data from the evaluation to account for both clock skew and batch delivery latency.
+
+### Data Loss from Throttling
+
+During extreme traffic spikes, the collection layer may not be able to keep up with the volume of incoming batches. The queue between the collector and the aggregator fills up. When the queue reaches capacity, the collector starts dropping batches.
+
+The system handles this by prioritizing which batches to drop. Batches from critical services are dropped last. The collector maintains a priority queue where each service has a priority level based on the criticality of its SLI data. User-facing services have the highest priority. Internal infrastructure services have the lowest priority.
+
+When the queue is full, batches from the lowest-priority services are dropped first. The dropped batches are counted in a "dropped batch counter" that is reported as a health metric for the SLI system itself. If the drop rate exceeds 0.1 percent of total batches, an alert fires on the SLI system's health.
+
+### Partial Data During Graceful Shutdown
+
+When an aggregation node is being shut down for maintenance, it must ensure that no data is lost. The shutdown sequence is:
+
+1. The node removes itself from the service discovery registry. No new batches are routed to it.
+2. The node waits for the in-flight batches to be processed. This typically takes 5 to 10 seconds.
+3. The node writes its current state to the time-series database, including the current minute's partial bucket.
+4. The node signals to the load balancer that it is ready to shut down.
+
+During the shutdown, the node's services are temporarily not being aggregated. The SLO evaluator skips the missing data by excluding the affected minute from the calculation. If the shutdown takes less than 60 seconds, the impact on the 30-day SLI is less than 0.001 percent.
+
+### Race Conditions on Window Rollover
+
+At the exact boundary between two time buckets (for example, at 10:00:00.000), the aggregation node must handle two operations atomically: the old bucket must be closed and written to the database, and the new bucket must be opened.
+
+A race condition occurs if a batch arrives at 10:00:00.001 with a timestamp of 09:59:59.500. The batch belongs to the old bucket, but the new bucket is already open. The aggregation node must route the batch to the correct bucket based on its timestamp, not the current time.
+
+The standard approach is to maintain a "late batch" buffer that holds batches with timestamps up to 60 seconds in the past. When the bucket rolls over, the old bucket remains open for 60 seconds to accept late-arriving batches. After 60 seconds, the bucket is closed and written to the database. This handles the common case of batches arriving slightly out of order.
+
+## Performance Characteristics
+
+Understanding how SLI systems perform at different scales is essential for capacity planning.
+
+### p50 (Median) Performance
+
+At the p50, a single aggregation shard can handle approximately 500,000 events per second. This is the typical operating point for most systems. The limiting factor is the HdrHistogram merge operation, which costs approximately 10 microseconds per merge. At 500,000 events per second, the merge overhead is 5 seconds of CPU time per second — spread across multiple cores, this is sustainable.
+
+Memory usage at the p50 is dominated by the sliding window buffer. With 1-minute resolution and 30-day window, each service's buffer consumes approximately:
+
+```
+30 days x 24 hours x 60 minutes x (8 bytes good + 8 bytes total) = 691,200 bytes
+```
+
+Add the HdrHistogram for latency (which requires approximately 256 KB), and each service's SLI state consumes roughly 1 MB. With 1,000 services on a single node, that is 1 GB of RAM.
+
+### p99 Performance
+
+At p99 conditions — a sudden traffic spike, a DDoS attack, or a large deployment — the system must handle up to 10 times the normal event rate. At this rate, the aggregation node's CPU becomes the bottleneck.
+
+The p99 response time for an SLI query goes from 10 milliseconds at the p50 to 150 milliseconds at the p99. This is still within acceptable bounds because SLI evaluation is not latency-sensitive — a 150-millisecond delay in updating the SLO dashboard is imperceptible.
+
+The main risk at p99 is that if the aggregator cannot keep up, batches back up in the queue. The queue acts as a shock absorber, but it has limited capacity. If the high load persists for more than 5 minutes, batches may be dropped.
+
+### p999 Performance
+
+At p999 conditions — a cascading failure, a regional outage, or a major incident — the system is in survival mode. The aggregation node should prioritize existing data ingestion over query accuracy.
+
+The p999 response time for SLI queries can exceed 5 seconds. At this load, the time-series database tier may also be degraded, and the evaluator might compute SLI values from partial data.
+
+The design principle at p999 is: degrading the SLI accuracy is acceptable if it prevents total data loss. The system can sample batches, dropping 50 percent of incoming data, and still produce a meaningful SLI estimate.
+
+<AsciiDiagram
+  id="slis/performance-characteristics"
+  title="SLI System Performance at Different Load Percentiles"
+  alt="Comparison table showing event throughput, CPU utilization, memory usage, and query latency at p50, p99, and p999 load conditions"
+ content={`
+┌──────────────────────────────────────────────────────────────────┐
+│              SLI System Performance by Load Percentile            │
+│                                                                  │
+│  Metric               p50            p99          p999           │
+│  ─────────────────────────────────────────────────────────────    │
+│  Events/sec           500,000      5,000,000   20,000,000        │
+│  CPU utilization       35%           85%          100%+           │
+│  Memory (1K services)  1 GB          2 GB         3.5 GB         │
+│  Query latency        10 ms        150 ms         5+ seconds     │
+│  Batch queue depth      0            5,000         50,000+       │
+│  Dedup success rate   100%         99.9%          97%             │
+│  Data loss rate        0%            0%           0.5%           │
+│  SLI accuracy         99.99%        99.9%         99%             │
+│                                                                  │
+│  At p999, the system prioritizes data ingestion over             │
+│  query accuracy. SLI values may be based on sampled data.        │
+└──────────────────────────────────────────────────────────────────┘
+`} />
+
+## Configuration and Tuning
+
+An SLI system has several knobs. The right settings depend on your traffic volume, latency requirements, and operational maturity. The defaults described here are a starting point — you should adjust them based on your specific needs.
+
+The most important principle in tuning is to change one parameter at a time and observe the effect for at least one full SLO window before making another change. Changing multiple parameters at once makes it impossible to know which change caused the effect.
+
+The tuning process typically follows this sequence:
+1. Start with the defaults (1-minute buckets, 30-day window, 3 significant digits)
+2. After one month, evaluate whether the SLI values are too noisy (increase bucket duration) or too slow to react (decrease window duration)
+3. After three months, evaluate whether the burn rate alerts are producing too many false positives (adjust thresholds) or missing real incidents (add shorter windows)
+4. After six months, evaluate whether the storage costs are too high (reduce precision or increase retention period)
+5. Annually, review whether the SLI coverage is complete (add or remove SLIs as the system evolves)
+
+### Bucket Duration
+
+### Bucket Duration
+
+The duration of each time bucket in the sliding window. Shorter buckets give finer granularity but use more memory. Standard choices:
+
+- **1-minute buckets**: Best for most systems. 43,200 slots for a 30-day window. Good balance of resolution and memory.
+- **5-minute buckets**: Use for systems with very high traffic (above 1 million requests per second) where memory is the bottleneck. 8,640 slots for a 30-day window.
+- **10-second buckets**: Use for systems that need sub-minute resolution for precise burn rate alerts. 259,200 slots for a 30-day window. Memory-intensive.
+
+### SLO Window
+
+The duration over which the SLO is evaluated. Longer windows smooth out spikes and make the SLO easier to meet, but delay feedback.
+
+- **28-day window**: Industry standard for most services. Matches a sprint cycle.
+- **7-day window**: Use for critical services where you want fast feedback. But be aware that 7 days of data means a single outage can consume the entire error budget.
+- **90-day window**: Use for services with very high SLO targets (99.99 percent or higher) where even a rare failure is significant.
+
+### Burn Rate Alert Thresholds
+
+The burn rate values and windows that trigger alerts. The standard Google SRE approach recommends:
+
+```
+Critical page: burn rate > 6 over 5 minutes OR burn rate > 3 over 30 minutes
+Warning page:  burn rate > 2 over 1 hour     OR burn rate > 1 over 6 hours
+```
+
+These thresholds catch both fast catastrophic failures and slow chronic degradation.
+
+### Sampling Rate
+
+The proportion of requests that contribute to SLI measurements. At very high throughput (above 100,000 requests per second), sampling 10 percent of requests gives statistically valid results at a fraction of the cost.
+
+Sampling introduces a tradeoff. At 10 percent sampling, the p50 latency estimate is accurate within 1 percent, but the p999 estimate degrades significantly because the tail events are rare and may be missed entirely. For SLIs that include tail latency, use a sampling rate of at least 50 percent.
+
+### Deduplication Window
+
+The time window for detecting and discarding duplicate batches. If a batch is received more than once (due to network retry or partition recovery), the deduplication system drops the duplicate.
+
+Set the deduplication window to twice the maximum expected batch delivery time. If batches are typically delivered within 5 seconds, set the deduplication window to 10 seconds.
+
+### Histogram Precision
+
+The number of significant digits in the HdrHistogram. More digits give finer precision but use more memory.
+
+- **3 significant digits**: Standard for most SLIs. Precision of 1 percent at the p99. Memory: approximately 256 KB per histogram.
+- **4 significant digits**: Use for systems where tail latency is critical (trading systems, real-time media). Precision of 0.1 percent at the p99. Memory: approximately 1 MB per histogram.
+- **2 significant digits**: Use for systems with constrained memory (edge devices, embedded systems). Precision of 10 percent at the p99. Memory: approximately 32 KB per histogram.
+
+### Concurrency Level
+
+The number of worker threads that process batches concurrently in the aggregation layer. More threads increase throughput but also increase lock contention.
+
+- **CPU-bound workloads**: Set the concurrency level to the number of CPU cores. The histogram merge operation is CPU-intensive, so more threads than cores do not improve throughput.
+- **I/O-bound workloads**: Set the concurrency level to 2x to 4x the number of CPU cores. If the aggregation node writes to a database on every batch, the threads spend time waiting for I/O, and more threads can improve throughput.
+- **Memory-bound workloads**: Set the concurrency level to 1x to 2x the number of CPU cores. More threads increase memory pressure because each thread maintains its own temporary data structures.
+
+### Batch Size
+
+The number of seconds of data accumulated before a batch is sent from the instrumented service to the collector. Smaller batches reduce latency between the request and the SLI update. Larger batches reduce the load on the collector.
+
+- **1-second batches**: Standard for most services. Provides near-real-time SLI updates with acceptable collector load.
+- **5-second batches**: Use for services with very high throughput (above 100,000 requests per second) where the collector is the bottleneck. Adds 5 seconds of latency between the request and the SLI update.
+- **10-second batches**: Use for non-critical services where real-time SLI updates are not required. Reduces collector load by 90 percent compared to 1-second batches.
+
+### Retention Period
+
+The duration for which SLI data is retained in the time-series database. Longer retention periods provide more historical data for trend analysis but increase storage costs and query latency.
+
+- **High-resolution (1-minute buckets)**: Retain for 7 days. This is sufficient for debugging recent incidents.
+- **Medium-resolution (5-minute buckets)**: Retain for 90 days. This covers one full quarter for quarterly SLO reviews.
+- **Low-resolution (1-hour buckets)**: Retain for 2 years. This covers the typical regulatory requirement for data retention.
+- **Aggregate (1-day buckets)**: Retain indefinitely. Day-level aggregates consume very little storage and are useful for year-over-year comparisons.
+
+### Evaluation Interval
+
+The frequency at which the SLO evaluator queries the aggregation layer and computes SLI values. Shorter intervals provide faster alerting but increase the load on the aggregation layer.
+
+- **10-second intervals**: Standard for most services. Burn rate alerts fire within 10 seconds of exceeding the threshold.
+- **30-second intervals**: Use for services with low traffic (under 1,000 requests per second) where the SLI value changes slowly. Reduces evaluator load by 3x.
+- **60-second intervals**: Use for non-critical services where 1-minute delay in alerting is acceptable.
+
+### Service Priority
+
+The priority level assigned to each service for resource allocation during contention. Higher priority services get more aggregation resources, longer queue capacity, and preferential treatment during data loss scenarios.
+
+- **Critical (P0)**: User-facing services with SLOs of 99.99 percent or higher. These services get dedicated aggregation shards.
+- **High (P1)**: User-facing services with SLOs of 99.9 percent. These services share shards but have priority over lower-priority services.
+- **Medium (P2)**: Internal services that support user-facing functionality. These services share shards and may experience data loss during extreme traffic spikes.
+- **Low (P3)**: Batch processing, internal tools, and experimental services. These services get best-effort SLI data and may be dropped during contention.
+
+---
+
+Understanding the internal mechanics of SLI computation gives you the tools to diagnose problems and tune performance. The next section moves from theory to practice, showing how SLI systems are built at scale across multiple data centers and global user populations.

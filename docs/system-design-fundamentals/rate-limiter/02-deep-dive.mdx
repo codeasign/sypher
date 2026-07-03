@@ -1,0 +1,957 @@
+---
+id: rate-limiter-deep-dive
+title: Rate Limiter Pattern -- Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A production rate limiter is not a single monolithic component. It is a layered pipeline with four distinct stages, each responsible for one aspect of the decision: identification, lookup, evaluation, and enforcement. Understanding each stage at the implementation level is essential for building a rate limiter that performs at 100,000 requests per second with sub-millisecond latency for the majority of checks.
+
+The four stages are connected by asynchronous queues. Stage 1 feeds into stage 2, which feeds into stage 3, and so on. Each stage can be scaled independently. If the lookup stage becomes a bottleneck, you add more Redis replicas. If the evaluation stage becomes a bottleneck, you move the algorithm logic into Redis Lua scripts. This decoupling is what allows production rate limiters to scale horizontally.
+
+<AsciiDiagram
+  id="rate-limiter/deep-dive-internal-arch"
+  title="Rate Limiter Internal Architecture Pipeline"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     RATE LIMITER INTERNAL PIPELINE                            │
+│                                                                              │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐           │
+│  │  STAGE 1         │  │  STAGE 2         │  │  STAGE 3         │           │
+│  │  IDENTIFICATION  │  │  STATE LOOKUP    │  │  ALGORITHM       │           │
+│  │                  │  │                  │  │  EVALUATION      │           │
+│  │ Extract:         │  │ Redis: GET       │  │                  │           │
+│  │ - API Key        │──│ Memcached: GET   │──│ Token Bucket     │──┐        │
+│  │ - User ID        │  │ Local Cache:     │  │   Check/Refill   │  │        │
+│  │ - IP + /24 CIDR  │  │   L1 Hit (0.1ms)│  │ Sliding Window   │  │        │
+│  │ - Session Token  │  │   L2 Hit (1ms)  │  │   Counter Calc   │  │        │
+│  │                  │  │   Redis (3ms)   │  │ Fixed Window     │  │        │
+│  │ QoS Class:       │  │                  │  │   INCR + EXPIRE  │  │        │
+│  │ - Premium Fast   │  │ TTL-based       │  │                  │  │        │
+│  │ - Standard       │  │  auto-eviction  │  │ Lua atomic ops   │  │        │
+│  │ - Bulk           │  │                  │  │                  │  │        │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘  │        │
+│                                                                     │        │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────────┘        │
+│  │  STAGE 4a        │  │  STAGE 4b        │  │                              │
+│  │  ALLOW PATH      │  │  REJECT PATH     │  │                              │
+│  │                  │  │                  │  │                              │
+│  │ Forward request  │  │ Return 429       │  │                              │
+│  │ Attach headers:  │  │ Set Retry-After  │  │                              │
+│  │ X-RateLimit-*    │  │ Log rejection    │  │                              │
+│  │ Emit: allowed    │  │ Emit: rejected   │  │                              │
+│  │ Increment state  │  │ No state change  │  │                              │
+│  └──────────────────┘  └──────────────────┘  │                              │
+│                                                │                              │
+│  ┌────────────────────────────────────────────┘                              │
+│  │                                                                            │
+│  ▼                                                                            │
+│  Backend Service or Client Response                                          │
+│                                                                              │
+│  Total target latency budget:                                                │
+│  L1 cache hit: 0.5ms added total (fast path, 60% of requests)              │
+│  L2 cache hit: 2ms added total (medium path, 25% of requests)              │
+│  L3 Redis R/W: 6ms added total (slow path, 15% of requests)               │
+│  p99 overall: 12ms added total                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Four-stage pipeline showing identification, state lookup, algorithm evaluation, and enforcement paths"
+  caption="The rate limiter pipeline processes each request through four distinct stages with specific latency budgets"
+/>
+
+### Stage 1: Identity Resolution
+
+The identification stage normalizes raw request attributes into a deterministic key. For IP-based limits, you might strip the last octet to create a /24 prefix key, grouping users behind the same NAT. For API keys, you hash the key using SHA-256 to create a fixed-length identifier that does not leak the raw key in logs or metrics. This stage also applies quality-of-service classification: premium customers might have faster lookup paths or higher limits.
+
+The identity resolution function must be deterministic (same request always produces the same key), fast (under 10 microseconds), and collision-resistant (two different clients never produce the same key). The key format is `rl:{version}:{namespace}:{normalized_id}:{endpoint}`.
+
+```python
+import hashlib
+import time
+
+def resolve_identity(request, config):
+    """Extract and normalize client identity from request."""
+    identity = None
+    tier = "anonymous"
+
+    # Try API key first
+    raw_key = request.headers.get("X-API-Key", "")
+    if raw_key:
+        identity = hashlib.sha256(raw_key.encode()).hexdigest()[:16]
+        tier = lookup_tier(raw_key)  # free, pro, enterprise
+        namespace = "apikey"
+    # Try user ID (JWT token)
+    elif request.headers.get("Authorization"):
+        token = request.headers.get("Authorization").replace("Bearer ", "")
+        identity = decode_jwt_sub(token)
+        tier = resolve_user_tier(identity)
+        namespace = "user"
+    # Try session cookie
+    elif request.cookies.get("session_id"):
+        identity = request.cookies.get("session_id")
+        tier = "standard"
+        namespace = "session"
+    # Fall back to IP
+    else:
+        client_ip = request.remote_addr
+        if config.cidr_prefix == 24:
+            parts = client_ip.split(".")
+            identity = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+        else:
+            identity = client_ip
+        tier = "anonymous"
+        namespace = "ip"
+
+    endpoint = request.path.split("?")[0]  # strip query params
+    key = f"rl:v1:{namespace}:{identity}:{endpoint}"
+    return key, tier
+```
+
+### Stage 2: State Lookup with Multi-Tier Caching
+
+Performance is critical at thousands of requests per second. A single Redis round trip adds 2-5 milliseconds. Production implementations use a multi-tier cache: an L1 in-process cache (zero network, 0.1ms hit time), an L2 distributed cache (Memcached or local Redis, 1ms hit time), and an L3 authoritative store (Redis cluster, 3ms hit time). Cache coherency is maintained through TTL-based invalidation.
+
+The L1 cache is the most critical performance layer. At 50,000 requests per second, a 60 percent L1 hit rate means 30,000 requests are served from local memory without any network call. This reduces the Redis load from 50,000 to 20,000 operations per second, which translates to roughly 3 fewer Redis CPU cores.
+
+```python
+import memcache
+import redis
+
+class MultiTierCache:
+    def __init__(self, redis_client, memcached_client):
+        self.redis = redis_client
+        self.memcached = memcached_client
+        self.l1_cache = {}  # in-process dict
+
+    def get_rate_limit_state(self, key, tier):
+        # L1: process-local cache, 0.1ms, 60% hit rate
+        l1_key = f"rl:l1:{key}"
+        state = self.l1_cache.get(l1_key)
+        if state and state["expires_at"] > time.time():
+            return state["data"]
+
+        # L2: distributed memcached, 1ms, 25% hit rate
+        l2_key = f"rl:l2:{key}"
+        state = self.memcached.get(l2_key)
+        if state:
+            self.l1_cache[l1_key] = {
+                "data": state,
+                "expires_at": time.time() + 1
+            }
+            return state
+
+        # L3: Redis authoritative store, 3ms, 15% miss rate
+        state = self.redis.hgetall(key)
+        if state:
+            self.memcached.set(l2_key, state, time=5)
+            self.l1_cache[l1_key] = {
+                "data": state,
+                "expires_at": time.time() + 1
+            }
+        return state
+```
+
+### Stage 3: Algorithm Evaluation
+
+This stage runs the specific algorithm implementation. The evaluation must be deterministic, fast, and atomic. Most production implementations encode the algorithm as a Lua script that runs directly on the Redis server, eliminating round trips for state read and write. The Lua script receives the current key, the algorithm parameters, and the current timestamp. It returns the decision (allow or reject) and the updated state.
+
+The evaluation stage is the most computationally intensive part of the pipeline. For token bucket, it involves the refill calculation (a multiplication and minimum operation). For sliding window log, it involves a sorted set count and an insertion (O(log n) operations). For sliding window counter, it involves a hash field increment and a weighted calculation.
+
+### Stage 4: Enforcement
+
+The enforcement stage produces the outcome. On allow: forward the request with headers. On reject: short-circuit with 429 without touching the backend. Enforcement can also include progressive actions: warn at 80 percent capacity, reject at 100 percent, and block for 60 seconds at 200 percent.
+
+The enforcement stage also handles the circuit breaker for Redis failures. If Redis is unreachable, the enforcement stage switches to a local in-memory rate limiter with conservative limits (50 percent of normal). This ensures the rate limiter continues operating even when its data store is unavailable.
+
+## Data Structures and Algorithms
+
+### Algorithm 1: Token Bucket
+
+The token bucket algorithm is the most widely used rate limiting algorithm. It models a bucket that holds tokens, refilled at a constant rate. Each request consumes one token. Burst capacity comes from accumulated tokens during idle periods. The algorithm has two parameters: capacity (maximum tokens the bucket can hold, defining the burst size) and refill rate (tokens added per second, defining the sustained rate).
+
+The token bucket is ideal for API rate limiting because most API traffic is bursty. A client might be idle for 10 seconds, then send 50 requests in 1 second. The token bucket allows this burst from accumulated tokens, then constrains the client to the sustained rate until tokens accumulate again.
+
+<AsciiDiagram
+  id="rate-limiter/deep-dive-token-bucket"
+  title="Token Bucket Algorithm -- Internal State Machine and Example Timeline"
+  content={`
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    TOKEN BUCKET STATE MACHINE                                │
+│                                                                             │
+│  State: { tokens: float, last_refill: timestamp }                          │
+│  Config: { capacity: 100, refill_rate: 10/sec }                            │
+│                                                                             │
+│  ┌────────────────────────────────────────────────────────┐               │
+│  │  REFILL(timestamp):                                    │               │
+│  │    elapsed = timestamp - last_refill                    │               │
+│  │    new_tokens = elapsed * refill_rate                   │               │
+│  │    tokens = min(capacity, tokens + new_tokens)          │               │
+│  │    last_refill = timestamp                              │               │
+│  └────────────────────────┬───────────────────────────────┘               │
+│                           │                                                │
+│                           ▼                                                │
+│  ┌────────────────────────────────────────────────────────┐               │
+│  │  CONSUME(count=1):                                     │               │
+│  │    refill(now())                                         │               │
+│  │    if tokens >= count:                                   │               │
+│  │        tokens = tokens - count                           │               │
+│  │        return ALLOW                                      │               │
+│  │    else:                                                 │               │
+│  │        return REJECT                                     │               │
+│  └────────────────────────────────────────────────────────┘               │
+│                           │                                                │
+│                           ▼                                                │
+│  ┌────────────────────────────────────────────────────────────────────────┐│
+│  │  Example Timeline: Capacity=100, Refill Rate=10/sec                   ││
+│  │                                                                        ││
+│  │  T=0s:   Bucket is full: 100 tokens                                   ││
+│  │  T=0s:   50 requests arrive, consume 50 tokens → 50 remaining        ││
+│  │  T=5s:   25 requests arrive, refill adds 50 (5s * 10/s)               ││
+│  │          tokens = min(100, 50+50) = 100, consume 25 → 75             ││
+│  │  T=10s:  200 requests arrive, refill adds 50 (5s * 10/s)             ││
+│  │          tokens = min(100, 75+50) = 100, consume 100 → 0             ││
+│  │          remaining 100 requests rejected (429)                         ││
+│  │  T=11s:  10 requests arrive, refill adds 10 (1s * 10/s)              ││
+│  │          tokens = min(100, 0+10) = 10, consume 10 → 0                ││
+│  │                                                                        ││
+│  │  Key property: Burst of up to 100 requests allowed, then limited      ││
+│  │  to 10 requests per second thereafter.                                ││
+│  └────────────────────────────────────────────────────────────────────────┘│
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="State machine diagram of token bucket algorithm showing refill and consume logic with example timeline"
+  caption="Token bucket combines burst capacity with sustained rate limiting through token accumulation"
+/>
+
+```lua
+-- Token Bucket Lua script (runs atomically on Redis)
+-- KEYS[1] = rate_limit:<identity>
+-- ARGV[1] = capacity (max tokens)
+-- ARGV[2] = refill_rate (tokens per second)
+-- ARGV[3] = now (unix timestamp)
+-- ARGV[4] = cost (usually 1, but can be higher for expensive operations)
+
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local cost = tonumber(ARGV[4])
+
+-- Read current state from Redis hash
+local state = redis.call("HMGET", key, "tokens", "last_refill")
+local tokens = tonumber(state[1]) or capacity
+local last_refill = tonumber(state[2]) or now
+
+-- Calculate refill based on elapsed time
+local elapsed = math.max(0, now - last_refill)
+local new_tokens = elapsed * refill_rate
+tokens = math.min(capacity, tokens + new_tokens)
+last_refill = now
+
+-- Check if enough tokens available
+if tokens >= cost then
+    tokens = tokens - cost
+    redis.call("HMSET", key, "tokens", tokens, "last_refill", last_refill)
+    -- Set TTL to auto-cleanup: capacity / refill_rate + 1 second buffer
+    local ttl = math.ceil(capacity / refill_rate) + 1
+    redis.call("EXPIRE", key, ttl)
+    return {1, tokens}  -- 1 = allowed, remaining tokens
+else
+    -- Still update last_refill so refill is not lost
+    redis.call("HMSET", key, "tokens", tokens, "last_refill", last_refill)
+    return {0, tokens}  -- 0 = rejected, 0 remaining tokens
+end
+```
+
+The Lua script is registered with `SCRIPT LOAD` and executed with `EVALSHA` to minimize network overhead. The script is roughly 400 bytes, fitting in a single TCP packet. The execution time on Redis is under 10 microseconds for typical cases, and under 50 microseconds for worst-case floating-point operations.
+
+### Algorithm 2: Leaky Bucket
+
+The leaky bucket algorithm enforces a strict output rate. Requests enter a queue (the bucket) and are processed at a fixed rate. If the queue is full, incoming requests are rejected. Unlike the token bucket, the leaky bucket provides no burst capacity -- it smooths traffic into a steady stream.
+
+The leaky bucket has two parameters: queue size (maximum number of requests that can be queued, analogous to buffer capacity) and drain rate (requests processed per second, the fixed outflow rate). The algorithm is modeled as a FIFO queue with a constant service rate.
+
+The leaky bucket is appropriate for downstream components that cannot handle burst traffic. A database that can process 500 writes per second needs a leaky bucket in front of it to transform bursty application traffic into a steady 500 writes per second stream. The queue buffers the difference between the arrival rate and the drain rate, but once the queue is full, further requests are rejected.
+
+```python
+class LeakyBucket:
+    def __init__(self, queue_size, drain_rate):
+        self.queue_size = queue_size  # max queue depth
+        self.drain_rate = drain_rate  # requests per second
+        self.queue = []
+        self.last_drain = time.monotonic()
+
+    def _drain(self):
+        """Remove requests from the queue at the drain rate."""
+        now = time.monotonic()
+        elapsed = now - self.last_drain
+        drain_count = int(elapsed * self.drain_rate)
+        if drain_count > 0:
+            self.queue = self.queue[drain_count:]
+            self.last_drain = now
+
+    def allow(self):
+        self._drain()
+        if len(self.queue) < self.queue_size:
+            self.queue.append(time.monotonic())
+            return True
+        return False
+```
+
+### Algorithm 3: Sliding Window Log
+
+The sliding window log maintains a sorted set of timestamps per client. Each request appends its timestamp. The algorithm counts timestamps within the current window. This provides exact accuracy but uses O(n) memory per client, where n is the number of requests in the window.
+
+The sliding window log is the most accurate rate limiting algorithm. It never allows a double burst at window boundaries because the window is defined relative to the current time, not fixed clock boundaries. The trade-off is memory: with a limit of 100 requests per minute and 96 bytes per stored request, each active client uses 9,600 bytes. For 10,000 active clients, this is 96 MB.
+
+<AsciiDiagram
+  id="rate-limiter/deep-dive-sliding-window"
+  title="Sliding Window Log -- Redis Sorted Set Data Structure"
+  content={`
+┌────────────────────────────────────────────────────────────────────────────┐
+│                  SLIDING WINDOW LOG -- REDIS SORTED SET                      │
+│                                                                             │
+│  Key: rl:sliding:user_8472                                                  │
+│  Limit: 10 requests per 60 seconds                                         │
+│                                                                             │
+│  Sorted Set Members (timestamp as score, millisecond precision):           │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ Member              │ Score (ms precision)  │ In Window?             │  │
+│  ├──────────────────────────────────────────────────────────────────────┤  │
+│  │ req:1719876000:001  │ 1719876000.001        │ YES                    │  │
+│  │ req:1719876000:423  │ 1719876000.423        │ YES                    │  │
+│  │ req:1719876001:100  │ 1719876001.100        │ YES                    │  │
+│  │ req:1719876002:001  │ 1719876002.001        │ YES                    │  │
+│  │ req:1719876003:500  │ 1719876003.500        │ YES                    │  │
+│  │ req:1719876004:000  │ 1719876004.000        │ YES                    │  │
+│  │ req:1719876005:200  │ 1719876005.200        │ YES                    │  │
+│  │ req:1719876006:800  │ 1719876006.800        │ YES                    │  │
+│  │ req:1719876007:100  │ 1719876007.100        │ YES                    │  │
+│  │ req:1719876008:400  │ 1719876008.400        │ YES                    │  │
+│  │ req:1719876009:000  │ 1719876009.000        │ YES (11th!) EXCEEDED │  │
+│  │ req:1719875900:100  │ 1719875900.100        │ NO (expired)           │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  Operations per request:                                                    │
+│  1. ZREMRANGEBYSCORE key 0 (now - window)  -- remove expired entries       │
+│  2. ZCOUNT key (now - window) now           -- count current entries       │
+│  3. if count < limit: ZADD key now request_id  -- add new entry            │
+│  4. EXPIRE key window_seconds * 2          -- auto-cleanup TTL             │
+│                                                                             │
+│  Memory per request: ~96 bytes (member string + score + overhead)          │
+│  For 100 clients at 100 req/min: 960,000 bytes/min = ~16 KB/sec growth    │
+│  Redis uses a skip list and hash table for sorted sets -- O(log n)        │
+│  insert and O(log n) count operations.                                    │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Redis sorted set structure showing timestamp entries with scores, expired and current window entries"
+  caption="Sliding window log stores every request timestamp for exact accuracy at higher memory cost"
+/>
+
+```lua
+-- Sliding Window Log Lua script
+-- KEYS[1] = rl:sliding:<identity>
+-- ARGV[1] = window_size (seconds)
+-- ARGV[2] = limit (max requests per window)
+-- ARGV[3] = now (unix timestamp in milliseconds)
+-- ARGV[4] = request_id (unique identifier, e.g., UUID)
+
+local key = KEYS[1]
+local window = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local request_id = ARGV[4]
+
+-- Calculate window start
+local window_start = now - (window * 1000)
+
+-- Remove expired entries outside the window
+redis.call("ZREMRANGEBYSCORE", key, 0, window_start)
+
+-- Count entries in current window
+local count = redis.call("ZCOUNT", key, window_start, now)
+
+if count < limit then
+    -- Add current request to the log
+    redis.call("ZADD", key, now, request_id)
+    -- Set TTL to auto-cleanup: window * 2 ensures entries are
+    -- removed even if the client stops sending requests
+    redis.call("EXPIRE", key, window * 2)
+    return {1, count + 1}  -- 1 = allowed, remaining count
+else
+    return {0, count}  -- 0 = rejected, current count
+end
+```
+
+### Algorithm 4: Sliding Window Counter
+
+The sliding window counter approximates the sliding window log using two fixed counters. It computes a weighted sum of the current window's counter and the previous window's counter. This uses O(1) memory per client with an error margin of roughly 3-5 percent.
+
+The key insight is that you do not need to store every timestamp. You only need to know how many requests occurred in the current sub-window and the previous sub-window. The weighted sum gives a good approximation of the true sliding window count.
+
+<AsciiDiagram
+  id="rate-limiter/deep-dive-sliding-counter"
+  title="Sliding Window Counter -- Approximation Mechanics with Weighted Calculation"
+  content={`
+┌────────────────────────────────────────────────────────────────────────────┐
+│                 SLIDING WINDOW COUNTER APPROXIMATION                        │
+│                                                                             │
+│  Window: 60 seconds, divided into 6 sub-windows of 10 seconds each        │
+│  Limit: 100 requests per minute                                            │
+│                                                                             │
+│  ┌──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐      │
+│  │  0-10s   │ 10-20s   │ 20-30s   │ 30-40s   │ 40-50s   │ 50-60s   │      │
+│  │          │          │          │          │          │          │      │
+│  │ Cnt: 15  │ Cnt: 22  │ Cnt: 18  │ Cnt: 25  │ Cnt: 20  │ Cnt: 30  │      │
+│  │          │          │          │          │          │          │      │
+│  └──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘      │
+│       ▲           ▲                                      ▲                 │
+│       │           │                                      │                 │
+│       └───────────┴──────────────────────────────────────┘                 │
+│                        Weighted Window Analysis:                            │
+│                                                                             │
+│  Request arrives at t=55 seconds.                                          │
+│  Current sub-window: 50-60s, counter = 30                                  │
+│  Previous sub-windows fully inside 60s window:                              │
+│    0-10s: 15, 10-20s: 22, 20-30s: 18, 30-40s: 25, 40-50s: 20             │
+│  Weight for current sub-window: 5/10 = 0.5                                 │
+│  (5 of 10 seconds elapsed in the current sub-window)                       │
+│                                                                             │
+│  Estimated count = 15 + 22 + 18 + 25 + 20 + (30 * 0.5) = 115              │
+│  Actual sliding window count = 112                                         │
+│  Error: 115 - 112 = 3 (2.7%)                                               │
+│                                                                             │
+│  Trade-off: More sub-windows = less error = more memory                   │
+│  6 sub-windows (10s each):    ~3% error, 6 counters per client            │
+│  12 sub-windows (5s each):    ~1.5% error, 12 counters per client         │
+│  60 sub-windows (1s each):    ~0.3% error, 60 counters per client         │
+│                                                                             │
+│  Recommendation: Start with 6 sub-windows. Move to 12 if error is         │
+│  unacceptable. The memory difference is negligible (6 counters vs 12).    │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Six sub-window counters illustrating the weighted approximation calculation for sliding window counter"
+  caption="Sliding window counter trades a small approximation error for O(1) memory per client"
+/>
+
+```lua
+-- Sliding Window Counter Lua script
+-- KEYS[1] = rl:counter:<identity>
+-- ARGV[1] = window_size (seconds, e.g., 60)
+-- ARGV[2] = sub_window_count (e.g., 6 for 10-second sub-windows)
+-- ARGV[3] = limit (max requests per window)
+-- ARGV[4] = now (unix timestamp)
+
+local key = KEYS[1]
+local window = tonumber(ARGV[1])
+local sub_count = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+
+-- Calculate current and previous sub-window indices
+local sub_window = window / sub_count
+local current_sub = math.floor(now / sub_window)
+local prev_sub = current_sub - 1
+
+-- Get current and previous sub-window counts
+local current_count = tonumber(redis.call("HGET", key, current_sub)) or 0
+local prev_count = tonumber(redis.call("HGET", key, prev_sub)) or 0
+
+-- Calculate weight for current sub-window
+local elapsed_in_sub = (now % sub_window) / sub_window
+local weight = 1.0 - elapsed_in_sub
+local estimated = prev_count * weight + current_count
+
+if estimated < limit then
+    redis.call("HINCRBY", key, current_sub, 1)
+    redis.call("EXPIRE", key, window * 2)
+    return {1, math.floor(estimated)}
+else
+    return {0, math.floor(estimated)}
+end
+```
+
+## Request Lifecycle
+
+The full request lifecycle through a rate limiter spans 12 distinct phases. Each phase contributes to the total latency budget. Understanding where time is spent helps you optimize the rate limiter for your specific workload.
+
+<AsciiDiagram
+  id="rate-limiter/deep-dive-lifecycle"
+  title="Full Request Lifecycle Through Rate Limiter with Latency Budgets"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     RATE LIMITER REQUEST LIFECYCLE                            │
+│                                                                              │
+│  1. Socket Accept          ───>  2. TLS Handshake  ───>  3. HTTP Parse      │
+│     (0.1ms)                       (1-5ms)                  (0.02ms)          │
+│                                                                              │
+│  4. Identity Extract       ───>  5. Tier Lookup    ───>  6. Cache Check     │
+│     (0.01ms)                      (0.5ms DB)               (0.1ms L1 hit)   │
+│                                                                              │
+│  7. Redis Read             ───>  8. Algorithm Eval  ───>  9. Redis Write    │
+│     (2-5ms)                       (0.001ms)                (2-5ms)           │
+│                                                                              │
+│  10. Decision              ───>  11. Headers Attach ───>  12. Forward/Send  │
+│      (0.001ms)                    (0.01ms)                 (0.1ms)           │
+│                                                                              │
+│  ───────────────────────────────────────────────────────────────────         │
+│  Latency budget summary:                                                     │
+│    Fast path (L1 cache hit, no Redis): 0.2ms total added                   │
+│    Normal path (L2 cache hit, Memcached): 2ms total added                  │
+│    Slow path (L3 Redis read + write): 5-12ms total added                   │
+│    p50 overall: 0.5ms                                                       │
+│    p99 overall: 12ms                                                        │
+│    p99.9 overall: 30ms                                                      │
+│  ───────────────────────────────────────────────────────────────────         │
+└──────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Twelve-phase lifecycle showing each step from socket accept through forwarding with latency budgets"
+  caption="The full lifecycle spans 12 phases with a target of under 15ms total added latency at p99"
+/>
+
+### Phase Details
+
+**Phase 1-3: Network and Protocol**: The request arrives at the edge server. TCP accept, TLS handshake, and HTTP parsing happen before the rate limiter sees the request. These phases are common to all request processing and not specific to rate limiting. TLS handshake is the most expensive phase, adding 1-5ms for the initial handshake and 0.1ms for session resumption.
+
+**Phase 4-5: Identity and Tier**: The rate limiter extracts the client identifier and looks up their tier. Tier information determines which rate limit configuration to apply. This lookup typically hits a local cache or a low-latency configuration store. The tier lookup is fast (under 0.5ms) because it uses a small, frequently accessed dataset.
+
+**Phase 6-7: Cache and Store**: The state lookup checks L1, L2, and L3 caches in sequence. If all caches miss, a Redis read fetches the authoritative state. Cache misses are the most expensive part of the lifecycle. The L1 cache is checked first because it is the fastest (zero network). The L2 cache provides a network-speed buffer. The L3 cache hit is the fallback.
+
+**Phase 8-9: Evaluation and Mutation**: The algorithm evaluates whether to allow the request. For allowed requests, the state is mutated in Redis. For rejected requests, no mutation occurs. Using a single Lua script combines evaluation and mutation into one atomic operation. The Lua script is the key to both correctness (atomicity) and performance (single Redis round trip instead of two).
+
+**Phase 10-12: Output**: The decision is produced. Allowed requests get rate limit headers and are forwarded. Rejected requests get a 429 response with Retry-After. Metrics are emitted asynchronously to avoid adding latency to the request path. The output phase is the fastest part of the lifecycle because it is purely local computation.
+
+## Consistency and State
+
+### Scenario 1: Race Condition at High Concurrency
+
+When 10,000 requests per second hit the rate limiter, multiple requests from the same client can arrive simultaneously. Without atomic operations, two requests might both read `tokens=1`, both decide they can proceed, and both decrement, resulting in a negative token count. This is a classic read-modify-write race condition.
+
+**Solution**: Redis Lua scripts execute atomically. The entire read-evaluate-write sequence runs as one operation on the Redis server. No other commands interleave during execution. The script is registered with `SCRIPT LOAD` and executed with `EVALSHA`, ensuring the script is always available on the Redis server.
+
+<AsciiDiagram
+  id="rate-limiter/deep-dive-race-condition"
+  title="Race Condition and Atomic Lua Solution"
+  content={`
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    RACE CONDITION SCENARIO                                   │
+│                                                                             │
+│  WITHOUT ATOMICITY (e.g., separate GET + SET):                            │
+│                                                                             │
+│  Time  Client A              Client B              Redis State             │
+│  ───── ──────────            ──────────            ────────────            │
+│  T=0   GET tokens=1                               tokens=1                │
+│  T=0                           GET tokens=1       tokens=1                │
+│  T=1   tokens >= 1? YES       (thinking...)       tokens=1                │
+│  T=2   (thinking...)          tokens >= 1? YES    tokens=1                │
+│  T=3   SET tokens=0                                tokens=0               │
+│  T=4                           SET tokens=0        tokens=0               │
+│  T=5   ALLOWED                ALLOWED             tokens=-1 (underflow)  │
+│                                                                             │
+│  Result: 2 requests allowed when only 1 was available.                    │
+│  State corruption: tokens = -1.                                            │
+│                                                                             │
+│  WITH REDIS LUA ATOMICITY:                                                │
+│                                                                             │
+│  Time  Client A              Client B              Redis State             │
+│  ───── ──────────            ──────────            ────────────            │
+│  T=0   Lua script runs       (queued)             tokens=1                │
+│  T=0   tokens >= 1? YES      (queued)             tokens=1                │
+│  T=0   SET tokens=0                               tokens=0               │
+│  T=0   ALLOWED                                     tokens=0               │
+│  T=0   Lua script runs       (executed)           tokens=0                │
+│  T=0   tokens >= 1? NO       (executed)           tokens=0                │
+│  T=0   REJECT                                       tokens=0               │
+│                                                                             │
+│  Result: 1 allowed, 1 rejected. Correct behavior.                         │
+│  Lua ensures the entire check+mutate happens as one uninterruptible       │
+│  operation on the Redis server. No other commands interleave.             │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Timeline showing two concurrent clients causing a race condition and how Lua atomic execution prevents it"
+  caption="Atomic Lua scripts are essential for correct rate limiting at high concurrency"
+/>
+
+### Scenario 2: Clock Skew in Distributed Setup
+
+Multiple application instances read and write to a shared Redis cluster. If one instance's clock is 5 seconds ahead of the others, it will compute different refill values than other instances. The token bucket's `last_refill` timestamp is stored in Redis, so all instances read the same reference time -- but the `now()` value passed to the Lua script differs.
+
+**Solution**: Always use Redis's `TIME` command inside the Lua script to get the authoritative timestamp. This ensures all operations use the same clock source regardless of the application server's clock. If you must pass the timestamp from the application, validate it against `TIME` inside the script and reject requests with timestamps that diverge by more than 1 second.
+
+```lua
+-- Use Redis TIME for authoritative timestamp
+local time_result = redis.call("TIME")
+local redis_seconds = tonumber(time_result[1])
+local redis_microseconds = tonumber(time_result[2])
+local now = redis_seconds + (redis_microseconds / 1000000)
+-- Use this 'now' for all rate limit calculations
+```
+
+### Scenario 3: Redis Failover and State Loss
+
+When the Redis leader fails and a replica is promoted, in-flight rate limit state that was not yet replicated is lost. The new leader starts with stale data. Clients might exceed their limits until the next refill period.
+
+**Solution**: Use Redis with `WAIT` to synchronously replicate rate limit state to at least one replica before responding. Accept the latency trade-off: 2-5 milliseconds extra per write in exchange for durability. For non-critical limits, accept the risk and let clients burst briefly after failover. The burst is bounded by the replication lag (typically under 100ms) times the client's rate limit.
+
+### Scenario 4: Network Partition
+
+If the rate limiter cannot reach Redis, it must make a decision: allow all requests (fail open, risking backend overload) or reject all requests (fail closed, risking false positives). Neither choice is ideal in isolation.
+
+**Solution**: Implement a circuit breaker with three states. If Redis is unreachable for 500 milliseconds, switch to a local in-process rate limiter with best-effort accuracy. The local limiter uses the last known state from the L1 cache. If Redis stays down for 10 seconds, escalate to degrade mode: allow all requests but log every decision for audit. The circuit breaker automatically reconnects when Redis becomes available, using a health check that runs every 2 seconds.
+
+<AsciiDiagram
+  id="rate-limiter/deep-dive-circuit-breaker"
+  title="Circuit Breaker State Machine for Redis Connectivity Failure"
+  content={`
+┌────────────────────────────────────────────────────────────────────────────┐
+│               CIRCUIT BREAKER STATE MACHINE                                  │
+│                                                                              │
+│                    ┌────────────────────────────────────┐                    │
+│                    │                                    │                    │
+│       ┌───────────>│   CLOSED (Normal Operation)        │                    │
+│       │            │   Redis connected and responding   │                    │
+│       │            │   Full distributed rate limiting   │                    │
+│       │            │   p50 latency: 0.5ms               │                    │
+│       │            │   p99 latency: 12ms                │                    │
+│       │            │                                    │                    │
+│       │            └──────────────┬─────────────────────┘                    │
+│       │                           │                                          │
+│       │              Redis timeout or error                                  │
+│       │              (500ms consecutive failures)                            │
+│       │                           │                                          │
+│       │                           ▼                                          │
+│       │            ┌────────────────────────────────────┐                    │
+│       │            │                                    │                    │
+│       │            │   HALF-OPEN (Local Fallback)        │                    │
+│       │            │   Local in-process rate limiter    │                    │
+│       │            │   50% of normal limits             │                    │
+│       │            │   Logging warnings every 10s       │                    │
+│       │            │   Attempt reconnect every 2s       │                    │
+│       │            │   p50 latency: 0.01ms (no network) │                    │
+│       │            │                                    │                    │
+│       │            └──────────────┬─────────────────────┘                    │
+│       │                           │                                          │
+│       │    ┌──────────────────────┴──────────────────────┐                  │
+│       │    │                                             │                   │
+│       │    ▼                                             ▼                   │
+│       │  Redis OK (reconnect)               Redis still down > 10s          │
+│       │    │                                             │                   │
+│       │    │                                             ▼                   │
+│       │    │                              ┌────────────────────────────┐    │
+│       │    │                              │                            │    │
+│       │    │                              │   OPEN (Degraded Mode)      │    │
+│       │    │                              │   Allow all requests       │    │
+│       │    │                              │   Log every decision       │    │
+│       │    │                              │   Alert on-call engineer   │    │
+│       │    │                              │   p50 latency: 0.01ms      │    │
+│       │    │                              │                            │    │
+│       │    │                              └────────────────────────────┘    │
+│       │    │                                             │                   │
+│       │    └───────────────── Redis OK ──────────────────┘                  │
+│       │                              │                                      │
+│       └──────────────────────────────┘                                      │
+│                                                                              │
+│   Recovery: When Redis responds to a health check, transition back to      │
+│   CLOSED. Wait 30 seconds with circuit breaker disabled to let Redis       │
+│   warm its caches before full traffic resumes.                             │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Three-state circuit breaker diagram showing closed, half-open, and open states with transition conditions"
+  caption="Circuit breaker patterns prevent cascading failures when the rate limiter's data store is unavailable"
+/>
+
+## Performance Characteristics
+
+Concrete numbers for a production rate limiter handling 50,000 requests per second with a single Redis cluster (6 shards, each with 1 replica):
+
+**Latency budget per request**:
+- L1 cache hit (in-process dict, zero network): 0.1 milliseconds, 60 percent of requests
+- L2 cache hit (Memcached, local network): 0.8 milliseconds, 25 percent of requests
+- L3 Redis read-write (Lua script, local network): 3-5 milliseconds, 15 percent of requests
+- p50 total added latency: 0.5 milliseconds
+- p99 total added latency: 12 milliseconds
+- p99.9 total added latency: 30 milliseconds
+
+**Throughput capacity**:
+- Single Redis node with Lua: 25,000 decisions per second per core
+- Redis cluster (6 shards, 8 cores each): 150,000 decisions per second
+- Local in-process limiter (no network): 500,000 decisions per second per application core
+- Bottleneck: Redis CPU for Lua script execution, not network bandwidth
+- Redis pipeline mode: increases throughput by 3x but adds latency
+
+**Memory per client by algorithm**:
+- Token bucket: 48 bytes (tokens float + last_refill timestamp)
+- Fixed window: 24 bytes (counter + window timestamp)
+- Sliding window log: 96 bytes per stored request (variable, grows with activity)
+- Sliding window counter: 16 bytes per sub-window (96 bytes for 6 sub-windows)
+- Redis overhead: roughly 64 bytes per key, plus hash/set overhead
+
+**Network overhead**:
+- Request to Redis: roughly 200 bytes per check (key + arguments)
+- Response from Redis: roughly 50 bytes per check (result array)
+- Total bandwidth for 50,000 req/s: 12.5 MB/s outbound, 2.5 MB/s inbound
+- Connection pooling: 50-100 persistent connections per rate limiter instance
+- Redis max memory: configured at 2 GB per shard (1.5 GB for rate limit data, 0.5 GB headroom)
+
+**Scaling characteristics**:
+- Linear scaling with Redis shards: 1 shard = 25K/s, 10 shards = 250K/s
+- Sub-linear scaling with application instances due to cache sharing
+- L1 cache hit rate decreases as the number of application instances increases (more unique clients per instance)
+- Rule of thumb: add 1 Redis shard per 25,000 requests per second of expected peak traffic
+
+## Configuration and Tuning
+
+Rate limiter configuration is a multi-dimensional optimization problem. The following parameters define the behavior:
+
+**Bucket Capacity**: Controls burst tolerance. Higher capacity allows larger spikes. Rule of thumb: capacity = 2x the sustained rate for typical traffic, 10x for bursty traffic like social media APIs. A capacity that is too high defeats the purpose of rate limiting. A capacity that is too low causes false positives during normal traffic fluctuations.
+
+**Refill Rate**: Controls the sustained throughput. Must match the backend's capacity. Calculate from the slowest downstream dependency: if your database handles 1,000 writes per second, set the refill rate to 800 writes per second to leave 20 percent headroom. The refill rate should be reviewed monthly as the backend infrastructure evolves.
+
+**Window Size**: For window-based algorithms. 1 second for aggressive limits on login endpoints (prevent brute force attacks). 60 seconds for standard API rate limits. 24 hours for daily quota limits. Shorter windows provide tighter control but require more frequent state updates. Longer windows provide smoother behavior but allow larger bursts.
+
+**Sub-Window Count**: For sliding window counter. 6 sub-windows (10-second each for a 60-second window) gives roughly 5 percent error. 60 sub-windows (1-second each) gives roughly 0.5 percent error but uses 10x memory. Start with 6 and increase only if the approximation error causes measurable problems.
+
+**Concurrency Limit**: Separate from rate limit. Set to `max_connections - 10` to leave room for health checks and administrative operations. Monitor connection pool depth as a leading indicator of overload. When the concurrency limit is hit, queue requests with a timeout rather than immediately rejecting.
+
+**Tier Thresholds**:
+- Free tier: 100 requests per minute, no burst
+- Pro tier: 1,000 requests per minute, burst to 2,000
+- Enterprise tier: 10,000 requests per minute, burst to 50,000
+- Internal service: 100,000 requests per minute, burst to 200,000
+
+**Dynamic Tuning**: Production systems adjust limits based on backend health. If the backend's p99 latency exceeds 500 milliseconds, reduce the rate limit by 20 percent automatically. If error rate exceeds 5 percent, tighten limits by 50 percent. The dynamic adjustment is computed every 30 seconds and propagated via a configuration store.
+
+```python
+class DynamicRateLimiter:
+    def __init__(self, redis_client, config_store):
+        self.redis = redis_client
+        self.config = config_store
+        self.backend_health = BackendHealthMonitor()
+        self.current_factor = 1.0
+
+    def get_effective_limit(self, identity, tier):
+        base_limit = self.config.get_limit(tier)
+        health_factor = self.backend_health.get_current_factor()
+        return int(base_limit * health_factor)
+
+    def update_health_factor(self):
+        p99 = self.backend_health.get_p99_latency()
+        error_rate = self.backend_health.get_error_rate()
+
+        # Proportional controller: reduce limits when backend struggles
+        if p99 > 500 or error_rate > 5.0:
+            self.current_factor = 0.5  # 50% reduction
+        elif p99 > 300 or error_rate > 2.0:
+            self.current_factor = 0.8  # 20% reduction
+        else:
+            self.current_factor = 1.0  # no reduction
+
+        # Gradual change: never reduce by more than 20% per cycle
+        # to prevent oscillation
+        return self.current_factor
+```
+
+## Key Takeaways
+
+The internal architecture of a rate limiter spans four pipeline stages: identification, state lookup, algorithm evaluation, and enforcement. Each stage has specific performance characteristics that determine the overall latency budget. The multi-tier caching strategy (L1 in-process, L2 Memcached, L3 Redis) is the most important performance optimization.
+
+Three algorithms dominate production use: token bucket for burst tolerance, sliding window log for exact accuracy, and sliding window counter for low memory footprint. Each makes different trade-offs in the dimensions of accuracy, memory, and computational complexity. The sliding window counter offers the best balance for most use cases.
+
+Atomic operations via Redis Lua scripts are mandatory for correct behavior at high concurrency. The race condition scenario demonstrates why two separate read and write operations are insufficient. The circuit breaker handles Redis failures gracefully, switching between closed, half-open, and open states. Clock skew is mitigated by using Redis's TIME command as the authoritative clock source.
+
+Dynamic tuning based on backend health closes the loop, allowing the rate limiter to respond not just to client behavior but to the actual capacity of the system it protects. The configuration parameters -- capacity, refill rate, window size, sub-window count, and tier thresholds -- define the rate limiter's behavior and must be tuned for each specific workload.
+
+## Rate Limit State Machine Patterns
+
+### Pattern 1: Token Bucket with Burst Reservation
+
+Some workloads require guaranteed burst capacity. A reservation-based token bucket sets aside a portion of the bucket capacity for burst reservations. Clients can reserve burst capacity in advance, ensuring it is available when needed. The reservation is a separate Redis key that decrements alongside the main bucket.
+
+```python
+class ReservedBurstBucket:
+    def __init__(self, capacity, refill_rate, reserved_burst=20):
+        self.capacity = capacity
+        self.refill_rate = refill_rate
+        self.reserved = reserved_burst  # reserved for burst
+        self.tokens = capacity - reserved_burst
+        self.last_refill = time.monotonic()
+
+    def reserve_burst(self):
+        """Reserve burst capacity before high-traffic operation."""
+        if self.reserved > 0:
+            self.reserved -= 1
+            self.tokens += 1  # extra token available
+            return True
+        return False
+
+    def consume(self, count=1, use_reserve=False):
+        self._refill()
+        if self.tokens >= count:
+            self.tokens -= count
+            return True
+        if use_reserve and self.reserved > 0:
+            self.reserved -= 1
+            return True
+        return False
+```
+
+### Pattern 2: Rate Limit with Cost-Weighted Requests
+
+Not all requests are equal. A search query that scans 10,000 records costs more than a simple key-value lookup. Cost-weighted rate limiting assigns a cost to each request instead of assuming every request costs 1 token. The cost is based on the estimated processing time or resource consumption.
+
+```python
+class CostWeightedRateLimiter:
+    def __init__(self, capacity, refill_rate):
+        self.capacity = capacity
+        self.refill_rate = refill_rate
+        self.tokens = float(capacity)
+        self.last_refill = time.monotonic()
+
+    def get_request_cost(self, endpoint, params=None):
+        costs = {
+            "/api/search": 10.0,
+            "/api/users/me": 1.0,
+            "/api/users/list": 5.0,
+            "/api/data/export": 50.0,
+        }
+        return costs.get(endpoint, 1.0)
+
+    def consume(self, endpoint, params=None):
+        self._refill()
+        cost = self.get_request_cost(endpoint, params)
+        if self.tokens >= cost:
+            self.tokens -= cost
+            return True
+        return False
+```
+
+This pattern is used by OpenAI for token-based rate limiting where the cost is the estimated number of tokens the request will consume. Complex requests with large context windows cost more than simple requests.
+
+### Pattern 3: Probabilistic Rate Limiting
+
+Instead of a hard threshold, probabilistic rate limiting rejects requests with a probability that increases as the request rate approaches the limit. This provides a smoother rejection curve and eliminates the sharp cutoff at the limit boundary.
+
+```python
+import random
+
+class ProbabilisticRateLimiter:
+    def __init__(self, soft_limit, hard_limit):
+        self.soft_limit = soft_limit
+        self.hard_limit = hard_limit
+
+    def allow(self, current_rate):
+        if current_rate >= self.hard_limit:
+            return False
+        if current_rate <= self.soft_limit:
+            return True
+        # Linear probability between soft and hard limit
+        overshoot = (current_rate - self.soft_limit) / (self.hard_limit - self.soft_limit)
+        rejection_probability = overshoot ** 2  # quadratic curve
+        return random.random() > rejection_probability
+```
+
+The probabilistic approach is useful for systems where a sharp rejection boundary causes client behavior to oscillate. By making rejections probabilistic near the boundary, the system avoids the thundering herd problem where all clients are simultaneously rejected and simultaneously retry.
+
+## Advanced Lua Script Patterns
+
+### Batched Rate Limit Check
+
+For endpoints that process multiple items in a single request, a batched rate limit check allows the client to consume multiple tokens in one operation. The Lua script accepts a batch size parameter and checks whether enough tokens are available for the entire batch.
+
+```lua
+-- Batched token bucket Lua script
+-- KEYS[1] = rate_limit:<identity>
+-- ARGV[1] = capacity
+-- ARGV[2] = refill_rate
+-- ARGV[3] = now
+-- ARGV[4] = batch_size (number of tokens to consume)
+
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local batch = tonumber(ARGV[4])
+
+local state = redis.call("HMGET", key, "tokens", "last_refill")
+local tokens = tonumber(state[1]) or capacity
+local last_refill = tonumber(state[2]) or now
+
+local elapsed = math.max(0, now - last_refill)
+tokens = math.min(capacity, tokens + elapsed * refill_rate)
+
+if tokens >= batch then
+    tokens = tokens - batch
+    redis.call("HMSET", key, "tokens", tokens, "last_refill", now)
+    redis.call("EXPIRE", key, math.ceil(capacity / refill_rate) + 1)
+    return {1, tokens}  -- entire batch allowed
+else
+    return {0, tokens}  -- batch rejected, not enough tokens
+end
+```
+
+### Multi-Key Hierarchical Check
+
+For hierarchical rate limiting, a single Lua script can check multiple keys atomically. The script accepts a variable number of keys and parameters, checking each level in order. If any level rejects, the script returns immediately without modifying the remaining levels.
+
+```lua
+-- Hierarchical rate limit check
+-- KEYS = {global_key, tier_key, per_client_key}
+-- ARGV = {global_limit, tier_limit, per_client_limit, now}
+
+local global = tonumber(redis.call("GET", KEYS[1]) or 0)
+if global >= tonumber(ARGV[1]) then return {0, "global"} end
+
+local tier = tonumber(redis.call("GET", KEYS[2]) or 0)
+if tier >= tonumber(ARGV[2]) then return {0, "tier"} end
+
+local client = tonumber(redis.call("GET", KEYS[3]) or 0)
+if client >= tonumber(ARGV[3]) then return {0, "client"} end
+
+-- All levels passed, increment all counters
+redis.call("INCR", KEYS[1])
+redis.call("INCR", KEYS[2])
+redis.call("INCR", KEYS[3])
+redis.call("EXPIRE", KEYS[1], 60)
+redis.call("EXPIRE", KEYS[2], 60)
+redis.call("EXPIRE", KEYS[3], 60)
+return {1, "allowed"}
+```
+
+## Benchmarking Rate Limiter Performance
+
+To validate rate limiter performance, run the following benchmark. The benchmark measures throughput and latency under load.
+
+```bash
+# Benchmark Redis Lua token bucket
+redis-benchmark -n 100000 -P 10 \
+  EVALSHA <script_sha> 1 rl:bench:user1 100 1.667 1719876000 1
+
+# Expected output:
+# 100000 requests completed in 4.00 seconds
+# 25000.00 requests per second
+# p50 latency: 0.5ms
+# p95 latency: 1.2ms
+# p99 latency: 2.8ms
+```
+
+The benchmark shows that a single Redis core handles 25,000 Lua evaluations per second. With pipelining (10 concurrent pipelines), throughput increases to roughly 100,000 evaluations per second, but p99 latency increases to 8ms. Design your system for the latency-sensitive path (non-pipelined) and use pipelining only for bulk operations.
+
+## Transport-Level Considerations
+
+Rate limiters that operate at the transport level (TCP, UDP) face different constraints than HTTP-level rate limiters:
+
+**TCP connection rate limiting**: Limit the number of new TCP connections per second from a single IP. This is implemented at the kernel level using iptables or at the application level by tracking SYN packets. Connection rate limiting has lower overhead than HTTP-level limiting because it does not require parsing the HTTP request.
+
+**TLS handshake rate limiting**: TLS handshakes are computationally expensive (roughly 1ms of CPU time per handshake). Rate limiting TLS handshakes prevents CPU exhaustion from rapid reconnections. This is implemented at the load balancer or CDN level.
+
+**WebSocket frame rate limiting**: WebSocket connections maintain a persistent connection, so rate limiting must track frames per second rather than connections per second. This is more complex because the connection state persists across frames. Use per-connection token buckets with periodic state cleanup for idle connections.
+
+## Key Takeaways (Extended)
+
+The additional patterns -- cost-weighted requests, probabilistic rate limiting, and batched checks -- extend the basic rate limiter to handle more complex scenarios. The cost-weighted approach is particularly important for AI/ML APIs where request cost varies dramatically. Lua script patterns for hierarchical and batched checks demonstrate how to implement multi-level rate limiting atomically.
+
+Benchmarking confirms that a single Redis core handles 25,000 rate limit evaluations per second. Transport-level rate limiting (TCP connections, TLS handshakes, WebSocket frames) extends the rate limiter beyond HTTP to cover all network protocols. Understanding these advanced patterns and transport-level considerations completes the deep dive into rate limiter internals.

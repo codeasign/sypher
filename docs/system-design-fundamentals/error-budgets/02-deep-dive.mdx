@@ -1,0 +1,776 @@
+---
+id: error-budgets-deep-dive
+title: Error Budgets — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+# Error Budgets — Under the Hood
+
+## Internal Architecture of an Error Budget System
+
+An error budget system is not a single component — it is a pipeline of data collection, aggregation, calculation, and policy enforcement. Understanding the internal architecture helps you design systems that are accurate, responsive, and reliable.
+
+<AsciiDiagram
+  id="error-budgets/internal-arch"
+  title="Internal Error Budget System Architecture"
+  alt="A detailed pipeline diagram showing metric sources streaming into a collector, which writes to a time-series database, feeding a budget calculator that outputs to alerting, dashboard, and deployment gate components."
+  content={`
+    ┌─────────────────────────────────────────────────────────────┐
+    │                   ERROR BUDGET PIPELINE                      │
+    ├─────────────────────────────────────────────────────────────┤
+    │                                                             │
+    │  ┌──────────┐    ┌──────────┐    ┌──────────┐              │
+    │  │ HTTP     │    │ gRPC     │    │ Queue    │  Metric      │
+    │  │ Requests │    │ Calls    │    │ Messages │  Sources      │
+    │  └────┬─────┘    └────┬─────┘    └────┬─────┘              │
+    │       │              │              │                       │
+    │       └──────────────┼──────────────┘                       │
+    │                      ▼                                      │
+    │              ┌──────────────┐      ┌──────────────┐         │
+    │              │ Metric       │      │ Metadata     │         │
+    │              │ Collector    │──────▶ Enricher     │         │
+    │              │ (Agent)      │      │ (Service     │         │
+    │              └──────┬───────┘      │  Name,       │         │
+    │                     │              │  Endpoint,   │         │
+    │                     ▼              │  Region)     │         │
+    │              ┌──────────────┐      └──────┬───────┘         │
+    │              │ Time-Series  │             │                 │
+    │              │ Database     │◀────────────┘                 │
+    │              │ (Prometheus/ │                                │
+    │              │  Thanos)     │                                │
+    │              └──────┬───────┘                                │
+    │                     │                                        │
+    │                     ▼                                        │
+    │              ┌──────────────┐                                │
+    │              │ Budget       │                                │
+    │              │ Calculator   │                                │
+    │              │ (Recording   │                                │
+    │              │  Rules +     │                                │
+    │              │  Service)    │                                │
+    │              └──────┬───────┘                                │
+    │                     │                                        │
+    │         ┌───────────┼───────────┐                            │
+    │         │           │           │                            │
+    │         ▼           ▼           ▼                            │
+    │   ┌─────────┐ ┌─────────┐ ┌─────────┐                       │
+    │   │ Alert   │ │ Dash-   │ │ Deploy  │                       │
+    │   │ Engine  │ │ board   │ │ Gate    │                       │
+    │   └─────────┘ └─────────┘ └─────────┘                       │
+    └─────────────────────────────────────────────────────────────┘
+  `}
+  caption="The error budget pipeline spans five stages: metric collection, enrichment, storage, calculation, and action."
+/>
+
+Each stage serves a specific purpose:
+
+**Metric Collection (Agent):** Runs as a sidecar or daemon on each service instance. Collects request-level data: total requests, error responses by status code, latency percentiles. Exports via a /metrics endpoint. The agent must be lightweight — collecting metrics should never add more than 1% overhead to the service.
+
+**Metadata Enricher:** Adds service-level metadata (service name, version, region, deployment ID) to each metric. This enrichment enables per-service, per-region, and per-deployment budget tracking. Without enrichment, you cannot attribute budget consumption to the right source.
+
+**Time-Series Database:** Stores the enriched metrics with high retention for budget windows. A 30-day budget window requires at least 35 days of metric retention (30 days of data plus query buffer). Prometheus is the common choice for small to medium deployments. Thanos or Cortex provide global aggregation for multi-cluster deployments.
+
+**Budget Calculator:** Runs as a combination of Prometheus recording rules and a dedicated service. Recording rules handle the continuous budget ratio calculation. The dedicated service handles complex policies: multi-window burn rate, per-tenant budgets, and trend analysis.
+
+**Action Engine:** Interprets budget state and enforces policy. Routes alerts through PagerDuty, updates deployment gates in the CI/CD pipeline, and publishes status to dashboards.
+
+## Data Structures and Algorithms
+
+### The Budget Ring Buffer
+
+The core data structure for budget calculation is a ring buffer that stores time-bucketed error counts. Each bucket represents a fixed time interval (typically 1 minute). The budget window spans N buckets.
+
+```
+Ring Buffer: error_buckets[1440] for a 24-hour window at 1-minute granularity
+
+Bucket 0:  errors=12,  total=1500   (minute 0)
+Bucket 1:  errors=8,   total=1400   (minute 1)
+...
+Bucket 1439: errors=3, total=1300   (minute 1439)
+
+Budget calculation:
+  total_errors = sum of errors across all buckets
+  total_requests = sum of total across all buckets
+  budget_remaining = 1 - (total_errors / total_requests) / slo_target
+```
+
+The ring buffer has three advantages:
+1. **Constant memory usage.** No matter how long the window, you only store N buckets.
+2. **O(1) window rollover.** When a new bucket is added, the oldest bucket is evicted. Only two buckets change — no need to recalculate the entire window.
+3. **Efficient querying.** The sum across all buckets can be maintained incrementally. Add the new bucket value, subtract the evicted bucket value, and you have the running total.
+
+Time complexity per update: O(1).
+Memory per budget: O(N) where N is the number of buckets in the window.
+
+### Incremental Budget Calculation Algorithm
+
+A naive approach recalculates the entire budget from scratch every time. An incremental approach is more efficient:
+
+```
+class ErrorBudget:
+    def __init__(self, window_buckets, slo_target):
+        self.buckets = [0] * window_buckets
+        self.total_errors = 0
+        self.total_requests = 0
+        self.slo_target = slo_target
+        self.head = 0
+        self.count = 0
+
+    def record(self, errors, total):
+        # Evict oldest bucket if window is full
+        if self.count == len(self.buckets):
+            self.total_errors -= self.buckets[self.head].errors
+            self.total_requests -= self.buckets[self.head].total
+
+        # Record new bucket
+        self.buckets[self.head] = Bucket(errors, total)
+        self.total_errors += errors
+        self.total_requests += total
+        self.head = (self.head + 1) % len(self.buckets)
+        self.count = min(self.count + 1, len(self.buckets))
+
+    def budget_remaining(self):
+        if self.total_requests == 0:
+            return 1.0
+        actual = 1 - (self.total_errors / self.total_requests)
+        return actual / self.slo_target
+
+    def burn_rate(self):
+        # Burn rate = how many times faster budget is consumed vs normal
+        expected_errors_per_window = (
+            self.total_requests * (1 - self.slo_target)
+        )
+        actual_errors = self.total_errors
+        return actual_errors / expected_errors_per_window
+```
+
+### Multi-Window Burn Rate Detection
+
+Google's multi-window approach uses three parallel ring buffers, each with a different window size and burn rate threshold:
+
+```
+window_1h = ErrorBudget(window_buckets=60, slo_target=0.999)
+window_6h = ErrorBudget(window_buckets=360, slo_target=0.999)
+window_24h = ErrorBudget(window_buckets=1440, slo_target=0.999)
+
+def check_alerts():
+    alerts = []
+    if window_1h.burn_rate() >= 10:
+        alerts.append(CriticalAlert("Fast burn: 10x rate"))
+    if window_6h.burn_rate() >= 2:
+        alerts.append(MediumAlert("Medium burn: 2x rate"))
+    if window_24h.burn_rate() >= 1.5:
+        alerts.append(LowAlert("Slow burn: 1.5x rate"))
+    return alerts
+```
+
+The burn rate multiplier is relative to the budget consumption rate that would exactly exhaust the budget by window end. A multiplier of 10 means you are consuming budget at 10x the sustainable rate — you will exhaust the budget in one-tenth of the window time.
+
+### Budget Attribution for Distributed Systems
+
+In a distributed system where a single request touches multiple services, budget attribution answers the question: "which service consumed the budget?"
+
+The algorithm uses propagation headers (similar to distributed tracing):
+
+```
+Request Flow: Gateway -> Cart -> Payment -> Notification
+
+On each service call:
+1. Read the incoming propagate header (trace_id, parent_service)
+2. Measure the outgoing status
+3. Write budget attribution record:
+   {
+     trace_id: "abc123",
+     service: "payment",
+     parent: "cart",
+     status: "error",
+     error_type: "timeout",
+     timestamp: 1719876543
+   }
+
+Aggregation queries:
+- By service: sum(budget_consumption) GROUP BY service
+- By parent: sum(budget_consumption) GROUP BY parent_service
+- Root cause identification:
+  For each error trace, find the first service that returned an error.
+  Attribute the full error cost to that service.
+```
+
+## Request Lifecycle
+
+A single user request travels through the error budget system in a well-defined lifecycle spanning 10 steps. Each step adds information or triggers a decision.
+
+<AsciiDiagram
+  id="error-budgets/request-lifecycle"
+  title="Error Budget Request Lifecycle — 10 Steps"
+  alt="A circular flow diagram showing the 10-step lifecycle of a request through the error budget pipeline, from user request to policy enforcement feedback."
+  content={`
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │              REQUEST LIFECYCLE — 10 STEPS                          │
+    └─────────────────────────────────────────────────────────────────────┘
+    
+    Step  1: User sends request ────▶ App Server receives
+    Step  2: App Server categorizes ──▶ HTTP 200, 4xx, or 5xx
+    Step  3: Metrics agent records ──▶ {total: +1, errors: +1 if 5xx}
+    Step  4: Collector batches ──▶ Aggregates into 60s buckets
+    Step  5: Enricher annotates ──▶ Adds {service, region, version}
+    Step  6: TSDB stores ──▶ Writes to Prometheus time-series
+    Step  7: Calculator queries ──▶ Reads window of buckets
+    Step  8: Budget computed ──▶ New budget_remaining value
+    Step  9: Policy evaluated ──▶ Check thresholds, fire alerts
+    Step 10: Action taken ──▶ Gate deployments, page on-call
+
+    ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐
+    │ 1. User │──▶│ 2. App  │──▶│ 3. Agent│──▶│ 4. Batch│──▶│ 5. Label│
+    │ Request │   │ Serve   │   │ Record  │   │ Collect │   │ Enrich  │
+    └─────────┘   └─────────┘   └─────────┘   └─────────┘   └─────────┘
+                                                              │
+    ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐   │
+    │10. Act  │◀──│ 9. Eval │◀──│ 8. Calc │◀──│ 7. Query│◀──│
+    │ Gate    │   │ Policy  │   │ Budget  │   │ TSDB    │   │
+    └─────────┘   └─────────┘   └─────────┘   └─────────┘   │
+                                                              │
+    ┌─────────┐                                               │
+    │ 6. Store │◀─────────────────────────────────────────────┘
+    │ TSDB    │
+    └─────────┘
+  `}
+  caption="Every user request triggers a 10-step pipeline through the error budget system, from initial receipt to policy enforcement."
+/>
+
+**Step 1:** The user sends an HTTP request to the API gateway. The request arrives at the application server.
+
+**Step 2:** The application server processes the request and produces an HTTP response. The response status code determines whether this request counts toward the error budget:
+- HTTP 2xx: Success. Counts as a total request, not an error.
+- HTTP 4xx: Client error. Whether it counts as an error depends on your SLI definition. In a well-designed SLI, 4xx errors from legitimate user mistakes are excluded.
+- HTTP 5xx: Server error. Counts as an error in most SLIs.
+- Timeouts and connection errors: These may not produce an HTTP response at all, which means the server never records them. Client-side SLI measurement is needed for these failure modes.
+
+**Step 3:** The metrics agent (running as a sidecar) intercepts the response and increments counters: `total_requests` and `error_requests` (for 5xx). The agent uses atomic increments to avoid race conditions under concurrent load.
+
+**Step 4:** The collector batches metrics from all service instances every 60 seconds. Batching reduces write load on the time-series database and allows the collector to deduplicate metrics from the same source.
+
+**Step 5:** The enricher adds service-level labels: service name, region, deployment version, and instance ID. These labels enable per-service and per-region budget tracking.
+
+**Step 6:** The time-series database stores the enriched metrics. Prometheus stores these as counter-type metrics, which can only increase. The rate() function calculates the per-second increase.
+
+**Step 7:** The budget calculator queries the TSDB for the window's worth of data. For a 30-day window at 60-second resolution, this means querying 43,200 data points per service.
+
+**Step 8:** The calculator computes the budget remaining ratio and burn rate. The result is stored back to the TSDB as a new metric.
+
+**Step 9:** The policy evaluator checks the new budget values against thresholds. If the budget drops below a threshold, it fires an alert through the action engine.
+
+**Step 10:** The action engine enforces policy: blocking deployments in the CD pipeline, paging the on-call engineer, or sending a Slack notification.
+
+## Consistency and State
+
+Error budget systems face the same consistency challenges as any distributed system. Understanding how failures affect your budget data is critical for designing a reliable system.
+
+### Crash Recovery
+
+If the budget calculator service crashes, it loses the in-memory ring buffer. On restart, it must rebuild the window from the time-series database.
+
+```
+def recover_after_crash():
+    # Query the TSDB for the last 30 days of data
+    start_time = now() - timedelta(days=30)
+    metrics = tsdb.query(
+        start=start_time,
+        metric="http_requests_total",
+        aggregation="1m"
+    )
+    
+    # Rebuild ring buffer from historical data
+    budget = ErrorBudget(window_buckets=43200, slo_target=0.999)
+    for bucket in metrics:
+        budget.record(errors=bucket.errors, total=bucket.total)
+    
+    return budget
+```
+
+Recovery time depends on the TSDB query performance. For a 30-day window with 43,200 data points, recovery typically takes 10-30 seconds. During recovery, the budget calculator returns the last known state (cached) rather than blocking.
+
+### Network Partitions
+
+When the collector cannot reach the TSDB, metrics are buffered locally. The collector writes to a local queue (typically backed by disk) and retries writes when connectivity is restored.
+
+```
+Buffer Behavior Under Partition:
+
+Time T0: Partition occurs.
+  - Collector continues receiving metrics from agents
+  - Metrics written to local queue (disk-backed, up to 1GB)
+  - TSDB writes fail, retried with exponential backoff
+
+Time T1 (30 minutes later): Partition resolves.
+  - Collector replays queued metrics to TSDB
+  - TSDB backfills the missing 30 minutes
+  - Budget calculator detects data gap and recalculates
+
+Impact on budget:
+  - During partition: budget is calculated from incomplete data
+  - After recovery: budget is recalculated with complete data
+  - If the partition spans less than 1% of the window: minimal impact
+  - If the partition spans more than 10% of the window: significant drift
+```
+
+The key design decision is: do you under-count or over-count errors during a partition? The safer approach is to over-count: assume all unrecorded requests are errors. This causes a temporary budget spike but prevents the system from appearing healthier than it is.
+
+### Concurrent Writes
+
+At high throughput, multiple service instances write metrics concurrently. The collector must handle concurrent writes without losing data.
+
+The collector uses a sharded aggregation approach:
+
+```
+Concurrent Write Handling:
+
+Instance 1 writes: {errors: 5, total: 1000}
+Instance 2 writes: {errors: 3, total: 800}
+Instance 3 writes: {errors: 8, total: 1200}
+
+Collector processes each write independently:
+  Bucket[timestamp_minute].errors += write.errors
+  Bucket[timestamp_minute].total += write.total
+
+Result: Bucket[1719876540] = {errors: 16, total: 3000}
+
+No lock needed: each bucket is a single atomic integer.
+Sequential consistency is not required — the sum is eventually correct.
+```
+
+### Stale Reads
+
+When the dashboard queries the budget, it may read stale data if the calculator has not processed recent metrics. This creates a delay between a real incident and its appearance in the budget.
+
+```
+Read Staleness Analysis:
+
+Step 1: User request (T=0)
+Step 2: Agent records metric (T=0.1s)
+Step 3: Collector batches (T=60s — waits for batch to fill)
+Step 4: TSDB stores (T=61s)
+Step 5: Calculator queries (T=90s — next calculation cycle)
+Step 6: Dashboard reads (T=91s)
+
+Total staleness: approximately 91 seconds.
+During a 5-minute incident: the budget shows the impact 91 seconds late.
+```
+
+This means your burn rate alerts are more important than your dashboard. By the time you see the budget drop on the dashboard, a fast-burning incident may have already consumed significant budget. Multi-window burn rate alerts detect the problem at Step 3 (within 60 seconds).
+
+## Performance Characteristics
+
+### Query Latency by Window Size
+
+| Window Size | Data Points | Query Time (Prometheus) | Query Time (Thanos) |
+|-------------|------------|------------------------|---------------------|
+| 1 hour | 60 | 50ms | 80ms |
+| 6 hours | 360 | 100ms | 150ms |
+| 24 hours | 1,440 | 300ms | 500ms |
+| 7 days | 10,080 | 2s | 3s |
+| 30 days | 43,200 | 8s | 12s |
+
+The 30-day query is the bottleneck. At 8-12 seconds per query, you cannot run budget calculations on every request. The calculator must cache results and refresh periodically.
+
+### Caching Strategy
+
+```
+Tier 1: In-memory cache (calculator process)
+  Budget values for each service
+  TTL: 60 seconds
+  Query time: 1ms
+  Cache hits: 95%
+
+Tier 2: Redis cache (shared across calculator instances)
+  Budget values for each service
+  TTL: 300 seconds
+  Query time: 5ms
+  Cache hits: 99%
+
+Tier 3: TSDB (source of truth)
+  Full window recalculation
+  Query time: 8s
+  Used when: cache miss or periodic full refresh
+```
+
+### p50, p99, p999 Latency
+
+The error budget system itself must be performant. If the budget calculation adds significant latency to the deployment pipeline, engineers will find ways to bypass it.
+
+```
+Budget API Endpoint: GET /api/v1/budget/{service}
+
+p50 latency: 12ms
+p99 latency: 45ms
+p999 latency: 120ms
+Timeout: 500ms
+
+Burn Rate Alert Check (internal, no API exposure):
+
+p50 latency: 2ms (in-memory ring buffer)
+p99 latency: 15ms (TSDB fallback for cold start)
+p999 latency: 800ms (full window recalculation)
+
+Deployment Gate Check:
+
+p50 latency: 25ms (Redis cache hit)
+p99 latency: 800ms (TSDB query)
+p999 latency: 5s (full recalculation + TSDB query)
+```
+
+The deployment gate check is the most latency-sensitive operation. Engineers running a deployment will wait for the gate check, so p999 at 5 seconds is acceptable. The budget API for dashboards must be faster — p99 under 50ms — because dashboards refresh frequently and users expect near-instant responses.
+
+## Configuration and Tuning
+
+### SLO Configuration
+
+Each service needs a configuration that defines its SLO and error budget parameters.
+
+```yaml
+# config/services/payment-service.yaml
+service:
+  name: payment-service
+  slo:
+    target: 99.99
+    window: 30d
+    window_type: rolling  # rolling or calendar
+    sli:
+      type: availability
+      sources:
+        - http_requests_total
+        - grpc_requests_total
+      error_codes:
+        - 500
+        - 502
+        - 503
+        - 504
+      exclude_codes:
+        - 429  # rate limiting — user behavior, not system error
+        - 401  # auth failure — user error, not system error
+  burn_rate:
+    windows:
+      - duration: 1h
+        threshold: 10
+        severity: critical
+      - duration: 6h
+        threshold: 2
+        severity: medium
+      - duration: 24h
+        threshold: 1.5
+        severity: low
+  policy:
+    stages:
+      - name: green
+        range: 0.5-1.0
+        action: allow_all
+      - name: yellow
+        range: 0.25-0.5
+        action: require_second_reviewer
+      - name: orange
+        range: 0.1-0.25
+        action: block_noncritical
+      - name: red
+        range: 0.0-0.1
+        action: block_all
+  notification:
+    slack_channel: "#sre-payment"
+    pagerduty_service: "payment-sre"
+  exceptions:
+    allowed_reasons:
+      - security_patch
+      - critical_bugfix
+    approval_required: true
+    approver_role: "vp_engineering"
+```
+
+### Tuning Window Size
+
+The window size has a direct impact on budget behavior.
+
+**Shorter windows (7 days):**
+- Budget recovers faster after a reset
+- Reacts more quickly to changes in system reliability
+- More volatile — a single bad day consumes 14% of the budget instead of 3%
+- Better for fast-moving teams that deploy frequently
+- Risk: teams may wait out the window rather than fixing the root cause
+
+**Longer windows (30 days):**
+- More stable — daily fluctuations are smoothed
+- Slower to react — a bad week might not trigger policy action
+- Harder to "wait out" — teams must fix issues
+- Better for stable systems with mature SRE practices
+- Risk: budget exhaustion can happen gradually without anyone noticing
+
+Data showing the impact of window choice:
+
+```
+Service with daily 0.1% error rate (meets 99.9% SLO):
+
+7-day window: budget bounces between 85% and 95% daily
+  — daily noise: 15%, too volatile for policy decisions
+30-day window: budget stays at 98% with 2% daily variation
+  — daily noise: 2%, stable enough for policy decisions
+
+Service with daily 0.5% error rate (fails 99.9% SLO):
+
+7-day window: budget exhausted in 3 days
+  — clear signal, fast response
+30-day window: budget hits 50% at day 15, exhausted at day 30
+  — slower signal, but gives time to investigate
+```
+
+### Tuning Burn Rate Thresholds
+
+The burn rate threshold determines how aggressively the system alerts.
+
+```python
+def calculate_burn_rate_thresholds(slo_target, window_days):
+    """
+    Calculate burn rate thresholds based on SLO and window.
+    Returns recommended thresholds for fast, medium, and slow burn.
+    """
+    budget_ratio = 1 - slo_target
+    window_seconds = window_days * 24 * 3600
+    
+    # At 1x burn rate, the budget lasts exactly the window duration
+    # At Nx burn rate, the budget lasts window_days / N days
+    
+    thresholds = {
+        "fast": {
+            "window": "1h",
+            "threshold": 10,
+            "time_to_exhaust": f"{window_days / 10} days"
+        },
+        "medium": {
+            "window": "6h",
+            "threshold": 2,
+            "time_to_exhaust": f"{window_days / 2} days"
+        },
+        "slow": {
+            "window": "24h",
+            "threshold": 1.5,
+            "time_to_exhaust": f"{window_days / 1.5} days"
+        }
+    }
+    return thresholds
+```
+
+The industry-standard approach uses 10x for fast burn, 2x for medium, and 1.5x for slow burn. These thresholds work for most SLOs from 99% to 99.99%. For extremely tight SLOs (99.999%), the fast burn threshold should be lower (5x instead of 10x) because the budget is so small that a 10x burn would exhaust it before the alert fires.
+
+### Aggregation Strategies for Multi-Instance Deployments
+
+When a service runs on 50 container instances, each instance reports its own metrics. The budget calculator must aggregate these metrics correctly.
+
+### Sum Aggregation
+
+The simplest approach: sum errors and total requests across all instances.
+
+```
+Instance 1: {errors: 12, total: 15,000}
+Instance 2: {errors: 8, total: 14,500}
+Instance 3: {errors: 15, total: 15,200}
+...
+Instance 50: {errors: 10, total: 14,800}
+
+Aggregated: {errors: 600, total: 750,000}
+SLI: 1 - (600 / 750,000) = 99.92%
+```
+
+Sum aggregation works because the budget is defined at the service level, not the instance level. It does not matter which instance served the failed request — it only matters that the request failed. The sum captures the overall service health.
+
+### Rate Aggregation
+
+For burn rate calculation, use rate aggregation rather than raw sum. The rate normalizes for traffic volume:
+
+```
+Total error rate = sum(rate(errors_total[5m])) / sum(rate(requests_total[5m]))
+                             ──────────    ──────────
+                             per-instance   per-instance
+                             error rate     request rate
+```
+
+The rate aggregation prevents instances with high traffic from dominating the calculation. A single instance handling 5x the normal traffic should not have 5x the influence on the budget.
+
+### Percentile Aggregation
+
+For latency-based SLIs, you need percentile aggregation. You cannot simply average p99 values across instances.
+
+```
+Correct approach: merge the latency distributions, then calculate the p99.
+
+Instance 1 p99: 200ms (based on 10,000 requests)
+Instance 2 p99: 450ms (based on 1,000 requests)
+
+Merged p99: depends on the full distribution, not just the p99 values.
+              If the 10,000 requests from Instance 1 are all fast,
+              the merged p99 may be closer to 200ms than 450ms.
+```
+
+Most time-series databases handle percentile aggregation natively. Prometheus supports histogram quantile calculations across multiple instances using the `histogram_quantile` function.
+
+## Data Retention and Purging
+
+The budget calculator must handle data retention correctly. Old data must be purged to prevent the window from growing indefinitely.
+
+### Sliding Window Purging
+
+```
+Current window: 30 days (43,200 buckets at 1-minute resolution)
+Data retention: 35 days (adds 5 days of buffer)
+
+Purge policy:
+  Every 24 hours at 00:00 UTC:
+    1. Delete all buckets older than 35 days
+    2. Verify the budget calculator can still access the last 30 days
+    3. Run a consistency check comparing TSDB data with budget calculator state
+    4. Log the purge count and any discrepancies
+
+If data for a specific day is missing (TSDB compaction or failure):
+  - The calculator uses linear interpolation for the missing data
+  - A warning is logged: "Data gap detected for day X — result may be inaccurate"
+  - If more than 5% of window data is missing: the budget is marked as "degraded"
+```
+
+### Cold Start Gap
+
+When a new service is deployed, it has no historical data for the entire budget window.
+
+```
+Service deployed at time T.
+Budget window: 30 days (2,592,000 seconds of data needed).
+Available data: from T to T+5 days.
+
+Options:
+1. Start with a shorter window (5 days) and extend daily until 30 days.
+2. Use all available data and note: "Insufficient data — budget is approximate."
+3. Set the budget to 100% until enough data accumulates.
+
+Best practice: Option 1 with a clear label on the dashboard:
+  "Insufficient data: budget calculated over 5 of 30 days."
+```
+
+### Backfill Handling
+
+When a data source is restored after an outage, backfilled data can cause budget spikes.
+
+```
+TSDB outage for 2 hours.
+Metrics are backfilled when the TSDB restores.
+The 2 hours of backfilled data shows a spike in error rate.
+
+Impact: the budget drops by 5% in a single recalculation cycle.
+
+Mitigation:
+  - Backfilled data is tagged with a "backfill" flag.
+  - The budget calculator processes backfilled data at a slower rate
+    (spread across 10 calculation cycles instead of all at once).
+  - Large backfills (over 6 hours) require manual review.
+```
+
+## Data Structures for Per-Service Budget Tracking
+
+Each service has its own budget state. The data structure must support concurrent reads and writes.
+
+```python
+@dataclass
+class BudgetState:
+    service_id: str
+    slo_target: float
+    window_seconds: int
+    current_bucket: int  # minutes since window start
+    total_errors: int
+    total_requests: int
+    bucket_errors: List[int]  # ring buffer
+    bucket_requests: List[int]  # ring buffer
+    last_updated: float  # unix timestamp
+    burn_rate_1h: float
+    burn_rate_6h: float
+    burn_rate_24h: float
+    budget_remaining: float
+
+class BudgetStore:
+    def __init__(self):
+        self._store: Dict[str, BudgetState] = {}
+        self._lock = threading.RLock()
+    
+    def update(self, service_id: str, errors: int, total: int):
+        with self._lock:
+            state = self._store.get(service_id)
+            if not state:
+                return  # service not tracked yet
+            # Applies the ring buffer update
+            self._update_ring_buffer(state, errors, total)
+            self._recalculate_burn_rates(state)
+    
+    def get_budget(self, service_id: str) -> Optional[float]:
+        with self._lock:
+            state = self._store.get(service_id)
+            if not state:
+                return None
+            return state.budget_remaining
+```
+
+The read-write lock ensures that dashboard queries (reads) are not blocked by metric updates (writes). Reads always return the latest fully-calculated budget state, not a partially-updated intermediate state.
+
+## Handling Planned Maintenance
+
+**Approach 1: Count all downtime.**
+- Pros: Simple, honest, incentivizes zero-downtime maintenance.
+- Cons: Teams may skip necessary maintenance to preserve budget.
+- Best for: Systems that support blue-green deployments and rolling updates.
+
+**Approach 2: Exclude planned maintenance.**
+- Pros: Teams are not penalized for necessary maintenance.
+- Cons: Teams may abuse the exclusion by labeling unplanned work as "planned."
+- Best for: Systems that require scheduled maintenance (database migrations, kernel upgrades).
+
+**Approach 3: Count it but with a separate "maintenance budget."**
+- Pros: Transparent tracking. Maintenance consumes a separate allocation.
+- Cons: Additional complexity. Two budgets per service.
+- Best for: Systems with frequent maintenance windows.
+
+The recommended approach is Approach 3 for mature teams and Approach 1 for teams investing in zero-downtime deployments. Approach 2 is not recommended because it creates a loophole.
+
+<AsciiDiagram
+  id="error-budgets/maintenance-budget"
+  title="Maintenance Budget Allocation Strategies"
+  alt="Three charts showing the three approaches to handling planned maintenance in error budgets: inclusive counting, exclusion, and separate maintenance budget."
+  content={`
+    ┌────────────────────────────────────────────────────────────────────┐
+    │              MAINTENANCE BUDGET APPROACHES                         │
+    ├────────────────────────────────────────────────────────────────────┤
+    │                                                                    │
+    │  Approach 1: Count All Downtime                                   │
+    │                                                                    │
+    │  ┌─────────────────────────────────────────────────────────┐       │
+    │  │ Error Budget: 2,592s                                    │       │
+    │  │ Used: 1,200s (incident) + 300s (maintenance) = 1,500s  │       │
+    │  │ Remaining: 1,092s                                       │       │
+    │  └─────────────────────────────────────────────────────────┘       │
+    │                                                                    │
+    │  Approach 2: Exclude Maintenance                                  │
+    │                                                                    │
+    │  ┌─────────────────────────────────────────────────────────┐       │
+    │  │ Error Budget: 2,592s                                    │       │
+    │  │ Used: 1,200s (incident only)                            │       │
+    │  │ Remaining: 1,392s (maintenance not counted)             │       │
+    │  └─────────────────────────────────────────────────────────┘       │
+    │                                                                    │
+    │  Approach 3: Separate Maintenance Budget                          │
+    │                                                                    │
+    │  ┌─────────────────────────────────────────────────────────┐       │
+    │  │ Error Budget:   2,592s  │  Maint Budget:    600s        │       │
+    │  │ Used: 1,200s            │  Used: 300s                   │       │
+    │  │ Remaining: 1,392s       │  Remaining: 300s              │       │
+    │  └─────────────────────────────────────────────────────────┘       │
+    └────────────────────────────────────────────────────────────────────┘
+  `}
+  caption="Three approaches to handling planned maintenance in error budgets, each with different incentive effects."
+/>
+
+## Bridge to Architecture
+
+Understanding the internal architecture, data structures, and request lifecycle of an error budget system gives you the foundation to design systems at scale. The next chapter builds on this foundation to show how error budgets integrate into a production-grade architecture spanning multiple services, regions, and teams.

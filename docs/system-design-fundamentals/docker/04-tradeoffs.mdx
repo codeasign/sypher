@@ -1,0 +1,321 @@
+---
+id: docker-tradeoffs
+title: Docker — Trade-offs and Failure Modes
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+Docker containers solve the "it works on my machine" problem, but they introduce their own set of trade-offs, failure modes, and anti-patterns. Understanding these trade-offs is essential for making informed architectural decisions and debugging production issues.
+
+## The Core Tension
+
+The fundamental trade-off in containerization is between **isolation overhead** and **resource efficiency**. Virtual machines provide strong isolation through a hypervisor and separate kernel, but each VM requires its own operating system, consuming 2-10 GB of disk and 500 MB-2 GB of RAM before any application runs. Containers share the host kernel and have near-zero overhead, but this shared-kernel approach means a container escape vulnerability can compromise the entire host.
+
+The tension plays out across three dimensions:
+
+- **Security isolation**: VMs provide hardware-level isolation. Containers provide kernel-level isolation through namespaces, which is weaker. A kernel exploit in a container can affect the host.
+- **Resource efficiency**: Containers support over-commitment and fine-grained resource limits. VMs reserve resources upfront and waste capacity.
+- **Operational density**: A single host can run 50-100 containers but only 5-10 VMs. Higher density means lower cost per workload.
+
+Where you fall on this spectrum depends on your threat model and cost constraints. A multi-tenant SaaS platform serving untrusted code needs VM-level isolation. A single-tenant microservice deployment benefits from container density.
+
+## Decision Matrix
+
+The following table compares Docker containers against virtual machines and bare-metal deployments across key dimensions. The scores are relative rankings — 1 is best, 3 is worst.
+
+| Dimension | Docker Container | Virtual Machine | Bare Metal |
+|---|---|---|---|
+| Startup time | 100-500 ms | 30-300 seconds | 3-15 minutes |
+| Image/disk size | 50-500 MB | 2-20 GB | N/A (full OS) |
+| Density per host | 50-100 | 5-10 | 1 |
+| CPU overhead | 1-3% | 5-15% | 0% |
+| Memory overhead | 5-10 MB/container | 500 MB-2 GB/VM | 0% |
+| Security isolation | Namespace-based (moderate) | Hypervisor-based (strong) | Hardware-based (strongest) |
+| Orchestration | Docker Swarm, K8s, ECS | vSphere, OpenStack | Manual |
+| Live migration | Not supported | Supported (vMotion) | Not applicable |
+| Snapshot/rollback | Image layers (immutable) | Full VM snapshots | Hardware snapshots |
+| Multi-tenant trust | Same-org only | Different orgs | Different orgs |
+
+## CAP Theorem Positioning
+
+Docker containers are not a distributed data system, so CAP theorem does not apply directly. However, the container ecosystem has analogous trade-offs. The Docker image distribution system is an **AP** (available and partition-tolerant) system. The image registry is designed to be available for reads under any condition — you can always pull an image you already have cached. Consistency is relaxed: if you push an image to a registry and immediately pull from a different replica, you might get a stale version. This is acceptable because images are immutable — once you have a specific digest, it never changes.
+
+The Docker state store (containers, volumes, networks) is **CP** (consistent and partition-tolerant) on a single host. Docker does not synchronize state across hosts — each Docker daemon is a single-node system. If the Docker daemon crashes, the local state is unavailable until it recovers. This is why orchestrators like Kubernetes manage state across hosts using etcd (a CP system) for cluster state.
+
+## Failure Modes
+
+### Failure 1: Disk Space Exhaustion
+
+Docker's default configuration does not limit disk usage. Container logs written to the json-file driver accumulate in `/var/lib/docker/containers/<id>/<id>-json.log`. A single container producing 100 MB/hour of logs fills a 100 GB disk in 42 days. When the disk is full, the Docker daemon stops responding, all containers on the host freeze, and you cannot SSH in to diagnose the problem.
+
+```bash
+# Common scenario: 100 GB disk filled by logs
+du -sh /var/lib/docker/containers/*/*-json.log
+# Output: 87G    /var/lib/docker/containers/abc123/abc123-json.log
+```
+
+**Prevention**: Configure log rotation at the Docker daemon level in `/etc/docker/daemon.json`:
+
+```json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+```
+
+Also set up disk monitoring with alerts at 80% capacity. Use a separate partition for `/var/lib/docker` to prevent Docker from filling the root filesystem.
+
+### Failure 2: PID 1 and Zombie Processes
+
+In a container, the main process runs as PID 1. PID 1 has a special responsibility in Unix — it must reap orphaned child processes. If the main process does not handle SIGCHLD signals and call `wait()`, zombie processes accumulate. Each zombie consumes a PID in the container's PID namespace, and when the PID limit is reached, the container cannot create new processes.
+
+This is particularly common in containers that use shell scripts as entrypoints, because the shell does not reap zombie processes. Java applications also suffer from this — the JVM does not reap child processes by default.
+
+**Prevention**: Use a minimal init system like `tini` (included in Docker since 1.13 with `--init` flag):
+
+```bash
+docker run --init my-app:1.0
+```
+
+The `--init` flag runs tini as PID 1, which handles signal forwarding and zombie reaping, then executes the application as a child process.
+
+### Failure 3: Time Drift Within Containers
+
+Containers share the host kernel's clock, but they can experience time drift if the host clock is adjusted. Docker does not synchronize the container clock independently. `clock_gettime` calls inside containers return the host's system time. When the host clock is corrected by NTP, the jump can confuse applications that rely on monotonic clock behavior.
+
+**Prevention**: For time-sensitive applications, use `--clock-adjust` with Docker 20.10+ or run the container with `SYS_TIME` capability (not recommended for security). The cleaner approach is to design applications that tolerate clock adjustments and use `CLOCK_MONOTONIC` for intervals rather than wall clock time.
+
+### Failure 4: Permission Denied and User Namespace Issues
+
+By default, containers run as root inside the container. The root user inside the container is root on the host for operations that cross namespace boundaries. A volume mounted from the host has the same permissions as the host filesystem. If the container's UID 0 tries to write to a volume owned by UID 1000, it fails with permission denied.
+
+**Prevention**: Use the `--user` flag to run the container as a non-root user:
+
+```dockerfile
+RUN adduser -D appuser
+USER appuser
+```
+
+Or use user namespace remapping in the Docker daemon configuration:
+
+```json
+{
+  "userns-remap": "default"
+}
+```
+
+This maps container root (UID 0) to a non-root UID on the host, preventing container root from having host root privileges.
+
+### Failure 5: Network Port Conflicts
+
+When deploying multiple containers that expose the same port, Docker requires unique host port mappings. This becomes a problem in CI/CD pipelines where multiple test environments run on the same host. If two CI jobs both try to start a Postgres container on port 5432, the second one fails.
+
+<AsciiDiagram id="docker/tradeoffs-port-conflict" title="Port conflict between containers trying to bind the same host port" alt="Diagram showing two containers that cannot bind to the same host port 5432" caption="Port conflict scenario" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PORT CONFLICT SCENARIO                                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  Host: ci-server-01.example.com
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  CI Job #1: "test-payment-service"                                   │
+  │  docker run -p 5432:5432 postgres:15                                 │
+  │  Result: Success. Container bound to host:5432                       │
+  └──────────────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  CI Job #2: "test-user-service"                                      │
+  │  docker run -p 5432:5432 postgres:15                                 │
+  │  Result: Fails with "port is already allocated"                      │
+  │  Error: driver failed programming external connectivity              │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  Solutions:
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  Option A: Dynamic port assignment                                   │
+  │  docker run -p 5432 postgres:15  (host assigns random port)          │
+  │  Find port: docker port <container> 5432                             │
+  │                                                                      │
+  │  Option B: Use Docker networks instead of host ports                 │
+  │  docker network create test-net                                      │
+  │  docker run --network=test-net --name db postgres:15                 │
+  │  App connects to "db:5432" — no port mapping needed                  │
+  │                                                                      │
+  │  Option C: Unique port per job                                       │
+  │  docker run -p ${CI_JOB_ID}:5432:5432 postgres:15                    │
+  └──────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Failure 6: Data Loss on Container Restart
+
+When a container's restart policy is `--restart always`, Docker creates a new container instance with a fresh writable layer. Any data written to the container's filesystem is lost. This catches teams who assume that container restarts are like server restarts, where data persists on disk.
+
+**Prevention**: Use volumes for all persistent data. The volume is mounted at a specific path inside the container and survives container restarts, recreations, and migrations to different hosts.
+
+## Anti-Patterns — Hall of Shame
+
+### Anti-Pattern 1: The Kitchen Sink Image
+
+A Dockerfile that installs every tool, library, and dependency into a single image "just in case." These images are 2-10 GB, take minutes to pull, and have a massive attack surface.
+
+```dockerfile
+# BAD: Kitchen sink image
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y \
+    build-essential curl wget git vim netcat \
+    postgresql-client redis-tools python3 golang \
+    nodejs npm default-jdk nginx apache2
+COPY . /app
+CMD ["node", "app.js"]
+```
+
+**Why it fails**: Every installed package is a potential vulnerability. The image takes 5 minutes to pull on a fast connection. Your application only needs Node.js, but you installed a C compiler, a Java runtime, and a web server you do not use.
+
+**Fix**: Use multi-stage builds. Start from a minimal base image. Install only what your application needs at runtime. Use `apt-get install --no-install-recommends` to skip unnecessary packages.
+
+### Anti-Pattern 2: Running as Root
+
+Running the container's main process as the root user inside the container. If an attacker exploits the application, they have root privileges inside the container. If combined with a kernel vulnerability, they can escape to the host.
+
+```dockerfile
+# BAD: Root user
+FROM node:18
+COPY . /app
+CMD ["node", "app.js"]
+```
+
+**Fix**: Create a non-root user and switch to it:
+
+```dockerfile
+FROM node:18-alpine
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -S appuser -u 1001 -G appgroup
+COPY --chown=appuser:appgroup . /app
+USER appuser
+CMD ["node", "app.js"]
+```
+
+### Anti-Pattern 3: Hardcoding Configuration in the Image
+
+Building a separate image for each environment (dev, staging, production) with environment-specific configuration baked in. This multiplies the number of images, makes it impossible to verify the production image works in staging, and encourages configuration drift.
+
+```dockerfile
+# BAD: Environment-specific images
+FROM node:18
+COPY . /app
+# Different Dockerfile for each env:
+# ENV DATABASE_URL=localhost:5432  (dev)
+# ENV DATABASE_URL=staging-db:5432 (staging)
+# ENV DATABASE_URL=prod-db:5432   (prod)
+```
+
+**Fix**: Build one image that runs in all environments. Inject configuration through environment variables, mounted config files, or a service discovery mechanism. The same image digest that passes tests in staging runs in production — only the configuration changes.
+
+### Anti-Pattern 4: Ignoring Dockerfile Layer Order
+
+Placing frequently changing instructions (COPY of source code) before infrequently changing instructions (RUN apt-get install). This invalidates the cache for all layers after the COPY, forcing every build to reinstall system packages.
+
+```dockerfile
+# BAD: Source code copied before dependency installation
+FROM node:18
+COPY . /app          # Invalidates cache on every code change
+RUN npm install      # Reinstalls everything every time
+```
+
+**Fix**: Order instructions from least-to-most frequently changing:
+
+```dockerfile
+# GOOD: Stable layers first
+FROM node:18
+COPY package.json package-lock.json /app/
+RUN npm ci           # Only reruns when package.json changes
+COPY . /app          # Reruns on every code change, but npm install is cached
+```
+
+### Anti-Pattern 5: Storing Secrets in Images
+
+Copying API keys, passwords, or certificates into the image. These secrets become part of the image layers and are accessible to anyone who can pull the image. Secrets baked into images cannot be rotated without rebuilding the image.
+
+```dockerfile
+# BAD: Secret in image
+FROM node:18
+COPY . /app
+ENV API_KEY=sk-abc123def456
+ENV DB_PASSWORD=super-secret
+```
+
+**Fix**: Use Docker secrets (in Swarm mode), Kubernetes secrets, or environment variables injected at runtime. Never COPY or ENV secrets in the Dockerfile. Use ARG for build-time values that are not secret, and pass runtime secrets through the container runtime:
+
+```bash
+docker run -e API_KEY=$(aws secretsmanager get-secret-value --secret-id api-key) my-app:1.0
+```
+
+<AsciiDiagram id="docker/tradeoffs-secrets" title="Secret injection patterns showing the correct and incorrect approaches" alt="Diagram comparing the wrong way (baking secrets into images) and the right way (injecting secrets at runtime)" caption="Secret injection: wrong vs right approach" content={`
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SECRET INJECTION COMPARISON                           │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  WRONG WAY                           RIGHT WAY
+  ─────────                           ─────────
+  ┌──────────────────────┐            ┌──────────────────────┐
+  │ Dockerfile           │            │ Dockerfile            │
+  │                      │            │                       │
+  │ COPY . /app          │            │ COPY . /app           │
+  │ ENV DB_PASS=secret   │            │ CMD ["node","app.js"] │
+  │ CMD ["node","app.js"]│            │ (No secrets in image) │
+  └──────────┬───────────┘            └───────────┬───────────┘
+             │                                    │
+             ▼                                    │
+  ┌──────────────────────┐                        │
+  │ Image Layers         │                        │  Environment
+  │ Layer 3: CMD         │  AWS Secrets Manager   │  Variables
+  │ Layer 2: ENV secret  │  ┌──────────────────┐  │  (injected at
+  │ Layer 1: COPY        │  │ docker run       │  │  runtime)
+  └──────────┬───────────┘  │ -e DB_PASS=...   │  │
+             │              │ my-app:1.0       │  │
+  Anyone who can pull       └────────┬─────────┘  │
+  the image reads the               │            │
+  secret!                           ├────────────┘
+                                    │
+                                    ▼
+                          ┌──────────────────────┐
+                          │ Container at runtime  │
+                          │ DB_PASS loaded from   │
+                          │ environment variable, │
+                          │ never stored in image │
+                          └──────────────────────┘
+`} />
+
+### Anti-Pattern 6: One Process Per Container — Dogmatic
+
+The Docker documentation recommends one process per container. Some teams interpret this so strictly that they run a single microservice across 20 containers, each with a separate sidecar for logging, metrics, and service mesh. The overhead of managing 20 containers for one service exceeds the benefit.
+
+**Fix**: The principle is one concern per container, not one process. A container can run multiple processes if they are part of the same concern. The real guideline is: can you scale these processes independently? If a logging sidecar and your web server must scale together, keep them in the same container.
+
+## When NOT to Use Docker
+
+Docker is not the right tool for every situation. Here are scenarios where VMs or bare metal are better choices.
+
+### Scenario 1: High-Performance Computing
+
+HPC workloads that require direct hardware access — GPU compute at high utilization, InfiniBand networking, or specialized hardware — lose performance behind Docker's abstraction layer. While Docker supports GPU passthrough with `--gpus all`, the scheduling and resource sharing adds overhead. For workloads that need 100% of a machine's resources, use bare metal.
+
+### Scenario 2: Desktop Applications with GUI
+
+Docker containers do not have a display server. Running GUI applications requires X11 forwarding (on Linux) or VNC servers inside the container. Both approaches add latency and complexity. For desktop applications, native installers or Flatpak/Snap (which use similar sandboxing) are better options.
+
+### Scenario 3: Real-Time Systems
+
+Applications with hard real-time deadlines (sub-millisecond latency guarantees) cannot tolerate the scheduling jitter introduced by Docker's resource management. The cgroup CPU scheduler adds latency variance, and the namespace switching adds overhead. For real-time systems, use a real-time operating system or dedicated hardware.
+
+### Scenario 4: Very Small Deployments
+
+If you are deploying a single binary to a single server, Docker adds unnecessary complexity. You need to install the Docker engine, manage the Docker daemon, maintain image registries, and update the Docker version. A static binary, a systemd unit file, and a configuration management tool are simpler and more maintainable for single-service deployments.
+
+### Scenario 5: Security-Critical Multi-Tenant Workloads
+
+If you run untrusted code from multiple tenants on the same infrastructure, containers do not provide sufficient isolation. Container escape vulnerabilities are discovered periodically. For multi-tenant SaaS where tenants upload and execute arbitrary code, use firecracker micro-VMs, gVisor, or Kata Containers, which provide hardware-level isolation.

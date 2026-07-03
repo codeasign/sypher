@@ -1,0 +1,529 @@
+---
+id: feed-generation-deep-dive
+title: Feed Generation Pattern — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A feed generation system consists of five major subsystems that interact to deliver personalized content at scale. Each subsystem has distinct responsibilities, performance characteristics, and failure modes.
+
+### Content Ingestion Layer
+
+The content ingestion layer receives new content from creators and validates, processes, and stores it. This layer handles deduplication, spam detection, content moderation, media processing, and metadata extraction. It produces a normalized content event that flows into the fan-out pipeline.
+
+The ingestion layer must handle peak write throughput. For a platform with 10 million daily active creators, peak writes can reach 50,000 content items per second. Each content item triggers media processing (thumbnail generation, virus scanning, content moderation) which can take 500 milliseconds to 5 seconds. The ingestion layer decouples the fast write path (accepting the upload) from the slow processing path (media transformation and moderation).
+
+The ingestion pipeline has multiple stages:
+
+**Stage 1: Upload Acceptance.** The upload handler receives the content and metadata. It validates the payload size (max 50 MB per upload), checks the file type against the allowed list, and stores the raw content in a blob store. The handler returns a content ID within 50 milliseconds. This is the fast path.
+
+**Stage 2: Media Processing.** A background worker picks up the raw content. For images, it generates thumbnails at 3 resolutions (150x150, 640x640, 1,200x1,200). For videos, it transcodes to 3 bitrates (480p, 720p, 1080p) and generates a thumbnail frame. Media processing is CPU and GPU intensive. A single worker processes 5 to 10 media items per second. The worker pool scales based on the queue depth.
+
+**Stage 3: Content Moderation.** The moderation pipeline checks the content against platform policies. Automated checks include: NSFW detection (image classification model), text toxicity analysis (NLP model), copyright matching (perceptual hash comparison), and spam detection (pattern matching). Items that fail automated checks are queued for human review. Items that pass are published to the event stream.
+
+**Stage 4: Metadata Extraction.** The extraction step parses the content metadata: hashtags, mentions, geolocation, EXIF data (for photos), duration and resolution (for videos), and accessibility information (alt text, captions). This metadata is stored alongside the content and used by the ranking engine and the topic classifier.
+
+**Stage 5: Event Publication.** The ingestion layer publishes a normalized event to the event stream (Kafka or equivalent). The event contains: content ID, creator ID, content type, content subtype (photo, video, text, link, poll), creation timestamp, list of mentioned user IDs, list of hashtags, content topic classification, and moderation result. The event is the input to the fan-out engine.
+
+### Fan-out Engine
+
+The fan-out engine is the core of the feed generation system. It reads content events from the ingestion pipeline, retrieves the follower list for the content creator, and writes a reference to each follower's feed list.
+
+The fan-out engine has three critical subcomponents:
+
+**Follower List Store.** A high-performance database that stores the mapping from creator ID to follower ID set. For a platform with 500 million users and an average of 200 followers per user, the follower graph contains 100 billion edges. The follower list store must support fast lookups (get all followers for user X), incremental updates (add follower, remove follower), and range queries (get first 10,000 followers). Graph databases and key-value stores are common choices. Pinterest uses HBase. Twitter uses Manhattan (Twinter). Instagram uses Apache Cassandra.
+
+**Fan-out Dispatcher.** The dispatcher reads the follower list and distributes the write operations across the feed storage cluster. For a user with 10,000 followers, the dispatcher generates 10,000 write operations. The dispatcher batches these writes into groups of 100 and sends them to the feed storage cluster in parallel. Each batch is a pipeline write to minimize round-trip overhead.
+
+**Backpressure and Throttling.** The fan-out engine must handle overload gracefully. When the feed storage cluster is under heavy write load, the engine throttles the fan-out rate. Content events queue up in the ingestion pipeline. The queue depth and consumer lag are monitored. If the queue grows beyond a threshold, the engine applies backpressure upstream, signaling the ingestion layer to slow down.
+
+### Feed Storage Layer
+
+The feed storage layer holds the pre-computed feed lists for all users. Each feed list is a sorted collection of content references. The storage layer must support point writes (insert a single reference), range reads (get items from position P to position P + N), and sorted iteration.
+
+Feed storage is the most performance-sensitive component. Read latency directly impacts the user-perceived feed load time. Write throughput determines how fast new content appears in feeds.
+
+The feed storage layer has several implementation options:
+
+**Redis Sorted Sets.** The most popular choice. Redis provides native sorted set operations: `ZADD` for insert, `ZREVRANGE` for descending range reads, `ZREMRANGEBYRANK` for truncation. Redis stores all data in RAM, providing sub-millisecond latency. The trade-off is cost: RAM is more expensive than disk. Redis Cluster provides sharding for horizontal scaling.
+
+**Apache Cassandra.** An alternative for systems that prioritize cost over latency. Cassandra stores data on disk with caching for hot data. Feed lists are modeled as a Cassandra table with a composite key (user ID, bucket) and a clustering column (timestamp). Cassandra provides linear scalability and multi-region replication at lower cost than Redis. The trade-off is higher read latency (5 to 20 milliseconds vs 1 to 5 milliseconds for Redis).
+
+**Apache Pulsar.** A message-streaming platform that can serve as a feed storage backend. Pulsar's topic structure maps to feed lists. Each user has a dedicated topic. The topic retains the last N messages (the feed entries). Pulsar provides durability, replayability, and multi-region replication. The trade-off is that Pulsar is optimized for streaming, not for point reads. Feed reads require a cursor-based subscription that may be slower than Redis.
+
+**Custom In-Memory Store.** Some platforms build a custom feed storage engine optimized for their specific workload. Pinterest uses a custom HBase-based storage. LinkedIn uses Espresso (their document store) for feeds. A custom store provides the exact performance characteristics needed but requires significant engineering investment.
+
+### Read Path Service
+
+The read path service handles incoming feed requests from users. It looks up the user's feed list in feed storage, applies ranking and filtering, and hydrates the content references into full content objects.
+
+The read path must operate at low latency. A target of 100 to 200 milliseconds at P99 is standard. The read path uses caching extensively: feed lists are cached in a distributed cache layer (Memcached or Redis), and hydrated content objects are cached by content ID.
+
+The read path service supports multiple read modes:
+
+**Mode 1: Timeline Cache Hit.** The user's hydrated feed is already in the timeline cache. The service returns the cached feed immediately. Latency: 5 to 15 milliseconds. This is the fast path for 60 to 80 percent of requests.
+
+**Mode 2: Feed List Cache Hit, Timeline Cache Miss.** The user's feed list is cached but the hydrated timeline is not. The service reads the feed list from the cache (5 ms), applies ranking (10 ms), hydrates content from the content cache (30 ms), and assembles the response (20 ms). Latency: 60 to 80 milliseconds.
+
+**Mode 3: Full Miss.** The feed list is not cached. The service reads from Redis (10 ms), applies ranking (10 ms), fetches content from the content service (100 ms batch), and assembles the response (20 ms). Latency: 140 to 200 milliseconds.
+
+**Mode 4: Pull-Based Fallback.** The user has celebrity followers who use pull-based delivery. The service reads the regular feed list, then queries the celebrity content store for recent posts from celebrity accounts the user follows. It merges the two lists and ranks them together. Latency: 100 to 300 milliseconds depending on the number of celebrity accounts followed.
+
+### Ranking Engine
+
+The ranking engine computes the order of items in each user's feed. It runs as a background job that re-scores feed lists periodically. The ranking model uses a combination of signals: recency, engagement velocity, affinity score between the creator and the viewer, content type preferences, and contextual signals (time of day, device type, location).
+
+The ranking engine processes feed lists in batches. A single ranking job re-scores 10,000 feed lists per second. The score for each item is computed using a lightweight scoring function that can run in-memory without external dependencies.
+
+<AsciiDiagram
+  id="feed-generation/deep-dive-internal-architecture"
+  title="Feed Generation Internal Architecture — Five Subsystems"
+  alt="Stacked architecture diagram showing five subsystems: content ingestion, fan-out engine, feed storage, read path service, and ranking engine with data flows between them"
+  caption="The five subsystems of a feed generation system. Content flows left-to-right from ingestion through fan-out to storage. Read requests flow right-to-left from the read path into storage."
+  content={`
+    ┌──────────────────────────────────────────────────────────────────┐
+    │              Feed Generation Internal Architecture               │
+    │                                                                  │
+    │  ┌───────────────────────┐                                       │
+    │  │ Content Ingestion     │   ┌──────────────────────┐           │
+    │  │ ┌─────────────────┐   │   │ Fan-out Engine       │           │
+    │  │ │ Upload Handler  │   │   │ ┌────────────────┐   │           │
+    │  │ └────────┬────────┘   │   │ │ Follower List  │   │           │
+    │  │          │            │   │ │ Store Lookup   │   │           │
+    │  │ ┌────────v────────┐   │   │ └───────┬────────┘   │           │
+    │  │ │ Media Processor │   │   │         │            │           │
+    │  │ └────────┬────────┘   │   │ ┌───────v────────┐   │           │
+    │  │          │            │   │ │ Dispatcher     │   │           │
+    │  │ ┌────────v────────┐   │   │ │ Batch Writer   │   │           │
+    │  │ │ Moderation      │   │   │ └───────┬────────┘   │           │
+    │  │ └────────┬────────┘   │   │         │            │           │
+    │  │          │            │   └─────────┼────────────┘           │
+    │  │ ┌────────v────────┐   │             │                        │
+    │  │ │ Event Producer  │───┼─────────────┘                        │
+    │  │ └─────────────────┘   │                                      │
+    │  └───────────────────────┘                                      │
+    │                                                                  │
+    │  ┌──────────────────────────────────────────────────────────┐   │
+    │  │              Feed Storage Layer                         │   │
+    │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐│   │
+    │  │  │ Shard 0  │  │ Shard 1  │  │ Shard 2  │  │ Shard N  ││   │
+    │  │  │ Redis    │  │ Redis    │  │ Redis    │  │ Redis    ││   │
+    │  │  │ Node     │  │ Node     │  │ Node     │  │ Node     ││   │
+    │  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘│   │
+    │  └──────────────────────────────────────────────────────────┘   │
+    │              ▲                             ▲                     │
+    │              │                             │                     │
+    │  ┌───────────┴──────────┐    ┌─────────────┴────────────┐      │
+    │  │ Read Path Service    │    │ Ranking Engine            │      │
+    │  │ ┌─────────────────┐  │    │ ┌──────────────────────┐ │      │
+    │  │ │ Cache Layer     │  │    │ │ Scoring Function    │ │      │
+    │  │ └────────┬────────┘  │    │ └──────────────────────┘ │      │
+    │  │          │           │    │ ┌──────────────────────┐ │      │
+    │  │ ┌────────v────────┐  │    │ │ Re-scoring Job      │ │      │
+    │  │ │ Hydration       │  │    │ └──────────────────────┘ │      │
+    │  │ └─────────────────┘  │    └──────────────────────────┘      │
+    │  └──────────────────────┘                                      │
+    └──────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+## Data Structures
+
+### Feed List (Sorted Set)
+
+The feed list is the primary data structure in feed generation. It is a sorted set where each element is a content reference and the score determines the sort order. In chronological feeds, the score is the Unix timestamp of the content creation. In ranked feeds, the score is the computed relevance score.
+
+Each feed list element contains: content ID (8 bytes), creator ID (8 bytes), content type (1 byte), and score (8 bytes). Total storage per element is approximately 25 to 40 bytes depending on encoding.
+
+The feed list has a maximum size, typically 500 to 1,000 items. When a new item is inserted and the list exceeds the maximum, the lowest-scored item is evicted. This maintains a bounded storage footprint.
+
+<AsciiDiagram
+  id="feed-generation/deep-dive-feed-list"
+  title="Feed List Data Structure — Sorted Set Internals"
+  alt="Diagram showing a Redis sorted set structure with content IDs as members and timestamps/scores as values, including the eviction boundary"
+  caption="The feed list is a sorted set of content references. Items beyond the retention limit are evicted to maintain bounded storage."
+  content={`
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  Feed List: user:feed:42  (Redis Sorted Set)                    │
+    │  Max Size: 800 items                                            │
+    │                                                                  │
+    │  ┌──────┬──────────┬────────┬──────────┬──────────────────────┐ │
+    │  │ Rank │ Member   │ Score  │ Creator  │ Created              │ │
+    │  ├──────┼──────────┼────────┼──────────┼──────────────────────┤ │
+    │  │ 1    │ post_901 │ 9.99e8 │ user_12  │ 2026-07-03 10:00:01 │ │
+    │  │ 2    │ post_899 │ 9.99e8 │ user_45  │ 2026-07-03 09:58:12 │ │
+    │  │ 3    │ post_898 │ 9.99e8 │ user_78  │ 2026-07-03 09:55:44 │ │
+    │  │ ...  │ ...      │ ...    │ ...      │ ...                  │ │
+    │  │ 798  │ post_102 │ 9.98e8 │ user_12  │ 2026-07-01 14:22:01 │ │
+    │  │ 799  │ post_99  │ 9.98e8 │ user_33  │ 2026-07-01 12:10:55 │ │
+    │  │ 800  │ post_95  │ 9.98e8 │ user_90  │ 2026-07-01 11:45:30 │ │
+    │  └──────┴──────────┴────────┴──────────┴──────────────────────┘ │
+    │                                                                  │
+    │  ──────────────────── Eviction Boundary ─────────────────────   │
+    │  Items below this line are removed when new items are inserted   │
+    └──────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Follower Graph (Adjacency Set)
+
+The follower graph maps each user to their set of followers. The data structure is a reverse adjacency list: for user ID 42, the set contains all user IDs who follow user 42. The graph is stored as a set per user ID, allowing O(1) membership checks and O(n) enumeration.
+
+The follower graph must support fast lookups for the fan-out engine. When user 42 posts, the fan-out engine queries the follower set for user 42. For a celebrity with 10 million followers, this lookup must return the first 10,000 follower IDs within 10 milliseconds.
+
+The graph is partitioned by user ID. Each partition handles a range of user IDs. The partition key is the creator ID, so the follower set for a single user is always co-located on one partition. This avoids cross-partition queries during fan-out.
+
+<AsciiDiagram
+  id="feed-generation/deep-dive-follower-graph"
+  title="Follower Graph — Reverse Adjacency Set Structure"
+  alt="Diagram showing two representation styles: raw adjacency pairs and the grouped-by-followee structure used for fan-out lookups"
+  caption="The follower graph stores sets of follower IDs keyed by followee ID. This structure enables O(1) enumeration of all followers for a given creator during fan-out."
+  content={`
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  Follower Graph (Reverse Adjacency Sets)                        │
+    │                                                                  │
+    │  Key: followee_id                                                │
+    │  Value: Set of follower_ids                                      │
+    │                                                                  │
+    │  ┌──────────┬────────────────────────────────────────────────┐   │
+    │  │ Followee │ Follower Set (first 10 shown of 10,000)      │   │
+    │  ├──────────┼────────────────────────────────────────────────┤   │
+    │  │ user_1   │ {user_4, user_7, user_12, user_45, user_89,   │   │
+    │  │          │  user_101, user_203, user_456, ...}            │   │
+    │  ├──────────┼────────────────────────────────────────────────┤   │
+    │  │ user_2   │ {user_3, user_8, user_15, user_22, ...}       │   │
+    │  ├──────────┼────────────────────────────────────────────────┤   │
+    │  │ user_3   │ {user_1, user_5, user_9, user_11, ...}        │   │
+    │  ├──────────┼────────────────────────────────────────────────┤   │
+    │  │ ...      │ ...                                            │   │
+    │  ├──────────┼────────────────────────────────────────────────┤   │
+    │  │ user_42  │ {user_1, user_67, user_89, user_102, ...      │   │
+    │  │          │  10 million total followers}                   │   │
+    │  └──────────┴────────────────────────────────────────────────┘   │
+    │                                                                  │
+    │  Partition key: followee_id % num_partitions                     │
+    │  Partition 0: followees with IDs ending in 0                    │
+    │  Partition 1: followees with IDs ending in 1                    │
+    │  ...                                                             │
+    │  Partition 15: followees with IDs ending in F                   │
+    └──────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+### Timeline Cache (Time-Sorted Buckets)
+
+The timeline cache stores the merged and ranked feed result for fast retrieval. This is separate from the feed list. The feed list contains lightweight references. The timeline cache contains fully hydrated feed items ready to serve.
+
+The timeline cache uses time-sorted buckets. Each bucket covers a 5-minute interval. When a user requests their feed, the cache returns items from the most recent buckets first. This structure enables efficient incremental updates: when new content arrives, it is inserted into the current bucket without invalidating the entire cache.
+
+Each timeline cache entry has a TTL of 30 minutes. After 30 minutes, the entry is evicted. The next request triggers a full feed assembly. The cache hit rate for active users is typically above 75 percent.
+
+<AsciiDiagram
+  id="feed-generation/deep-dive-timeline-cache"
+  title="Timeline Cache — Time-Sorted Bucket Structure"
+  alt="Diagram showing time-sorted buckets with 5-minute intervals, each containing hydrated feed items, with the most recent buckets shown first"
+  caption="The timeline cache organizes feed items into 5-minute time buckets for efficient incremental updates and fast retrieval."
+  content={`
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  Timeline Cache for user_42                                      │
+    │  Cache TTL: 30 minutes                                          │
+    │  Bucket interval: 5 minutes                                     │
+    │                                                                  │
+    │  ┌──────────────────────────────────────────────────────────────┐│
+    │  │ Bucket T+0 (10:00 - 10:05) — 3 items                         ││
+    │  │ ┌──────┬────────────┬──────────┬──────────────────────────┐  ││
+    │  │ │ Item │ Content    │ Creator  │ Score                     │  ││
+    │  │ ├──────┼────────────┼──────────┼──────────────────────────┤  ││
+    │  │ │ 1    │ post_901   │ user_12  │ 0.95 (high engagement)   │  ││
+    │  │ │ 2    │ post_899   │ user_45  │ 0.87 (recent + liked)    │  ││
+    │  │ │ 3    │ post_898   │ user_78  │ 0.72 (close friend)      │  ││
+    │  │ └──────┴────────────┴──────────┴──────────────────────────┘  ││
+    │  ├──────────────────────────────────────────────────────────────┤│
+    │  │ Bucket T-1 (09:55 - 10:00) — 5 items                         ││
+    │  │ ┌──────┬────────────┬──────────┬──────────────────────────┐  ││
+    │  │ │ 1    │ post_897   │ user_12  │ 0.68 (engagement)       │  ││
+    │  │ │ 2    │ post_895   │ user_33  │ 0.65 (engagement)       │  ││
+    │  │ │ 3    │ post_894   │ user_90  │ 0.61 (engagement)       │  ││
+    │  │ │ 4    │ post_892   │ user_45  │ 0.55 (engagement)       │  ││
+    │  │ │ 5    │ post_890   │ user_78  │ 0.48 (engagement)       │  ││
+    │  │ └──────┴────────────┴──────────┴──────────────────────────┘  ││
+    │  ├──────────────────────────────────────────────────────────────┤│
+    │  │ Bucket T-2 (09:50 - 09:55) — 4 items                         ││
+    │  │ ...                                                          ││
+    │  ├──────────────────────────────────────────────────────────────┤│
+    │  │ Bucket T-3 (09:45 - 09:50) — 6 items                         ││
+    │  │ ...                                                          ││
+    │  ├──────────────────────────────────────────────────────────────┤│
+    │  │ Bucket T-4 (09:40 - 09:45) — 3 items                         ││
+    │  │ ...                                                          ││
+    │  ├──────────────────────────────────────────────────────────────┤│
+    │  │ Bucket T-5 (09:35 - 09:40) — 2 items                         ││
+    │  │ ...                                                          ││
+    │  └──────────────────────────────────────────────────────────────┘│
+    │                                                                  │
+    │  Total cached items: 23 / 800 max                               │
+    │  Cache age: 2 seconds ago (next refresh in 28 minutes)          │
+    └──────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+## Request Lifecycle
+
+### Step 1: User Opens App
+
+The user opens the mobile app. The app sends a `GET /feed?cursor=last_seen_id&limit=20` request to the feed service. The cursor is the content ID of the last item the user saw. If the user has never opened the app, the cursor is null and the feed service returns the first page.
+
+### Step 2: Feed Service Validates Request
+
+The feed service validates the request parameters. The user ID is extracted from the authentication token. The cursor is checked for format validity. The limit is clamped between 1 and 100. Invalid requests return a 400 error. This validation prevents malicious requests from reaching the storage layer.
+
+### Step 3: Feed Service Checks Timeline Cache
+
+The feed service checks the timeline cache for the user's cached feed. If the cache has a valid entry (not expired, and no fan-out events for the user since the cache was built), the service returns the cached feed. This is the fast path with typical latency of 5 to 15 milliseconds.
+
+### Step 4: Cache Miss Triggers Feed List Read
+
+On a cache miss, the feed service reads the user's feed list from feed storage. The operation is a sorted set range query: `ZREVRANGE user:feed:{user_id} {start} {end}`. The start and end positions are calculated from the cursor. If the user ID has an activity backfill in progress, the feed list may be partially empty, triggering a pull-based assembly.
+
+### Step 5: Ranking Scores Applied
+
+If the feed is ranked (not chronological), the ranking engine computes scores for each feed item. The scoring function combines multiple signals into a single float score:
+
+`score = (recency_weight * recency_norm) + (engagement_weight * engagement_norm) + (affinity_weight * affinity_norm)`
+
+Typical weights are: recency 0.4, engagement 0.35, affinity 0.25. The normalization ensures each signal contributes proportionally. The scores are computed in a single pass over the feed list.
+
+### Step 6: Deduplication Filter
+
+The feed service removes duplicate content items. A post that was reshared by multiple followed accounts appears only once. The deduplication key is the original content ID. The service also filters out content the user has already seen, using a set of recently viewed content IDs stored in a short-term cache.
+
+### Step 7: Hydration Batch Fetch
+
+The feed service sends a batch hydration request to the content service. The request contains all content IDs from the current page (typically 20 to 50 IDs). The content service fetches the full metadata for all IDs in a single query, using a `WHERE id IN (...)` pattern or a batch get from a key-value store.
+
+### Step 8: Media URL Assembly
+
+The hydration layer assembles media URLs. Content items may have multiple media variants: thumbnail, standard resolution, high resolution, and original. The URL includes CDN information and signed tokens for access control. This step also attaches video transcoding metadata, image dimensions, and duration for video content.
+
+### Step 9: Engagement Data Attachment
+
+The hydration layer attaches engagement data: like count, comment count, share count, and the current user's engagement status (did the current user like this post? did they save it?). This data is fetched from a counter service and the user engagement store.
+
+### Step 10: Feed Response Assembly
+
+The feed service assembles the final response. Each feed item is a JSON object with all metadata. The response includes the cursor for the next page (`next_cursor: "post_895"`), the total number of items remaining in the feed, and any warnings or informational messages.
+
+### Step 11: Async Timeline Cache Update
+
+The feed service asynchronously updates the timeline cache. The cache write happens in the background after the response is sent to the user. The cache stores the hydrated and ranked feed for 30 minutes. This ensures that the next request from the same user is served from the cache.
+
+### Step 12: Client-Side Rendering
+
+The mobile or web client renders the feed items. The client maintains its own local cache for instant loading on subsequent opens. The client requests new items on a refresh (pull-to-refresh gesture) or via a background polling loop that checks for new content every 30 seconds.
+
+### Step 13: Continuous Feed Updates
+
+For real-time feeds, the client maintains a persistent connection (WebSocket or Server-Sent Events) to the feed service. When new content is published to a followed user, the fan-out engine sends a push notification to the feed service, which forwards it to the connected clients. The client inserts the new item at the top of the feed without requiring a full refresh.
+
+### Step 14: Pagination for Deeper Pages
+
+When the user scrolls past the first page, the app requests the next page using the cursor from the previous response. The feed service reads the next range from the feed list. Deeper pages (page 5+) are typically slower because the feed list must be scanned from the beginning to reach the cursor position.
+
+<AsciiDiagram
+  id="feed-generation/deep-dive-read-path-sequence"
+  title="Complete Feed Read Path — Step-by-Step Sequence"
+  alt="Sequence diagram showing the full feed read path: user request, cache check, feed list read, ranking, deduplication, hydration, and response assembly"
+  caption="The feed read path involves up to seven sequential steps. The timeline cache short-circuits the most expensive steps for returning users."
+  content={`
+    User        Feed          Timeline      Feed          Ranking     Content     Hydration
+    App         Service       Cache         Storage       Engine      Service     Cache
+      │            │             │             │             │           │           │
+      │── GET ────>│             │             │             │           │           │
+      │  /feed     │             │             │             │           │           │
+      │            │── Check ────>             │             │           │           │
+      │            │<── Miss ────│             │             │           │           │
+      │            │             │             │             │           │           │
+      │            │── ZREVRANGE ─────────────>│             │           │           │
+      │            │<── [items] ──────────────│             │           │           │
+      │            │             │             │             │           │           │
+      │            │── Rank ────────────────────────────────>│           │           │
+      │            │<── Scores ─────────────────────────────│           │           │
+      │            │             │             │             │           │           │
+      │            │── Dedup ───>│             │             │           │           │
+      │            │<── Filtered │             │             │           │           │
+      │            │             │             │             │           │           │
+      │            │── Batch Get Content ───────────────────────────────>│           │
+      │            │             │             │             │   ┌───────┤           │
+      │            │             │             │             │   │Check  │           │
+      │            │             │             │             │   │Cache  │           │
+      │            │             │             │             │   │──────>│           │
+      │            │<── Full Content ──────────────────────────────────│           │
+      │            │             │             │             │           │           │
+      │            │── Assemble ─>│             │             │           │           │
+      │            │  Response   │             │             │           │           │
+      │            │<── Cache ───│             │             │           │           │
+      │<── 200 OK ─│             │             │             │           │           │
+      │  [feed]    │             │             │             │           │           │
+  `}
+/>
+
+## Consistency and State
+
+### Scenario 1: Read-Your-Own-Write Consistency
+
+A user posts a new photo. They immediately refresh their feed and expect to see their own post at the top. In a fan-out on write system, the user's own post is written to their own feed list as part of the fan-out. The read path should include the creator's own feed list as a source, ensuring that the user sees their own post immediately.
+
+The fan-out engine ensures read-your-own-write consistency by always writing the new content to the creator's feed list first, before writing to follower feed lists. This guarantees that the creator's next feed read includes their latest post.
+
+### Scenario 2: Eventually Consistent Follower Feeds
+
+User A posts a photo. User B follows User A. After the fan-out engine completes, User B's feed list contains the new photo. However, there is a window between the write to the feed list and the read. If User B reads their feed before the fan-out completes, the new photo is not visible.
+
+This is eventually consistent behavior. The window is typically 100 to 500 milliseconds for a user with a small follower count, and up to 5 seconds for a user with a large follower count. The system does not guarantee that all followers see the content at the same time. This is acceptable for most feed use cases because users do not expect instant propagation.
+
+### Scenario 3: Stale Feeds During Fan-out Backlog
+
+During peak hours, the fan-out engine may fall behind. Content events queue up in the ingestion pipeline. The queue can grow to hundreds of thousands of events. Users see stale feeds because new content has not been written to their feed lists yet.
+
+The system handles this by monitoring the fan-out lag (the difference between the event timestamp and the current time). If the lag exceeds 10 seconds, the system signals the read path to fall back to a pull-based assembly for active users. The pull-based assembly bypasses the feed list and queries the content store directly, ensuring that users see fresh content even when the fan-out pipeline is backed up.
+
+### Scenario 4: Concurrent Reads and Writes
+
+A feed list is being read while a fan-out write is in progress. The write adds a new item to the sorted set while the read is iterating through the range. This is a concurrent access pattern.
+
+Redis sorted sets handle this correctly: the read returns a consistent snapshot of the sorted set as of the start of the read operation. Writes that arrive during the read are not visible in that read. This means users may see a feed that is one event behind, but they never see a partial or corrupted feed.
+
+## Performance
+
+### Read Path Latency Budget
+
+The read path latency budget is allocated across the subsystems:
+
+| Subsystem | Budget (ms) | P99 Target (ms) |
+|-----------|-------------|-----------------|
+| Cache check | 5 | 15 |
+| Feed list read | 10 | 30 |
+| Ranking score | 15 | 40 |
+| Deduplication | 5 | 10 |
+| Hydration batch | 50 | 120 |
+| Response assembly | 5 | 20 |
+| Network overhead | 10 | 30 |
+| **Total** | **100** | **265** |
+
+The total P99 target is 300 milliseconds. This means 99 percent of feed reads complete within 300 milliseconds. The remaining 1 percent may experience cache misses, storage hotspotting, or network congestion.
+
+### Write Path Throughput
+
+The fan-out engine must handle peak write throughput. For a platform with 50,000 content creations per second and an average of 200 followers per post, the fan-out engine generates 10 million feed list writes per second.
+
+Each feed list write is a single Redis `ZADD` command. A single Redis node can handle approximately 100,000 writes per second. To handle 10 million writes per second, the feed storage cluster requires 100 Redis nodes working in parallel. With replication (1 primary + 1 replica per shard), the cluster has 200 nodes.
+
+### Cache Hit Ratio Optimization
+
+The timeline cache hit ratio directly impacts read latency. A high hit ratio delivers fast responses. A low hit ratio triggers expensive feed assembly.
+
+Cache hit ratio is optimized through three strategies:
+
+**Prefetching.** When a user's feed is assembled, the system caches the result and also prefetches the next page. The prefetch adds 20 milliseconds to the write path but saves 100 milliseconds on the next read.
+
+**Warm-up for Active Users.** The system identifies the top 1 percent of users by feed read frequency and proactively maintains their timeline caches. A background job refreshes these caches every 60 seconds, regardless of whether the user has read their feed recently.
+
+**Invalidation Batching.** When new content arrives for a user who has an active timeline cache entry, the system does not immediately invalidate the cache. Instead, it appends a "new content available" flag to the cache entry. The next read from the user checks the flag and conditionally merges new content with the cached content.
+
+## Fan-Out Batch Optimization
+
+The fan-out engine's most critical optimization is batch processing. Writing to 10,000 feed lists one at a time requires 10,000 network round trips, each taking 1 to 5 milliseconds. The total time is 10 to 50 seconds. Batching reduces this to 2 to 5 seconds.
+
+The fan-out engine uses a three-level batching strategy:
+
+**Level 1: Connection Pooling.** The fan-out engine maintains a persistent connection pool to each Redis shard. Connections are reused across fan-out operations. Connection establishment overhead is eliminated.
+
+**Level 2: Pipeline Batching.** The fan-out engine sends multiple Redis commands in a single pipeline. A pipeline of 100 commands requires one network round trip instead of 100. The engine batches feed list writes into groups of 100 and sends them as a single pipeline.
+
+**Level 3: Asynchronous Writes.** The fan-out engine does not wait for each pipeline to complete before sending the next one. It uses asynchronous I/O to overlap network latency with processing. While pipeline A is in flight, the engine prepares pipeline B.
+
+The fan-out engine also uses follower-level batching. Follower lists are sorted by engagement recency. Followers who opened the app recently get priority writes. The first 500 followers receive their feed list writes in the first batch. The remaining followers are written in subsequent batches. This ensures that users who are likely to read their feed immediately see the new content first.
+
+### Ranking Engine Deep Dive
+
+The ranking engine is a background service that re-computes feed scores periodically. It runs on a cron schedule, typically every 5 minutes. The engine processes feed lists in batches, re-scores each item, and writes the updated scores back to the feed storage.
+
+The ranking engine uses a multi-stage scoring pipeline:
+
+**Stage 1: Signal Collection.** The engine collects all ranking signals for the user and the feed items. Signals come from various sources: the engagement counter service (likes, comments, shares per item), the user affinity service (how strongly does the user engage with each creator?), the time service (current time for recency calculation), and the content type service (does the user prefer photos over videos?). Each signal is fetched in a batch to minimize round trips.
+
+**Stage 2: Normalization.** The raw signals are normalized to a 0.0 to 1.0 range. Recency: `recency = max(0, 1 - age_hours / max_age_hours)` where `max_age_hours` is 48. Engagement: `engagement = log(1 + like_count + comment_count + share_count) / log(1 + max_engagement)`. Affinity: `affinity = user_affinity_score` (pre-computed by the user affinity model, range 0.0 to 1.0). Normalization ensures that no single signal dominates the score.
+
+**Stage 3: Weighted Sum.** The normalized signals are combined using a weighted sum: `score = 0.3 * recency + 0.3 * engagement + 0.2 * affinity + 0.1 * diversity_bonus + 0.1 * content_type_preference`. The weights are tuned through A/B testing. Different user segments may have different weights. Power users get higher recency weight. Casual users get higher engagement weight.
+
+**Stage 4: Diversity Adjustment.** The engine applies a diversity bonus to ensure the feed is not dominated by a single creator or content type. The diversity bonus is calculated as: for each creator, count the number of that creator's items in the top 50 of the feed list. If a creator has more than 10 items, apply a penalty of 0.01 per extra item. This prevents feed homogenization.
+
+**Stage 5: Score Write-back.** The new scores are written to the feed storage as a batch update. The engine uses `ZADD` with the updated scores. The scores are written in a single pipeline to minimize write latency. The ranking update for a single feed list takes 5 to 20 milliseconds.
+
+## Configuration
+
+### Feed List Size
+
+`feed_list_max_size` — Controls the maximum number of items stored per user's feed list. Default: 800. Range: 200 to 2,000. Lower values reduce storage and improve read speed. Higher values reduce the frequency of pull-assembly for heavy users. The cost of increasing the max size is approximately 40 bytes per additional item per user.
+
+### Fan-out Threshold
+
+`fan_out_max_followers` — The maximum number of followers that trigger push-based fan-out. Users with more followers than this threshold are switched to pull-based feed delivery. Default: 10,000. Range: 1,000 to 100,000. This threshold protects the fan-out engine from write amplification spikes. Celebrity accounts with millions of followers are always pull-based.
+
+### Feed Ranking Weights
+
+`ranking_recency_weight` — Weight for the recency signal in the ranking score. Default: 0.4. Range: 0.0 to 1.0.
+
+`ranking_engagement_weight` — Weight for the engagement velocity signal. Default: 0.35. Range: 0.0 to 1.0.
+
+`ranking_affinity_weight` — Weight for the creator-viewer affinity signal. Default: 0.25. Range: 0.0 to 1.0.
+
+The three weights must sum to 1.0. Different content types can have different weight configurations. Video content may have a higher engagement weight. News content may have a higher recency weight.
+
+### Cache TTL
+
+`timeline_cache_ttl_seconds` — How long a hydrated timeline cache entry remains valid. Default: 1,800 (30 minutes). Range: 60 to 3,600. Shorter TTL provides fresher content at the cost of more cache misses. Longer TTL reduces read latency at the cost of serving potentially stale content.
+
+### Activity Window
+
+`active_user_window_days` — The number of days since last activity that defines an active user for the hybrid fan-out strategy. Default: 7. Range: 1 to 30. A shorter window reduces write amplification but increases the pull-based load when inactive users return. A longer window pre-computes feeds for more users, improving their read latency but increasing storage and write costs.
+
+<AsciiDiagram
+  id="feed-generation/deep-dive-performance-tradeoffs"
+  title="Feed Generation Configuration Trade-offs"
+  alt="Three charts showing the trade-offs between feed list size, fan-out threshold, cache TTL, and their effects on latency, storage, and write amplification"
+  caption="Key configuration parameters and their effect on system performance. Each parameter involves a trade-off between speed, cost, and freshness."
+  content={`
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  Configuration Trade-offs                                       │
+    │                                                                  │
+    │  Feed List Size vs Storage Cost                                 │
+    │  ┌────────────────────────────────────────────────────────┐     │
+    │  │  400 MB   600 MB    800 MB    1.0 GB    1.2 GB         │     │
+    │  │  [200]───[500]────[800]────[1200]───[2000]             │     │
+    │  │  Low storage        Default          High storage       │     │
+    │  │  More refills                          Fewer refills    │     │
+    │  └────────────────────────────────────────────────────────┘     │
+    │                                                                  │
+    │  Fan-out Threshold vs Write Amplification                       │
+    │  ┌────────────────────────────────────────────────────────┐     │
+    │  │  500x      1,000x    5,000x    10,000x   50,000x       │     │
+    │  │  [1K]─────[2K]─────[5K]──────[10K]─────[50K]          │     │
+    │  │  Low amplif.        Default            High amplif.    │     │
+    │  │  More pull reads                      Faster writes    │     │
+    │  └────────────────────────────────────────────────────────┘     │
+    │                                                                  │
+    │  Cache TTL vs Read Latency                                      │
+    │  ┌────────────────────────────────────────────────────────┐     │
+    │  │  10 ms     15 ms     20 ms     30 ms     50 ms         │     │
+    │  │  [60s]────[300s]───[1800s]───[3600s]──[7200s]         │     │
+    │  │  Fresh                Default           Stale           │     │
+    │  │  More reads                           Fewer reads      │     │
+    │  └────────────────────────────────────────────────────────┘     │
+    └──────────────────────────────────────────────────────────────────┘
+  `}
+/>

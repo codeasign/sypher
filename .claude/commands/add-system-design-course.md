@@ -1,4 +1,4 @@
-# /add-system-design-course
+﻿# /add-system-design-course
 
 Generate a complete, FAANG-level System Design Fundamentals topic for the Sypher platform.
 
@@ -566,4 +566,19 @@ Print this summary table after all files are written:
 | 06-interview.mdx | N | N | ✅/❌ | ✅ |
 | 07-challenge.mdx | N | N | ✅/❌ | ✅ |
 
-Then run `npm start` and confirm zero compilation errors.
+Then run the pre-flight validation:
+
+1. Build with `npm run start` and watch for MDX compilation errors in the terminal output.
+2. If any file fails, diagnose by the exact error (`ruleId`, file, line, column) from the build output.
+3. **Common MDX errors and their fixes:**
+
+   | Error pattern | Root cause | Fix |
+   |---|---|---|
+   | `Expected a closing tag for <word>` — any `<placeholder>` in prose | MDX treats `<word>` as a JSX component. Happens with placeholders, type params like `List<String>`, math comparisons | Wrap in backticks: `` `<placeholder>` ``. Or use `&lt;` and `&gt;`. |
+   | `Expected a closing tag for <details>` / `end-tag-mismatch` | A `<details>` block is missing its `</details>` closing tag | Count every `<details>` and verify a matching `</details>` exists for each. |
+   | `Expected a closing tag for <summary>` | A `<summary>` tag inside a `<details>` is missing `</summary>` | Add `</summary>` before the content after the summary line. |
+   | Bare `{` / `}` in prose (acorn parse error) | JSON, GraphQL, or code with `{}` outside fenced code blocks | Wrap in a fenced code block with the appropriate language tag. |
+   | **AsciiDiagram renders as blank/empty box** (no build error) | AsciiDiagram uses `>` `{` `` ` `` (children pattern) instead of `content={` `` ` `` (content prop) | Replace `>` before `{` `` ` `` with `content=`. Replace `</AsciiDiagram>` with `/>`. Run `grep -rn '</AsciiDiagram>' docs/` after generation. |
+
+4. Apply the matching fix and re-run the build. Repeat up to 3 times per file; flag anything still failing as `NEEDS MANUAL REVIEW`.
+5. Do not print the final summary table until every file builds clean or is explicitly flagged.

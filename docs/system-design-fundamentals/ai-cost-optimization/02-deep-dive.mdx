@@ -1,0 +1,602 @@
+---
+id: ai-cost-optimization-deep-dive
+title: AI Cost Optimization -- Under the Hood
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+The cost optimization system is composed of five core services that work together to track, control, and optimize spending across all AI inference. Each service has a specific responsibility, and together they form a pipeline that processes every request with sub-50ms overhead.
+
+<AsciiDiagram id="ai-cost-optimization/internal-architecture" alt="Internal architecture diagram showing the five core services of the cost optimization system: cost tracking pipeline, budget enforcement, model selection engine, batch scheduler, cache optimizer, and cost allocation service with data flows between them" caption="Figure 1: Internal architecture of the AI cost optimization system" content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                  Cost Optimization Engine                         │
+  ├─────────────────────────────────────────────────────────────────┤
+  │                                                                   │
+  │  ┌────────────────┐    ┌────────────────┐    ┌────────────────┐ │
+  │  │ Cost Tracking   │    │ Budget          │    │ Model Selection│ │
+  │  │ Pipeline        │───>│ Enforcement     │───>│ Engine         │ │
+  │  │                 │    │                 │    │                │ │
+  │  │ - Token counter │    │ - Threshold     │    │ - Routing table│ │
+  │  │ - Price lookup  │    │   monitoring    │    │ - Cost ranking │ │
+  │  │ - Latency       │    │ - Circuit       │    │ - Quality      │ │
+  │  │   tracking      │    │   breaker       │    │   estimator    │ │
+  │  └────────────────┘    └────────────────┘    └───────┬────────┘ │
+  │                                                        │         │
+  │  ┌────────────────┐    ┌────────────────┐              │         │
+  │  │ Cache Optimizer│    │ Batch Scheduler│              │         │
+  │  │                │    │                │              │         │
+  │  │ - LFU eviction │    │ - Packing      │              │         │
+  │  │ - Cost-aware   │    │   algorithm    │              │         │
+  │  │   admission    │    │ - Max wait     │              │         │
+  │  │ - TTL manager  │    │   timeout      │              │         │
+  │  └────────────────┘    └────────────────┘              │         │
+  │                                                        v         │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │  Cost Allocation Service                                  │   │
+  │  │  - Aggregates per-feature, per-team, per-user costs       │   │
+  │  │  - Generates chargeback reports                           │   │
+  │  │  - Exports to billing system                              │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────────┘
+`} />
+
+### Cost Tracking Pipeline
+
+The cost tracking pipeline is the foundation of the entire system. Every inference call produces a cost event that flows through this pipeline. The pipeline has three stages:
+
+1. **Token counting**: The exact input and output token counts from the API response. Most providers return these in the response body.
+2. **Price lookup**: A pricing registry maps provider, model, and region to current prices. The lookup returns the cost per million tokens for both input and output.
+3. **Metric emission**: The calculated cost is emitted as a structured log and a time-series metric.
+
+### Budget Enforcement Service
+
+The budget enforcement service maintains budgets per team, per feature, and per user. Budgets are time-windowed (daily, weekly, monthly) with rolling windows. The service checks every request against current budget consumption and returns a routing directive: allow with preferred model, allow with downgraded model, or deny.
+
+### Model Selection Engine
+
+The model selection engine maintains a routing table that maps request characteristics to optimal models. The table is updated dynamically based on provider pricing changes, model availability, and quality metrics.
+
+### Batch Scheduler
+
+The batch scheduler groups non-urgent requests into batches for discounted processing. It maintains a priority queue per model and per provider. Requests are batched by destination (same model and provider) to maximize compatibility.
+
+### Cache Optimizer
+
+The cache optimizer manages the multi-level cache. It uses cost-aware eviction: when the cache is full, the optimizer evicts entries with the lowest cost savings per byte of storage, not just the least recently used. This maximizes the dollar value of the cache.
+
+### Cost Allocation Service
+
+The cost allocation service aggregates cost events by dimension (team, feature, user, model, provider) and generates chargeback reports. It exports data to the corporate billing system in standard formats.
+
+## Data Structures and Algorithms
+
+### Token Counting and Accumulation
+
+Token counts are tracked using a sliding window counter. For each dimension being tracked (team, feature, model), the system maintains a set of time buckets:
+
+```python
+class SlidingWindowCounter:
+    def __init__(self, window_seconds=3600, bucket_seconds=60):
+        self.window_seconds = window_seconds
+        self.bucket_seconds = bucket_seconds
+        self.buckets = CircularBuffer(window_seconds // bucket_seconds)
+        self.current_bucket = None
+
+    def add(self, count, timestamp):
+        bucket_index = timestamp // self.bucket_seconds
+        if bucket_index != self.current_bucket:
+            self.buckets.advance(bucket_index)
+            self.current_bucket = bucket_index
+        self.buckets.current().add(count)
+
+    def total(self):
+        return sum(b.total() for b in self.buckets)
+```
+
+Each bucket stores cumulative token counts and cost for that interval. The total for the window is the sum of all buckets. This gives O(1) add and O(n) query where n is the number of buckets (typically 60 for a 1-hour window with 1-minute buckets).
+
+### Cost Accumulation Trees
+
+For hierarchical cost tracking (user belongs to team belongs to department), the system uses a cost accumulation tree:
+
+```
+Root: Company ($2.4M/month)
+  ├── Dept: Engineering ($1.2M)
+  │     ├── Team: AI Platform ($800K)
+  │     │     ├── Feature: Chat ($500K)
+  │     │     │     └── User-level costs...
+  │     │     └── Feature: Search ($300K)
+  │     └── Team: Backend ($400K)
+  └── Dept: Product ($1.2M)
+        ├── Team: Writing ($700K)
+        └── Team: Analytics ($500K)
+```
+
+Each node in the tree stores the cumulative cost for its subtree. When a cost event arrives, the system updates the leaf node and propagates the cost up the tree. The update is O(log n) where n is the depth of the tree (typically 3-5 levels).
+
+### Cache Optimization Algorithms
+
+The cache uses a cost-aware variant of LFU (Least Frequently Used). Each cache entry stores:
+
+- **Hit rate**: Number of times the entry was served from cache.
+- **Cost saved per hit**: The cost of regenerating this response.
+- **Storage cost**: The memory or storage cost of keeping this entry.
+- **Value score**: (hit rate x cost saved per hit) / storage cost.
+
+When the cache reaches capacity, entries with the lowest value score are evicted first. This maximizes the cost savings per byte of cache storage.
+
+For comparison, the system also tracks a standard LRU eviction policy as a baseline. In practice, cost-aware LFU consistently outperforms LRU by 15-25% in dollar savings for the same cache size.
+
+### Batch Packing Algorithm
+
+Batch packing uses a bin-packing approach. Requests are packed into batches based on:
+
+- **Destination**: Same model and provider = compatible.
+- **Token budget**: Each batch has a maximum token limit (typically 32K tokens total).
+- **Time budget**: Each request has a maximum wait time.
+- **Priority**: Premium users get priority placement in the next available batch.
+
+```python
+class BatchPacker:
+    def __init__(self, max_batch_tokens=32000, max_wait_ms=5000):
+        self.max_batch_tokens = max_batch_tokens
+        self.max_wait_ms = max_wait_ms
+        self.queues = {}  # model_provider -> PriorityQueue
+
+    def add_request(self, request):
+        key = f"{request.model}:{request.provider}"
+        if key not in self.queues:
+            self.queues[key] = PriorityQueue()
+        self.queues[key].push(request)
+
+    def form_batches(self, current_time):
+        batches = []
+        for key, queue in self.queues.items():
+            batch = []
+            token_count = 0
+            while not queue.empty() and token_count < self.max_batch_tokens:
+                request = queue.peek()
+                if request.expiry_time < current_time:
+                    queue.pop()  # expired, send individually
+                    continue
+                if token_count + request.tokens <= self.max_batch_tokens:
+                    queue.pop()
+                    batch.append(request)
+                    token_count += request.tokens
+                else:
+                    break
+            if batch:
+                batches.append(batch)
+        return batches
+```
+
+## The Cost Lifecycle
+
+Every request traces a path through the cost optimization system. Here is the full lifecycle, from user action to billing report.
+
+<AsciiDiagram id="ai-cost-optimization/cost-lifecycle" alt="Ten-step lifecycle diagram showing a request flowing from user action through classification, routing, inference, cost tracking, aggregation, and finally billing" caption="Figure 2: The full cost lifecycle -- from user action to billing line item" content={`
+  Step 1: User Action
+  │
+  v
+  Step 2: Request Classification
+  │
+  v
+  Step 3: Model Route Selection
+  │
+  v
+  Step 4: Prompt Optimization
+  │
+  v
+  Step 5: Cache Lookup
+  │
+  ├── Cache Hit: Return cached response, cost = $0
+  │
+  └── Cache Miss: Continue
+       │
+       v
+  Step 6: Batch Decision
+  │
+  ├── Urgent: Send immediately
+  │   │
+  │   v
+  └── Non-urgent: Queue for batching
+      │
+      v
+  Step 7: Inference API Call
+  │
+  v
+  Step 8: Token Counting and Cost Calculation
+  │
+  v
+  Step 9: Cost Event Emission
+  │  - Provider, model, tokens, cost, user, feature
+  │  - Emitted to tracking pipeline and time-series DB
+  │
+  v
+  Step 10: Cost Aggregation and Allocation
+     - Update sliding window counters
+     - Propagate up cost accumulation tree
+     - Update budget monitors
+     - Generate billing line items
+`} />
+
+### Step-by-Step Details
+
+**Step 1-2** (User action to classification): These happen at the application layer, before any AI inference cost is incurred.
+
+**Step 3** (Model route selection): The model selection engine checks the routing table for the best model given the request complexity, user tier, and current budget status. If the daily budget is at 85%, the engine may downgrade complex requests from Tier 3 to Tier 2.
+
+**Step 4** (Prompt optimization): The prompt optimizer runs. If the request is cache-bound (Step 5 follows immediately), compression is skipped to avoid wasting compute on requests that will be served from cache.
+
+**Step 5** (Cache lookup): The cache is checked. If the exact key exists in the Redis cache, the response is returned immediately. If the key does not exist, the semantic cache is queried using the embedding of the compressed prompt. Cache updates are written asynchronously after the response is returned to the user.
+
+**Step 6** (Batch decision): The batch scheduler checks the request's batch tolerance. If batchable, the request is queued and the response is deferred. The scheduler forms batches every 500ms or when the batch size threshold is reached.
+
+**Step 7** (Inference): The API call is made. The response is returned to the user.
+
+**Step 8-10** (Cost tracking, emission, aggregation): The response includes token counts from the provider. The cost tracking pipeline calculates the cost, emits metrics, and updates all counters and accumulators.
+
+## Consistency and State
+
+### Concurrent Request Cost Tracking
+
+When multiple requests arrive simultaneously, the cost tracking system must not double-count or miss any request. The sliding window counter handles concurrency through atomic bucket updates:
+
+```python
+import threading
+
+class AtomicBucket:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.total_tokens = 0
+        self.total_cost = 0.0
+        self.request_count = 0
+
+    def add(self, tokens, cost):
+        with self.lock:
+            self.total_tokens += tokens
+            self.total_cost += cost
+            self.request_count += 1
+```
+
+The lock contention is low because each bucket covers a fixed time interval (60 seconds) and updates are fast (microseconds). For very high throughput systems (10,000+ requests per second), the system uses sharded buckets per model-provider pair to reduce contention.
+
+### Budget Race Conditions
+
+A race condition occurs when two requests arrive at the exact moment the budget is exhausted. Both requests see budget remaining, but after both are processed, the actual consumption exceeds the budget. The solution is two-phase budget checking:
+
+1. **Optimistic check**: Before processing, check if budget remains. If yes, provisionally deduct the estimated cost.
+2. **Actual deduction**: After processing, deduct the actual cost. If the provisional was wrong (over or under), adjust.
+
+The provisional deduction uses the estimated cost based on the model tier. Under-estimation is handled by exceeding the budget temporarily -- the system accepts a small overshoot (2-5%) rather than blocking legitimate requests at budget boundaries.
+
+### Distributed Cost Aggregation
+
+In a multi-region deployment, cost events are produced in each region and must be aggregated globally. The system uses a leader-worker architecture:
+
+1. Each region has a local cost aggregator that maintains regional sliding window counters.
+2. Every 60 seconds, each region's aggregator sends a summary to the global aggregator.
+3. The global aggregator merges the summaries into a global view.
+
+This means global cost data is up to 60 seconds stale. For real-time budget enforcement, each region uses local counters. For global chargeback and reporting, the global aggregated data is used.
+
+### Billing Reconciliation
+
+Provider invoices arrive monthly but cost events are tracked in real time. The reconciliation process compares the provider's invoice to the internally tracked costs. Discrepancies arise from:
+
+- **Pricing changes**: Provider changed prices mid-month without notice.
+- **Tax and fees**: Provider adds taxes or surcharges not reflected in per-request pricing.
+- **Minimum commitments**: Committed use contracts have monthly minimums that affect per-request costs.
+
+The reconciliation system flags discrepancies greater than 1% for manual review. Historical price data is stored so the system can recompute past costs with updated prices.
+
+## Performance Characteristics
+
+### Tracking Overhead
+
+The cost tracking pipeline adds under 1ms per request. The breakdown: token extraction from API response (0.1ms), price lookup from in-memory registry (0.05ms), metric emission to local buffer (0.3ms), cache update for cost accumulation tree (0.2ms). This microsecond-level overhead is negligible compared to the 500ms-5s LLM inference time.
+
+### Batch Efficiency Gains
+
+Batching provides a 50% discount from most providers. Additionally, batched requests use fewer API connections, reducing network overhead. The effective throughput gain is 2-5x depending on the mixture of urgent and non-urgent requests.
+
+For a system with 60% non-urgent requests:
+- Without batching: 100 API calls per minute, full cost
+- With batching: 40 urgent calls + 10 batched calls = 50 API calls per minute
+- Cost savings: (60 requests x 50% discount) = 30% total cost reduction
+
+### Compression Savings
+
+Prompt compression reduces token counts by 40-60% on average. For a system where input tokens account for 70% of total cost (typical for RAG applications with long context windows), this translates to 28-42% total cost reduction.
+
+Compression performance depends on prompt structure:
+- Verbose system prompts: 70-80% reduction
+- RAG with irrelevant documents: 50-70% reduction
+- Short conversational prompts: 10-20% reduction
+- Already-optimized prompts: 0-10% reduction
+
+### Caching ROI
+
+Cache ROI depends on hit rate and the cost of cache infrastructure:
+
+| Cache Type | Typical Hit Rate | Infrastructure Cost | Monthly Savings (at $500K/mo API cost) |
+|---|---|---|---|
+| Exact-match only | 15-25% | $500/month | $75,000-$125,000 |
+| Exact + semantic | 35-55% | $5,000/month | $175,000-$275,000 |
+| Full multi-level | 50-70% | $15,000/month | $250,000-$350,000 |
+
+<AsciiDiagram id="ai-cost-optimization/cache-roi" alt="Bar chart showing cache ROI for three cache configurations: exact-match only saves $100K at $500 cost, semantic adds $200K at $5K cost, full multi-level saves $300K at $15K cost" caption="Figure 3: Cache ROI at different investment levels -- infrastructure costs are dwarfed by savings" content={`
+  Cache ROI Comparison (Monthly)
+
+  Exact-match cache          ┌────────────────────────────────────┐
+  Cost: $500/month           │ Savings: $75K - $125K             │
+                             │ ROI: 150x - 250x                  │
+                             └────────────────────────────────────┘
+
+  Semantic cache             ┌─────────────────────────────────────────────────────┐
+  Cost: $5,000/month         │ Savings: $175K - $275K                             │
+                             │ ROI: 35x - 55x                                     │
+                             └─────────────────────────────────────────────────────┘
+
+  Full multi-level cache     ┌─────────────────────────────────────────────────────────────┐
+  Cost: $15,000/month        │ Savings: $250K - $350K                                      │
+                             │ ROI: 17x - 23x                                              │
+                             └─────────────────────────────────────────────────────────────┘
+`} />
+
+### Capacity and Throughput
+
+A single cost optimization engine instance handles 5,000 requests per second. For higher throughput, the engine is horizontally scaled behind a consistent hash ring that routes each request to the same engine instance (ensuring cache locality and consistent budget state).
+
+## Configuration and Tuning
+
+### Cost Tiers
+
+Cost tiers define the quality-cost tradeoff for different segments of your application:
+
+| Tier | Model Class | Max Tokens per Request | Target Latency | Price Premium |
+|---|---|---|---|---|
+| Free | Small open-weight | 1,000 | 2s | 0x |
+| Basic | GPT-3.5 class | 4,000 | 1.5s | 1x |
+| Pro | GPT-4o mini class | 16,000 | 1s | 4x |
+| Enterprise | GPT-4 / Claude 3 | 128,000 | 0.5s | 20x |
+
+### Budget Caps
+
+Budgets are configured per team with hard and soft caps:
+
+```json
+{
+  "team": "ai-platform",
+  "monthly_budget": 500000,
+  "soft_cap_percent": 80,
+  "hard_cap_percent": 100,
+  "overage_action": "downgrade_to_tier_2",
+  "alert_recipients": ["team-lead@company.com", "infra@company.com"],
+  "budget_windows": {
+    "daily": 20000,
+    "weekly": 125000,
+    "monthly": 500000
+  }
+}
+```
+
+### Rate Limits
+
+Rate limits prevent cost spikes from runaway retry loops, abusive users, or misconfigured clients. The system supports:
+
+- **Per-user rate limits**: Max requests per minute per user.
+- **Per-feature rate limits**: Max requests per minute per feature.
+- **Global rate limits**: Max requests per minute across all users.
+- **Cost-based rate limits**: Max spend per minute, rather than request count.
+
+Cost-based rate limits are particularly effective: they directly cap the burn rate. If a user's requests suddenly switch from short, cheap models to long, expensive ones, the cost rate limit kicks in immediately even if the request count is normal.
+
+### Model Pricing Tables
+
+The pricing registry stores current and historical prices for all models and providers:
+
+```json
+{
+  "gpt-4": {
+    "provider": "openai",
+    "input_price_per_million": 30.0,
+    "output_price_per_million": 60.0,
+    "effective_date": "2025-06-01",
+    "regions": {
+      "us-east": { "input": 30.0, "output": 60.0 },
+      "eu-west": { "input": 33.0, "output": 66.0 }
+    }
+  },
+  "gpt-3.5-turbo": {
+    "provider": "openai",
+    "input_price_per_million": 1.0,
+    "output_price_per_million": 2.0,
+    "effective_date": "2025-06-01",
+    "regions": {
+      "us-east": { "input": 1.0, "output": 2.0 },
+      "eu-west": { "input": 1.1, "output": 2.2 }
+    }
+  }
+}
+```
+
+### Discount Thresholds
+
+Volume discounts apply when monthly spend exceeds certain thresholds:
+
+| Provider | Threshold | Discount |
+|---|---|---|
+| OpenAI | $10K/month | 0% |
+| OpenAI | $100K/month | 10% |
+| OpenAI | $500K/month | 20% |
+| OpenAI | $1M/month | 30% |
+| Azure OpenAI | $50K/month (committed) | 15% |
+| AWS Bedrock | $25K/month (committed) | 10% |
+
+The system tracks cumulative monthly spend per provider and applies the appropriate discount tier when calculating cost metrics.
+
+### Reservation and Prepaid Pricing
+
+For predictable workloads, reserved capacity reduces per-token costs by 40-60%. The system supports:
+
+- **Committed use contracts**: Monthly minimum spend in exchange for lower per-token pricing.
+- **Provisioned throughput**: Reserved TPM (tokens per minute) capacity with guaranteed availability.
+- **Prepaid tokens**: Purchase token packs at a discount and draw from them first.
+
+The cost optimization system manages reserved capacity by routing traffic to preferred providers until the commitment is met, then distributing remaining traffic across all providers for cost optimization.
+
+<AsciiDiagram id="ai-cost-optimization/reserved-capacity" alt="Flow chart showing how reserved capacity is managed: traffic is routed to preferred provider until commitment is met, then distributed across all providers for best cost" caption="Figure 4: Reserved capacity management -- ensuring commitments are met before optimizing remaining traffic" content={`
+  ┌────────────────────────────────────────────────────────────┐
+  │  Reserved Capacity Manager                                  │
+  │                                                             │
+  │  Monthly commitment: $500K to Provider A at 40% discount    │
+  │  Current spend toward commitment: $320K                     │
+  │                                                             │
+  │  Is commitment met?                                         │
+  │     │                                                       │
+  │     ├── No ($320K < $500K):                                 │
+  │     │   Route new requests to Provider A                    │
+  │     │   (to meet commitment and benefit from discount)       │
+  │     │                                                       │
+  │     └── Yes ($500K+ reached):                               │
+  │         Route new requests to cheapest provider             │
+  │         (Provider B at standard pricing)                    │
+  │                                                             │
+  │  End of month:                                              │
+  │  Track: commitment met? Did we overspend on commitment?     │
+  │  Adjust next month's commitment based on actual usage       │
+  └────────────────────────────────────────────────────────────┘
+`} />
+
+## Observability and Debugging
+
+Troubleshooting cost optimization issues requires visibility into the entire pipeline. Each component emits structured logs that allow you to trace a request through the system.
+
+### Cost Trace Visualization
+
+Every request generates a cost trace with the following information:
+
+- **Cache decision**: Was the request served from cache? Which cache level (exact, semantic, prefix)? How much was saved compared to calling the API? If the cache was missed, why?
+- **Model selection**: Which model was selected? What was the alternative model? What was the decision reason (query complexity, user tier, budget status)?
+- **Compression statistics**: Original token count, compressed token count, compression ratio, compression technique used (truncation, instruction compression, semantic compression).
+- **Batch status**: Was the request batched? How long did it wait in the queue? What batch size was it packed into?
+- **Cost breakdown**: Input cost, output cost, total cost, savings versus the uncached, uncompressed default model, and savings attribution.
+
+### Debugging Common Issues
+
+**Issue: Costs are higher than expected by 20% or more.** Start by checking the cache hit rate. If the hit rate dropped significantly, check whether the cache was invalidated (deployment, configuration change) or whether user query patterns changed. Next, check the model routing logs. If more requests are being routed to expensive models, the classifier may need retraining. Finally, check for cost anomalies that indicate a retry loop or abusive user.
+
+**Issue: User complaints about quality increased.** Check the model routing logs for requests that were classified as simple but should have been complex. If the classifier is making errors, the routing needs adjustment. Check whether the budget enforcer has been downgrading requests aggressively (happens late in the budget cycle). Check whether prompt compression is removing important context from the prompts.
+
+**Issue: Budget was exhausted mid-month.** Look for cost anomalies. Check whether a retry loop was triggered. Check whether a new feature was deployed without proper cost estimation. Check whether usage patterns changed (new marketing campaign, product launch, viral growth).
+
+**Issue: Cache is not helping as expected.** Check the cache hit rate broken down by model and feature. A low hit rate may indicate that the cache size is too small for the request volume, the TTL is too short for the query repetition pattern, or the semantic cache similarity threshold is too strict. Adjust these parameters incrementally and measure the impact.
+
+## Cost Optimization Maturity Model
+
+Organizations progress through stages of cost optimization maturity. Knowing your current level helps you prioritize the next investment.
+
+### Stage 1: Awareness
+
+You know the total monthly spend on AI inference from the provider dashboard. You cannot break costs down by team or feature. You have not implemented any optimization techniques. You spend $500K per month and do not know which features contribute what.
+
+**Next step:** Implement cost tracking with per-feature and per-team attribution. This is the foundation for everything that follows.
+
+### Stage 2: Tracking
+
+You track costs per feature and per team. A cost dashboard updates daily. You know which features are the most expensive and which teams consume the most. You have a spreadsheet with optimization ideas but have not implemented any yet.
+
+**Next step:** Implement caching for your highest-volume features. The ROI is immediate and the risk is minimal.
+
+### Stage 3: Optimization
+
+You have implemented caching, model routing, or prompt compression for your highest-cost features. Costs have been reduced by 30-50%. You manually review cost data monthly and adjust optimization parameters. The team is seeing the impact and is motivated to optimize further.
+
+**Next step:** Automate budget enforcement and cost anomaly detection to prevent cost spikes.
+
+### Stage 4: Automation
+
+Budget enforcement is automated with soft caps (alert at 80%) and hard caps (downgrade at 100%). Cost anomaly detection alerts the on-call engineer within minutes of a spike. The routing system adjusts model selection based on current budget status. Costs have been reduced by 50-70%.
+
+**Next step:** Implement multi-model routing with dynamic model selection based on current pricing data and quality metrics.
+
+### Stage 5: Optimization as Culture
+
+Every engineer considers cost when designing new features. Cost estimation is part of the CI/CD pipeline. Chargeback models make each team accountable for their own AI costs. The optimization system continuously learns from usage patterns. Costs have been reduced by 70-85% and continue to decrease quarter over quarter.
+
+**Next step:** Explore self-hosting for the highest-volume use cases and negotiate reserved capacity with providers.
+
+## Advanced Concepts
+
+### Cost-Aware A/B Testing
+
+When you change a model or optimization strategy, you need to measure the impact on both cost and quality. Standard A/B testing measures user engagement and conversion. Cost-aware A/B testing adds cost per request as a primary metric.
+
+The testing setup: randomly assign a percentage of traffic to the control group (current strategy) and the treatment group (new strategy). Measure cost per request, quality score (from automated evaluation if available), latency, and user engagement. Run the test for enough time to reach statistical significance.
+
+A typical test comparing GPT-3.5 to GPT-4o mini for simple queries would run for 7 days with 10% of traffic in the treatment group. Results would show: cost reduction of 60%, quality score difference of 0.3% (within the acceptable range), and latency improvement of 200ms. Decision: roll out the cheaper model.
+
+### Multi-Objective Optimization
+
+In real systems, you optimize for multiple objectives simultaneously: cost, quality, latency, reliability, and freshness. These objectives often conflict. Multi-objective optimization finds the set of Pareto-optimal configurations where no objective can be improved without degrading another.
+
+The optimization engine generates a cost-quality-latency surface by measuring different configurations against production traffic. For each configuration, it records the cost per request, the quality score (from automated evaluation), and the p95 latency. The result is a three-dimensional surface showing the feasible region.
+
+For a given request, the system selects the configuration that meets the latency budget at the lowest cost while staying above the quality threshold. If multiple configurations meet the requirements, it selects the one with the lowest cost.
+
+<AsciiDiagram id="ai-cost-optimization/cost-quality-surface" alt="Three-dimensional surface chart showing the cost-quality-latency tradeoff space, with the Pareto frontier highlighted as the optimal region" caption="Figure 5: Multi-objective optimization surface -- the Pareto frontier of cost, quality, and latency" content={`
+  Cost-Quality-Latency Surface
+
+  Quality          ● = Measured configuration
+    ^
+  1.0│  ●──────●──────●──────●──────●
+     │  │      │      │      │      │
+  0.9│  ●──────●──────●──────●──────●
+     │  │      │      │      │      │
+  0.8│  ●──────●──────●──────●──────●
+     │  │      │      │      │      │
+  0.7│  ●──────●──────●──────●──────●
+     │  │      │      │      │      │
+  0.6│  ●──────●──────●──────●──────●
+     │
+     └────────────────────────────────────► Latency
+      0.1s  0.5s  1.0s  2.0s  5.0s
+
+  Each column is a different model or configuration.
+  The Pareto frontier is the set of points where no
+  improvement in one dimension is possible without
+  degrading another.
+
+  Optimal configurations for different scenarios:
+  - Real-time chat: (0.95 quality, 0.5s latency, $0.02)
+  - Batch processing: (0.85 quality, 5.0s latency, $0.003)
+  - Enterprise: (1.0 quality, 1.0s latency, $0.05)
+`} />
+
+### Dynamic Pricing and Off-Peak Processing
+
+Some providers offer lower prices during off-peak hours. AWS Bedrock offers lower prices between 10 PM and 6 AM in each region. The cost optimization system can shift non-urgent processing to off-peak hours to take advantage of these discounts.
+
+This is particularly effective for batch processing workloads. A nightly batch job that processes 500,000 documents can be scheduled during off-peak hours, saving 30-50% on inference costs. The system tracks off-peak pricing schedules for each provider and region, and schedules batch jobs accordingly.
+
+<AsciiDiagram id="ai-cost-optimization/off-peak-scheduling" alt="Timeline showing how batch jobs are scheduled during off-peak hours to take advantage of lower pricing, with an estimated 30-50% cost savings" caption="Figure 6: Off-peak scheduling -- shifting non-urgent processing to lower-cost time windows" content={`
+  Off-Peak Pricing Schedule
+
+  Provider: AWS Bedrock
+  On-peak: $30/M tokens (8 AM - 10 PM)
+  Off-peak: $22/M tokens (10 PM - 8 AM)
+
+  Daily batch volume: 50 million tokens
+  Current cost (peak only): 50M x $30 = $1,500/day
+
+  With off-peak scheduling:
+  60% shifted to off-peak: 30M x $22 + 20M x $30 = $660 + $600 = $1,260
+  Savings: $240/day = $7,200/month
+
+  Implementation: Use a cron-style batch scheduler with
+  region-specific off-peak window configurations.
+`} />

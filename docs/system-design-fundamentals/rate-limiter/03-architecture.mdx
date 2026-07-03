@@ -1,0 +1,711 @@
+---
+id: rate-limiter-architecture
+title: Rate Limiter Pattern at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+A naive rate limiter stores state in application memory and checks each request against a local counter. It works for a single-instance deployment handling 100 requests per second. It fails catastrophically at three scale points. Understanding these failure modes is essential because they reveal the architectural requirements of a distributed rate limiter.
+
+<AsciiDiagram
+  id="rate-limiter/arch-naive"
+  title="Naive Single-Process Rate Limiter Showing Three Breakage Points"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    NAIVE SINGLE-PROCESS RATE LIMITER                          │
+│                                                                              │
+│   ┌──────────────────────────────────────────────────────────────────┐      │
+│   │  Application Server (Single Process)                             │      │
+│   │                                                                   │      │
+│   │  ┌──────────────────────┐                                        │      │
+│   │  │  In-Memory Dict     │   private _counters: dict[str, int]     │      │
+│   │  │                      │                                        │      │
+│   │  │  user_8472: 45       │                                        │      │
+│   │  │  user_1234: 12       │                                        │      │
+│   │  │  ip_10.0.0.1: 7     │                                        │      │
+│   │  │  ip_10.0.0.2: 103   │  <-- BREAKAGE POINT 3: memory grows    │      │
+│   │  │  ... (50K entries)  │      unbounded with 50K+ clients       │      │
+│   │  └──────────┬───────────┘                                        │      │
+│   │             │                                                     │      │
+│   │             ▼                                                     │      │
+│   │  ┌──────────────────────┐                                        │      │
+│   │  │  Rate Limit Check    │   if client in dict:                   │      │
+│   │  │  & Increment         │       if dict[client] >= limit:        │      │
+│   │  │                      │           return False                 │      │
+│   │  │                      │       dict[client] += 1                │      │
+│   │  │                      │   else:                                │      │
+│   │  │                      │       dict[client] = 1                 │      │
+│   │  └──────────┬───────────┘                                        │      │
+│   │             │                                                     │      │
+│   │             ▼                                                     │      │
+│   │  ┌──────────────────────┐                                        │      │
+│   │  │  Backend Logic       │   Process the request                  │      │
+│   │  └──────────────────────┘                                        │      │
+│   └──────────────────────────────────────────────────────────────────┘      │
+│                                                                              │
+│   BREAKAGE POINT 1: 2+ instances → counters diverge, client gets 2x limit  │
+│   BREAKAGE POINT 2: Process restart → all counters lost, full quota reset  │
+│   BREAKAGE POINT 3: 10,000+ clients → memory exhaustion, OOM risk         │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Single-process rate limiter with in-memory dictionary, showing three breakage points"
+  caption="In-memory rate limiting fails at the first sign of horizontal scaling"
+/>
+
+### Breakage Point 1: Multiple Instances
+
+When you scale to two application servers behind a load balancer, each instance has its own in-memory counters. Client A sends 100 requests. Instance 1 sees 60 and allows all. Instance 2 sees 40 and allows all. The client effectively gets a doubled limit. Round-robin load balancing makes this worse -- the same client alternates between instances, and neither instance ever accumulates enough to trigger the limit.
+
+Without shared state, a client with a limit of 100 requests per minute can send 200 requests per minute across 2 instances, 500 across 5 instances, and 1,000 across 10 instances. The rate limit becomes meaningless at scale. The only fix is to move the state out of process memory into a shared data store that all instances can read and write to.
+
+**The fix**: Introduce a centralized data store (Redis) that all instances share. Each instance reads and writes to the same Redis keys. The rate limit check becomes a network call instead of a local memory lookup, but the state is consistent across all instances.
+
+### Breakage Point 2: Process Restart
+
+When the application restarts for a deploy or crash recovery, all in-memory counters vanish. Every client starts at zero. For the first window period after restart, all clients can send their full quota simultaneously, potentially overwhelming the backend. This is especially dangerous during a rolling deploy where instances restart one at a time -- each restart resets the counters for clients routed to that instance.
+
+**The fix**: Persist rate limit state to a durable store with TTL-based auto-cleanup. Redis with AOF (Append-Only File) persistence provides durability without the latency of a full database. The AOF fsync policy is set to `everysec`, which limits data loss to at most 1 second of state. Redis persistence ensures that a restart does not reset the rate limit counters.
+
+### Breakage Point 3: Memory Exhaustion
+
+With 50,000 active clients and the sliding window log algorithm storing every request timestamp, each client uses roughly 9,600 bytes (100 requests per window at 96 bytes each). Total: 480 MB for the counter dict alone, plus Python dict overhead (roughly 1.5x), bringing the total to 720 MB. This grows unbounded if cleanup is not enforced.
+
+**The fix**: Use TTL-based keys in Redis with automatic eviction. Set a maximum memory policy of `allkeys-lru` so stale rate limit entries are evicted before Redis runs out of memory. Use the sliding window counter algorithm instead of sliding window log to cap per-client memory at 96 bytes regardless of activity level.
+
+## Production-Grade Architecture
+
+A production-grade rate limiter is a distributed system component with its own data tier, caching layer, health monitoring, and configuration management. It runs as middleware in the API gateway or as a standalone sidecar service. The architecture is designed for horizontal scalability, fault tolerance, and low latency.
+
+<AsciiDiagram
+  id="rate-limiter/arch-production"
+  title="Production-Grade Distributed Rate Limiter Architecture"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                PRODUCTION-GRADE DISTRIBUTED RATE LIMITER                      │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────┐           │
+│   │  Client Layer                                                │           │
+│   │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                    │           │
+│   │  │Web  │ │Mobile│ │ IoT │ │3rd  │ │Batch│                    │           │
+│   │  │App  │ │ App │ │ Dev │ │Party│ │ Job │                    │           │
+│   │  └──┬──┘ └──┬──┘ └──┬──┘ └──┬──┘ └──┬──┘                    │           │
+│   └─────┼────────┼────────┼────────┼────────┼────────────────────┘           │
+│         │        │        │        │        │                                 │
+│         ▼        ▼        ▼        ▼        ▼                                 │
+│   ┌─────────────────────────────────────────────────────────────┐           │
+│   │  CDN / Edge (CloudFront / Cloudflare)                       │           │
+│   │  Caches 429 responses at edge to reduce origin load         │           │
+│   │  Caches common responses within rate limit (logged-in UIs)  │           │
+│   └──────────────────────────┬──────────────────────────────────┘           │
+│                              │                                                │
+│                              ▼                                                │
+│   ┌─────────────────────────────────────────────────────────────┐           │
+│   │  API Gateway Layer (Kong / Envoy / APIGEE)                 │           │
+│   │  ┌──────────────────────────────────────────────────────┐  │           │
+│   │  │  Rate Limiter Plugin / Filter per route              │  │           │
+│   │  │  ┌────────────────┐  ┌────────────────┐              │  │           │
+│   │  │  │ L1 Local Cache │  │ L2 Memcached   │              │  │           │
+│   │  │  │ (0.1ms, 60%)   │  │ (1ms, 25%)     │              │  │           │
+│   │  │  └────────────────┘  └────────────────┘              │  │           │
+│   │  │  Circuit breaker: Redis down → local fallback        │  │           │
+│   │  └──────────────────────────────────────────────────────┘  │           │
+│   └──────────────────────────┬──────────────────────────────────┘           │
+│                              │                                                │
+│                              ▼                                                │
+│   ┌─────────────────────────────────────────────────────────────┐           │
+│   │  Redis Cluster (State Store)                                │           │
+│   │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐      │           │
+│   │  │ Shard 1  │ │ Shard 2  │ │ Shard 3  │ │ Shard 4  │      │           │
+│   │  │ (master) │ │ (master) │ │ (master) │ │ (master) │      │           │
+│   │  │  ┌──┐    │ │  ┌──┐    │ │  ┌──┐    │ │  ┌──┐    │      │           │
+│   │  │  │R │    │ │  │R │    │ │  │R │    │ │  │R │    │      │           │
+│   │  │  └──┘    │ │  └──┘    │ │  └──┘    │ │  └──┘    │      │           │
+│   │  │  ┌──┐    │ │  ┌──┐    │ │  ┌──┐    │ │  ┌──┐    │      │           │
+│   │  │  │R │    │ │  │R │    │ │  │R │    │ │  │R │    │      │           │
+│   │  │  └──┘    │ │  └──┘    │ │  └──┘    │ │  └──┘    │      │           │
+│   │  └──────────┘ └──────────┘ └──────────┘ └──────────┘      │           │
+│   │  Consistent hashing: client key → shard                    │           │
+│   │  Lua scripts: atomic rate limit evaluation                 │           │
+│   └──────────────────────────┬──────────────────────────────────┘           │
+│                              │                                                │
+│                              ▼                                                │
+│   ┌─────────────────────────────────────────────────────────────┐           │
+│   │  Backend Services Layer                                     │           │
+│   │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐              │           │
+│   │  │Svc A │ │Svc B │ │Svc C │ │ DB   │ │Cache │              │           │
+│   │  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘              │           │
+│   └─────────────────────────────────────────────────────────────┘           │
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────┐           │
+│   │  Monitoring & Configuration                                 │           │
+│   │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐      │           │
+│   │  │Prometheus│ │ Grafana  │ │ Config   │ │ Alert   │      │           │
+│   │  │Metrics  │ │Dashboard │ │ Service  │ │ Manager  │      │           │
+│   │  └──────────┘ └──────────┘ └──────────┘ └──────────┘      │           │
+│   └─────────────────────────────────────────────────────────────┘           │
+└──────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Full distributed architecture showing client layer, CDN, API gateway with caching tiers, Redis cluster shards, and monitoring"
+  caption="Production rate limiters span five layers from CDN to monitoring infrastructure"
+/>
+
+### Component Responsibilities
+
+**API Gateway**: Runs the rate limiter as a plugin or filter. Envoy, Kong, and NGINX all support rate limiting natively. The gateway handles TLS termination, request routing, and rate limit enforcement in a single hot path. The gateway is configured declaratively, with rate limit policies defined per route, per consumer, and per tier.
+
+**Redis Cluster**: Stores all rate limit state across sharded nodes. Each shard has a master for writes and one or more replicas for read scaling. Consistent hashing ensures that all requests for the same client key hit the same shard, which is necessary for Lua script atomicity. The Redis cluster is configured with `cluster-require-full-coverage no` so that a shard failure does not take down the entire cluster.
+
+**Local Cache**: Each gateway instance maintains an in-process cache of recently checked rate limit states. This absorbs 60 percent of checks without any network round trip. The cache TTL is 1-2 seconds -- long enough to matter, short enough to avoid stale decisions. The cache uses an LRU eviction policy with a maximum of 100,000 entries.
+
+**Config Service**: A central service that stores rate limit rules per tier, per endpoint, and per client. Changes propagate to all gateways within 30 seconds via a pub/sub mechanism. No deploy needed to update a rate limit. The config service exposes a REST API and a gRPC streaming endpoint for real-time updates.
+
+**Monitoring Stack**: Prometheus scrapes rate limiter metrics from each gateway. Grafana dashboards show real-time rejection rates, top clients, and latency. Alerts fire when rejection rate exceeds 10 percent for any tier, when rate limiter latency exceeds 50ms at p99, or when the Redis cluster has any down shards.
+
+## Integration Patterns
+
+### Pattern 1: API Gateway Plugin
+
+The most common integration. The rate limiter runs as a plugin in the API gateway, inspecting every request before it reaches backend services. The gateway intercepts all traffic, so the rate limiter sees every request without any application code changes.
+
+<AsciiDiagram
+  id="rate-limiter/arch-gateway"
+  title="Pattern 1 -- API Gateway Plugin Integration"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                 PATTERN 1: API GATEWAY PLUGIN                                 │
+│                                                                              │
+│   Client                         API Gateway                        Backend │
+│                                                                              │
+│   ┌──────┐      POST /api/v1     ┌──────────────────────┐                   │
+│   │      │────────────────────────>│  Kong / Envoy      │      ┌──────────┐ │
+│   │Mobile│                        │                     │─────>│          │ │
+│   │      │                        │  ┌───────────────┐  │      │ Service │ │
+│   └──────┘                        │  │ Rate Limiter  │  │      │   A     │ │
+│                                   │  │ Plugin        │  │      │          │ │
+│   ┌──────┐                        │  │               │  │      └──────────┘ │
+│   │      │   POST /api/v1         │  │ 1. Extract    │  │                   │
+│   │Web   │────────────────────────>│  │ 2. Lookup     │  │      ┌──────────┐ │
+│   │App   │                        │  │ 3. Evaluate   │  │─────>│          │ │
+│   └──────┘                        │  │ 4. Forward    │  │      │ Service │ │
+│                                   │  │ 5. Headers    │  │      │   B     │ │
+│   ┌──────┐                        │  └───────────────┘  │      │          │ │
+│   │      │                        │                     │      └──────────┘ │
+│   │ 3rd  │                        │  Headers added:     │                   │
+│   │Party │                        │  X-RateLimit-*      │                   │
+│   └──────┘                        └──────────────────────┘                   │
+│                                                                              │
+│   Pros: Central control, no app changes needed, single configuration point  │
+│   Cons: Gateway bottleneck, all traffic routes through it, gateway CPU      │
+│         becomes the bottleneck at high scale                                │
+│                                                                              │
+│   Best for: Organizations with a single API gateway for all services       │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="API gateway with rate limiter plugin intercepting requests from mobile, web, and third-party clients before routing to services"
+  caption="Gateway-based rate limiting provides central control without modifying backend services"
+/>
+
+### Pattern 2: Sidecar Proxy
+
+Each service instance has its own rate limiter sidecar. The sidecar intercepts inbound and outbound traffic, applying rate limits specific to that service. This pattern is common in service mesh architectures (Istio, Linkerd) where each pod runs an Envoy proxy alongside the application container.
+
+<AsciiDiagram
+  id="rate-limiter/arch-sidecar"
+  title="Pattern 2 -- Sidecar Proxy Integration in Service Mesh"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    PATTERN 2: SIDECAR PROXY INTEGRATION                       │
+│                                                                              │
+│   Service A Pod                     Service B Pod                            │
+│   ┌──────────────────────┐         ┌──────────────────────┐                 │
+│   │ ┌──────────────────┐ │         │ ┌──────────────────┐ │                 │
+│   │ │ Service A        │ │         │ │ Service B        │ │                 │
+│   │ │ Container        │ │         │ │ Container        │ │                 │
+│   │ └────────┬─────────┘ │         │ └────────┬─────────┘ │                 │
+│   │          │           │         │          │           │                 │
+│   │ ┌────────▼─────────┐ │         │ ┌────────▼─────────┐ │                 │
+│   │ │ Envoy Sidecar    │ │         │ │ Envoy Sidecar    │ │                 │
+│   │ │ Rate Limiter     │─┼─────────┼─│ Rate Limiter     │ │                 │
+│   │ │ Config:           │ │         │ │ Config:           │ │                 │
+│   │ │ Outbound: 100/s   │ │         │ │ Outbound: 50/s    │ │                 │
+│   │ │ Inbound:  200/s   │ │         │ │ Inbound:  100/s   │ │                 │
+│   │ │ Redis: localhost  │ │         │ │ Redis: localhost  │ │                 │
+│   │ └──────────────────┘ │         │ └──────────────────┘ │                 │
+│   └──────────────────────┘         └──────────────────────┘                 │
+│                                                                              │
+│   Service C Pod                     Service D Pod                            │
+│   ┌──────────────────────┐         ┌──────────────────────┐                 │
+│   │ ┌──────────────────┐ │         │ ┌──────────────────┐ │                 │
+│   │ │ Service C        │ │         │ │ Service D        │ │                 │
+│   │ │ Container        │ │         │ │ Container        │ │                 │
+│   │ └────────┬─────────┘ │         │ └────────┬─────────┘ │                 │
+│   │          │           │         │          │           │                 │
+│   │ ┌────────▼─────────┐ │         │ ┌────────▼─────────┐ │                 │
+│   │ │ Envoy Sidecar    │ │         │ │ Envoy Sidecar    │ │                 │
+│   │ │ Rate Limiter     │ │         │ │ Rate Limiter     │ │                 │
+│   │ │ Outbound: 200/s  │─┼─────────┼─│ Outbound: 30/s   │ │                 │
+│   │ │ Inbound: 500/s   │ │         │ │ Inbound: 100/s   │ │                 │
+│   │ └──────────────────┘ │         │ └──────────────────┘ │                 │
+│   └──────────────────────┘         └──────────────────────┘                 │
+│                                                                              │
+│   Pros: Per-service limits, language-agnostic, no gateway bottleneck        │
+│   Cons: More infrastructure, each sidecar needs Redis connection            │
+│                                                                              │
+│   Best for: Service mesh deployments with many services                     │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Two pods each with a service container and Envoy sidecar, showing inbound and outbound rate limiting between services"
+  caption="Sidecar-based rate limiting enables per-service policies without gateway centralization"
+/>
+
+### Pattern 3: Client-Side Throttling
+
+The client itself implements rate limiting, preventing requests before they are sent. This reduces server load and improves client experience by avoiding 429 responses. Client-side throttling is cooperative -- it cannot enforce anything, but it reduces the likelihood of hitting server-side limits.
+
+```python
+class ClientSideRateLimiter:
+    def __init__(self, limit=100, window=60):
+        self.limit = limit
+        self.window = window
+        self.timestamps = []
+
+    def can_send(self):
+        now = time.time()
+        window_start = now - self.window
+        self.timestamps = [t for t in self.timestamps if t > window_start]
+        return len(self.timestamps) < self.limit
+
+    def send_request(self, request_func, *args, **kwargs):
+        while not self.can_send():
+            sleep_time = self.timestamps[0] + self.window - time.time()
+            if sleep_time > 0:
+                time.sleep(min(sleep_time, 1))
+        self.timestamps.append(time.time())
+        return request_func(*args, **kwargs)
+```
+
+**Pros**: Zero server cost for rate limit enforcement. Immediate feedback for the client. No network latency for rate limit checks.
+**Cons**: Cannot enforce -- a misconfigured or malicious client bypasses it. Used for cooperative clients only. Requires client library updates when rate limits change.
+
+### Pattern 4: Hybrid Local plus Global
+
+Combines a local in-process rate limiter with periodic synchronization to a global store. The local limiter makes fast decisions for most requests. The global store periodically reconciles and redistributes capacity. This pattern provides the best of both worlds: low latency from local decisions and global consistency from periodic sync.
+
+<AsciiDiagram
+  id="rate-limiter/arch-hybrid"
+  title="Pattern 4 -- Hybrid Local-Global Rate Limiting Architecture"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│              HYBRID LOCAL + GLOBAL RATE LIMITING                              │
+│                                                                              │
+│   Instance 1                  Instance 2                  Instance 3         │
+│   ┌──────────────────┐       ┌──────────────────┐       ┌──────────────────┐│
+│   │ Local Bucket    │       │ Local Bucket    │       │ Local Bucket    ││
+│   │ Capacity: 10    │       │ Capacity: 10    │       │ Capacity: 10    ││
+│   │ Rate: 5/sec     │       │ Rate: 5/sec     │       │ Rate: 5/sec     ││
+│   │ Count: 3        │       │ Count: 7        │       │ Count: 5        ││
+│   │ 0ms latency     │       │ 0ms latency     │       │ 0ms latency     ││
+│   └────────┬────────┘       └────────┬────────┘       └────────┬────────┘│
+│            │                          │                          │          │
+│            └──────────────────────────┼──────────────────────────┘          │
+│                                       │                                      │
+│                              ┌────────▼────────┐                            │
+│                              │                 │                            │
+│                              │   Global Redis  │                            │
+│                              │   Sync every 5s │                            │
+│                              │   Aggregate     │                            │
+│                              │   counts +      │                            │
+│                              │   redistribute  │                            │
+│                              │                 │                            │
+│                              │   Total used:   │                            │
+│                              │   15 of 50/sec  │                            │
+│                              │   Each gets 16  │                            │
+│                              │   for next sync │                            │
+│                              │   +3ms latency  │                            │
+│                              └─────────────────┘                            │
+│                                                                              │
+│   Sync protocol:                                                             │
+│   1. Every 5s, each instance sends its local count to Redis                 │
+│   2. Redis aggregates: total = sum(local_counts)                           │
+│   3. Redis computes: fair_share = (limit - total) / instance_count         │
+│   4. Each instance receives: new_local_limit = local_limit + fair_share     │
+│   5. Instances adjust local token bucket capacity                           │
+│                                                                              │
+│   Overage risk: During the 5s sync window, each instance can send          │
+│   up to 50 requests (5s * 10 local capacity) beyond the fair share.        │
+│   With 3 instances, max overage = 150 requests per 5s window.             │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Three instances each with local token buckets that periodically sync with a global Redis store"
+  caption="Hybrid limiting trades perfect accuracy for zero-latency local decisions with periodic global reconciliation"
+/>
+
+## Multi-Region Architecture
+
+When your system spans multiple geographic regions, the rate limiter must account for the fact that a client may migrate between regions or route to the closest region. Without coordination, a client could exceed limits by sending requests to different regions. A client in New York might be routed to US-East, while a client in London routes to EU-West -- but the same client could use both regions during a single session.
+
+<AsciiDiagram
+  id="rate-limiter/arch-multi-region"
+  title="Multi-Region Rate Limiter Architecture with Global Coordinator"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    MULTI-REGION RATE LIMITING                                 │
+│                                                                              │
+│   US-East-1                   EU-West-1                  AP-Southeast-1     │
+│                                                                              │
+│   ┌──────────────────────┐   ┌──────────────────────┐   ┌──────────────────┐│
+│   │ Gateway Cluster (5) │   │ Gateway Cluster (3)  │   │ Gateway Cluster  ││
+│   │  ┌────────────────┐  │   │  ┌────────────────┐  │   │  (2)             ││
+│   │  │Local Cache     │  │   │  │Local Cache     │  │   │  ┌────────────┐  ││
+│   │  │60% hit rate    │  │   │  │60% hit rate    │  │   │  │Local Cache │  ││
+│   │  └────────────────┘  │   │  └────────────────┘  │   │  │60% hit     │  ││
+│   └──────────┬───────────┘   └──────────┬───────────┘   │  └────────────┘  ││
+│              │                          │               └────────┬─────────┘│
+│              ▼                          ▼                        ▼          │
+│   ┌──────────────────────┐   ┌──────────────────────┐   ┌──────────────────┐│
+│   │ Redis US-East        │   │ Redis EU-West        │   │ Redis AP-SE      ││
+│   │ 3 shards + replica   │   │ 2 shards + replica   │   │ 1 shard + replica ││
+│   │ Local state only     │   │ Local state only     │   │ Local state only  ││
+│   └──────────┬───────────┘   └──────────┬───────────┘   └────────┬─────────┘│
+│              │                          │                          │          │
+│              └──────────────────────────┼──────────────────────────┘          │
+│                                         │                                      │
+│                                ┌────────▼────────┐                            │
+│                                │                 │                            │
+│                                │  Global          │                            │
+│                                │  Coordinator     │                            │
+│                                │  (Leader in      │                            │
+│                                │   US-East)       │                            │
+│                                │                  │                            │
+│                                │  Async sync      │                            │
+│                                │  every 10 sec    │                            │
+│                                │  Propagates      │                            │
+│                                │  top-offenders   │                            │
+│                                │  to all regions  │                            │
+│                                │                  │                            │
+│                                │  Global blocked  │                            │
+│                                │  clients list:   │                            │
+│                                │  user_8472 (DDoS)│                            │
+│                                │  10.0.0.0/24 (FW)│                            │
+│                                └─────────────────┘                            │
+│                                                                              │
+│   Strategy: Local-first decisions (under 5ms) with async global             │
+│   coordination for enforcement. Overage bound: 10 seconds * limit.         │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Three AWS regions each with gateways and Redis, connected to a global coordinator for cross-region rate limiting"
+  caption="Multi-region rate limiting uses local-first decisions with async global coordination"
+/>
+
+**Replication Strategy**: Each region maintains its own Redis cluster for low-latency rate limit checks. A global coordinator asynchronously synchronizes top-offending clients across regions. Under normal operation, each region trusts its local state. When a client exceeds limits in multiple regions, the global coordinator issues a global block within 10 seconds.
+
+The global coordinator is a leader-elected service (using ZooKeeper or etcd for consensus) that runs in the primary region. It collects top-offending client lists from each region every 10 seconds. If a client appears in the top-offending list of two or more regions, the coordinator adds the client to the global block list. The global block list is replicated to all regions and checked alongside the local rate limit.
+
+## Capacity Planning
+
+Capacity planning for a rate limiter involves calculating the Redis cluster size, the number of gateway instances, and the network bandwidth needed.
+
+**Formula**: Total rate limit capacity = Redis shards * throughput per shard * (1 - headroom fraction)
+
+Given:
+- Each Redis shard handles 25,000 Lua evaluations per second
+- Target headroom: 30 percent
+- Required throughput: 150,000 requests per second
+
+Calculation:
+- Required shards = 150,000 / (25,000 * 0.7) = 8.57, round up to 9 shards
+- Memory per shard: 9,000 active clients * 96 bytes each = 864 KB of rate limit data
+- Total Redis cluster memory: 9 * 864 KB = roughly 8 MB (plus Redis overhead for keys, hash tables, connection buffers)
+- Realistic Redis memory allocation: 1 GB per shard (leaving room for other data, buffer, and overhead)
+- Network bandwidth per shard: 25,000 * 250 bytes = 6.25 MB/s
+- Total cluster bandwidth: 9 * 6.25 = 56.25 MB/s
+
+**Connections**: Each gateway instance maintains a pool of 20 Redis connections. With 50 gateway instances, total connections = 1,000. Redis handles 10,000+ idle connections easily, so this is well within limits. Each connection uses roughly 16 KB of memory, so 1,000 connections use 16 MB total.
+
+**Scaling rules**:
+- Add 1 Redis shard per 25,000 requests per second of peak traffic
+- Add 1 gateway instance per 5,000 requests per second (assuming other gateway responsibilities)
+- Add 1 Redis replica per shard for read scaling and failover
+
+## Deployment and Operations
+
+**Deployment as Gateway Plugin**: Configure rate limit rules in the gateway's configuration file. No application deploy needed. Rules hot-reload within 30 seconds. The gateway configuration is stored in a version-controlled repository and deployed through CI/CD.
+
+```yaml
+# Kong rate limiting plugin configuration
+plugins:
+  - name: rate-limiting
+    config:
+      second: null
+      minute: 100
+      hour: 5000
+      policy: redis
+      redis_host: redis-cluster.internal
+      redis_port: 6379
+      redis_database: 0
+      redis_timeout: 2000
+      fault_tolerant: true
+      hide_client_headers: false
+      limit_by: consumer
+```
+
+**Health Checks**: The rate limiter exposes a `/health` endpoint that checks Redis connectivity (ping within 500ms), local cache size (under 100,000 entries), Lua script availability (scripts loaded in Redis and returning correct results), and sync lag (under 5 seconds for multi-region deployments). If any check fails, the instance is removed from the load balancer's rotation.
+
+**Deploying Limit Changes**: Never change a rate limit by more than 50 percent in a single deploy. Gradual changes prevent unexpected client impact. Use feature flags to test new limits on 1 percent of traffic before full rollout. Monitor the rejection rate for 5 minutes after each change. If the rejection rate spikes by more than 20 percent, roll back automatically.
+
+**Disaster Recovery**: If the entire Redis cluster fails, fall back to a local in-memory limiter with conservative defaults (50 percent of normal limits). Log every decision for audit. When Redis recovers, wait for local caches to warm before switching back. The Redis AOF file provides point-in-time recovery with at most 1 second of data loss.
+
+## Advanced Deployment Patterns
+
+### Pattern A: Canary Rate Limit Rollouts
+
+Deploying a new rate limit policy to all clients simultaneously is risky. A misconfigured limit can reject legitimate traffic from every client at once. Canary rollouts apply the new limit to a small percentage of traffic first, monitoring for issues before expanding.
+
+```python
+class CanaryRateLimitDeployer:
+    def __init__(self, config_service, canary_percent=5):
+        self.config = config_service
+        self.canary = canary_percent  # 5% of clients
+        self.monitoring = RateLimitMonitor()
+
+    def deploy_new_limit(self, tier, new_limit, canary_duration_minutes=30):
+        # Phase 1: Apply to canary clients (5%)
+        self.config.set_canary_limit(tier, new_limit, self.canary)
+        # Wait for monitoring data
+        time.sleep(canary_duration_minutes * 60)
+        # Check for issues
+        rejection_rate = self.monitoring.get_rejection_rate(tier)
+        if rejection_rate > 0.10:  # 10% rejection rate threshold
+            self.config.rollback(tier)
+            return False
+        # Phase 2: Gradual rollout in 25% increments
+        for percent in [25, 50, 75, 100]:
+            self.config.set_limit_coverage(tier, percent)
+            time.sleep(5 * 60)  # 5 minutes between increments
+            rejection_rate = self.monitoring.get_rejection_rate(tier)
+            if rejection_rate > 0.10:
+                self.config.rollback(tier)
+                return False
+        return True
+```
+
+### Pattern B: Rate Limit as a Sidecar Container
+
+For Kubernetes deployments, the rate limiter can run as a sidecar container in the same pod as the application. The sidecar intercepts all incoming and outgoing traffic through a local proxy (Envoy or HAProxy). This pattern provides per-pod rate limiting without modifying the application code.
+
+```yaml
+# Kubernetes pod with rate limiter sidecar
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api-server
+spec:
+  containers:
+    - name: api-server
+      image: my-api:latest
+      ports:
+        - containerPort: 8080
+    - name: rate-limiter
+      image: envoyproxy/envoy:v1.28
+      ports:
+        - containerPort: 10000  # ingress port
+      volumeMounts:
+        - name: config
+          mountPath: /etc/envoy
+  volumes:
+    - name: config
+      configMap:
+        name: rate-limiter-config
+```
+
+The sidecar approach has the advantage of independent scaling. When the application scales up, the rate limiter scales with it. No additional infrastructure is needed for rate limiter capacity. The Redis cluster is shared across all pods and provides global state coordination.
+
+### Pattern C: Serverless Rate Limiting
+
+For serverless architectures (AWS Lambda, Google Cloud Functions), rate limiting must be implemented differently because there is no persistent server. Each function invocation runs in a fresh container. A DynamoDB or Firestore table serves as the shared rate limit state store.
+
+```python
+import boto3
+import time
+from decimal import Decimal
+
+class DynamoDBRateLimiter:
+    def __init__(self, table_name, limit=100, window=60):
+        self.dynamodb = boto3.resource('dynamodb')
+        self.table = self.dynamodb.Table(table_name)
+        self.limit = limit
+        self.window = window
+
+    def allow(self, client_id):
+        now = int(time.time())
+        window_key = now // self.window
+        pk = f"rl:{client_id}:{window_key}"
+
+        try:
+            response = self.table.update_item(
+                Key={'pk': pk},
+                UpdateExpression='ADD counter :incr',
+                ExpressionAttributeValues={':incr': 1, ':limit': self.limit},
+                ConditionExpression='attribute_not_exists(counter) OR counter < :limit',
+                ReturnValues='UPDATED_NEW'
+            )
+            counter = int(response['Attributes']['counter'])
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                return False
+            raise
+```
+
+DynamoDB's conditional update provides atomic increment-and-check, similar to Redis Lua scripts. The trade-off is higher latency (10-30ms for DynamoDB vs 3-5ms for Redis) and cost (DynamoDB charges per write request unit).
+
+## Traffic Pattern Analysis for Capacity Planning
+
+Capacity planning depends on understanding your traffic patterns. Different patterns require different rate limiter configurations.
+
+**Pattern 1: Steady State Traffic (e.g., IoT sensor data)**
+- Requests arrive at a constant rate with minimal variation
+- Coefficient of variation (CV) under 0.5
+- Optimal algorithm: Fixed window or sliding window counter
+- Burst capacity: 1.5x the sustained rate is sufficient
+- Redis memory: Low, because the request pattern is predictable
+
+**Pattern 2: Bursty Traffic (e.g., social media API)**
+- Requests arrive in spikes separated by idle periods
+- CV between 2.0 and 10.0
+- Optimal algorithm: Token bucket with high capacity
+- Burst capacity: 10x to 50x the sustained rate
+- Redis memory: Moderate, because bursts create high token consumption
+
+**Pattern 3: Periodic Traffic (e.g., batch processing)**
+- Requests arrive at predictable intervals (every hour, every day)
+- CV under 0.3 within the active period, high between periods
+- Optimal algorithm: Token bucket or sliding window counter
+- Capacity planning: Match the peak period, not the average
+- Redis memory: Low during idle periods, high during active periods
+
+**Pattern 4: Thundering Herd (e.g., ticket sales, product launches)**
+- All clients send requests simultaneously at a predictable time
+- CV spikes to 100+ at the launch moment
+- Optimal algorithm: Token bucket with pre-filled capacity plus queuing
+- Capacity planning: Pre-warm Redis with capacity before the event
+- Redis memory: Pre-allocate capacity for the expected surge
+
+### Calculating Redis Shard Count Based on Traffic Pattern
+
+The formula for Redis shard count should account for the traffic pattern's peak-to-average ratio (PA):
+
+shards = (peak_requests_per_second * latency_factor) / (25000 * (1 - headroom))
+
+where:
+- peak_requests_per_second = average_throughput * peak_to_average_ratio
+- latency_factor = 1.5 for strict latency requirements (under 5ms p99)
+- latency_factor = 1.0 for standard latency requirements (under 15ms p99)
+- headroom = 0.3 for production systems
+
+Example: 50,000 req/s average, 5:1 peak-to-average ratio, strict latency
+- peak = 50,000 * 5 = 250,000 req/s
+- shards = (250,000 * 1.5) / (25,000 * 0.7) = 375,000 / 17,500 = 21.4, round up to 22 shards
+
+## Rate Limiter Topology Patterns
+
+### Centralized Topology
+
+All rate limit decisions go through a single rate limiter service. Simple to manage, but the rate limiter is a single point of failure and a bottleneck. Suitable for systems with under 10,000 req/s.
+
+### Distributed Topology
+
+Rate limiters run on each gateway instance. They share state through a Redis cluster. No single point of failure, but cache coherency is more complex. Suitable for systems with 10,000 to 1,000,000 req/s.
+
+### Edge Topology
+
+Rate limiting happens at the CDN edge (Cloudflare, AWS WAF). Traffic is rejected before reaching the origin. Zero origin latency, but limited to client IP-based identification. Suitable for DDoS protection and simple rate limits.
+
+### Hybrid Topology
+
+Edge rate limiting for IP-based protection, gateway rate limiting for API key-based protection, and application-level rate limiting for fine-grained business logic protection. Provides defense in depth. Suitable for large-scale multi-tenant platforms.
+
+## Rate Limiter Metrics and Observability
+
+A production rate limiter requires comprehensive observability. The following metrics and dashboards provide the visibility needed to operate the rate limiter reliably.
+
+### Critical Metrics
+
+**Request Volume Metrics**:
+- `rate_limiter.requests.total`: Total requests processed, tagged by service, tier, and decision
+- `rate_limiter.requests.allowed`: Requests that passed the rate limit
+- `rate_limiter.requests.rejected`: Requests that exceeded the limit, tagged by reason (burst, quota, concurrency)
+- `rate_limiter.requests.rejected_percent`: Rejection rate as a percentage of total requests
+
+**Latency Metrics**:
+- `rate_limiter.latency.p50`: Median rate limit check latency
+- `rate_limiter.latency.p99`: 99th percentile latency
+- `rate_limiter.latency.max`: Maximum observed latency in the window
+- `rate_limiter.cache.hit_ratio`: Ratio of L1 cache hits to total lookups
+
+**State Metrics**:
+- `rate_limiter.state.active_clients`: Number of unique clients with state in Redis
+- `rate_limiter.state.memory_bytes`: Total memory used by rate limit state
+- `rate_limiter.state.key_count`: Total number of rate limit keys in Redis
+- `redis.cpu.percent`: Redis CPU utilization
+
+### Alerting Thresholds
+
+| Alert | Condition | Severity | Response |
+|-------|-----------|----------|----------|
+| High rejection rate | Rejection > 10% for 5 minutes | P2 | Investigate client behavior |
+| Rate limiter latency | p99 > 50ms for 5 minutes | P2 | Check Redis load, add shards |
+| Redis unreachable | Redis ping fails for 10 seconds | P1 | Activate circuit breaker |
+| Cache hit ratio low | L1 hit ratio < 40% for 30 minutes | P3 | Increase cache TTL or size |
+| Memory high | Redis memory > 80% of maxmemory | P2 | Increase maxmemory or add shards |
+| Overage spike | Overshoot > 20% for 1 minute | P2 | Check for clock drift or race conditions |
+
+### Grafana Dashboard Layout
+
+The rate limiter dashboard should have three rows:
+
+Row 1: Overview -- rejection rate gauge, allowed/rejected requests per second graph, p50/p99 latency graph
+Row 2: Per-Tier Breakdown -- rejection rate per tier (free, pro, enterprise), top 10 rejected clients, top 10 most expensive clients
+Row 3: Infrastructure -- Redis CPU per shard, Redis memory usage, cache hit ratio, connection pool utilization
+
+### Rate Limiter Runbook
+
+A runbook for the rate limiter should document the following procedures:
+
+**Procedure 1: Spike in Rejection Rate**
+1. Check Grafana dashboard for rejection rate per tier
+2. Identify the top 5 rejected clients by request count
+3. Check if the rejected clients are legitimate users or misconfigured partners
+4. If legitimate users: check if the rate limit is too low for the current traffic pattern
+5. If misconfigured partners: contact the partner and share the rejection logs
+6. Escalate: if rejection rate exceeds 50 percent, consider temporary limit increase
+
+**Procedure 2: Redis Cluster Unreachable**
+1. Confirm the circuit breaker has activated (check rate limiter logs)
+2. Verify that local fallback is active (check L1 cache hit ratio)
+3. Check Redis cluster health (Redis cluster nodes, connectivity, resource usage)
+4. If Redis is overloaded: add shards or increase maxmemory
+5. If Redis is down: restart the Redis cluster and verify AOF recovery
+6. After Redis recovery: wait for L1 cache to warm before full traffic resumes
+
+**Procedure 3: Rate Limit Configuration Error**
+1. Identify the misconfigured rule (check the last configuration change)
+2. Roll back the configuration change immediately
+3. Verify the rollback is effective (check rejection rate dropping)
+4. Investigate the root cause: was it a typo, a wrong tier mapping, or a logic error?
+5. Test the corrected configuration in shadow mode before re-deploying
+6. Document the incident and add validation rules to prevent recurrence
+
+## Key Takeaways
+
+Architecting a rate limiter at scale requires moving from in-process memory to a distributed state layer with Redis clustering, multi-tier caching, and global coordination. The naive implementation breaks at three predictable points: multi-instance divergence, process restart state loss, and memory exhaustion.
+
+Four integration patterns cover different deployment scenarios: API gateway plugin for central control, sidecar proxy for per-service policies, client-side throttling for cooperative clients, and hybrid local-global for latency-critical paths. Each pattern makes different trade-offs between latency, consistency, and operational complexity. The API gateway pattern offers the simplest operational model. The sidecar pattern offers the best isolation. The client-side pattern offers the lowest server cost. The hybrid pattern offers the best latency.
+
+Advanced deployment patterns -- canary rollouts, sidecar containers, and serverless rate limiting -- address specific operational scenarios. Canary rollouts reduce the risk of misconfigured limits affecting all clients. Sidecar containers provide per-pod isolation. Serverless rate limiting extends the pattern to Lambda and Cloud Functions architectures. Each pattern requires different infrastructure components and has different operational runbooks.
+
+Multi-region deployments require local-first decisions with asynchronous global coordination. The global coordinator collects top-offending clients and propagates global blocks within 10 seconds. Capacity planning follows a sharding formula that accounts for the traffic pattern's peak-to-average ratio: shards = (peak_throughput * latency_factor) / (25000 * (1 - headroom)). The four network topologies -- centralized, distributed, edge, and hybrid -- offer different levels of scalability and complexity. Choose centralized for simplicity under 10K req/s, distributed for scale up to 1M req/s, edge for DDoS protection, and hybrid for the most comprehensive protection.

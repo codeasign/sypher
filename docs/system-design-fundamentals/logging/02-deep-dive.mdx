@@ -1,0 +1,693 @@
+---
+id: logging-deep-dive
+title: Logging — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+Structured logging looks simple from the outside: write a JSON line, ship it somewhere, query it later. But beneath that surface lies a sophisticated pipeline of serialization, buffering, batching, backpressure, indexing, and storage tiering. This section opens the hood and shows you how each piece works — the data structures, the algorithms, the concurrency model, and the performance trade-offs that determine whether your logging system can handle 10,000 events per second or 10 million.
+
+## Internal Architecture
+
+A production logging system has four logical layers: generation, collection, indexing, and storage. Each layer operates at a different latency and throughput envelope.
+
+<AsciiDiagram
+  id="logging/internal-arch"
+  title="Four-layer internal architecture of a production logging system"
+  alt="Diagram showing the four layers: Generation (in-process logging library), Collection (shipper daemon with buffer), Indexing (Elasticsearch with inverted index), Storage (hot SSD tier and cold S3 tier)"
+ content={`
+┌──────────────────────────────────────────────────────────────┐
+│                 Production Logging Stack                      │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌─────────────────────┐                                    │
+│  │ L1: Generation      │  In-process logging library         │
+│  │  • Serializer       │  Formats event → bytes              │
+│  │  • Async appender   │  Writes to lock-free ring buffer    │
+│  │  • Backpressure     │  Drops or blocks when buffer full   │
+│  └─────────┬───────────┘                                    │
+│            │ writes to stdout or file                        │
+│  ┌─────────▼───────────┐                                    │
+│  │ L2: Collection      │  Shipper daemon (Fluentd/Vector)    │
+│  │  • File tailer      │  Reads from file or socket          │
+│  │  • In-memory buffer │  Holds 100MB before flushing        │
+│  │  • Disk queue       │  Persists when aggregator is down   │
+│  └─────────┬───────────┘                                    │
+│            │ batch send over HTTP or gRPC                    │
+│  ┌─────────▼───────────┐                                    │
+│  │ L3: Indexing        │  Elasticsearch / Loki / Datadog     │
+│  │  • Parse            │  Extract fields from JSON           │
+│  │  • Build inverted   │  Map term→document_id list          │
+│  │  • Write segment    │  Flush to disk                      │
+│  └─────────┬───────────┘                                    │
+│            │ write to storage                                │
+│  ┌─────────▼───────────┐                                    │
+│  │ L4: Storage         │  Hot (SSD) / Warm (HDD) / Cold (S3)│
+│  │  • Hot: 30 days     │  SSD RAID 10, 10K IOPS             │
+│  │  • Warm: 90 days    │  HDD, 1K IOPS, compressed         │
+│  │  • Cold: 1+ years   │  S3 Glacier, 5s first-byte         │
+│  └─────────────────────┘                                    │
+└──────────────────────────────────────────────────────────────┘
+`} />
+
+### Generation Layer (L1)
+
+The generation layer lives inside the application process. Every logging library — whether Python's `logging`, Go's `zap`, Java's `Logback`, or Rust's `tracing` — implements the same core components:
+
+**Logger instance**: a named object that your code calls (e.g., `logger.info("user logged in")`). The logger holds configuration (log level, appender reference) and creates log events.
+
+**Appender**: the output destination for log events. In cloud-native environments, the appender writes to stdout (which the container runtime captures). In traditional deployments, it writes to a file with rotation.
+
+**Layout/Encoder**: the component that serializes the log event into bytes. For structured logging, this is a JSON encoder. For plain text, it is a pattern formatter.
+
+**Ring buffer**: a fixed-size, lock-free circular buffer that the application thread writes into and a background flusher thread reads from. This decouples the hot path (application code) from the I/O path (disk write or network send).
+
+<AsciiDiagram
+  id="logging/ring-buffer"
+  title="Lock-free ring buffer decouples application thread from I/O thread"
+  alt="Diagram of a ring buffer with producer thread writing at index 7 and consumer thread reading from index 3, with slots labeled 0-15"
+ content={`
+                    ┌─────────────────────┐
+                    │   Ring Buffer        │
+                    │   Size: 16384 slots  │
+                    │                      │
+                    │   ┌──┬──┬──┬──┬──┐  │
+                    │   │0 │1 │2 │3 │4 │  │
+                    │   ├──┼──┼──┼──┼──┤  │
+                    │   │5 │6 │7 │8 │9 │  │
+                    │   ├──┼──┼──┼──┼──┤  │
+                    │   │10│11│12│13│14│  │
+                    │   ├──┼──┼──┼──┼──┤  │
+                    │   │15│  │  │  │  │  │
+                    │   └──┴──┴──┴──┴──┘  │
+                    │                      │
+                    │   ┌────────────────┐ │
+                    │   │ Write cursor: 7│ │  <── Producer (app thread)
+                    │   │ Read cursor:  3│ │  <── Consumer (flusher thread)
+                    │   └────────────────┘ │
+                    │                      │
+                    │   Full → block/drop  │
+                    │   Empty → sleep 1ms  │
+                    └─────────────────────┘
+`} />
+
+When the ring buffer is full, the library must make a choice: block the application thread until space is available (preserving every event at the cost of latency), or drop the new event (preserving latency at the cost of completeness). Most production libraries default to dropping — a lost debug log is acceptable; a 50ms latency spike is not.
+
+### Collection Layer (L2)
+
+The collection layer runs as a separate process on each node. In Kubernetes, this is typically a DaemonSet. On bare metal, it is a systemd service.
+
+The shipper reads log data from each application process, applies lightweight transformations (add Kubernetes pod labels, parse multi-line stack traces, filter out noisy events), and batches events for transmission to the aggregator.
+
+**File tailer**: maintains a cursor into the log file. When the file is rotated, the tailer detects the new inode and follows it. On Linux, it uses `inotify` for file change notifications rather than polling.
+
+**In-memory buffer**: holds events in a configurable-sized buffer (typically 100 MB). Events are batched into chunks of 100-1000 events or 1 MB total, whichever is reached first.
+
+**Disk queue**: if the aggregator is unreachable, the shipper writes events to a disk-based queue. This queue must have bounded size to prevent filling the disk. The queue is replayed once connectivity is restored.
+
+```json
+# Filebeat configuration (shipper config)
+filebeat.inputs:
+  - type: container
+    paths:
+      - /var/log/containers/*.log
+    json.keys_under_root: true
+    json.add_error_key: true
+    processors:
+      - add_kubernetes_metadata:
+          host: ${NODE_NAME}
+      - drop_fields:
+          fields: ["ecs", "host"]
+
+output.elasticsearch:
+  hosts: ["${ELASTICSEARCH_HOST}:9200"]
+  worker: 4
+  bulk_max_size: 500
+  flush_interval: 1s
+```
+
+### Indexing Layer (L3)
+
+The indexing layer is where log data becomes searchable. Elasticsearch is the dominant technology, but Loki (Grafana) and managed services (Datadog, Splunk) follow similar principles.
+
+**Inverted index**: the core data structure. For each unique term in a field, the index maintains a sorted list of document IDs that contain that term. A query like `level:error AND service:auth-service` intersects the postings lists for `level=error` and `service=auth-service` to find documents matching both.
+
+```python
+# Pseudo-code for inverted index query
+def search(query_terms):
+    # query_terms = [("level", "error"), ("service", "auth-service")]
+    postings_lists = []
+    for field, value in query_terms:
+        postings_list = inverted_index[field][value]
+        # postings_list is a sorted array of document IDs
+        postings_lists.append(postings_list)
+
+    # Intersect postings lists (merge join on sorted arrays)
+    result = intersect_sorted_arrays(postings_lists)
+    return fetch_documents(result)
+```
+
+**Segment**: the on-disk unit of the inverted index. Elasticsearch writes data into immutable segments. Every 1-30 seconds (configurable refresh interval), buffered documents are written to a new segment. Segments are periodically merged into larger segments to reduce the number of files and reclaim space from deleted documents.
+
+**Write-ahead log (translog)**: every write to Elasticsearch is first written to the translog (a durable append-only log on disk). If the node crashes before the segment is flushed, the translog is replayed on restart. This ensures that acknowledged writes survive crashes.
+
+<AsciiDiagram
+  id="logging/indexing-flow"
+  title="Elasticsearch indexing flow: document to searchable segment"
+  alt="Diagram showing a document arriving, being written to the translog and in-memory buffer, then flushed to a segment on disk, and eventually merged into larger segments"
+ content={`
+                   Incoming JSON log event
+                           │
+                           ▼
+                  ┌─────────────────┐
+                  │  Analysis chain  │
+                  │  Tokenizer       │
+                  │  Lowercasing     │
+                  │  Stop-word       │
+                  │  removal         │
+                  └────────┬────────┘
+                           │
+                           ▼
+          ┌─────────────────────────────────┐
+          │         Memory buffer           │
+          │  ┌──────┬──────┬──────┬──────┐  │
+          │  │ doc1 │ doc2 │ doc3 │ ...  │  │
+          │  └──────┴──────┴──────┴──────┘  │
+          └────────────────┬────────────────┘
+                           │ refresh (1-30s)
+                           ▼
+          ┌─────────────────────────────────┐
+          │         Segment (immutable)     │
+          │  ┌─────────────────────────┐    │
+          │  │ Inverted index          │    │
+          │  │ term → [doc1, doc3]     │    │
+          │  │ error → [doc1, doc4]    │    │
+          │  │ auth   → [doc2, doc3]   │    │
+          │  ├─────────────────────────┤    │
+          │  │ Stored fields           │    │
+          │  │ doc1: {...}            │    │
+          │  │ doc3: {...}            │    │
+          │  └─────────────────────────┘    │
+          └─────────────────────────────────┘
+                           │ merge
+                           ▼
+          ┌─────────────────────────────────┐
+          │  Merged segment (larger)        │
+          │  Fewer files, better query perf   │
+          └─────────────────────────────────┘
+`} />
+
+## Data Structures and Algorithms
+
+Beyond the inverted index, several data structures underpin high-performance logging.
+
+**Bloom filter**: a probabilistic data structure used to quickly check whether a field value exists in an index segment. Returns "definitely not present" or "probably present." This avoids loading an entire segment's postings list for rare terms.
+
+**Skip list**: the postings list (sorted document IDs) is stored as a skip list to enable fast intersection without scanning every entry. A skip list allows binary-search-like skipping through the list.
+
+**Finite State Transducer (FST)**: the term dictionary (mapping from term to postings list location) is encoded as an FST. This is a compact, in-memory lookup structure that maps terms to their byte offsets in the postings list file. For a 10-million-term dictionary, the FST fits in 100-200 MB of RAM.
+
+**Compression schemes**:
+- Frame of Reference (FOR): encodes blocks of sorted integers using the minimum number of bits per value. If document IDs in a block range from 1000 to 1100, only 7 bits per ID are needed instead of 32.
+- vByte (variable-length byte encoding): encodes integers using 1-5 bytes depending on magnitude. Small values (under 128) use 1 byte; large values use more.
+
+```python
+# Frame of Reference encoding example
+# Original postings list: [1000, 1003, 1005, 1010, 1020]
+# Step 1: Calculate deltas: [1000, 3, 2, 5, 10]
+# Step 2: Find min bits needed: max delta = 1000 → 10 bits
+# Step 3: Pack into 64-bit words
+#   1000 (10 bits) | 3 (2 bits) | 2 (2 bits) | 5 (3 bits) | 10 (4 bits)
+#   Total: 21 bits vs 5 × 32 = 160 bits (87 percent compression)
+```
+
+### B-Tree vs. LSM Tree in Log Storage
+
+Two storage engine data structures compete in the logging space. Elasticsearch uses a Log-Structured Merge (LSM) tree, while traditional databases use B-trees.
+
+**B-tree**: optimized for reads. Each data page contains a sorted range of keys with pointers to child pages. Reads require traversing the tree from root to leaf, O(log N). Writes are in-place modifications to existing pages, which requires random I/O. B-trees are the right choice when the workload is read-heavy and data fits in memory.
+
+**LSM tree**: optimized for writes. Data is written to an in-memory buffer (memtable), then flushed to immutable SSTable files on disk. Background compaction merges SSTables. Writes are sequential I/O, which is 10-100x faster than random I/O on HDDs. Reads require checking the memtable and then searching all SSTables, which is slower than a B-tree for read-heavy workloads.
+
+Logging workloads are write-heavy — the ratio of writes to reads is often 1000:1 or more. LSM trees are the right choice for log storage because sequential write throughput is the dominant constraint.
+
+| Property | B-Tree | LSM Tree |
+|----------|--------|----------|
+| Write throughput | 10-50K ops/s | 100K-1M ops/s |
+| Read throughput | 100K-1M ops/s | 10-100K ops/s |
+| Storage overhead | 5-10 percent | 10-20 percent |
+| Compaction cost | None | Background, CPU-intensive |
+| Space amplification | Low | Medium-High |
+| Write amplification | Low | High (10-50x) |
+| Example systems | MySQL, PostgreSQL | Elasticsearch, Cassandra, RocksDB |
+
+### How Compaction Works in Practice
+
+LSM tree compaction is a background process that merges multiple SSTables into one. During compaction:
+
+1. The compaction process reads two or more SSTables from disk.
+2. It merges them by key, keeping the latest version of each document.
+3. Deleted documents are dropped during compaction.
+4. The merged result is written to a new SSTable.
+5. The old SSTables are deleted.
+
+Compaction is CPU and I/O intensive. During compaction, the system has less capacity for accepting new writes. If compaction cannot keep up with the write rate, the number of SSTables grows unbounded, and read performance degrades. This is called a compaction stall and is a common failure mode in LSM-based systems.
+
+## Request Lifecycle
+
+A single log event travels through eight stages from creation to query. The following sections trace the path step by step.
+
+### Stage 1: Application calls logger.info()
+
+```python
+import structlog
+logger = structlog.get_logger()
+logger.info("order_created", order_id=12345, amount=99.95)
+```
+
+The library creates a log event object with: timestamp, logger name, level, message, and any key-value pairs. It then calls the encoder to serialize this into JSON bytes.
+
+### Stage 2: Encoder serializes the event
+
+```json
+{"event": "order_created", "level": "info", "timestamp": "2026-07-02T14:30:00.123456Z", "logger": "app.orders", "order_id": 12345, "amount": 99.95}
+```
+
+The encoder writes to a reusable buffer to avoid allocating a new byte array for every event. This is critical for performance — allocation-free serialization reduces GC pressure.
+
+### Stage 3: Async appender writes to ring buffer
+
+The bytes are copied into the ring buffer's write slot, and the write cursor is advanced atomically. This operation takes under 100 nanoseconds on modern hardware.
+
+### Stage 4: Flusher thread reads from ring buffer
+
+The background flusher picks up the bytes and writes them to stdout (container) or to the log file. In the file case, it first checks whether rotation is needed: if the file exceeds 100 MB, it closes the current file, renames it with a timestamp suffix, and opens a new one.
+
+### Stage 5: Log shipper reads the output
+
+The shipper (Filebeat or Vector) reads the log byte stream from either the file or the container runtime socket. It parses the JSON, extracts fields, enriches with metadata (Kubernetes pod name, namespace, node), and places the event in its internal buffer.
+
+### Stage 6: Shipper batches and transmits
+
+When the batch reaches 500 events or 1 MB (whichever first), or when 1 second has elapsed since the last flush, the shipper sends the batch over HTTP or gRPC to the aggregator. The shipper uses compression (gzip typically) to reduce network bandwidth by 5-10x.
+
+### Stage 7: Aggregator/Indexer ingests the batch
+
+The aggregator receives the batch, decompresses it, and feeds each event to the indexing pipeline. The indexer writes to the translog (for durability), updates the in-memory buffer, and after the refresh interval, flushes to a new immutable segment on disk.
+
+### Stage 8: Query arrives
+
+An operator issues a query: `level:error AND service:auth-service AND @timestamp:[now-1h TO now]`. The coordinator node broadcasts to every shard holding relevant data ranges. Each shard searches its segments' inverted indices and returns matching document IDs and scores. Results are merged and returned sorted by timestamp newest-first, typically within milliseconds for queries across billions of events.
+
+<AsciiDiagram
+  id="logging/full-lifecycle"
+  title="Complete lifecycle of a single log event from creation to query result"
+  alt="Diagram showing an event flowing through eight stages: app thread, ring buffer, stdout, shipper, network, aggregator, storage, and query UI"
+ content={`
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│ App      │─>│ Ring     │─>│ stdout   │─>│ Shipper  │─>│ Network  │─>│ Indexer  │─>│ Segment  │─>│ Query    │
+│ Thread   │  │ Buffer   │  │ or File  │  │ (Vector) │  │ (gzip)   │  │ (ES)     │  │ (Disk)   │  │ UI       │
+│          │  │          │  │          │  │          │  │          │  │          │  │          │  │          │
+│ create   │  │ enqueue  │  │ flush to │  │ read &   │  │ batch    │  │ translog │  │ inverted │  │ search   │
+│ event    │  │ 100ns    │  │ disk     │  │ enrich   │  │ send     │  │ + memory │  │ index    │  │ result   │
+│ serialize│  │          │  │ 100-500  │  │ 500-1000 │  │ 10-50ms  │  │ buffer   │  │          │  │ <100ms   │
+│ 1-5µs    │  │          │  │ µs       │  │ events   │  │          │  │ 1-30s    │  │          │  │          │
+└──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘
+   L1: Generation                        L2: Collection                L3: Indexing         L4: Query
+`} />
+
+### End-to-End Latency Budget
+
+From the moment the application calls `logger.info()` to the moment the event appears in a query result, the total latency is dominated by the indexing layer's refresh interval (1-30 seconds). The generation and collection layers contribute 1-10 milliseconds total. This means that logs are available for query within 1-30 seconds of generation, not in real time.
+
+For applications that need sub-second log visibility (fraud detection, real-time analytics), a separate streaming pipeline is needed. This pipeline processes log events from Kafka in real-time without the indexing delay.
+
+## Consistency and State
+
+Logging systems operate under specific guarantees about data durability and consistency. Understanding these guarantees prevents surprises during failures.
+
+### Crash Consistency
+
+What happens when the application process crashes immediately after calling `logger.info()`?
+
+- **Synchronous appender**: the write is flushed to the OS kernel buffer before returning to the caller. If the process crashes before the OS flushes to disk (typically within 30 seconds), the event is lost. To guarantee durability, call `fsync()` after every write, but this costs 1-10 ms per event — prohibitive at high throughput.
+
+- **Async appender with ring buffer**: the event is in the ring buffer but has not been written to stdout yet. On crash, the entire ring buffer contents are lost. This is the standard trade-off for performance: you accept losing up to 16384 events on crash.
+
+- **Durable path**: the library calls `write()` followed by `fsync()` on a dedicated log file. The event survives a process crash, but throughput drops to approximately 1000 events/s per thread.
+
+### Partition Tolerance
+
+When the network between the shipper and aggregator is partitioned:
+
+- The shipper's disk queue fills up. The queue size is bounded (typically 1-5 GB) to prevent filling the node's disk. When the queue is full, the shipper must drop events.
+
+- While the partition persists, the aggregator's time-based indices have gaps. After the partition heals, the shipper replays the disk queue, and events appear in the aggregator with a timestamp hours in the past. They are indexed into the correct time-based index based on their timestamp, not the arrival time.
+
+- Queries covering the partition period may initially show incomplete results. After the replay completes, results are correct.
+
+### Concurrent Writes
+
+Multiple threads or processes writing to the same log file without coordination produces interleaved lines:
+
+```text
+Thread A: {"event": "request_start", "trace_id": "abc"}
+Thread B: {"event": "request_start", "trace_id": "xyz"}
+Thread A: {"event": "db_query", "trace_id": "abc"}
+```
+
+Each line is valid JSON, but the order of events from different threads is non-deterministic. For a single trace, the events appear in order because a single thread produces them sequentially. For cross-trace ordering, timestamps provide the correct sequence.
+
+### Stale Reads
+
+Elasticsearch uses near-real-time (NRT) search. Data written to a segment is visible to search after the refresh interval (default 1 second). If you write a log event and immediately search for it, it may not appear. This is by design: the 1-second window allows batching many writes into a single segment write, dramatically improving throughput.
+
+```python
+# Writes go to the translog immediately (durable)
+# Writes go to the in-memory buffer immediately (visible to GET by ID)
+# Writes become searchable after refresh (default 1s)
+
+# After 500ms, this may return 0 results:
+search("level:error AND trace_id:abc")
+
+# After 1000ms, this returns the expected result:
+search("level:error AND trace_id:abc")
+```
+
+### Consistency Guarantees by Component
+
+| Component | Write Consistency | Read Consistency | Durability |
+|-----------|-------------------|------------------|------------|
+| Application logger | None (async) | N/A | None (crash loses buffer) |
+| File-based log file | Per-line, no fsync | Full on re-read | OS buffer (30s window) |
+| Kafka broker | Leader ack (configurable) | In-sync replicas | Configurable (acks=all) |
+| Elasticsearch | Primary shard ack | Near-real-time (1-30s delay) | Translog + replica |
+| S3 cold storage | Strong (put completes) | Strong (read-after-write) | 11 nines durability |
+
+## Performance Characteristics
+
+Understanding the performance envelope of your logging system prevents capacity surprises.
+
+### Latency Breakdown by Operation
+
+| Operation | p50 | p99 | p999 |
+|-----------|-----|-----|------|
+| Serialize JSON event (100 bytes) | 1 µs | 3 µs | 10 µs |
+| Write to ring buffer | 50 ns | 100 ns | 500 ns |
+| Write to stdout (buffered) | 10 µs | 100 µs | 500 µs |
+| Write to file (with fsync) | 1 ms | 10 ms | 50 ms |
+| Shipper batch (500 events) | 20 µs | 100 µs | 500 µs |
+| Network transmit (batch, LAN) | 1 ms | 5 ms | 50 ms |
+| Index into Elasticsearch (per event) | 10 µs | 50 µs | 200 µs |
+| Search query (range + filter) | 5 ms | 50 ms | 500 ms |
+| Aggregation query (count over 1h) | 100 ms | 500 ms | 5 s |
+
+### Throughput Scaling
+
+Throughput at each layer depends on hardware and configuration:
+
+- **Generation**: a single thread can serialize approximately 1 million events/second with optimized JSON encoders (no allocation, pooled buffers). With reflection-based encoders (Python `logging`, Java `Logback`), throughput drops to 50,000-100,000 events/second.
+
+- **Collection**: a single shipper process handles 20,000-50,000 events/second per CPU core. Filebeat with 4 workers handles approximately 100,000 events/second. Vector with multiple transforms handles approximately 50,000 events/second.
+
+- **Indexing**: each Elasticsearch data node handles 10,000-30,000 events/second, depending on the number of indexed fields, mapping complexity, and refresh interval. A 10-node cluster handles 100,000-300,000 events/second.
+
+- **Query**: a single query across 10 shards returns within 5-50 ms for simple filter queries, and 100-500 ms for aggregation queries (group by, count, average).
+
+### Bottlenecks
+
+The most common bottleneck in production logging systems is the indexing layer. Writes are CPU-bound (inverted index building) and I/O-bound (translog writes, segment flushes). When the indexing rate exceeds the cluster's capacity, Elasticsearch applies backpressure: it slows ingestion and eventually rejects new writes.
+
+```python
+# Elasticsearch rejects writes when:
+# 1. The node's write queue exceeds 200 (default thread pool queue size)
+# 2. The disk utilization exceeds 95 percent
+# 3. The JVM heap usage exceeds 85 percent
+# Rejection response:
+{
+    "error": {
+        "reason": "rejected execution of coordinating operation",
+        "type": "es_rejected_execution_exception"
+    },
+    "status": 429
+}
+```
+
+### Compression Performance
+
+Network bandwidth is often the second most expensive resource after storage. Compression reduces bandwidth at the cost of CPU. Typical compression ratios for JSON log data:
+
+| Algorithm | Compression Ratio | Speed (MB/s compress) | Speed (MB/s decompress) |
+|-----------|-------------------|----------------------|------------------------|
+| None (raw) | 1.0x | N/A | N/A |
+| gzip (level 6) | 5-10x | 50 MB/s | 200 MB/s |
+| zstd (level 3) | 6-12x | 300 MB/s | 800 MB/s |
+| snappy | 3-5x | 400 MB/s | 800 MB/s |
+| lz4 | 2-4x | 500 MB/s | 1000 MB/s |
+
+For log shipping, zstd at level 3 is the sweet spot: 6-12x compression at 300 MB/s compress speed. At 500 MB/s network throughput, compression saves 80-90 percent of bandwidth.
+
+## Configuration and Tuning
+
+### Log Level Configuration
+
+Log levels should be configurable at runtime without restarting the application. Two common approaches:
+
+**Environment variable** (simple):
+```bash
+export LOG_LEVEL=DEBUG
+python app.py
+```
+
+**Dynamic reconfiguration** (advanced): the application watches a configuration store (Consul, etcd, Kubernetes ConfigMap) and updates log levels in real-time. This allows operators to enable DEBUG level for a specific service during incident response without restarting or redeploying.
+
+```python
+import os
+import time
+import structlog
+
+def configure_logging():
+    level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(level),
+    )
+
+configure_logging()
+
+# In production, watch for config changes:
+while True:
+    if config_changed():
+        configure_logging()
+    time.sleep(30)
+```
+
+### Sampling Configuration
+
+At very high throughput, sampling becomes necessary to control costs. Three sampling strategies are common:
+
+**Head-based sampling**: decide at the beginning of a request whether to log it. Example: log every 10th request. Simple but misses rare failures.
+
+```python
+import random
+# Log 1 in 10 requests
+if random.randint(1, 10) == 1:
+    logger.info("sampled_request", request_id=request.id)
+```
+
+**Tail-based sampling**: log all events for a request, then decide after the request completes whether to store them. Useful for capturing all events of failed requests. Requires buffering until the request finishes.
+
+```python
+# Buffer all log events for this request in memory
+buffer = []
+def log_with_buffer(event):
+    buffer.append(event)
+
+# When request completes:
+if request.status_code >= 400:
+    # Store all buffered events
+    for event in buffer:
+        logger.info(event)
+```
+
+**Adaptive sampling**: automatically adjust the sampling rate based on current throughput. When traffic is low, sample more; when traffic peaks, sample less.
+
+### Retention Configuration
+
+Retention policies balance cost against availability needs:
+
+```yaml
+# Elasticsearch ILM (Index Lifecycle Management) policy
+policy:
+  phases:
+    hot:
+      min_age: "0d"
+      actions:
+        rollover:
+          max_size: "50GB"
+          max_age: "1d"
+    warm:
+      min_age: "7d"
+      actions:
+        shrink:
+          number_of_shards: 1
+        force_merge:
+          max_num_segments: 1
+    cold:
+      min_age: "30d"
+      actions:
+        freeze: {}
+    delete:
+      min_age: "90d"
+      actions:
+        delete: {}
+```
+
+### Sampling and Rate Limiting Configuration
+
+Most log shippers support per-source rate limiting:
+
+```yaml
+# Fluentd rate limit configuration
+<match kubernetes.var.log.containers.**>
+  @type rewrite_tag_filter
+  <rule>
+    key $tag
+    pattern /^(.+)$/
+    tag \1.${record["level"]}
+  </rule>
+</match>
+
+# Rate limit per container to 1000 events/second
+<filter kubernetes.var.log.containers.**>
+  @type throttle
+  group_key service
+  group_bucket_period_s 1
+  group_bucket_limit 1000
+</filter>
+```
+
+### Field Mapping Configuration
+
+Mapping defines which fields are indexed (searchable), stored (returnable), or both. Too many indexed fields increases index size and slows writes. Too few makes queries slow or impossible.
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "@timestamp":     { "type": "date" },
+      "level":          { "type": "keyword" },
+      "service":        { "type": "keyword" },
+      "trace_id":       { "type": "keyword" },
+      "event":          { "type": "keyword" },
+      "message":        { "type": "text" },
+      "duration_ms":    { "type": "integer" },
+      "user_id":        { "type": "keyword" },
+      "error":          { "type": "text" },
+      "metadata":       { "type": "object", "dynamic": true }
+    }
+  }
+}
+```
+
+Keyword types are used for exact-match filtering (equality, range). Text types are used for full-text search (contains, matches). Using keyword for fields that are never filtered on wastes index space.
+
+### Bulk Indexing Configuration
+
+Elasticsearch bulk indexing performance is tuned through three knobs:
+
+1. **bulk_size**: the number of documents per bulk request. Larger batches improve throughput but use more memory. Start at 500 and increase until CPU or memory is saturated.
+
+2. **concurrent_requests**: the number of parallel bulk requests. More concurrency improves throughput but increases cluster load. Start at 4 and increase to 8-16 for large clusters.
+
+3. **refresh_interval**: how often new segments are created. The default is 1 second, which maximizes search freshness at the cost of indexing throughput. For pure ingestion, increase to 30 seconds (or disable refresh entirely during bulk loads).
+
+```python
+# Elasticsearch bulk indexing tuning
+# For maximum throughput during ingestion:
+client.indices.put_settings(
+    index="logs-*",
+    body={"index": {
+        "refresh_interval": "30s",
+        "number_of_replicas": 0,
+        "translog.durability": "async",
+        "translog.sync_interval": "5s"
+    }}
+)
+# After ingestion completes:
+# Set refresh_interval back to 1s, restore replicas
+```
+
+<AsciiDiagram
+  id="logging/tuning-map"
+  title="Tuning decision tree for logging pipeline parameters"
+  alt="Decision tree showing configuration choices: high throughput → increase batch size and refresh interval, strict durability → enable fsync, cost sensitive → reduce retention and increase sampling, compliance → enable obfuscation"
+ content={`
+                    ┌──────────────────────┐
+                    │  Start: What matters? │
+                    └──┬────────┬────────┬──┘
+                       │        │        │
+              ┌────────┘        │        └────────┐
+              ▼                 ▼                  ▼
+    ┌─────────────────┐ ┌──────────────┐ ┌──────────────┐
+    │ Throughput      │ │ Durability   │ │ Cost         │
+    │ is critical     │ │ must be      │ │ must be       │
+    │                 │ │ guaranteed    │ │ minimized    │
+    └───────┬─────────┘ └──────┬───────┘ └──────┬───────┘
+            │                  │                 │
+            ▼                  ▼                 ▼
+    ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+    │ • Batch 1000 │  │ • fsync()   │  │ • Sample     │
+    │ • Refresh    │  │ • Translog  │  │   1:1000     │
+    │   30s        │  │   sync      │  │ • Retain     │
+    │ • Compress   │  │ • RAID 10   │  │   7 days     │
+    │ • Remove     │  │ • Replica=2 │  │ • Remove     │
+    │   text fields│  │             │  │   replicas   │
+    └──────────────┘  └──────────────┘  └──────────────┘
+`} />
+
+### Thread Pool Configuration
+
+Elasticsearch uses thread pools for different operation types. The write thread pool is the most critical for logging:
+
+| Thread Pool | Queue Size | Default Workers | Purpose |
+|-------------|------------|-----------------|---------|
+| write | 200 | Number of CPUs | Indexing operations |
+| search | 1000 | CPU * 3 | Search queries |
+| bulk | 200 | CPU * 2 | Bulk index requests |
+| get | 1000 | CPU * 2 | Get-by-ID operations |
+| analyze | 16 | 1 | Field analysis |
+
+When the write queue fills up (queue size exceeds 200), Elasticsearch returns HTTP 429. The client should retry with exponential backoff. If the 429 rate exceeds 1 percent of total writes, the cluster is saturated and needs more nodes or tuning.
+
+### Monitoring and Alerting for the Logging System
+
+The logging system itself must be monitored. Key metrics to track:
+
+**Ingestion rate**: the number of events per second entering the pipeline. A sudden drop indicates a shipper failure. A sustained increase may indicate a runaway process.
+
+**Kafka consumer lag**: the difference between the latest event in Kafka and the latest event consumed by the indexer. Growing lag means the indexer is falling behind.
+
+**Elasticsearch 429 rate**: the percentage of writes that Elasticsearch rejects. A rate above 1 percent indicates the cluster is saturated.
+
+**Disk usage**: the percentage of disk consumed by hot tier indices. Warn at 80 percent, critical at 90 percent.
+
+**Query latency**: the p99 latency of log search queries. Degradation indicates the cluster is overloaded or segments are too numerous.
+
+### JVM Heap Configuration
+
+Elasticsearch runs on the JVM. Heap configuration directly affects indexing performance:
+
+```bash
+# ES_JAVA_OPTS for a logging cluster
+ES_JAVA_OPTS="-Xms16g -Xmx16g -XX:+UseG1GC -XX:InitiatingHeapOccupancyPercent=30"
+```
+
+- Heap size: 50 percent of available RAM. Do not exceed 32 GB (compressed OOPs limit).
+- G1GC: default garbage collector. Tune InitiatingHeapOccupancyPercent lower (30) to avoid long GC pauses.
+- The remaining 50 percent of RAM is used by the OS page cache, which caches segment files for fast search.
+
+---
+
+Next, you will see how these components come together into a production-grade logging architecture that serves millions of events per second across global infrastructure.

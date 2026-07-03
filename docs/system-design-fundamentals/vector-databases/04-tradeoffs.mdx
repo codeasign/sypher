@@ -1,0 +1,264 @@
+---
+id: vector-databases-tradeoffs
+title: Vector Databases — Trade-offs & Failure Modes
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Core Tension
+
+When you choose a vector database, you are explicitly trading **exact perfect recall** for **speed at scale**. A vector database will never return the exact same results as a brute-force search on the same data — it's an approximation by design. The question is not whether you lose accuracy, but whether the 1-5% recall loss is worth the 100-1000x speedup.
+
+The deeper tension: **every knob you turn to improve recall makes the system slower and more expensive**. There is no free lunch — you must pick your poison among accuracy, latency, throughput, and cost.
+
+## Decision Matrix
+
+| Decision Point | Option A | Option B | Choose A When | Choose B When |
+|:---|:---|:---|:---|:---|
+| **Index type** | HNSW (in-memory graph) | IVF (clustered) | Latency under 10ms is critical, dataset fits in RAM | Dataset is 100M+ vectors, memory budget is tight |
+| **Distance metric** | Cosine similarity | Dot product | Vectors are not normalized, text embeddings | Vectors are normalized, need slightly faster computation |
+| **Recall target** | 0.99 (high ef) | 0.90 (low ef) | Wrong results are costly (medical, legal) | Faster results matter more than perfect accuracy (recommendations) |
+| **Filtering strategy** | Pre-filter (filter before search) | Post-filter (filter after search) | Filter is highly selective (eliminates 90%+ of rows) | Filter is not selective, or you need maximum recall on filtered results |
+| **Storage** | All in-memory | Disk + memory (PQ) | Budget is not a concern, latency is everything | Storing billions of vectors, cost matters |
+| **Consistency** | Strong (synchronous writes) | Eventual (async writes) | Read-after-write consistency required | Throughput is more important than immediate consistency |
+| **Deployment** | Self-hosted (Milvus, Qdrant) | Managed (Pinecone, Weaviate Cloud) | You have on-call capacity, need full control | You want to avoid ops overhead, have a smaller team |
+
+## CAP Theorem Positioning
+
+Vector databases are **AP (Available and Partition-tolerant)** in the CAP theorem. When a network partition occurs, the vector database continues serving reads and writes on both sides of the partition rather than blocking.
+
+<AsciiDiagram title="CAP Theorem — Vector Database Partition Behavior" content={`
+  Normal state:
+  ┌──────────────┐     healthy     ┌──────────────┐
+  │  Node A       │────────────────│  Node B       │
+  │  (leader)     │                │  (replica)    │
+  └──────────────┘                └──────────────┘
+  Write to A → replicated to B
+  Read from A or B → same results
+  
+  Partitioned state:
+  ┌──────────────┐     ─ ─ ─ ─ ─ ─ ┌──────────────┐
+  │  Node A       │    NETWORK      │  Node B       │
+  │  (leader)     │    CUT          │  (replica)    │
+  └──────────────┘                  └──────────────┘
+  Accepts writes                    Accepts writes
+  Serves reads                      Serves reads
+  (both sides available)            (both sides available)
+  
+  When partition heals:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  - B's writes during partition are replicated to A              │
+  │  - Conflicting writes resolved by last-writer-wins timestamp    │
+  │  - Some data loss is possible (the "losing" writes are dropped) │
+  │  - Index is rebuilt from the merged vector set                  │
+  └──────────────────────────────────────────────────────────────────┘
+`} />
+
+**What this means in practice:**
+- Your vector database stays up during network partitions, but you may lose writes or serve stale data.
+- If you need CP (Consistency + Partition-tolerance), you need a consensus-based system (etcd, ZooKeeper) — but those can't handle vector search workloads.
+- The trade-off is inherent: vector search requires distributed state, and distributed state can't be both consistent and available during partitions.
+
+## Failure Modes
+
+### Failure 1: Index Drift
+
+**What happens:** Over time, as vectors are inserted and deleted, the HNSW graph becomes unbalanced. Some nodes have too many connections, others too few. Search quality degrades gradually.
+
+**Root cause:** HNSW is built for append-heavy workloads. Deletions leave "holes" — nodes that are removed but their connections remain. Over time, these holes degrade the graph structure.
+
+<AsciiDiagram title="Index Drift — HNSW Graph Degradation Over Time" content={`
+  Fresh index (0 inserts):
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  N1──N2──N3──N4──N5──N6──N7──N8──N9──N10                        │
+  │  Balanced edges, uniform distribution, fast traversal            │
+  └──────────────────────────────────────────────────────────────────┘
+  
+  After 500K inserts + 100K deletes:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  N1──N2──N3──N4──N5──N6──N7──N8──N9──N10                        │
+  │  │    │   │    │         │   │    │   │    │                     │
+  │  N11──N12──N13──N14──N15──N16──N17──N18──N19──N20               │
+  │  Some nodes have 12 connections, others have 3.                  │
+  │  Traversal path is longer because greedy search hits dead ends.  │
+  └──────────────────────────────────────────────────────────────────┘
+  
+  After 2M inserts + 500K deletes (no re-index):
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Recall has dropped from 0.98 → 0.85                             │
+  │  p99 latency has increased from 10ms → 35ms                      │
+  └──────────────────────────────────────────────────────────────────┘
+`} />
+
+**Blast radius:** Degraded search quality affects all users. Products don't show up in search results. Revenue drops.
+
+**Detection:** Monitor recall rate by running periodic A/B tests against brute-force search on a sample of queries. If recall drops below 0.90, it's time to re-index.
+
+**Recovery:** Trigger a full re-index. This is a background operation that takes 1-2 hours for a 100M-vector dataset. During re-index, the old index continues serving reads.
+
+### Failure 2: Warm Cache Miss
+
+**What happens:** A new node joins the cluster or a node restarts, and the HNSW index is not in memory. Every query to that node takes 10x longer because it's reading from disk and rebuilding the index.
+
+**Root cause:** The HNSW graph is loaded into memory on startup. Loading a 4.7GB index takes 30-60 seconds. During this time, the node is "cold" — it can serve queries but at degraded performance.
+
+<AsciiDiagram title="Cache Miss Cascade — Cold Node Degradation" content={`
+  Normal state (all nodes warm):
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  p99 latency: 20ms  │  QPS: 5,000  │  Error rate: 0.01%        │
+  └──────────────────────────────────────────────────────────────────┘
+  
+  Node goes down and comes back:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Node restarts → loads index from disk (45s)                    │
+  │  During load: node is unhealthy → coordinator removes from pool  │
+  │  Remaining nodes handle 2x traffic → latency spikes              │
+  └──────────────────────────────────────────────────────────────────┘
+  
+  Cascade:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Second node under load → OOM or GC pause → becomes unhealthy   │
+  │  Only 1 node left → handles ALL traffic → latency: 500ms+       │
+  │  Errors start at 5%, then 20%, then 80% as nodes crash          │
+  └──────────────────────────────────────────────────────────────────┘
+`} />
+
+**Blast radius:** Cascading failure that can take down the entire cluster.
+
+**Detection:** Monitor startup time and "warm-up" period. Set an alert if any node takes more than 60 seconds to become healthy after restart.
+
+**Recovery:** Pre-warm new nodes by loading the index from a snapshot before adding them to the serving pool. Use a load balancer that supports "slow start" — gradually ramping traffic to a new node over 60 seconds.
+
+### Failure 3: Metadata Filter Explosion
+
+**What happens:** A query with a metadata filter that matches only 5 vectors out of 100 million forces the database to search the entire index and then filter. The query takes 200ms instead of 10ms.
+
+**Root cause:** The vector index is separate from the metadata index. The database can't efficiently combine them — it must either search the entire vector space and then filter, or filter first and then search the reduced set. If the filtered set is too small, the ANN search quality degrades.
+
+**Blast radius:** Only the specific query is slow, but if many users apply the same rare filter simultaneously, the node can be overwhelmed.
+
+**Detection:** No built-in metric. You need to instrument your application to track query latency by filter cardinality.
+
+**Recovery:** Re-design the filter. Use a separate index per filter value (create a separate collection per category) or use a filter that's more selective on the vector side.
+
+### Failure 4: Embedding Distribution Collapse
+
+**What happens:** All vectors end up clustered in a small region of the embedding space. The ANN index can't distinguish between them, and every query returns essentially random results.
+
+**Root cause:** The embedding model is not calibrated for your data. For example, using a general-purpose text embedding model for code snippets, or using a model trained on English for mixed-language data.
+
+<AsciiDiagram title="Embedding Distribution Collapse — All Vectors in a Tight Cluster" content={`
+  Healthy embedding distribution (ideal):
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                                                                   │
+  │    .      .                                                       │
+  │         .      .    .         .      .                            │
+  │      .      .      .     .       .      .      .                  │
+  │        .      .    .   .    .     .         .                     │
+  │     .       .         .     .         .                           │
+  │          .      .          .      .     .                         │
+  │      .        .              .          .      .                  │
+  │                                                                   │
+  │  Pairwise distances range from 0.1 to 1.2 — good separation      │
+  └──────────────────────────────────────────────────────────────────┘
+  
+  Collapsed embedding distribution (broken):
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                                                                   │
+  │                    . . .                                          │
+  │                 . . . . . . .                                     │
+  │               . . . . . . . . .                                   │
+  │                . . . . . . . .                                    │
+  │                 . . . . . . .                                     │
+  │                    . . .                                          │
+  │                                                                   │
+  │  Pairwise distances range from 0.05 to 0.25 — all too close      │
+  │  ANN index cannot distinguish between different content           │
+  └──────────────────────────────────────────────────────────────────┘
+`} />
+
+**Blast radius:** Global — every query returns bad results. The vector database appears to be working (low latency, no errors) but is useless.
+
+**Detection:** Plot the distribution of pairwise distances between random samples. If 90% of pairs have distances between 0.1 and 0.3, your embeddings are collapsed.
+
+**Recovery:** Switch to a different embedding model. Fine-tune the model on your domain. Add normalization or dimensionality reduction.
+
+### Failure 5: Write Amplification
+
+**What happens:** The database is writing 10x more data to disk than the raw vector size, because each insert triggers metadata index updates, HNSW edge updates, and WAL writes.
+
+**Root cause:** Every vector insert causes cascading writes: the vector itself, the WAL entry, the metadata index update, and the HNSW graph updates (which may trigger updates to neighboring nodes' edges). A 3KB vector can trigger 30KB of write operations.
+
+**Blast radius:** Disk I/O saturation, which increases query latency because reads and writes compete for the same disk bandwidth.
+
+**Detection:** Monitor disk write throughput. If it exceeds 50% of your SSD's sustained write capacity, you have a problem.
+
+**Recovery:** Batch writes — 1,000 inserts in a batch produce 10x less write amplification than 1,000 individual inserts. Use a larger WAL flush interval. Consider using a separate write-ahead log on a faster device (NVMe).
+
+## Anti-Patterns Hall of Shame
+
+### Anti-Pattern 1: Using a Vector Database as a Primary Database
+
+**The mistake:** Storing all data (vectors, metadata, payloads, relationships) exclusively in the vector database.
+
+**Why it seemed reasonable:** "The vector database can store metadata too. Why maintain two databases?"
+
+**What went wrong in production:** The team needed to join vector data with relational data. The vector database had no join support. They ended up doing application-level joins — querying the vector DB, then querying PostgreSQL for each result. Latency went from 10ms to 200ms.
+
+**The correct pattern:** Use the vector database only for vector search. Store full records in a relational database. Use the vector database to find candidate IDs, then fetch full records from the relational database.
+
+### Anti-Pattern 2: Never Re-Indexing
+
+**The mistake:** Inserting vectors for months without ever rebuilding the index.
+
+**Why it seemed reasonable:** "The index automatically handles inserts. Why rebuild?"
+
+**What went wrong in production:** After 6 months and 10 million inserts, recall dropped from 0.98 to 0.72. Users complained that search was "broken." The team spent 3 days debugging before realizing the index was fragmented.
+
+**The correct pattern:** Schedule re-indexing based on insert volume. A good rule of thumb: re-index every N inserts where N equals the initial dataset size. For a 1M-vector dataset, re-index after every 1M new inserts.
+
+### Anti-Pattern 3: Ignoring the Embedding Model
+
+**The mistake:** Spending 3 months optimizing the vector database index while using a default embedding model with no evaluation.
+
+**Why it seemed reasonable:** "The vector database is the hard part. Embeddings are just API calls."
+
+**What went wrong in production:** The team optimized latency from 50ms to 5ms, but recall was still terrible because the embedding model was wrong for their domain (using a general text model for medical terminology). All the index tuning couldn't fix garbage-in, garbage-out.
+
+**The correct pattern:** Evaluate your embedding model before tuning the vector database. Measure recall on a representative query set. Switch models if needed. The embedding model has a 10x larger impact on search quality than any index parameter.
+
+### Anti-Pattern 4: No Distance Threshold
+
+**The mistake:** Always returning top-k results without checking if they're actually similar.
+
+**Why it seemed reasonable:** "topK=10 always returns 10 results. That's what the UI expects."
+
+**What went wrong in production:** A query with no close matches still returned 10 results — all with similarity scores below 0.3. Users saw completely irrelevant products and lost trust in the recommendation system.
+
+**The correct pattern:** Always set a distance threshold. If no results meet the threshold, return fewer results or a fallback. Communicate to the UI that no good matches were found.
+
+### Anti-Pattern 5: Over-Indexing with Filters
+
+**The mistake:** Creating a separate vector index for every metadata filter combination.
+
+**Why it seemed reasonable:** "Each product category has different vectors. I'll create one index per category for faster filtered search."
+
+**What went wrong in production:** With 500 categories, each with 2,000 vectors, the team had 500 small HNSW indexes. Each index had poor graph quality because HNSW needs many nodes per index to build good connections. Recall was under 0.50.
+
+**The correct pattern:** Use a single large index with metadata filtering. If you must partition, ensure each partition has at least 10,000 vectors so the HNSW graph has enough nodes to build meaningful connections.
+
+## When NOT to Use This
+
+**Your dataset fits in memory and brute-force is fast enough.** If you have under 100,000 vectors and a few hundred queries per second, brute-force with numpy or a simple Python service is simpler, cheaper, and gives exact results. Adding a vector database is over-engineering.
+
+**You need exact results, not approximations.** Vector databases are approximate by design. If your use case requires 100% recall (e.g., deduplication, exact nearest neighbor search), you need a different approach — exact search with KD-trees or R-trees, or a brute-force scan.
+
+**You need complex joins, transactions, or ACID guarantees.** Vector databases are not general-purpose databases. They don't support joins, multi-statement transactions, or strict ACID guarantees. Use PostgreSQL with pgvector for moderate-scale vector workloads that need full database features.
+
+**Your data is purely relational.** If you're storing structured data (customer records, orders, inventory) with no semantic search requirement, a relational database is the right tool. Adding a vector database adds complexity with no benefit.
+
+**Your scale is small enough for pgvector.** For datasets under 10 million vectors and moderate query volume (under 100 QPS), pgvector in PostgreSQL is simpler — you don't need a separate infrastructure, and you get ACID transactions, joins, and backups for free.
+
+Proceed to the Real World page to see how companies like Netflix, Uber, and Notion actually use vector databases in production.

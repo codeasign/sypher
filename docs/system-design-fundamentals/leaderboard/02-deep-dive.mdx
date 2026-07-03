@@ -1,0 +1,903 @@
+---
+id: leaderboard-deep-dive
+title: Leaderboard Pattern -- Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A leaderboard system at scale is composed of five layers, each with distinct responsibilities. Understanding the internals of each layer is essential for diagnosing performance issues and designing for scale.
+
+### Layer 1: Ingestion Layer
+
+The ingestion layer receives score submissions from game clients. It handles authentication, rate limiting, validation, and deduplication. The ingestion layer is stateless and scales horizontally behind a load balancer.
+
+```python
+# Ingestion layer configuration
+INGESTION_CONFIG = {
+    "rate_limit_per_player_per_second": 1,
+    "max_score_value": 999999,
+    "min_score_value": 0,
+    "dedup_window_seconds": 5,
+    "max_payload_size_bytes": 4096,
+    "timeout_ms": 2000,
+}
+```
+
+Each ingestion request follows this flow:
+1. Parse the request payload and validate its structure.
+2. Authenticate the player using a session token or API key.
+3. Check the rate limit for this player. If exceeded, return HTTP 429.
+4. Validate the score against business rules.
+5. Check for duplicate submissions within the dedup window.
+6. Enrich the payload with server-side metadata (timestamp, region, server ID).
+7. Publish the validated score to a message queue for downstream processing.
+
+### Layer 2: Processing Layer
+
+The processing layer consumes scores from the message queue and performs the core leaderboard operations. This layer is the stateful part of the system -- it holds the sorted set and the cache.
+
+```python
+# Score processing worker
+async def process_score(message: ScoreMessage):
+    # Compute final score from game-specific logic
+    final_score = compute_final_score(
+        message.raw_score, message.game_config, message.player_history
+    )
+
+    # Update the sorted set
+    window_key = get_window_key(message.window_type, message.timestamp)
+    await redis.zadd(window_key, {message.player_id: final_score})
+
+    # Set TTL on the sorted set key
+    ttl = get_window_ttl(message.window_type)
+    await redis.expire(window_key, ttl)
+
+    # Conditional cache invalidation
+    if await should_invalidate_cache(window_key, final_score):
+        await invalidate_top_n_cache(window_key)
+
+    # Persist to database
+    await persist_score(message, final_score)
+```
+
+### Layer 3: Storage Layer
+
+The storage layer has two components: the Redis sorted set for live data and the relational database for durable storage. The Redis sorted set is the primary data structure for the leaderboard. The database is the system of record for historical scores, dispute resolution, and analytics.
+
+```python
+# Database schema for score persistence
+SCORE_TABLE_SCHEMA = """
+CREATE TABLE score_history (
+    id BIGSERIAL PRIMARY KEY,
+    player_id VARCHAR(64) NOT NULL,
+    score INTEGER NOT NULL,
+    game_id VARCHAR(32) NOT NULL,
+    window_type VARCHAR(16) NOT NULL,  -- daily, weekly, monthly, all_time
+    window_key VARCHAR(64) NOT NULL,   -- e.g., "2026-07-03"
+    metadata JSONB,
+    achieved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_scores_lookup ON score_history (player_id, window_type, window_key);
+CREATE INDEX idx_scores_analytics ON score_history (game_id, achieved_at);
+"""
+```
+
+### Layer 4: Serving Layer
+
+The serving layer handles read requests. It checks the cache first, falls back to the sorted set on cache miss, and formats the response for the client. The serving layer is stateless and scales horizontally.
+
+```python
+# Serving layer handler
+async def get_leaderboard(request: LeaderboardRequest):
+    cache_key = f"lb:{request.window}:{request.window_key}:{request.offset}:{request.limit}"
+
+    # Check cache
+    cached = await cache.get(cache_key)
+    if cached:
+        return cached
+
+    # Cache miss -- query sorted set
+    sorted_set_key = f"leaderboard:{request.window}:{request.window_key}"
+    results = await redis.zrevrange(
+        sorted_set_key,
+        request.offset,
+        request.offset + request.limit - 1,
+        withscores=True
+    )
+
+    # Build response
+    entries = []
+    for i, (player_id, score) in enumerate(results):
+        entries.append({
+            "rank": request.offset + i + 1,
+            "player_id": player_id.decode(),
+            "score": int(score)
+        })
+
+    response = {"entries": entries, "count": len(entries), "offset": request.offset}
+
+    # Cache the response
+    await cache.set(cache_key, response, ttl=30)
+    return response
+```
+
+### Layer 5: Monitoring and Alerting Layer
+
+The monitoring layer tracks key metrics for the leaderboard system: write throughput, read latency, cache hit rate, sorted set size, and error rates. Without monitoring, you cannot detect hot shards, stale data, or performance degradation.
+
+```python
+# Key metrics to monitor
+LEADERBOARD_METRICS = {
+    "score_write_latency_p99": "Current: 45ms, Alert: >200ms",
+    "leaderboard_read_latency_p99": "Current: 12ms, Alert: >100ms",
+    "cache_hit_rate": "Current: 94%, Alert: <80%",
+    "sorted_set_size": "Current: 1.2M, Alert: >5M (per shard)",
+    "write_throughput_per_second": "Current: 8,500, Alert: >15,000 (scale needed)",
+    "error_rate": "Current: 0.02%, Alert: >1%",
+    "replication_lag_ms": "Current: 350ms, Alert: >2000ms",
+}
+```
+
+---
+
+## Data Structures
+
+Three data structures form the backbone of a leaderboard system. Each serves a specific purpose and has distinct performance characteristics.
+
+### Data Structure 1: Redis Sorted Set (Skip List + Hash Map)
+
+The Redis sorted set is the primary data structure. It combines a skip list for ordered traversal with a hash map for O(1) element lookup. The skip list provides O(log N) for insert, update, rank, and range queries.
+
+<AsciiDiagram
+  id="leaderboard/deep-dive-skip-list"
+  title="Skip List Internal Structure for Leaderboard Operations"
+  alt="Detailed diagram of a skip list with four levels, showing the forward pointers at each level and how ZREVRANK traverses the skip list to find a player's rank"
+  caption="The skip list maintains ordered elements with probabilistic leveling. Each level provides a highway for faster traversal."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  SKIP LIST INTERNALS (scores sorted descending)                 │
+  │                                                                  │
+  │  Level 4: ┌────┐                           ┌────┐              │
+  │  (top)    │HEAD│──────────────────────────>│NULL│              │
+  │           └────┘                           └────┘              │
+  │                                                                  │
+  │  Level 3: ┌────┐         ┌──────────┐      ┌────┐              │
+  │           │HEAD│────────>│score:95000│─────>│NULL│              │
+  │           └────┘         │player_84 │      └────┘              │
+  │                          └──────────┘                           │
+  │                               │                                 │
+  │  Level 2: ┌────┐         ┌───┴──────┐    ┌──────────┐ ┌────┐  │
+  │           │HEAD│────────>│score:95000│───>│score:87000│>│NULL│  │
+  │           └────┘         │player_84 │    │player_17 │ └────┘  │
+  │                          └──────────┘    └──────────┘          │
+  │                               │               │                 │
+  │  Level 1: ┌────┐         ┌───┴──────┐    ┌───┴──────┐  ┌────┐ │
+  │  (bottom) │HEAD│────────>│score:95000│───>│score:87000│─>│... │ │
+  │           └────┘         │player_84 │    │player_17 │  └────┘ │
+  │                          └──────────┘    └──────────┘          │
+  │                                                                  │
+  │  ZREVRANK("player_17") traversal:                               │
+  │  Start at HEAD Level 4 → move right → NULL → drop to Level 3  │
+  │  Level 3: HEAD → player_84 (score 95000 > 87000, go down)     │
+  │  Level 2: player_84 → player_17 (found!)                       │
+  │  Count elements before player_17 at bottom level: 1             │
+  │  Result: rank = 1 (0-based, meaning 2nd place)                  │
+  │                                                                  │
+  │  Memory: ~64 bytes per entry (key + score + forward pointers)   │
+  │  Max level: 32 (for 2^32 elements, probabilistic)              │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+The skip list is the right choice for leaderboards because it supports all four required operations efficiently. Compare this with a balanced binary search tree, which also provides O(log N) operations but requires more complex rebalancing logic. The skip list's probabilistic leveling means that in practice, its performance is indistinguishable from a balanced tree, but its implementation is significantly simpler.
+
+Redis's implementation of the sorted set uses a dictionary (hash map) that maps members to scores, plus a skip list that maps scores to members. The dictionary enables O(1) lookup of a member's score, which is needed for the `ZADD` command when updating an existing member. The skip list enables ordered traversal and rank queries.
+
+```python
+# Redis sorted set commands for leaderboard operations
+# Each command is O(log N) for the skip list part
+
+# Insert or update a player's score
+redis.zadd("leaderboard:daily:2026-07-03", {"player_42": 15000})
+
+# Get the rank of a player (0-based, highest score = 0)
+rank = redis.zrevrank("leaderboard:daily:2026-07-03", "player_42")
+
+# Get the top 100 players
+top_100 = redis.zrevrange("leaderboard:daily:2026-07-03", 0, 99, withscores=True)
+
+# Get players around a specific player (neighbors)
+neighbors = redis.zrevrange("leaderboard:daily:2026-07-03", rank - 5, rank + 5)
+
+# Get the score of a player
+score = redis.zscore("leaderboard:daily:2026-07-03", "player_42")
+
+# Get the total number of players
+count = redis.zcard("leaderboard:daily:2026-07-03")
+
+# Increment a player's score by a delta
+redis.zincrby("leaderboard:daily:2026-07-03", 500, "player_42")
+```
+
+### Data Structure 2: Score Bucket Array
+
+For approximate leaderboards, a score bucket array stores counts of players in each score range. This is a fixed-size array where each bucket represents a range of scores. The bucket array is orders of magnitude smaller than the full sorted set and can be updated in O(1) time.
+
+<AsciiDiagram
+  id="leaderboard/deep-dive-bucket-array"
+  title="Score Bucket Array for Approximate Rank Computation"
+  alt="Fixed-size array of 10 buckets, each containing a count of players in that score range, with cumulative sums computed once and cached"
+  caption="The bucket array stores counts per score range. Cumulative sums enable approximate rank queries in O(number of buckets) time."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  SCORE BUCKET ARRAY                                             │
+  │                                                                  │
+  │  Bucket size = 10,000 points                                    │
+  │  Number of buckets = 100 (covers scores 0 to 999,999)           │
+  │                                                                  │
+  │  ┌───────┬───────────┬──────────────┬────────────────────────┐  │
+  │  │Bucket │Range      │Player Count  │Cumulative Higher Count │  │
+  │  ├───────┼───────────┼──────────────┼────────────────────────┤  │
+  │  │  0    │ 0 - 9,999 │   450,000    │       550,000          │  │
+  │  │  1    │10K - 19K  │   320,000    │       230,000          │  │
+  │  │  2    │20K - 29K  │   180,000    │        50,000          │  │
+  │  │  3    │30K - 39K  │    95,000    │        30,000          │  │
+  │  │  4    │40K - 49K  │    50,000    │        20,000          │  │
+  │  │  5    │50K - 59K  │    25,000    │        12,000          │  │
+  │  │  6    │60K - 69K  │    12,000    │         5,000          │  │
+  │  │  7    │70K - 79K  │     5,000    │         2,000          │  │
+  │  │  8    │80K - 89K  │     2,000    │           500          │  │
+  │  │  9    │90K - 99K  │       500    │           100          │  │
+  │  │ 10    │100K+      │       100    │             0          │  │
+  │  └───────┴───────────┴──────────────┴────────────────────────┘  │
+  │                                                                  │
+  │  Rank computation for player with score 45,000:                  │
+  │  1. Bucket = 45,000 / 10,000 = 4                                 │
+  │  2. Cumulative higher count = 20,000                             │
+  │  3. Approximate rank = 20,000 + 1 = 20,001                       │
+  │  4. Error margin = plus or minus 50,000 (size of bucket 4)      │
+  │                                                                  │
+  │  Update: ZINCRBY on bucket 4 when a player's score changes.     │
+  │  O(1) update, O(number of buckets) for cumulative sum.          │
+  │  Memory: ~800 bytes for 100 buckets (negligible).               │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+The bucket array is updated by incrementing or decrementing the count for the relevant bucket. When a player's score moves from one bucket to another, both buckets are updated. The cumulative sum is recomputed periodically (every 1-5 seconds) or on demand.
+
+```python
+# Score bucket array operations
+class ScoreBucketArray:
+    def __init__(self, bucket_size=10000, num_buckets=100):
+        self.bucket_size = bucket_size
+        self.num_buckets = num_buckets
+        self.buckets = [0] * num_buckets
+        self.cumulative = [0] * num_buckets
+        self.cumulative_dirty = True
+
+    def update(self, old_score: int, new_score: int):
+        """Move a player from old_score to new_score."""
+        old_bucket = old_score // self.bucket_size
+        new_bucket = new_score // self.bucket_size
+        if old_bucket == new_bucket:
+            return  # No bucket change
+        if old_bucket < self.num_buckets:
+            self.buckets[old_bucket] -= 1
+        if new_bucket < self.num_buckets:
+            self.buckets[new_bucket] += 1
+        self.cumulative_dirty = True
+
+    def get_approximate_rank(self, score: int) -> int:
+        """Get approximate rank (1-based) for a given score."""
+        if self.cumulative_dirty:
+            self._recompute_cumulative()
+        bucket = score // self.bucket_size
+        if bucket >= self.num_buckets:
+            return 1  # Top score
+        # Count of players with higher score
+        return self.cumulative[bucket] + 1
+
+    def _recompute_cumulative(self):
+        total = 0
+        for i in range(self.num_buckets - 1, -1, -1):
+            self.cumulative[i] = total
+            total += self.buckets[i]
+        self.cumulative_dirty = False
+```
+
+### Data Structure 3: T-Digest for Percentile Estimation
+
+When you need to estimate percentiles (e.g., "what score puts you in the top 1 percent"), a t-digest data structure provides accurate estimates with minimal memory. The t-digest is a sketch data structure that approximates the cumulative distribution function of a dataset.
+
+<AsciiDiagram
+  id="leaderboard/deep-dive-tdigest"
+  title="T-Digest Structure for Percentile Estimation"
+  alt="T-digest showing centroids distributed across the score range, with tighter clustering in high-score regions for better accuracy at the tails"
+  caption="The t-digest partitions data into centroids. Centroid density is higher near the tails, providing better accuracy for extreme percentiles."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  T-DIGEST FOR PERCENTILE ESTIMATION                             │
+  │                                                                  │
+  │  Data: 1,000,000 player scores                                  │
+  │  Compression parameter: 100                                     │
+  │  Number of centroids: ~150                                      │
+  │  Memory: ~3 KB                                                  │
+  │  Error: plus or minus 0.1% at p99, plus or minus 1% at p50     │
+  │                                                                  │
+  │  Centroids (mean, count):                                       │
+  │                                                                  │
+  │   (100, 5000)  (5000, 12000)  (15000, 8000)  ...  (95000, 50)  │
+  │      │             │              │                  │          │
+  │      ▼             ▼              ▼                  ▼          │
+  │  ┌────────┐  ┌────────┐    ┌────────┐          ┌────────┐      │
+  │  │  0-1%  │  │  1-2%  │    │  2-3%  │  ...    │ 99-100%│      │
+  │  │ 100 pts│  │5000 pts│    │15000pts│          │95000pts│      │
+  │  │ 5000ppl│  │12000ppl│    │ 8000ppl│          │  50ppl │      │
+  │  └────────┘  └────────┘    └────────┘          └────────┘      │
+  │                                                                  │
+  │  Tight clustering at high scores (small centroids)              │
+  │  Loose clustering at low scores (large centroids)               │
+  │                                                                  │
+  │  Query: "What score is at the 99th percentile?"                 │
+  │  Walk centroids until cumulative count reaches 990,000.         │
+  │  Interpolate within the centroid to estimate the score.         │
+  │  Result: approximately 92,000 points.                            │
+  │                                                                  │
+  │  Query: "What percentile is score 45,000?"                      │
+  │  Walk centroids, sum counts below 45,000.                       │
+  │  Result: approximately 65th percentile.                          │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+The t-digest is useful for displaying percentile information alongside the leaderboard, such as "You are in the top 5 percent of players." It is not a replacement for the sorted set -- it is a complementary data structure that provides approximate percentile queries with minimal memory overhead.
+
+```python
+# T-Digest integration for leaderboard percentiles
+from tdigest import TDigest
+
+class LeaderboardPercentiles:
+    def __init__(self, compression=100):
+        self.digest = TDigest(compression=compression)
+
+    def update(self, score: int):
+        self.digest.update(score)
+
+    def get_percentile(self, score: int) -> float:
+        """Returns the percentile rank of a score (0.0 to 100.0)."""
+        return self.digest.percentile_rank(score) * 100
+
+    def get_score_at_percentile(self, percentile: float) -> float:
+        """Returns the score at the given percentile."""
+        return self.digest.percentile(percentile / 100)
+```
+
+---
+
+## Request Lifecycle
+
+Follow the full lifecycle of a score submission and leaderboard read through a production system.
+
+### Step 1: Client Submits Score
+
+The game client sends a POST request to `/api/v1/scores` with the player ID, game session ID, raw score, and metadata. The client includes an authentication token in the header.
+
+```http
+POST /api/v1/scores HTTP/1.1
+Host: game-api.example.com
+Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
+Content-Type: application/json
+
+{
+  "player_id": "player_42",
+  "game_session_id": "sess_abc123",
+  "raw_score": 15200,
+  "metadata": {
+    "level": 7,
+    "difficulty": "hard",
+    "duration_seconds": 340
+  }
+}
+```
+
+### Step 2: API Gateway Authentication and Rate Limiting
+
+The API gateway validates the JWT token, extracts the player ID, and checks the rate limit. The rate limit is enforced using a sliding window counter in Redis.
+
+```python
+# Rate limiting with sliding window
+async def check_rate_limit(player_id: str, max_requests: int = 1, window_seconds: int = 1):
+    key = f"ratelimit:score:{player_id}"
+    now = time.time()
+    window_start = now - window_seconds
+
+    # Remove old entries outside the window
+    await redis.zremrangebyscore(key, 0, window_start)
+
+    # Count current requests
+    count = await redis.zcard(key)
+
+    if count >= max_requests:
+        return False  # Rate limited
+
+    # Add current request
+    await redis.zadd(key, {f"{now}:{uuid4()}": now})
+    await redis.expire(key, window_seconds)
+    return True
+```
+
+### Step 3: Score Validation
+
+The score processor validates the payload against business rules. It checks that the game session exists, the raw score is within bounds, and the player is not on a banned list.
+
+```python
+async def validate_score(payload: dict) -> ScoreValidation:
+    errors = []
+
+    # Game session validation
+    session = await db.fetchrow(
+        "SELECT * FROM game_sessions WHERE id = $1 AND player_id = $2",
+        payload["game_session_id"], payload["player_id"]
+    )
+    if not session:
+        errors.append("Invalid game session")
+
+    # Score bounds
+    if not (0 <= payload["raw_score"] <= 999999):
+        errors.append("Score out of range")
+
+    # Player ban check
+    is_banned = await redis.sismember("banned_players", payload["player_id"])
+    if is_banned:
+        errors.append("Player is banned")
+
+    if errors:
+        return ScoreValidation(valid=False, errors=errors)
+
+    return ScoreValidation(valid=True, score_payload=payload)
+```
+
+### Step 4: Score Computation
+
+The score processor runs the game-specific score computation logic. Each game type has its own computation function registered in a lookup table.
+
+```python
+# Score computation registry
+SCORE_COMPUTATORS = {
+    "racing": compute_racing_score,
+    "puzzle": compute_puzzle_score,
+    "shooter": compute_shooter_score,
+    "sports": compute_sports_score,
+}
+
+async def compute_score(player_id: str, game_type: str, raw_score: int, metadata: dict) -> int:
+    computator = SCORE_COMPUTATORS.get(game_type)
+    if not computator:
+        raise ValueError(f"Unknown game type: {game_type}")
+
+    # Fetch player's current score for delta computation
+    current_score = await get_current_score(player_id)
+
+    # Compute new score
+    new_score = computator(raw_score, metadata, current_score)
+
+    # Apply score floor (scores cannot decrease below 0)
+    return max(0, new_score)
+```
+
+### Step 5: Redis Sorted Set Update
+
+The computed score is written to the Redis sorted set. The operation uses `ZADD` which handles both insert (new player) and update (existing player) cases.
+
+```python
+async def update_sorted_set(player_id: str, score: int, window_type: str, timestamp: float):
+    window_key = get_window_key(window_type, timestamp)
+    redis_key = f"leaderboard:{window_type}:{window_key}"
+
+    # ZADD returns 1 if new element, 0 if updated
+    is_new = await redis.zadd(redis_key, {player_id: score})
+
+    # Get old score for bucket array update
+    old_score = None
+    if not is_new:
+        old_score = await redis.zscore(redis_key, player_id)
+
+    # Set TTL
+    ttl = get_window_ttl(window_type)
+    await redis.expire(redis_key, ttl)
+
+    return ScoreUpdateResult(is_new=bool(is_new), old_score=old_score, new_score=score)
+```
+
+### Step 6: Conditional Cache Invalidation
+
+The system checks whether the new score qualifies for the top-N cache. If the score is below the current top-N minimum, the cache is not invalidated. This is the critical optimization that prevents cache thrashing.
+
+```python
+async def conditional_cache_invalidation(window_key: str, new_score: int, top_n: int = 100):
+    # Get the current minimum score for the top-N
+    min_score_key = f"cache:top{top_n}:min:{window_key}"
+    current_min = await redis.get(min_score_key)
+
+    if current_min is None:
+        # No cached top-N exists yet, or it expired
+        await refresh_top_n_cache(window_key, top_n)
+        return
+
+    current_min = int(current_min)
+
+    if new_score > current_min:
+        # New score qualifies for the top-N, invalidate cache
+        cache_key = f"cache:top{top_n}:{window_key}:0"
+        await redis.delete(cache_key)
+        # Also invalidate the min score key so it gets refreshed
+        await redis.delete(min_score_key)
+    # If new_score <= current_min, no cache invalidation needed
+```
+
+### Step 7: Score Persistence
+
+The score is written to the durable database. This is done asynchronously to avoid blocking the write path. The database write is idempotent -- if the same score is written twice, the second write is a no-op.
+
+```python
+async def persist_score_async(player_id: str, score: int, game_id: str, window_type: str, window_key: str, metadata: dict):
+    await db.execute(
+        """
+        INSERT INTO score_history
+            (player_id, score, game_id, window_type, window_key, metadata, achieved_at)
+        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        ON CONFLICT (player_id, window_type, window_key, achieved_at)
+        DO NOTHING
+        """,
+        player_id, score, game_id, window_type, window_key, json.dumps(metadata)
+    )
+```
+
+### Step 8: Client Requests Leaderboard
+
+The client sends a GET request to `/api/v1/leaderboard` with query parameters for the window type, offset, and limit.
+
+```http
+GET /api/v1/leaderboard?window=daily&offset=0&limit=100 HTTP/1.1
+Host: game-api.example.com
+Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
+```
+
+### Step 9: Cache Lookup
+
+The serving layer checks the cache for the requested leaderboard page. If the cache has the data, it returns immediately. If not, the request proceeds to the sorted set.
+
+```python
+async def get_cached_leaderboard(window_key: str, offset: int, limit: int):
+    cache_key = f"cache:top{limit}:{window_key}:{offset}"
+    cached = await cache.get(cache_key)
+
+    if cached:
+        return cached
+
+    return None  # Cache miss
+```
+
+### Step 10: Sorted Set Query
+
+On cache miss, the serving layer queries the Redis sorted set. The `ZREVRANGE` command returns the top N players starting from the given offset. The results are formatted and cached before returning.
+
+```python
+async def query_sorted_set(window_type: str, window_key: str, offset: int, limit: int):
+    redis_key = f"leaderboard:{window_type}:{window_key}"
+    results = await redis.zrevrange(redis_key, offset, offset + limit - 1, withscores=True)
+
+    entries = []
+    for i, (member, score) in enumerate(results):
+        player_id = member.decode() if isinstance(member, bytes) else member
+        entries.append({
+            "rank": offset + i + 1,
+            "player_id": player_id,
+            "score": int(score),
+        })
+
+    # Cache the result
+    cache_key = f"cache:top{limit}:{window_key}:{offset}"
+    response = {"entries": entries, "offset": offset, "count": len(entries)}
+    await cache.set(cache_key, response, ttl=30)
+
+    return response
+```
+
+### Step 11: Rank Query with Neighbors
+
+The client may also request the player's rank and the surrounding players. This is a combined query that uses `ZREVRANK` and `ZREVRANGE`.
+
+```python
+async def get_player_rank_with_neighbors(player_id: str, window_type: str, neighbor_count: int = 5):
+    window_key = get_current_window_key(window_type)
+    redis_key = f"leaderboard:{window_type}:{window_key}"
+
+    # Get rank (0-based)
+    rank_0 = await redis.zrevrank(redis_key, player_id)
+    if rank_0 is None:
+        return None  # Player not found
+
+    # Get neighbors
+    start = max(0, rank_0 - neighbor_count)
+    end = rank_0 + neighbor_count
+    neighbors = await redis.zrevrange(redis_key, start, end, withscores=True)
+
+    # Get player's score
+    score = await redis.zscore(redis_key, player_id)
+    total = await redis.zcard(redis_key)
+
+    return {
+        "rank": rank_0 + 1,
+        "score": int(score),
+        "total_players": total,
+        "percentile": round((rank_0 / total) * 100, 1) if total > 0 else 0,
+        "neighbors": [
+            {"rank": start + i + 1, "player_id": m.decode(), "score": int(s)}
+            for i, (m, s) in enumerate(neighbors)
+        ]
+    }
+```
+
+---
+
+## Consistency and State
+
+Leaderboard systems face four consistency scenarios that determine how scores are read and written.
+
+### Scenario 1: Read-Your-Writes Consistency
+
+A player submits a score and immediately requests their rank. The system must guarantee that the player sees their own score. This is the most common consistency requirement and the minimum acceptable guarantee.
+
+```python
+# Read-your-writes guarantee using session pinning
+async def submit_and_get_rank(player_id: str, score: int, window_type: str):
+    # Write to sorted set
+    window_key = get_current_window_key(window_type)
+    redis_key = f"leaderboard:{window_type}:{window_key}"
+    await redis.zadd(redis_key, {player_id: score})
+
+    # Pin the player's read to the primary Redis node for 5 seconds
+    await redis.set(f"pin:{player_id}", "primary", ex=5)
+
+    # Read from primary (forced by pin)
+    rank = await redis.zrevrank(redis_key, player_id)
+    return rank + 1
+```
+
+### Scenario 2: Eventual Consistency
+
+The leaderboard is replicated across multiple Redis replicas for read scalability. Reads from replicas may return stale data for up to 2 seconds. This is acceptable for most leaderboard use cases because a 2-second delay is invisible to players.
+
+```python
+# Eventual consistency read from replica
+async def get_leaderboard_eventual(window_type: str, offset: int, limit: int):
+    # Read from a read replica (may be slightly stale)
+    redis_replica = get_read_replica()
+    redis_key = f"leaderboard:{window_type}:{get_current_window_key(window_type)}"
+    results = await redis_replica.zrevrange(redis_key, offset, offset + limit - 1, withscores=True)
+    # Cache the result
+    return format_leaderboard_response(results, offset)
+```
+
+### Scenario 3: Strong Consistency for Critical Operations
+
+During tournament finals or competitions, the leaderboard must be strongly consistent. The system bypasses the cache and reads directly from the primary Redis node.
+
+```python
+# Strong consistency read from primary
+async def get_leaderboard_strong(window_type: str, offset: int, limit: int):
+    # Force read from primary Redis node
+    redis_primary = get_primary_redis()
+    redis_key = f"leaderboard:{window_type}:{get_current_window_key(window_type)}"
+    results = await redis_primary.zrevrange(redis_key, offset, offset + limit - 1, withscores=True)
+    return format_leaderboard_response(results, offset)
+```
+
+### Scenario 4: Score Discrepancy Resolution
+
+When two systems disagree on a player's rank (e.g., the player sees one rank on the mobile app and another on the website), the system must reconcile the discrepancy. The resolution uses the database as the source of truth.
+
+```python
+# Score discrepancy resolution
+async def resolve_score_discrepancy(player_id: str, window_type: str, window_key: str):
+    # Query the database for the authoritative score
+    db_score = await db.fetchval(
+        "SELECT MAX(score) FROM score_history "
+        "WHERE player_id = $1 AND window_type = $2 AND window_key = $3",
+        player_id, window_type, window_key
+    )
+
+    # Update the Redis sorted set with the authoritative score
+    redis_key = f"leaderboard:{window_type}:{window_key}"
+    await redis.zadd(redis_key, {player_id: db_score})
+
+    return db_score
+```
+
+---
+
+## Performance
+
+### Read Performance
+
+| Operation | Data Structure | Complexity | Latency (1M players) | Latency (10M players) |
+|---|---|---|---|---|
+| Top 100 query | Sorted set | O(log N + M) | 1-2ms | 2-4ms |
+| Single rank query | Sorted set | O(log N) | 0.5-1ms | 1-2ms |
+| Rank + neighbors | Sorted set | O(log N + M) | 1-3ms | 2-5ms |
+| Approximate rank | Bucket array | O(1) | 0.1ms | 0.1ms |
+| Percentile query | T-digest | O(K) | 0.5ms | 0.5ms |
+| SQL rank query | B-tree index | O(N) | 400ms | 4000ms |
+
+### Write Performance
+
+| Operation | Data Structure | Complexity | Latency (1M players) | Throughput (per second) |
+|---|---|---|---|---|
+| Single score update | Sorted set | O(log N) | 1-3ms | 50,000 |
+| Score + cache invalidation | Sorted set + cache | O(log N + 1) | 3-5ms | 20,000 |
+| Score + persistence | Sorted set + DB | O(log N + 1) | 5-10ms | 10,000 |
+| Batch score update | Pipeline | O(K log N) | 10-20ms | 100,000 |
+
+### Memory
+
+| Data Structure | Per-Entry Overhead | 1M Players | 10M Players |
+|---|---|---|---|
+| Redis sorted set | ~64 bytes | 64 MB | 640 MB |
+| Bucket array (100 buckets) | ~8 bytes per bucket | 800 bytes | 800 bytes |
+| T-digest (compression=100) | ~20 bytes per centroid | 3 KB | 3 KB |
+| Database (PostgreSQL) | ~200 bytes per row | 200 MB | 2 GB |
+
+---
+
+## Configuration
+
+### Redis Configuration for Leaderboards
+
+```yaml
+# redis.conf settings optimized for leaderboard workloads
+# Memory management
+maxmemory 8gb
+maxmemory-policy allkeys-lru  # Evict old keys when memory is full
+
+# Persistence
+save 900 1       # Save if at least 1 key changed in 900 seconds
+save 300 10      # Save if at least 10 keys changed in 300 seconds
+save 60 10000    # Save if at least 10,000 keys changed in 60 seconds
+
+# Networking
+timeout 300
+tcp-keepalive 60
+
+# Performance tuning
+hash-max-ziplist-entries 512
+hash-max-ziplist-value 64
+zset-max-ziplist-entries 128
+zset-max-ziplist-value 64
+```
+
+### Connection Pool Configuration
+
+```python
+# Redis connection pool for leaderboard operations
+REDIS_POOL_CONFIG = {
+    "min_connections": 10,
+    "max_connections": 100,
+    "health_check_interval": 30,
+    "timeout": 5.0,
+    "retry_on_timeout": True,
+    "max_retries": 3,
+}
+
+# Create separate pools for write and read operations
+write_pool = create_redis_pool("redis://primary:6379", **REDIS_POOL_CONFIG)
+read_pool = create_redis_pool("redis://replica:6379", **REDIS_POOL_CONFIG)
+```
+
+### Window Configuration
+
+```python
+# Leaderboard window configuration
+WINDOW_CONFIGS = {
+    "daily": {
+        "ttl_seconds": 86400 + 3600,  # 24 hours + 1 hour buffer
+        "key_format": "leaderboard:daily:%Y-%m-%d",
+        "archive_after_days": 90,
+        "cache_ttl_seconds": 30,
+        "top_n_cache_size": 100,
+    },
+    "weekly": {
+        "ttl_seconds": 604800 + 3600,  # 7 days + 1 hour buffer
+        "key_format": "leaderboard:weekly:%Y-%W",
+        "archive_after_days": 180,
+        "cache_ttl_seconds": 60,
+        "top_n_cache_size": 200,
+    },
+    "monthly": {
+        "ttl_seconds": 2592000 + 3600,  # 30 days + 1 hour buffer
+        "key_format": "leaderboard:monthly:%Y-%m",
+        "archive_after_days": 365,
+        "cache_ttl_seconds": 120,
+        "top_n_cache_size": 500,
+    },
+    "all_time": {
+        "ttl_seconds": 0,  # No expiration
+        "key_format": "leaderboard:all_time",
+        "archive_after_days": None,  # Never archive
+        "cache_ttl_seconds": 60,
+        "top_n_cache_size": 1000,
+    },
+}
+```
+
+### Monitoring Configuration
+
+```python
+# Prometheus metrics for leaderboard monitoring
+LEADERBOARD_METRICS_CONFIG = {
+    "write_latency_histogram": {
+        "name": "leaderboard_write_latency_ms",
+        "buckets": [1, 5, 10, 25, 50, 100, 250, 500],
+    },
+    "read_latency_histogram": {
+        "name": "leaderboard_read_latency_ms",
+        "buckets": [1, 5, 10, 25, 50, 100, 250, 500],
+    },
+    "cache_hit_rate_gauge": {
+        "name": "leaderboard_cache_hit_rate",
+    },
+    "sorted_set_size_gauge": {
+        "name": "leaderboard_sorted_set_size",
+        "labels": ["window_type", "shard"],
+    },
+    "write_throughput_counter": {
+        "name": "leaderboard_write_throughput",
+    },
+    "read_throughput_counter": {
+        "name": "leaderboard_read_throughput",
+    },
+}
+```
+
+### Alert Configuration
+
+```yaml
+# Alert rules for leaderboard health
+alerts:
+  high_write_latency:
+    condition: "p99_write_latency_ms > 200"
+    duration: "5m"
+    severity: "warning"
+    action: "Investigate Redis CPU or memory pressure"
+
+  low_cache_hit_rate:
+    condition: "cache_hit_rate < 0.80"
+    duration: "10m"
+    severity: "warning"
+    action: "Check cache invalidation logic, may be thrashing"
+
+  sorted_set_too_large:
+    condition: "sorted_set_size > 5000000"
+    duration: "5m"
+    severity: "warning"
+    action: "Consider sharding or archiving old windows"
+
+  high_error_rate:
+    condition: "error_rate > 0.01"
+    duration: "5m"
+    severity: "critical"
+    action: "Investigate score processing pipeline errors"
+
+  replication_lag:
+    condition: "replication_lag_ms > 5000"
+    duration: "2m"
+    severity: "critical"
+    action: "Check Redis replica health and network connectivity"
+```

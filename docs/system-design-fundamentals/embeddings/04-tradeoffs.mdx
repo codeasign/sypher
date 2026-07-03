@@ -1,0 +1,439 @@
+﻿---
+id: embeddings-tradeoffs
+title: Embeddings — Trade-offs and Failure Modes
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Core Tension
+
+When you build an embedding system, you are explicitly trading **accuracy for speed** at every layer of the stack.
+
+The embedding model itself: a larger model produces better vectors but takes longer to run. The index: a more thorough search finds better results but takes longer to query. The dimensionality: more dimensions capture more nuance but cost more to store and compare. The re-ranking: a cross-encoder produces better relevance scores but adds 10x the latency.
+
+Every decision in an embedding system is a slider between "perfect results, slow" and "good enough results, fast." The art is knowing where to set each slider for your specific use case — and that Goldilocks zone is different for every application.
+
+## Decision Matrix
+
+| Decision Point | Option A | Option B | Choose A When | Choose B When |
+|---------------|----------|----------|---------------|---------------|
+| Embedding model | Small (text-embedding-3-small) | Large (text-embedding-3-large) | Latency matters more than accuracy | Accuracy is the priority |
+| Vector dimensions | 256-512 | 1536-3072 | Storage/bandwidth constrained | Need maximum recall |
+| Index type | HNSW | IVF | Need fastest search | Building first, iterating |
+| Search mode | ANN | Brute force | Over 100K vectors | Under 100K vectors |
+| Quantization | None (float32) | PQ (int8) | Accuracy is critical | Memory is constrained |
+| Re-ranking | Cross-encoder | None | Quality is the top priority | Speed is the top priority |
+| Deployment | Self-hosted | API (OpenAI, Cohere) | High volume, stable load | Low volume, variable load |
+| Cache | Redis | None | 30%+ cache hit rate expected | Data changes too fast to cache |
+| Embedding strategy | Per-document | Per-chunk | Documents are short | Documents are long |
+| Update frequency | Batch (daily) | Streaming (real-time) | Stale results are acceptable | Freshness is critical |
+
+## CAP Theorem Positioning
+
+Embedding systems are **AP** (Available, Partition-tolerant) in the CAP theorem. They prioritize availability and partition tolerance over strong consistency.
+
+<AsciiDiagram title="Embedding System in a Network Partition" content={`
+  Before Partition:
+  ┌──────────────────────┐    ┌──────────────────────┐
+  │  Shard 1              │    │  Shard 2              │
+  │  [Vectors 1-500K]     │────│  [Vectors 500K-1M]   │
+  │  QPS: 500             │    │  QPS: 500             │
+  └──────────────────────┘    └──────────────────────┘
+                              │
+  After Partition:            │
+  ┌──────────────────────┐    │  ┌──────────────────────┐
+  │  Shard 1              │    │  │  Shard 2              │
+  │  [Vectors 1-500K]     │  X │  │  [Vectors 500K-1M]   │
+  │  QPS: 500             │    │  │  QPS: 500             │
+  │  Status: Healthy      │    │  │  Status: Isolated     │
+  └──────────────────────┘    │  └──────────────────────┘
+                              │
+  What happens: Shard 1 keeps serving (Available).
+  Shard 2 cannot be reached, but writes are queued.
+  Results are partial until the partition heals.
+`} />
+
+**What this means in practice:**
+- The system continues serving queries even when some shards are unreachable
+- Results may be incomplete during a partition
+- Writes are accepted but may not be visible immediately
+- When the partition heals, the writes are replayed and the index catches up
+
+**What CP would look like:** A CP embedding system would reject all queries during a partition (because it cannot guarantee complete results). This is acceptable for some use cases (e.g., financial compliance search) but terrible for most user-facing applications.
+
+## Failure Modes
+
+### Failure 1: Index Skew
+
+**What happens:** One shard of the index grows much larger than the others. Queries to that shard become 10x slower. The system's p99 latency spikes.
+
+**Why it happens:** The data partition strategy (e.g., hash-based sharding) doesn't account for uneven distribution of data. If one category has 10x more documents than others, the shard responsible for that category becomes overloaded.
+
+<AsciiDiagram title="Index Skew — Unbalanced Shards" content={`
+  Healthy:                    Skewed:
+  ┌────────┐ ┌────────┐      ┌────────────────┐ ┌────────┐
+  │Shard 1 │ │Shard 2 │      │   Shard 1       │ │Shard 2 │
+  │ 500K   │ │ 500K   │      │   2.5M           │ │ 500K   │
+  │ 10ms   │ │ 10ms   │      │   50ms           │ │ 10ms   │
+  └────────┘ └────────┘      └────────────────┘ └────────┘
+`} />
+
+**Blast radius:** The slow shard slows down every query that spans all shards (global search). Even if 9 out of 10 shards respond in 10ms, the query waits for the slowest one.
+
+**Detection:** Monitor shard vector count and shard-level p99 latency. An alert triggers when any shard is 30% larger than the median.
+
+**Recovery:** Rebalance the shards. This requires rebuilding the index with a better partition strategy. Consistent hashing with virtual nodes reduces the impact of skew but doesn't eliminate it.
+
+### Failure 2: Cache Stampede
+
+**What happens:** A popular query expires from the cache simultaneously, and thousands of requests hit the embedding service and index at once. The system falls over.
+
+**Why it happens:** Cache entries have the same TTL. When they expire together, the load multiplies instantly.
+
+**Blast radius:** The embedding service (GPU) becomes overloaded, queries back up, and the API starts returning 503 errors. The cascading failure can take down the entire search endpoint.
+
+**Detection:** Latency spikes from 30ms to 10s. Error rate jumps. Cache hit rate drops to near zero.
+
+**Recovery:** Add jitter to cache TTLs (randomize within +/- 30% of the base TTL). Implement a circuit breaker that falls back to a simpler search (e.g., keyword search) when the embedding service is overwhelmed.
+
+### Failure 3: Model Drift
+
+**What happens:** The embedding model is updated, and the new vectors are in a different space. Old and new vectors cannot be compared. Search quality drops dramatically.
+
+**Why it happens:** Someone deploys a new version of the embedding model without rebuilding the index. The index holds vectors from the old model, but queries produce vectors from the new model.
+
+**Blast radius:** Every query returns garbage results. Users see completely irrelevant search results. Trust in the system erodes.
+
+**Detection:** A sudden drop in click-through rate (CTR) on search results, or a spike in "no results found" queries.
+
+**Recovery:** Roll back to the old model version immediately. Rebuild the index with the new model before re-deploying. This is why you should never delete the old index until the new one is verified.
+
+### Failure 4: Memory Exhaustion
+
+**What happens:** The HNSW graph grows beyond the allocated memory. The process starts swapping, and latency spikes by 100x.
+
+**Why it happens:** The HNSW graph overhead is 2-5x the vector data. Teams often estimate only the vector storage and forget the graph overhead.
+
+**Blast radius:** The index node becomes unresponsive. If it's a critical shard, that shard's data is unavailable. If the shard has no replicas, queries are incomplete.
+
+**Detection:** Memory usage steadily climbing past 85%. Swap usage growing. GC pauses becoming longer.
+
+**Recovery:** Add more memory or switch to a more memory-efficient index (IVF with PQ). The immediate fix is to restart the node and reduce the efConstruction parameter to limit graph connections.
+
+### Failure 5: Cold Start
+
+**What happens:** A new index is built with no data, and queries return empty results until enough vectors are indexed.
+
+**Why it happens:** This is the normal state when deploying a new system, but it catches teams by surprise when they migrate indexes or start fresh.
+
+**Blast radius:** The search feature is effectively broken for the first few hours to days of operation.
+
+**Detection:** Zero results returned for all queries. Search metrics show 0% recall.
+
+**Recovery:** Pre-populate the index with a bulk import of existing documents before enabling query traffic. Use a blue-green deployment: build the full index offline, then swap traffic.
+
+## Anti-Patterns Hall of Shame
+
+### Anti-Pattern 1: One Vector Per Document
+
+**The mistake:** Embedding entire documents (50-page research papers) as a single vector.
+
+**Why it seemed reasonable:** It's simpler — one vector per document, one-to-one mapping.
+
+**What went wrong:** The single vector captured the document's general topic but missed all the specific details. A query for "neural network training tricks" found a paper about deep learning but couldn't pinpoint the section about learning rate scheduling. The user had to search within the document.
+
+**The correct pattern:** Chunk documents into smaller pieces (paragraphs, 256-512 token windows) and embed each chunk separately. Store the chunk-to-document mapping so you can reconstruct the full context for display.
+
+### Anti-Pattern 2: Using the Same Embeddings for Search and Classification
+
+**The mistake:** Using the same vector index for both semantic search and document classification.
+
+**Why it seemed reasonable:** "We already have the vectors — why not reuse them?"
+
+**What went wrong:** Embedding models optimized for search produce vectors that are good at measuring pairwise similarity but bad at forming clean class boundaries. Classification accuracy was 15% lower than a dedicated classifier.
+
+**The correct pattern:** Use a dedicated embedding model fine-tuned for classification (or a separate classifier model) for classification tasks. Search and classification have different objective functions.
+
+### Anti-Pattern 3: No Query Normalization
+
+**The mistake:** Not normalizing the query vector before searching.
+
+**Why it seemed reasonable:** The raw model output "should be fine."
+
+**What went wrong:** Without normalization, the vector length affected the similarity score. Long queries (many words) produced long vectors that scored higher than short queries, even when the short query was more relevant. Cosine similarity with unnormalized vectors isn't equivalent to cosine similarity — it's a mix of angle and magnitude.
+
+**The correct pattern:** Always L2-normalize both index and query vectors to unit length. Verify that normalization logic is identical in both pipelines.
+
+### Anti-Pattern 4: Ignoring the Filter Step
+
+**The mistake:** Building a vector index with no metadata filtering, then trying to add post-search filtering.
+
+**Why it seemed reasonable:** "We can just filter out results that don't match the category after the search."
+
+**What went wrong:** A query for "Python courses" returned 100 results, but 95 were in the wrong category. The post-filter removed them, leaving only 5 results. The user saw a nearly empty page. The pre-filter search didn't know about categories, so it wasted 95% of its effort.
+
+**The correct pattern:** Use a filtered vector index (IVF with inverted index per filter field, or a HNSW variant that supports metadata filtering). The filter should be applied during the search, not after.
+
+### Anti-Pattern 5: Over-Indexing
+
+**The mistake:** Embedding every field of every document, including fields that carry no semantic meaning (IDs, timestamps, internal codes).
+
+**Why it seemed reasonable:** "More data in the vector means better search."
+
+**What went wrong:** The embedding model wasted dimensions on meaningless patterns. An internal product code like "PRD-48291-X" dominated the vector because it was a distinctive token. A search for "red shoes" found a product whose code happened to be similar to the query vector. And the index was 30% larger than necessary.
+
+**The correct pattern:** Be selective about what you embed. Only include fields that carry semantic meaning. IDs, timestamps, and internal codes should be stored as metadata, not included in the embedding text.
+
+## When NOT to Use This
+
+Embeddings are not the right tool for every problem. Here are concrete signals that you should use something simpler:
+
+**Signal 1: Your data is small.** If you have fewer than 10,000 documents, a brute-force search with TF-IDF or BM25 will be faster and more interpretable. Don't bring in embeddings for small datasets.
+
+**Signal 2: Exact matches are what you need.** If users are searching for product codes, usernames, or other exact identifiers, a simple database index (B-tree or hash) is faster, cheaper, and more accurate.
+
+**Signal 3: Your domain is highly specialized.** If you're searching medical records, legal documents, or scientific papers with specialized vocabulary, a general-purpose embedding model may underperform. You need a domain-specific fine-tuned model or a traditional search engine tuned for your domain.
+
+**Signal 4: You need interpretable results.** Embeddings are black boxes. You can't explain why a result appeared. If your application requires explainability (regulatory compliance, debugging), consider a keyword-based system where you can show exactly which terms matched.
+
+**Signal 5: Your latency requirements are extremely tight.** If you need sub-5ms query latency, embedding models (even the fastest) add 5-15ms just for inference. A keyword-based index can return results in 1-2ms.
+
+**At what scale does this become necessary?** Embeddings start to shine when you have over 100,000 documents, and users are searching with natural language queries that don't match exact keywords. For most applications, this means 500K+ documents before you see a significant improvement over keyword search.
+
+### Cost-Benefit Analysis
+
+The real cost of an embedding system reaches far beyond the API bill or GPU rental. Four components dominate the total cost of ownership: compute (model inference), storage (vectors and index structures), networking (data transfer between services), and operations (monitoring, maintenance, incident response). Each scales differently, and the optimal architecture shifts as you grow.
+
+**GPU Compute vs API Costs at Different Scales:**
+
+At low volume (under 100K documents and under 1M queries per month), API-based embedding services from OpenAI, Cohere, or Voyage AI are the clear winner. You pay roughly $0.10 to $1.30 per 1M input tokens with no upfront hardware cost. At this scale, a self-hosted GPU sits idle most of the time, wasting capacity and engineering hours on setup and maintenance.
+
+At medium volume (1M to 10M documents, 10M to 100M queries per month), the economics begin to flip. A single NVIDIA A10G or L4 GPU handles roughly 50 to 100 embedding requests per second. At 50M queries per month, you need about 200 to 400 GPU-hours, costing roughly $800 to $1,600 per month on a cloud GPU instance — compared to $2,500 to $6,500 per month for the API equivalent at scale. The break-even point typically lands around 500K documents with moderate query volume.
+
+At high volume (100M+ queries per month), self-hosting is dramatically cheaper. A dedicated cluster of 4 to 8 GPUs costs $8,000 to $15,000 per month including compute nodes, attached storage, and networking. The API equivalent would cost $25,000 to $50,000 per month. At this scale you also gain control over latency (no shared-tenant noise), batching (you can pack 64 to 128 texts per GPU call), and model choice (you can swap models without renegotiating API contracts).
+
+**Storage Costs: RAM is Expensive, SSD is Cheap:**
+
+This is the most commonly underestimated cost in embedding systems. Raw vector data is only part of the story.
+
+A 1M-document index at 768 dimensions (float32) needs about 3 GB for the raw vectors. But the HNSW graph structure adds 2x to 5x overhead, pushing you to 6 to 15 GB of RAM. At roughly $0.10 per GB per hour for cloud RAM, that equals $430 to $1,080 per month just for the index node memory — before any compute costs.
+
+SSD-based indices like DiskANN or IVF with Product Quantization can reduce RAM costs by 90 percent. The vectors live on SSD, and only the compressed quantized version lives in RAM. Query latency increases from roughly 5 ms to 15 to 25 ms, but the cost drops from $1,000 per month to $100 per month for the same 1M vectors.
+
+The rule of thumb: if your index fits in 32 GB of RAM, use HNSW in memory. If it needs 128 GB or more, strongly consider DiskANN or a quantized index. If it needs 1 TB or more, you should be using a distributed system regardless of index type.
+
+<AsciiDiagram id="embeddings/cost-breakdown" title="Cost Component Breakdown Per Scale" content={`
+  Cost Component Breakdown (Monthly, USD):
+  ┌──────────────────────┬──────────────┬──────────────┬──────────────┐
+  │ Component            │ Small (10K)  │ Med (1M)     │ Large (10M)  │
+  ├──────────────────────┼──────────────┼──────────────┼──────────────┤
+  │ GPU Compute          │      $200    │    $3,000    │    $12,000   │
+  │ Vector Storage (RAM) │       $50    │      $500    │     $4,000   │
+  │ API Inference Calls  │      $100    │    $2,500    │     $8,000   │
+  │ Networking / BW      │       $30    │      $200    │     $1,500   │
+  │ Operations / SRE     │      $300    │    $1,000    │     $3,000   │
+  ├──────────────────────┼──────────────┼──────────────┼──────────────┤
+  │ Total (Self-Host)    │      $680    │    $5,200    │    $28,500   │
+  │ Total (API + Managed)│      $430    │    $7,800    │    $31,000   │
+  └──────────────────────┴──────────────┴──────────────┴──────────────┘
+  At medium scale self-hosting breaks even. At large scale it wins.
+`} />
+
+**When Managed Services Make Financial Sense:**
+
+| Factor | Managed (Pinecone, Weaviate Cloud) | Self-Hosted (Milvus, Qdrant) |
+|---|---|---|
+| Setup time | Hours | Weeks |
+| Maintenance burden | Zero | Significant |
+| Latency control | Limited | Full control |
+| GPU embedding included | Extra cost | Full control |
+| Cost at 10K docs | $100 to $300 per month | $300 to $800 per month |
+| Cost at 1M docs | $1,000 to $3,000 per month | $800 to $2,000 per month |
+| Cost at 10M docs | $8,000 to $15,000 per month | $4,000 to $8,000 per month |
+
+Managed services shine when your engineering team is small and your query volume is moderate. They lose their advantage above roughly 5M vectors and 100K queries per day, where the flat monthly fee starts exceeding well-optimized self-hosted infrastructure.
+
+**Total Cost of Ownership Comparison:**
+
+| Scale | API Only | Managed DB | Self-Hosted |
+|---|---|---|---|
+| Small (10K docs, 10K queries per day) | $100 to $300 | $200 to $500 | Too expensive for this scale |
+| Medium (1M docs, 50K queries per day) | $3,000 to $5,000 | $1,500 to $3,500 | $1,200 to $2,500 |
+| Large (10M docs, 500K queries per day) | $25,000 to $50,000 | $10,000 to $18,000 | $5,000 to $12,000 |
+
+The managed versus self-hosted decision should be revisited every six to twelve months as your scale changes. What made financial sense at 100K documents may be leaving thousands of dollars on the table at 5M.
+
+### Scaling Deep Dive
+
+**Horizontal Scaling Challenges Specific to Embeddings:**
+
+Unlike stateless web services where you add instances behind a load balancer, embedding indices are stateful and graph-based. You cannot simply spin up another HNSW instance and expect it to help. The vector graph is a single data structure that must either be partitioned (sharded) or replicated.
+
+Sharding splits the vector space across multiple nodes. Each shard builds its own independent HNSW graph. A query is broadcast to all shards, and results are merged. This works well but introduces the "recall tax": with 10 shards, you might ask each shard for the top 10 results and get 100 candidates, but the true top 10 might all reside on one shard. You need to query each shard for more results (top-k times shards times an oversampling factor) to compensate.
+
+**Rebalancing Shards When the Index Grows Unevenly:**
+
+Hash-based sharding distributes vectors by the hash of their document ID. This is simple but fragile: if one category has significantly more documents, the hashes concentrate on a subset of shards, producing index skew.
+
+Consistent hashing mitigates this by assigning each shard multiple hash ranges called virtual nodes. When a shard grows hot, its virtual nodes can be migrated to less-loaded shards. But this migration requires rebuilding the HNSW graph for the moved vectors — a CPU and memory-intensive operation that can take hours for large indices.
+
+<AsciiDiagram id="embeddings/shard-rebalancing" title="Shard Rebalancing Process" content={`
+  Shard Rebalancing Process:
+                                          ┌──────────────────────┐
+  Before:                                │  Monitoring System   │
+  ┌────────────┐ ┌────────────┐ ┌──────┐ │  Shard 1 p99 = 45ms │
+  │ Shard 0    │ │ Shard 1    │ │Shard2│ │  Load imbalance     │
+  │ 200K vecs  │ │ 800K vecs  │ │200K  │ │  detected           │
+  │ 8ms p99    │ │ 45ms p99   │ │9ms   │ └─────────┬───────────┘
+  └────────────┘ └────────────┘ └──────┘           │
+                                                    ▼
+                                           ┌────────────────────┐
+                                           │ Rebalance Ops      │
+                                           │ 1. Pause writes    │
+                                           │    to Shard 1      │
+                                           │ 2. Read + hash     │
+                                           │    redistribute    │
+                                           │ 3. Split into two  │
+                                           │    new shards      │
+                                           │ 4. Rebuild HNSW    │
+                                           │    graph per shard │
+                                           │ 5. Redirect traffic│
+                                           └────────────────────┘
+                                                    │
+                                                    ▼
+  After:                                 New node added
+  ┌────────────┐ ┌────────────┐ ┌──────┐ ┌────────────┐
+  │ Shard 0    │ │ Shard 1    │ │Shard2│ │ Shard 3    │
+  │ 200K vecs  │ │ 300K vecs  │ │200K  │ │ 300K vecs  │
+  │ 8ms p99    │ │ 12ms p99   │ │9ms   │ │ 11ms p99   │
+  │ Balanced   │ │ Balanced   │ │Balanced│ │ Balanced   │
+  └────────────┘ └────────────┘ └──────┘ └────────────┘
+  Rebalance complete: all shards within 15% of median.
+`} />
+
+**The Trade-Off: More Shards vs Fewer Shards:**
+
+More shards means each shard's graph is smaller, so graph traversal is faster. But every query must visit all shards, adding network round-trips and merge overhead. The practical sweet spot is 4 to 16 shards for most production systems.
+
+Fewer shards means each graph has more vectors, so recall is higher — the graph is a better approximation of the full vector space. But each graph traversal is slower, and per-query latency increases.
+
+The optimal shard count depends on your vector count and latency budget:
+- Under 500K vectors: 1 to 2 shards (no sharding needed)
+- 500K to 10M vectors: 4 to 8 shards
+- 10M to 100M vectors: 8 to 32 shards
+- Over 100M vectors: 32 to 128 shards
+
+**Hot Shard Mitigation Strategies:**
+
+When one shard receives disproportionate traffic — for example, a celebrity vector that gets searched more often than all others — that shard becomes a bottleneck. Mitigation strategies include:
+
+1. **Read replicas:** Create copies of the hot shard and load-balance queries across them. This helps with read-heavy hot shards but does not help with write-heavy ones, where the write bottleneck remains.
+
+2. **Consistent hashing with weight adjustment:** Dynamically increase the number of virtual nodes for hot shards to spread their load across more physical nodes. This is effective but requires careful monitoring to avoid oscillation.
+
+3. **Popularity-aware partitioning:** Separate frequently queried vectors into their own partition. Hot topics live in a small, fast partition that can be heavily replicated, while cold data lives in a larger, cheaper partition.
+
+4. **Adaptive query routing:** Monitor shard-level latency and route fewer queries to slow shards, allowing them to catch up. This is effectively a circuit breaker at the shard level and pairs well with read replicas.
+
+### Embedding Model Selection Guide
+
+**Open-Source vs Proprietary Embedding Models:**
+
+Open-source models — BGE, E5, GTE, MiniLM, Jina Embeddings — offer full control over deployment, zero per-token costs, and the ability to fine-tune on your specific domain. The trade-off is operational complexity: you need GPU infrastructure, model hosting, and ongoing maintenance.
+
+Proprietary models — OpenAI text-embedding-3-small and large, Cohere Embed v3, Voyage AI — charge per token but offer zero operational overhead. They also benefit from continuous improvement by the provider. OpenAI silently updates text-embedding-3 models every few months, potentially improving quality without any work on your side.
+
+The meaningful accuracy gap between open-source and proprietary models has been shrinking rapidly. As of mid-2026, BGE-Large and E5-Mistral-7B are within 1 to 2 points of the best proprietary models on general-domain MTEB benchmarks. For specific domains, fine-tuned open-source models often outperform general-purpose proprietary models.
+
+**The MTEB Leaderboard: What It Measures and Its Limitations:**
+
+The Massive Text Embedding Benchmark evaluates models across eight tasks: classification, clustering, pair classification, re-ranking, retrieval, semantic textual similarity, summarization, and bitext mining. It scores each task separately and reports a macro average.
+
+MTEB limitations are significant:
+- **General-domain bias:** Most MTEB tasks use Wikipedia, news articles, or Reddit. Performance on these domains does not predict performance on legal contracts, medical literature, or internal company documentation.
+- **English dominance:** Most tasks are English-only. Multilingual performance is poorly reflected in the overall score.
+- **Score compression:** The difference between the 10th-ranked and 1st-ranked model on MTEB is often only 2 to 3 points. This makes it hard to distinguish genuinely better models from noise.
+- **No speed or cost axis:** MTEB measures only accuracy, not inference speed, memory usage, or cost. The best-scoring model may be 50 times slower and 100 times more expensive than a slightly lower-scoring alternative.
+
+Use MTEB as a starting filter, not a final decision. Eliminate models that score poorly on the tasks relevant to your use case, then evaluate the remaining candidates on your specific data.
+
+**Model Size vs Inference Speed Trade-Off:**
+
+| Model | Parameters | MTEB Score | Latency per Query | VRAM Needed |
+|---|---|---|---|---|
+| MiniLM-L6-v2 | 22M | 56.8 | 3 to 5 ms | 0.5 GB |
+| BGE-Small | 100M | 59.3 | 8 to 12 ms | 0.8 GB |
+| text-embedding-3-small | ~150M | 62.3 | 10 to 15 ms | API only |
+| BGE-Large | 326M | 63.2 | 15 to 25 ms | 2.5 GB |
+| Cohere Embed v3 | ~500M | 63.8 | 20 to 30 ms | API only |
+| text-embedding-3-large | ~350M | 64.1 | 15 to 25 ms | API only |
+| E5-Mistral-7B | 7B | 65.5 | 80 to 150 ms | 32 GB |
+
+A 2-point MTEB gain from doubling model size is common. Whether those 2 points matter depends on your application. For a FAQ search, probably not. For medical diagnosis retrieval, it might be life-critical.
+
+**How to Evaluate on Your Specific Domain:**
+
+Never trust MTEB alone. Build a domain-specific evaluation set:
+
+1. Collect 500 to 1,000 query-document pairs from your actual use case. Real user queries, real documents — not synthetic data.
+2. Have domain experts score relevance on a 0 to 3 scale for each pair.
+3. Compute recall at k and NDCG at k for each candidate model.
+4. Run a blind A/B comparison: show results from two models side by side to domain experts without revealing which model produced which result.
+
+A model that scores 2 points lower on MTEB but 5 points higher on your domain-specific evaluation is the better choice. This is surprisingly common — especially for specialized domains like legal, medical, or code search.
+
+**When to Fine-Tune vs Use a General-Purpose Model:**
+
+Fine-tuning makes sense when (a) you have at least 10,000 labeled query-document pairs in your domain, and (b) the general-purpose model's recall at 10 is below 80 percent on your evaluation set.
+
+If you have fewer than 10,000 labeled pairs, fine-tuning may hurt more than it helps. The model forgets its general knowledge and learns noise from your small dataset. This phenomenon is called catastrophic forgetting and is especially pronounced in embedding models.
+
+If your domain recall is already above 85 percent with a general-purpose model, the return on investment of fine-tuning is usually negative. The engineering effort, training costs, data pipeline, and ongoing maintenance of a custom model outweigh the marginal improvement.
+
+**The Cost of Model Switching:**
+
+Switching embedding models requires re-embedding every document in your index. For a 10M-document corpus:
+
+- API-based re-embedding: 10M documents at $0.0001 per 1K tokens times 300 tokens average equals $300 in API costs, plus days of wall-clock time due to rate limits.
+- Self-hosted re-embedding: 10M documents at 50 requests per second throughput times batch size 64 equals roughly one hour on a single GPU, with zero marginal API cost.
+
+The hidden cost is validation. After re-indexing, you must re-validate search quality against your domain-specific evaluation set. If the new embeddings are worse, you roll back. This requires keeping the old index running in parallel, which doubles storage costs during the transition period.
+
+The takeaway: choose your embedding model carefully the first time. Model switching is expensive enough that teams often stick with a suboptimal model for 6 to 12 months rather than pay the re-indexing tax.
+
+<AsciiDiagram id="embeddings/model-comparison" title="Embedding Model Selection Dimensions" content={`
+  Embedding Model Selection By Use Case:
+  ┌─────────────────────┬────────────────────────┬────────────────────┐
+  │ Use Case            │ Recommended Model      │ Reason              │
+  ├─────────────────────┼────────────────────────┼────────────────────┤
+  │ General search      │ text-embedding-3-small  │ Best quality-per-  │
+  │                     │ or BGE-Small           │ dollar ratio        │
+  ├─────────────────────┼────────────────────────┼────────────────────┤
+  │ High-accuracy       │ E5-Mistral-7B or       │ Best MTEB scores    │
+  │ retrieval           │ text-embedding-3-large  │ but 5x slower       │
+  ├─────────────────────┼────────────────────────┼────────────────────┤
+  │ Real-time search    │ MiniLM-L6-v2 or         │ Sub-5ms inference   │
+  │ under 10ms          │ BGE-Small              │ with minimal GPU    │
+  ├─────────────────────┼────────────────────────┼────────────────────┤
+  │ Self-hosted with    │ BGE-Small + PQ         │ Quantization drops  │
+  │ limited RAM         │ (int8 quantization)    │ RAM use by 75%      │
+  ├─────────────────────┼────────────────────────┼────────────────────┤
+  │ Legal or medical    │ Fine-tuned BGE-Large   │ Domain-specific     │
+  │ domain search       │ or E5-base             │ beats general 2:1   │
+  ├─────────────────────┼────────────────────────┼────────────────────┤
+  │ Code search         │ Voyage Code or         │ Trained on code     │
+  │                     │ Stella-base-v5         │ semantics           │
+  ├─────────────────────┼────────────────────────┼────────────────────┤
+  │ Multilingual        │ Cohere Embed v3 or     │ Multi-language      │
+  │ search              │ BGE-M3                 │ vector alignment    │
+  ├─────────────────────┼────────────────────────┼────────────────────┤
+  │ Budget-constrained  │ BGE-Small or Ada-002   │ Lowest cost per     │
+  │ high volume         │ (API)                  │ query at scale      │
+  └─────────────────────┴────────────────────────┴────────────────────┘
+`} />
+
+---
+
+On the next page, you'll see how real companies like Netflix, Spotify, and Pinterest use embeddings in production — the specific problems they solved, the architectures they built, and the lessons they learned the hard way.

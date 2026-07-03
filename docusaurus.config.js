@@ -48,11 +48,11 @@ const config = {
       items: [
         // === TOPICS ===
         // Claude Code inserts new items here. Do not remove these markers.
-                                { type: 'docSidebar', sidebarId: 'playwrightMastery', position: 'left', label: 'Playwright Mastery' },
-                                { type: 'docSidebar', sidebarId: 'pythonForAi', position: 'left', label: 'Python for AI' },
+                                                                { type: 'docSidebar', sidebarId: 'pythonForAi', position: 'left', label: 'Python for AI' },
                                 { type: 'docSidebar', sidebarId: 'agenticAiFundamentals', position: 'left', label: 'Agentic AI Fundamentals' },
                                 { type: 'docSidebar', sidebarId: 'systemDesignFundamentalsSidebar', position: 'left', label: 'System Design' },
-        // === /TOPICS ===
+                                                                { type: 'docSidebar', sidebarId: 'gitGithubActionsSidebar', position: 'left', label: 'Git & GitHub Actions' },
+                                        // === /TOPICS ===
       ],
     },
     prism: {

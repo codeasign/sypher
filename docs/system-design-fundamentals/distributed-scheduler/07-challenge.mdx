@@ -1,0 +1,542 @@
+---
+id: distributed-scheduler-challenge
+title: Distributed Scheduler Pattern -- Challenges
+sidebar_label: Challenges
+sidebar_position: 7
+---
+
+## Tier 1 -- Foundation
+
+These challenges test your understanding of the fundamental concepts. Each challenge includes a model answer. Complete them before moving to harder tiers.
+
+### Challenge 1.1 -- Single-Node Scheduler with Crash Recovery
+
+**Problem**: You are building a scheduler for a small deployment handling 500 tasks per hour. The scheduler runs on a single machine. The key requirement is that tasks must survive process crashes. If the scheduler process dies and restarts, all pending tasks must be recovered and executed.
+
+**Requirements**:
+- 500 tasks per hour, evenly distributed across the hour
+- Task delays range from 30 seconds to 24 hours
+- Tasks must survive process crashes
+- The scheduler must not miss a task by more than 60 seconds after recovery
+- The scheduler runs on a single machine with a local filesystem
+- The scheduler can be down for up to 2 minutes during a restart
+
+**Model Answer**:
+
+**Data model**: Use SQLite as the backing store. SQLite is embedded, requires no separate server process, and provides ACID transactions. The schema has a single table:
+
+```sql
+CREATE TABLE tasks (
+  id            TEXT PRIMARY KEY,
+  task_type     TEXT NOT NULL,
+  payload       TEXT NOT NULL,
+  trigger_at    INTEGER NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'PENDING',
+  worker_id     TEXT,
+  lease_until   INTEGER,
+  retry_count   INTEGER DEFAULT 0,
+  max_retries   INTEGER DEFAULT 3,
+  created_at    INTEGER NOT NULL
+);
+
+CREATE INDEX idx_pending_tasks
+  ON tasks (trigger_at)
+  WHERE status = 'PENDING';
+```
+
+The partial index only indexes PENDING tasks, keeping the index small and fast.
+
+**Crash recovery logic**: On startup, the scheduler runs a recovery scan:
+
+```python
+def recover():
+    conn = sqlite3.connect('tasks.db')
+    now = int(time.time())
+    # Find tasks that were LEASED but should have completed
+    conn.execute(
+        "UPDATE tasks SET status = 'PENDING', worker_id = NULL, "
+        "lease_until = NULL "
+        "WHERE status = 'LEASED' AND lease_until < ?",
+        (now,)
+    )
+    # Find tasks that are PENDING and past their trigger time
+    overdue = conn.execute(
+        "SELECT * FROM tasks WHERE status = 'PENDING' AND trigger_at <= ?",
+        (now,)
+    ).fetchall()
+    conn.commit()
+    return overdue
+```
+
+This handles the mid-execution crash case. If the scheduler crashed while a task was LEASED, the recovery scan finds the expired lease and resets the task to PENDING. The task is then executed immediately.
+
+**Mid-execution crash edge case**: The lease_until column is the key. When a worker claims a task, it sets status = 'LEASED' and lease_until = now() + 30 seconds. If the process crashes, the lease_until stays in the database. On recovery, the scan finds all tasks where status = 'LEASED' AND lease_until < now() and resets them. A task that was claimed 5 seconds before the crash has lease_until = crash_time + 25 seconds, which is still in the future. The recovery scan skips it. After 30 seconds from the claim, the task is reset. This is correct: the task had 30 seconds to complete before being reclaimed.
+
+**Worst-case delay calculation**: A task's trigger time is during a 2-minute scheduler outage. The scheduler is down for 2 minutes. On restart, the recovery scan immediately finds the task (its trigger time is in the past) and executes it. The worst-case delay is the outage duration plus the poll interval. If the outage is 2 minutes and the poll interval is 30 seconds, the worst-case delay is 2 minutes 30 seconds. This exceeds the 60-second requirement.
+
+**Fix**: The poll interval must be 30 seconds or less. With a 30-second poll interval, the worst-case delay is 2 minutes (outage) plus 30 seconds (poll) = 2 minutes 30 seconds. This still exceeds 60 seconds.
+
+**Better fix**: The recovery scan should execute overdue tasks immediately, not wait for the next poll cycle. The recover() function returns the overdue tasks, and the scheduler executes them before entering the poll loop. This eliminates the poll interval from the recovery path. The worst-case delay becomes the outage duration: 2 minutes. Still exceeds 60 seconds.
+
+**Final fix**: The scheduler must restart in under 30 seconds. If the process starts every 30 seconds (via a watchdog or supervisor), the worst-case delay is 30 seconds (restart time) plus 0 (immediate execution of overdue tasks) = 30 seconds. This meets the 60-second requirement.
+
+**Extension -- Testing crash recovery**: To verify the crash recovery mechanism works correctly, design a test that enqueues 100 tasks, crashes the scheduler at a random time, restarts it, and verifies that all 100 tasks eventually complete with no duplicates. Run this test 1,000 times with different crash times. The test should cover: crash during enqueue, crash during claim, crash during execution, crash during status update, and crash during recovery itself. This is the idle-leak test for single-node schedulers.
+
+**Extension -- Data integrity verification**: SQLite is susceptible to corruption if the process crashes during a write. The defense is WAL (Write-Ahead Log) mode, which provides crash recovery without corruption. Enable WAL mode on the SQLite connection:
+
+```python
+conn.execute("PRAGMA journal_mode=WAL;")
+conn.execute("PRAGMA synchronous=NORMAL;")
+```
+
+WAL mode allows concurrent reads and writes. It also provides rollback recovery on crash. The synchronous=NORMAL setting ensures durability without the performance cost of FULL synchronous mode.
+
+### Challenge 1.2 -- Lease Mechanism for 5 Workers
+
+**Problem**: You have a scheduler with 5 workers polling the same task table. Each worker can claim up to 10 tasks per poll cycle. Tasks have a 30-second timeout. You need to ensure that no two workers execute the same task.
+
+**Requirements**:
+- 5 workers, each polling every 500ms
+- Up to 10 tasks claimed per poll cycle per worker
+- 30-second task timeout
+- Zero tolerance for duplicate execution
+- Workers can crash at any time
+
+**Model Answer**:
+
+**Claim query**: The SQL query for claiming tasks uses SELECT FOR UPDATE SKIP LOCKED. This is the correct approach because it atomically selects and locks rows, skipping any rows that are already locked by other workers.
+
+```sql
+WITH next_tasks AS (
+  SELECT id
+  FROM tasks
+  WHERE status = 'PENDING'
+    AND trigger_at <= EXTRACT(EPOCH FROM NOW())
+  ORDER BY trigger_at
+  LIMIT 10
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE tasks
+SET status = 'LEASED',
+    worker_id = $1,
+    lease_until = EXTRACT(EPOCH FROM NOW()) + 30,
+    updated_at = NOW()
+WHERE id IN (SELECT id FROM next_tasks)
+RETURNING id, task_type, payload;
+```
+
+The CTE (Common Table Expression) atomically selects and locks up to 10 rows, then updates them. The SKIP LOCKED clause prevents contention: if worker 1 has locked rows 1-10, worker 2 skips those rows and gets rows 11-20. Without SKIP LOCKED, worker 2 would wait for worker 1's lock to release, causing serialization of the claim operation.
+
+**Lease table schema**: The tasks table itself stores the lease state. The lease columns are status, worker_id, and lease_until. No separate lease table is needed. The single-table design is simpler and reduces the number of writes per claim operation.
+
+```sql
+-- Lease columns within the tasks table
+status      TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING, LEASED, COMPLETED, FAILED
+worker_id   TEXT,                             -- ID of the claiming worker
+lease_until INTEGER                           -- Unix timestamp of lease expiry
+```
+
+**Lease renewal mechanism**: A worker that is still executing after 20 seconds needs to extend its lease. The worker sends a heartbeat:
+
+```sql
+UPDATE tasks
+SET lease_until = EXTRACT(EPOCH FROM NOW()) + 30
+WHERE id = $1
+  AND worker_id = $2
+  AND status = 'LEASED';
+```
+
+If the renewal fails (zero rows updated), the worker lost the lease. This happens if the lease expired and another worker claimed the task, or if the reclaim scanner reset the task. The worker must stop executing immediately. The task is no longer theirs.
+
+The renewal interval is 10 seconds, one-third of the 30-second lease duration. This gives the worker 3 chances to renew before the lease expires.
+
+**Reclaim scanner**: The reclaim scanner runs every 60 seconds, which is 2x the lease duration. It finds expired leases and resets them:
+
+```sql
+UPDATE tasks
+SET status = 'PENDING',
+    worker_id = NULL,
+    lease_until = NULL,
+    retry_count = retry_count + 1
+WHERE status = 'LEASED'
+  AND lease_until < EXTRACT(EPOCH FROM NOW());
+```
+
+The reclaim scanner also increments the retry count. This prevents infinite reclaim cycles. If a task has exhausted its retries, the scanner moves it to DEAD_LETTER instead of PENDING.
+
+**Probability of duplicate execution**: If the lease mechanism is correctly implemented, the probability of two workers executing the same task is zero under normal operation. The SKIP LOCKED clause ensures that only one worker can claim each task. The reclaim scanner only resets tasks after the lease expires, which is 30 seconds after the original claim. By that time, the original worker has either completed the task (status = COMPLETED) or crashed (status remains LEASED). In the crash case, the reclaim scanner resets the task, and another worker claims it. There is no overlap.
+
+The only scenario for duplicate execution is a zombie worker: a worker that is partitioned from the database but still executing. The worker cannot renew its lease (it cannot reach the database), so the lease expires. The reclaim scanner resets the task. Another worker claims it. The zombie worker continues executing the original task. Both workers execute the same task. The fix is idempotent execution: the downstream system deduplicates by task ID.
+
+### Challenge 1.3 -- Retry Policy with Exponential Backoff
+
+**Problem**: A task calls an external API that has transient failures. The API returns 503 (Service Unavailable) approximately 5% of the time. The task must be retried up to 5 times with exponential backoff.
+
+**Requirements**:
+- Base delay: 1 second
+- 5 maximum retries
+- Exponential backoff: delay = base_delay * 2^retry_count
+- Jitter: add a random value between 0 and 1000ms to each delay
+- The total retry window must not exceed 5 minutes
+
+**Model Answer**:
+
+**Theoretical delay per retry without jitter**:
+
+- Retry 1: 1 * 2^1 = 2 seconds
+- Retry 2: 1 * 2^2 = 4 seconds
+- Retry 3: 1 * 2^3 = 8 seconds
+- Retry 4: 1 * 2^4 = 16 seconds
+- Retry 5: 1 * 2^5 = 32 seconds
+
+Total without jitter: 2 + 4 + 8 + 16 + 32 = 62 seconds.
+
+**Total maximum retry window with jitter**: Each retry can add up to 1000ms (1 second) of jitter. The maximum total jitter is 5 * 1 = 5 seconds. Maximum total with jitter: 62 + 5 = 67 seconds. This is well under the 5-minute (300-second) requirement.
+
+**Task schema for retry state**:
+
+```sql
+CREATE TABLE tasks (
+  id              TEXT PRIMARY KEY,
+  task_type       TEXT NOT NULL,
+  payload         TEXT NOT NULL,
+  trigger_at      INTEGER NOT NULL,       -- original trigger time
+  retry_count     INTEGER DEFAULT 0,      -- current retry number
+  max_retries     INTEGER DEFAULT 5,      -- maximum retries allowed
+  next_retry_at   INTEGER,                -- when the next retry should fire
+  last_error      TEXT,                   -- reason for last failure
+  status          TEXT NOT NULL DEFAULT 'PENDING',
+  ...
+);
+```
+
+The next_retry_at column is computed by the retry logic and written when the task is re-enqueued after a failure. The poll query uses next_retry_at instead of trigger_at for tasks that have been retried:
+
+```sql
+SELECT * FROM tasks
+WHERE status = 'PENDING'
+  AND (next_retry_at IS NOT NULL AND next_retry_at <= EXTRACT(EPOCH FROM NOW())
+    OR trigger_at <= EXTRACT(EPOCH FROM NOW()))
+ORDER BY COALESCE(next_retry_at, trigger_at)
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+```
+
+**Crash-during-retry edge case**: A task fails on retry 3 and the scheduler crashes. On recovery, the task is at retry 3. The recovery scan finds the task with status = PENDING and retry_count = 3. The next_retry_at is in the past (the crash happened during the retry). The task should be retried with the retry-3 delay: 8 seconds. Using the retry-1 delay would be incorrect because it would retry too aggressively, violating the backoff schedule.
+
+The retry_count is the source of truth. It tracks how many retries have been attempted, regardless of crashes. The next_retry_at is recomputed from retry_count on recovery.
+
+**Retry logic implementation**:
+
+```python
+import random
+import time
+
+def compute_next_retry(retry_count, base_delay=1, max_jitter=1):
+    """
+    Compute the next retry delay using exponential backoff with jitter.
+
+    Args:
+        retry_count: The current retry number (0-indexed, so retry 0 is the first retry)
+        base_delay: Base delay in seconds (default 1)
+        max_jitter: Maximum random jitter in seconds (default 1)
+
+    Returns:
+        Delay in seconds before the next retry
+    """
+    if retry_count < 0:
+        raise ValueError("retry_count must be non-negative")
+
+    exponential_delay = base_delay * (2 ** retry_count)
+    jitter = random.uniform(0, max_jitter)
+    return exponential_delay + jitter
+
+
+def handle_failure(task, error_message):
+    """
+    Handle a task execution failure. Decide whether to retry or dead-letter.
+    """
+    task.retry_count += 1
+    task.last_error = error_message
+
+    if task.retry_count > task.max_retries:
+        task.status = 'DEAD_LETTER'
+        # Alert: task exceeded max retries
+        return task  # No more retries
+
+    delay = compute_next_retry(task.retry_count)
+    task.next_retry_at = int(time.time()) + delay
+    task.status = 'PENDING'
+    return task
+```
+
+The retry function uses 2^retry_count, not 2^(retry_count-1). This means retry 1 (the first retry) has a delay of 2 seconds, not 1 second. The pattern is: the first retry waits 2 seconds, the second waits 4 seconds, and so on. This is more aggressive at the start and spreads out over time, which is the standard exponential backoff behavior.
+
+**Extension -- Max retry window enforcement**: The requirement states the total retry window must not exceed 5 minutes. Even though the calculated maximum with jitter is 67 seconds, you should enforce the maximum at the task level. In the handle_failure function, add a check:
+
+```python
+def handle_failure(task, error_message):
+    task.retry_count += 1
+    task.last_error = error_message
+
+    if task.retry_count > task.max_retries:
+        task.status = 'DEAD_LETTER'
+        return task
+
+    elapsed = int(time.time()) - task.created_at
+    max_window = 300  # 5 minutes
+    if elapsed >= max_window:
+        task.status = 'DEAD_LETTER'
+        task.last_error = f"Retry window exceeded: {error_message}"
+        return task
+
+    delay = compute_next_retry(task.retry_count)
+    task.next_retry_at = int(time.time()) + delay
+    task.status = 'PENDING'
+    return task
+```
+
+This prevents a task from being retried indefinitely even within the retry count limit. The maximum retry window is checked at every retry attempt.
+
+**Extension -- Thundering herd on retry**: If 10,000 tasks all fail at the same time (for example, the downstream API is down for 30 seconds), they all enter the retry cycle simultaneously. After the base delay of 2 seconds, all 10,000 tasks are eligible for the first retry simultaneously. This creates a retry storm. The defense adds full jitter to the retry delay, not just additive jitter. Full jitter randomizes the delay between 0 and the exponential backoff value:
+
+```python
+def compute_full_jitter_retry(retry_count, base_delay=1):
+    exponential_delay = base_delay * (2 ** retry_count)
+    return random.uniform(0, exponential_delay)
+```
+
+With full jitter, the 10,000 tasks' retries are distributed between 0 and 2 seconds, spreading the load over the entire backoff window. Full jitter is preferred over additive jitter for high-throughput systems because it provides better load spreading.
+
+## Tier 2 -- Design
+
+These challenges require deeper analysis and design. Each includes a detailed rubric.
+
+### Challenge 2.1 -- Shard a Scheduler for 100x Scale
+
+**Problem**: Your current scheduler handles 1,000 tasks per second using a single PostgreSQL database. The business requires 100,000 tasks per second. You must shard the scheduler.
+
+**Requirements**:
+- 100,000 tasks per second sustained
+- P99 task execution latency under 1 second
+- Tasks must be recovered within 60 seconds of a shard failure
+- The sharding scheme must support adding and removing shards without downtime
+
+**Rubric**:
+
+| Criterion | Poor (0 points) | Good (1 point) | Excellent (2 points) |
+|-----------|----------------|----------------|----------------------|
+| Sharding strategy | Range-based without rebalancing | Hash-based without rebalancing | Consistent hashing with virtual nodes |
+| Shard count | No calculation | 20 shards (5,000 tasks/s each) | 25 shards (20% headroom for bursts) |
+| Task routing | Direct connection to shard | Router service with static mapping | Partitioned message queue with consumer groups |
+| Rebalancing | Manual, requires downtime | Automated with downtime window | Automated, zero-downtime, incremental |
+| Load imbalance | No analysis | 50% worst-case imbalance | Under 10% worst-case imbalance |
+| Cross-shard monitoring | No monitoring | Per-shard queue depth | Per-shard queue depth, drain rate, latency |
+
+**Model Answer**:
+
+**Sharding strategy**: Use consistent hashing with 128 virtual nodes. Consistent hashing assigns each task to a shard by hashing the task ID. When a shard is added or removed, only 1/N of the tasks are reassigned (where N is the number of shards). The 128 virtual nodes per shard distribute the load evenly even if the number of shards is small.
+
+**Shard count**: Each shard handles 5,000 tasks per second. For 100,000 tasks per second, you need 20 shards under ideal conditions. Add 20% headroom for bursts and rebalancing: 25 shards. Each shard runs on its own PostgreSQL instance with a dedicated worker pool.
+
+**Task routing**: The API gateway hashes the task ID using the consistent hashing ring and publishes the task to the Kafka partition corresponding to the target shard. Each shard consumes from its assigned Kafka partition. This decouples the API gateway from the shard placement. The gateway does not need to know which shard is on which machine.
+
+```python
+def route_task(task_id, shard_count, virtual_nodes=128):
+    """
+    Route a task to a shard using consistent hashing.
+    """
+    hash_val = hash(task_id)
+    position = hash_val % (shard_count * virtual_nodes)
+    shard = position // virtual_nodes
+    return shard
+```
+
+**Rebalancing**: When a new shard is added, the consistent hashing ring is updated. The new shard takes over a portion of the existing shards' tasks. Each existing shard scans its tasks, computes the new shard assignment for each, and moves tasks that belong to the new shard. The move is done by publishing the task to the new shard's Kafka partition. The old shard keeps the task until the new shard acknowledges receipt.
+
+**Worst-case load imbalance**: With consistent hashing and 128 virtual nodes per shard, the worst-case imbalance is under 10%. This is acceptable. The 20% headroom in the shard count covers the imbalance.
+
+**Cross-shard monitoring**: Each shard reports its queue depth, drain rate, and latency to a central monitoring system. The monitoring system alerts if any shard's queue depth exceeds 200% of the average, or if a shard's drain rate drops to zero for more than 2 poll intervals.
+
+### Challenge 2.2 -- Multi-Region Active-Active Scheduler
+
+**Problem**: Your scheduler must operate across three geographic regions (US, EU, Asia). Each region must be able to schedule tasks independently. Tasks can be region-tied (send SMS to a EU phone number) or region-independent.
+
+**Requirements**:
+- Three regions: US, EU, Asia
+- Cross-region task enqueue latency must not exceed 500ms
+- Task execution must be consistent across regions
+- If one region fails, the other regions must pick up its tasks within 60 seconds
+- Tasks must not execute more than once across regions
+
+**Rubric**:
+
+| Criterion | Poor (0 points) | Good (1 point) | Excellent (2 points) |
+|-----------|----------------|----------------|----------------------|
+| Replication strategy | Single global database | Async replication | Global queue + local index |
+| Region affinity | No affinity mechanism | Hard-coded affinity | Dynamic affinity via task metadata |
+| Failover | Manual failover | Automated with 120s recovery | Automated with under 60s recovery |
+| Conflict resolution | Not addressed | Last-writer-wins | Idempotency key + deduplication |
+| Cross-region latency | No latency calculation | Approximate calculation | Correct calculation with margin |
+
+**Model Answer**:
+
+**Replication strategy**: Use a global task queue (Kafka with cross-region replication) combined with local schedule indexes in each region. When a task is enqueued in the US region, it is written to the US Kafka partition. The Kafka cluster replicates the message to EU and Asia using Kafka's MirrorMaker. Each region's scheduler consumes from its local Kafka partition and inserts the task into its local schedule index.
+
+The local schedule index (PostgreSQL or Redis) is not replicated across regions. Each region has its own independent index. The global Kafka topic ensures every region eventually receives every task. The local index ensures fast enqueue (local write) and fast poll (local read).
+
+**Region affinity**: The task metadata includes a region_affinity field. If set to 'us', the task is only processed by the US region. If set to 'global', any region can process it. The scheduler checks the region_affinity before claiming the task. Region-tied tasks are processed by the specified region. Region-independent tasks are processed by the first region that claims them.
+
+**Failover mechanism**: Each region monitors the other regions' health through a heartbeat mechanism. The US region sends a heartbeat every 5 seconds. If EU and Asia both miss 3 consecutive heartbeats (15 seconds), they declare the US region as failed. The remaining regions scan the global Kafka topic for tasks that were assigned to the US region and claim them.
+
+The failover scans the Kafka topic from the last committed offset. They find tasks with region_affinity = 'us' that have not been processed. They set the affinity to the claiming region and insert the tasks into their local schedule index.
+
+**Conflict resolution**: The task ID is the idempotency key. If the same task is enqueued in two regions (due to a network partition), the schedule index uses the task ID as the primary key. The second INSERT is a no-op (ON CONFLICT DO NOTHING). The task executes exactly once. If the same task is claimed by two regions (due to a failover race), the downstream system deduplicates by the task ID.
+
+**Cross-region latency calculation**: US-to-EU latency is 80ms round trip. EU-to-Asia is 150ms round trip. US-to-Asia is 120ms round trip. The enqueue path is: write to local Kafka (5ms), Kafka replication to other regions (80ms to 150ms), consumer read from local Kafka (5ms), insert into local schedule index (5ms). Total: 95ms to 165ms. This is well under the 500ms requirement.
+
+**Follow-up analysis**: The cross-region replication introduces a race condition. A task enqueued in the US may arrive in the EU schedule index before the US worker claims it. Both regions could try to execute the same task. The defense is a cross-region claim lock. Before claiming a task, a worker checks the global claim registry (a DynamoDB table with TTL). If no other region has claimed it, the worker creates a claim entry with a 30-second TTL. The claim entry prevents other regions from claiming the same task. If the claim expires without completion, another region can reclaim it. This adds 10ms to 20ms to the claim operation but eliminates cross-region duplicate execution.
+
+### Challenge 2.3 -- Priority-Based Scheduling with Preemption
+
+**Problem**: Your scheduler handles tasks of four priority levels (Critical, High, Normal, Low). Critical tasks must execute within 100ms, while Low-priority tasks can wait up to 5 minutes. A surge of Critical tasks should preempt running Low-priority tasks.
+
+**Requirements**:
+- Four priority levels: Critical, High, Normal, Low
+- Critical task execution within 100ms of trigger time
+- Low-priority tasks can be preempted by Critical tasks
+- Preempted tasks must be resumed or re-enqueued within 10 seconds
+- No priority inversion (a Low-priority task should not block a Critical task)
+
+**Rubric**:
+
+| Criterion | Poor (0 points) | Good (1 point) | Excellent (2 points) |
+|-----------|----------------|----------------|----------------------|
+| Queue structure | Single queue with priority sorting | Separate queue per priority | Separate queue per priority with deadline promotion |
+| Preemption mechanism | Not addressed | Kill Low-priority process | Save state, release lease, re-enqueue |
+| Resource allocation | Equal allocation | Static allocation by priority | Dynamic allocation with work stealing |
+| Priority inversion | Not addressed | Priority inheritance protocol | Priority inheritance + priority ceiling |
+| Deadline handling | Ignored | EDF within each priority | EDF + deadline-based promotion to higher priority |
+
+**Model Answer**:
+
+**Queue structure**: Each priority level has its own schedule index. This ensures that Critical tasks are not blocked by the scan order of a shared queue. The Critical queue is polled every 50ms (to meet the 100ms latency requirement). The Low queue is polled every 30 seconds (the 5-minute requirement allows relaxed polling).
+
+Within each queue, tasks are ordered by Earliest Deadline First (EDF). A task approaching its deadline is promoted to the next higher priority level. For example, a Low-priority task with a deadline within 60 seconds is promoted to Normal priority.
+
+**Preemption mechanism**: When a Critical task is enqueued and all Critical workers are busy, the scheduler checks the Low-priority worker pool. If a Low-priority worker is executing a task, the scheduler sends a preemption signal:
+
+1. The scheduler sends a SIGTERM to the Low-priority worker.
+2. The worker catches the signal, saves the task's execution state (including any progress), and releases the lease.
+3. The worker reports the task status as PREEMPTED with the saved state.
+4. The task is re-enqueued at Low priority with a new trigger time (current time plus 10 seconds).
+5. The now-idle worker picks up the Critical task.
+
+The preempted task is re-enqueued within 10 seconds because the preemption handling is fast: save state, release lease, re-enqueue. The entire operation takes under 100ms.
+
+**Resource allocation**: The cluster has 100 worker cores. The allocation is:
+
+- Critical: 40 cores (40%) -- can borrow from Low and Normal
+- High: 30 cores (30%) -- can borrow from Low
+- Normal: 20 cores (20%) -- can borrow from Low
+- Low: 10 cores (10%) -- can be preempted by all higher levels
+
+The dynamic allocation allows work stealing. If the Critical queue is empty, Critical workers can steal Normal tasks (using Critical resource budgets). This prevents resource fragmentation.
+
+**Priority inversion prevention**: Priority inversion occurs when a Low-priority task holds a resource that a Critical task needs. The defense is the priority inheritance protocol: when a Critical task waits for a resource held by a Low-priority task, the Low-priority task temporarily inherits the Critical priority. The Low-priority task runs at Critical priority until it releases the resource. This prevents the Low-priority task from being preempted while holding the resource.
+
+The second defense is the priority ceiling protocol: each resource is assigned a priority ceiling (the highest priority of any task that can access the resource). A task can only lock a resource if its priority is higher than the priority ceiling of all currently locked resources. This prevents deadlocks and nested priority inversions.
+
+## Tier 3 -- Expert
+
+These challenges require deep distributed systems knowledge and original thinking. They are designed to stretch your understanding beyond the standard patterns.
+
+### Challenge 3.1 -- Geographically Distributed Scheduler with Strong Consistency
+
+**Problem**: You must design a scheduler that guarantees exactly-once task execution across five global regions. The scheduler must maintain strong consistency (linearizable writes) for the schedule index while keeping p99 enqueue latency under 200ms.
+
+**Requirements**:
+- Five regions: US-West, US-East, EU, Asia, Australia
+- Linearizable consistency for all enqueue operations
+- P99 enqueue latency under 200ms
+- Tasks must be executed exactly once, even during region failures
+- Each region runs its own workers
+- The schedule index must survive the loss of two regions simultaneously
+
+**Trade-off Analysis**:
+
+**Consensus protocol choice**: The theoretical minimum latency for a linearizable write is one round trip to the majority of regions. With 5 regions, a majority is 3 regions. The round trip from the leader to the farthest follower and back is the dominant factor.
+
+Inter-region latencies (round trip):
+- US-West to US-East: 65ms
+- US-West to EU: 140ms
+- US-West to Asia: 120ms
+- US-West to Australia: 170ms
+
+If the leader is in US-West, the majority set is US-West, US-East, and EU (or Asia). The latency to the farthest in the majority determines the commit time. US-West to EU is 140ms round trip. The commit takes 140ms (one round trip to EU) plus processing time (10ms) = 150ms. This is under the 200ms requirement.
+
+If the leader is in Australia, the majority set is Australia, Asia, and US-West. US-West to Australia is 170ms round trip. The commit takes 170ms plus processing = 180ms. This is still under 200ms.
+
+EPaxos (Egalitarian Paxos) is a better choice than Raft for this scenario. EPaxos allows any region to be the leader for its own writes, avoiding the need to route all writes to a single leader. Each region's writes are committed with a majority of that region's closest peers. For a write from Australia, the majority is Australia, Asia, and US-West (the three closest regions). The commit time is 170ms, which is the same as Raft, but with lower latency for the other regions because they use their local leaders.
+
+**Read path**: Workers need to read the schedule index to find due tasks. Linearizable reads would require contacting the consensus leader, which adds the full consensus latency to every poll. This is unacceptable for 100ms poll intervals.
+
+The solution is follower reads with bounded staleness. Workers read from their local region's replica. The replica is guaranteed to be within 50ms of the leader (configured by the replication lag). If a worker reads a task that is not yet visible locally, it either waits (up to 50ms) or reads from the leader. This gives sub-millisecond reads in the common case (the data is already replicated) and bounded staleness in the worst case.
+
+**Worker location strategy**: Workers read from their local region's replica. This gives sub-millisecond read latency. Workers write to their local region's consensus leader (which is local in EPaxos). This gives 150ms to 180ms write latency, which is under the 200ms requirement.
+
+**Region partition**: If the consensus leader is in a region that becomes partitioned, the remaining regions elect a new leader. With EPaxos, the remaining 4 regions can form a majority (3 of 4). The election takes one round trip: 120ms to 150ms depending on which regions remain.
+
+Tasks that were due during the partition are handled by the catch-up mechanism. When the partition heals, the rejoining region's leader discovers it missed updates. It replays the consensus log from the last committed entry. Tasks that were due during the partition are now overdue. The workers in the rejoining region execute them immediately.
+
+**Cost of strong consistency**: Strong consistency adds 150ms to 180ms to every enqueue operation compared to an eventually consistent approach (which would be under 10ms locally). This is a 15x to 18x increase in write latency. The trade-off is correct: the exactly-once requirement demands strong consistency. Without it, the scheduler cannot guarantee that a task is not enqueued twice or lost during a failure.
+
+The 200ms latency requirement is the key constraint. It forces the choice of EPaxos over Raft (EPaxos allows local leaders). It forces the use of follower reads with bounded staleness. It forces a careful region topology analysis to ensure the majority round trip is under 200ms.
+
+### Challenge 3.2 -- Planetary-Scale IoT Scheduler
+
+**Problem**: You are designing a scheduler for an IoT platform with 1 billion devices. Each device can schedule tasks on itself (run firmware update at 3 AM local time) or on the cloud (report telemetry data every 5 minutes). The scheduler must handle the scale of 1 billion devices, each with multiple schedules.
+
+**Requirements**:
+- 1 billion devices, each with 5 active schedules on average (5 billion total schedules)
+- 100 million tasks executed per day from device-side schedules
+- 10 billion tasks executed per day from cloud-side schedules
+- Device-side schedules are stored on the device and executed locally
+- Cloud-side schedules are stored in the cloud and trigger API calls to devices
+- Schedules can be created, modified, and deleted by devices or by cloud applications
+- P99 latency for schedule creation: 500ms
+- P99 latency for task execution: 5 seconds for cloud-side triggers
+
+**Trade-off Analysis**:
+
+**Division of responsibility**: Device-side scheduling handles tasks that must execute on the device regardless of connectivity. These include local-time-zone schedules (firmware update at 3 AM local time), offline-capable tasks (log telemetry every hour, upload when connected), and latency-sensitive tasks (respond to sensor threshold within 100ms). Cloud-side scheduling handles tasks that require cloud resources: cross-device coordination (trigger all devices in region X at the same time), data aggregation (collect and analyze telemetry from all devices), and complex scheduling rules (if device temperature exceeds 50C, schedule a diagnostic).
+
+The division is based on connectivity and latency requirements. If the device is offline and the task must execute, the schedule is on the device. If the task requires cloud resources or coordination, the schedule is in the cloud.
+
+**Cloud-side schedule index for 5 billion schedules**: Sharding by device ID using consistent hashing. Each shard owns a range of device IDs. The shard count is determined by the number of schedules per shard. With 5 billion schedules and 1 million schedules per shard, you need 5,000 shards. Each shard runs on a commodity machine with 64GB RAM and 8 CPU cores.
+
+The schedule index is a time-ordered data structure per device. Within each shard, the schedules are stored in a B-tree keyed by (device_id, trigger_time). This allows efficient range queries: "find all schedules for device X with trigger_time between now and now + 5 minutes."
+
+The shard assignment is stored in a distributed configuration service (ZooKeeper or etcd). When a device creates or modifies a schedule, the API gateway looks up the shard from the configuration service and routes the request to the shard.
+
+**Device time synchronization**: Devices may have unreliable clocks. The defense is a two-layer approach. Layer 1 is NTP: each device synchronizes its clock with the cloud when connected. The synchronization error is reported to the cloud and stored with the device metadata. Layer 2 is cloud-side time reference: the device-side scheduler stores the last NTP sync time and the estimated drift rate. When the device is offline, it uses the estimated clock. When the device reconnects, the cloud compares the device's estimated time with the actual time and adjusts the schedule.
+
+For the 3 AM local time schedule, the device computes the next trigger time based on its local time zone. If the device's clock is off by 5 minutes, the task executes at 3:05 AM instead of 3:00 AM. This is acceptable for firmware updates. For time-sensitive tasks, the cloud pushes the exact trigger time based on the device's time zone.
+
+**Schedule update propagation**: When a cloud application updates a device's schedule, the change is written to the cloud-side schedule index. The shard responsible for the device sends a push notification to the device. If the device is offline, the notification is queued. When the device reconnects, it receives the pending update.
+
+The maximum propagation delay is the device's connectivity interval. A device that checks in every 5 minutes has a maximum delay of 5 minutes. A device that maintains a persistent connection has a delay of under 1 second.
+
+**Storage requirements**: 5 billion schedules at 256 bytes per schedule = 1.28 TB. This fits in a cluster of 100 machines with 64GB RAM each (6.4 TB total). The actual storage is 1.28 TB, which is 20% of the cluster's memory. The remaining memory is used for working data, indexes, and replication.
+
+**Rate limiting**: 10 billion cloud-side task executions per day = 115,740 tasks per second on average. The peak may be 10x higher: 1.15 million tasks per second. The defense is a hierarchical token bucket. Each device has a token bucket limiting its execution rate. Each shard has a token bucket limiting the total execution rate for its devices. The API gateway has a global token bucket limiting the total execution rate.
+
+The burst is handled by queuing. The scheduler's write-ahead log (Kafka) buffers the burst. The workers drain the queue at their maximum rate. The queue depth grows during the burst and shrinks after. The Kafka topic must be sized for the peak queue depth: 1.15 million tasks per second at 5 seconds peak = 5.75 million tasks in the queue. At 256 bytes per task, that is 1.47 GB. Kafka handles this easily.
+
+The key insight is that the IoT scheduler is two systems in one: a device-side scheduler that is distributed across 1 billion endpoints and a cloud-side scheduler that is intensely sharded. The device-side scheduler handles local execution with unreliable clocks. The cloud-side scheduler handles coordination and complex rules. The connection between them is the schedule update propagation, which must work even when devices are offline.
+
+**Follow-up analysis -- Data consistency across device and cloud**: When a device creates a schedule locally (for example, "run firmware update at 3 AM"), and then the cloud application also creates a schedule for the same device (for example, "run diagnostic at 3 AM"), a conflict arises. The resolution strategy uses device authority: the device's local schedule takes precedence for device-side tasks, and the cloud's schedule takes precedence for cloud-side tasks. The conflict is detected during the next device check-in. The device reports its local schedules, and the cloud compares them with its own. If a conflict is detected, the device-side scheduler wins for tasks that execute on the device, and the cloud-side scheduler wins for tasks that trigger API calls to the device. This prevents the device from being double-booked.
+
+**Follow-up analysis -- Device battery optimization**: IoT devices often run on battery power. The scheduler must minimize the number of wake-ups. The device-side scheduler groups tasks by their next wake-up time. If a device has three schedules triggering at 3:00 AM, 3:05 AM, and 3:10 AM, the scheduler wakes the device once at 3:00 AM, executes all three tasks, and sleeps until the next group. The grouping interval is configurable (default 15 minutes). This reduces battery consumption by up to 70% compared to waking for each task individually.
+
+**Follow-up analysis -- Massive fan-out scheduling**: A cloud application may need to schedule the same task on 10 million devices simultaneously (for example, "update firmware to version 2.1 at 3 AM UTC"). Creating 10 million individual schedule records is expensive and slow. The solution is a broadcast schedule: a single schedule record with a device filter (all devices with firmware version 2.0 and region US). When the broadcast schedule triggers, it fans out to matching devices. The fan-out is done in batches of 10,000 using a multicast mechanism. Each batch creates a sub-task that handles 10,000 devices. The sub-tasks are distributed across the shards for parallel execution. This reduces the schedule creation from 10 million writes to 1 write plus 1,000 sub-task writes.

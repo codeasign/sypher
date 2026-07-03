@@ -1,0 +1,697 @@
+---
+id: search-system-architecture
+title: Search System Pattern at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+A naive search system is tempting: store all documents in a relational database and use `LIKE` or `ILIKE` for text matching. This approach works for 10,000 documents but collapses at 100,000.
+
+### The SQL Approach
+
+```sql
+SELECT * FROM products
+WHERE name ILIKE '%wireless%'
+  AND description ILIKE '%headphones%'
+  AND price BETWEEN 50 AND 200
+  AND rating >= 4.0
+ORDER BY rating DESC
+LIMIT 20 OFFSET 0;
+```
+
+This query scans every row in the products table. Even with a full-text index, the database cannot support:
+
+- Tokenization with language-specific rules
+- Stemming and lemmatization (wireless vs. wirelessly)
+- Synonym expansion (headphones vs. earphones)
+- Relevance scoring (BM25 or TF-IDF)
+- Faceted aggregation (counts per brand, price range)
+- Fuzzy matching and spell correction
+- Phrase queries with term positions
+
+A database `LIKE` search on 1 million products takes 500 to 2,000 milliseconds. A purpose-built search engine takes 10 to 50 milliseconds.
+
+### The Naive In-Memory Approach
+
+Another naive approach is loading all documents into memory and scanning them linearly:
+
+```python
+def search(documents, query_terms, filters):
+    results = []
+    for doc in documents:
+        if all(term in doc.text for term in query_terms):
+            if all(filter_matches(doc, f) for f in filters):
+                score = compute_bm25(doc, query_terms)
+                results.append((doc.id, score))
+    results.sort(key=lambda x: -x[1])
+    return results[:20]
+```
+
+This works for 100,000 documents but fails for 10 million. The linear scan of 10 million documents takes 1 to 3 seconds. Each query requires a full scan because there is no index.
+
+### Scaling Limits of Naive Approaches
+
+| Approach | Max Documents | Latency (P99) | QPS |
+|----------|--------------|---------------|-----|
+| SQL LIKE | 100,000 | 500 ms | 10 |
+| SQL full-text index | 1,000,000 | 200 ms | 50 |
+| In-memory linear scan | 500,000 | 1,000 ms | 5 |
+| In-memory with hash index | 5,000,000 | 100 ms | 100 |
+
+The naive approaches hit a wall at 1 to 5 million documents. Beyond that, you need a purpose-built search engine with an inverted index, filter bitmaps, and distributed architecture.
+
+## Production-Grade Architecture
+
+A production search system serves 10,000+ queries per second across 100 million+ documents with P99 latency under 200 milliseconds. Achieving this requires a multi-layered distributed architecture.
+
+### Cluster Topology
+
+A production cluster has three node types:
+
+**Data nodes** store index shards and execute queries. Each data node hosts multiple shards (both primary and replica). Data nodes are the workhorses of the cluster. They handle indexing, querying, merging, and all data operations.
+
+**Coordinator nodes** accept client requests, route them to the appropriate data nodes, merge results, and return responses. Coordinator nodes are stateless. They do not store data. They handle query planning, caching, and result merging.
+
+**Master nodes** manage cluster state: shard allocation, node membership, and configuration. They do not serve queries or index data. For high availability, run 3 master nodes (odd number for quorum).
+
+<AsciiDiagram
+  id="search-system/cluster-topology"
+  title="Production Search Cluster Topology"
+  alt="Three-tier cluster architecture with client requests routed through coordinator nodes, which fan out queries to data nodes, with master nodes managing cluster state"
+  caption="Figure 1: Production search cluster with dedicated node roles"
+  content={`
+                          +-----------+
+                          |  Clients  |
+                          +-----+-----+
+                                |
+                                v
+                    +-----------+-----------+
+                    |                       |
+              +-----+-----+          +-----+-----+
+              |Coordinator |          |Coordinator |
+              |  Node 1    |          |  Node 2    |
+              +-----+------+          +------+-----+
+                    |                        |
+          +---------+-------+     +---------+--------+
+          |         |         |   |         |         |
+          v         v         v   v         v         v
+    +--------+ +--------+ +--------+ +--------+ +--------+
+    | Data   | | Data   | | Data   | | Data   | | Data   |
+    | Node 1 | | Node 2 | | Node 3 | | Node 4 | | Node 5 |
+    |        | |        | |        | |        | |        |
+    | P0,R1  | | P1,R0  | | P2,R1  | | P0,R2  | | P1,R2  |
+    | P3,R2  | | P3,R0  | | P0,R1  | | P2,R0  | | P3,R1  |
+    +--------+ +--------+ +--------+ +--------+ +--------+
+          ^         ^         ^         ^         ^
+          |         |         |         |         |
+          +---------+----+----+---------+---------+
+                         |
+                  +------+------+
+                  |  Master     |
+                  |  Node 1     |
+                  |  (leader)   |
+                  |             |
+                  |  Master     |
+                  |  Node 2     |
+                  |  (follower) |
+                  |             |
+                  |  Master     |
+                  |  Node 3     |
+                  |  (follower) |
+                  +-------------+
+`} />
+
+### Sharding Strategy
+
+A shard is a self-contained Lucene index. The total data is divided across N shards. Each shard handles a subset of the documents.
+
+**Routing strategy**: documents are routed to shards using a hash function. The default routing uses `_id` as the routing key: `shard = hash(_id) % num_shards`. Custom routing allows grouping related documents on the same shard.
+
+**Shard sizing**: each shard should be 20 to 50 GB. Smaller shards mean more shards to search (more overhead per query). Larger shards mean slower merges and recovery. For 500 GB of data, use 10 to 25 shards.
+
+**Replication factor**: each primary shard has N replica shards (typically 1 or 2). Replicas serve queries and provide fault tolerance. With a replication factor of 2, the cluster tolerates 1 node failure without data loss.
+
+### Query Flow in a Distributed System
+
+1. Client sends a search request to a coordinator node (round-robin or load-balanced)
+2. Coordinator parses the query and determines which shards to query
+3. Coordinator sends a shard-level query to each shard (all primary or replica shards)
+4. Each shard executes the query against its local index and returns the top N results
+5. Coordinator merges results from all shards into a globally sorted list
+6. Coordinator fetches document metadata for the top results
+7. Coordinator returns the response to the client
+
+Each shard query is independent. The coordinator waits for all shards to respond (or for a timeout). The total query time is the max shard response time, not the sum.
+
+### Query Caching
+
+Production systems cache query results at multiple levels:
+
+- **Node-level query cache**: caches the results of recent queries. Keyed by query string + filters. Evicted by LRU. Typical hit rate: 20 to 30 percent.
+- **Shard-level request cache**: caches the results of individual shard queries. This is more granular than the node-level cache. Used when the same query is sent to multiple shards.
+- **Filter cache**: caches the bitmaps for individual filter values. "Brand=Sony" is cached once and reused across all queries that include that filter. This is the most effective cache. Filter cache hit rates exceed 90 percent for popular filters.
+
+## Integration Patterns
+
+A search system does not exist in isolation. It integrates with other systems through well-defined patterns.
+
+### Pattern 1: Database Change Data Capture (CDC)
+
+Documents originate in a relational database. Changes to the database must be reflected in the search index. CDC captures these changes and streams them to the search system.
+
+```sql
+-- PostgreSQL logical replication publications
+CREATE PUBLICATION search_publication FOR TABLE products;
+```
+
+The CDC pipeline:
+
+1. A change appears in the database (INSERT, UPDATE, DELETE)
+2. The CDC connector (Debezium, AWS DMS) captures the change
+3. The change is published to a message queue (Kafka, Kinesis)
+4. The search indexing service consumes the change
+5. The search index is updated with the new document
+
+CDC latency is typically 1 to 10 seconds. This is acceptable for most search applications. The database remains the source of truth. The search index is a derived data store.
+
+<AsciiDiagram
+  id="search-system/cdc-pipeline"
+  title="Database CDC to Search Index Pipeline"
+  alt="Flow from database through CDC connector, message queue, indexing service, and into the search cluster"
+  caption="Figure 2: CDC-based indexing pipeline"
+  content={`
++----------+     +----------+     +----------+     +----------+     +----------+
+|  Postgres|---->|  CDC     |---->|  Kafka   |---->|  Indexer |---->|  Search  |
+|  DB      |     |  Connector|    |  Topic   |     |  Service |     |  Cluster |
+|          |     | (Debezium)|    |          |     |          |     |          |
+| products |     | capture  |    | "products|     | consume  |     | update   |
+| table    |     | INSERT/  |    | .changes"|     | transform|     | inverted |
+|          |     | UPDATE/  |    |          |     | batch    |     | index    |
+|          |     | DELETE   |    |          |     | index    |     |          |
++----------+     +----------+     +----------+     +----------+     +----------+
+     |                |                |                |                |
+     | WAL log        | 1-10ms         | 10-100ms       | 10-100ms       | 10-100ms
+     v                v                v                v                v
+  transaction     change event     partitioned     bulk index      searchable
+  committed       serialized       message         request         in 1-10s
+`} />
+
+### Pattern 2: Dual-Write with Transactional Outbox
+
+When the application writes directly to both the database and the search index, dual-write problems arise: one write succeeds and the other fails, leaving the system inconsistent.
+
+The transactional outbox pattern solves this:
+
+1. The application writes the document to the database and writes an event to an outbox table in the same database transaction
+2. A separate process (the outbox relay) reads from the outbox table
+3. The relay writes the event to a message queue
+4. The indexing service consumes the event and updates the search index
+
+If the relay crashes, it resumes from the last processed event. This guarantees at-least-once delivery. The search index is eventually consistent with the database.
+
+### Pattern 3: Search-as-a-Service Proxy
+
+For multi-tenant applications, each tenant has its own index or shared index with tenant isolation. The search-as-a-service proxy handles:
+
+- **Tenant routing**: injecting tenant ID into every query as a mandatory filter
+- **Rate limiting**: per-tenant query quotas
+- **Resource isolation**: dedicated shards for high-volume tenants
+- **Billing**: tracking query volume and index size per tenant
+
+The proxy intercepts all search requests, injects tenant context, and enforces policies. This pattern is used by Elastic Cloud, Algolia, and Meilisearch.
+
+### Pattern 4: Index Federation
+
+Some queries need to search across multiple heterogeneous data sources. Index federation combines results from multiple search indexes:
+
+1. The query is sent to each index independently
+2. Each index returns its top results with normalized scores
+3. The federation layer merges the results using a fusion algorithm
+
+Common fusion algorithms:
+
+- **Reciprocal Rank Fusion (RRF)**: each document's score is the sum of 1/(rank + k) across all result sets. k is typically 60. RRF does not require normalized scores.
+- **Score normalization**: each result set's scores are normalized to a common scale (0 to 1) before merging. This requires understanding each index's scoring characteristics.
+
+Index federation is used in enterprise search (search across SharePoint, email, wikis, and databases) and in hybrid search (combining keyword and vector results).
+
+## Multi-Region Architecture
+
+A global search system serves users across multiple geographic regions. Multi-region architecture addresses latency, data residency, and disaster recovery.
+
+### Active-Active Multi-Region
+
+Each region has a full copy of the search cluster. Writes are accepted in any region and replicated asynchronously to other regions.
+
+**Advantages**: users query the nearest region (low latency). The system survives a full region failure.
+
+**Challenges**: cross-region replication latency (100 to 500 milliseconds). Conflicting updates require conflict resolution. Local relevance signals (like click-through rate) differ by region.
+
+<AsciiDiagram
+  id="search-system/multi-region"
+  title="Multi-Region Active-Active Search Architecture"
+  alt="Three regions each with their own search cluster, with cross-region replication and DNS-based routing, showing query and write paths"
+  caption="Figure 3: Multi-region active-active search architecture"
+  content={`
++------------------+    +------------------+    +------------------+
+|  US-East Region  |    |  EU-West Region  |    |  AP-Southeast   |
+|                  |    |                  |    |                  |
+|  +-----------+   |    |  +-----------+   |    |  +-----------+   |
+|  | Search    |   |    |  | Search    |   |    |  | Search    |   |
+|  | Cluster   |   |    |  | Cluster   |   |    |  | Cluster   |   |
+|  | 3 nodes   |   |    |  | 3 nodes   |   |    |  | 3 nodes   |   |
+|  +-----------+   |    |  +-----------+   |    |  +-----------+   |
+|        ^         |    |        ^         |    |        ^         |
+|        |         |    |        |         |    |        |         |
+|  +-----------+   |    |  +-----------+   |    |  +-----------+   |
+|  | CDC       |   |    |  | CDC       |   |    |  | CDC       |   |
+|  | Consumer  |   |    |  | Consumer  |   |    |  | Consumer  |   |
+|  +-----------+   |    |  +-----------+   |    |  +-----------+   |
+|        ^         |    |        ^         |    |        ^         |
++--------+---------+    +--------+---------+    +--------+---------+
+         |                       |                       |
+         +----------+------------+----------------------+
+                    |
+            +-------v--------+
+            |  Global Kafka  |
+            |  (cross-region |
+            |   replication) |
+            +----------------+
+                    |
+            +-------v--------+
+            |  Source of     |
+            |  Truth DB      |
+            |  (primary      |
+            |   region)      |
+            +----------------+
+`} />
+
+### DNS-Based Routing
+
+Users are routed to the nearest region using DNS-based global load balancing. Route53 or Cloudflare DNS resolves the search endpoint to the nearest healthy region. If a region fails, DNS is updated to route traffic to the next nearest region.
+
+### Disaster Recovery
+
+Each region has a recovery plan:
+
+- **Regional failover**: if the primary region fails, DNS routes traffic to a secondary region. The secondary region serves stale data (last replicated state) until the primary recovers.
+- **Data backup**: index snapshots are taken every 6 hours and stored in object storage (S3, GCS). Snapshots enable restoring a cluster from scratch.
+- **Cross-region replication**: writes are replicated asynchronously. The replication lag is 10 to 30 seconds under normal conditions, up to 5 minutes during peak load.
+
+## Capacity Planning
+
+Capacity planning for a search system requires estimating storage, memory, CPU, and network requirements.
+
+### Storage Estimation
+
+Storage is dominated by the inverted index, stored fields, and doc values.
+
+```
+Raw data size: 500 GB
+Inverted index overhead: 1.5x to 3x (depending on text analysis)
+Stored fields: 0.5x to 1x (depending on compression)
+Doc values: 0.3x to 0.5x
+Total per shard: 2.3x to 4.5x of raw data
+
+With replication factor of 2: 4.6x to 9x of raw data
+For 500 GB raw data: 2.3 TB to 4.5 TB total storage
+```
+
+### Memory Estimation
+
+The operating system's page cache is the most important memory for search. The OS caches frequently accessed index files. Recommended memory allocation:
+
+```
+Index files per node: 200 GB
+OS page cache: 64 GB (30 percent of index files)
+JVM heap: 32 GB (Lucene works best with 32 GB heaps, avoid 32+ GB due to compressed OOPs)
+Total RAM per node: 96 GB
+```
+
+### CPU Estimation
+
+CPU is consumed by query processing, indexing, and merging.
+
+```
+Query CPU: 5 ms per query per shard
+Indexing CPU: 2 ms per document per shard
+Merge CPU: 10 percent of total CPU under steady state
+
+For 5,000 QPS with 20 shards:
+  Query CPU: 5,000 * 20 * 5 ms = 500,000 ms = 500 seconds of CPU per second
+  Required cores: 500 (at 100% utilization) -> 250 cores (at 50% utilization)
+  With 16 cores per node: 16 nodes
+```
+
+### Network Estimation
+
+Network bandwidth is consumed by query fan-out and cross-node data transfer.
+
+```
+Query fan-out: 10 KB per shard request * 20 shards = 200 KB per query
+Result transfer: 50 KB per query result
+Total network per query: 250 KB
+
+For 5,000 QPS: 1.25 GB/s of network traffic
+With 16 nodes: 78 MB/s per node (well within 10 Gbps capacity)
+```
+
+## Operations
+
+Running a search system in production requires ongoing operational practices.
+
+### Monitoring
+
+Essential metrics to monitor:
+
+- **Query latency**: P50, P99, P99.9 broken down by query type. Alert when P99 exceeds 500 milliseconds.
+- **Indexing rate**: documents per second. Alert when the rate drops below the expected minimum.
+- **Merge rate**: bytes merged per second. A persistent merge backlog indicates insufficient I/O capacity.
+- **Segment count**: total segments across all shards. High segment counts increase query latency.
+- **Cache hit rates**: query cache, filter cache, field data cache. Low hit rates indicate cache pressure.
+- **Circuit breaker trips**: queries that exceed the memory limit. Frequent trips indicate oversized queries or insufficient memory.
+
+### Index Lifecycle Management
+
+Indexes grow over time. Managing the lifecycle prevents unbounded growth:
+
+- **Time-based indices**: create a new index per day or week. Query across multiple indices using an index alias. Delete indices older than the retention period.
+- **Rollover**: automatically create a new index when the current index reaches a size threshold (50 GB) or a document count threshold (10 million documents).
+- **Cold storage**: move older indices to slower, cheaper storage. Cold indices are still searchable but have higher latency.
+- **Snapshot and delete**: take a snapshot of old indices, then delete them from the cluster. Snapshots can be restored later if needed.
+
+### Rolling Upgrades
+
+Upgrading a search cluster without downtime requires a rolling upgrade:
+
+1. Disable shard allocation to prevent rebalancing during the upgrade
+2. Stop one node
+3. Upgrade the software
+4. Start the node
+5. Re-enable shard allocation
+6. Wait for the node to rejoin and recover
+7. Repeat for each node
+
+Master nodes are upgraded last. The cluster remains operational during the upgrade, though with reduced capacity.
+
+### Backup and Restore
+
+Regular backups protect against data loss:
+
+- **Snapshot frequency**: every 6 hours for incremental snapshots, daily for full snapshots
+- **Snapshot storage**: object storage (S3, GCS, Azure Blob) in a different region from the cluster
+- **Restore time objective (RTO)**: 2 hours for a full cluster restore from snapshots
+- **Recovery point objective (RPO)**: 6 hours (worst-case data loss between snapshots)
+
+For stricter RPO, combine snapshots with CDC replication. The CDC pipeline provides continuous backup with 1-10 second RPO.
+
+## Summary
+
+A production-grade search system is a distributed cluster with dedicated node roles (coordinator, data, master). The cluster is horizontally scalable: add nodes to increase capacity.
+
+Integration patterns connect the search system to the broader data infrastructure. CDC provides reliable indexing from the database. The transactional outbox pattern prevents dual-write inconsistencies. The search-as-a-service proxy enables multi-tenant isolation. Index federation combines results from multiple heterogeneous sources.
+
+## Real-World Deployment Configurations
+
+### Development Environment
+
+A development search cluster runs on a single node with default settings. The index is small (under 10 GB). The cluster is destroyed and recreated frequently as the schema evolves.
+
+Configuration:
+- Single node with both master and data roles
+- 1 shard, 0 replicas
+- Refresh interval: 1 second
+- No security or authentication (internal network only)
+- Minimum memory: 4 GB heap, 8 GB total RAM
+
+### Staging Environment
+
+The staging cluster mirrors production at a smaller scale. It is used for integration testing, performance testing, and schema validation.
+
+Configuration:
+- 3 nodes: 1 master, 2 data
+- 5 shards per index, 1 replica
+- Refresh interval: 5 seconds (to reduce indexing overhead during testing)
+- Security enabled (LDAP integration)
+- Memory: 16 GB heap per data node, 32 GB total RAM per node
+
+### Production Environment
+
+The production cluster serves live traffic. It is optimized for reliability, performance, and operational manageability.
+
+Configuration:
+- 12 nodes: 3 dedicated master nodes, 9 data nodes
+- 30 shards per index, 2 replicas
+- Refresh interval: 30 seconds during peak indexing periods, 1 second during normal operations
+- Security: TLS, role-based access control, API key authentication
+- Monitoring: Prometheus metrics, Grafana dashboards, PagerDuty alerts
+- Memory: 32 GB heap per data node (with compressed OOPs), 64 GB total RAM per node
+- Storage: 2 TB SSD per data node in RAID 0
+
+### Disaster Recovery Environment
+
+A secondary cluster in a different region receives replicated data. It is used for read-only queries during normal operations and takes over write operations if the primary cluster fails.
+
+Configuration:
+- 12 nodes (same as production)
+- Cross-cluster replication from the primary region
+- Read-only for user traffic during normal operations
+- Automatic failover if the primary cluster is unreachable for 5 minutes
+- Independent snapshot schedule (every 6 hours to S3 in the DR region)
+
+## Shard Management Strategies
+
+### Shard Allocation
+
+Shards are allocated to nodes based on a set of rules:
+
+- **Disk-based allocation**: shards are allocated to nodes with the most free disk space. This prevents any single node from running out of disk.
+- **Shard allocation awareness**: shards are allocated across availability zones. Each shard and its replica are in different zones. This tolerates a full zone failure.
+- **Filter-based allocation**: certain indices can be restricted to specific nodes. High-priority indices get dedicated hardware.
+
+### Shard Rebalancing
+
+When nodes are added or removed, shards are rebalanced across the cluster. The rebalancing algorithm:
+
+1. Identifies nodes that are over-allocated (more shards than the average)
+2. Identifies nodes that are under-allocated (fewer shards than the average)
+3. Moves shards from over-allocated to under-allocated nodes
+4. Balances the number of shards per node within a configurable threshold (default: 2)
+
+Rebalancing is throttled to prevent overwhelming the network. The default throttle is 40 MB/s for incoming and outgoing shard movements.
+
+### Shard Recovery
+
+When a node fails, its shards are recovered on other nodes. The recovery process:
+
+1. The master node detects the failed node (default: 30 second timeout)
+2. The master promotes replica shards to primary
+3. The master allocates new replica shards on available nodes
+4. The new replicas copy data from the primary shards
+
+Shard recovery is I/O-intensive. A shard with 50 GB of data takes 5 to 15 minutes to recover. During recovery, the recovering shard serves queries but with reduced performance.
+
+## Deployment Automation
+
+Production search clusters are deployed and managed through infrastructure as code.
+
+### Terraform Configuration
+
+```hcl
+resource "aws_instance" "elasticsearch_data" {
+  count         = 9
+  ami           = data.aws_ami.elasticsearch.id
+  instance_type = "m5.4xlarge"
+  subnet_id     = element(var.data_subnets, count.index)
+
+  root_block_device {
+    volume_size = 64
+    volume_type = "gp3"
+  }
+
+  ebs_block_device {
+    device_name = "/dev/xvdb"
+    volume_size = 2048
+    volume_type = "gp3"
+    iops        = 16000
+  }
+
+  user_data = templatefile("${path.module}/elasticsearch.yml", {
+    node_roles    = "data"
+    cluster_name  = var.cluster_name
+    heap_size     = 32768
+    discovery_seed_hosts = var.master_ips
+  })
+}
+```
+
+### Kubernetes Deployment
+
+```yaml
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: production
+spec:
+  version: 8.12.0
+  nodeSets:
+  - name: master
+    count: 3
+    config:
+      node.roles: ["master"]
+    podTemplate:
+      spec:
+        containers:
+        - name: elasticsearch
+          env:
+          - name: ES_JAVA_OPTS
+            value: "-Xms16g -Xmx16g"
+          resources:
+            requests:
+              memory: 24Gi
+              cpu: 4
+            limits:
+              memory: 24Gi
+              cpu: 4
+  - name: data
+    count: 9
+    config:
+      node.roles: ["data_hot", "data_content"]
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Ti
+        storageClassName: ssd
+```
+
+## Security Architecture
+
+A production search system requires comprehensive security.
+
+### Network Security
+
+- All traffic runs over TLS 1.3
+- The cluster operates in a private VPC with no public IP addresses
+- Ingress traffic is routed through an API gateway or load balancer
+- Inter-node traffic uses mutual TLS (mTLS) for authentication
+
+### Authentication
+
+- API key authentication for programmatic access
+- LDAP or SAML integration for human users
+- Service account tokens for application-to-cluster communication
+- No shared passwords for administrative access
+
+### Authorization
+
+- Role-based access control (RBAC) at the index level
+- Field-level security: certain fields are redacted for specific roles
+- Document-level security: documents are filtered based on user permissions
+- Queries are audited: every query is logged with the authenticated user and timestamp
+
+### Encryption
+
+- Data at rest is encrypted using the cluster's encryption at rest feature
+- Data in transit is encrypted using TLS
+- Snapshot backups are encrypted using server-side encryption
+
+Multi-region deployment with active-active clusters provides low latency for global users and disaster recovery. Capacity planning requires estimating storage, memory, CPU, and network requirements based on the workload.
+
+## Observability Stack
+
+### Metrics Collection
+
+Essential metrics for production search clusters:
+
+**Cluster health metrics**:
+- `cluster_status`: green (all shards allocated), yellow (replicas not allocated), red (primaries not allocated)
+- `number_of_nodes`: total nodes in the cluster
+- `active_shards`: number of shards serving queries
+- `relocating_shards`: shards being moved between nodes
+- `initializing_shards`: shards being initialized
+
+**Node health metrics**:
+- `jvm.heap_used_percent`: JVM heap usage. Alert when above 85 percent
+- `os.cpu.percent`: CPU utilization. Alert when sustained above 80 percent
+- `os.disk.free_bytes`: free disk space. Alert when below 20 percent of total
+- `indices.segments.count`: total segments. Alert when the count exceeds 10,000 per node
+- `indices.search.query_time_in_millis`: cumulative query time
+- `indices.indexing.index_time_in_millis`: cumulative indexing time
+
+**Thread pool metrics**:
+- `thread_pool.search.queue`: queued search requests. Alert when queue size exceeds 100
+- `thread_pool.search.rejected`: rejected search requests. Alert on any rejection
+- `thread_pool.write.queue`: queued write requests
+- `thread_pool.write.rejected`: rejected write requests. Alert on any rejection
+
+### Monitoring Dashboards
+
+A Grafana dashboard for search clusters should include:
+
+- Cluster health overview: status, nodes, shards, indices
+- Query performance: P50, P99, P99.9 latency over time
+- Query volume: QPS by index and query type
+- Indexing rate: documents per second, indexing latency
+- Merge activity: segments merged, bytes merged, merge time
+- Memory usage: JVM heap, OS page cache, circuit breaker utilization
+- Disk usage: total, free, and used by index
+- Network: bytes sent and received, connection count
+
+### Alerting Rules
+
+Critical alerts for a production search cluster:
+
+- **RED ALERT**: any primary shard is unassigned (cluster status is red)
+- **RED ALERT**: search latency P99 exceeds 1 second for 5 minutes
+- **RED ALERT**: indexing rejection rate exceeds 1 percent for 1 minute
+- **YELLOW ALERT**: any replica shard is unassigned (cluster status is yellow)
+- **YELLOW ALERT**: JVM heap usage exceeds 85 percent for 5 minutes
+- **YELLOW ALERT**: disk usage exceeds 80 percent on any node
+- **YELLOW ALERT**: query rejection rate exceeds 1 percent for 1 minute
+- **INFO ALERT**: segment count exceeds 5,000 per node
+- **INFO ALERT**: merge queue size exceeds 10
+
+## Reindexing Strategies
+
+### Zero-Downtime Reindexing
+
+When the mapping or analysis chain changes, existing documents must be reindexed. The zero-downtime approach:
+
+1. Create a new index with the updated mapping
+2. Start indexing new and updated documents to both the old and new indices (dual-write)
+3. Reindex the old index data to the new index using Elasticsearch's reindex API
+4. Monitor the reindex progress and verify data consistency
+5. Atomically swap the index alias from the old index to the new index
+6. Delete the old index
+
+The dual-write period ensures no data is lost between the old and new indices. The alias swap is atomic from the perspective of clients.
+
+### In-Place Reindexing
+
+For small indices (under 50 GB), in-place reindexing is acceptable:
+
+1. Take the index offline
+2. Update the mapping
+3. Reindex all documents
+4. Bring the index back online
+
+Downtime is proportional to the index size and the reindexing speed. For a 50 GB index, in-place reindexing takes 5 to 10 minutes.
+
+### Reindexing with Minimal Resources
+
+For large indices (over 500 GB), reindexing can consume significant resources. Strategies to minimize impact:
+
+- Throttle the reindexing rate to 5,000 documents per second
+- Schedule reindexing during low-traffic hours
+- Use dedicated reindexing nodes that are removed from the query pool
+- Use source filtering to reindex only the fields that changed
+
+Operational practices -- monitoring, index lifecycle management, rolling upgrades, and backup -- keep the system healthy over time.

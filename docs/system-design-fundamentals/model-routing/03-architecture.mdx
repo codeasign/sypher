@@ -1,0 +1,1005 @@
+---
+id: model-routing-architecture
+title: Model Routing at Scale
+sidebar_label: Building It at Scale
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+Routing a single LLM request is straightforward. Routing 10 million daily active users through dozens of models across multiple regions, each with different cost, latency, and capability profiles -- that is a distributed systems problem. This page walks through the architecture from a naive prototype to a production-grade global routing system.
+
+## Naive Implementation
+
+Every model routing system starts as an if-else chain. You check the prompt length, check the capability required, check the user's tier, and return a model name. It works in development. It works at 100 users. Then it breaks.
+
+### The Simple Approach
+
+A naive router looks like this:
+
+```python
+import os
+from typing import Optional
+
+MODEL_REGISTRY = {
+    "gpt-4o":    {"cost_per_1k": 0.01,  "max_tokens": 128000, "capability": "high"},
+    "gpt-4o-mini": {"cost_per_1k": 0.001, "max_tokens": 128000, "capability": "medium"},
+    "claude-3-haiku": {"cost_per_1k": 0.001, "max_tokens": 200000, "capability": "medium"},
+    "claude-3-sonnet": {"cost_per_1k": 0.003, "max_tokens": 200000, "capability": "high"},
+    "llama-3-70b": {"cost_per_1k": 0.002, "max_tokens": 8192,   "capability": "high"},
+}
+
+
+def naive_route(request: dict) -> str:
+    prompt = request.get("prompt", "")
+    user_tier = request.get("tier", "free")
+    capabilities = request.get("required_capability", "medium")
+
+    prompt_length = len(prompt.split())
+
+    # Free tier: cheapest only
+    if user_tier == "free":
+        if prompt_length under 500:
+            return "claude-3-haiku"
+        return "gpt-4o-mini"
+
+    # Pro tier: balance cost and quality
+    if user_tier == "pro":
+        if capabilities == "high":
+            if prompt_length over 10000:
+                return "gpt-4o"
+            return "claude-3-sonnet"
+        if prompt_length under 2000:
+            return "gpt-4o-mini"
+        return "claude-3-haiku"
+
+    # Enterprise: always best model
+    return "gpt-4o"
+```
+
+This function runs in under a millisecond, needs no external dependencies, and is trivially debuggable. Every production routing system starts here. The hardcoded approach is a direct reflection of the team's assumptions about their users: free users get cheap models, pro users get a mix, enterprise users get the best. Those assumptions are wrong in ways that only become visible at scale.
+
+### A Slightly Better, Still Naive Approach
+
+The obvious improvement is to externalize the configuration. Instead of hardcoding thresholds in the function body, load them from a JSON file:
+
+```python
+import json
+
+with open("routing_config.json") as f:
+    ROUTING_CONFIG = json.load(f)
+
+
+def configured_route(request: dict) -> str:
+    tier = request.get("tier", "free")
+    config = ROUTING_CONFIG["tiers"].get(tier, ROUTING_CONFIG["tiers"]["free"])
+
+    prompt_length = len(request.get("prompt", "").split())
+    for rule in config["rules"]:
+        if (rule["max_length"] is None or prompt_length under= rule["max_length"]):
+            return rule["model"]
+
+    return config.get("fallback", "gpt-4o-mini")
+```
+
+This is better. You can change thresholds without redeploying code. But it still has the same fundamental problems: no caching, no observability, no circuit breakers, no multi-region support. The configuration file approach works at 1,000 users but still breaks at 100,000.
+
+The key insight is that routing is not a configuration problem. It is a distributed systems problem that requires dedicated infrastructure.
+
+### What Breaks at 1K Users
+
+At 1,000 daily active users the if-else chain still works, but problems appear:
+
+- **Hardcoded thresholds are wrong.** You assumed a prompt with 500 tokens should use the cheap model, but your users' average prompt is 2,000 tokens. Every request hits the expensive path. The monthly cost difference between a 500-token threshold and a 2,000-token threshold is thousands of dollars.
+
+- **No observability.** There is no way to know how many requests go to each model, what the average latency is, or how much each tier costs. When the cloud bill arrives, you cannot attribute the cost to any specific feature or user segment.
+
+- **Single point of failure.** The routing logic lives inside the application process. If the process restarts, routing state resets. If a developer deploys a buggy version of the routing logic, all traffic is affected.
+
+- **No caching.** Identical prompts from different users each trigger a full routing decision. A system prompt like "You are a helpful assistant" runs through the if-else chain tens of thousands of times per day, each producing the same result.
+
+### What Breaks at 100K Users
+
+At 100,000 DAU the monolithic router becomes actively harmful:
+
+- **Deployment coupling.** Changing a routing rule requires redeploying the entire application. A typo in a threshold takes the whole system down. The deployment cycle for a rule change is 30 minutes (build, test, deploy, verify) when it should be 5 seconds.
+
+- **No load shedding.** When a model is degraded (high latency, errors), the router keeps sending traffic to it. There is no circuit breaker. A partial outage at the model provider cascades into a full outage because the router has no mechanism to redirect traffic.
+
+- **No A/B testing.** You cannot route 5 percent of traffic to a new model variant without modifying code. The engineering team must write a new if-else branch, deploy it, and hope the metrics show improvement. There is no way to run a controlled experiment.
+
+- **Cost explosion.** Without cost tracking per route, you have no feedback loop. The "enterprise always gets the best model" rule costs 10x what it should because most enterprise requests are simple Q\&A. The monthly LLM bill grows linearly with user count, but revenue grows sub-linearly.
+
+### What Breaks at 10M Users
+
+At 10 million DAU, the naive approach fails catastrophically:
+
+- **Throughput bottleneck.** A single process cannot evaluate 10,000 routing decisions per second. The if-else chain, while fast, competes with application logic for CPU. The application server needs to be scaled horizontally just to handle routing, even though routing is a fraction of the total request processing.
+
+- **No multi-region awareness.** All traffic routes to a single region. Users in Asia experience 300ms added latency just from network round trips. That 300ms compounds: users retry, timeouts increase, error rates go up.
+
+- **No fallback logic.** If the chosen model returns a 503, the user sees an error. There is no retry with a different model. At 10 million DAU, provider API errors are not rare -- they happen thousands of times per day.
+
+- **No cost governance.** Monthly LLM costs run into six figures with no per-route attribution. Finance cannot answer "which feature caused this spike?" The only observable signal is the total cloud bill, which tells you nothing about the individual model choices.
+
+<AsciiDiagram id="model-routing/arch-naive" title="Naive Router vs. Production Router Scaling" alt="Comparison of naive monolithic router and production distributed router architecture across user scales" caption="The scaling gap between a hardcoded router and a distributed routing system" content={
+`                            ┌─────────────────────┐
+                            │   Application Code   │
+                            │  ┌─────────────────┐ │
+                            │  │  route(request)  │ │
+                            │  │  if tier=="free" │ │
+                            │  │  if len>500 ...  │ │
+                            │  │  return model    │ │
+                            │  └────────┬────────┘ │
+                            └──────────┼──────────┘
+                                       │ model name
+                                       ▼
+                               ┌───────────────┐
+                               │   LLM API     │
+                               └───────────────┘
+                          Naive: embedded, single process
+
+   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+
+                     ┌──────────────────────┐
+                     │    Load Balancer     │
+                     └──────────┬───────────┘
+                                │
+                ┌───────────────┼───────────────┐
+                │               │               │
+        ┌───────▼───────┐ ┌────▼────┐ ┌───────▼───────┐
+        │ Router Node 1 │ │Router 2 │ │ Router Node N │
+        │  decision     │ │         │ │               │
+        └───────┬───────┘ └────┬────┘ └───────┬───────┘
+                │               │               │
+                └───────────────┼───────────────┘
+                                │ model + params
+                                ▼
+                        ┌───────────────┐
+                        │   LLM API     │
+                        └───────────────┘
+                   Production: distributed, stateless
+`} />
+
+## Production-Grade Architecture
+
+A production routing system decouples the routing decision from the application serving it. The architecture separates six concerns: request ingestion, routing logic, model registry, metrics collection, caching, and fallback handling.
+
+### Core Components
+
+**Load Balancer.** The entry point. Distributes incoming routing requests across a pool of stateless router instances. Uses consistent hashing so that identical requests (same prompt hash, same user context) reach the same router instance, maximizing cache locality. Runs health checks against each router instance every five seconds, removing unhealthy instances from the pool within two health check cycles.
+
+The load balancer also performs protocol detection: some clients send HTTP/1.1, some send gRPC, and some send WebSocket connections for streaming. It terminates each protocol appropriately and forwards the routing context as an internal protobuf message.
+
+**Routing Service Cluster.** A pool of stateless services that accept a request context and return a model assignment. Each instance loads routing rules from the registry on startup and refreshes them every thirty seconds. The routing decision is a pure function of the input context -- no per-request I/O against the registry. This keeps p99 latency under 10 milliseconds.
+
+Each router instance maintains several in-memory data structures:
+
+- **Rule index.** An ordered list of routing rules sorted by priority. Each rule contains a condition tree (AND/OR of atomic predicates) and an action block.
+- **Model group cache.** The set of concrete models within each model group, annotated with their current health status and average latency.
+- **Cache key shard assignment.** A consistent hash ring that maps cache keys to Redis cluster nodes, enabling direct cache access without a coordinator.
+
+**Model Registry (etcd/Consul).** The source of truth for all routing rules, model metadata, and deployment state. Stores:
+
+- Model capability profiles: max tokens, supported modalities, pricing tier, pricing per 1K tokens, supported regions
+- Routing policies: user tier to model group mappings, prompt length rules, cost ceilings, time-of-day rules
+- Model health status: degraded, available, draining, retired
+- Deployment versions and rollout percentages for each model variant
+
+The registry uses a distributed consensus protocol (Raft) to ensure consistency. Writes are rare (policy changes, model additions) and reads are cached by the router instances. A watch mechanism notifies router instances of changes within one second. The registry cluster spans at least three nodes across two availability zones for fault tolerance.
+
+**Metrics Pipeline.** Every routing decision emits a structured event: request ID, user tier, prompt length, selected model, latency, cache hit/miss, rule IDs that were evaluated, fallback flag. These events flow to a time-series database (Prometheus, VictoriaMetrics, or similar) and are aggregated into dashboards and alerts. The pipeline must handle 10,000+ events per second with under 100ms p99 delivery latency.
+
+The metrics pipeline uses a buffered, batched writer that collects events for 500ms or until the buffer reaches 1,000 events, whichever comes first. This batching reduces write pressure on the time-series database by a factor of 200.
+
+**Async Fallback Queue.** When a model is degraded or returns an error, the router enqueues the request to a fallback queue instead of failing. A separate worker dequeues requests, retries with a different model, and returns the result asynchronously. The queue provides backpressure: if every model is degraded, requests queue up rather than overwhelming the API gateways.
+
+The fallback queue uses Kafka for durability and ordering. Each partition handles a specific failure domain: one partition for provider timeouts, another for rate limits, a third for invalid responses. Workers consume from their assigned partition and retry with a configurable backoff (500ms, 2s, 5s, then dead-letter).
+
+**Caching Layer.** A distributed cache (Redis or Memcached) stores routing decisions keyed by a hash of the request context: prompt fingerprint, user tier, capability requirements. Cache TTL is typically 60 seconds for general requests and 300 seconds for repeated prompts (system prompts, templates). At 10M DAU, a 60 percent cache hit ratio reduces routing service load from 10,000 QPS to 4,000 QPS.
+
+The cache uses a two-tier structure:
+
+- **L1: Local LRU cache** inside each router instance. Stores the most recent 10,000 decisions. Serves lookups in under 1 microsecond. Invalidated every 30 seconds if the registry version changes.
+- **L2: Redis cluster.** Stores all cached decisions with TTL-based eviction. Serves lookups in under 3 milliseconds. Uses Redis Cluster with three master nodes and three replica nodes.
+
+A decision is written to both tiers on a cache miss. If Redis is unreachable, the router continues operating with L1-only caching, degrading gracefully rather than failing.
+
+<AsciiDiagram id="model-routing/arch-production" title="Production Model Routing Architecture" alt="Full architecture diagram showing load balancer, router cluster, model registry, cache, metrics pipeline, and fallback queue" caption="The six-component architecture of a production routing system" content={
+`                                    ┌─────────────────────────────────────┐
+                                    │          External Request            │
+                                    └────────────────┬────────────────────┘
+                                                     │
+                                               ┌─────▼─────┐
+                                               │   DNS +   │
+                                               │  Geo LB   │
+                                               └─────┬─────┘
+                                                     │
+                                          ┌──────────▼──────────┐
+                                          │   HTTP Load Balancer │
+                                          │  (consistent hash)   │
+                                          └──────────┬──────────┘
+                                                     │
+                    ┌────────────────────────────────┼────────────────────────────┐
+                    │                                │                            │
+            ┌───────▼────────┐              ┌───────▼────────┐          ┌───────▼────────┐
+            │  Router Inst 1 │              │  Router Inst 2 │          │  Router Inst N │
+            │  L1 cache (10K)│              │  L1 cache (10K)│          │  L1 cache (10K)│
+            │  rule index    │              │  rule index    │          │  rule index    │
+            └───────┬────────┘              └───────┬────────┘          └───────┬────────┘
+                    │                                │                            │
+                    └────────────────┬───────────────┼────────────────────────────┘
+                                     │               │
+             ┌───────────────────────┼───────────────┼───────────────────────┐
+             │                       │               │                       │
+             ▼                       ▼               ▼                       ▼
+     ┌───────────────┐     ┌────────────────┐     ┌───────────────┐     ┌───────────────┐
+     │  L2 Redis     │     │  Model Registry│     │  Metrics      │     │  Fallback     │
+     │  Cache        │     │  (etcd/Consul) │     │  Pipeline     │     │  Queue (Kafka)│
+     │  TTL: 60-300s │     │  rules + state │     │  Prometheus   │     │  + Worker     │
+     │  3 masters    │     │  3-5 nodes     │     │  Victoria     │     │  3 partitions │
+     └───────────────┘     └────────────────┘     └───────────────┘     └───────────────┘
+                                     │
+                                     ▼
+                          ┌──────────────────────┐
+                          │   LLM API Gateways   │
+                          │  (openai/anthropic/  │
+                          │   custom inference   │
+                          │   servers)           │
+                          └──────────────────────┘
+`} />
+
+### Request Flow Walkthrough
+
+A routing request moves through five stages. Each stage has a defined latency budget and failure mode:
+
+**Stage 1: Ingest (budget: 2ms).** The load balancer receives the request and picks a router instance using consistent hashing. The request carries: prompt text or a fingerprint, user tier, required capabilities, and a deadline (maximum acceptable wait time). If the load balancer cannot find a healthy router instance within 2ms, it returns a 503 with a Retry-After header.
+
+**Stage 2: Cache lookup (budget: 5ms).** The router computes a cache key from the request context and checks L1 cache (local RAM). On a miss, it checks L2 cache (Redis). On a hit at either level, it returns the cached model assignment and emits a metrics event with a cache-hit tag. The cache key is a SHA-256 hash of: prompt fingerprint + user tier + capability requirement + active experiment IDs.
+
+**Stage 3: Rule evaluation (budget: 10ms).** On a cache miss, the router evaluates the request against its local copy of the routing rules. Rules are a DAG (directed acyclic graph) of conditions: tier, prompt length, capability, session history, cost budget remaining, time of day, active experiments. The router evaluates rules in priority order and returns the first match. Rule evaluation is pure computation -- no I/O, no locks.
+
+**Stage 4: Model selection (budget: 3ms).** From the matching model group, the router selects a concrete model. Selection strategies include: lowest cost among available models, round-robin, latency-weighted, or randomized with a fixed seed for reproducibility. The selection considers the current health status of each model in the group, excluding any models marked as degraded or draining.
+
+**Stage 5: Post-processing (budget: 5ms).** The router records the decision to the metrics pipeline (async, fire-and-forget), writes it to both cache tiers (async), and returns the model ID plus any model-specific parameters (max tokens, temperature override, stop sequences). The response is a protobuf message under 200 bytes.
+
+The entire flow, including cache read and metrics emission, completes in under 15 milliseconds at p99. The cache hit path completes in under 3 milliseconds.
+
+### Routing Rules as Data
+
+Routing rules live in the model registry as structured data, not as application code. A rule document looks like this:
+
+```json
+{
+  "rule_id": "pro-prompt-length",
+  "priority": 100,
+  "description": "Short pro-tier prompts with medium capability use cheap models",
+  "conditions": {
+    "tier": "pro",
+    "prompt_tokens": {"operator": "lte", "value": 4000},
+    "required_capability": "medium"
+  },
+  "action": {
+    "model_group": "fast-cheap",
+    "cost_ceiling": 0.005,
+    "max_tokens_override": 4096
+  },
+  "fallback": {
+    "model_group": "medium-quality",
+    "max_retries": 2,
+    "backoff_ms": 500
+  }
+}
+```
+
+Rules are ordered by priority. The router evaluates rules in descending priority order and returns the first match. This makes routing behavior auditable and changeable without code deploys. A rule change in the registry propagates to all router instances within two seconds and takes effect on the next request.
+
+The condition language supports eight operators: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`. Conditions can be nested with `AND` and `OR` combinators. A rule matches only when all conditions in its top-level AND block are satisfied.
+
+### Circuit Breakers and Degradation
+
+The production architecture includes circuit breakers at two levels:
+
+**Model-level circuit breaker.** Each model endpoint has a circuit breaker with three states: closed (normal), open (failing), half-open (testing recovery). The breaker tracks the last 100 requests to the model. If the error rate exceeds 10 percent, the breaker opens and the router stops selecting that model for 30 seconds. After 30 seconds, the breaker allows a single probe request. If it succeeds, the breaker closes. If it fails, the breaker stays open for another 60 seconds.
+
+**Provider-level circuit breaker.** If all models from a single provider (for example, all Anthropic models) show elevated error rates, the provider-level breaker opens. The router selects models from alternative providers for all requests that would have used the degraded provider. This prevents a single provider outage from affecting all traffic.
+
+### Health Checking
+
+Each model endpoint is health-checked every 10 seconds. The health check is a lightweight request (a simple completion with a short prompt) that measures:
+
+- HTTP status code (must be 200)
+- Response time (must be under 5 seconds)
+- Response content validity (must return a non-empty completion)
+- Token generation rate (must exceed 10 tokens per second for streaming)
+
+Health check results are stored in the model registry and cached by each router instance. A model with three consecutive failed health checks is marked as degraded. A model with ten consecutive failed health checks is marked as down and removed from the routing pool.
+
+The health check system is independent of the routing service. It runs as a separate cron job or daemon set, preventing false positives during router deployments.
+
+## Integration Patterns
+
+A model router does not operate in isolation. It integrates with every system around the LLM stack: API gateways, internal inference servers, observability platforms, experimentation frameworks, and cost management systems.
+
+### With LLM API Gateways
+
+The router sits between the application and the LLM API gateway. The application sends a routing request (context plus prompt fingerprint), receives a model assignment, and then calls the gateway with the chosen model.
+
+The gateway handles authentication, rate limiting, and retry logic for the upstream LLM provider. The router handles which model to use and whether the request is cacheable. This separation means the gateway can be swapped (for example, migrating from OpenAI direct to Azure OpenAI) without changing routing logic.
+
+<AsciiDiagram id="model-routing/arch-gateway" title="Integration with LLM API Gateways" alt="Sequence diagram showing the application, router, gateway, and upstream LLM API interaction" caption="The router assigns a model; the gateway handles provider interaction" content={
+`    Application         Router          Gateway         LLM API
+        │                 │                │               │
+        │  route(context) │                │               │
+        │────────────────>│                │               │
+        │                 │  evaluate      │               │
+        │                 │  rules + cache │               │
+        │    model ID     │                │               │
+        │<────────────────│                │               │
+        │                 │                │               │
+        │  POST /chat     │                │               │
+        │  model="gpt-4o" │                │               │
+        │─────────────────────────────────>│               │
+        │                 │                │  rate check   │
+        │                 │                │  authenticate │
+        │                 │                │               │
+        │                 │                │  POST /v1     │
+        │                 │                │──────────────>│
+        │                 │                │   response    │
+        │                 │                │<──────────────│
+        │                 │                │               │
+        │                 │  cost_report   │               │
+        │                 │<───────────────│               │
+        │    response     │                │               │
+        │<─────────────────────────────────│               │
+`} />
+
+The gateway reports back per-request cost and latency metrics to the router's metrics pipeline. This feedback loop enables the router to adjust its model selection over time: if a model shows elevated latency above 2 seconds, the router reduces its selection weight by 50 percent. If latency normalizes, the weight is restored over a 5-minute ramp.
+
+The gateway integration adds two critical capabilities to the router:
+
+- **Token count feedback.** The gateway reports actual token usage (prompt + completion) back to the router. The router uses this to refine its prompt length estimates for future routing decisions.
+- **Error classification.** The gateway classifies errors into categories (rate limited, timeout, invalid request, server error) and passes the category to the router. The router uses the category to select the appropriate fallback action: rate-limited requests retry with longer backoff, server errors switch to a different provider.
+
+### With Internal Model Servers
+
+For organizations running private model infrastructure, the router must understand internal server topology: which models are deployed on which servers, current load per server, and any server-specific constraints (GPU memory, batch queue depth).
+
+The router maintains a connection pool to the inference cluster's internal load balancer. It adds server-level metadata to each routing decision: target server group, estimated queue wait, and preferred batch window.
+
+Internal model servers report their status through a sidecar agent that pushes metrics to the model registry every 5 seconds. The metrics include:
+
+- GPU utilization (percentage, 0-100)
+- Batch queue depth (number of queued inference requests)
+- Average inference time per request (milliseconds, rolling 60-second window)
+- Available memory (GB of free GPU memory)
+- Model loading status (loading, ready, unloading, error)
+
+The router uses these metrics in its selection strategy. A server with queue depth over 50 gets a latency penalty of 200ms in the selection score. A server with GPU utilization over 95 percent gets a 500ms penalty. This spreads load across the cluster and prevents any single server from becoming a hotspot.
+
+<AsciiDiagram id="model-routing/arch-internal" title="Integration with Internal Model Servers" alt="Diagram showing router connecting to an internal inference cluster with multiple GPU nodes" caption="The router considers GPU node load and queue depth when routing to internal models" content={
+`                         ┌─────────────────────┐
+                         │   Model Router       │
+                         │   load-aware routing │
+                         └──┬──────┬──────┬─────┘
+                            │      │      │
+                ┌───────────┼──────┼──────┼───────────┐
+                │           │      │      │           │
+                ▼           ▼      ▼      ▼           │
+        ┌──────────┐ ┌────────┐ ┌────────┐ ┌────────┐│
+        │ GPU Node │ │GPU Node│ │GPU Node│ │ GPU    ││
+        │ Llama 3  │ │Mixtral │ │Llama 3 │ │ Node 4 ││
+        │ 70B      │ │8x7B    │ │8B      │ │ free   ││
+        │ load: 80%│ │load:45%│ │load:10% │ │ load:0%││
+        │ queue: 12│ │queue:3 │ │queue:0  │ │ queue:0││
+        │ ready    │ │ready   │ │ready    │ │ idle   ││
+        └──────────┘ └────────┘ └────────┘ └─────────┘│
+        └─────────────────────────────────────────────┘
+                          Inference Cluster
+`} />
+
+### With Monitoring and Observability
+
+Every component emits structured logs and metrics. The observability stack consumes these to answer three questions: is routing correct, is routing fast, and is routing cost-effective.
+
+Key metrics emitted by the router:
+
+- `router_decision_total` -- counter by model, tier, cache hit/miss, fallback (cardinality: under 100)
+- `router_decision_duration_ms` -- histogram by rule set (buckets: 1, 2, 5, 10, 25, 50, 100, 250, 500)
+- `router_cache_hit_ratio` -- gauge, per cache shard (updated every 10 seconds)
+- `router_fallback_rate` -- proportion of requests that required a retry (rolling 1-minute window)
+- `router_cost_per_request` -- derived from selected model and token count (bucketed by tier)
+- `router_stale_rule_count` -- number of instances with rule version older than 30 seconds
+- `router_circuit_breaker_state` -- gauge: 0=closed, 1=open, 2=half-open, per model endpoint
+
+These metrics feed a Grafana dashboard with five panels:
+
+1. **Routing throughput.** QPS by model and tier, split across two y-axes (left: total, right: by model).
+2. **Latency distribution.** p50, p95, p99 decision latency over the last hour with SLO lines at 10ms and 50ms.
+3. **Cache performance.** Hit ratio for L1 and L2 caches, eviction rate, memory usage.
+4. **Cost burn.** Cost per hour by tier and model, with a 7-day rolling average overlay.
+5. **Error and fallback rate.** Fallback rate, circuit breaker state changes, and provider error rate.
+
+Alerts trigger at three severity levels:
+
+- **Warning.** Fallback rate above 5 percent, p99 latency above 50ms, cache hit ratio below 40 percent.
+- **Critical.** Fallback rate above 10 percent, p99 latency above 100ms, any circuit breaker open for more than 5 minutes.
+- **Page.** All models in a provider group unavailable, global cache cluster unreachable, routing accuracy below 99 percent.
+
+### With A/B Testing Frameworks
+
+A/B testing requires the router to split traffic between model variants deterministically. The router accepts an experiment context: experiment ID, variant assignment (control, treatment), and rollout percentage.
+
+```python
+def route_with_experiment(context: dict) -> str:
+    experiment_id = context.get("experiment_id")
+    variant = get_experiment_variant(
+        user_id=context["user_id"],
+        experiment_id=experiment_id
+    )
+
+    if variant == "control":
+        base_model = evaluate_rules(context)
+        return base_model
+
+    if variant == "treatment":
+        override = get_experiment_override(experiment_id)
+        context["model_group_override"] = override["model_group"]
+        return evaluate_rules_with_override(context)
+```
+
+The deterministic assignment uses a hash of the user ID and experiment ID, ensuring the same user always sees the same variant. The router logs the experiment assignment with each decision so the analytics pipeline can compare quality scores between control and treatment groups.
+
+A/B testing integration adds two routing rule primitives:
+
+- **Experiment override.** Temporarily replaces a model group in a matching rule with a different model group. For example, "replace gpt-4o-mini with gpt-4o for 5 percent of pro-tier users."
+- **Traffic split.** Randomly distributes requests matching a rule across multiple model groups according to specified percentages. For example, "route 70 percent to gpt-4o, 30 percent to claude-3-sonnet."
+
+These primitives are the foundation for model evaluation pipelines. Before promoting a new model to production, the team runs a week-long A/B test comparing the candidate model against the incumbent across metrics: response quality, latency, cost, and error rate.
+
+### With Streaming Responses
+
+Streaming LLM responses (Server-Sent Events or chunked transfer encoding) introduce a complication for routing: the routing decision must be made before any streamed content arrives, but the stream may need to switch models mid-response if the primary model degrades.
+
+The router handles streaming in three phases:
+
+**Pre-stream routing.** Before the stream starts, the router makes a standard routing decision using the prompt context. The decision is returned to the gateway, which opens a streaming connection to the chosen model.
+
+**Mid-stream degradation detection.** The gateway monitors the stream for signs of degradation: tokens per second falling below a threshold (for example, 5 tokens per second for a 70B model), increased inter-token latency, or error frames in the stream. If degradation is detected, the gateway records the stream position (number of tokens received) and pauses the stream.
+
+**Mid-stream reroute.** The gateway sends a reroute request to the router with the partial context (original prompt plus tokens received so far). The router evaluates a new routing decision, optionally selecting a different model for the remainder of the response. The gateway opens a new streaming connection to the second model starting from the paused position.
+
+Mid-stream reroute is a partial reroute: the model group must be compatible (same provider, same response format) to avoid confusing the client. In practice, mid-stream reroute handles approximately 2 percent of streaming requests and has a 90-second timeout for model recovery before switching.
+
+The router logs a `stream_reroute` metric whenever mid-stream rerouting occurs, segmented by the cause: degradation, error, or user cancellation.
+
+### With Cost Tracking
+
+Cost tracking is a first-class concern in the routing architecture. Each decision encodes a cost budget that the selected model must not exceed. The cost tracking integration works in two directions:
+
+**Pre-request budget check.** The router queries a cost ledger (a fast key-value store) for the user's or tenant's remaining budget. If the budget is exhausted, the router selects a cheaper model or returns a budget-exceeded signal. The cost ledger stores running totals keyed by user ID, with a TTL of 24 hours for daily budgets and 30 days for monthly budgets.
+
+**Post-request cost accrual.** After the LLM call completes, the gateway reports actual token usage to the cost pipeline. The pipeline updates the cost ledger and emits cost events to the billing system. The cost event includes: request ID, user ID, model, input tokens, output tokens, cost (computed from the model's per-token rate), and tier.
+
+The cost ledger uses eventual consistency with a TTL-based reconciliation window. A budget spent in the last five seconds may not be reflected in the pre-request check, but the system bounds the overspend to at most two requests per user. For high-value tenants, the router supports synchronous budget checks against a Redis-backed counter with strong consistency within a single region.
+
+Cost tracking data feeds two downstream systems:
+
+- **Real-time cost dashboard.** Shows cost per hour by model, tier, feature, and user segment. Updated every 30 seconds.
+- **Cost anomaly detection.** A background process compares the current hour's cost against the same hour in the previous 7 days. A deviation of more than 3 standard deviations triggers an alert.
+
+## Multi-Region and Global Scale
+
+When your users span continents, a single-region router adds 100 to 300 milliseconds of unavoidable network latency for remote users. A global routing topology places routing decisions and model endpoints close to the user.
+
+### Global Routing Topology
+
+Each region runs an independent routing stack: load balancer, router instances, a regional cache, and a metrics agent. The model registry runs globally across three replicas (leaderless or leader-follower depending on write volume). Routing tables replicate from the global registry to every regional router instance.
+
+The regional stacks are independent in the serving path but unified in the control plane. A routing rule written in one region propagates to all regions within two seconds. A metrics event from any region is available in the global dashboard within 10 seconds.
+
+<AsciiDiagram id="model-routing/arch-region" title="Global Multi-Region Routing Topology" alt="Three-region architecture showing regional router clusters connected to a global registry" caption="Each region runs independent routing infrastructure with a shared global registry" content={
+`                         ┌─────────────────────────────┐
+                         │     Global Model Registry     │
+                         │  ┌──────┐ ┌──────┐ ┌──────┐ │
+                         │  │etcd  │ │etcd  │ │etcd  │ │
+                         │  │ US   │ │ EU   │ │ APAC │ │
+                         │  │leader│ │follow│ │follow│ │
+                         │  └──┬───┘ └──┬───┘ └──┬───┘ │
+                         └─────┼────────┼────────┼──────┘
+                               │        │        │
+         ┌─────────────────────┼────────┼────────┼──────────────────┐
+         │                     │        │        │                   │
+         ▼                     ▼        ▼        ▼                   │
+ ┌──────────────┐     ┌──────────────┐     ┌──────────────┐         │
+ │  US-East      │     │  EU-West     │     │ AP-Southeast │         │
+ │               │     │              │     │              │         │
+ │  ┌──────────┐ │     │  ┌──────────┐ │     │  ┌──────────┐ │       │
+ │  │ Router   │ │     │  │ Router   │ │     │  │ Router   │ │       │
+ │  │ Cluster  │ │     │  │ Cluster  │ │     │  │ Cluster  │ │       │
+ │  │ 5 nodes  │ │     │  │ 3 nodes  │ │     │  │ 3 nodes  │ │       │
+ │  ├──────────┤ │     │  ├──────────┤ │     │  ├──────────┤ │       │
+ │  │ L2 Cache │ │     │  │ L2 Cache │ │     │  │ L2 Cache │ │       │
+ │  │ Redis    │ │     │  │ Redis    │ │     │  │ Redis    │ │       │
+ │  ├──────────┤ │     │  ├──────────┤ │     │  ├──────────┤ │       │
+ │  │ Metrics  │ │     │  │ Metrics  │ │     │  │ Metrics  │ │       │
+ │  │ Agent    │ │     │  │ Agent    │ │     │  │ Agent    │ │       │
+ │  ├──────────┤ │     │  ├──────────┤ │     │  ├──────────┤ │       │
+ │  │ Gateway  │ │     │  │ Gateway  │ │     │  │ Gateway  │ │       │
+ │  │ → AWS   │ │     │  │ → GCP   │ │     │  │ → AWS   │ │       │
+ │  └──────────┘ │     │  └──────────┘ │     │  └──────────┘ │       │
+ └──────────────┘     └──────────────┘     └──────────────┘         │
+ └──────────────────────────────────────────────────────────────────┘
+`} />
+
+### Latency-Based Routing
+
+When a request arrives, the regional router evaluates two sets of rules: the standard routing rules (which model to use) and the regional routing rules (which region should serve the model). The regional decision is based on four factors:
+
+**Origin region.** Determined by GeoIP or the cloud provider's region header (for example, `x-region: ap-southeast-1`). The router prefers the origin region if the chosen model is available there. Origin region routing adds zero cross-region latency.
+
+**Model availability.** Not every model is deployed in every region. A model may be US-only during early deployment, or a region may lack the GPU capacity for a 70B-parameter model. The router checks a region-to-model mapping before selecting a target region.
+
+**Cross-region latency budget.** The request carries a maximum acceptable end-to-end latency. If the origin region can serve within the budget, it does. If not, the router considers nearby regions with lower model latency. For example, a user in Australia with a 2-second latency budget and no local model deployment would be routed to AP-Southeast (Singapore) at 150ms round trip, not to US-East at 250ms.
+
+**Failover cost penalty.** Cross-region routing adds a fixed penalty (typically 50ms for inter-region fiber) to the decision score. The router selects the region with the lowest total score. The score is computed as:
+
+```
+region_score = base_region_latency + failover_penalty + model_queue_wait
+```
+
+If the origin region's score exceeds the budget, the router selects the region with the lowest score within the budget. If no region can serve within the budget, the request is queued for async processing.
+
+### Routing Table Replication
+
+Routing tables are versioned and replicated asynchronously. Each table carries a monotonic version number. When a router instance detects a stale table (version lower than the global latest), it fetches the full table via HTTP or gRPC. Partial updates are published through the registry's watch mechanism.
+
+The replication strategy follows a push-and-pull model:
+
+1. A policy change is written to the global registry leader in US-East.
+2. The leader increments the table version from 1423 to 1424 and propagates the change to follower nodes in EU-West and AP-Southeast using etcd's built-in Raft replication.
+3. Regional router instances detect the version change via the watch mechanism (push) or a periodic poll every 5 seconds (pull, as a fallback).
+4. Each router instance atomically swaps its in-memory rule index: it builds the new index from the new table, then replaces the old index with a pointer swap.
+5. The new rules take effect in all regions within two seconds. The 95th percentile replication latency across global regions is under 800ms.
+
+During a replication lag event (a region is temporarily disconnected from the global registry), the router continues using its last known rules. Stale routing is safer than no routing: the worst case is a slightly suboptimal model choice, not a dropped request. The router logs a `stale_rules` metric while operating on stale data, incrementing by one every second.
+
+### Cross-Region Cache Replication
+
+The L2 cache (Redis) in each region operates independently -- the cache in US-East is not the same cache as in AP-Southeast. This is intentional: cross-region cache replication adds latency to every cache write and introduces consistency headaches. Each regional cache stores decisions specific to that region's request patterns.
+
+However, certain cache entries are worth replicating across regions:
+
+- **Global system prompts.** Prompt templates used by every region (for example, "You are a helpful assistant") produce the same routing decision regardless of the request's origin. These entries are tagged with a `global: true` flag and are replicated to all regional caches via a background replication process.
+
+- **Model health state.** If a model is marked as degraded in US-East, the same model should be avoided in EU-West until the degradation is resolved. Model health state is pushed from the global registry to all regional caches within 5 seconds via the watch mechanism.
+
+- **Cost budget state.** If a tenant has exhausted their budget, the budget exhaustion should be honored across all regions. The cost ledger in each region synchronizes every 30 seconds, with the US-East region acting as the authoritative source for global tenant budgets.
+
+Cross-region cache replication uses Kafka as the transport layer: each region publishes cache entries marked for global replication to a shared topic. Other regions consume the topic and write matching entries to their local cache. The replication adds approximately 500ms of latency for global entries and consumes minimal bandwidth (under 1 KB per second per region).
+
+### Failover and Disaster Recovery
+
+A global topology requires defined failover paths for three scenarios:
+
+**Regional router failure.** If the entire router cluster in a region becomes unhealthy, DNS routing redirects traffic to the nearest healthy region. The failover region's router inherits the request context and makes a routing decision using its own registry replica. The health check that triggers the failover runs at the DNS level (Route53 health checks or equivalent) and at the load balancer level.
+
+The failover sequence is:
+
+1. Regional health check fails 3 consecutive checks (15 seconds).
+2. DNS record TTL is overridden from 60 seconds to 5 seconds.
+3. Traffic begins shifting to the failover region within 30 seconds.
+4. The failover region scales up its router pool by 50 percent to handle the additional load.
+5. Once the primary region recovers, traffic shifts back gradually over 5 minutes.
+
+**Model provider failure.** If a specific model provider (for example, OpenAI in US-East) goes down, the router reroutes those requests to an alternative provider or a different region. The circuit breaker detects the failure pattern (5 consecutive errors) and marks the provider as degraded. Subsequent requests that would have matched an OpenAI model are evaluated against fallback rules that substitute an Anthropic or open-source model.
+
+The fallback queue captures requests that exceed the failover capacity. If the alternative provider cannot handle the redirected traffic volume, excess requests are queued for async processing with a target completion time of 30 seconds.
+
+**Global registry failure.** If the etcd cluster loses quorum (fewer than 2 of 3 nodes reachable), router instances continue operating with their last cached rules. Registry writes are rejected until quorum is restored, but reads (routing decisions) continue without interruption. The router logs a critical alert and increments a `registry_unreachable` counter every second.
+
+If the registry is unreachable for more than 5 minutes, the router falls back to a local configuration file that was generated during the last successful registry sync. This file contains the top 100 most frequently matched routing rules, covering approximately 95 percent of request patterns.
+
+### Regional Cost Optimization
+
+Multi-region routing introduces a cost dimension beyond model selection: inter-region data transfer. AWS charges $0.02 to $0.09 per GB for data leaving a region. For a system processing 200 million requests per day, each request carrying 5 KB of prompt and response data, the cross-region data transfer cost is:
+
+```
+Data per request = 5 KB
+Data per day = 200M × 5 KB = 1,000 GB = 1 TB
+Cross-region rate = $0.05/GB (average)
+Daily cost = 1 TB × $0.05 = $50
+Monthly cost = $50 × 30 = $1,500
+```
+
+The router factors this cost into its regional routing decision. Serving a request from a local region with a slightly more expensive model may be cheaper than routing to a distant region with a cheaper model, once data transfer costs are included. The router computes a total cost for each candidate region:
+
+```
+total_cost = model_inference_cost + data_transfer_cost
+```
+
+The router selects the region with the lowest total cost, subject to the latency budget constraint.
+
+## Capacity Planning
+
+Capacity planning for a model router means answering: how many router instances do you need, how much cache memory, and how much registry bandwidth? The math uses four key inputs: daily active users, requests per session, routing decision latency, and cache hit ratio.
+
+### Core Assumptions
+
+All calculations assume a system at 10 million DAU with specific request patterns derived from production data at that scale. The formulas are general -- you can substitute your own numbers and follow the same methodology.
+
+### Inputs for the Calculation
+
+Assume a system with 10 million DAU, each user making 20 requests per day, for a total of 200 million daily requests. Traffic is not uniform -- peak hour sees 2.5x the hourly average, and the peak hour typically falls between 9 AM and 10 AM in the user's time zone.
+
+```
+Daily requests       = 10,000,000 DAU × 20 requests = 200,000,000
+Average QPS          = 200,000,000 / 86,400 seconds = 2,315 QPS
+Peak QPS             = 2,315 × 2.5 = 5,788 QPS
+Cache hit ratio      = 60 percent (conservative estimate from production)
+Peak routing QPS     = 5,788 (total request QPS)
+Peak uncached QPS    = 5,788 × (1 - 0.60) = 2,315 QPS
+```
+
+The routing service handles 5,788 decisions per second at peak, of which 2,315 require full rule evaluation (cache miss) and 3,473 are fast cache returns (approximately 2ms each).
+
+### Router Instances
+
+Each router instance processes routing decisions. The capacity of a single instance depends on the complexity of the rule set. For a typical rule set with 50 rules and 10 model groups, a 2-vCPU instance can handle about 2,000 uncached evaluations per second (p99 latency 10ms) and 10,000 cached lookups per second (p99 latency 2ms).
+
+```
+Total capacity needed:
+  - Uncached: 2,315 QPS / 2,000 QPS per instance = 2 instances
+  - Cached:   5,788 QPS / 10,000 QPS per instance = 1 instance
+  - Headroom:  2x for failover and traffic spikes
+
+Instances = max(2, 1) × 2 = 4 instances
+
+Recommendation: 5 instances (4 + 1 spare) across 2 availability zones
+```
+
+Each instance runs with 2 vCPUs and 4 GB of memory. The routing service is CPU-bound (rule evaluation is string comparison and arithmetic), not memory-bound. The 4 GB allocation covers the L1 cache (10,000 entries at 200 bytes each = 2 MB) and the rule index (50 rules at 50 KB total), with the remaining 3.9 GB available for OS and JVM/Node heap.
+
+The instance count scales linearly with uncached QPS. Doubling the DAU to 20 million doubles the uncached QPS to 4,630, requiring 5 instances of the same size.
+
+### Cache Sizing
+
+The cache stores routing decisions keyed by a hash of the request context. Each entry is approximately 200 bytes: 64-byte key hash (SHA-256), 32-byte model ID, 8-byte expiry timestamp, 8-byte rule ID, and 88 bytes of metadata and overhead.
+
+```
+Distinct requests per hour   = 200,000,000 / 24 = 8,333,333
+Cache TTL                    = 60 seconds
+Cache entries stored         = 8,333,333 × (60 / 3600) = 138,889
+Memory needed                = 138,889 × 200 bytes = 27.8 MB
+Redis overhead (2x)          = 55.6 MB
+
+With 4x burst headroom: 222 MB
+```
+
+A single Redis instance with 1 GB of memory is more than sufficient. For multi-region deployments, each regional cache is independently sized based on that region's request volume. The US-East region handling 50 percent of traffic would need 500 MB of cache. The AP-Southeast region handling 10 percent of traffic would need 200 MB.
+
+The cache also stores metadata about model health, which adds approximately 5 KB per model (50 models = 250 KB). This is negligible compared to the decision cache.
+
+### Registry Bandwidth
+
+The model registry handles two traffic patterns: routing rule reads by router instances and routing rule writes by operators. Reads dominate by several orders of magnitude.
+
+```
+Router instances             = 5
+Rule fetch interval          = 30 seconds
+Rule set size                = 50 KB (compressed with gzip)
+Read bandwidth per 30 seconds = 5 × 50 KB = 250 KB
+Read bandwidth per second     = 250 KB / 30 = 8.3 KBps
+
+Operator writes per day      = 20 (rule modifications, model additions)
+Write size                   = 5 KB per write (single rule)
+Total write bandwidth        = 20 × 5 KB / 86,400 ≈ negligible (1.2 bytes/sec)
+
+Watch events                 = 1 event per write × 5 instances = 5 events
+Watch bandwidth              = 5 events × 1 KB ≈ negligible
+```
+
+Registry bandwidth is negligible for routing purposes. The registry's primary constraint is consistency latency (writes propagating to all replicas), not throughput. A 3-node etcd cluster with standard SSDs handles this load with room for 100x growth to 500 million daily requests.
+
+### Latency Budget Breakdown
+
+The end-to-end routing latency budget is 50ms at p99. This budget is split across components:
+
+```
+Component              Budget    Measured p99
+─────────────────────────────────────────────
+DNS resolution         2ms      ~1ms (warm cache)
+Load balancer          3ms      ~1ms (TCP + HTTP)
+Router processing      15ms     ~8ms (uncached, full eval)
+Cache read             5ms      ~2ms (L2 Redis, p99)
+Metrics emission       5ms      ~1ms (async, fire-and-forget)
+Network to LLM API     20ms     ~15ms (same region)
+─────────────────────────────────────────────
+Total                  50ms     ~28ms (within budget)
+```
+
+The measured p99 of 28ms leaves 22ms of headroom for traffic spikes, GC pauses, and network jitter. This buffer absorbs most transient issues without violating the SLO.
+
+### Cost Projection
+
+```
+Component            Instances   Monthly cost (approx)
+─────────────────────────────────────────────────────
+Router services      5 × $70     $350    (2 vCPU, 4 GB each)
+Redis cache          1 × $30     $30     (1 GB memory)
+etcd cluster         3 × $100    $300    (3 nodes, 2 AZs)
+Load balancer        1 × $25     $25     (HTTP, 10 TB transfer)
+Metrics pipeline     1 × $200    $200    (Prometheus + Grafana)
+Fallback queue       1 × $150    $150    (Kafka, 3 partitions)
+
+Infrastructure total              $1,055
+
+LLM costs at 10M DAU             $80,000 - $150,000
+Routing overhead fraction         0.7 percent - 1.3 percent
+```
+
+The routing infrastructure costs roughly 1 percent of the total LLM spend. Every percentage point of cost optimization from better routing (choosing cheaper models for suitable requests, reducing unnecessary high-capability model usage) pays for the infrastructure ten times over. A 10 percent cost optimization from routing saves $8,000 to $15,000 per month against an infrastructure cost of $1,055.
+
+### Scaling for 100M DAU
+
+At 100 million DAU (10x growth), the infrastructure scales as follows:
+
+```
+Daily requests       = 100,000,000 × 20 = 2,000,000,000
+Peak QPS             = (2,000,000,000 / 86,400) × 2.5 = 57,870 QPS
+Router instances     = max(uncached QPS/2000, cached QPS/10000) × 2
+                     = max(23,148/2000, 57,870/10000) × 2
+                     = max(12, 6) × 2 = 24 instances
+Cache memory         = 57,870 × 60% × 200 bytes × 4x = 2.2 GB
+Total monthly infra  = ~$8,000
+
+LLM costs at 100M DAU    = $800,000 - $1,500,000
+Infrastructure overhead   = 0.5 percent - 1 percent
+```
+
+The routing infrastructure scales sub-linearly because the uncached QPS is a fraction of total QPS and the cache hit ratio improves with volume (more users mean more repeated prompts, driving the hit ratio toward 75 percent).
+
+## Deployment and Operations
+
+Operating a model router at scale means deploying changes without interrupting traffic, verifying routing correctness before full rollout, and debugging routing decisions when they go wrong.
+
+### Zero-Downtime Deployment
+
+Router instances are stateless, making rolling deployments straightforward. The deployment sequence follows a careful drain-warm-restore pattern:
+
+1. **Health check drain (30 seconds).** The load balancer marks one instance for draining. It stops sending new requests but allows in-flight requests up to 30 seconds to complete. The health check endpoint returns 503 during drain, signaling the load balancer to route elsewhere.
+
+2. **Graceful shutdown (5 seconds).** The instance completes any in-flight routing decisions and flushes its metrics buffer to the pipeline. It logs a final metrics snapshot showing cumulative counters for the instance's lifetime.
+
+3. **Instance replacement (10 seconds).** The orchestrator (Kubernetes, Nomad) terminates the drained instance and starts a new instance with the updated code and rule cache. The new instance loads the routing rules from the registry on startup.
+
+4. **Warmup (10 seconds).** The new instance pre-fetches the top 1,000 most common routing patterns from the registry and populates its L1 cache. Warmup is complete when the L1 cache reaches 50 percent capacity. A readiness endpoint returns 200 only after warmup completes.
+
+5. **Traffic restore (0 seconds).** The load balancer adds the instance back to the pool. Health checks verify it responds within 100ms before serving traffic. The first 100 requests warm the remaining L1 cache entries.
+
+6. **Repeat across all instances.** A 5-instance cluster deploys in under 3 minutes. Deployments can be paused after any instance if monitoring shows anomalies.
+
+The warmup step is critical. A cold instance that starts serving traffic immediately produces 100 percent cache misses for the first minute, spiking registry read load by 5x and increasing p99 latency by 30-50ms. Every deployment must complete warmup before accepting traffic.
+
+### Canary Routing for Rule Changes
+
+Routing rule changes are high risk: a misconfigured rule can route all traffic to an expensive model 10x the normal cost, or route production traffic to a model that does not exist. Canary routing mitigates this with a five-stage pipeline.
+
+```
+┌─────────────────────────────────────────────────────┐
+│                 Operator Dashboard                   │
+│                                                      │
+│  1. Write new rule → dry-run evaluate against         │
+│     last 10,000 real requests                        │
+│  2. Deploy rule to canary (5% of router instances)   │
+│  3. Monitor: cost delta, latency delta, error rate   │
+│  4. If canary passes 15-min window → full rollout    │
+│  5. If canary fails → auto-rollback to previous rule │
+└─────────────────────────────────────────────────────┘
+```
+
+The dry-run evaluation compares the new rule's model assignments against the existing rule. It flags cases where the new rule would have chosen a different model, allowing the operator to inspect the differences before any traffic is affected. The dry-run report shows:
+
+- Number of requests with changed model assignments
+- Cost impact of the changes (estimated from token counts)
+- Latency impact of the changes (estimated from model profiles)
+- Distribution of changes by tier and feature
+
+If the dry-run shows more than 5 percent of requests changing model assignment, the rule is flagged for manual review. The operator can approve, modify, or reject the change before proceeding to canary.
+
+<AsciiDiagram id="model-routing/arch-canary" title="Canary Routing Deployment Flow" alt="Five-stage canary deployment pipeline from dry-run evaluation through full rollout with auto-rollback" caption="Canary rule deployment reduces the blast radius of misconfigured routing policies" content={
+`                         ┌──────────────┐
+                         │ Write Rule v2 │
+                         └──────┬───────┘
+                                │
+                                ▼
+                    ┌──────────────────────┐
+                    │  Dry-Run Evaluation   │
+                    │  v2 vs v1 on 10K reqs │
+                    └──────┬───────────────┘
+                           │
+                    ┌──────▼───────────────┐
+                    │  Flag differences?   │
+                    │  ┌───┐    ┌───┐      │
+                    │  │No │    │Yes│      │
+                    │  └───┘    └───┘      │
+                    └──┬─────────┼─────────┘
+                       │         │ review
+                       ▼         │
+              ┌──────────────┐   │
+              │  Deploy to   │   │
+              │  5% of nodes │   │
+              └──────┬───────┘   │
+                     │           │
+              ┌──────▼───────┐   │
+              │  Monitor 15m │   │
+              │  cost +10%?  │   │
+              │  latency +5%?│   │
+              │  errors +1%? │   │
+              └──────┬───────┘   │
+                     │           │
+              ┌──────▼───────┐   │
+              │  Anomalies?   │   │
+              │  ┌───┐ ┌───┐  │   │
+              │  │No │ │Yes│  │   │
+              │  └───┘ └───┘  │   │
+              └──┬───┼───────┘   │
+                 │   └───┐       │
+                 ▼       ▼       │
+          ┌────────┐ ┌────────┐  │
+          │Full    │ │Auto-   │  │
+          │Rollout │ │Rollback│  │
+          │to 100% │ │to v1   │  │
+          └────────┘ └────┬───┘  │
+                          └──────┘
+`} />
+
+### Key Metrics to Monitor
+
+**Routing accuracy.** The percentage of routing decisions that match the expected outcome for a given test set. A shadow evaluation runs every hour: it replays the last hour's requests through the routing rules and compares the actual model chosen against the model the rules should have chosen. Accuracy below 99.5 percent triggers a warning. Accuracy below 99 percent triggers a critical alert.
+
+The shadow evaluation also checks for regressions: if today's accuracy is 0.5 percent lower than the same hour yesterday, an investigation is triggered. Regression often indicates a misconfigured rule or a stale cache serving outdated decisions.
+
+**Fallback rate.** The proportion of requests that required a fallback because the primary model was degraded or returned an error. Measured as a rolling 5-minute average.
+
+- Under 2 percent: normal operation.
+- 2 percent to 5 percent: investigate the primary model's error rate. Check for provider issues or model degradation.
+- 5 percent to 10 percent: page the on-call engineer. Evaluate whether to mark the degraded model as unavailable.
+- Above 10 percent: incident response. Consider switching all traffic off the affected provider.
+
+**Routing latency.** Three percentile measurements, each tracked separately for cached and uncached paths:
+
+- p50 routing latency: typically under 2ms with cache hits, under 10ms without. A sustained increase of 5ms above baseline indicates a problem: overloaded router instances, a registry issue, or a networking fault.
+- p95 routing latency: must stay under 25ms. Spikes above 50ms suggest GC pressure or CPU contention on the router instances.
+- p99 routing latency: must stay under 50ms. Spikes above 100ms trigger an immediate alert. Common causes: Redis cluster overload, network congestion, or a routing rule that requires expensive computation (regex matching, string parsing).
+
+**Cache hit ratio.** Expected range: 55 percent to 75 percent for general traffic. A drop below 40 percent indicates the cache is thrashing (too many unique requests relative to cache size) or has been flushed unexpectedly.
+
+- Check L1 vs L2 separately: if L1 is low but L2 is healthy, the per-instance cache size is too small.
+- If both are low, the cache TTL may be too short or the traffic pattern has shifted (new feature launching with unique prompts).
+- If the ratio drops suddenly (10 percent in under 5 minutes), check for a cache key format change in a recent deployment.
+
+**Cost per routed request.** Tracks the average cost of the model selected per routing decision, segmented by tier and feature. A sudden increase of more than 20 percent signals that expensive models are being selected more frequently than expected.
+
+- Check for a rule change that expanded the conditions for high-capability model selection.
+- Check for model availability changes that removed cheap models from a model group.
+- Check for a traffic pattern shift (more high-capability requests from pro-tier users).
+
+**Stale rule count.** The number of router instances running a routing table version older than 30 seconds. A persistent non-zero count indicates a replication problem between the global registry and regional caches.
+
+- If 1-2 instances are stale: network partition or instance-level issue. Restart the affected instances.
+- If all instances in a region are stale: region-level connectivity issue with the global registry. Check firewall rules, DNS resolution, and registry endpoint health.
+
+### Debugging Routing Decisions
+
+When a user reports an unexpected model response, you need to answer: which model was chosen, why was it chosen, and should it have been different.
+
+Every routing decision carries a trace context that correlates the decision with the downstream LLM call. The trace is a JSON object stored in the metrics pipeline:
+
+```json
+{
+  "routing_decision": {
+    "request_id": "req_abc123",
+    "selected_model": "gpt-4o-mini",
+    "rule_id": "pro-prompt-length",
+    "cache_hit": false,
+    "evaluation_time_ms": 4.2,
+    "rule_conditions": [
+      {"tier": "pro", "matched": true},
+      {"prompt_tokens": 2340, "operator": "lte", "value": 4000, "matched": true},
+      {"capability": "medium", "matched": true}
+    ],
+    "fallback_triggered": false,
+    "registry_version": 1423,
+    "router_instance": "router-us-east-3"
+  }
+}
+```
+
+The trace is emitted to the metrics pipeline and stored for 30 days. Operators query by request ID or user ID to replay the routing decision. The replay feature runs the same request context through the current rules to verify whether a rule change fixed the issue.
+
+A debugging workflow looks like this:
+
+1. User reports getting a slow response from gpt-4o when they expect the fast claude-3-haiku.
+2. Operator looks up the request ID in the metrics pipeline and retrieves the routing decision trace.
+3. The trace shows `selected_model: "gpt-4o"` matched by rule id `enterprise-highest-quality`.
+4. The operator discovers the user was accidentally classified as enterprise tier due to a stale user profile.
+5. The user profile is corrected. The next request routes correctly to claude-3-haiku based on the `pro-prompt-length` rule.
+
+Without the trace, this debugging session would take hours instead of minutes.
+
+The trace system also supports bulk queries: "show me all decisions in the last hour where the selected model cost more than $0.01 per request." This helps identify cost anomalies and rule misconfigurations before they affect the monthly bill.
+
+### Upgrading the Registry
+
+The model registry itself requires occasional upgrades (version upgrades for etcd or Consul, configuration changes, schema migrations). Since the registry is a read-mostly system with cached clients, upgrades follow a blue-green pattern:
+
+1. **Stage a new registry cluster** alongside the existing one, populated with the latest routing rules. The new cluster runs the upgraded version but accepts no traffic initially.
+2. **Point a subset of router instances** (the canary group) to the new registry for validation. Monitor for rule divergence: each canary instance logs a `rule_version_mismatch` metric if the rules from the new registry differ from the old.
+3. **Migrate all router instances** to the new registry over a 5-minute period, one instance at a time. Each instance swaps its registry endpoint via a configuration reload (SIGHUP or equivalent) without restarting.
+4. **Decommission the old registry** after confirming all instances are healthy on the new registry for at least 15 minutes.
+
+During the migration, the old registry remains available as a fallback. If the new registry exhibits unexpected behavior (incorrect rules, high latency), router instances can be re-pointed to the old registry in under 10 seconds by reverting a DNS record or configuration file.
+
+The registry upgrade is planned during low-traffic hours (typically 2 AM to 4 AM in the primary region) to minimize the impact of any issues. A rollback plan is tested in staging before the production upgrade.
+
+### Rollback Strategy
+
+Every deployment carries risk. A rollback strategy defines how to revert a bad change in under 60 seconds. The routing system supports rollback at three levels:
+
+**Rule-level rollback.** When a routing rule change causes issues (cost spike, latency increase, routing errors), the operator reverts the specific rule in the registry. The registry keeps the last 100 versions of each rule, accessible via the operator dashboard. Reverting a rule takes 5 seconds: the operator selects the previous version and clicks "restore." The change propagates to all router instances within 2 seconds.
+
+**Configuration rollback.** When a full configuration change (multiple rules, model group updates, new tier definitions) causes problems, the operator rolls back the entire routing table to a previous version. The registry stores a snapshot of the routing table every 6 hours, keeping 30 days of snapshots. Rolling back to a snapshot takes 15 seconds: the operator selects the snapshot, the registry computes the diff, and the router instances atomically swap their rule index.
+
+**Code rollback.** When a router code deployment (binary or container image update) causes crashes or incorrect behavior, the operator initiates a Kubernetes rollback to the previous deployment revision. The rollback uses the same drain-warm-restore sequence as a normal deployment but targets the previous image version. The rollback completes in under 3 minutes for a 5-instance cluster.
+
+The rollback playbook is documented in the operator runbook with specific criteria for each level:
+
+| Trigger                                 | Rollback Level   | Time to Complete |
+|-----------------------------------------|------------------|------------------|
+| p99 latency exceeds 100ms               | Rule or config   | 17 seconds       |
+| Fallback rate exceeds 15 percent        | Rule or config   | 17 seconds       |
+| Cost per request exceeds 2x normal      | Rule              | 7 seconds        |
+| Router crash loop (restarts per minute)  | Code             | 3 minutes        |
+| Routing accuracy below 98 percent       | Config           | 17 seconds       |
+
+Every rollback generates a post-mortem record that captures: the change that was rolled back, the metric that triggered the rollback, the time to detect, and the time to rollback. These records feed into the team's weekly reliability review.
+
+### Runbook: Cache Hit Ratio Drop
+
+A drop in cache hit ratio from 65 percent to 30 percent is a common incident. The runbook follows four diagnostic steps:
+
+1. **Check for a recent rule change.** If a new rule was deployed within the last hour, it may be generating different model assignments than the old rules, invalidating cached entries for the same request context. Roll back the rule and observe whether the hit ratio recovers within 5 minutes (the cache TTL window).
+
+2. **Check cache cluster health.** A Redis node may be under memory pressure, evicting entries aggressively. Inspect `evicted_keys` and `maxmemory` metrics via the Redis INFO command. If evictions are high, increase the cache memory limit or reduce the TTL. Also check for network latency between router instances and the Redis cluster.
+
+3. **Check for traffic pattern change.** A new feature launch (for example, a new chat template or system prompt) may be sending requests with unique fingerprints that do not match any cached decisions. Compare the distribution of prompt fingerprints from the last hour against the previous 24 hours. If the distribution shifted, either pre-warm the cache for the new patterns or adjust the cache key to capture the common portions of the requests.
+
+4. **Check for a cache key format change.** If a code deployment changed the cache key computation (for example, adding a field to the hash or changing the hash algorithm), all previously cached entries are effectively invalid. Compare the cache key format between the current deployment and the previous deployment. The fix is to deploy with a key migration strategy that serves old-format keys while populating new-format keys for 2x the TTL period (typically 2 minutes).
+
+### Operating at Off-Peak Hours
+
+Traffic to LLM applications is not uniform across 24 hours. Off-peak hours (midnight to 6 AM in the region's time zone) see 10-20 percent of peak traffic. The routing infrastructure can be scaled down during off-peak hours to reduce cost:
+
+- Reduce router instances from 5 to 2 (the minimum for high availability).
+- Reduce the Redis cache cluster from 3 masters and 3 replicas to 2 masters and 2 replicas.
+- Reduce the metrics pipeline sampling rate from 100 percent to 10 percent (sufficient for trend analysis at low volume).
+- Reduce the etcd cluster from 5 nodes to 3 nodes (the minimum for quorum).
+
+The scaling is automated based on a traffic prediction model that uses historical QPS data. The model predicts the next hour's traffic with 95 percent accuracy, giving the orchestrator 30 minutes of lead time to scale down or up.
+
+Off-peak hours are also used for maintenance tasks: registry upgrades, cache warmup for expected morning patterns, rule validation, and capacity test runs that would be too risky during peak traffic.
+
+### Common Failure Modes and Mitigations
+
+Knowing what breaks in production helps you design for robustness. Here are the most common failure modes encountered in production model routing systems and how each is mitigated.
+
+**Cache stampede at traffic ramp-up.** When traffic spikes at the start of the business day (9 AM in the time zone), the cache is mostly cold from overnight. The first requests all miss the cache and hit the registry simultaneously. Mitigation: the router instances pre-warm the cache during the 10-minute ramp window by evaluating the most common request patterns from the previous day and caching the results before peak traffic arrives.
+
+**Rule explosion.** As the product grows, the number of routing rules grows from 10 to 500. Rule evaluation time increases linearly with the number of rules, pushing p99 latency from 5ms to over 100ms. Mitigation: the rule index uses a decision tree compiled from the rule set, reducing evaluation from O(n) to O(log n). Rules are also segmented by tier and feature gate so the router only evaluates rules relevant to the request context.
+
+**Configuration drift.** Over time, manual registry changes by different team members create inconsistent rules: a rule references a model group that no longer exists, or two rules with overlapping conditions produce ambiguous matches. Mitigation: the registry runs a validation hook on every write that checks for orphaned references, overlapping conditions, and rules that will never match. Violations are reported to the operator dashboard and block the write.
+
+**Provider throttling at scale.** The router selects a model and sends the request, but the provider returns a 429 (rate limited). The fallback queue retries with another model, but if the same provider is used for the retry, it gets throttled again. Mitigation: the fallback queue tracks which provider was used for each attempt and excludes that provider from subsequent retries. After 3 failed attempts across different providers, the request is moved to the dead-letter queue for manual review.
+
+**Cross-region latency spike.** An undersea cable issue between US-East and EU-West increases cross-region latency from 80ms to 300ms. Router instances in EU-West that fetch routing rules from the US-East registry leader experience slow rule updates. Mitigation: each region has a local registry replica that serves reads without cross-region traffic. The registry leader change happens automatically if latency exceeds 200ms for more than 30 seconds.

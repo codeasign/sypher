@@ -1,0 +1,694 @@
+---
+id: tracing-architecture
+title: Tracing at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation: Instrument-All-the-Things
+
+The simplest approach to tracing is to add instrumentation to every service, send all spans directly to a shared database, and query traces on demand. This works for small systems but breaks down at every scaling threshold.
+
+### At 1,000 Users: Single Collector
+
+With 1,000 daily active users processing 100 requests per minute, each generating 15 spans, you produce 1,500 spans per minute. A single collector instance running on a small VM can handle this volume easily. Spans are stored in a single Elasticsearch instance. Queries return in under 100 milliseconds. This is the happy path where tracing just works.
+
+### At 100,000 Users: The Bottlenecks Appear
+
+At 100,000 users processing 10,000 requests per minute, each generating 20 spans, you produce 200,000 spans per minute. The single collector becomes a bottleneck because it must process, index, and batch all spans. The single Elasticsearch instance reaches its write throughput limit. Queries slow down as the index grows, and the cost of storing all spans becomes significant.
+
+### At 10 Million Users: Full Collapse
+
+At 10 million users processing 1 million requests per minute with 25 spans each, you produce 25 million spans per minute. The single collector is overwhelmed by network connections and serialization. The Elasticsearch cluster's write throughput is exhausted, causing backpressure that fills export queues across all services. Spans are dropped at every level. The storage cost for full-fidelity data exceeds 5 TB per day.
+
+<AsciiDiagram
+  id="tracing/architecture-naive-vs-production"
+  title="Comparison of naive single-collector tracing vs production-grade multi-collector tracing with sampling"
+  alt="A diagram comparing two architectures: left side shows all services sending spans directly to one collector and one database which bottlenecks; right side shows services sending to distributed collectors with sampling, a buffering layer, and a distributed storage cluster"
+  caption="Naive architecture fails at scale; production architecture distributes every layer" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              NAIVE                        PRODUCTION-GRADE                  │
+│                                                                             │
+│  [Service A]──┐                  [Service A]────>[Collector 1]──┐          │
+│               │                              (1% sampled)     │           │
+│  [Service B]──┼──>[Collector]──>[ES]         [Service B]────>[Collector 2]──┤
+│               │                    │         (5% sampled)     │   │        │
+│  [Service C]──┘                    ▼         [Service C]────>[Collector 3]──┤
+│                           bottleneck                       │   │          │
+│  [Service D]──┐                                            ▼   ▼          │
+│               │                                       ┌──────────┐         │
+│  [Service E]──┼──>[Collector]──>[ES]                  │  Kafka   │         │
+│               │                    │                  │ (buffer) │         │
+│  [Service F]──┘                    ▼                  └─────┬────┘         │
+│                           bottleneck                        │              │
+│                                                            ▼              │
+│                                                    ┌──────────────┐       │
+│                                                    │   Stream     │       │
+│                                                    │  Processor   │       │
+│                                                    └──────┬───────┘       │
+│                                                           │               │
+│                                                    ┌──────┴───────┐       │
+│                                                    │  ES Cluster  │       │
+│                                                    │  8 nodes     │       │
+│                                                    └──────────────┘       │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Production-Grade Architecture
+
+A production-grade tracing architecture distributes every layer of the pipeline to eliminate single points of failure and enable horizontal scaling.
+
+### Collector Layer
+
+Run multiple collector instances behind a load balancer. Each service sends spans to the load balancer, which distributes spans across collector instances. Collectors are stateless, so any instance can process any span. Use gRPC load balancing with health checks so unhealthy collectors are automatically removed from rotation.
+
+Each collector runs with a configured memory limit. The batch processor inside the collector buffers spans before sending them to the storage pipeline. If the storage backend slows down, the collector's buffer absorbs the backpressure. Configure the buffer to hold 30 seconds of peak throughput to handle transient storage slowdowns.
+
+### Buffering Layer
+
+Between the collectors and the storage engine, insert a buffering layer using Apache Kafka. Spans from collectors are published to a Kafka topic. A stream processor consumes from Kafka, performs tail-based sampling, enrichment, and indexing, then writes to the storage backend.
+
+Kafka provides several benefits. It decouples collector throughput from storage write throughput. If the storage backend goes offline, collectors continue writing to Kafka without backpressure. Kafka's partitioned log enables exactly-once semantics for the stream processor. Multiple stream processor instances can consume from different Kafka partitions in parallel.
+
+### Storage Layer
+
+Use a distributed storage engine that can scale horizontally. Elasticsearch is the most common choice, running as a cluster of 5 to 20 nodes depending on volume. Each span is stored as a JSON document in an index named by date: `traces-2026-07-02`. Time-based indices simplify retention management: the system drops entire indices for data older than the retention period.
+
+Configure the index template with span-specific mappings. The `trace_id` field uses a `keyword` mapping for exact lookups. The `start_time` field uses a `date` mapping with nanosecond precision for time-range queries. Service name and operation name use `keyword` mappings for filtered searches.
+
+### Query Layer
+
+The query layer provides the API and UI for trace visualization. A query service sits between the UI and the storage backend. It receives trace queries, converts them to storage backend queries, and returns formatted results. The query service caches frequent queries in Redis to reduce storage backend load.
+
+The query service also handles trace tree assembly. It fetches all spans for a trace ID, sorts them by start time, and builds the parent-child tree. The assembled trace tree is cached for a configurable duration, typically 5 minutes, since recent traces are queried repeatedly during debugging sessions.
+
+## Integration Patterns
+
+### Pattern 1: Database Integration
+
+<AsciiDiagram
+  id="tracing/architecture-db-integration"
+  title="Database tracing integration showing how database calls are instrumented with spans for connection pool, query, and transaction boundaries"
+  alt="A diagram showing an application service with spans for: connection pool acquisition, query execution, and transaction commit, with each span recording database host, query text, row count, and duration"
+  caption="Database tracing reveals query performance at three granularities" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      DATABASE TRACING INTEGRATION                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                                                                
+  [Payment Service]                                                           
+  ┌──────────────────────────────────────────────────────┐                    
+  │  Span: processPayment                                │                    
+  │  ┌──────────────────────────────────────────────┐    │                    
+  │  │  Span: acquireConnection                      │    │                   
+  │  │  attrs: pool_size=20, wait_ms=45             │    │                   
+  │  └──────────────────────────────────────────────┘    │                    
+  │  ┌──────────────────────────────────────────────┐    │                    
+  │  │  Span: executeQuery                           │    │                   
+  │  │  attrs: db=orders, query=SELECT * FROM ...   │    │                   
+  │  │  attrs: rows=42, db.host=db-primary-1        │    │                   
+  │  └──────────────────────────────────────────────┘    │                    
+  │  ┌──────────────────────────────────────────────┐    │                    
+  │  │  Span: commitTransaction                      │    │                   
+  │  │  attrs: tx_id=txn789, affected_rows=1        │    │                   
+  │  └──────────────────────────────────────────────┘    │                    
+  └──────────────────────────────────────────────────────┘                    
+                                                                                
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Each database interaction is a separate span, enabling precise         │
+  │  identification of slow queries, connection contention, and             │
+  │  transaction deadlocks.                                                 │
+  └─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+Database drivers are instrumented at the protocol level. The PostgreSQL driver instrumentation hooks into the query execution lifecycle, creating spans for connection pool check-out, query execution, row fetching, and transaction commit. Connection pool spans reveal contention issues: if the pool acquisition span shows high duration, the pool is too small for the workload.
+
+Instrumentation sanitizes query parameters to prevent sensitive data in traces. The SQL statement `SELECT * FROM users WHERE email = ? AND password = ?` is stored with the parameterized form, not with actual email and password values. This satisfies security requirements while preserving query shape analysis.
+
+### Pattern 2: Cache Integration
+
+Cache instrumentations create spans for each cache operation. A cache miss span followed by a database query span clearly shows the cost of a cold cache. Cache hit spans show the latency savings. The tracing UI can overlay cache hit rates on the trace waterfall to highlight cache effectiveness.
+
+Memcached and Redis both have OpenTelemetry instrumentations. The instrumentation captures the cache command type (GET, SET, DELETE), the key (truncated to a configurable maximum length), and the response size. For Redis, the instrumentation also captures the cluster node that served the request.
+
+### Pattern 3: Message Queue Integration
+
+Message queue tracing is more complex because the producer and consumer are decoupled in time. A message might be produced and consumed 10 seconds, 10 minutes, or 10 hours later. The trace context must travel through the queue with the message, not through the queue infrastructure.
+
+The producer injects the trace context into the message headers before sending. The consumer extracts the context when receiving the message. The resulting trace shows the full path from the original request through the queue. The time gap between producer and consumer spans is visible as an empty region in the waterfall.
+
+Kafka and RabbitMQ are the most commonly instrumented queue systems. The instrumentation hooks into the message serialization and deserialization lifecycle. For Kafka, the trace context is injected into the record headers. For RabbitMQ, the context goes into the AMQP message headers.
+
+### Pattern 4: CDN and Edge Integration
+
+Tracing at the CDN or edge level captures latency before the request reaches your origin servers. Cloudflare, Fastly, and Akamai all support injecting trace headers into requests forwarded to origin. The CDN span becomes the root span, with the origin server spans as children.
+
+To enable CDN tracing, configure your CDN to inject a `traceparent` header if one is not present. The CDN also adds attributes for the POP location, cache status (HIT or MISS), and client IP geolocation. The complete trace then shows whether slow responses are caused by CDN cache misses, origin latency, or network issues between the CDN and the origin.
+
+## Multi-Region Architecture
+
+<AsciiDiagram
+  id="tracing/architecture-multi-region"
+  title="Multi-region tracing architecture showing regional collectors and a global query layer"
+  alt="A diagram showing three cloud regions (US-East, EU-West, AP-Southeast), each with its own collector fleet and local Elasticsearch cluster, plus a global query service that federates queries across all regions"
+  caption="Multi-region tracing uses local collectors and a federated query layer" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       MULTI-REGION TRACING ARCHITECTURE                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                                                                
+  ┌──── Region: us-east ──────────────────────────────────────────────┐       
+  │  [Service A]─>Service B]─>Service C]                                │      
+  │       │            │           │                                    │      
+  │       ▼            ▼           ▼                                    │      
+  │  [Collector]──[Collector]──[Collector]                               │      
+  │       │            │           │                                    │      
+  │       └────────────┼───────────┘                                    │      
+  │                    ▼                                                │      
+  │            [Kafka us-east]──>[Stream Proc]──>[ES us-east]             │      
+  └───────────────────────────────────────────────────────────────────────┘      
+                                                                                
+  ┌──── Region: eu-west ───────────────────────────────────────────────┐       
+  │  [Service D]─>Service E]                                              │      
+  │       │            │                                                │      
+  │       ▼            ▼                                                │      
+  │  [Collector]──[Collector]                                           │      
+  │       │            │                                                │      
+  │       └────────────┘                                                │      
+  │            ▼                                                        │      
+  │   [Kafka eu-west]──>[Stream Proc]──>[ES eu-west]                     │      
+  └───────────────────────────────────────────────────────────────────────┘      
+                                                                                
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  Global Query Service (us-east)                                        │
+  │                                                                         │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────┐                              │
+  │  │ Query    │  │ Federate │  │ Cache    │                              │
+  │  │ Router   │─>│ across   │─>│ (Redis)  │                              │
+  │  │          │  │ regions  │  │          │                              │
+  │  └──────────┘  └──────────┘  └──────────┘                              │
+  └─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+In a multi-region deployment, each region runs its own collector fleet, buffering layer, and storage cluster. Cross-region traces are broken into regional fragments because a downstream service in EU-West produces spans that are collected by the EU-West collector.
+
+The challenge is assembling cross-region traces. The solution is a global query service that federates queries across all regional storage clusters. When you query for a specific trace ID, the global query service queries all regions in parallel and merges the results. Cross-region query latency is the maximum of individual region query times plus the slowest network round-trip time.
+
+Sampling decisions must be consistent across regions. Use a hash-based head sampler with the trace ID as input. The hash function is deterministic, so all regions make the same sampling decision for a given trace ID without coordination. A service in US-East and a service in EU-West will both sample or both drop the same trace.
+
+## Capacity Planning
+
+Design a tracing system for 10 million daily active users with the following assumptions:
+
+- Each user makes 100 requests per day on average.
+- Average request rate: 10 million * 100 / 86,400 = approximately 11,574 requests per second.
+- Each request generates 20 spans on average.
+- Total span rate: 11,574 * 20 = approximately 231,480 spans per second.
+- Sampling rate: 5%.
+- Sampled span rate: 231,480 * 0.05 = approximately 11,574 spans per second.
+- Span size: 512 bytes uncompressed, approximately 150 bytes compressed.
+
+### Collector Capacity
+
+Each collector instance handles 2,000 spans per second. With 11,574 sampled spans per second, you need 6 collector instances for the sampled traffic. Each service exports all spans (before sampling), so the unsampled traffic is 231,480 spans per second. You need 116 collector instances to handle all unsampled traffic if you use head-based sampling, or 6 collectors if sampling is applied at the service level.
+
+The delta comes from whether sampling happens in the service SDK or in the collector. Service-level sampling (SDK) reduces collector requirements but loses the ability to do tail-based sampling. Collector-level sampling preserves tail sampling but requires more collector instances.
+
+### Kafka Throughput
+
+The buffering layer must handle peak throughput. Assume peak is 3 times average: 34,722 spans per second (sampled). Each span is 150 bytes compressed: 5.2 MB per second. Kafka handles this easily with 3 partitions. Each partition provides sequential writes at 50 MB per second on standard SSDs. The total throughput requirement is well within Kafka's capacity.
+
+Set the retention period on the Kafka topic to 24 hours. In case of storage backend outage, the buffer accumulates 450 GB over 24 hours. Provision disk space accordingly on the Kafka brokers.
+
+### Storage Capacity
+
+Sampled spans: 11,574 spans per second.
+- Daily span count: 11,574 * 86,400 = approximately 1 billion spans per day.
+- Uncompressed storage per span: 512 bytes plus 256 bytes of Elasticsearch overhead = 768 bytes.
+- Daily storage: 1 billion * 768 bytes = approximately 768 GB per day before replication.
+- With 2x replication for high availability: 1.5 TB per day.
+- 30-day retention: 1.5 TB * 30 = 45 TB.
+
+An Elasticsearch cluster with 12 data nodes, each with 4 TB of SSD storage, provides 48 TB of usable capacity (assuming 1x replication). Each node handles 83 million spans per day, or approximately 960 spans per second of write throughput. Elasticsearch 8.x can sustain 5,000 to 10,000 documents per second per node, so 960 spans per second per node is well within the write capacity.
+
+### Query Performance
+
+At 1 billion spans per day, the index contains 30 billion spans after 30 days. Trace ID lookups remain fast because the trace ID is shard key, but filtered searches become slower. Implement pre-aggregated rollups to accelerate common queries:
+
+- **Service graph rollup**: Pre-compute the dependency graph between services every 5 minutes. Store it as a separate index. Service graph queries use this pre-computed index instead of scanning spans.
+- **Latency percentile rollup**: Pre-compute p50, p95, p99 latency for each (service, operation) pair every minute. Anomaly detection alerts compare current percentiles against the rollup.
+- **Error rate rollup**: Pre-compute error rates per service and operation every minute. The error rate rollup feeds the alerting system without querying raw spans.
+
+## Deployment and Operations
+
+### Collector Deployment
+
+Deploy collectors as a Kubernetes Deployment with 3 replicas minimum. Set resource requests to 1 CPU core and 2 GB of memory per replica. Set resource limits to 2 CPU cores and 4 GB of memory. Configure horizontal pod autoscaling based on CPU utilization with a target of 70%.
+
+Use a gRPC load-balanced Service as the collector endpoint. Each service's OpenTelemetry SDK is configured with the collector Service DNS name. Enable gRPC health checks on the collector so the load balancer routes traffic only to healthy pods.
+
+### Storage Operations
+
+Monitor Elasticsearch cluster health continuously. The critical metrics are:
+- **GC pause time**: Young generation GC should stay under 100 milliseconds per cycle. Old generation GC under 500 milliseconds.
+- **Merge rate**: Elasticsearch segment merges should not exceed 50 MB per second per node. High merge rates indicate too many small segments.
+- **Write rejection rate**: Elasticsearch rejects writes when the node is overwhelmed. A rejection rate above 0 indicates the cluster needs more capacity.
+
+Run periodic index optimization. Force merge indices older than 1 day down to 1 segment per shard. This reduces query latency by 30% to 50% for historical traces at the cost of temporary I/O during the merge.
+
+### Monitoring the Tracing System
+
+The tracing infrastructure itself must be monitored. If the tracing system is down, you lose visibility into production issues. Set up these alerts:
+
+- **Collector down**: Alert if a collector is unreachable for more than 30 seconds.
+- **Queue fill rate**: Alert if any collector's queue fill rate exceeds 50% for 5 minutes.
+- **Export error rate**: Alert if the span export error rate exceeds 1% over 5 minutes.
+- **Kafka consumer lag**: Alert if the stream processor's consumer lag exceeds 1 million spans.
+- **Storage write latency**: Alert if Elasticsearch write latency exceeds 500 milliseconds at p50.
+
+## Advanced Capacity Planning
+
+### Estimating Collector Memory
+
+Each collector instance needs memory for span buffering, batching, and internal data structures. The memory requirement is driven by the span rate and the batch configuration.
+
+```python
+# Memory calculation for a single collector
+span_rate = 2000  # spans per second
+span_size = 700   # bytes per span (uncompressed)
+batch_size = 512  # spans per batch
+queue_depth_per_service = 2048  # default SDK queue size
+num_services = 50  # services sending to this collector
+
+# Active span buffer
+active_buffer = queue_depth_per_service * span_size * num_services
+# Example: 2048 * 700 * 50 = 71.68 MB
+
+# Batch processing buffer
+batch_buffer = batch_size * span_size * 4
+# Example: 512 * 700 * 4 = 1.43 MB (4 concurrent batches)
+
+# Internal structures (index, metadata, connections)
+internal_overhead = 500 * 1024 * 1024  # 500 MB
+
+# Total estimated memory
+total_memory = active_buffer + batch_buffer + internal_overhead
+# Example: approximately 573 MB
+```
+
+Add 50% headroom for traffic spikes: total collector memory for 2,000 spans per second with 50 services is approximately 860 MB. A collector instance with 2 GB of memory provides adequate headroom.
+
+### Estimating Network Bandwidth
+
+The network bandwidth between services and collectors depends on the span export rate and compression ratio.
+
+```python
+span_rate = 2000  # spans per second
+span_size_compressed = 200  # bytes after gzip compression
+export_frequency = 0.2  # exports per second (5 second interval)
+
+# Bandwidth per collector
+bandwidth = span_rate * span_size_compressed
+# Example: 2000 * 200 = 400,000 bytes per second = 3.2 Mbps
+
+# Bandwidth between collector and storage (after sampling)
+sampled_span_rate = span_rate * 0.05  # 5% sampling
+storage_bandwidth = sampled_span_rate * span_size_compressed
+# Example: 100 * 200 = 20,000 bytes per second = 0.16 Mbps
+```
+
+The service-to-collector bandwidth is the dominant cost because it carries unsampled spans. The collector-to-storage bandwidth is much lower because it carries only sampled spans.
+
+### Estimating Storage Index Overhead
+
+Elasticsearch stores each span as a JSON document with an inverted index. The index overhead is approximately 2 to 3 times the raw span size.
+
+```python
+daily_raw_spans = 1000000000  # 1 billion spans per day
+span_size = 512  # bytes
+
+# Raw storage per day
+raw_storage = daily_raw_spans * span_size
+# Example: 512 GB
+
+# Elasticsearch storage per day (with index overhead)
+es_storage = raw_storage * 2.5  # 2.5x overhead factor
+# Example: 1,280 GB = 1.28 TB
+
+# Elasticsearch storage with replication
+es_storage_with_replication = es_storage * 2
+# Example: 2.56 TB per day
+
+# 30-day retention
+total_30_day = es_storage_with_replication * 30
+# Example: 76.8 TB
+```
+
+The overhead factor of 2.5 captures the inverted index, stored fields, and metadata. The replication factor of 2 provides high availability. With these assumptions, 1 billion spans per day requires 76.8 TB of raw Elasticsearch storage for 30-day retention.
+
+## High Availability and Disaster Recovery
+
+### Multi-AZ Deployment
+
+Deploy the tracing infrastructure across multiple availability zones within a region. Each zone gets its own collector fleet and an independent Elasticsearch cluster. The collector load balancer distributes traffic across zones. If one zone fails, the remaining zones handle the full load.
+
+Elasticsearch cross-cluster replication syncs data between zones with a 1-second replication lag. If the primary zone fails, the query service switches to the replica zone within 30 seconds. The failover is transparent to the tracing UI.
+
+### Disaster Recovery Across Regions
+
+For disaster recovery, replicate trace data to a secondary region. Two strategies are available:
+
+**Active-passive replication**: The primary region handles all trace collection. Spans are asynchronously replicated to the secondary region using Elasticsearch cross-cluster replication. If the primary region fails, the secondary region takes over. The failover time is 5 to 15 minutes, and up to 30 seconds of trace data may be lost.
+
+**Active-active replication**: Both regions independently collect traces. The query layer knows about both regions and queries both for every trace lookup. This provides zero failover time but doubles the infrastructure cost. An active-active setup also requires a global trace ID index that maps trace IDs to the regions that have spans for that trace.
+
+### Backup and Restore
+
+Back up the Elasticsearch indices daily. Use snapshot and restore to Amazon S3 or Google Cloud Storage. Each snapshot captures the day's index. Retention of snapshots matches the data retention policy: 30 days of snapshots for 30 days of data retention.
+
+Restore from snapshot when data corruption occurs. A full restore of 30 days of data takes 2 to 6 hours depending on the data volume. For faster recovery, maintain a hot standby cluster that receives a real-time feed of the primary cluster.
+
+## Security Considerations
+
+### Sensitive Data in Spans
+
+Spans can contain sensitive data: user IDs, email addresses, credit card numbers, authentication tokens, and request bodies. The tracing pipeline must not expose this data to unauthorized parties.
+
+Apply attribute filtering at the SDK level. The OpenTelemetry SDK supports a span processor that drops or redacts attributes matching a pattern:
+
+```python
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+class RedactProcessor(SimpleSpanProcessor):
+    def on_start(self, span, parent_context):
+        # Redact PII attributes
+        if span.attributes.get("http.request.body"):
+            span.set_attribute("http.request.body", "[REDACTED]")
+        if span.attributes.get("user.email"):
+            span.set_attribute("user.email", "[REDACTED]")
+```
+
+### Encryption in Transit
+
+All spans must be encrypted in transit between services, collectors, and storage. The OpenTelemetry exporter supports TLS for gRPC connections. Configure the exporter with TLS certificates:
+
+```python
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+exporter = OTLPSpanExporter(
+    endpoint="https://collector.internal:4317",
+    credentials=grpc.ssl_channel_credentials(
+        root_certificates=open("/etc/certs/ca.crt", "rb").read()
+    )
+)
+```
+
+### Encryption at Rest
+
+Trace data stored in Elasticsearch should be encrypted at rest. Enable Elasticsearch encryption at rest when using managed services (AWS Elasticsearch Service, Elastic Cloud). For self-managed Elasticsearch, use filesystem-level encryption (LUKS) or Elasticsearch's built-in encryption feature.
+
+### Access Control
+
+Control access to trace data based on team boundaries. The tracing system should support multi-tenancy: the payment team sees payment service traces, and the inventory team sees inventory service traces. Elasticsearch supports field-level security that restricts access to specific indices or fields based on user roles.
+
+## Cost Optimization Strategies
+
+### Tiered Sampling
+
+Apply different sampling rates to different services. Critical services (payment, authentication) get 10% sampling. Standard services (inventory, catalog) get 1% sampling. Non-critical services (analytics, recommendations) get 0.1% sampling or no tracing at all.
+
+This tiered approach aligns tracing cost with business value. The payment service processes revenue, so every millisecond of latency costs money. The recommendation service improves user experience but a latency spike there does not cause a revenue loss.
+
+### Attribute Budget
+
+Set a budget of 10 attributes per span. Any span with more than 10 attributes is truncated by a span processor. This prevents high-attribute spans from consuming disproportionate storage.
+
+Monitor the attribute count distribution across spans. If one service consistently creates spans with 50 attributes, investigate whether all attributes are necessary. Often, half of the attributes are unused debugging artifacts.
+
+### Index Pruning
+
+Not all span attributes need to be indexed. The Elasticsearch mapping should specify which attributes are indexed and which are stored but not indexed. Indexed attributes consume more storage because they are added to the inverted index. Stored-but-not-indexed attributes consume only the raw document storage.
+
+Index only attributes that are frequently used in search queries: service name, operation name, status code, and a small set of business-critical attributes. Store but do not index high-cardinality attributes like user IDs.
+
+### Compression Tuning
+
+The OpenTelemetry SDK supports configurable compression. The default is gzip compression at the default level. Increasing the compression level from 1 (fastest) to 9 (best compression) reduces span size by an additional 15% but increases CPU usage by 30%.
+
+For CPU-constrained services, use compression level 1 to minimize CPU impact. For storage-constrained setups, use compression level 6 (default gzip level) to balance compression ratio and CPU usage. Level 9 provides minimal improvement over level 6 for the small span payloads.
+
+## Observability of the Tracing Pipeline
+
+### Tracing the Tracing System
+
+The tracing infrastructure itself must be observable. Instrument the collectors, the stream processors, and the query service with their own tracing. The meta-tracing uses a distinct service name prefix: `tracing-collector`, `tracing-stream-processor`, `tracing-query-service`.
+
+Meta-tracing helps debug issues in the tracing pipeline. If spans are not appearing in the UI, the meta-trace shows whether the issue is in collection, processing, or storage. The meta-tracing uses a separate storage backend to avoid circular dependencies.
+
+### Metrics from Trace Data
+
+The tracing pipeline emits metrics about its own operation. The collector exports prometheus metrics at `/metrics`:
+
+- `otelcol_exporter_send_failed_requests`: count of failed exports
+- `otelcol_processor_batch_batch_send_size`: distribution of batch sizes
+- `otelcol_receiver_accepted_spans`: count of spans received
+- `otelcol_receiver_refused_spans`: count of spans refused
+- `otelcol_exporter_queue_capacity`: remaining queue capacity
+
+These metrics feed into a dashboard that shows the health of the tracing pipeline. Alert on any export failures that persist for more than 1 minute.
+
+### Self-Diagnostics
+
+The tracing system should periodically validate its own operation. A synthetic probe sends a request through a test endpoint every minute and verifies that the trace appears in the UI within 30 seconds. If the probe trace does not appear, the tracing system is degraded.
+
+The probe trace is tagged with `synthetic: true` so it can be filtered out of production data. The probe result feeds into a health check endpoint that load balancers use for routing decisions.
+
+## Client-Side vs Server-Side Tracing
+
+### Client-Side Tracing
+
+Client-side tracing instruments the user's browser or mobile application. A JavaScript SDK in the browser creates spans for page load, API calls, and user interactions. The client span is sent to the tracing backend, where it becomes the root span of the trace.
+
+Client-side tracing provides visibility into the user experience that server-side tracing cannot capture. The time between the user clicking a button and the request reaching the load balancer includes DNS resolution, TCP connection, TLS handshake, and queuing at the load balancer. Server-side tracing misses all of this.
+
+The challenge with client-side tracing is the short-lived nature of browser sessions. The span must be exported before the user navigates away or closes the tab. The browser's `sendBeacon` API is used for reliable span export at page unload.
+
+### Server-Side Tracing
+
+Server-side tracing instruments the backend services. This is the standard tracing approach. Server-side spans capture service processing time, database queries, cache lookups, and inter-service communication. Server-side tracing is more reliable because the spans are exported from a long-lived process.
+
+The combination of client-side and server-side tracing provides end-to-end visibility. The client span covers the full user-perceived latency. The server spans cover the backend processing. The gap between the client span and the server root span reveals network latency.
+
+## Integration with Service Mesh
+
+### Istio Integration
+
+Istio provides tracing at the infrastructure level without application changes. The Istio sidecar proxy (Envoy) generates spans for all inbound and outbound HTTP traffic. The spans are sent to the tracing backend configured in the Istio mesh configuration.
+
+The Istio-generated spans capture the network-level view of service-to-service communication. Each span records the source and destination IP, HTTP method, URL, response code, and duration. The spans from Istio complement application-level spans from the OpenTelemetry SDK.
+
+Configure Istio tracing with a sampling rate of 1% to 10%. The sampling rate is set in the Istio mesh config:
+
+```yaml
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+  meshConfig:
+    enableTracing: true
+    defaultConfig:
+      tracing:
+        sampling: 5.0
+        zipkin:
+          address: tracing-collector:9411
+```
+
+When both Istio and the application generate spans for the same request, the trace contains two sets of spans. The Istio spans appear as siblings of the application spans. The Istio spans wrap the application spans in time because the proxy processes traffic before and after the application.
+
+### Linkerd Integration
+
+Linkerd supports tracing through the OpenTelemetry Collector. The Linkerd proxy injects trace context headers into requests and forwards them to the OpenTelemetry Collector running as a sidecar. The collector enriches the spans with Linkerd-specific metadata and exports them to the tracing backend.
+
+Linkerd's tracing provides the hop-by-hop network view. Each Linkerd proxy creates a span for the request as it passes through. The Linkerd spans show the latency between proxies, which is the network transit time between services.
+
+## Multi-Tenancy in Tracing
+
+### Why Multi-Tenancy Matters
+
+In a large organization, multiple teams share the same tracing infrastructure. The payment team's traces should not be visible to the recommendation team. Each team should see only their own services. Multi-tenancy is essential for compliance and security.
+
+### Index-Level Isolation
+
+Elasticsearch supports index-level security. Create separate indices for each team: `traces-payment-2026-07-02`, `traces-recommendation-2026-07-02`. Each team's collector writes to its team's index. The query service filters by index based on the authenticated user's team membership.
+
+The drawback is that a cross-team trace (payment calling inventory) spans two indices. The query service must query both indices and merge the results. Cross-team traces are slower to query.
+
+### Tag-Level Isolation
+
+A simpler approach uses a tenant tag on each span. Every span has a `team` attribute set by the collector based on the service name. Elasticsearch's field-level security restricts access based on the `team` attribute value.
+
+Tag-level isolation does not require separate indices. All spans are in the same index, but a query for a specific team's spans filters by the `team` attribute. The query service enforces the filter based on the user's team membership.
+
+## Advanced Trace Query Language
+
+### Filtering Traces
+
+The tracing UI supports complex query filters. Common query patterns include:
+
+- Find all traces where the root span duration exceeds 2 seconds.
+- Find all traces where any span has a status of ERROR.
+- Find all traces where the payment service called the fraud service and the fraud service returned a specific error code.
+- Find all traces from VIP users whose user ID is in a specific range.
+- Find all traces that have a span with attribute `db.system` equal to `postgresql`.
+
+### Aggregating Trace Data
+
+Aggregation queries operate across traces to compute statistics:
+
+- Average root span duration by service name over the last hour.
+- P99 latency of the payment service's `charge` operation by deployment version.
+- Error rate of the fraud service's `score` operation, broken down by error code.
+- Number of traces that include a call to the database `db-primary-1`.
+- Distribution of trace depth (number of spans per trace) over the last day.
+
+### Trace to Metric Pipelines
+
+The tracing system can emit metrics derived from trace data. A pipeline processes trace data every minute and outputs metrics:
+
+- Error rate per service and operation: a counter with service, operation, and error type labels.
+- Latency distribution per service and operation: a histogram with p50, p95, p99, and p999 values.
+- Dependency strength: the ratio of traces where service A calls service B, as a percentage of all traces where service A makes any downstream call.
+
+These trace-derived metrics feed into the standard metrics dashboard and alerting system. They provide request-level granularity that is not available from metrics collected at the service level.
+
+## Trace Visualization Architecture
+
+### Waterfall View
+
+The waterfall view is the primary trace visualization. It displays spans as horizontal bars arranged vertically, sorted by start time. Parent-child relationships are shown through indentation: child spans are indented below their parent. The width of each bar corresponds to the span duration.
+
+The waterfall view includes color coding. Each service is assigned a distinct color. Spans from the same service share the same color, making it easy to identify service boundaries. Error spans are highlighted in red. Slow spans (exceeding a configurable threshold) are highlighted in yellow.
+
+The waterfall view supports interactive exploration. Clicking a span reveals its attributes, events, and links. Hovering over a span shows the exact start time and duration in milliseconds. Users can zoom into a specific time range or filter out spans below a minimum duration.
+
+### Graph View
+
+The graph view shows the service dependency graph derived from trace data. Each service is a node. Each traced call from one service to another is a directed edge. The graph is computed from aggregate trace data over a configurable time window, typically the last 5 minutes.
+
+The graph view highlights problematic services. A service with elevated error rate is shown in red. A service with high latency is shown in yellow. The edge thickness represents the call frequency relative to other edges: a thick edge means high call volume.
+
+The graph view is interactive. Clicking a service shows the list of recent traces involving that service. Clicking an edge shows traces that use that call path. The graph view is the starting point for understanding system behavior before diving into individual traces.
+
+### List View
+
+The list view shows a searchable, filterable table of traces. Each row shows the trace ID, root service name, root operation name, total duration, number of spans, start time, and status. Users can sort by any column and filter by service, operation, duration range, and time range.
+
+The list view is the starting point for most debugging sessions. Users filter by the affected service and operation, sort by duration descending to find the slowest traces, and open the slowest trace in the waterfall view.
+
+## Scaling the Collector Fleet
+
+### Collector Autoscaling
+
+The collector fleet should autoscale based on span throughput. Use horizontal pod autoscaling in Kubernetes with a custom metric for span ingestion rate. The autoscaler targets 1,000 spans per second per collector replica. When the average ingestion rate per replica exceeds 1,200 spans per second, add a replica. When it drops below 800 spans per second, remove a replica.
+
+The autoscaler must respect a cooldown period of 3 minutes between scaling events. This prevents oscillation during traffic spikes. The minimum replica count is 2 for high availability. The maximum replica count is 20 for the initial deployment.
+
+### Collector ZooKeeper for Span Routing
+
+For advanced deployments, use a consistent hash ring to route spans from the same trace to the same collector instance. The hash ring maps trace IDs to collector instances. All spans with the same trace ID are routed to the same collector. This eliminates the need for the collector to merge spans from multiple sources.
+
+The hash ring is implemented using a consistent hashing algorithm (jump hash or rendezvous hashing). When a collector instance joins or leaves the ring, only a fraction of trace-to-collector mappings change. This minimizes disruption during scaling events.
+
+### Collector Health Probes
+
+Each collector exposes three health endpoints. The liveness probe returns 200 if the collector process is healthy. The readiness probe returns 200 if the collector can accept spans. The startup probe returns 200 only after the collector has finished initialization, including loading the sampling configuration and establishing connections to the storage backend.
+
+The liveness probe checks every 10 seconds with a timeout of 5 seconds. The readiness probe checks every 5 seconds with a timeout of 3 seconds. The startup probe has an initial delay of 30 seconds to account for initialization time.
+
+## Trace Sampling Placement
+
+### SDK-Level Sampling
+
+Sampling at the SDK level is the most efficient approach. The SDK decides whether to sample a trace before any spans are created. If the trace is not sampled, the SDK creates spans but does not export them. This reduces the span creation overhead to the minimum.
+
+The advantage of SDK-level sampling is that unsampled traces consume no collector or storage resources. The disadvantage is that the sampling decision must be made at the entry point, and it cannot be reversed later.
+
+### Collector-Level Sampling
+
+Sampling at the collector level allows all spans to be collected before the sampling decision. The collector receives spans from all services and applies sampling rules. The advantage is flexibility: the collector can use trace-level information (number of spans, error status, total duration) to make the sampling decision.
+
+The disadvantage of collector-level sampling is that all spans are exported from the services and sent to the collector. This increases network bandwidth and collector compute requirements. Collector-level sampling is recommended only when tail-based sampling is required.
+
+### Service-Level Sampling with Override
+
+A hybrid approach applies SDK-level sampling with a service-level override. Each service can override the sampling decision for specific spans. If the fraud service detects an error, it sets a "must sample" attribute on its span. The SDK checks for the attribute and exports the span even if the trace was not sampled.
+
+The override is propagated through the trace context headers using the tracestate field. Downstream services check for the override and similarly export their spans. This ensures that error traces are complete even when they were not sampled at the entry point.
+
+## Trace Data Lifecycle Management
+
+### Data Classification
+
+Not all traces are equally valuable. Classify traces into three tiers based on their value for debugging. Tier 1 traces contain errors or latency anomalies and are retained for 90 days. Tier 2 traces are from critical services (payment, authentication) and are retained for 30 days. Tier 3 traces are from non-critical services and are retained for 7 days.
+
+The classification is applied at the collector level. The collector inspects each trace's span statuses and service tags. Traces with any ERROR span are classified as Tier 1. Traces from services tagged as "critical" are classified as Tier 2. All other traces are Tier 3.
+
+### Data Compression
+
+Trace data compression reduces storage costs by 60% to 70%. The OpenTelemetry Collector applies gzip compression at level 6. The compressed span size is approximately 200 bytes per span, down from 512 bytes uncompressed.
+
+For long-term storage, additional compression is applied. The Elasticsearch index is configured with a codec that compresses stored fields. The `best_compression` codec reduces storage by an additional 20% at the cost of slightly slower query performance.
+
+### Data Deletion Policy
+
+Trace data is deleted when the retention period expires. Elasticsearch time-based indices make deletion simple: the index for the expired date is dropped entirely. The deletion runs as a cron job that checks the current date and drops indices older than the retention period.
+
+The deletion policy is configured for each tier. Tier 1 indices are retained for 90 days, Tier 2 for 30 days, and Tier 3 for 7 days. The deletion is final: trace data cannot be recovered after the index is dropped.
+
+## Trace Data Retention Strategies
+
+### Hot-Warm-Cold Architecture
+
+A hot-warm-cold storage architecture balances query performance and cost. Hot storage (SSD) holds the most recent 7 days of trace data. Query latency is under 50 milliseconds. Warm storage (HDD) holds data from 8 to 30 days. Query latency is under 500 milliseconds. Cold storage (S3) holds data from 31 to 90 days. Query latency is under 60 seconds because data must be recalled from S3.
+
+The hot-warm-cold transition is automated. A daily cron job moves indices between tiers. The job checks the index date, moves the index to the appropriate tier, and updates the Elasticsearch index lifecycle policy.
+
+### Retention Policy by Service Criticality
+
+Not all services need the same retention period. Critical services (payment, authentication, fraud detection) retain traces for 90 days. Standard services (inventory, catalog, search) retain traces for 30 days. Non-critical services (analytics, recommendations, logging) retain traces for 7 days.
+
+The retention policy is enforced by the collector. The collector tags each span with a `retention` attribute based on the service name. The storage backend applies the retention policy based on this attribute. This approach reduces storage costs by 40% to 60% compared to a uniform retention policy.
+
+### Trace Catalog
+
+A trace catalog is a searchable index of trace metadata. The catalog stores the trace ID, root service name, root operation name, total duration, span count, start time, and status. The catalog is separate from the span storage. Queries against the catalog are fast because the catalog is small compared to the full span data.
+
+The catalog is updated asynchronously. When a trace is stored in Elasticsearch, a post-processing step extracts the trace metadata and writes it to the catalog. The catalog is used for the list view in the tracing UI. The full span data is loaded from Elasticsearch only when the user opens a specific trace.
+
+### Index Rollover Strategy
+
+Elasticsearch indices are created daily with the format `traces-YYYY-MM-DD`. Each index is configured with a rollover policy that creates a new index when the current index reaches 50 GB or 100 million documents. The rollover prevents any single index from becoming too large and causing slow queries.
+
+The rollover policy is managed by Elasticsearch Index Lifecycle Management (ILM). ILM automatically creates a new index when the rollover condition is met. The old index is moved to the warm tier after 7 days and to the cold tier after 30 days. The index is deleted after the retention period expires.
+
+### Trace Sampling at the Load Balancer
+
+The load balancer is an ideal place to apply sampling because it is the entry point for all traffic. The load balancer applies a hash-based sampler that decides whether to trace each request. The sampling decision is injected into the trace context as a flag. Downstream services respect the flag and do not make independent sampling decisions.
+
+Configuring sampling at the load balancer simplifies the SDK configuration. All services use the same sampling rate without needing to synchronize configuration. The load balancer can also override the sampling decision based on the request path: all requests to `/checkout` are sampled, while requests to `/health` are not sampled.
+
+### Trace Audit Trail
+
+A trace audit trail is a tamper-evident record of every span in the system. Each span is hashed and linked to the previous span in the trace, forming a hash chain. The hash chain prevents unauthorized modification of trace data. If a span is modified after creation, the hash chain breaks and the modification is detected.
+
+The audit trail is stored in a separate Elasticsearch index that is write-only. The index is configured with a write-once, read-many policy. Once a span is written to the audit trail index, it cannot be modified or deleted. The audit trail is retained for the full compliance retention period, typically 1 to 7 years.
+
+### Trace Sharding
+
+For extremely large deployments, shard trace data by service group. Each service group (payment, inventory, notification) has its own collector fleet and Elasticsearch cluster. The sharding reduces the blast radius of a storage backend failure. If the payment cluster fails, the inventory and notification clusters continue to operate.
+
+The trace ID includes a shard key that determines which shard stores the spans. The shard key is derived from the trace ID's first byte. The collector uses the shard key to route spans to the correct shard. The query service queries all shards in parallel and merges the results. The sharding strategy allows the tracing system to scale horizontally beyond the capacity of a single Elasticsearch cluster. Each shard operates independently, so a failure in one shard does not affect other shards. This isolation is critical for maintaining tracing availability during partial infrastructure failures.
+
+---
+
+Now that you understand how to build tracing systems at scale, the next step is to explore the trade-offs and failure modes you will encounter in production.
+

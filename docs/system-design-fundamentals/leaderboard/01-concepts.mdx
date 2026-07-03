@@ -1,0 +1,636 @@
+---
+id: leaderboard-concepts
+title: Understanding Leaderboard Pattern
+sidebar_label: Mental Model
+sidebar_position: 1
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Tournament That Broke the Scoreboard
+
+A mobile gaming startup launches a real-time puzzle game. Within three months, the game reaches 500,000 daily active users. The founders add a leaderboard feature to drive engagement -- players compete for the top spot each week.
+
+The first implementation is straightforward. Every time a player scores points, the backend writes to a `scores` table in PostgreSQL:
+
+```sql
+INSERT INTO scores (player_id, score, achieved_at)
+VALUES (42, 15000, NOW())
+ON CONFLICT (player_id)
+DO UPDATE SET score = GREATEST(scores.score, 15000);
+```
+
+To render the leaderboard, the app queries:
+
+```sql
+SELECT player_id, score
+FROM scores
+ORDER BY score DESC
+LIMIT 100;
+```
+
+For the first 10,000 players, this works perfectly. The query returns in under 20 milliseconds. Players see their ranks update within seconds of posting a score.
+
+Then the game goes viral. The user base grows to 2 million players. The `scores` table grows to 50 million rows. The leaderboard query now takes 3.7 seconds. Players refresh the page, see stale data, and complain that the standings are wrong. The database CPU spikes to 95 percent during peak hours. The `ORDER BY score DESC LIMIT 100` query scans millions of rows to find the top 100, and the `COUNT(*)` query to compute a player's rank requires a full table scan.
+
+The team tries indexing. A descending B-tree index on `score` helps the top-100 query:
+
+```sql
+CREATE INDEX idx_scores_score_desc ON scores (score DESC);
+```
+
+The top-100 query now runs in 12 milliseconds. But the rank query remains problematic:
+
+```sql
+SELECT COUNT(*) FROM scores
+WHERE score > (SELECT score FROM scores WHERE player_id = 42);
+```
+
+This still requires an index scan over all players with a higher score. For a player ranked 500,000, this means counting 500,000 rows. The query takes 400 milliseconds. During peak traffic, 10,000 players per second request their rank, and the database cannot keep up.
+
+The founders face a choice: throw more hardware at the problem, or redesign the leaderboard from scratch.
+
+This is the moment every leaderboard system reaches its breaking point. The naive approach -- a single table with sorted queries -- does not scale beyond a few hundred thousand players. The leaderboard pattern solves this problem with a combination of data structures, partitioning strategies, and caching layers that can handle tens of millions of players with sub-50 millisecond reads.
+
+---
+
+## The Insight
+
+A leaderboard is a **sorted set** with four operations: insert or update a score, read the top N players, read a specific player's rank, and read the players around a specific player. The fundamental challenge is that the rank operation requires knowing the relative ordering of all elements, which is expensive to compute from scratch each time.
+
+The analogy that clarifies the solution is the **classroom grading curve**. A professor has 300 exam scores. To find the top 10 students, the professor sorts the papers once and copies the top 10 onto a separate sheet. To find any single student's rank, the professor looks at the sorted list, not the unsorted pile.
+
+The naive approach tries to sort the full list every time someone asks for a rank. The optimized approach maintains the sorted order incrementally and uses a data structure that can answer rank queries in logarithmic time.
+
+The key insight is that you do not need to store every player's exact score to compute ranks accurately. You can bucket scores into ranges, estimate ranks within buckets, and update the sorted structure only when scores change significantly. This is the same principle behind a **skip list** or a **balanced binary search tree** -- you trade a small amount of accuracy for a massive reduction in computational cost.
+
+---
+
+## Core Vocabulary
+
+Master these 16 terms before moving to the deep dive.
+
+**Sorted set** -- A data structure that maintains elements in sorted order by a score value. Redis calls this a sorted set (`ZADD`, `ZRANK`, `ZRANGE`). The underlying implementation is a skip list combined with a hash map.
+
+**Rank** -- The position of a player in the leaderboard, typically 1-based. Rank 1 is the highest score. Rank queries require knowing how many players have a higher score than the target player.
+
+**Percentile rank** -- The percentage of players who have a score lower than a given player. A player at the 95th percentile has a higher score than 95 percent of all players.
+
+**Score bucket** -- A range of scores grouped together for approximate ranking. For example, scores 1000-1999 form one bucket. All players in a bucket share the same approximate rank, and the exact rank within the bucket is computed only when requested.
+
+**Delta propagation** -- The mechanism for updating the leaderboard when a single player's score changes. Instead of recalculating the entire leaderboard, only the affected player's position is updated, and the ranks of players who shift are adjusted.
+
+**Tie-breaking** -- The rule for ordering players with the same score. Common strategies include: first-to-reach the score wins, last-update timestamp, or a secondary metric such as accuracy or completion time.
+
+**Time window** -- The period over which the leaderboard is computed. Common windows are daily, weekly, monthly, or all-time. Time-windowed leaderboards require partitioning scores by the window boundary.
+
+**Sharded leaderboard** -- A leaderboard divided across multiple nodes by a shard key such as player ID hash or region. Each shard maintains its own sorted set, and the global leaderboard is a merge of all shard tops.
+
+**Approximate leaderboard** -- A leaderboard that returns ranks within a bounded error margin, such as plus or minus 5 positions. Trading accuracy for performance allows the use of data sketches like t-digest or Count-Min Sketch.
+
+**Leaderboard cache** -- A caching layer that stores the top N players and their ranks. The cache is invalidated when the top N changes. This reduces the read load on the primary data store by orders of magnitude.
+
+**Active player set** -- The subset of players who have posted a score within the current time window. Only active players need to appear in the leaderboard. Inactive players can be archived to reduce the size of the sorted set.
+
+**Score decay** -- A mechanism that reduces a player's score over time if they stop playing. This keeps the leaderboard fresh and prevents stale high scores from dominating the top positions.
+
+**Leaderboard write path** -- The pipeline from a player submitting a score to the leaderboard being updated: validation, score computation, sorted set update, cache invalidation, and notification to subscribers.
+
+**Leaderboard read path** -- The pipeline from a client requesting the leaderboard to receiving the response: cache lookup, sorted set query, rank computation, and response formatting.
+
+**Consistency model for leaderboards** -- The tradeoff between showing the most recent scores instantly (strong consistency) and accepting a short delay in exchange for higher throughput (eventual consistency). Most leaderboards use eventual consistency with a staleness window of 1-5 seconds.
+
+**Leaderboard hot shard** -- A shard that contains disproportionately many top players. When a small number of shards hold the highest scores, those shards become hot spots and require rebalancing.
+
+---
+
+## Big Picture: The Leaderboard Architecture
+
+<AsciiDiagram
+  id="leaderboard/concepts-big-picture"
+  title="Leaderboard Architecture Overview"
+  alt="End-to-end flow from player submitting a score through API gateway, score processor, Redis sorted set, cache, and database, to the client requesting the leaderboard"
+  caption="The leaderboard architecture separates the write path (score submission) from the read path (leaderboard display) and uses a sorted set as the core data structure."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                    LEADERBOARD ARCHITECTURE                      │
+  │                                                                  │
+  │  ┌──────────┐    ┌──────────────┐    ┌────────────────────────┐ │
+  │  │ Player   │───>│ API Gateway  │───>│ Score Processing       │ │
+  │  │ submits  │    │ rate limit   │    │ validate, deduplicate  │ │
+  │  │ score    │    │ auth check   │    │ compute final score    │ │
+  │  └──────────┘    └──────────────┘    └───────────┬────────────┘ │
+  │                                                   │              │
+  │                    ┌──────────────────────────────┼──────────┐   │
+  │                    │            WRITE PATH        │          │   │
+  │                    │                              ▼          │   │
+  │                    │  ┌────────────────────────────────────┐ │   │
+  │                    │  │  Redis Sorted Set (ZADD)          │ │   │
+  │                    │  │  Key: leaderboard:daily:2026-07-03│ │   │
+  │                    │  │  Score: 15000  Member: player_42  │ │   │
+  │                    │  └───────────────┬────────────────────┘ │   │
+  │                    │                  │                       │   │
+  │                    │  ┌───────────────▼────────────────────┐ │   │
+  │                    │  │  Write-Ahead Log / Database        │ │   │
+  │                    │  │  Persistent storage of all scores  │ │   │
+  │                    │  └────────────────────────────────────┘ │   │
+  │                    └──────────────────────────────────────────┘   │
+  │                                                                  │
+  │  ┌──────────┐    ┌──────────────┐    ┌────────────────────────┐ │
+  │  │ Client   │<───│ API Gateway  │<───│ Leaderboard Read       │ │
+  │  │ requests │    │              │    │ service                │ │
+  │  │ leaderbrd│    │              │    │                        │ │
+  │  └──────────┘    └──────────────┘    └───────────┬────────────┘ │
+  │                                                   │              │
+  │                    ┌──────────────────────────────┼──────────┐   │
+  │                    │           READ PATH          │          │   │
+  │                    │                              ▼          │   │
+  │                    │  ┌────────────────────────────────────┐ │   │
+  │                    │  │  Cache (Redis / Memcached)        │ │   │
+  │                    │  │  Key: leaderboard:top100:daily    │ │   │
+  │                    │  │  Value: [player_42, player_17..] │ │   │
+  │                    │  └───────────────┬────────────────────┘ │   │
+  │                    │                  │                       │   │
+  │                    │                  │ on cache miss         │   │
+  │                    │                  ▼                       │   │
+  │                    │  ┌────────────────────────────────────┐ │   │
+  │                    │  │  Redis Sorted Set (ZREVRANGE      │ │   │
+  │                    │  │  + ZREVRANK)                      │ │   │
+  │                    │  └────────────────────────────────────┘ │   │
+  │                    └──────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+The architecture separates concerns into two distinct paths. The write path handles score submissions and updates the sorted set. The read path handles leaderboard queries and uses a cache to absorb the majority of read traffic. The sorted set is the source of truth for the current leaderboard state, while the database provides durable storage for historical scores and auditing.
+
+---
+
+## How It Works
+
+A leaderboard system processes scores through a pipeline of eight stages. Each stage addresses a specific challenge in the overall problem.
+
+### Step 1: Score Ingestion
+
+When a player submits a score, the API gateway validates the request, authenticates the player, and forwards the payload to the score processing service. The gateway enforces rate limits -- typically 1 score submission per second per player -- to prevent abuse.
+
+```python
+# Score ingestion handler
+@app.post("/api/v1/scores")
+async def submit_score(player_id: str, game_id: str, score: int, metadata: dict):
+    # Rate limit check
+    can_submit = await rate_limiter.check(player_id, "score_submit", max_per_second=1)
+    if not can_submit:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    # Validate score
+    if score < 0 or score > 999999:
+        raise HTTPException(status_code=400, detail="Invalid score")
+
+    # Process score
+    score_id = await score_processor.submit(player_id, game_id, score, metadata)
+    return {"score_id": score_id, "status": "accepted"}
+```
+
+### Step 2: Score Validation and Deduplication
+
+The score processor validates the score against business rules: the score must be within the allowed range, the game session must be valid, and the player must not be using a banned account. The processor also checks for duplicate submissions -- if the same player submits the same score within 5 seconds, it is rejected as a duplicate.
+
+```python
+# Score deduplication check
+async def deduplicate_score(player_id: str, score: int, timestamp: float):
+    key = f"dedup:{player_id}:{timestamp // 5}"
+    was_seen = await redis.setnx(key, 1)
+    if not was_seen:
+        raise DuplicateScoreError("Score already submitted in this window")
+    await redis.expire(key, 10)
+    return True
+```
+
+### Step 3: Score Computation
+
+Some games compute the final score from multiple sub-scores. For example, a racing game might combine lap time, speed bonuses, and collision penalties. The score processor runs the computation logic and produces the final score value.
+
+```python
+# Score computation for a racing game
+def compute_final_score(lap_time_ms: int, speed_bonus: int, collision_penalty: int) -> int:
+    base_score = max(0, 100000 - lap_time_ms)  # Faster laps get higher base score
+    return base_score + speed_bonus - collision_penalty
+```
+
+### Step 4: Sorted Set Update
+
+The final score is written to a Redis sorted set. The key identifies the leaderboard window (daily, weekly, all-time). The member is the player ID. The score is the computed value.
+
+```python
+# Update Redis sorted set
+async def update_leaderboard(player_id: str, score: int, window: str):
+    key = f"leaderboard:{window}:{current_window_key()}"
+    # ZADD adds or updates the player's score
+    await redis.zadd(key, {player_id: score})
+    # Set TTL to expire when the window ends
+    await redis.expire(key, window_ttl_seconds(window))
+    return True
+```
+
+The `ZADD` operation in Redis uses a skip list internally, which provides O(log N) complexity for insertions and updates. This is the critical performance characteristic that makes Redis suitable for leaderboards at scale.
+
+### Step 5: Cache Invalidation
+
+After updating the sorted set, the system invalidates the cached leaderboard top-N. The invalidation is done asynchronously using a message queue to avoid blocking the write path.
+
+```python
+# Asynchronous cache invalidation
+async def invalidate_leaderboard_cache(window: str):
+    # Publish invalidation event to a message queue
+    await message_queue.publish("leaderboard.invalidate", {
+        "window": window,
+        "timestamp": time.time()
+    })
+    return True
+
+# Cache worker listens for invalidation events and refreshes the cache
+async def cache_invalidation_worker():
+    async for event in message_queue.subscribe("leaderboard.invalidate"):
+        # Delete the cached top-N
+        key = f"leaderboard:top100:{event['window']}"
+        await cache.delete(key)
+        # Optionally, pre-warm the cache with the new top-N
+        await refresh_top_n_cache(event['window'])
+```
+
+### Step 6: Rank Query
+
+When a player requests their rank, the system queries the sorted set using `ZREVRANK` (reverse rank, where 0 is the highest score):
+
+```python
+# Get player rank
+async def get_player_rank(player_id: str, window: str) -> dict:
+    key = f"leaderboard:{window}:{current_window_key()}"
+    rank = await redis.zrevrank(key, player_id)
+    score = await redis.zscore(key, player_id)
+
+    if rank is None:
+        return {"rank": None, "score": 0, "total_players": 0}
+
+    total_players = await redis.zcard(key)
+    return {
+        "rank": rank + 1,  # Convert to 1-based
+        "score": int(score),
+        "total_players": total_players,
+        "percentile": round((rank / total_players) * 100, 1)
+    }
+```
+
+`ZREVRANK` is an O(log N) operation. It traverses the skip list to find the element and counts the number of elements ahead of it. This is the key advantage over the SQL `COUNT(*)` approach, which requires O(N) scans.
+
+### Step 7: Leaderboard Query
+
+When a client requests the leaderboard, the system first checks the cache. On a cache hit, it returns the cached top-N immediately. On a cache miss, it queries the sorted set, populates the cache, and returns the result.
+
+```python
+# Get leaderboard top-N
+async def get_leaderboard(window: str, top_n: int = 100, offset: int = 0) -> dict:
+    cache_key = f"leaderboard:top{top_n}:{window}:{current_window_key()}:{offset}"
+
+    # Try cache first
+    cached = await cache.get(cache_key)
+    if cached:
+        return cached
+
+    # Cache miss -- query sorted set
+    key = f"leaderboard:{window}:{current_window_key()}"
+    results = await redis.zrevrange(key, offset, offset + top_n - 1, withscores=True)
+
+    entries = []
+    for i, (player_id, score) in enumerate(results):
+        entries.append({
+            "rank": offset + i + 1,
+            "player_id": player_id,
+            "score": int(score)
+        })
+
+    response = {
+        "entries": entries,
+        "offset": offset,
+        "count": len(entries)
+    }
+
+    # Populate cache with TTL
+    await cache.set(cache_key, response, ttl=30)
+    return response
+```
+
+### Step 8: Score Persistence and Archival
+
+The sorted set is the live data structure, but it is ephemeral. The system persists scores to a durable database for historical analysis, dispute resolution, and leaderboard reconstruction. Archival jobs move scores older than 90 days to cold storage.
+
+```python
+# Persist score to database
+async def persist_score(player_id: str, score: int, game_id: str, metadata: dict):
+    await db.execute(
+        "INSERT INTO score_history (player_id, score, game_id, metadata, achieved_at) "
+        "VALUES ($1, $2, $3, $4, NOW())",
+        player_id, score, game_id, json.dumps(metadata)
+    )
+
+# Archival job -- moves old scores to cold storage
+async def archive_old_scores():
+    cutoff = datetime.utcnow() - timedelta(days=90)
+    async with db.transaction():
+        old_scores = await db.fetch(
+            "SELECT * FROM score_history WHERE achieved_at < $1", cutoff
+        )
+        if old_scores:
+            await cold_storage.bulk_write(old_scores)
+            await db.execute(
+                "DELETE FROM score_history WHERE achieved_at < $1", cutoff
+            )
+```
+
+---
+
+## The Sorted Set Data Structure
+
+<AsciiDiagram
+  id="leaderboard/concepts-sorted-set"
+  title="Redis Sorted Set Internal Structure"
+  alt="Diagram showing a skip list with multiple levels, where each node contains a player ID, score, and forward pointers at each level"
+  caption="A Redis sorted set uses a skip list with a hash map. The skip list enables O(log N) insert, update, and rank queries."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  REDIS SORTED SET INTERNAL STRUCTURE                            │
+  │  Key: leaderboard:daily:2026-07-03                              │
+  │                                                                  │
+  │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
+  │  │ Level 3  │───>│ Level 3  │───>│ Level 3  │───>│  NULL    │  │
+  │  │ header   │    │ player_84│    │ player_42│    │          │  │
+  │  └──────────┘    │ score:   │    │ score:   │    └──────────┘  │
+  │                  │  95000   │    │  15000   │                   │
+  │                  └──────────┘    └──────────┘                   │
+  │                       │              │                          │
+  │  ┌──────────┐    ┌────┴──────┐    ┌──┴────────┐  ┌──────────┐  │
+  │  │ Level 2  │───>│ Level 2   │───>│ Level 2   │─>│ Level 2  │  │
+  │  │ header   │    │ player_84 │    │ player_17 │  │ player_42│  │
+  │  └──────────┘    │ score:    │    │ score:    │  │ score:   │  │
+  │                  │  95000    │    │  32000    │  │  15000   │  │
+  │                  └───────────┘    └───────────┘  └──────────┘  │
+  │                       │              │              │           │
+  │  ┌──────────┐    ┌────┴──────┐    ┌──┴────────┐  ┌┴─────────┐  │
+  │  │ Level 1  │───>│ Level 1   │───>│ Level 1   │─>│ Level 1  │  │
+  │  │ header   │    │ player_84 │    │ player_17 │  │ player_42│  │
+  │  └──────────┘    │ score:    │    │ score:    │  │ score:   │  │
+  │                  │  95000    │    │  32000    │  │  15000   │  │
+  │                  └───────────┘    └───────────┘  └──────────┘  │
+  │                                                                  │
+  │  Hash Map (O(1) lookup by player ID):                           │
+  │  ┌───────────┬───────────────┐                                  │
+  │  │ player_84 │ ──> skip node  │                                  │
+  │  │ player_17 │ ──> skip node  │                                  │
+  │  │ player_42 │ ──> skip node  │                                  │
+  │  └───────────┴───────────────┘                                  │
+  │                                                                  │
+  │  Operations:                                                     │
+  │  ZADD member score  → O(log N)  Insert or update                │
+  │  ZREVRANK member    → O(log N)  Get rank (highest = 0)         │
+  │  ZREVRANGE start stop → O(log N + M)  Get top N players         │
+  │  ZCARD              → O(1)      Get total player count          │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+The skip list provides the same O(log N) complexity as a balanced binary tree but is simpler to implement and requires less memory. The hash map provides O(1) lookup from player ID to the skip list node, which is needed for the `ZADD` operation when updating an existing player's score.
+
+---
+
+## Variants
+
+### Variant 1: Time-Windowed Leaderboard
+
+The most common variant. Scores are partitioned by a time window -- daily, weekly, or monthly. Each window has its own sorted set key. When the window expires, the sorted set is either archived or deleted.
+
+<AsciiDiagram
+  id="leaderboard/concepts-time-window"
+  title="Time-Windowed Leaderboard with Weekly Rotation"
+  alt="Three weekly leaderboard keys shown side by side, with the current week active and past weeks archived to cold storage"
+  caption="Time-windowed leaderboards partition scores by calendar windows. Past windows are archived, current window is live."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  TIME-WINDOWED LEADERBOARD                                      │
+  │                                                                  │
+  │  ┌──────────────────┐  ┌──────────────────┐  ┌────────────────┐ │
+  │  │ Week 25 (past)   │  │ Week 26 (past)   │  │ Week 27 (live) │ │
+  │  │ leaderboard:     │  │ leaderboard:     │  │ leaderboard:   │ │
+  │  │ weekly:2026-25   │  │ weekly:2026-26   │  │ weekly:2026-27 │ │
+  │  │                  │  │                  │  │                │ │
+  │  │ 1. Alice 98000   │  │ 1. Bob   99000   │  │ 1. Carol 95000 │ │
+  │  │ 2. Bob   97000   │  │ 2. Alice 98000   │  │ 2. Alice 92000 │ │
+  │  │ 3. Carol 96000   │  │ 3. Carol 96000   │  │ 3. Dave  91000 │ │
+  │  └──────────────────┘  └──────────────────┘  └────────────────┘ │
+  │         │                      │                      │          │
+  │         ▼                      ▼                      │          │
+  │  ┌──────────────────┐  ┌──────────────────┐           │          │
+  │  │ Cold Storage     │  │ Cold Storage     │           │          │
+  │  │ S3 / GCS         │  │ S3 / GCS         │           │          │
+  │  │ Archived after   │  │ Archived after   │           │          │
+  │  │ 90 days          │  │ 90 days          │           │          │
+  │  └──────────────────┘  └──────────────────┘           │          │
+  │                                                        │          │
+  │  TTL on current week sorted set: 7 days + 1 day buffer │          │
+  │  TTL on archived keys: until manual cleanup            │          │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+Time-windowed leaderboards are simple to implement and understand. The tradeoff is that players who had a high score in a past window lose their position when the window resets. This drives engagement because players must keep playing to maintain their rank.
+
+### Variant 2: Approximate Leaderboard with Score Buckets
+
+When exact ranks are not required, score bucketing provides dramatic performance improvements. Scores are grouped into ranges, and players within the same bucket share the same approximate rank.
+
+<AsciiDiagram
+  id="leaderboard/concepts-score-buckets"
+  title="Approximate Leaderboard with Score Buckets"
+  alt="Score ranges from 0-9999 grouped into buckets of 1000 points each, with a count of players in each bucket, and a detail query for one bucket"
+  caption="Score buckets group players by score range. The rank is approximate within the bucket, and exact ranking requires a secondary query."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  APPROXIMATE LEADERBOARD WITH SCORE BUCKETS                     │
+  │                                                                  │
+  │  Bucket 0:    0 -  9999  │ count: 450,000  │  1% of players    │
+  │  Bucket 1: 10000 - 19999 │ count: 320,000  │  2% of players    │
+  │  Bucket 2: 20000 - 29999 │ count: 180,000  │  5% of players    │
+  │  Bucket 3: 30000 - 39999 │ count:  95,000  │ 10% of players    │
+  │  Bucket 4: 40000 - 49999 │ count:  50,000  │ 20% of players    │
+  │  Bucket 5: 50000 - 59999 │ count:  25,000  │ 35% of players    │
+  │  Bucket 6: 60000 - 69999 │ count:  12,000  │ 50% of players    │
+  │  Bucket 7: 70000 - 79999 │ count:   5,000  │ 65% of players    │
+  │  Bucket 8: 80000 - 89999 │ count:   2,000  │ 80% of players    │
+  │  Bucket 9: 90000 - 99999 │ count:     500  │ 95% of players    │
+  │  Bucket10:100000+        │ count:     100  │ 99% of players    │
+  │                                                                  │
+  │  Rank computation:                                               │
+  │  Player has score 45,000 → Bucket 4 (40000-49999)                │
+  │  Cumulative count of higher buckets: 5000+2000+500+100 = 7600   │
+  │  Approximate rank: 7600 + (position within bucket 4)            │
+  │  Error margin: plus or minus 50,000 (size of bucket 4)          │
+  │                                                                  │
+  │  When exact rank is needed, query inside the bucket only:        │
+  │  SELECT COUNT(*) FROM scores WHERE score > 45000 AND            │
+  │  score < 50000; → rank within bucket = 23,000                   │
+  │  Exact rank: 7600 + 23000 = 30600                               │
+  │  (Reduced scan from 1.1M to 50K rows)                           │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+The bucket approach reduces the rank computation from O(N) to O(number of buckets + bucket size). With 10 buckets, the rank query scans at most 10 percent of the data. This is ideal for large player bases where exact rank is not critical for the majority of players.
+
+### Variant 3: Sharded Leaderboard
+
+When a single Redis instance cannot handle the write throughput, the leaderboard is sharded across multiple nodes. Each shard maintains its own sorted set for a subset of players. The global leaderboard is computed by merging the top N from each shard.
+
+<AsciiDiagram
+  id="leaderboard/concepts-sharded"
+  title="Sharded Leaderboard with Global Merge"
+  alt="Three shards each holding a portion of players sorted by score, with a global merge service reading the top 100 from each shard and producing the final merged top 100"
+  caption="Sharded leaderboards distribute players across Redis nodes. A global merge service combines the top N from each shard to produce the final leaderboard."
+  content={`
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  SHARDED LEADERBOARD                                            │
+  │                                                                  │
+  │  Shard 0 (players 0-333K)   Shard 1 (players 334K-667K)        │
+  │  ┌──────────────────────┐   ┌──────────────────────┐           │
+  │  │ 1. player_42: 95000  │   │ 1. player_17: 92000  │           │
+  │  │ 2. player_84: 87000  │   │ 2. player_99: 88000  │           │
+  │  │ 3. player_12: 81000  │   │ 3. player_55: 79000  │           │
+  │  │ ...                  │   │ ...                  │           │
+  │  │ 100. player_3: 1500  │   │ 100. player_8: 1400  │           │
+  │  └──────────────────────┘   └──────────────────────┘           │
+  │                                                                  │
+  │  Shard 2 (players 668K-1M)                                      │
+  │  ┌──────────────────────┐                                       │
+  │  │ 1. player_31: 91000  │                                       │
+  │  │ 2. player_66: 84000  │                                       │
+  │  │ 3. player_22: 77000  │                                       │
+  │  │ ...                  │                                       │
+  │  │ 100. player_9: 1300  │                                       │
+  │  └──────────────────────┘                                       │
+  │                                                                  │
+  │  Global Merge Service                                           │
+  │  ┌────────────────────────────────────────────────────────────┐ │
+  │  │  1. Read top 100 from each shard (300 entries total)       │ │
+  │  │  2. Merge and sort by score descending                     │ │
+  │  │  3. Select top 100 from merged list                        │ │
+  │  │  4. Cache the result                                       │ │
+  │  │                                                             │ │
+  │  │  Global Top 100:                                            │ │
+  │  │  1. player_42: 95000 (from shard 0)                        │ │
+  │  │  2. player_17: 92000 (from shard 1)                        │ │
+  │  │  3. player_31: 91000 (from shard 2)                        │ │
+  │  │  ...                                                        │ │
+  │  └────────────────────────────────────────────────────────────┘ │
+  │                                                                  │
+  │  Each shard holds 1/N of players.                               │
+  │  Write throughput scales linearly with number of shards.        │
+  │  Global read requires merging top N from each shard.            │
+  │  Rank queries require summing counts from all shards.           │
+  └─────────────────────────────────────────────────────────────────┘
+  `}
+/>
+
+Sharded leaderboards scale write throughput linearly with the number of shards. The tradeoff is that global rank queries require aggregating data from all shards, which adds latency. Sharding is the right choice when you have millions of active players submitting scores concurrently.
+
+### Variant 4: Hybrid Leaderboard (Redis + Database)
+
+For systems that need both real-time performance and historical accuracy, a hybrid approach combines Redis for the live leaderboard with a relational database for persistent storage and complex queries.
+
+In this variant, the write path updates both Redis and the database. The read path serves from Redis for the live leaderboard and falls back to the database for historical queries. The database also supports analytical queries that Redis cannot, such as "average score per player over the last 30 days" or "score distribution by geographic region."
+
+---
+
+## Mental Model Check
+
+Test your understanding of the leaderboard pattern with these five questions.
+
+### Question 1
+
+A gaming platform has 10 million players. The leaderboard uses a single PostgreSQL table with an index on `score DESC`. The top-100 query takes 50ms, but the rank query for a player ranked 3 millionth takes 1.2 seconds. What is the root cause?
+
+<details>
+<summary>Answer</summary>
+
+The root cause is that the rank query `SELECT COUNT(*) FROM scores WHERE score > X` requires a full index scan of all rows with a higher score. For a player ranked 3 millionth, this means scanning 3 million index entries. Even with a B-tree index, counting 3 million entries takes significant time.
+
+The fix is to use a Redis sorted set, which provides O(log N) rank queries. The `ZREVRANK` command traverses the skip list and returns the rank in microseconds regardless of the player's position.
+
+</details>
+
+### Question 2
+
+You are designing a leaderboard for a daily puzzle game. Players can submit one score per day. The game has 50,000 daily active users. Should you use Redis sorted sets or a relational database?
+
+<details>
+<summary>Answer</summary>
+
+At 50,000 daily active users, a relational database with an index on `score DESC` would work fine. The top-100 query would scan the index and return in under 10ms. The rank query for any player would scan at most 50,000 entries, which is acceptable.
+
+However, using Redis sorted sets is still the better choice because:
+- The implementation is simpler (one `ZADD`, one `ZREVRANK`, one `ZREVRANGE`)
+- The read latency is consistently under 1ms
+- It naturally handles the daily reset with TTL
+- It scales to 500,000 users without architecture changes
+
+Use the database as the source of truth for historical scores and Redis as the live leaderboard.
+
+</details>
+
+### Question 3
+
+A leaderboard shows incorrect ranks during peak hours. Some players see rank 5 when they should be rank 3. The leaderboard uses eventual consistency with a 2-second staleness window. What is happening?
+
+<details>
+<summary>Answer</summary>
+
+The staleness window is too wide for the score update frequency. During peak hours, multiple players are posting scores within the same 2-second window. A read that hits a replica that has not yet received the latest writes sees a stale version of the leaderboard.
+
+Solutions:
+1. Reduce the staleness window to 500ms by tuning replication lag.
+2. Pin the leaderboard read to the primary node (strong consistency for the leaderboard).
+3. Use a write-through cache that updates the cached top-N synchronously on every score write.
+4. Accept the staleness and add a "last updated" timestamp to the UI so players know the data may be slightly delayed.
+
+</details>
+
+### Question 4
+
+Your game has a weekly leaderboard. On Monday morning, the leaderboard is empty because the weekly Redis key was deleted. Players who scored on Sunday night see their scores disappear. How do you fix this?
+
+<details>
+<summary>Answer</summary>
+
+The problem is that the weekly window boundary is misaligned with the score submission time. The weekly key changes at midnight Sunday, but scores submitted on Sunday night should still count toward the current week.
+
+Fix: Use a grace period of 24 hours. When the weekly key expires, keep a buffer copy of the previous week's key for 24 hours. The read path checks both the current week key and the previous week key. Any score submitted within the last 24 hours of the previous week is still visible.
+
+Alternatively, use a rolling 7-day window instead of calendar weeks. The key never resets -- it always includes the last 7 days of scores. This eliminates the boundary issue but makes the leaderboard slightly different at the start and end of each calendar week.
+
+</details>
+
+### Question 5
+
+Your leaderboard has 1 million active players. The top 100 players change frequently. The leaderboard cache is invalidated on every score write, which causes 10,000 cache invalidations per second. The cache hit rate is 12 percent. How do you improve this?
+
+<details>
+<summary>Answer</summary>
+
+The cache is thrashing because every score write invalidates the top-100 cache, even when the score is not high enough to enter the top 100. The solution is conditional cache invalidation:
+
+1. Before invalidating the cache, check if the new score is within the top 100 range. You can do this by keeping the current top-100 minimum score in a separate Redis key.
+2. If the new score is below the top-100 minimum, do not invalidate the cache. Only update the sorted set.
+3. If the new score is above the top-100 minimum, invalidate the cache and recompute the top 100.
+4. Cache the top-100 minimum score with a short TTL (1 second) to reduce the check overhead.
+
+This reduces cache invalidations from 10,000 per second to approximately 100 per second, improving the cache hit rate to above 90 percent.
+
+</details>

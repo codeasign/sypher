@@ -1,0 +1,765 @@
+---
+id: slos-architecture
+title: SLOs at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+### At 1,000 Users
+
+The simplest SLO implementation is a single counter. The application records every request and every error in a shared counter, usually a database row. A background job runs once per minute, reads the counters, computes the percentage, and updates a dashboard widget.
+
+```python
+# Naive SLO counter — single database row
+def record_request(success: bool):
+    db.execute("""
+        UPDATE slo_counters
+        SET total = total + 1,
+            success = success + :success,
+            updated_at = NOW()
+        WHERE counter_id = 'api_slo'
+    """, {"success": 1 if success else 0})
+
+def compute_slo():
+    row = db.query_one("""
+        SELECT total, success FROM slo_counters
+        WHERE counter_id = 'api_slo'
+    """)
+    if row.total == 0:
+        return 1.0
+    return row.success / row.total
+```
+
+This approach works for 1,000 users processing 10 requests per second. The database row is updated 10 times per second, which is well within the capacity of any database. The SLO is computed once per minute by a cron job. The dashboard updates with 1-minute latency.
+
+The problems start at higher traffic volumes. The single database row becomes a write hotspot. Every request acquires a row-level lock on the same row. At 100 writes per second, the database handles the load. At 1,000 writes per second, the row-level lock creates contention. At 10,000 writes per second, the database spends more time managing locks than processing data.
+
+The single counter also has no windowing. It can only track total requests from the start of the system. To compute a 30-day rolling window, the system would need to store historical data separately. The single counter is a dead end for any serious SLO implementation.
+
+### At 10,000 Users
+
+At 10,000 users processing 100 requests per second, the single counter starts showing contention. The database row-level lock creates a queue of update statements. The average write latency increases from 1ms to 50ms. The application threads block waiting for the database write to complete.
+
+The naive fix is to use a counter in Redis instead of a database row:
+
+```python
+# Redis counter — better but still problematic
+def record_request(success: bool):
+    redis.incr("slo:api:total")
+    if not success:
+        redis.incr("slo:api:bad")
+
+def compute_slo():
+    total = int(redis.get("slo:api:total") or 0)
+    bad = int(redis.get("slo:api:bad") or 0)
+    if total == 0:
+        return 1.0
+    return (total - bad) / total
+```
+
+Redis handles 100 writes per second easily. The INCR command is lock-free and runs in under 100 microseconds. This scales to about 10,000 requests per second before the single Redis instance becomes a bottleneck.
+
+The real problem with this approach is that Redis counters are ephemeral. If the Redis instance restarts, all counter data is lost. The SLO computation starts from zero. The 30-day window is gone. The error budget resets. This makes the SLO unreliable for long-term tracking.
+
+Another problem is the lack of windowing. The Redis counters track the total from the start of the system. To compute a rolling 30-day window, the system needs to store daily snapshots and subtract the data outside the window. This adds complexity that the naive approach does not handle.
+
+### At 100,000 Users
+
+At 100,000 users processing 1,000 requests per second, the single counter approach breaks. The database row experiences 1,000 writes per second, each holding a row-level lock for 1-5 milliseconds. The lock contention means concurrent requests spend most of their time waiting for the lock.
+
+The naive fix is to use a counter in Redis instead of a database row:
+
+```python
+# Redis counter — better but still problematic
+def record_request(success: bool):
+    redis.incr("slo:api:total")
+    if not success:
+        redis.incr("slo:api:bad")
+
+def compute_slo():
+    total = int(redis.get("slo:api:total") or 0)
+    bad = int(redis.get("slo:api:bad") or 0)
+    if total == 0:
+        return 1.0
+    return (total - bad) / total
+```
+
+Redis handles 1,000 writes per second easily. The INCR command is lock-free and runs in under 100 microseconds. This scales to about 10,000 requests per second before the single Redis instance becomes a bottleneck.
+
+The real problem with this approach is that Redis counters are ephemeral. If the Redis instance restarts, all counter data is lost. The SLO computation starts from zero. The 30-day window is gone. The error budget resets. This makes the SLO unreliable for long-term tracking.
+
+<AsciiDiagram id="slos/architecture-scaling-naive" title="Naive SLO implementation scaling from 1K to 10M users showing break points" alt="Diagram showing three panels: 1K users with DB counter, 10K users with Redis counter, and 10M users showing all the failure modes"
+caption="Naive SLO implementation scaling limits" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 Naive SLO Implementation Scaling Limits                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1,000 Users                         10,000 Users                           │
+│  10 req/sec                          100 req/sec                            │
+│  ┌────────────────────────┐          ┌────────────────────────┐             │
+│  │ [App] ──> UPDATE slo   │          │ [App] ──> Redis INCR   │             │
+│  │         counter SET    │          │         total, bad     │             │
+│  │         total=total+1  │          │                        │             │
+│  │         ((SQL DB))     │          │ {Redis}                │             │
+│  │                        │          │                        │             │
+│  │ Works: 10 writes/sec  │          │ Works: 100 writes/sec  │             │
+│  │ Fails: no windowing   │          │ Fails: ephemeral,      │             │
+│  │        no histograms  │          │ no windowing           │             │
+│  └────────────────────────┘          └────────────────────────┘             │
+│                                                                              │
+│  100,000 Users                       10,000,000 Users                       │
+│  1,000 req/sec                       50,000 req/sec                         │
+│  ┌────────────────────────┐          ┌────────────────────────┐             │
+│  │ [App 1] ──> Redis      │          │ [100 Instances]         │             │
+│  │ [App 2] ──> INCR same  │          │  ──> INCR same key     │             │
+│  │ [App 3] ──> key        │          │  ──> 50K writes/sec    │             │
+│  │                        │          │  ──> Redis bottleneck  │             │
+│  │ CONTENTION: 1,000      │          │  ──> Data loss on      │             │
+│  │ writes/sec on same     │          │  restart               │             │
+│  │ Redis key              │          │  ──> No histogram      │             │
+│  └────────────────────────┘          └────────────────────────┘             │
+│                                                                              │
+│  Conclusion: The naive approach breaks at every scaling level.              │
+│  A distributed pipeline is required for any production service.             │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### At 10 Million Users
+
+At 10 million users processing 10,000 requests per second, the simple counter approach fails on multiple fronts:
+
+1. **Write throughput:** A single Redis instance cannot handle 10,000 INCR commands per second without service degradation. Redis can handle 100,000 operations per second for simple GET/SET, but INCR on a single key creates contention.
+
+2. **Data loss:** If Redis restarts, 30 days of SLO data is lost. No persistent storage means no reliable long-term SLO tracking.
+
+3. **No windowing:** The naive approach tracks only the current counter value. It cannot compute a rolling 30-day window without additional infrastructure.
+
+4. **No histograms:** Latency SLOs require histogram data, not just counters. Storing histograms in Redis requires more complex data structures.
+
+5. **No multi-service aggregation:** If the service runs on 100 instances, each instance writes to the same Redis key. The INCR command is atomic, so the aggregate is correct, but the network round trips from 100 instances to a single Redis instance create a fan-in problem.
+
+## Production-Grade Architecture
+
+A production-grade SLO system uses a distributed pipeline with multiple stages. Each stage handles a different concern: instrumentation, local aggregation, global aggregation, persistent storage, evaluation, and alerting.
+
+<AsciiDiagram id="slos/architecture-production" title="Production-grade SLO system architecture showing the distributed pipeline" alt="Architecture diagram showing the full SLO pipeline from service instances through local aggregators, global aggregators, time-series database, evaluator cluster, and alert manager"
+caption="Production SLO system: distributed pipeline from instrumentation to alerting" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      Production SLO Pipeline                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Service Tier (100 instances)                                               │
+│  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐                         │
+│  │ Inst │  │ Inst │  │ Inst │  │ Inst │  │ Inst │                         │
+│  │  A1  │  │  A2  │  │  A3  │  │  A4  │  │  A5  │   ... 100 instances    │
+│  └──┬───┘  └──┬───┘  └──┬───┘  └──┬───┘  └──┬───┘                         │
+│     │         │         │         │         │                              │
+│     │  metric  │         │         │         │                              │
+│     │  events  │         │         │         │                              │
+│     ▼         ▼         ▼         ▼         ▼                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │              Local Aggregation Tier (10 instances)                    │   │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐      │   │
+│  │  │ Aggregator │  │ Aggregator │  │ Aggregator │  │ Aggregator │      │   │
+│  │  │  G1        │  │  G2        │  │  G3        │  │  G4        │      │   │
+│  │  │ 1-min      │  │ 1-min      │  │ 1-min      │  │ 1-min      │      │   │
+│  │  │ windows    │  │ windows    │  │ windows    │  │ windows    │      │   │
+│  │  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘      │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│           │               │               │               │                │
+│           │    merged minute entries via Kafka topic "slo-windows"          │
+│           ▼               ▼               ▼               ▼                │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │              Global Aggregation Tier (3 instances)                    │   │
+│  │  ┌───────────────────────────────────────────┐                       │   │
+│  │  │ Global Aggregator                          │                       │   │
+│  │  │ Merges per-minute windows from all local   │                       │   │
+│  │  │ aggregators into a single global window    │                       │   │
+│  │  │ Deduplicates by (instance_id, timestamp)   │                       │   │
+│  │  │ Outputs: merged 1-minute windows            │                       │   │
+│  │  └───────────────────┬───────────────────────┘                       │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                          │                                                   │
+│                          ▼                                                   │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │              Storage Tier                                              │   │
+│  │  ┌──────────────────┐    ┌──────────────────┐                         │   │
+│  │  │ ((Time-Series DB))    │ {Object Store}    │                         │   │
+│  │  │ 1-min windows      │    │ Hourly snapshots │                         │   │
+│  │  │ 30-day retention   │    │ 90-day archive   │                         │   │
+│  │  └──────────────────┘    └──────────────────┘                         │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                          │                                                   │
+│                          ▼                                                   │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │              Evaluation Tier (3 instances, active-active)              │   │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐                       │   │
+│  │  │ Evaluator  │  │ Evaluator  │  │ Evaluator  │                       │   │
+│  │  │ 1          │  │ 2          │  │ 3          │                       │   │
+│  │  │ Shard A-F  │  │ Shard G-L  │  │ Shard M-Z  │                       │   │
+│  │  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘                       │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│           │               │               │                                │
+│           ▼               ▼               ▼                                │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │              Alerting Tier                                             │   │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐                       │   │
+│  │  │ [Alert     │  │ [Dashboard │  │ [Incident  │                       │   │
+│  │  │  Manager]  │  │  Service]  │  │  Tracker]  │                       │   │
+│  │  └────────────┘  └────────────┘  └────────────┘                       │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Service Tier
+
+Each service instance runs an instrumentation library that emits metric events. The library is configured with the service name, the SLO definitions, and the address of the local aggregation tier.
+
+The instrumentation library uses UDP to emit events. UDP is connectionless, so a failure in the aggregation tier does not block the service. If the aggregator is down, the events are lost, but the service continues processing requests. This is the correct trade-off — SLO metrics are important, but not important enough to block user requests.
+
+Each event contains the service name, the endpoint, the latency in milliseconds, the status code, the timestamp, and the instance ID. The event is approximately 100 bytes. At 10,000 requests per second, the instrumentation layer emits 1 megabyte per second in metric events.
+
+### Local Aggregation Tier
+
+The local aggregation tier runs on separate instances within the same region. Each local aggregator receives metric events from a subset of service instances. The aggregator groups events into 1-minute windows and computes the total and bad counts for each window.
+
+The local aggregator also maintains a latency histogram for each SLO. The histogram is updated for every request and is a convergent data structure that can be merged with histograms from other aggregators.
+
+Every 60 seconds, the local aggregator emits a window entry to Kafka. The window entry contains the timestamp, the service name, the SLO name, the total count, the bad count, the latency histogram, and the aggregator ID. The entry is approximately 200 bytes.
+
+### Global Aggregation Tier
+
+The global aggregation tier consumes the Kafka topic and merges window entries from all local aggregators. For each (service, SLO, timestamp) tuple, the global aggregator sums the total and bad counts and merges the histograms.
+
+The global aggregator also handles deduplication. If a service instance sends events to two local aggregators (due to a configuration error), the global aggregator detects the duplicate by checking the instance ID in each window entry. Duplicates are discarded.
+
+The global aggregator writes the merged window entry to the time-series database. The database stores the entry with a composite key of (service, SLO, timestamp). The entry is immutable — once written, it is never updated.
+
+### Storage Tier
+
+The time-series database stores 1-minute window entries with a 30-day retention period. Entries older than 30 days are moved to an object store for archival and compliance reporting.
+
+The database supports range queries over timestamps. The evaluator reads the last 30 days of entries by querying for all entries with timestamp greater than (NOW - 30 days). The database returns entries sorted by timestamp, which the evaluator replays through the sliding window.
+
+The database also supports point lookups by key. The evaluator reads the latest entry for each SLO every minute. The point lookup is an O(1) operation that returns the entry in 1-5 milliseconds.
+
+### Evaluation Tier
+
+The evaluation tier runs three evaluator instances in an active-active configuration. Each evaluator is responsible for a shard of SLOs. Sharding is by SLO name hash — SLO names starting with A-F go to evaluator 1, G-L to evaluator 2, and M-Z to evaluator 3.
+
+Each evaluator maintains a sliding window for each SLO in its shard. The evaluator reads new window entries from the database every minute, advances the sliding windows, computes burn rates, and generates alerts.
+
+The evaluator writes hourly snapshots of the sliding windows to the object store. On restart, the evaluator reads the latest snapshot and replays only the minutes since the snapshot.
+
+### Alerting Tier
+
+The alerting tier receives alerts from the evaluation tier and routes them to the appropriate notification channels. The alert manager groups related alerts, applies hysteresis, and sends notifications through PagerDuty, email, or the incident tracking system.
+
+The alert manager also maintains an alert state. If an alert has been firing for more than 30 minutes, the alert manager escalates to the next tier of on-call engineers. If an alert has been firing for more than 60 minutes, the alert manager notifies the engineering manager.
+
+## Integration Patterns
+
+### Pattern 1: Direct Database
+
+The simplest integration pattern writes each request outcome directly to a database counter. This pattern works for low-traffic services (under 100 requests per second) where the database write overhead is negligible.
+
+The advantage is simplicity. The code change is minimal — add a database write after the response is sent. The database is already part of the infrastructure, so no new components are needed.
+
+The disadvantage is write amplification. For every user request, the service makes an additional database write. At 1,000 requests per second, this doubles the database write load. The database must be scaled to handle the extra writes.
+
+```python
+# Direct database integration
+@app.middleware("http")
+async def slo_middleware(request: Request, call_next):
+    start = time.time()
+    try:
+        response = await call_next(request)
+        latency = (time.time() - start) * 1000
+        success = 200 <= response.status_code < 500
+        await db.execute(
+            "INSERT INTO slo_events (service, endpoint, latency, success, ts) "
+            "VALUES ($1, $2, $3, $4, NOW())",
+            "api", request.url.path, latency, success
+        )
+        return response
+    except Exception:
+        await db.execute(
+            "INSERT INTO slo_events (service, endpoint, latency, success, ts) "
+            "VALUES ($1, $2, $3, $4, NOW())",
+            "api", request.url.path, 9999, False
+        )
+        raise
+```
+
+### Pattern 2: Local Buffer with Periodic Flush
+
+The local buffer pattern writes metric events to an in-memory buffer and flushes the buffer periodically. This reduces the write overhead from O(requests) to O(windows).
+
+The buffer is a list of metric events stored in memory. When the buffer reaches 10,000 events or 10 seconds have elapsed, the buffer is serialized and sent to the aggregation layer in a single batch request.
+
+The batch request is sent via HTTP POST to the local aggregator. The aggregator acknowledges the batch and the buffer is cleared. If the aggregator is unreachable, the buffer continues to accumulate. When the buffer reaches 20,000 events, the oldest events are dropped.
+
+```python
+# Local buffer with periodic flush
+class SloBuffer:
+    def __init__(self, aggregator_url: str):
+        self.buffer = []
+        self.aggregator_url = aggregator_url
+        self.lock = threading.Lock()
+        self.last_flush = time.time()
+
+    def record(self, event: dict):
+        with self.lock:
+            self.buffer.append(event)
+            if len(self.buffer) >= 10000 or time.time() - self.last_flush >= 10:
+                batch = self.buffer.copy()
+                self.buffer.clear()
+                self.last_flush = time.time()
+                threading.Thread(target=self._flush, args=(batch,)).start()
+
+    def _flush(self, batch: list):
+        try:
+            requests.post(
+                f"{self.aggregator_url}/api/v1/metrics",
+                json={"events": batch},
+                timeout=2
+            )
+        except requests.RequestException:
+            # Log the failure but do not retry — the next flush will include
+            # new events. Old events are lost, which is acceptable.
+            logging.warning("Failed to flush %d metric events", len(batch))
+```
+
+### Pattern 3: Message Queue
+
+The message queue pattern uses a message queue (Kafka, RabbitMQ, or Amazon SQS) as the transport between the instrumentation layer and the aggregation layer. Each service instance publishes metric events to a topic.
+
+The message queue provides durability — if the aggregation layer is down, the events remain in the queue and are processed when the aggregator recovers. This eliminates data loss during aggregation outages.
+
+The disadvantage is operational complexity. The message queue must be provisioned, monitored, and scaled. The queue adds latency to the metric pipeline — events may sit in the queue for seconds or minutes before being processed.
+
+```python
+# Message queue integration
+class SloProducer:
+    def __init__(self, kafka_brokers: list):
+        self.producer = KafkaProducer(
+            bootstrap_servers=kafka_brokers,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            acks=1,  # Leader acknowledgment only — faster than all
+            compression_type="gzip",
+        )
+        self.topic = "slo-metrics"
+
+    def record(self, service: str, endpoint: str, latency: float, success: bool):
+        self.producer.send(self.topic, {
+            "service": service,
+            "endpoint": endpoint,
+            "latency": latency,
+            "success": success,
+            "ts": time.time(),
+            "instance": socket.gethostname(),
+        })
+```
+
+### Pattern 4: Sidecar Agent
+
+The sidecar agent pattern runs a separate process on the same host as the service. The sidecar receives metric events from the service via localhost and handles the buffering, batching, and flushing logic.
+
+The sidecar pattern decouples the instrumentation logic from the service code. The service sends events to the sidecar via a Unix socket or localhost HTTP, and the sidecar handles the rest. The sidecar can be updated independently of the service.
+
+The sidecar also handles retries and backpressure. If the aggregation layer is unreachable, the sidecar retries with exponential backoff. If the sidecar's buffer is full, it applies backpressure to the service by blocking the event reception.
+
+<AsciiDiagram id="slos/architecture-integration" title="Four SLO integration patterns showing direct DB, local buffer, message queue, and sidecar agent" alt="Four panels showing different integration patterns for SLO instrumentation with their pros and cons"
+caption="SLO integration patterns comparison" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     SLO Integration Patterns                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Pattern 1: Direct Database              Pattern 2: Local Buffer            │
+│  ┌──────────┐         ┌──────────┐      ┌──────────┐    ┌──────────┐       │
+│  │  Service  │ ──write─>│ ((DB))   │      │  Service  │──>│ {Buffer}  │       │
+│  │           │         │          │      │           │   │ 10K evts │       │
+│  └──────────┘         └──────────┘      └──────────┘   └────┬─────┘       │
+│  Pros: Simple, no new infra              │ flush every 10s  │             │
+│  Cons: Write amplification               │                  │             │
+│                                          ▼                  ▼             │
+│                                       ┌──────────┐    ┌──────────┐        │
+│                                       │ [Local   │    │ Aggreg.  │        │
+│                                       │  Buffer] │    │          │        │
+│                                       └──────────┘    └──────────┘        │
+│                                                                              │
+│  Pattern 3: Message Queue              Pattern 4: Sidecar Agent             │
+│  ┌──────────┐    ┌──────────┐         ┌──────────┐    ┌──────────┐         │
+│  │  Service  │───>│ <Kafka>   │         │  Service  │───>│ [Sidecar] │         │
+│  │           │    │  Topic   │         │  (Unix    │    │  Buffer   │         │
+│  └──────────┘    └────┬─────┘         │   socket) │    │  Retry    │         │
+│                       │               └──────────┘    └────┬─────┘         │
+│                       ▼                                    │               │
+│                  ┌──────────┐                              ▼               │
+│                  │ [Consumer]│                        ┌──────────┐         │
+│                  │  Group   │                         │ <Kafka>   │         │
+│                  └──────────┘                         │  or HTTP │         │
+│                                                       └──────────┘         │
+│  Pros: Durable, no data loss          Pros: Decoupled, independent updates │
+│  Cons: Operational overhead            Cons: Extra resource per host       │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## SLO Pipeline Resilience
+
+<AsciiDiagram id="slos/architecture-resilience" title="SLO pipeline resilience showing redundancy at every layer and graceful degradation" alt="Diagram showing the five layers of the SLO pipeline with redundant components at each layer and arrows showing failover paths"
+caption="SLO pipeline resilience: redundancy and failover at every layer" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  SLO Pipeline Resilience                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Service Layer     [Inst A1]  [Inst A2]  [Inst A3]  ... 100 instances      │
+│  Redundancy: Load balancer, auto-scaling group                              │
+│  Failure: Buffer events locally, drop oldest if full                        │
+│       │                                                                     │
+│       ▼                                                                     │
+│  Aggregation Layer  [Agg G1]  [Agg G2]  (active-active)                    │
+│  Redundancy: 2+ instances per region                                       │
+│  Failure: Fall back to local file write                                    │
+│       │                                                                     │
+│       ▼                                                                     │
+│  Message Layer     <Kafka Topic "slo-metrics">  (3 replicas)               │
+│  Redundancy: 3 brokers, replication factor 3                               │
+│  Failure: Buffered at producer if broker unavailable                        │
+│       │                                                                     │
+│       ▼                                                                     │
+│  Storage Layer     ((TSDB Primary)) ──> ((TSDB Replica 1))                 │
+│                                       ──> ((TSDB Replica 2))               │
+│  Redundancy: Primary + 2 replicas in different AZs                         │
+│  Failure: Automatic failover to replica within 30 seconds                  │
+│       │                                                                     │
+│       ▼                                                                     │
+│  Evaluation Layer  [Eval 1]  [Eval 2]  [Eval 3]  (active-active sharding) │
+│  Redundancy: 3 instances, automatic shard reassignment                     │
+│  Failure: Lease-based shard reassignment within 30 seconds                 │
+│       │                                                                     │
+│       ▼                                                                     │
+│  Alerting Layer    [Alert Manager]  (primary + standby)                    │
+│                                                                              │
+│  Principle: No single component failure stops SLO evaluation               │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Redundancy at Every Layer
+
+A production SLO system must be resilient to failures at every layer. The principle is: no single component failure should cause the SLO system to lose data or stop generating alerts.
+
+**Redundant service instances:** Each service runs multiple instances behind a load balancer. If one instance crashes, the remaining instances continue emitting metric events. The SLO pipeline does not depend on any single instance being alive.
+
+**Redundant local aggregators:** Each region runs at least two local aggregator instances. The service instances send metric events to both aggregators in an active-active configuration. If one aggregator crashes, the other continues processing events.
+
+**Redundant Kafka brokers:** The Kafka topic for metric events is replicated across three brokers. If one broker fails, the remaining brokers serve the topic. The replication factor of 3 ensures durability.
+
+**Redundant evaluators:** The evaluation tier runs three instances in an active-active configuration. Each instance is responsible for a shard of SLOs. If one evaluator crashes, its shard is reassigned to the remaining evaluators within 30 seconds.
+
+**Redundant time-series database:** The time-series database runs with a primary and two replicas in different availability zones. If the primary fails, a replica is promoted within 30 seconds. The evaluator reads from the primary and falls back to replicas if the primary is unavailable.
+
+### Graceful Degradation
+
+When components fail, the SLO system should degrade gracefully rather than failing completely. The degradation modes are:
+
+**Instrumentation failure:** If the instrumentation library cannot reach the local aggregator, it buffers events in memory. If the buffer fills up (more than 10 seconds of data), the oldest events are dropped. The service continues processing requests. The SLO metrics may be incomplete, but the service is not affected.
+
+**Aggregation failure:** If all local aggregators are unreachable, the service instances fall back to writing metric events to a local file. A sidecar process reads the file and sends the data to the global aggregator when connectivity is restored. The SLO evaluation is delayed but not lost.
+
+**Evaluation failure:** If one evaluator crashes, its SLO shard is not evaluated until the evaluator restarts or the shard is reassigned. During the gap, alerts for that shard do not fire. The evaluator should restart within 30 seconds to minimize the gap.
+
+**Storage failure:** If the time-series database is unavailable, the evaluator uses the in-memory sliding window for current data but cannot read historical data for reconstruction. The evaluator continues evaluating current data and generating alerts. Historical SLO queries are unavailable until the database recovers.
+
+### Data Durability
+
+Metric events are the source of truth for SLO computation. Losing events means losing the ability to compute accurate SLOs. The SLO system must ensure data durability through the pipeline.
+
+**At the instrumentation layer:** Events are buffered in memory and flushed to the aggregator every 10 seconds. If the aggregator is unreachable, the buffer retains events for up to 60 seconds. After 60 seconds, the oldest events are dropped. The trade-off is between durability and memory usage.
+
+**At the aggregation layer:** The aggregator acknowledges each batch of events after writing to Kafka. The Kafka topic is configured with a replication factor of 3 and an acknowledgment setting of "all" — the broker does not acknowledge the write until all three replicas have persisted the data.
+
+**At the storage layer:** The time-series database stores each window entry with a write-ahead log (WAL). The WAL ensures that the entry is not lost even if the database crashes before the entry is written to the main storage. The WAL is flushed every 100 milliseconds.
+
+**At the evaluation layer:** The sliding window snapshots are written to an object store every hour. The snapshot includes the full state of the sliding window for all SLOs. If the evaluator crashes, it recovers from the last snapshot and replays any minutes since the snapshot.
+
+### Self-Healing
+
+The SLO system should detect failures and recover automatically. The self-healing mechanisms are:
+
+**Dead instance detection:** If a service instance has not emitted metrics for 5 minutes, the SLO system alerts the operations team. The instance may be crashed or may have stopped emitting metrics. The operations team investigates.
+
+**Aggregator health checks:** The local aggregators run a health check endpoint. If the health check fails, the load balancer removes the aggregator from the pool. The remaining aggregators handle the load.
+
+**Evaluator leader election:** If an evaluator crashes, the remaining evaluators detect the failure through a distributed lease mechanism. The lease grants ownership of the crashed evaluator's SLO shard to a surviving evaluator. The lease is valid for 30 seconds and is renewed every 10 seconds. If the lease expires, the shard is reassigned.
+
+**Database failover:** If the primary time-series database fails, the monitoring system detects the failure and promotes a replica to primary. The promotion happens automatically within 30 seconds. The evaluators detect the promotion through the database connection and switch to the new primary.
+
+## Multi-Region Architecture
+
+A multi-region SLO system must handle the fact that each region operates independently. A global SLO aggregates metrics from all regions. A regional SLO measures only one region. Both are useful for different purposes.
+
+### Regional SLOs
+
+Each region has its own SLO pipeline. Service instances in the region emit events to local aggregators in the same region. The local aggregators merge window entries and write to a regional time-series database. The regional evaluator computes SLO compliance for the region.
+
+Regional SLOs detect region-specific problems. If the us-east-1 region has a network issue, the us-east-1 SLO drops while other regions remain healthy. The regional SLO is the primary signal for regional incident detection.
+
+### Global SLOs
+
+The global SLO aggregates window entries from all regions. Each region's global aggregator writes merged window entries to a cross-region Kafka topic. A global evaluator consumes the topic and computes the global SLO from the aggregate of all regions.
+
+Global SLOs are important for SLA compliance. If a customer's traffic is distributed across regions, the global SLO represents their actual experience. A regional outage in one region degrades the global SLO proportionally to the traffic share of that region.
+
+The global SLO is computed with a delay. Cross-region replication adds 1-5 seconds of latency. This means the global SLO is always slightly behind the regional SLOs. Global alerts are slower to fire than regional alerts.
+
+### Regional Evaluation Strategy
+
+For faster alerting, use regional evaluation for the primary alerting path and global evaluation for compliance reporting. Regional alerts fire within 1 minute of a problem. Global alerts fire within 2 minutes. The compliance report at the end of the month uses global data because it represents the user-facing experience.
+
+<AsciiDiagram id="slos/architecture-multi-region" title="Multi-region SLO architecture showing regional and global SLO pipelines" alt="Architecture diagram showing three regions each with their own SLO pipeline feeding into a global SLO aggregator"
+caption="Multi-region SLO system: regional and global evaluation paths" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      Multi-Region SLO Architecture                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Region: us-east-1             Region: eu-west-1          Region: ap-southeast-1 │
+│  ┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────┐│
+│  │ [Service Instances]  │    │ [Service Instances]  │    │ [Service Inst]   ││
+│  │        │             │    │        │             │    │        │         ││
+│  │ [Local Aggregators]  │    │ [Local Aggregators]  │    │ [Local Agg]     ││
+│  │        │             │    │        │             │    │        │         ││
+│  │ [Regional TSDB]      │    │ [Regional TSDB]      │    │ [Regional TSDB] ││
+│  │        │             │    │        │             │    │        │         ││
+│  │ [Regional Evaluator] │    │ [Regional Evaluator] │    │ [Regional Eval] ││
+│  │        │             │    │        │             │    │        │         ││
+│  │ [Regional Alerts]    │    │ [Regional Alerts]    │    │ [Regional Alert]││
+│  └────────┬─────────────┘    └────────┬─────────────┘    └────────┬─────────┘│
+│           │                          │                          │          │
+│           │   Cross-region Kafka     │                          │          │
+│           └──────────────────────────┼──────────────────────────┘          │
+│                                      ▼                                     │
+│                          ┌──────────────────────┐                           │
+│                          │ [Global Aggregator]  │                           │
+│                          │ Merges all 3 regions │                           │
+│                          └──────────┬───────────┘                           │
+│                                     ▼                                       │
+│                          ┌──────────────────────┐                           │
+│                          │ [Global Evaluator]   │                           │
+│                          │ Computes global SLO  │                           │
+│                          └──────────┬───────────┘                           │
+│                                     ▼                                       │
+│                          ┌──────────────────────┐                           │
+│                          │ [Global Alerts]      │                           │
+│                          │ SLA reporting        │                           │
+│                          └──────────────────────┘                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Capacity Planning
+
+### Estimating the Pipeline
+
+Consider a service with 10 million daily active users (DAU). Each user makes an average of 10 requests per day. The total request volume is 100 million requests per day. The peak traffic is 4 times the average, giving a peak rate of 4,629 requests per second.
+
+**Instrumentation Layer:** Each request generates one metric event of approximately 100 bytes. At peak, the instrumentation layer processes 4,629 events per second. The total metric data is 463 kilobytes per second, or 40 gigabytes per day.
+
+**Local Aggregation Layer:** With 100 service instances, each instance runs a buffer that flushes every 10 seconds. Each flush contains 463 events on average. The flush payload is 46 kilobytes. The local aggregator receives 10 flushes per second from 100 instances — 1,000 HTTP requests per second. Each request contains 463 events.
+
+**Global Aggregation Layer:** The global aggregator receives 1 merged window entry per SLO per minute. With 500 SLOs, this is 500 entries per minute, or 8 entries per second. The global aggregation is not a bottleneck at this scale.
+
+**Storage Layer:** The time-series database stores 500 window entries per minute. Each entry is 200 bytes. The total storage is 100 kilobytes per minute, 144 megabytes per day, 4.3 gigabytes per 30-day retention period. This is negligible storage.
+
+**Evaluation Layer:** Each evaluator reads 500 window entries per minute and updates 500 sliding windows. Each update is O(1). The evaluation workload is well within the capacity of a single evaluator instance. Three evaluator instances provide redundancy and headroom.
+
+### Data Volume at 10M DAU
+
+At 10 million DAU processing 10,000 requests per second, the raw metric data volume is substantial:
+
+- **Per-second event rate:** 10,000 events/second
+- **Per-event size (compressed):** 50 bytes
+- **Per-second data volume:** 500 KB/s
+- **Per-hour data volume:** 1.8 GB
+- **Per-day data volume:** 43.2 GB
+- **Per-30-day data volume:** 1.3 TB
+
+The histogram data adds additional volume. Each latency histogram is approximately 100 bytes. At 10,000 requests per second, the histogram updates are merged into 1-minute windows. The histogram storage is:
+
+- **Per-minute histogram per SLO:** 100 bytes
+- **Per-day histogram per SLO:** 144 KB
+- **Per-30-day histogram per SLO:** 4.3 MB
+- **Per-30-day for 500 SLOs:** 2.15 GB
+
+The time-series database must handle writes of 10,000 data points per second and reads of 43,200 data points per SLO per minute. The write throughput is manageable for a modern time-series database. The read throughput is 500 reads per minute for 500 SLOs, which is approximately 8 reads per second.
+
+### Pipeline Component Sizing
+
+Each component in the SLO pipeline should be sized to handle the estimated load with headroom:
+
+**Service instances:** 100 instances, each with a 10-second buffer and 10,000-event capacity. The buffer uses 500 KB per instance. Total buffer memory: 50 MB.
+
+**Local aggregators:** 10 instances, each handling 1,000 flushes per second from 10 service instances. Each aggregator needs enough memory to hold 500 SLOs * 1 minute of window data = 500 KB per aggregator. CPU requirements are modest — the merging operation is simple summation.
+
+**Kafka topic:** 1 topic with 10 partitions, replication factor 3. Each partition handles 1,000 events per second. The total Kafka throughput is 10,000 events per second, which is well below Kafka's typical limit of 100,000 events per second per partition.
+
+**Time-series database:** 1 primary and 2 replicas. The database stores 500 window entries per minute plus 500 histograms per minute. The write throughput is 1,000 writes per minute. The read throughput is 500 reads per minute. A single database instance handles this easily.
+
+**Evaluator instances:** 3 instances, each handling a shard of approximately 167 SLOs. Each evaluator needs 167 SLOs * 1 MB per SLO = 167 MB of memory for the sliding windows. CPU usage is minimal — the evaluation is O(1) per SLO per minute.
+
+### Scaling Beyond 10M DAU
+
+For services with 100 million DAU or more, the instrumentation layer becomes a bottleneck. Each service instance emits 46,000 events per second at peak. The local buffer fills in 0.2 seconds. The HTTP flush to the local aggregator creates significant load.
+
+The solution at this scale is to use the sidecar pattern with a Unix socket transport and gRPC for the flush. The sidecar batches events more aggressively — every 5 seconds or 50,000 events, whichever comes first. The flush uses gRPC streaming to reduce connection overhead.
+
+The local aggregator is scaled horizontally behind a load balancer. Each sidecar is configured with the load balancer address. The aggregator instances are stateless and can be scaled to handle the load.
+
+The time-series database is the next bottleneck. At 100M DAU, the database stores 500 window entries per minute plus latency histogram data. The histogram data is 1 kilobyte per entry, giving a total of 500 kilobytes per minute, 720 megabytes per day, 21.6 gigabytes per 30-day period. The database handles this easily with proper indexing and partitioning.
+
+<AsciiDiagram id="slos/architecture-capacity" title="Capacity planning data flow for 10M DAU showing component sizing at each stage" alt="Diagram showing the data flow through the SLO pipeline with data volumes and component sizes annotated at each stage"
+caption="Capacity planning: data volumes and component sizing at 10M DAU" content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 Capacity Planning at 10 Million DAU                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Traffic: 50K req/sec peak, 10K req/sec average                            │
+│                                                                              │
+│  Instrumentation Layer                                                      │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 100 instances × 50 KB/s = 5 MB/s total metric events                 │   │
+│  │ Each instance: 10K event buffer, 10s flush interval                  │   │
+│  │ Memory per instance: 10K × 50 bytes = 500 KB                        │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                         │
+│  Local Aggregation Layer                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 10 instances × 500 SLOs × 1KB per SLO = 5 MB per instance           │   │
+│  │ 1,000 flushes/sec per instance = 50 MB/s per instance               │   │
+│  │ Output: 500 merged window entries per minute to Kafka               │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                         │
+│  Kafka Message Layer                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 1 topic, 10 partitions, replication factor 3                        │   │
+│  │ 500 entries/min = 8.3 entries/sec = negligible load                 │   │
+│  │ Retention: 7 days, then archival to object store                    │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                         │
+│  Storage Layer                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ Time-Series DB: 500 entries/min × 200 bytes = 100 KB/min            │   │
+│  │ 30-day retention: 4.3 GB                                             │   │
+│  │ Object Store: 90-day archive: 12.9 GB                               │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                    │                                         │
+│  Evaluation Layer                                                           │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 3 evaluators × 167 SLOs × 1 MB = 167 MB each                       │   │
+│  │ 500 evaluations/min = trivial CPU                                   │   │
+│  │ Snapshot every hour: 500 MB to object store                         │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Total infrastructure: 10 aggregator instances + 3 evaluator instances      │
+│  + 3 Kafka brokers + 1 TSDB cluster = 17 nodes for full SLO pipeline        │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Deployment and Operations
+
+### Canary Deployments
+
+New versions of the SLO evaluator are deployed using a canary strategy. One evaluator instance is updated to the new version while the other two remain on the old version. The canary runs for 30 minutes before the remaining instances are updated.
+
+The canary monitors three metrics during the evaluation period: (1) alert generation rate — the canary should generate approximately the same number of alerts as the control instances, (2) evaluation latency — the canary should not add more than 5ms to the evaluation time, and (3) memory usage — the canary should not leak memory.
+
+If any of these metrics deviate by more than 10% from the control, the canary is rolled back and the deployment is investigated.
+
+### Backup and Restore
+
+The sliding window snapshots are the primary backup mechanism. Snapshots are written to the object store every hour. The snapshots are retained for 90 days to support compliance audits.
+
+The time-series database is backed up daily. The backup includes all window entries for the last 30 days. The backup is stored in the object store and can be used to restore the entire SLO system in case of a catastrophic failure.
+
+The restore procedure: (1) restore the time-series database from the latest backup, (2) restore the sliding window snapshots from the latest hourly snapshot, (3) replay any minutes since the snapshot from the time-series database, and (4) verify that the SLO compliance values match the pre-failure values.
+
+### Runbook for SLO System Incidents
+
+The following runbooks define the response to common SLO system incidents:
+
+**Runbook: Data Staleness Detected**
+- Check the data freshness dashboard. If the age exceeds 2 minutes, investigate the instrumentation layer.
+- Check the service instances for the affected SLO. Are they emitting metrics? Check the instrumentation log for errors.
+- Check the local aggregators. Are they receiving metric events? Check the aggregator health endpoint.
+- Check the Kafka consumer lag for the global aggregation topic. If the lag exceeds 1,000 messages, restart the global aggregator.
+- If all checks pass, the issue may be a network partition. Check the network connectivity between layers.
+
+**Runbook: Evaluator Crash**
+- The shard reassignment should happen automatically within 30 seconds. Monitor the shard reassignment status.
+- If the shard is not reassigned within 60 seconds, manually reassign the shard by restarting one of the surviving evaluators.
+- Check the evaluator logs for the crash reason. Common causes are out-of-memory errors and segmentation faults.
+- If the crash is caused by an out-of-memory error, increase the evaluator's memory allocation and restart.
+
+**Runbook: False Alert Storm**
+- If multiple alerts fire simultaneously for unrelated SLOs, the alerting thresholds may be too sensitive.
+- Check the burn rate for each affected SLO. If the burn rates are significantly different, the alerts may be from different root causes.
+- If the burn rates are similar, there may be a shared infrastructure problem affecting multiple services.
+- If no actual problem is found, the alerting thresholds need to be adjusted. Increase the burn rate threshold or the window size.
+
+**Runbook: SLO System Database Failure**
+- Check the database replication status. If the primary is down, a replica should be promoted automatically.
+- If automatic failover did not trigger, manually promote a replica by updating the database connection configuration.
+- The evaluator should detect the database change through the connection pool and switch to the new primary.
+- During the failover, the evaluator uses the in-memory sliding window for current evaluation. No evaluation is lost.
+- After the failover, verify that metrics are still flowing through the pipeline by checking the data freshness dashboard.
+
+### Daily Operations Checklist
+
+The following checklist should be completed at the start of each on-call shift:
+
+1. Check the SLO dashboard for all critical SLOs. Are any SLOs in violation? Is the budget consumption trending upward?
+2. Check the data freshness dashboard. Is data flowing through the pipeline within 2 minutes?
+3. Check the evaluator health. Are all three evaluators running? Are the shards properly distributed?
+4. Check the alert manager status. Are there any pending alerts? Is the alert queue depth normal?
+5. Check the SLO system's own SLO. Is the SLO system meeting its 99.9% uptime target?
+6. Review any SLO violations from the previous shift. Were they properly documented? Are follow-up actions in progress?
+7. Review the error budget consumption for all services. Are any services approaching the yellow or red zones?
+
+The daily operations checklist ensures that the SLO system is healthy and that the team is aware of the current SLO state. The checklist takes approximately 10 minutes to complete and should be part of every on-call handoff.
+
+### SLO Dashboard Design
+
+The SLO dashboard is the primary operational interface for the SLO system. The dashboard should be designed to provide the most important information at a glance, with drill-down capability for detailed analysis.
+
+The top section of the dashboard shows an aggregate view: the number of services in each budget zone (green, yellow, red). A red indicator should immediately catch the on-call engineer's attention.
+
+The middle section shows per-service error budget remaining as a bar chart. Each bar is colored by zone. The bars are sorted by budget consumption descending. The engineer's eye is drawn to the red bars at the top.
+
+The bottom section shows the burn rate sparklines for the last 6 hours for each SLO. The sparkline shows the burn rate over time, with the alerting thresholds marked as horizontal lines. This allows the engineer to see at a glance whether recent events are approaching or exceeding the thresholds.
+
+The dashboard auto-refreshes every 60 seconds. It is the first thing the on-call engineer opens at the start of their shift and the last thing they close at the end.
+
+### Monitoring the Monitor
+
+The SLO system must be monitored to ensure it is working correctly. The key metrics for the SLO system itself are:
+
+- **Data freshness:** The age of the newest window entry in the database. If the data is more than 2 minutes old, the SLO system is stale.
+- **Event throughput:** The number of metric events received per second. A sudden drop indicates a problem in the instrumentation layer.
+- **Evaluation latency:** The time to evaluate all SLOs. If the latency exceeds 10 seconds, the evaluator cannot keep up with the 1-minute evaluation cadence.
+- **Alert queue depth:** The number of alerts waiting to be delivered. A growing queue indicates a problem in the alert manager.
+
+### Capacity Alerts
+
+The SLO system generates capacity alerts when it approaches resource limits. The thresholds are:
+
+- **CPU usage over 80%** for more than 5 minutes — scale out the local aggregator tier.
+- **Memory usage over 85%** for more than 5 minutes — increase the instance size or reduce retention.
+- **Kafka consumer lag over 10,000 messages** — scale out the global aggregation tier.
+- **Database query latency over 100ms** for more than 5 minutes — optimize queries or scale the database.
+
+The SLO system that measures everything must itself be measured. The reliability of the reliability system is a recursive problem that requires careful attention.
+
+Proceed to the trade-offs section to understand the costs, failure modes, and anti-patterns of SLO systems.

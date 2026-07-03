@@ -1,0 +1,534 @@
+---
+id: url-shortener-pattern-real-world
+title: URL Shortener Pattern in Production
+sidebar_label: Real World
+sidebar_position: 5
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## How Companies Use URL Shorteners at Scale
+
+Five major products demonstrate how the URL shortener pattern adapts to different business requirements. Each company faced the same core problem -- transforming a long URL into a short, opaque identifier -- but made different architectural choices based on their constraints.
+
+The table below summarizes the four case studies before you examine each one in detail:
+
+| Company | Scale | Key Strategy | Database | Cache | Redirect |
+|---------|-------|-------------|----------|-------|----------|
+| Bitly | 10B+ clicks/month | Hash-based with Bloom filter dedup | Cassandra (multiple DCs) | Redis multi-tier | 301 for anonymous, 302 for authenticated |
+| TinyURL | 2B+ redirects/month | Sequential counter with base-62 | MySQL partitioned by code prefix | Memcached cluster | 301 permanent |
+| Google (goo.gl) | 1B+ links created | Snowflake hybrid with DB fallback | Spanner (global, strong consistency) | Global in-memory cache | 302 for analytics |
+| Twitter (t.co) | 500M+ daily redirects | Custom 6-char hash with salt | Manhattan (internal KV store) | Twemcache + local L1 | 302 always |
+
+## Case Study 1: Bitly
+
+Bitly is the most recognizable public URL shortener, processing over 10 billion clicks per month across 15 million active links. Bitly's architecture evolved from a simple LAMP stack to a distributed system spanning multiple data centers with Cassandra as the primary database.
+
+### Architecture Overview
+
+Bitly uses a hash-based key generation strategy. Each long URL is hashed with MurmurHash, and the first 4 bytes of the hash are encoded in base-62 to produce a 7-character short code. If a collision occurs (the code already exists for a different URL), Bitly appends a salt and rehashes up to 5 times before failing.
+
+The deduplication layer uses a Bloom filter to quickly check whether a URL has been shortened before. The Bloom filter supports 100 million entries with a 1 percent false positive rate, consuming approximately 120 MB of memory. Bloom filter lookups take under 1 microsecond, avoiding a database query for URLs that have already been shortened.
+
+Bitly's database is Cassandra, chosen for its multi-data-center replication, high write throughput, and no single point of failure. The URL mappings table uses the short code as the partition key:
+
+```sql
+CREATE TABLE bitly.mappings (
+    short_code text PRIMARY KEY,
+    long_url text,
+    created_at timestamp,
+    expires_at timestamp,
+    owner_id uuid,
+    is_custom boolean,
+    metadata map<text, text>
+) WITH compaction = { 'class': 'LeveledCompactionStrategy' };
+```
+
+The redirect path uses Redis as a cache with a write-through pattern. Bitly operates two cache tiers:
+
+1. **L1: Application-local LRU cache** on each application server, holding 10,000 entries with a 1-minute TTL. This handles 60 percent of read requests with zero network round-trips.
+
+2. **L2: Redis cluster** with 8 primary nodes and 8 replica nodes, holding 50 million entries with a 24-hour TTL. This handles 35 percent of read requests.
+
+The remaining 5 percent of requests hit Cassandra directly. The P99 latency targets are 5ms for cache hits and 15ms for database queries.
+
+<AsciiDiagram
+  id="url-shortener-pattern/realworld-bitly"
+  title="Bitly Production Architecture"
+  alt="Bitly's multi-tier architecture showing MurmurHash key generation, Bloom filter deduplication, Cassandra storage, Redis cache, and analytics pipeline"
+  caption="Bitly uses a three-tier cache hierarchy and Cassandra for multi-data-center writes"
+  content={`
+                     ┌─────────────────────────┐
+                     │  POST /v3/shorten        │
+                     │  { long_url }            │
+                     └───────────┬─────────────┘
+                                 │
+                     ┌───────────▼─────────────┐
+                     │  1. Normalize URL        │
+                     │  2. Check Bloom filter   │
+                     │     (120 MB, 1% fp rate) │
+                     │  3. MurmurHash + base62  │
+                     │  4. Collision check      │
+                     │  5. Collision retry      │
+                     │     (max 5 attempts)     │
+                     └───────────┬─────────────┘
+                                 │
+                     ┌───────────▼─────────────┐
+                     │  Cassandra cluster       │
+                     │  3 DCs, RF=3             │
+                     │  ┌──────────────────┐   │
+                     │  │ URL mappings     │   │
+                     │  │ short_code=PK    │   │
+                     │  │ long_url         │   │
+                     │  │ metadata (map)   │   │
+                     │  └──────────────────┘   │
+                     └───────────┬─────────────┘
+                                 │
+                     ┌───────────▼─────────────┐
+                     │  Redis Cache Cluster     │
+                     │  8 primary, 8 replica    │
+                     │  24h TTL, LRU eviction   │
+                     │  50M entries, 95% hit    │
+                     │                          │
+                     │  ┌─────────────────────┐ │
+                     │  │ L1: App local cache │ │
+                     │  │ 10K entries         │ │
+                     │  │ 1 min TTL           │ │
+                     │  └─────────────────────┘ │
+                     └───────────┬─────────────┘
+                                 │
+                     ┌───────────▼─────────────┐
+                     │  Analytics Pipeline      │
+                     │  Click events to Kafka   │
+                     │  to Stream processor      │
+                     │  to TimescaleDB           │
+                     │  to Dashboard (5s delay)  │
+                     └──────────────────────────┘
+`} />
+
+### Key Design Decisions
+
+Bitly made three notable design decisions that differ from the standard playbook:
+
+**Decision 1: MurmurHash over MD5**. Bitly chose MurmurHash because it is non-cryptographic and 10x faster than MD5 for short URL inputs. A 200-byte URL hashes in approximately 200 nanoseconds with MurmurHash versus 2 microseconds with MD5. At 10 million creates per day, this saves 18 CPU-seconds per day on hashing alone.
+
+**Decision 2: Cassandra over MySQL**. Bitly started with MySQL but migrated to Cassandra when write throughput exceeded a single primary's capacity. Cassandra's multi-data-center replication eliminated the need for manual failover procedures. The trade-off is that Cassandra does not support SQL joins or transactions across partitions, but Bitly's access pattern (single-key lookups by short code) maps perfectly to Cassandra's strengths.
+
+**Decision 3: 301 for anonymous users, 302 for authenticated users**. Bitly serves 301 redirects to unauthenticated (anonymous) visitors. Browsers cache the redirect, reducing origin traffic by 70 percent. For authenticated users who have a Bitly account and expect accurate click counts, Bitly uses 302 redirects. The authentication state is detected via a cookie that is set when the user logs in. This hybrid approach balances infrastructure cost with accuracy requirements.
+
+### Lessons Learned
+
+Bitly's engineering team has published three key lessons from operating at scale:
+
+First, **the Bloom filter must be periodically rebuilt**. As the dataset grows, the false positive rate increases. Bitly rebuilds the Bloom filter weekly from a full Cassandra scan, taking approximately 4 hours. During the rebuild, the old Bloom filter remains in service. The new filter is swapped in atomically.
+
+Second, **Cassandra tombstone accumulation causes read latency spikes**. When links are deleted, Cassandra creates tombstones that must be skipped during reads. If millions of links are deleted in a short period (for example, a bulk expiration of 30-day links), Cassandra reads slow down by 2-3x while scanning tombstones. Bitly mitigated this by using TTL-based expiration at the Cassandra level instead of application-level deletes.
+
+Third, **rate limiting must account for API clients, not just humans**. Bitly's early rate limiting assumed 100 requests per minute per user. Marketing automation platforms sent 10,000 requests per minute in bursts, triggering false rate-limiting. Bitly moved to a token bucket algorithm with burst capacity: 100 requests per minute sustained, with a burst capacity of 500 requests.
+
+## Case Study 2: TinyURL
+
+TinyURL is one of the oldest URL shorteners, launched in 2002. Unlike Bitly's feature-rich platform, TinyURL maintains a deliberately simple architecture. It supports basic shortening and redirects without analytics, custom slugs, or API access tiers. This simplicity lets TinyURL operate with a fraction of Bitly's infrastructure.
+
+### Architecture Overview
+
+TinyURL uses a sequential counter for key generation. A MySQL auto-increment column provides the next ID. The ID is encoded in base-62 to produce a short code. The sequential approach means:
+
+- Codes are monotonically increasing (code 1 is `1`, code 62 is `10`, code 3844 is `100`).
+- Early adopters get shorter URLs. The first 62 users get 1-character codes.
+- Collision handling is unnecessary because the counter guarantees uniqueness.
+
+This simplicity means TinyURL's key generation is a single SQL statement:
+
+```sql
+INSERT INTO url_mappings (long_url, created_at)
+VALUES ('https://example.com/page', NOW());
+-- MySQL generates the auto-increment id
+-- Application encodes the id in base-62
+```
+
+The redirect path is equally simple. A GET request for a short code decodes the base-62 string back to the integer ID and performs a primary key lookup on the MySQL table:
+
+```sql
+SELECT long_url FROM url_mappings WHERE id = :decoded_id LIMIT 1;
+```
+
+TinyURL uses Memcached instead of Redis for caching. The cache key is the decoded integer ID, not the short code string. This reduces cache key size from 14 bytes (`short:aB3xK9`) to 6 bytes (the integer ID as a string).
+
+### Why Memcached over Redis
+
+TinyURL's architecture team chose Memcached for two reasons. First, TinyURL does not need Redis's data structures. The cache is purely a key-value store with no need for sorted sets, lists, or hash operations. Memcached is simpler and uses less memory per entry (approximately 40 bytes overhead versus 130 bytes for Redis).
+
+Second, TinyURL does not need Redis persistence. If the cache is lost, the MySQL database serves as the authoritative source. There is no data in the cache that is not in the database. TinyURL accepts a 10-minute cache warming window after a cluster restart.
+
+The trade-off is that Memcached lacks Redis's cluster management features (automatic failover, replication, resharding). TinyURL manages cache cluster topology manually, which is acceptable for their engineering team size.
+
+<AsciiDiagram
+  id="url-shortener-pattern/realworld-tinyurl"
+  title="TinyURL Simplified Architecture"
+  alt="Clean architecture diagram showing TinyURL's sequential counter, MySQL database, Memcached cache, and redirect flow"
+  caption="TinyURL's architecture is intentionally simple: sequential IDs, MySQL, and Memcached"
+  content={`
+  ┌────────────────────────────────────────────────────────────┐
+  │  TinyURL Architecture                                       │
+  │                                                             │
+  │  Create Path:                                               │
+  │  Client to Web Server to MySQL INSERT (auto-inc id)         │
+  │                               │                            │
+  │                               v                            │
+  │                        base62.encode(id)                   │
+  │                               │                            │
+  │                               v                            │
+  │                        Return short URL                    │
+  │                                                             │
+  │  Redirect Path:                                             │
+  │  Client to Web Server to Memcached lookup (id)              │
+  │                               │                            │
+  │                          Hit? - Yes - Return 301            │
+  │                               │                            │
+  │                              No                            │
+  │                               │                            │
+  │                               v                            │
+  │                        MySQL SELECT (PK lookup)            │
+  │                               │                            │
+  │                               v                            │
+  │                        Memcached SET                       │
+  │                        Return 301                          │
+  └────────────────────────────────────────────────────────────┘
+`} />
+
+## Case Study 3: Google goo.gl
+
+Google operated goo.gl from 2009 to 2019 before shutting it down in favor of Firebase Dynamic Links. At its peak, goo.gl had created over 1 billion short URLs and served billions of redirects daily. Google's approach was unique because it treated URL shortening as an infrastructure service rather than a standalone product.
+
+### Architecture Overview
+
+goo.gl used a Snowflake-style ID generator with a database fallback. Each application server generated 64-bit IDs independently using a timestamp, worker ID, and sequence number. If the clock drifted backward, the generator fell back to a Google Spanner sequence counter.
+
+This hybrid approach gave goo.gl the best of both worlds: sub-millisecond ID generation under normal conditions and guaranteed uniqueness during clock disruptions. The Spanner fallback was slower (5-10 milliseconds per ID) but was activated fewer than 100 times across the entire lifetime of the service.
+
+Google used Spanner as the database, which provided global strong consistency with 5-10 millisecond write latency across continents. Spanner's TrueTime API provided globally synchronized clocks, eliminating the clock skew problem that affects standard Snowflake implementations.
+
+### Unique Feature: Link Preview
+
+goo.gl had a unique feature: it showed a preview page before redirecting. When you visited a goo.gl short URL, the service displayed a page showing the destination URL, a safety warning, and a "Proceed to site" button. This preview page was goo.gl's approach to security -- users could verify the destination before clicking.
+
+The preview page introduced an architectural challenge: the service had to fetch the destination URL's title and description before showing the preview. This fetch added 200-500 milliseconds of latency to the first visit. goo.gl cached the preview metadata to avoid repeated fetches.
+
+The preview feature was a double-edged sword. It improved user safety but added complexity and latency. Google ultimately removed the preview page in a later version, switching to direct redirects with a URL safety check performed asynchronously.
+
+### Lessons Learned
+
+Google's postmortem for goo.gl identified three lessons:
+
+First, **URL shorteners are a commodity**. Most users do not care which shortener they use. They pick whichever is most convenient. goo.gl's integration with Google products (Gmail, Blogger, Google+) drove adoption, but standalone URL shortening did not generate enough revenue to justify the infrastructure cost.
+
+Second, **safety scanning at creation time is not enough**. goo.gl scanned URLs at creation time to check for malware. However, legitimate URLs could be compromised after creation. goo.gl added periodic re-scanning of existing URLs, checking the 1 million most-clicked links daily and the remaining links weekly.
+
+Third, **rate limiting must account for automated abuse**. goo.gl faced persistent abuse from spammers who created thousands of short URLs per minute to obfuscate malicious destinations. Google deployed ML-based abuse detection that analyzed patterns: a user creating 100 URLs in 60 seconds to the same domain was likely a spammer. The ML model achieved 99.5 percent precision with 0.1 percent false positive rate.
+
+## Case Study 4: Twitter t.co
+
+Twitter's t.co shortener is unique because it wraps every link shared on the platform, whether the URL is short or long. Even if a user shares a Bitly link, Twitter wraps it in a t.co redirect. This gives Twitter complete control over link safety, click analytics, and spam detection.
+
+### Architecture Overview
+
+t.co uses a custom hash-based key generation with a salt. Each URL is hashed with a 5-byte output (40 bits), producing a 6-character base-62 short code. The 40-bit hash provides 1 trillion possible values, which is sufficient for Twitter's scale.
+
+The salt is a per-user secret derived from the user's account identifier. This means the same URL shared by two different users produces two different t.co short codes. This prevents link analysis: an attacker cannot determine how many times a URL has been shared by comparing short codes.
+
+### Scale and Performance
+
+t.co handles over 500 million redirects per day, with peaks of 20,000 redirects per second during major events (Super Bowl, World Cup, election nights). The P99 redirect latency target is 5 milliseconds. t.co achieves this through aggressive caching and a custom in-memory key-value store called Twemcache.
+
+Twemcache is Twitter's fork of Memcached, optimized for flash storage and multi-threaded operations. t.co runs Twemcache on dedicated cache servers with 64 GB of RAM each, distributed across 6 data centers. Each cache server handles approximately 30,000 requests per second with sub-millisecond P99 latency.
+
+The underlying database is Manhattan, Twitter's internal key-value store built on MySQL. Manhattan provides strong consistency within a data center and eventual consistency across data centers. t.co writes to the local data center's Manhattan cluster and relies on cross-DC replication for global availability.
+
+t.co also uses a local L1 cache on each application server. This L1 cache stores the 100,000 most recently accessed short codes with a 60-second TTL. The L1 cache is implemented as a concurrent LRU map in Java, providing hot-path lookups in under 50 microseconds.
+
+<AsciiDiagram
+  id="url-shortener-pattern/realworld-twitter"
+  title="Twitter t.co Architecture"
+  alt="Twitter's t.co architecture showing the custom hash generation with per-user salt, Twemcache tier, Manhattan KV store, and analytics pipeline"
+  caption="t.co wraps every link shared on Twitter with a per-user salted hash for privacy and security"
+  content={`
+  ┌────────────────────────────────────────────────────────────┐
+  │  t.co Architecture (6 data centers)                        │
+  │                                                            │
+  │  ┌────────────────────────────────────────────────────┐   │
+  │  │  Short Code Generation                              │   │
+  │  │  hash = SHA256(url + user_secret)                   │   │
+  │  │  code = base62(hash[:5])  // 40 bits, 6 chars      │   │
+  │  │  code is unique per user per URL                    │   │
+  │  │  Salt prevents link analysis across users           │   │
+  │  └──────────────────────────┬─────────────────────────┘   │
+  │                             │                              │
+  │  ┌──────────────────────────▼─────────────────────────┐   │
+  │  │  L1 Cache (Application-Local)                       │   │
+  │  │  100K entries, 60s TTL, ConcurrentLRUHashMap       │   │
+  │  │  Lookup: less than 50 microseconds, 60% hit rate   │   │
+  │  └──────────────────────────┬─────────────────────────┘   │
+  │                             │                              │
+  │  ┌──────────────────────────▼─────────────────────────┐   │
+  │  │  L2 Cache (Twemcache Cluster)                       │   │
+  │  │  64 GB RAM per node, 6 DCs, 30K req/s per node     │   │
+  │  │  24h TTL, P99 less than 1ms, 35% hit rate          │   │
+  │  └──────────────────────────┬─────────────────────────┘   │
+  │                             │                              │
+  │  ┌──────────────────────────▼─────────────────────────┐   │
+  │  │  Manhattan KV Store (MySQL-based)                   │   │
+  │  │  Strong consistency within DC                       │   │
+  │  │  Eventual consistency across DCs                    │   │
+  │  │  5% of requests, P99 less than 10ms                │   │
+  │  └────────────────────────────────────────────────────┘   │
+  │                                                            │
+  │  ┌────────────────────────────────────────────────────┐   │
+  │  │  Analytics Pipeline                                 │   │
+  │  │  Every click to EventBus (Kafka) to Heron topology   │   │
+  │  │  to Real-time dashboard (10s delay)                  │   │
+  │  │  to Link safety scanning (async)                     │   │
+  │  └────────────────────────────────────────────────────┘   │
+  └────────────────────────────────────────────────────────────┘
+`} />
+
+### Lessons Learned
+
+t.co's engineering team documented three operational lessons:
+
+First, **the L1 cache is the most important performance optimization**. Before adding the L1 cache, t.co's P99 latency was 12 milliseconds. After adding a 100,000-entry L1 cache, P99 dropped to 4 milliseconds. The L1 cache handles 60 percent of requests with zero network round-trips. The cost is 100 MB of heap memory per server, which is negligible.
+
+Second, **per-user salting complicates deduplication**. Because the same URL produces different codes for different users, t.co cannot easily determine how many times a URL has been shared. This makes it harder to detect spam campaigns that repeatedly share the same URL. Twitter compensates by analyzing click patterns rather than creation patterns.
+
+Third, **CDN caching of 302 redirects is ineffective**. t.co uses 302 redirects exclusively to maintain accurate click analytics. CDN providers cache 302 responses only if explicitly configured, and Twitter chose not to configure it. This means every redirect request reaches the origin infrastructure. t.co's infrastructure is sized for 100 percent origin traffic, unlike services that offload 70-90 percent to CDN caching.
+
+## Open Source Implementations
+
+If you want to run your own URL shortener, several mature open source projects are available.
+
+### Polr
+
+Polr is a PHP-based URL shortener designed for self-hosting. It supports MySQL or PostgreSQL, Redis caching, and a REST API. Polr is suitable for teams that need a simple shortener for internal use or a small public service.
+
+Key specifications:
+- **Database**: MySQL 5.7+ or PostgreSQL 9.6+
+- **Cache**: Redis or Memcached (optional)
+- **Key generation**: Random alphanumeric (crypto-random, 6-12 characters)
+- **Max throughput**: Approximately 1,000 req/s on a single 4-core server
+- **Features**: Custom slugs, link expiration, click analytics, API key management
+- **License**: GNU GPL v2
+
+Polr's codebase is approximately 15,000 lines of PHP. It provides a web UI for managing links and viewing analytics. The project has 4,800 GitHub stars and an active community.
+
+### YOURLS
+
+YOURLS (Your Own URL Shortener) is the most established open source shortener, first released in 2010. It runs on PHP with MySQL and supports plugins for custom functionality.
+
+Key specifications:
+- **Database**: MySQL 5+
+- **Cache**: No built-in caching (relies on MySQL query cache)
+- **Key generation**: Sequential ID in base-62 or custom keyword
+- **Max throughput**: Approximately 500 req/s on a single server
+- **Features**: Plugin architecture (150+ plugins), API, stats, bookmarklet
+- **License**: MIT
+
+YOURLS has 10,000+ GitHub stars and is the most popular self-hosted shortener. Its plugin architecture lets you add features like Google Safe Browsing integration, QR code generation, and Twitter card previews.
+
+### Kutt
+
+Kutt is a modern Node.js URL shortener with a Vue.js frontend. It supports PostgreSQL, Redis, and Docker deployment.
+
+Key specifications:
+- **Database**: PostgreSQL 11+
+- **Cache**: Redis (required)
+- **Key generation**: UUID-based (crypto-random, 7 characters)
+- **Max throughput**: Approximately 2,000 req/s on a single 4-core server
+- **Features**: Custom slugs, link expiration, password-protected links, API, admin panel
+- **License**: MIT
+
+Kutt provides a modern UI with dark mode support. It supports domain whitelisting (only URLs from approved domains can be shortened), which is useful for enterprise deployments.
+
+## Cloud Provider Solutions
+
+Major cloud providers offer managed URL shortener services that eliminate the need to build and operate infrastructure.
+
+### AWS
+
+AWS does not offer a dedicated URL shortener service, but you can build one using managed components:
+
+| Component | AWS Service | Purpose |
+|-----------|-------------|---------|
+| Compute | Lambda + API Gateway | Serverless redirect handler |
+| Database | DynamoDB | Key-value storage for mappings |
+| Cache | DAX (DynamoDB Accelerator) | In-memory cache for hot codes |
+| Analytics | Kinesis + Lambda | Click event processing |
+| CDN | CloudFront | Edge caching for 301 redirects |
+
+A Lambda-based shortener handles approximately 5,000 req/s on a single function with 1 GB memory. Beyond this, you need provisioned concurrency and multiple functions. The cost for a small deployment (1 million redirects/month) is approximately $15/month in Lambda and DynamoDB costs.
+
+### Google Cloud
+
+Google Cloud provides Firebase Dynamic Links, which is a managed URL shortener integrated with Firebase. Dynamic Links survive app installation: if a user clicks a dynamic link and does not have the app installed, the link redirects to the app store and preserves the deep link content after installation.
+
+Firebase Dynamic Links handle up to 10,000 req/s by default, with higher limits available through support. The cost is based on the number of clicks. The first 25,000 clicks per month are free, after which the cost is $0.0006 per click.
+
+### Cloudflare
+
+Cloudflare Workers can implement a URL shortener that runs entirely at the edge. The short code mappings are stored in Cloudflare KV, which provides global read replication with 10-millisecond P99 read latency.
+
+```javascript
+// Cloudflare Worker URL Shortener
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const code = url.pathname.slice(1);
+    if (!code) {
+      return new Response('Shortener running', { status: 200 });
+    }
+    const destination = await env.LINKS.get(code);
+    if (destination) {
+      return Response.redirect(destination, 301);
+    }
+    return new Response('Link not found', { status: 404 });
+  }
+};
+```
+
+A Cloudflare Worker shortener handles up to 10,000 req/s per worker script. The cost is $0.30 per million requests plus KV storage costs of $0.50 per GB per month. This is the cheapest option for small to medium deployments.
+
+## Lessons Learned from Production
+
+Across all four case studies and the open source projects, eight operational lessons emerge that apply to any URL shortener deployment at any scale.
+
+### Lesson 1: The Redirect Path is Your Most Critical SLA
+
+Every case study treats the redirect path as the most critical performance metric. 99 percent of user-facing requests are redirects. If the redirect is slow, every link shared on the platform is slow. If the redirect fails, every link shared on the platform is broken.
+
+Bitly targets 5ms P99 for redirects. Twitter targets 5ms. Google targeted 10ms. These targets drive architecture decisions: aggressive caching, L1 caches, CDN offloading, and async analytics. Never add latency to the redirect path for a feature that could be async.
+
+### Lesson 2: Cache at Every Level
+
+All four production systems use at least two cache tiers. Twitter uses three (L1, L2, CDN). The cache hierarchy transforms a single bottleneck into a distributed system where each tier absorbs a portion of requests.
+
+The cache tier strategy:
+- **L1 (local)**: 50-60 percent hit rate, zero network cost, less than 50 microseconds latency
+- **L2 (Redis/Memcached)**: 30-35 percent hit rate, single network hop, less than 1ms latency
+- **L3 (CDN)**: 0-70 percent hit rate depending on redirect type, zero origin cost, less than 5ms latency (geographic)
+
+Without an L1 cache, the Redis cluster must handle 100 percent of cache lookups. With an L1 cache, Redis handles 40 percent. The database handles 5 percent.
+
+### Lesson 3: Choose Your Consistency Model Explicitly
+
+Bitly chose eventual consistency with Cassandra (eventually consistent reads within 100ms). Twitter chose strong consistency within a data center with Manhattan. Google chose global strong consistency with Spanner. Each choice was explicit and based on business requirements.
+
+Bitly can tolerate stale reads because link destinations rarely change. Twitter requires strong consistency within a DC because a tweet's wrapped link must resolve correctly for all users in the same region. Google required global strong consistency because goo.gl was integrated with products that expected immediate correctness.
+
+Your choice depends on how often link destinations change and how harmful a stale redirect would be.
+
+### Lesson 4: Monitor Cache Hit Rate in Real Time
+
+Cache hit rate is the single most important operational metric. A drop from 95 percent to 85 percent means the database is handling 3x more queries, which may saturate connection pools and degrade latency.
+
+Every case study team monitors cache hit rate on a dedicated dashboard with 10-second refresh intervals. Alerts trigger at 90 percent (warning) and 85 percent (critical). The on-call engineer investigates the cause immediately.
+
+Common causes of cache hit rate drops:
+- Cache cluster node failure (handle with failover)
+- TTL misconfiguration (handle with rollback)
+- Traffic pattern shift (handle with cache warming)
+- Deployment that clears cache (handle with gradual rollout)
+
+### Lesson 5: Plan for Hot Keys Before You Need Them
+
+Every production shortener has experienced a hot key event. A celebrity shares a link. A campaign goes viral. A news story breaks. One short code receives 100x its normal traffic.
+
+The pre-planned mitigations that work in production:
+- Rate-limit per short code at the application level (50,000 req/s max)
+- L1 cache spreads hot key reads across all application servers
+- Redis replicas provide read scaling for hot keys
+- CDN caching bypasses origin for 301 redirects
+
+### Lesson 6: Analytics Data Grows Faster Than Mapping Data
+
+The mapping data (short code to long URL) grows at 3 GB per day for Bitly's scale. The click analytics data grows at 50 GB per day. Analytics storage costs will dominate infrastructure costs within 6 months of launch.
+
+Two strategies for managing analytics costs:
+- **Sampling**: Store 100 percent of click events for 7 days, then 10 percent sampling for 90 days, then aggregate data only.
+- **Aggregation pipeline**: Roll up per-minute click counts into per-hour counts after 24 hours, per-day counts after 30 days, and per-month counts after 1 year. Delete raw events after 90 days.
+
+### Lesson 7: Abuse Detection Must Evolve
+
+Spammers and attackers adapt faster than static blocklists. All four production shorteners deployed ML-based abuse detection after static rule systems failed to keep pace.
+
+The ML approach analyzes three signals:
+- **Creation patterns**: A user creating 50+ links per minute is suspicious.
+- **Redirect patterns**: A link that receives clicks from geographically diverse IPs within seconds of creation (botnet activity) is suspicious.
+- **Destination patterns**: A link pointing to a domain registered within the last 7 days is high risk.
+
+Combining these signals, all four systems achieve over 99 percent abuse detection precision with under 0.5 percent false positive rates.
+
+### Lesson 8: Graceful Degradation is a Feature
+
+When a component fails, the system must degrade gracefully rather than fail entirely. The degradation modes used in production:
+
+| Component Failure | Degradation Mode | User Experience |
+|------------------|-----------------|-----------------|
+| Redis cluster down | Bypass cache, query DB directly | 10ms slower redirects |
+| Database read replica down | Route reads to primary | Slightly higher write latency |
+| Kafka cluster down | Drop analytics events (buffer in memory) | Analytics delays only |
+| CDN down | Route directly to origin | Same latency for first visit |
+| DNS provider down | Secondary DNS with lower TTL | No visible impact |
+
+Each degradation mode was designed, tested, and documented before production deployment. The on-call team has runbooks for each scenario.
+
+<AsciiDiagram
+  id="url-shortener-pattern/realworld-lessons"
+  title="Lessons Learned Summary"
+  alt="Summary diagram showing eight operational lessons arranged by category: performance, consistency, monitoring, abuse, and degradation"
+  caption="Eight production lessons cover the full lifecycle from architecture planning to incident response"
+  content={`
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Production Lessons for URL Shorteners                       │
+  │                                                              │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  Performance                                          │   │
+  │  │  - Lesson 1: Redirect path is your most critical SLA   │   │
+  │  │  - Lesson 2: Cache at every level (L1, L2, CDN)      │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  │                                                              │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  Architecture                                         │   │
+  │  │  - Lesson 3: Choose consistency model explicitly     │   │
+  │  │  - Lesson 5: Plan for hot keys before you need them │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  │                                                              │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  Operations                                           │   │
+  │  │  - Lesson 4: Monitor cache hit rate in real time     │   │
+  │  │  - Lesson 6: Analytics grows faster than mappings    │   │
+  │  │  - Lesson 8: Graceful degradation is a feature       │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  │                                                              │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │  Security                                             │   │
+  │  │  - Lesson 7: Abuse detection must evolve (ML)        │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────┘
+`} />
+
+## Summary
+
+The URL shortener pattern in production reveals that the architecture is shaped as much by operational experience as by initial design:
+
+- **Bitly** demonstrates hash-based generation at scale with Cassandra and a three-tier cache hierarchy. The Bloom filter for deduplication saves millions of database queries daily.
+
+- **TinyURL** shows that a simple sequential counter with MySQL and Memcached can serve 2 billion redirects per month. Simplicity is a valid architectural choice.
+
+- **Google goo.gl** proves that global strong consistency is achievable with Spanner but that URL shortening is a commodity service with limited revenue potential.
+
+- **Twitter t.co** demonstrates the most challenging scale: 500 million daily redirects with 5ms P99 latency, achieved through per-user salted hashing, a three-tier cache, and aggressive L1 caching.
+
+- **Open source projects** (Polr, YOURLS, Kutt) provide viable alternatives for teams that want to self-host. Each targets a different scale and feature set.
+
+- **Cloud provider solutions** (Lambda+DynamoDB, Firebase Dynamic Links, Cloudflare Workers) eliminate infrastructure management at the cost of vendor lock-in and per-request pricing.
+
+The eight operational lessons from production apply regardless of your chosen architecture. Prioritize the redirect path, cache aggressively, monitor cache hit rate, plan for hot keys, manage analytics storage growth, evolve abuse detection, design graceful degradation, and choose your consistency model explicitly.

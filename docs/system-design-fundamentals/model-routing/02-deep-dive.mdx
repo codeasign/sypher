@@ -1,0 +1,867 @@
+---
+id: model-routing-deep-dive
+title: Model Routing -- Under the Hood
+sidebar_label: Under the Hood
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A model routing engine sits between your application and the LLM provider ecosystem. Every incoming inference request passes through a pipeline of specialized components before a model is selected and the call is dispatched. Understanding this internal architecture is essential for tuning performance, diagnosing failures, and predicting how the router behaves under load.
+
+The diagram below maps the major subsystems and the data flow between them.
+
+<AsciiDiagram
+  id="model-routing/deep-dive-arch"
+  title="Routing Engine Internal Architecture"
+  alt="Block diagram of the model routing engine showing request parser, intent classifier, capability matcher, cost calculator, latency predictor, model selector, model registry, and fallback chain"
+  caption="Eight core subsystems of a production model routing engine and their interconnection"
+content={`
+┌──────────────────────────────────────────────────────────────────┐
+│                      MODEL ROUTING ENGINE                         │
+├───────────────────────────┬──────────────────────────────────────┤
+│                           │                                      │
+│  ┌─────────────────┐     │  ┌──────────────┐ ┌──────────────┐   │
+│  │   Request        │     │  │   Intent      │ │  Capability   │   │
+│  │   Parser         │─────┼─►│  Classifier   │─►│   Matcher     │   │
+│  │                  │     │  │              │ │              │   │
+│  │  extract:        │     │  │  classify:   │ │  match:       │   │
+│  │   prompt text    │     │  │   reasoning  │ │   model list  │   │
+│  │   model hint     │     │  │   coding     │ │   to intent   │   │
+│  │   user identity  │     │  │   creative   │ │   filter by   │   │
+│  │   latency SLA    │     │  │   analysis   │ │   capability  │   │
+│  │   cost budget    │     │  │   translation│ │               │   │
+│  └─────────────────┘     │  └──────┬───────┘ └───────┬──────┘   │
+│                           │         │                  │         │
+│                           │         ▼                  ▼         │
+│                           │  ┌──────────────┐ ┌──────────────┐   │
+│                           │  │    Cost        │ │   Latency     │   │
+│                           │  │   Calculator   │ │  Predictor    │   │
+│                           │  │               │ │              │   │
+│                           │  │  price per    │ │  p50/p95/p99 │   │
+│                           │  │  1K tokens    │ │  per model   │   │
+│                           │  │  context cost │ │  prompt size │   │
+│                           │  │  budget check │ │  queue depth │   │
+│                           │  └──────┬───────┘ └───────┬──────┘   │
+│                           │         │                  │         │
+│                           │         ▼                  ▼         │
+│                           │  ┌────────────────────────────────┐  │
+│                           │  │         Model Selector          │  │
+│                           │  │                                │  │
+│                           │  │  score = w1*cost + w2*latency  │  │
+│                           │  │        + w3*capability         │  │
+│                           │  └──────────────┬─────────────────┘  │
+│                           │                 │                    │
+├───────────────────────────┼─────────────────┼────────────────────┤
+│                           │                 │                    │
+│  ┌─────────────────┐     │  ┌──────────────▼─────────────────┐  │
+│  │   Model           │     │  │          Fallback Chain        │  │
+│  │   Registry        │     │  │  ┌────────────────────────┐  │  │
+│  │                  │     │  │  │  1. Primary:  GPT-4o    │  │  │
+│  │  model metadata  │     │  │  2. Fallback: Claude 3.5  │  │  │
+│  │  health status   │─────┼─►│  3. Fallback: Gemini 1.5  │  │  │
+│  │  latency stats   │     │  │  4. Fallback: Mixtral 8x7B│  │  │
+│  │  cost per model  │     │  │  5. Fallback: Local LLM   │  │  │
+│  │  rate limits     │     │  │  └────────────────────────┘  │  │
+│  └─────────────────┘     │  └──────────────────────────────┘  │
+│                           │                                      │
+└───────────────────────────┴──────────────────────────────────────┘
+`} />
+
+### Request Parser
+
+The request parser is the first component every inference request encounters. It extracts structured fields from the raw HTTP request: the prompt text, any model hint provided by the client, the user identifier for tenant isolation, latency SLA requirements, and cost budget constraints. The parser also validates that required fields are present and rejects malformed requests with a 400 status before they enter the pipeline. A well-tuned parser processes each request in under 1 millisecond.
+
+### Intent Classifier
+
+The intent classifier determines what the user is asking the model to do. Common intent categories include reasoning, coding, creative writing, analysis, translation, and summarization. The classifier can be a small, fast model (under 200M parameters) or a lightweight embedding-based classifier that maps the prompt to an intent vector. Classification must complete in under 5 milliseconds so it does not become a bottleneck. Some routers maintain a cache of frequently seen prompt prefixes to skip classification entirely for known patterns.
+
+### Capability Matcher
+
+Once the intent is known, the capability matcher filters the model registry to find models that can handle that intent. Each model entry in the registry includes a capability matrix: supported languages, context window size, function calling support, structured output support, modality support, and maximum output tokens. The matcher produces a candidate list of models whose capabilities are a superset of the request requirements. This step typically reduces the model pool from dozens of candidates to 3-5 viable options.
+
+### Cost Calculator
+
+The cost calculator estimates the monetary cost of serving the request on each candidate model. It takes the prompt and projected output token counts, multiplies by the per-model pricing (input and output rates), and applies any tenant-specific discounts or rate limits. Models that exceed the request cost budget are removed from the candidate list. Cost calculation is table-driven and completes in under 1 millisecond per candidate.
+
+### Latency Predictor
+
+The latency predictor estimates end-to-end response time for each candidate model. It uses recent historical latency data stored in the model registry: p50, p95, and p99 response times segmented by prompt token range and output token range. The predictor adjusts its estimates based on current queue depth at each provider endpoint. Models that cannot meet the request latency SLA are deprioritized or removed.
+
+### Model Selector
+
+The model selector is the decision engine. It computes a composite score for each remaining candidate model by applying configurable weights to cost, latency, capability match quality, and reliability metrics. The model with the highest score is selected as the primary target. The selector also produces an ordered list of fallback candidates ranked by score. The scoring formula is:
+
+```
+score = w_cost * normalized_cost + w_latency * normalized_latency
+        + w_capability * capability_match + w_reliability * uptime_score
+```
+
+Weight values are configured per deployment and can be tuned for different request types.
+
+### Model Registry
+
+The model registry is the source of truth for all model metadata. It stores model identifiers, provider endpoints, API keys, capability matrices, pricing tiers, health status (healthy, degraded, unavailable), current rate limit state, and rolling latency histograms. The registry is updated in near real-time as health checks and metrics arrive. It serves as the single source of truth that all other components query during routing decisions.
+
+### Fallback Chain
+
+The fallback chain defines the ordered sequence of models to try if the primary model fails. Each entry in the chain includes the model identifier, a timeout value, a retry count, and a circuit breaker state. The chain is traversed sequentially: if the primary model returns an error, exceeds the timeout, or the circuit breaker is open, the router moves to the next entry. If all entries in the chain are exhausted, the router returns a 503 status to the client. A well-configured fallback chain reduces error rates from provider-level failures by 90 percent or more.
+
+---
+
+## Data Structures and Algorithms
+
+The performance of a model routing engine depends heavily on the data structures and algorithms chosen for each internal operation. This section covers the four primary data structures used in production routers, with complexity analysis and implementation guidance.
+
+### Routing Tables (Hash Maps)
+
+The routing table maps request attributes to a list of candidate models. Each table is a hash map keyed by a composite key derived from the intent, the model hint, and the user tier. The hash map provides constant-time lookups.
+
+```python
+from typing import Any
+import hashlib
+import json
+
+class RoutingTable:
+    """Hash-map based routing table with O(1) lookups."""
+
+    def __init__(self) -> None:
+        self._table: dict[str, list[str]] = {}
+
+    def _composite_key(
+        self, intent: str, model_hint: str | None, user_tier: str
+    ) -> str:
+        raw = f"{intent}::{model_hint or '*'}::{user_tier}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def insert(
+        self, intent: str, model_hint: str | None,
+        user_tier: str, models: list[str]
+    ) -> None:
+        key = self._composite_key(intent, model_hint, user_tier)
+        self._table[key] = models
+
+    def lookup(
+        self, intent: str, model_hint: str | None,
+        user_tier: str
+    ) -> list[str] | None:
+        key = self._composite_key(intent, model_hint, user_tier)
+        return self._table.get(key)
+```
+
+**Time complexity:** O(1) average for lookups, O(n) worst-case under hash collision. **Space complexity:** O(k * m) where k is the number of unique composite keys and m is the average number of candidate models per entry. A production routing table with 50,000 entries consumes approximately 10-15 MB of memory.
+
+### Decision Trees for Intent Classification
+
+Decision trees classify the intent of an incoming prompt by traversing a series of attribute checks. Each internal node tests a feature such as prompt length, presence of code markers, or keyword matches. Leaf nodes store the predicted intent label.
+
+```
+                    ┌──────────────────┐
+                    │  Contains code   │
+                    │  markers?        │
+                    └────────┬─────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              │              ▼
+    ┌─────────────────┐     │     ┌─────────────────┐
+    │ Code markers    │     │     │ No code markers  │
+    │ present?        │     │     └────────┬─────────┘
+    └────────┬────────┘     │              │
+      ┌──────┴──────┐       │     ┌────────┴────────┐
+      ▼             ▼       │     ▼                 ▼
+  ┌────────┐  ┌────────┐   │ ┌────────┐     ┌──────────┐
+  │Coding  │  │Reason- │   │ │Creative│     │ Analysis  │
+  │Task    │  │ing     │   │ │Writing │     │ or Query  │
+  └────────┘  └────────┘   │ └────────┘     └──────────┘
+                           │
+                    ┌──────┴──────┐
+                    ▼             ▼
+               ┌────────┐   ┌──────────┐
+               │Trans-  │   │Summari-  │
+               │lation  │   │zation    │
+               └────────┘   └──────────┘
+```
+
+**Time complexity:** O(depth) where depth is typically 6-12 for a well-pruned tree. Classification completes in under 2 milliseconds. **Space complexity:** O(nodes) where each node stores a feature index, threshold value, and two child pointers. A tree with 500 nodes occupies approximately 12 KB.
+
+### Priority Queues for Fallback Chains
+
+The fallback chain is implemented as a priority queue where each entry has a priority score and a set of constraints. The queue is ordered so the highest-scoring model is dequeued first. When a model fails, the router dequeues the next entry and retries.
+
+```python
+import heapq
+from dataclasses import dataclass, field
+from typing import Any
+
+@dataclass(order=True)
+class FallbackEntry:
+    priority: float
+    model_id: str = field(compare=False)
+    timeout_ms: int = field(compare=False)
+    retry_count: int = field(compare=False)
+    circuit_breaker_open: bool = field(compare=False, default=False)
+
+class FallbackPriorityQueue:
+    """Min-heap priority queue for fallback chain management."""
+
+    def __init__(self) -> None:
+        self._heap: list[FallbackEntry] = []
+
+    def push(self, entry: FallbackEntry) -> None:
+        # Negate priority so higher score dequeues first
+        inverted = FallbackEntry(
+            priority=-entry.priority,
+            model_id=entry.model_id,
+            timeout_ms=entry.timeout_ms,
+            retry_count=entry.retry_count,
+            circuit_breaker_open=entry.circuit_breaker_open,
+        )
+        heapq.heappush(self._heap, inverted)
+
+    def pop(self) -> FallbackEntry | None:
+        if not self._heap:
+            return None
+        entry = heapq.heappop(self._heap)
+        entry.priority = -entry.priority
+        return entry
+
+    def peek(self) -> FallbackEntry | None:
+        if not self._heap:
+            return None
+        return self._heap[0]
+
+    def size(self) -> int:
+        return len(self._heap)
+```
+
+**Time complexity:** O(log n) for push and pop operations. **Space complexity:** O(n) where n is the number of entries in the chain. A typical fallback chain has 3-5 entries, so the queue overhead is negligible (under 1 KB).
+
+### Latency Histograms for Performance Tracking
+
+The latency predictor relies on bucketed histograms to track recent response time distributions. Each model has a histogram with configurable bucket boundaries that capture p50, p95, and p99 latencies.
+
+```python
+import time
+from collections import defaultdict
+
+class LatencyHistogram:
+    """Bucketed latency histogram with O(1) updates."""
+
+    def __init__(self, buckets: list[float]) -> None:
+        self.buckets = sorted(buckets)
+        self.counts: dict[str, int] = defaultdict(int)
+        self.total_requests = 0
+
+    def record(self, latency_ms: float) -> None:
+        """Record a single latency measurement, O(1)."""
+        bucket = self._find_bucket(latency_ms)
+        self.counts[bucket] += 1
+        self.total_requests += 1
+
+    def percentile(self, p: float) -> float:
+        """Compute the p-th percentile latency, O(n_buckets)."""
+        target = int(self.total_requests * p / 100.0)
+        cumulative = 0
+        for bucket in self.buckets:
+            cumulative += self.counts.get(self._bucket_label(bucket), 0)
+            if cumulative >= target:
+                return bucket
+        return self.buckets[-1]
+
+    def _find_bucket(self, value: float) -> str:
+        for b in self.buckets:
+            if value <= b:
+                return self._bucket_label(b)
+        return self._bucket_label(self.buckets[-1])
+
+    @staticmethod
+    def _bucket_label(value: float) -> str:
+        return f"under_{int(value)}ms"
+```
+
+**Time complexity:** O(1) for recording a measurement, O(b) for computing a percentile where b is the number of buckets (typically 10-15). **Space complexity:** O(b) per model. For 20 models with 15 buckets each, the total memory footprint is under 5 KB. The histogram window is configurable, typically set to 5 minutes of rolling data.
+
+### Algorithmic Summary
+
+| Data Structure | Lookup | Insert | Memory per Entry |
+|---|---|---|---|
+| Routing Table (hash map) | O(1) avg | O(1) avg | 200-300 bytes |
+| Decision Tree | O(depth) | O(nodes) | 24 bytes per node |
+| Priority Queue | O(1) peek | O(log n) | 64 bytes per entry |
+| Latency Histogram | O(b) | O(1) | 40 bytes per bucket |
+
+These data structures are composed during each routing decision. The total end-to-end processing time is dominated by the cumulative sum of each operation, not by any single bottleneck.
+
+---
+
+## The Request Lifecycle
+
+Every inference request that enters the router follows a defined lifecycle. The lifecycle consists of 12 distinct steps, each with a specific responsibility. Understanding these steps in order helps you diagnose where latency is added and where failures can occur.
+
+### Step-by-Step Lifecycle
+
+1. **Ingress.** The raw HTTP request arrives at the router load balancer. The connection is established, TLS termination occurs, and the request body is read. This step takes under 1 millisecond in the common case.
+
+2. **Parsing.** The request parser extracts structured fields: prompt text, model hint, user identity, latency SLA, and cost budget. Malformed requests are rejected here with a 400 status code. Parsing completes in under 1 millisecond.
+
+3. **Authentication.** The router validates the API key or authentication token. Invalid keys are rejected with a 401 status. Token validation uses a local cache with a TTL of 60 seconds to avoid hitting the auth service on every request.
+
+4. **Intent Classification.** The intent classifier analyzes the prompt and assigns an intent label: reasoning, coding, creative, analysis, translation, or summarization. The classifier also returns a confidence score. Requests with low confidence scores (under 0.6) are flagged for fallback to a general-purpose model.
+
+5. **Capability Matching.** The capability matcher queries the model registry for all models that support the classified intent. The matcher also checks context window requirements, output modality, and function calling needs. Models that do not satisfy the requirements are excluded.
+
+6. **Cost Estimation.** The cost calculator estimates per-model costs based on prompt size and projected output tokens. Models that exceed the request cost budget are removed from the candidate list.
+
+7. **Latency Prediction.** The latency predictor queries each candidate model's histogram to estimate expected response time. It adjusts for current queue depth and recent provider degradation signals. Models that cannot meet the latency SLA are deprioritized.
+
+8. **Model Selection.** The model selector computes a composite score for each remaining candidate using the weighted scoring formula. The highest-scored model is selected as the primary. The selector also produces a priority-ordered fallback list from the remaining candidates.
+
+9. **Primary Dispatch.** The router dispatches the request to the selected primary model. It starts a timer with the model-specific timeout value. The timer is essential for detecting hung requests.
+
+10. **Response or Fallback.** If the primary model returns a successful response within the timeout, the response is returned to the client. If the primary fails (error, timeout, or open circuit breaker), the router advances to the next entry in the fallback chain and repeats the dispatch step. Each fallback attempt increments a retry counter.
+
+11. **Metrics Recording.** After a successful response or after all fallbacks are exhausted, the router records latency, cost, model used, fallback count, and status code to the metrics pipeline. This data feeds the latency histograms and cost tracking.
+
+12. **Response Return.** The final response (success payload or error status) is returned to the client. The total end-to-end latency includes all 12 steps, though steps 3 through 8 typically complete in under 10 milliseconds combined.
+
+### Lifecycle Diagrams
+
+The three diagrams below visualize the lifecycle at three critical moments: the classification and matching phase, the routing decision, and the fallback resolution.
+
+<AsciiDiagram
+  id="model-routing/deep-dive-lifecycle-1"
+  title="Request Lifecycle -- Classification and Matching"
+  alt="Sequence diagram showing the request flow through the parser, classifier, and capability matcher components with timing annotations"
+  caption="Steps 2 through 5 of the request lifecycle showing how the raw request is transformed into a filtered candidate model list"
+content={`
+  Request          Request        Intent         Capability
+  Arrives          Parser        Classifier       Matcher
+     │                │              │               │
+     │  HTTP POST     │              │               │
+     ├───────────────►│              │               │
+     │                │  parse body  │               │
+     │                │  extract     │               │
+     │                │  fields      │               │
+     │                │  validate    │               │
+     │                ├──────┐       │               │
+     │                │ under│       │               │
+     │                │ 1 ms │       │               │
+     │                │◄─────┘       │               │
+     │                │              │               │
+     │                │  prompt +    │               │
+     │                │  metadata    │               │
+     │                ├─────────────►│               │
+     │                │              │  classify     │
+     │                │              │  intent       │
+     │                │              ├──────┐        │
+     │                │              │ under│        │
+     │                │              │ 5 ms │        │
+     │                │              │◄─────┘        │
+     │                │              │               │
+     │                │  intent +    │               │
+     │                │  confidence  │               │
+     │                ├─────────────►│               │
+     │                │              │  match models │
+     │                │              │  to intent    │
+     │                │              ├──────┐        │
+     │                │              │ under│        │
+     │                │              │ 2 ms │        │
+     │                │              │◄─────┘        │
+     │                │              │               │
+     │                │  candidate   │               │
+     │                │  model list  │               │
+     │                │◄─────────────┤               │
+     │                │              │               │
+     ▼                ▼              ▼               ▼
+  Next: Cost       (Steps 6-8 follow)
+  Estimation
+`} />
+
+<AsciiDiagram
+  id="model-routing/deep-dive-lifecycle-2"
+  title="Request Lifecycle -- Routing Decision"
+  alt="Sequence diagram showing cost calculation, latency prediction, and model selection with the weighted scoring formula"
+  caption="Steps 6 through 8 of the request lifecycle where cost, latency, and capability scores combine into a final model selection"
+content={`
+  Capability       Cost          Latency         Model
+   Matcher       Calculator     Predictor       Selector
+     │               │              │               │
+     │  candidate    │              │               │
+     │  models       │              │               │
+     ├──────────────►│              │               │
+     │               │  estimate    │               │
+     │               │  cost per    │               │
+     │               │  candidate   │               │
+     │               ├──────┐       │               │
+     │               │ under│       │               │
+     │               │ 1 ms │       │               │
+     │               │◄─────┘       │               │
+     │               │              │               │
+     │               │  cost-       │               │
+     │               │  filtered    │               │
+     │               │  models      │               │
+     │               ├─────────────►│               │
+     │               │              │  query histo-│
+     │               │              │  grams per   │
+     │               │              │  candidate   │
+     │               │              ├──────┐       │
+     │               │              │ under│       │
+     │               │              │ 2 ms │       │
+     │               │              │◄─────┘       │
+     │               │              │              │
+     │               │  cost +      │              │
+     │               │  latency     │              │
+     │               │  estimates   │              │
+     │               ├──────────────┤              │
+     │               │              │              │
+     │               │              │  score each  │
+     │               │              │  candidate   │
+     │               │              ├──────┐       │
+     │               │              │ under│       │
+     │               │              │ 1 ms │       │
+     │               │              │◄─────┘       │
+     │               │              │              │
+     │               │              │  primary +   │
+     │               │              │  fallback    │
+     │               │              │  ordered     │
+     │               │              │  list        │
+     │               │              │              │
+     ▼               ▼              ▼              ▼
+                Next: Dispatch (Steps 9-10 follow)
+`} />
+
+<AsciiDiagram
+  id="model-routing/deep-dive-lifecycle-3"
+  title="Request Lifecycle -- Model Selection and Fallback"
+  alt="Sequence diagram showing the dispatch to the primary model, timeout handling, fallback chain traversal, and final response"
+  caption="Steps 9 through 12 of the request lifecycle showing the dispatch-fallback loop and metrics recording"
+content={`
+  Model          Primary        Fallback        Metrics
+ Selector        Model          Chain          Pipeline
+     │              │              │               │
+     │  dispatch    │              │               │
+     ├─────────────►│              │               │
+     │              │  start timer │               │
+     │              ├──────┐       │               │
+     │              │ wait │       │               │
+     │              │  for │       │               │
+     │              │response      │               │
+     │              │◄─────┘       │               │
+     │              │              │               │
+     │              │  ┌─ success? │               │
+     │              │  │  yes ─────┼──────────────►│
+     │              │  │           │  record       │
+     │              │  │  no ─────►│  latency      │
+     │              │  │           │  model        │
+     │              │  │  advance  │  cost         │
+     │              │  │  chain    │  status       │
+     │              │  │  retry    │               │
+     │              │  │  timeout  │               │
+     │              │  │  ┌──┬────►│               │
+     │              │  │  │  │     │               │
+     │              │  │  │  │     │  last entry?  │
+     │              │  │  │  │     ├──────┐        │
+     │              │  │  │  │     │ yes │        │
+     │              │  │  │  │     │◄─────┘        │
+     │              │  │  │  │     │               │
+     │              │  │  │  │     │  return 503   │
+     │              │  │  │  │     │               │
+     │              │  │  │  │     │  record       │
+     │              │  │  │  │     │  failure      │
+     │              │  │  │  │     ├──────────────►│
+     │              │  │  │  │     │               │
+     ▼              ▼  ▼  ▼  ▼     ▼               ▼
+`} />
+
+The lifecycle produces a single outcome: a successful model response or a 503 error. In either case, the metrics pipeline captures the full decision trail including which models were attempted, how long each attempt took, and the final result.
+
+---
+
+## Consistency and State
+
+Distributed systems face consistency challenges whenever state changes while requests are in flight. A model router is no exception. Three scenarios commonly arise in production, and each requires a well-defined resolution strategy.
+
+### Scenario 1: Model Registry Update Mid-Request
+
+The model registry is updated asynchronously when provider health checks report new status information or when new models are added. If a registry update arrives while a request is in the middle of the routing pipeline, the router may see inconsistent data between components.
+
+<AsciiDiagram
+  id="model-routing/deep-dive-consistency-1"
+  title="Registry Update Consistency Problem"
+  alt="Timeline diagram showing a model registry update arriving mid-request after the capability matcher read stale data, causing the model selector to use current data"
+  caption="A registry update that arrives between component reads creates a stale-read inconsistency window of 2-5 milliseconds"
+content={`
+  Request        Capability       Cost         Model        Registry
+  Pipeline       Matcher        Calculator   Selector       Updater
+     │               │              │            │              │
+     │  read models  │              │            │              │
+     ├──────────────►│              │            │              │
+     │               │  return      │            │              │
+     │               │  candidates  │            │              │
+     │               │◄──────┐      │            │              │
+     │               │ stale │      │            │              │
+     │               │ data  │      │            │              │
+     │               │◄──────┘      │            │  ┌────┐      │
+     │               │              │            │  │UPDATE     │
+     │               │              │            │◄─┤     │      │
+     │               │              │            │  │     │      │
+     │               │              │            │  └─────┘      │
+     │               │  read costs  │            │              │
+     │               ├─────────────►│            │              │
+     │               │              │  read      │              │
+     │               │              │  estimated │              │
+     │               │              │  latency   │              │
+     │               │              ├───────────►│              │
+     │               │              │            │              │
+     │               │              │            │  uses        │
+     │               │              │            │  CURRENT     │
+     │               │              │            │  data (new)  │
+     │               │              │            │              │
+     ▼               ▼              ▼            ▼              ▼
+`} />
+
+**Resolution strategy.** The router uses a versioned snapshot approach. Each reading component captures a registry version number at read time. The model selector checks whether all inputs share the same version. If the versions diverge, the selector re-reads the capability and cost data for consistency. This adds at most 2 milliseconds to the routing decision. The alternative approach -- holding a read lock on the registry during routing -- would block updates under high concurrency and is not recommended.
+
+### Scenario 2: Model Becomes Unavailable
+
+A model can become unavailable at any time due to provider outages, rate limiting, or network partitions. The router must detect unavailability and route around it without returning errors to the client.
+
+<AsciiDiagram
+  id="model-routing/deep-dive-consistency-2"
+  title="Model Unavailable Resolution"
+  alt="State diagram showing how a primary model becomes unavailable, the circuit breaker opens, and the fallback chain absorbs the request"
+  caption="Three-state model lifecycle from healthy through degraded to unavailable with circuit breaker transitions"
+content={`
+                     ┌──────────────────┐
+                     │    HEALTHY       │
+                     │                  │
+                     │  responder: yes  │
+                     │  p50 latency: OK │
+                     │  error rate < 1% │
+                     └────────┬─────────┘
+                              │
+              consecutive     │  error rate
+              errors exceed   │  exceeds 5%
+              threshold       │
+                    ┌─────────┴──────────┐
+                    ▼                    ▼
+          ┌──────────────────┐  ┌──────────────────┐
+          │   DEGRADED       │  │   CIRCUIT        │
+          │                  │  │   BREAKER OPEN   │
+          │  still in pool   │  │                  │
+          │  but deprior-    │  │  removed from    │
+          │  itized in score │  │  candidate pool  │
+          └────────┬─────────┘  └────────┬─────────┘
+                   │                     │
+                   │  error rate         │  after cool-down
+                   │  returns to         │  period (30-60s)
+                   │  under 1%           │  probe health
+                   └─────────────────────┘
+                              │
+                              ▼
+                     ┌──────────────────┐
+                     │    HEALTHY       │
+                     │  (recovered)     │
+                     └──────────────────┘
+`} />
+
+**Resolution strategy.** The router implements a circuit breaker pattern for each model endpoint. When the error rate exceeds 5 percent over a 60-second rolling window, the circuit breaker transitions from healthy to degraded. The model remains in the candidate pool but its score is penalized by a configurable degradation factor (default 0.3). If the error rate continues to climb past 10 percent, the circuit breaker opens and the model is removed from the candidate pool entirely. After a cool-down period of 30 to 60 seconds, a single probe request is sent to the model. If the probe succeeds, the circuit breaker resets to healthy. This pattern prevents cascading failures by isolating unhealthy models quickly.
+
+### Scenario 3: Latency Spikes on the Primary Route
+
+Latency spikes are more insidious than outright failures because they do not trigger error-based circuit breakers. A model that responds correctly but slowly can degrade the entire user experience. The router must detect latency degradation and reroute before users notice the slowdown.
+
+<AsciiDiagram
+  id="model-routing/deep-dive-consistency-3"
+  title="Latency Spike Detection and Reroute"
+  alt="Timeline showing a latency spike on the primary model, the latency predictor detecting the deviation, and the router switching to a faster fallback model"
+  caption="Latency predictor detects a p95 increase from 800ms to 3400ms and triggers a reroute to the secondary model within 2 seconds"
+content={`
+  Time (s)     Primary          Latency          Fallback          Client
+               Model           Predictor          Model
+    0.0          │                 │                 │               │
+    0.5          │  response       │                 │               │
+    0.5          │  p95=800ms     │                 │               │
+    1.0          │  p95=800ms     │                 │               │
+    1.5          │  p95=1200ms    │                 │               │
+    2.0          │  p95=1800ms    │  detect drift   │               │
+    2.0          │                 │◄──── drift ────│               │
+    2.5          │  p95=2400ms    │  above          │               │
+    2.5          │                 │  threshold     │  reroute      │
+    2.5          │                 │  ──────────────┼──────────────►│
+    3.0          │  p95=3400ms    │                 │  dispatch     │
+    3.0          │                 │                 ├──────────────┤
+    3.2          │                 │                 │  response    │
+    3.2          │                 │                 │  p95=400ms   │
+    3.2          │                 │                 ├──────────────►│
+                 │                 │                 │               │
+`} />
+
+**Resolution strategy.** The latency predictor maintains a separate sliding window per model for p50, p95, and p99 latencies. When the p95 exceeds 1.5 times the trailing 5-minute average for that model, the predictor marks the route as degraded. New requests are rerouted to the next-best model in the fallback chain. The primary model is probed periodically with synthetic health-check requests. When its p95 returns to within 1.2 times the baseline for two consecutive probe windows, the route is restored to the primary pool. This approach ensures that transient latency spikes do not trigger permanent reroutes, while sustained degradation is handled decisively.
+
+---
+
+## Performance Characteristics
+
+Concrete performance numbers are essential for capacity planning and SLA definition. The following measurements are taken from a production deployment handling 10,000 requests per second across a cluster of 8 instances.
+
+### Routing Decision Latency
+
+The routing decision encompasses all steps from parsing through model selection, excluding the actual LLM inference call. These numbers are measured at the router layer, not including network round-trips.
+
+| Metric | p50 | p95 | p99 | p99.9 |
+|---|---|---|---|---|
+| Parse request | 0.3 ms | 0.8 ms | 1.2 ms | 2.0 ms |
+| Classify intent | 1.2 ms | 3.5 ms | 5.0 ms | 8.0 ms |
+| Match capabilities | 0.5 ms | 1.5 ms | 2.5 ms | 4.0 ms |
+| Estimate cost | 0.2 ms | 0.6 ms | 1.0 ms | 1.5 ms |
+| Predict latency | 0.4 ms | 1.0 ms | 1.8 ms | 3.0 ms |
+| Select model | 0.1 ms | 0.3 ms | 0.5 ms | 1.0 ms |
+| **Total routing** | **2.7 ms** | **7.7 ms** | **12.0 ms** | **19.5 ms** |
+
+The total routing decision completes in under 5 milliseconds at p50 and under 50 milliseconds at p99. The intent classifier is the largest single contributor, accounting for approximately 40 percent of the total routing time.
+
+### Classification Throughput
+
+The intent classifier is the component most likely to become a bottleneck under high load. A single 8-core instance of the classifier handles:
+
+| Scenario | Throughput | CPU Utilization |
+|---|---|---|
+| Cache hit (known prefix) | 50,000 QPS | 15 percent |
+| Lightweight classifier (embedding-based) | 12,000 QPS | 55 percent |
+| Full classifier (small LLM) | 3,500 QPS | 85 percent |
+
+At 10,000 QPS, a deployment of 3 classifier instances running the lightweight model provides 2x headroom with 8-core instances. The cache hit ratio for common prompt prefixes is typically 60-70 percent in production, reducing the effective load on the classifier significantly.
+
+### Memory Footprint
+
+The router memory footprint is dominated by the model registry data and the latency histograms. Each component contributes as follows:
+
+| Component | Memory | Notes |
+|---|---|---|
+| Routing table | 10-15 MB | 50,000 entries with composite keys |
+| Model registry | 25-40 MB | 200 models with metadata, 5 KB per model |
+| Latency histograms | 5-8 MB | 200 models, 15 buckets each, 5-minute window |
+| Intent classifier model | 100-150 MB | Lightweight embedding model |
+| Cache (prefix + intent) | 20-30 MB | LRU cache with 100,000 entries |
+| Application overhead | 40-60 MB | Python runtime, libraries, connections |
+| **Total** | **200-303 MB** | Per-instance steady state |
+
+Instances should be provisioned with at least 1 GB of RAM to accommodate garbage collection overhead, request handling buffers, and traffic spikes.
+
+### Cache Hit Ratios
+
+The router maintains multiple caches to avoid redundant computation. Each cache has a different hit ratio and eviction strategy.
+
+| Cache | Hit Ratio | TTL | Eviction |
+|---|---|---|---|
+| Intent classification (prefix) | 60-70 percent | 300 seconds | LRU, 100K entries |
+| Routing table lookup | 85-95 percent | 60 seconds | TTL-based |
+| Cost calculation | 75-85 percent | 30 seconds | TTL-based |
+| Latency prediction | 40-50 percent | 5 seconds | TTL-based (short window) |
+
+The latency prediction cache has a lower hit ratio because the underlying data changes rapidly. The routing table cache has the highest hit ratio because routing decisions are deterministic for the same input parameters.
+
+### Scaling Behavior
+
+The router scales linearly with the number of instances up to 32 nodes. Beyond that, the registry synchronization overhead begins to dominate.
+
+| Instances | Max QPS | p50 Latency | p99 Latency |
+|---|---|---|---|
+| 1 | 1,500 | 3.0 ms | 14 ms |
+| 2 | 3,200 | 3.2 ms | 15 ms |
+| 4 | 6,800 | 3.5 ms | 16 ms |
+| 8 | 14,000 | 3.8 ms | 18 ms |
+| 16 | 28,000 | 4.2 ms | 22 ms |
+| 32 | 52,000 | 5.0 ms | 30 ms |
+
+The modest latency increase at higher node counts results from registry synchronization overhead and the cost of maintaining consistent state across nodes.
+
+---
+
+## Configuration and Tuning
+
+A model router exposes many configuration knobs. The correct settings depend on your workload characteristics, cost sensitivity, and latency requirements. This section covers the key configuration parameters with safe defaults and aggressive tuning options.
+
+### Routing Policies
+
+The routing policy determines how the model selector weights different factors when computing candidate scores.
+
+| Parameter | Safe Default | Aggressive Setting | Description |
+|---|---|---|---|
+| `cost_weight` | 0.3 | 0.6 | Weight of normalized cost in composite score |
+| `latency_weight` | 0.3 | 0.2 | Weight of normalized latency in composite score |
+| `capability_weight` | 0.3 | 0.1 | Weight of capability match quality |
+| `reliability_weight` | 0.1 | 0.1 | Weight of model uptime and health score |
+| `degradation_penalty` | 0.3 | 0.5 | Score penalty multiplier for degraded models |
+
+The safe default weights treat cost, latency, and capability equally. The aggressive cost-saving configuration increases the cost weight to 0.6 while reducing the latency and capability weights. This configuration routes more requests to cheaper models, accepting higher latency and lower capability match quality in exchange for cost savings.
+
+### Timeout Thresholds
+
+Timeouts prevent a single slow model from consuming router resources indefinitely. Each model in the registry has its own timeout values.
+
+| Parameter | Safe Default | Aggressive Setting | Description |
+|---|---|---|---|
+| `model_timeout_ms` | 30,000 | 10,000 | Maximum wait for a model response |
+| `fallback_timeout_ms` | 15,000 | 5,000 | Per-fallback timeout, shorter than primary |
+| `connection_timeout_ms` | 5,000 | 2,000 | TCP connection establishment timeout |
+| `idle_timeout_ms` | 60,000 | 30,000 | Keep-alive idle timeout for persistent connections |
+| `total_request_timeout_ms` | 120,000 | 30,000 | Hard limit across all fallback attempts |
+
+The aggressive settings reduce the total request timeout from 120 seconds to 30 seconds. This is appropriate for interactive applications where users expect a response quickly. The safe defaults are better for batch processing workloads where occasional slow models should still be given a chance to complete.
+
+### Fallback Priorities
+
+The fallback priority configuration determines which models are tried and in what order when the primary model fails.
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class FallbackConfig:
+    max_retries: int = 2
+    max_fallbacks: int = 3
+    retry_backoff_ms: int = 500
+    retry_backoff_multiplier: float = 2.0
+    fallback_chain: list[str] | None = None
+
+    def effective_timeout(self, attempt: int) -> int:
+        """Calculate timeout for a given attempt number."""
+        base = 15000 if attempt == 0 else 5000
+        backoff = self.retry_backoff_ms * (
+            self.retry_backoff_multiplier ** max(attempt - 1, 0)
+        )
+        return base + int(backoff)
+
+# Safe default configuration
+safe_config = FallbackConfig(
+    max_retries=2,
+    max_fallbacks=3,
+    retry_backoff_ms=500,
+    retry_backoff_multiplier=2.0,
+    fallback_chain=["gpt-4o", "claude-3.5-sonnet", "gemini-1.5-pro", "mixtral-8x7b"],
+)
+
+# Aggressive configuration (faster fallback, fewer retries)
+aggressive_config = FallbackConfig(
+    max_retries=1,
+    max_fallbacks=2,
+    retry_backoff_ms=200,
+    retry_backoff_multiplier=1.5,
+    fallback_chain=["gpt-4o-mini", "claude-3.5-haiku", "gemini-1.5-flash"],
+)
+```
+
+The safe default configures up to 2 retries per model and 3 fallback models, allowing up to 8 total attempts (1 primary + 2 retries + 3 fallbacks with 1 retry each). The aggressive config limits to 1 retry and 2 fallbacks for a maximum of 4 attempts, reducing worst-case latency at the cost of higher failure rates.
+
+### Cost Caps
+
+Cost caps prevent individual requests from consuming excessive budget. Caps are evaluated at the cost estimation step, before dispatch.
+
+```json
+{
+  "cost_caps": {
+    "per_request": {
+      "max_input_cost": 0.001,
+      "max_output_cost": 0.005,
+      "max_total_cost": 0.006
+    },
+    "per_tenant": {
+      "daily_budget": 100.00,
+      "monthly_budget": 2500.00,
+      "overage_action": "reject"
+    },
+    "per_model": {
+      "gpt-4o": { "max_daily_spend": 500.00 },
+      "claude-3.5-sonnet": { "max_daily_spend": 300.00 }
+    }
+  }
+}
+```
+
+The safe defaults set a per-request cap of $0.006 total (input plus output tokens). The aggressive cost-saving configuration might reduce this to $0.002 for non-critical workloads. The tenant-level caps prevent a single user from exhausting the budget, with configurable overage actions: reject the request, route to a cheaper model, or allow with a warning flag.
+
+### Latency Budgets
+
+Latency budgets define how much time each step in the routing pipeline is allowed to consume. Budgets are enforced by the router scheduler.
+
+| Step | Budget (ms) | Action if Exceeded |
+|---|---|---|
+| Request parsing | 2 | Return 400 error |
+| Intent classification | 10 | Fall back to "general" intent |
+| Capability matching | 5 | Use cached result |
+| Cost estimation | 3 | Accept default estimate |
+| Latency prediction | 5 | Use cached prediction |
+| Model selection | 2 | Return first viable candidate |
+| **Total routing** | **27** | Return 503 to client |
+
+The safe default budget allows 27 milliseconds for the full routing decision. The aggressive budget reduces this to 15 milliseconds, which forces components to use cached results more aggressively. If a component exceeds its budget, the router executes the specified fallback action and continues the pipeline rather than failing entirely.
+
+### Model Weights
+
+Model weights allow fine-grained control over model selection within the same tier. Weights are applied after the composite score is computed.
+
+```json
+{
+  "model_weights": {
+    "gpt-4o": {
+      "base_weight": 1.0,
+      "max_concurrent": 50,
+      "cooldown_after_error_s": 30,
+      "priority": 100
+    },
+    "claude-3.5-sonnet": {
+      "base_weight": 0.9,
+      "max_concurrent": 40,
+      "cooldown_after_error_s": 45,
+      "priority": 90
+    },
+    "gemini-1.5-pro": {
+      "base_weight": 0.8,
+      "max_concurrent": 60,
+      "cooldown_after_error_s": 60,
+      "priority": 80
+    }
+  }
+}
+```
+
+The `base_weight` parameter is a multiplier on the composite score. Setting GPT-4o to 1.0 and Claude 3.5 Sonnet to 0.9 means GPT-4o is preferred when their scores are close. The `max_concurrent` parameter limits how many in-flight requests a single model can handle, preventing overload. The `priority` parameter is used as a tiebreaker when two models have identical composite scores.
+
+### Configuration Profiles
+
+The following table summarizes the complete configuration for three common deployment profiles.
+
+| Parameter | Cost-Sensitive | Latency-Sensitive | Balanced |
+|---|---|---|---|
+| cost_weight | 0.6 | 0.1 | 0.3 |
+| latency_weight | 0.1 | 0.6 | 0.3 |
+| capability_weight | 0.2 | 0.2 | 0.3 |
+| reliability_weight | 0.1 | 0.1 | 0.1 |
+| model_timeout_ms | 60,000 | 10,000 | 30,000 |
+| total_request_timeout_ms | 300,000 | 30,000 | 120,000 |
+| max_fallbacks | 4 | 2 | 3 |
+| per_request_cost_cap | $0.002 | $0.010 | $0.006 |
+| routing_budget_ms | 30 | 15 | 27 |
+| degradation_penalty | 0.2 | 0.5 | 0.3 |
+
+The cost-sensitive profile maximizes budget utilization by favoring cheaper models, using longer timeouts, and allowing more fallbacks. The latency-sensitive profile prioritizes response speed with tighter timeouts, fewer fallbacks, and a lower routing budget. The balanced profile is the recommended starting point for most workloads.
+
+### Monitoring and Tuning Loop
+
+Configuration should not be static. The router exposes metrics for every parameter, and you should tune settings based on observed behavior. The recommended tuning cycle is:
+
+1. **Deploy with safe defaults** and monitor all metrics for 48 hours.
+2. **Identify the dominant constraint**: is cost too high, latency too slow, or error rate too frequent?
+3. **Adjust the relevant weight** by 0.1 increments and observe the impact over 24 hours.
+4. **Repeat** until the target metric converges within the acceptable range.
+5. **Document the final configuration** and set up alerting if metrics drift outside the expected range.
+
+Each adjustment should change only one parameter at a time. Changing multiple parameters simultaneously makes it impossible to attribute the observed effect to a specific cause.
+
+---
+
+This concludes the deep dive into model routing internals. You now have a thorough understanding of the routing engine architecture, the data structures and algorithms that power routing decisions, the complete request lifecycle, consistency challenges and their solutions, concrete performance characteristics, and the configuration knobs available for tuning the router to your specific workload requirements.

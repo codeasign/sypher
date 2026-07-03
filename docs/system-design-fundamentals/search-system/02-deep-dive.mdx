@@ -1,0 +1,694 @@
+---
+id: search-system-deep-dive
+title: Search System Pattern -- Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A search system is composed of four layers that run in a single process or across a distributed cluster. Understanding each layer's internal structure is essential for tuning and debugging.
+
+### Ingestion Layer
+
+The ingestion layer converts raw documents into indexed data. It accepts documents in various formats (JSON, CSV, plain text, binary) and transforms them into the internal representation used by the index.
+
+Ingestion proceeds through a pipeline:
+
+1. **Document parsing**: the raw input is parsed into a structured document with fields. Each field has a type (text, keyword, integer, float, date, geo_point).
+2. **Field analysis**: text fields are passed through an analyzer chain. The chain applies character filters (HTML stripping, regex replacement), a tokenizer (standard, whitespace, regex), and token filters (lowercase, stop words, stemmer, synonym).
+3. **Index building**: the analyzed tokens are written to the inverted index. For each token, the system records the document ID, term frequency, and optionally positions and offsets.
+4. **Stored fields**: the original field values are stored separately for retrieval. These are not indexed but are returned in search results.
+
+The ingestion layer must handle backpressure. If documents arrive faster than the index can write them, the system buffers in memory and spills to disk. A healthy ingestion pipeline processes documents at a sustained rate of 10,000 to 50,000 documents per second per node.
+
+### Index Layer
+
+The index layer manages the inverted index, filter index, and stored fields. It is the most complex layer because it must balance write throughput with read performance.
+
+The index is divided into **segments**. Each segment is an immutable, self-contained index. Segments are created by the ingestion layer and merged in the background. The segment-based design solves a fundamental tension: the inverted index is most efficient when it is static (sorted, compressed, optimized), but documents arrive continuously.
+
+A segment contains:
+
+- **Term dictionary**: a sorted mapping from terms to their metadata (document frequency, pointer to posting list)
+- **Posting lists**: the list of document IDs for each term, with optional positions and payloads
+- **Field norms**: normalization factors for length-aware scoring
+- **Stored fields**: the original field values, stored in a columnar format
+- **Doc values**: column-oriented storage for sorting, aggregations, and scripting
+
+Segments are searched in order. The query runs against each segment independently, and results are merged. Searching N segments is N times slower than searching one segment with the same total data. This is why segment merging is critical.
+
+### Query Layer
+
+The query layer parses incoming queries, routes them to the appropriate index segments, and merges the results. It handles:
+
+- **Query parsing**: converting the query DSL into an internal query tree
+- **Query rewriting**: applying optimizations like removing redundant filters, combining boolean clauses, and pushing down filters
+- **Execution planning**: deciding the order of index lookups based on term selectivity (rarest term first)
+- **Result merging**: combining results from multiple segments, applying global sorting, and implementing pagination
+
+The query layer maintains a cache of recent queries and their results. A well-tuned cache hits 30 to 50 percent of repeat queries, saving significant latency.
+
+### Coordination Layer
+
+In a distributed search system, the coordination layer manages cluster state, shard allocation, and query routing. It is responsible for:
+
+- **Cluster membership**: which nodes are alive and serving traffic
+- **Shard placement**: which node holds which shard (primary and replica)
+- **Query distribution**: fanning out queries to all relevant shards and collecting results
+- **Failure handling**: detecting failed nodes and reallocating shards
+
+The coordination layer typically uses a consensus algorithm (like Raft or Paxos) or relies on an external coordination service (like ZooKeeper or etcd) for distributed consensus.
+
+## Data Structures
+
+The search system uses several specialized data structures. Three are essential for understanding performance.
+
+### Data Structure 1: The Inverted Index with Skip Lists
+
+The inverted index maps each term to its posting list. A posting list is a sorted array of document IDs. For efficient intersection, posting lists are augmented with skip pointers.
+
+A skip pointer is a secondary index within the posting list. Every 128 entries, the posting list stores a pointer to an entry further ahead. When intersecting two posting lists, the algorithm can skip over blocks of entries that cannot possibly match.
+
+For example, if posting list A has value 500 and posting list B is at position 0 with value 3, the skipper checks the skip pointer for B. If the next skip pointer points to entry 512 with value 600, the algorithm knows that nothing in B between position 0 and 512 is below 500. It skips B's pointer to 512 directly.
+
+Skip lists reduce posting list intersection time from O(N) to O(sqrt(N)) in practice. For a posting list of 1 million entries, this means 1,000 comparisons instead of 1 million.
+
+<AsciiDiagram
+  id="search-system/skip-list-structure"
+  title="Posting List with Skip Pointers"
+  alt="Diagram of a posting list with skip pointers every 128 entries, showing how the skipper can jump over irrelevant blocks during intersection"
+  caption="Figure 1: Posting list with skip pointers for faster intersection"
+  content={`
+Posting List:  [3, 7, 12, 18, 22, 31, 45, 53, 67, 72, 88, 95, 101, ...]
+                 |             |              |               |
+                 v             v              v               v
+Skip Pointers:  [0]           [128]         [256]           [384]
+                 |             |              |               |
+                 v             v              v               v
+                 docId=3       docId=...      docId=...       docId=...
+
+Intersection without skip:  check every entry (O(N))
+Intersection with skip:     check skip targets first, jump over blocks that
+                            cannot contain matches (O(sqrt(N)))
+
+When A[ptrA] = 500 and B[ptrB] = 3:
+  Check B's skip at [128]: value = 480 (still below 500, advance)
+  Check B's skip at [256]: value = 600 (above 500, so match is in [128..256])
+  Binary search within [128..256] for 500
+`} />
+
+### Data Structure 2: Roaring Bitmaps for Filtering
+
+Roaring bitmaps are compressed bitsets that support fast boolean operations. They are the standard data structure for filter indexes in production search systems.
+
+A roaring bitmap divides the 32-bit integer space into chunks of 2^16 (65,536) values. Each chunk is stored in one of two formats:
+
+- **Array container**: stores individual integers (up to 4,096 values). Uses 2 bytes per value.
+- **Bitmap container**: stores a dense bitset (more than 4,096 values). Uses 8 KB per chunk.
+
+The format adapts automatically. Sparse data uses array containers (compact). Dense data uses bitmap containers (fast for bitwise operations). This hybrid approach gives roaring bitmaps the best of both worlds: small memory footprint and fast operations.
+
+For a filter on "brand = Sony" with 50,000 matching documents out of 50 million, the roaring bitmap uses approximately 200 KB. The same filter stored as a Java Bitset would use 6.25 MB. The AND operation between two filters takes 2 to 10 microseconds.
+
+<AsciiDiagram
+  id="search-system/roaring-bitmap"
+  title="Roaring Bitmap Internal Structure"
+  alt="Diagram showing how a roaring bitmap divides the integer space into 2^16 chunks, each stored as either an array container or bitmap container depending on density"
+  caption="Figure 2: Roaring bitmap internal structure with hybrid containers"
+  content={`
+32-bit integer space (0 to 4,294,967,295)
++---------------------------------------------+
+| Chunk 0    | Chunk 1    | Chunk 2    | ...  |
+| 0 - 65535  | 65536 -    | 131072 -   |      |
+|            | 131071     | 196607     |      |
++------------+------------+------------+------+
+
+Chunk 0 (sparse: 42 values out of 65536):
+  +-> Array Container [42 entries]
+      [12, 45, 127, 892, 1432, ...]
+      2 bytes per entry = 84 bytes total
+
+Chunk 1 (dense: 50,000 values out of 65536):
+  +-> Bitmap Container [65536 bits]
+      [111010101110...]
+      8 KB total
+
+Operations:
+  AND: iterate over aligned chunks, bitwise AND if both are bitmap
+       containers, or zigzag merge if any array container
+  OR:  similar, bitwise OR for bitmap containers
+  NOT: compute complement within each chunk
+`} />
+
+### Data Structure 3: BKD Tree for Range and Numeric Queries
+
+The BKD tree is a data structure for indexing numeric, date, and geospatial fields. It is a variant of the K-D tree that stores points in a tree of bounding boxes. Lucene uses BKD trees for all numeric and date fields.
+
+A BKD tree recursively partitions the data space. At each level, it splits the points along one dimension (the dimension with the widest spread). The split point is the median value. The tree is stored as a sorted array of leaf blocks, each containing up to 1,024 points.
+
+For a range query like `price >= 100 AND price <= 200`, the BKD tree traversal visits only the leaf blocks that overlap the query range. This is much faster than scanning all documents.
+
+BKD trees support multiple dimensions. A 2D query like `price >= 100 AND price <= 200 AND rating >= 4.0` traverses the tree once, visiting only the blocks that satisfy both constraints.
+
+<AsciiDiagram
+  id="search-system/bkd-tree"
+  title="BKD Tree Structure for Range Queries"
+  alt="A BKD tree partitioning 2D space (price and rating) into bounding boxes, showing how a range query visits only overlapping leaf blocks"
+  caption="Figure 3: BKD tree for numeric range queries"
+  content={`
+2D Space: Price (x-axis) and Rating (y-axis)
+
+Rating
+^
+|  +-------+-------+-------+-------+
+|  |       |       |       |       |
+|  |  B3   |  B7   |  B11  |  B15  |
+|  |       |       |       |       |
+|  +-------+-------+-------+-------+
+|  |       |       |       |       |
+|  |  B2   |  B6   |  B10  |  B14  |
+|  |       |       |       |       |
+|  +-------+-------+-------+-------+
+|  |       |#######|#######|       |
+|  |  B1   |##B5  #|##B9  #|  B13  |
+|  |       |#######|#######|       |
+|  +-------+-------+-------+-------+
+|  |       |#######|#######|       |
+|  |  B0   |##B4  #|##B8  #|  B12  |
+|  |       |#######|#######|       |
+|  +-------+-------+-------+-------+
+|                          Price --->
+|  Query range: price [100, 200], rating [3.0, 5.0]
+|  Blocks visited: B4, B5, B8, B9 (shaded)
+|  Blocks skipped: 12 of 16 (75 percent reduction)
+`} />
+
+## Request Lifecycle
+
+A single search request passes through 12 distinct stages. Each stage has a latency budget and specific failure modes.
+
+### Stage 1: Authentication and Authorization
+
+The API gateway validates the request. It checks API keys, rate limits, and resource permissions. A search API key might be restricted to certain indexes or query types. Authorization adds 1 to 3 milliseconds.
+
+### Stage 2: Query Parsing
+
+The raw query string or JSON body is parsed into an internal query tree. The parser handles:
+
+- Query type detection: full-text, boolean, geo, or aggregation
+- Syntax validation: malformed queries are rejected with specific error codes
+- Parameter extraction: pagination, sorting, field selection, and response formatting options
+
+Invalid queries are rejected at this stage before any index work begins. This prevents wasted computation on malformed requests.
+
+### Stage 3: Query Rewriting and Expansion
+
+The query tree is passed through a rewrite pipeline. Each rewrite plugin can modify the tree. Common rewrites include:
+
+- **Spell correction**: if the term "noice" has zero document frequency, replace it with "noise" and add a suggestion
+- **Synonym expansion**: replace "laptop" with a boolean OR of synonyms: `("laptop" OR "notebook" OR "ultrabook")`
+- **Stemming override**: if the user explicitly quoted a term, skip stemming for that term
+- **Template expansion**: replace named variables like `$current_date` with their actual values
+- **Permission filters**: inject tenant-specific filters for multi-tenant indexes
+
+Rewrite plugins are ordered by priority. The total rewrite time should stay under 2 milliseconds.
+
+### Stage 4: Query Planning
+
+The rewritten query tree is optimized for execution. The planner determines:
+
+- The order of term lookups: the rarest term is processed first because it produces the smallest intermediate result set
+- The use of cached results: frequent queries skip the full execution path
+- The filter pushdown strategy: filters that can be applied during index lookup (like date ranges) are injected into the term enumeration
+
+Query planning is a critical optimization. A poorly planned query scans 10x more data than necessary.
+
+### Stage 5: Index Segment Selection
+
+The query is dispatched to each index segment. Segments that are entirely excluded by the query (for example, a date range that excludes documents in a segment) are skipped. This is called segment pruning.
+
+Segment pruning uses the segment's metadata: min/max values for each field, term frequency statistics, and document count. A segment that contains no documents matching the query's date range is skipped entirely.
+
+### Stage 6: Term Enumeration and Posting List Fetching
+
+For each segment, the query terms are looked up in the term dictionary. The dictionary is a sorted map (implemented as a finite state transducer or a block tree) that maps terms to their posting list locations.
+
+The posting list is fetched from disk or from the OS page cache. Hot terms (frequently queried terms) are cached in memory. Cold terms require a disk seek. A well-tuned system keeps the term dictionary and the most frequently accessed posting lists in memory.
+
+### Stage 7: Posting List Intersection
+
+The posting lists for all query terms are intersected. The intersection algorithm uses the skip lists described earlier. The result is a set of document IDs that contain all query terms.
+
+For phrase queries, the intersection also verifies term positions. The system checks that the terms appear in the correct order with the correct spacing. For proximity queries, the system checks that terms are within a specified distance.
+
+### Stage 8: Filter Application
+
+The intersected document IDs are combined with the filter constraints. The filter engine loads the relevant bitmaps and applies boolean logic. The result is a filtered set of candidate document IDs.
+
+Filter application is fast because it operates on integer IDs and bitmaps, not on strings or documents. The entire filter operation for a query with 5 filters typically completes in under 1 millisecond.
+
+### Stage 9: Scoring
+
+Each document in the filtered candidate set receives a score. The scoring engine evaluates:
+
+- BM25 score for each matching term
+- Coordination factor: documents that match more query terms get a higher score
+- Field boosts: some fields (like title) are more important than others (like description)
+- Custom scoring scripts: if configured
+
+Scoring is the most CPU-intensive stage. For a candidate set of 10,000 documents and 3 query terms, the scoring engine performs 30,000 BM25 evaluations. This takes 5 to 15 milliseconds depending on the hardware.
+
+### Stage 10: Aggregation and Faceting
+
+While the scoring engine processes the candidate set, the aggregation engine computes:
+
+- **Term aggregations**: for each requested field, count documents per unique value
+- **Range aggregations**: for numeric fields, count documents in each bucket
+- **Date histogram**: for date fields, count documents per time interval
+- **Geo distance**: for geo fields, count documents at each distance tier
+
+Aggregations are computed on the fly. For large result sets (over 100,000 matches), the aggregation engine samples the data or uses cardinality approximation to stay within the latency budget.
+
+### Stage 11: Result Merging and Sorting
+
+The results from all segments are merged into a single sorted list. The merge algorithm is a multi-way merge: it reads the top N documents from each segment's sorted results and produces the globally sorted top N.
+
+The merge is efficient because each segment returns its results pre-sorted. The merge takes O(K * log S) where K is the total number of documents from all segments and S is the number of segments.
+
+### Stage 12: Response Building
+
+The final sorted results are mapped to full document metadata. The response builder:
+
+- Fetches stored fields for the top N documents (from the document store or cache)
+- Formats the response according to the requested format (JSON, XML, or custom)
+- Includes metadata: total hits, query time, pagination tokens, suggestions, and facet counts
+- Applies field-level security: redacts fields that the user is not authorized to see
+
+Response building adds 1 to 5 milliseconds for the top 20 documents.
+
+## Consistency and State
+
+A search system manages several types of state. Each type has different consistency requirements.
+
+### Scenario 1: Index Freshness
+
+When a document is indexed, how soon is it searchable? This is the index freshness trade-off.
+
+- **Near real-time (NRT)**: documents are searchable within 1 second of indexing. The system writes to an in-memory buffer that is refreshed every second. This is the default in Elasticsearch.
+- **Real-time**: documents are searchable immediately. Every write is written to the in-memory index before the write acknowledgment is returned. This is 2-3x slower for writes.
+- **Batch**: documents are searchable after a manual refresh or a scheduled interval (30 seconds to 1 hour). This is used for large bulk imports.
+
+The consistency model is eventual. A document that was just indexed might not appear in a query that started before the refresh. This is acceptable for most search applications. For use cases requiring immediate consistency (like search within a single user's email), the system uses a separate real-time index.
+
+### Scenario 2: Distributed Consistency
+
+In a distributed search cluster, each shard is a separate index. When a document is indexed, it is routed to one primary shard. The primary shard indexes the document and replicates it to replica shards.
+
+If the primary shard fails before replication completes, the document is lost. The system recovers by reindexing from the source of truth (the database or the write-ahead log).
+
+Search queries are sent to all shards (primary or replica). Each shard returns its local results. The coordinator merges them. This means a query might see a document on one shard but not on another, depending on the replication state.
+
+### Scenario 3: Concurrent Updates
+
+Two users updating the same document simultaneously can cause race conditions. The search system uses optimistic concurrency control:
+
+- Each document has a version number (or primary term)
+- An update request includes the expected version
+- If the version has changed, the update is rejected with a conflict error
+- The client retries with the new version
+
+This is the same approach used by databases for optimistic locking. The conflict rate is low for most search workloads because the same document is rarely updated by multiple users in the same second.
+
+### Scenario 4: Cluster State
+
+The cluster state (which nodes, which shards, which replicas) must be consistent across all nodes. Elasticsearch uses Zen Discovery (based on a quorum-based consensus protocol). Nodes that disagree on the cluster state cannot serve queries.
+
+If a network partition occurs, the cluster may enter a split-brain scenario. The minority side stops serving queries. When the partition heals, the minority side rejoins and reconciles its state with the majority.
+
+## Performance
+
+Search system performance is measured by three metrics: latency, throughput, and precision.
+
+### Latency
+
+Search latency is dominated by:
+
+- **Disk I/O**: fetching posting lists from disk. The OS page cache mitigates this for hot data. For cold data, each segment touch costs 5 to 10 milliseconds.
+- **CPU**: scoring and aggregation. A complex query with 10 aggregations uses 50 milliseconds of CPU time.
+- **Network**: in a distributed cluster, fan-out queries add network round-trip time. Each shard touch adds 1 to 3 milliseconds.
+
+Total latency for a typical query: 50 to 200 milliseconds for the first result, 200 to 500 milliseconds for aggregations.
+
+### Throughput
+
+A single search node handles 500 to 2,000 queries per second (QPS) on modern hardware. The bottleneck is usually CPU, not I/O. Scaling throughput is achieved by:
+
+- **Adding replicas**: each replica is a copy of the index that can serve queries. With 3 replicas, throughput triples.
+- **Shard optimization**: the right number of shards is a function of total data size and query complexity. A rule of thumb is 20-40 GB per shard and 0.5-1 shard per CPU core.
+- **Query caching**: caching the results of frequent queries reduces the load on the index. A cache hit avoids all index lookups, scoring, and aggregation.
+
+### Precision
+
+Precision is measured with standard information retrieval metrics:
+
+- **Precision at K (P@K)**: what fraction of the top K results are relevant? P@10 is the most common metric for web search.
+- **Recall at K (R@K)**: what fraction of all relevant documents appear in the top K results?
+- **Mean Average Precision (MAP)**: the average precision across all query-document pairs.
+- **Normalized Discounted Cumulative Gain (NDCG)**: a graded relevance metric that accounts for the position of relevant documents.
+
+Production systems track precision through A/B testing. A 1 percent improvement in NDCG translates to a measurable improvement in user engagement.
+
+## Configuration
+
+A production search system has dozens of configuration parameters. The most important ones are:
+
+### Index Configuration
+
+- **Number of shards**: determines the maximum write throughput and query parallelism. More shards means faster writes and more parallel queries, but higher merge overhead. Default: 1 shard per 20-40 GB of data.
+- **Number of replicas**: determines query throughput and fault tolerance. Each replica doubles query capacity. Default: 1 replica.
+- **Refresh interval**: how often the in-memory buffer is flushed to a searchable segment. Lower values improve freshness but increase segment count. Default: 1 second.
+- **Merge policy**: controls when and how segments are merged. Options include tiered (default), log byte size, and scheduled. Tiered merge is the best general-purpose choice.
+
+### Query Configuration
+
+- **Max result window**: the maximum number of results that can be returned. Default: 10,000. Higher values use more memory and CPU.
+- **Timeout**: the maximum time a query can take before being canceled. Default: 30 seconds. Queries that exceed this return partial results.
+- **Max concurrent shard requests**: the number of shard requests that can run in parallel per node. Default: 500. Higher values increase throughput but risk memory pressure.
+
+### Memory Configuration
+
+- **Indexing buffer**: the memory allocated for the in-memory indexing buffer. Default: 10 percent of the JVM heap. Larger buffers improve indexing throughput but reduce memory for caches.
+- **Cache size**: the memory allocated for filter cache, field data cache, and query cache. Default: 20 percent of the JVM heap.
+- **Circuit breaker**: the memory limit for individual queries. Queries that exceed this limit are terminated. Default: 60 percent of the JVM heap.
+
+### Tuning Methodology
+
+The optimal configuration depends on the workload. Follow this methodology:
+
+1. Measure baseline performance with default settings
+2. Identify the bottleneck: CPU, I/O, or memory
+3. Adjust one parameter at a time
+4. Re-measure and compare
+5. Repeat until the bottleneck shifts or performance targets are met
+
+Common tuning scenarios:
+
+- **Write-heavy workload**: increase the indexing buffer, decrease the refresh interval to 30 seconds, and use fewer shards
+- **Read-heavy workload**: add replicas, increase the query cache, and tune the merge policy for fewer segments
+- **Mixed workload**: balance between indexing and query resources. Use separate node roles for indexing and querying
+
+## Summary
+
+The search system is a layered architecture with specialized data structures at each layer. The inverted index with skip lists enables fast term lookup. Roaring bitmaps provide efficient filter evaluation. BKD trees support numeric range queries.
+
+A search request passes through 12 stages, from authentication to response building. Each stage has a specific latency budget and optimization strategy.
+
+Consistency in a search system is eventual by design. The system trades immediate consistency for write throughput and query performance. Understanding the consistency model is essential for building applications that use search as a primary data access pattern.
+
+## Additional Data Structures
+
+### Data Structure 4: Finite State Transducer (FST) for Term Dictionary
+
+The term dictionary maps each indexed term to its metadata: document frequency, pointer to the posting list, and optional payload. For an index with 10 million unique terms, the dictionary must be compact enough to fit in memory and fast enough for random lookups.
+
+A Finite State Transducer (FST) is the data structure used by Lucene for the term dictionary. An FST is a directed acyclic graph where each edge is labeled with a character. The FST encodes all terms in the dictionary as paths from the start state to an accepting state.
+
+The FST is highly compact. It exploits shared prefixes and suffixes. The terms "cat," "cats," "caterpillar," and "cater" share the prefix "cat-" and are encoded as a single path with branches. The total size of the FST is typically 10 to 20 percent of the raw term text size.
+
+Lookup is O(length of term) by traversing the FST edges. An FST with 10 million terms fits in 200 to 500 MB of memory. Lookup time is 50 to 200 nanoseconds per character.
+
+### Data Structure 5: Doc Values for Sorting and Aggregation
+
+Doc values are a column-oriented storage format for document-level values. They are used for sorting, aggregations, and scripting. Unlike the inverted index (which maps terms to documents), doc values map documents to values.
+
+Doc values are stored on disk as a columnar structure. For each document, the doc values store the value of a specific field. The storage format is optimized for sequential access: when the system needs to sort 10,000 documents by price, it reads the price doc values for those documents in sequence.
+
+The columnar format provides two advantages:
+
+1. **Compression**: values for the same field are stored together, enabling better compression. Integers are delta-encoded and bit-packed. Strings are stored in a sorted dictionary with ordinal encoding.
+
+2. **Efficient access**: sorting by price requires reading only the price column, not the entire document. This is 10x to 100x more efficient than reading the full document store.
+
+Doc values are enabled by default in Elasticsearch for all fields except text. They consume approximately 20 to 30 percent of the raw data size.
+
+### Data Structure 6: Completion Suggester Trie
+
+The completion suggester enables autocomplete functionality. As the user types, the system suggests completions of the query. The completion suggester is implemented as a Finite State Transducer (FST) built from the indexed terms.
+
+The completion FST is augmented with weights. Each complete term has a weight (based on term frequency, popularity, or a custom score). The suggester returns the top K completions with the highest weights.
+
+The completion FST is built at index time and loaded into memory at query time. It supports prefix matching: given a prefix, the FST enumerates all terms that start with that prefix, sorted by weight. For a prefix of 3 characters, the suggester returns results in under 5 milliseconds.
+
+The completion FST is stored separately from the main term dictionary FST. This allows the completion suggester to use different weights (popularity-based) than the main search (BM25-based).
+
+## Request Lifecycle Details
+
+### Stage 4 Extended: Query Planning Algorithms
+
+The query planner uses several optimization techniques:
+
+**Term ordering by cost**: The planner estimates the cost of each term lookup based on the term's document frequency. The rarest term is processed first because it produces the smallest intermediate result set. For a query with terms "the" (10 million docs) and "algorithm" (50,000 docs), the planner processes "algorithm" first.
+
+**Filter pushdown**: Filters that can be evaluated during term enumeration are pushed down into the index lookup. A date range filter is applied during document enumeration, not after. This reduces the number of documents that pass through the full scoring pipeline.
+
+**Boolean simplification**: The query tree is simplified using boolean algebra. `(A AND B) OR (A AND C)` is simplified to `A AND (B OR C)`. This eliminates redundant term lookups.
+
+**Cost-based optimization**: The planner estimates the cost of different execution plans and chooses the cheapest. The cost model considers the number of documents to process, the I/O cost of fetching posting lists, and the CPU cost of scoring.
+
+### Stage 10 Extended: Aggregation Execution
+
+Aggregations are computed on the candidate set after filtering but before pagination. The aggregation engine processes each aggregation in a pipeline:
+
+1. **Leaf aggregations**: compute simple statistics like count, sum, min, max, and average. These are computed by iterating over the candidate set and accumulating values.
+
+2. **Terms aggregations**: count documents per unique value. The engine uses a hash map to accumulate counts. For high-cardinality fields (like user IDs), the hash map can grow large. The engine limits the number of buckets (default: 10) and discards low-frequency buckets.
+
+3. **Range aggregations**: count documents in each bucket. The engine iterates over the candidate set and increments the appropriate bucket counter. Range buckets are predefined by the query.
+
+4. **Nested aggregations**: compute aggregations within aggregations. For example, "count products per brand, and within each brand, count per price range." The engine builds a tree of aggregation results.
+
+The aggregation engine uses approximation for large result sets. The `cardinality` aggregation uses HyperLogLog (HLL) to estimate distinct counts. HLL uses 12 KB of memory per aggregation and provides 99 percent accuracy for result sets of any size.
+
+## Compression Techniques
+
+Search systems use compression aggressively to reduce storage and improve query performance.
+
+### Posting List Compression
+
+Posting lists are compressed using delta encoding and variable-length encoding:
+
+- **Delta encoding**: Instead of storing absolute document IDs [7, 12, 18, 31, 42], store the differences [7, 5, 6, 13, 11]. Deltas are smaller numbers.
+- **Variable-length encoding**: Small numbers use fewer bytes. A delta of 5 fits in 1 byte. A delta of 13,000 uses 2 bytes. Lucene uses a variable-length encoding called VInt.
+
+The combination reduces posting list size by 60 to 80 percent. A posting list of 1 million 32-bit integers (4 MB) compresses to 800 KB to 1.6 MB.
+
+### Term Dictionary Compression
+
+The term dictionary FST provides natural compression through prefix sharing. The FST also uses suffix sharing: terms that share suffixes are encoded as converging paths.
+
+Lucene uses a block-tree term dictionary for additional compression. Terms are grouped into blocks of 128 terms. Each block stores the shared prefix once and the suffixes for each term. The block structure enables efficient prefix queries and range scans.
+
+### Stored Field Compression
+
+Stored fields (the original field values) are compressed using general-purpose compression algorithms:
+
+- **LZ4**: fast compression (200 MB/s), moderate compression ratio (2x to 3x)
+- **ZSTD**: slower compression (100 MB/s), better compression ratio (3x to 5x)
+- **Best_speed**: LZ4 for indexing, ZSTD for archival
+
+The default compression for stored fields is LZ4. This provides a good balance between compression speed (important during indexing) and compression ratio (important for storage efficiency).
+
+## Testing and Validation
+
+Testing a search system requires specialized approaches.
+
+### Relevance Testing
+
+Relevance is tested using a judgment list: a set of queries with manually labeled relevant documents. The system runs each query and compares the results against the judgment list.
+
+Metrics: NDCG@10, P@10, MAP, and recall@100. A regression test suite runs these metrics after every relevancy change. A 1 percent drop in NDCG triggers a code review.
+
+### Performance Testing
+
+Performance is tested using a query load generator. The generator replays real query logs or synthetic query patterns. Key metrics: P50, P99, and P99.9 latency, throughput (QPS), and error rate.
+
+Performance tests must be run on hardware that matches production. A test on a developer laptop does not predict production performance.
+
+### Chaos Testing
+
+Chaos tests verify the system's resilience:
+
+- Kill a data node: verify that queries continue to return results
+- Increase network latency: verify that query timeouts are handled
+- Saturate I/O: verify that indexing backpressure works
+- Corrupt an index segment: verify that the segment is recovered or skipped
+
+## Advanced Configuration Parameters
+
+### Indexing Parameters
+
+**index.codec**: The compression codec for stored fields and doc values. Options: `default` (LZ4), `best_compression` (ZSTD). Best compression reduces storage by 30 to 40 percent at the cost of 10 to 20 percent slower indexing.
+
+**index.merge.scheduler.max_thread_count**: The number of threads used for segment merging. Default: `Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 2))`. For nodes with SSDs, increase this to 4. For HDDs, keep it at 1.
+
+**index.merge.policy.segments_per_tier**: The target number of segments per tier. Default: 10. Lower values produce fewer segments but increase merge overhead. Higher values produce more segments but reduce merge overhead.
+
+**index.translog.durability**: The durability of the transaction log. `request` (default): fsync and acknowledge after every write. `async`: fsync every 5 seconds. Async mode increases indexing throughput by 2x to 3x but risks data loss if the node crashes.
+
+### Query Parameters
+
+**search.max_buckets**: The maximum number of aggregation buckets. Default: 65,536. Queries that request more buckets are rejected. This prevents memory exhaustion from high-cardinality aggregations.
+
+**search.default_search_timeout**: The default timeout for search queries. Default: -1 (no timeout). A timeout of 30 seconds is recommended for production to prevent long-running queries from consuming resources.
+
+**indices.query.bool.max_clause_count**: The maximum number of clauses in a boolean query. Default: 4,096. Queries with more clauses are rejected. This prevents complex queries from consuming excessive CPU.
+
+### Circuit Breakers
+
+Circuit breakers prevent queries from causing out-of-memory errors.
+
+**indices.breaker.total.limit**: The total memory limit for all circuit breakers. Default: 70 percent of the JVM heap. When the limit is exceeded, the query is terminated with a CircuitBreakingException.
+
+**indices.breaker.fielddata.limit**: The memory limit for field data (used for aggregations and sorting). Default: 40 percent of the JVM heap. Aggregations that exceed this limit are rejected.
+
+**indices.breaker.request.limit**: The memory limit for individual query requests. Default: 60 percent of the JVM heap. Queries that exceed this limit are rejected.
+
+**network.breaker.inflight_requests.limit**: The memory limit for in-flight HTTP requests. Default: 100 percent of the JVM heap. This prevents the node from being overwhelmed by concurrent requests.
+
+## Debugging and Profiling
+
+### Common Performance Issues
+
+**High CPU usage**: Usually caused by expensive scoring or aggregation. Check if queries have many `should` clauses or high-cardinality aggregations. Use the Elasticsearch Profile API to identify the slowest components.
+
+**High disk I/O**: Usually caused by segment merging or cold posting list access. Check the merge rate and the segment count. If the segment count is high, the merge policy is not keeping up. If the merge rate is high, the indexing rate is too high for the hardware.
+
+**High memory usage**: Usually caused by the field data cache or the query cache. Check the cache sizes and eviction rates. If the field data cache is thrashing, increase the memory or reduce the number of aggregation fields.
+
+**Slow queries**: Use the Profile API to identify the slowest stage. If scoring is slow, simplify the scoring function. If aggregation is slow, reduce the number of buckets. If term lookup is slow, check if the term dictionary is in memory.
+
+### The Profile API
+
+Elasticsearch's Profile API provides detailed timing information for each query component:
+
+```json
+GET /my_index/_search
+{
+  "profile": true,
+  "query": { "match": { "title": "search" } }
+}
+```
+
+The response includes:
+
+- `time`: total time for the query component
+- `breakdown`: detailed timing for sub-components (score, build_scorer, create_weight, next_doc, match)
+- `children`: nested breakdown for compound queries
+
+Use the Profile API to identify the slowest component and focus optimization efforts there.
+
+### Slow Log
+
+Elasticsearch's slow log captures queries that exceed a configurable threshold:
+
+```yaml
+index.search.slowlog.threshold.query.warn: 10s
+index.search.slowlog.threshold.query.info: 500ms
+index.search.slowlog.threshold.query.debug: 200ms
+index.search.slowlog.threshold.query.trace: 100ms
+```
+
+Slow logs are indexed in a separate index for analysis. Review slow logs weekly to identify recurring expensive queries and optimize them.
+
+## Index Templates and Dynamic Mapping
+
+### Index Templates
+
+Index templates define the configuration for new indices. They ensure consistency across indices:
+
+```json
+PUT _index_template/logs_template
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 5,
+      "number_of_replicas": 1,
+      "refresh_interval": "30s"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "message": { "type": "text" },
+        "severity": { "type": "keyword" },
+        "service": { "type": "keyword" }
+      }
+    }
+  }
+}
+```
+
+Templates are applied when the index is created. Changes to the template do not affect existing indices.
+
+### Dynamic Mapping
+
+Dynamic mapping automatically detects field types from the data. This is convenient but dangerous in production. A single malformed document can create a field with the wrong type, causing all subsequent queries on that field to fail.
+
+Best practices:
+
+- Disable dynamic mapping for production indices
+- Define all field types explicitly in the mapping
+- Use dynamic templates for known patterns (like `metric_*` fields)
+- Validate documents before indexing to ensure they match the expected schema
+
+## Node Recovery and Rebalancing
+
+When a search node fails, the cluster must detect the failure, recover the shards, and rebalance the cluster.
+
+### Failure Detection
+
+Elasticsearch uses a master election process with a configurable timeout:
+
+- `discovery.zen.ping_timeout`: time to wait for a ping response from another node (default: 3 seconds)
+- `discovery.zen.join_timeout`: time to wait for a node to join the cluster (default: 3 seconds)
+- `discovery.zen.master_election.wait_for_joins_timeout`: time to wait for enough master-eligible nodes to join (default: 30 seconds)
+
+When the master node detects a node failure, it promotes replica shards on surviving nodes to primary and allocates new replicas.
+
+### Recovery Throttling
+
+Shard recovery consumes significant I/O bandwidth. The recovery throttle prevents recovery from overwhelming the cluster:
+
+- `indices.recovery.max_bytes_per_sec`: maximum recovery bandwidth per node (default: 40 MB/s)
+- During recovery, the recovering shard is still searchable but with reduced performance
+- Recovery of a 50 GB shard takes 5 to 15 minutes at the default throttle rate
+
+### Rebalancing
+
+After recovery is complete, the cluster rebalances shards across nodes:
+
+- `cluster.routing.rebalance.enable`: controls when rebalancing occurs (default: `all`)
+- `cluster.routing.allocation.balance.shard`: weight for balancing shard count (default: 0.45)
+- `cluster.routing.allocation.balance.index`: weight for balancing per-index shard count (default: 0.55)
+
+Rebalancing moves shards from nodes with more shards to nodes with fewer shards. The rebalance threshold is configurable: shards will not be moved unless the imbalance exceeds the threshold.
+
+## Summary
+
+This deep dive covered the internal architecture of a search system: the ingestion pipeline, the segment-based index structure, the query execution layer, and the distributed coordination layer. You learned about six key data structures: the inverted index with skip lists, roaring bitmaps for filtering, BKD trees for range queries, FSTs for the term dictionary, doc values for sorting and aggregations, and the completion suggester trie for autocomplete functionality. Each data structure serves a specific purpose and is optimized for its workload. Together, they form the foundation of every production search system.
+
+The 12-stage request lifecycle provides a framework for understanding where time is spent in a search query. Scoring and aggregation dominate the latency budget, accounting for 55 percent of total query time. Compression techniques reduce storage requirements by 60 to 80 percent for posting lists and 2x to 5x for stored fields. Understanding these internals helps you make informed decisions about configuration, optimization, and capacity planning.
+
+Performance tuning is a systematic process of measurement, adjustment, and re-measurement. The key parameters are shard count, replica count, refresh interval, merge policy, and memory allocation. Use the Profile API and slow logs to identify bottlenecks. Circuit breakers protect the cluster from out-of-memory errors caused by expensive queries or aggregations. Template configurations and explicit mappings ensure consistency across indices. Recovery throttling prevents node failures from cascading into cluster-wide instability.
+
+Mastering these internals enables you to design, deploy, and operate search systems that perform reliably at any scale. The concepts in this section translate directly to real-world decisions about cluster sizing, query optimization, and capacity planning. With this foundation, you are ready to explore specific trade-offs and failure modes in the next section.
+
+The search system deep dive equips you with the knowledge to understand how production search engines work under the hood, enabling informed decisions about architecture, configuration, and performance optimization. Use this knowledge to design systems that balance speed, relevance, and reliability at any scale. Work through the architecture section next to see how these components come together in a distributed system.
+
+The key takeaway: search performance is determined by the quality of your data structures, the efficiency of your query execution, and the effectiveness of your caching strategy. Master these three areas and you can build a search system that performs at any scale. From a single-node prototype to a multi-region cluster handling millions of queries per day, the fundamental principles remain the same.
+
+
+

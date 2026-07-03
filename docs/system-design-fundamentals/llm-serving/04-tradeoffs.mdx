@@ -1,0 +1,282 @@
+---
+id: llm-serving-tradeoffs
+title: LLM Serving — Trade-offs & Failure Modes
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## The Core Tension
+
+When you design an LLM serving system, you are explicitly trading **latency for throughput**. You can serve each request instantly on a dedicated GPU and achieve 100ms response times. But you will need one GPU per concurrent user, which costs $30,000 per GPU per month. You can batch 256 requests together on one GPU and achieve 10x higher throughput per dollar. But each request will wait in the queue, and the time to first token will be measured in seconds, not milliseconds.
+
+The fundamental equation is: **Total cost = (tokens per day × GPU cost per token) + (latency SLA violations × business cost).** Every design decision is a negotiation between these two terms. The optimal point is where the marginal cost of reducing latency equals the marginal cost of latency SLA violations.
+
+## Decision Matrix
+
+| Decision Point | Option A | Option B | Choose A When | Choose B When |
+|---------------|----------|----------|--------------|--------------|
+| Batch strategy | Dynamic (continuous batching) | Static (fixed batch) | Request lengths vary widely | All requests generate similar token counts |
+| Model size | 7B (small, fast) | 70B (large, accurate) | Latency under 200ms required | Accuracy is the priority |
+| Precision | FP16 (full precision) | FP8/INT4 (quantized) | Maximum accuracy required | Memory or throughput is the bottleneck |
+| GPU allocation | Dedicated per client | Shared pool | Predictable traffic, SLA guarantees | Variable traffic, cost optimization |
+| Caching | Cache all responses | No caching | Many identical prompts (>10% hit rate) | All prompts are unique |
+| Streaming | SSE (token-by-token) | Wait for complete response | Chat / interactive use cases | Batch / offline processing |
+| Model parallelism | Tensor parallelism | Pipeline parallelism | Model fits on 2-8 GPUs | Model is very deep (100+ layers) |
+| Deployment | Self-hosted on-premise | Cloud API (OpenAI, etc.) | Predictable high volume, compliance | Variable traffic, rapid prototyping |
+
+## CAP Theorem Positioning
+
+The LLM serving system is an **AP** (Available and Partition-tolerant) system. When the network partitions, the system continues to serve requests, even if it means losing consistency across inference nodes.
+
+<AsciiDiagram id="llm-serving-tradeoffs/cap-positioning" alt="A CAP triangle diagram showing LLM serving in the AP corner with CP and CA options labeled" caption="Figure 1: CAP theorem positioning — LLM serving prioritizes availability and partition tolerance over consistency" content={`
+  ┌───────────────────────────────────────────────────────────────────────────┐
+  │                        CAP THEOREM TRIANGLE                                 │
+  └───────────────────────────────────────────────────────────────────────────┘
+
+               ┌────────────────────────┐
+               │      CONSISTENCY        │
+               │  (All nodes see same    │
+               │   data at same time)    │
+               └────────────┬───────────┘
+                            │
+               ┌────────────┴────────────┐
+               │                         │
+               │    CP Systems            │
+               │    (ZooKeeper, etcd)    │
+               │                         │
+               └────────────┬────────────┘
+                            │
+  ┌───────────────┐          │          ┌───────────────────┐
+  │  AVAILABILITY   │         │         │  PARTITION          │
+  │  (Every request  │         │         │  TOLERANCE          │
+  │   gets response) │         │         │  (System continues │
+  │                  │         │         │   despite network  │
+  │                  │         │         │   splits)          │
+  └────────┬────────┘         │         └────────┬──────────┘
+           │                  │                    │
+           └──────────────────┴────────────────────┘
+                              │
+                    ┌─────────┴──────────────┐
+                    │                         │
+                    │  AP Systems              │
+                    │  ★ LLM Serving System   │
+                    │  (DNS, CDN, Cassandra)  │
+                    │                         │
+                    └─────────────────────────┘
+`} />
+
+**What this means in practice:** When the network between the API gateway and the inference cluster partitions, the gateway continues to accept requests. It queues them locally and retries when the connection is restored. If the inference node crashes during a request, the gateway retries on another node — the request may be processed twice, but it is never dropped.
+
+**What it does NOT mean:** The system does not guarantee that every request is processed exactly once. Duplicates can happen. Requests can be lost if the gateway crashes before forwarding them. The system trades strict consistency for high availability.
+
+## Failure Modes
+
+### Failure 1: GPU OOM (Out of Memory)
+
+**What happens:** The KV cache grows beyond available GPU memory. The CUDA memory allocator fails. The inference process crashes with a CUDA OOM error. All in-flight requests on that GPU are lost.
+
+**Why it happens:** The batch builder added too many sequences to the batch, or one request generated far more tokens than expected (prompt injection, infinite loop), or the KV cache manager failed to free blocks from completed requests.
+
+**Blast radius:** All requests on the crashed GPU are lost. The GPU is unavailable for 5-10 minutes while the process restarts and reloads model weights. Other GPUs in the cluster are unaffected.
+
+<AsciiDiagram id="llm-serving-tradeoffs/gpu-oom" alt="A diagram showing GPU memory filling up with KV cache blocks until the CUDA allocator fails with an OOM error" caption="Figure 2: GPU OOM — KV cache oversubscription causes CUDA memory allocation failure" content={`
+  Normal State:
+  ┌─────────────────────────────────────────────────────────────┐
+  │  GPU Memory (80 GB HBM)                                      │
+  │  ┌───────────────────────┬──────────────────┬──────────────┐│
+  │  │ Model Weights (35 GB) │ KV Cache (12 GB) │ Free (33 GB) ││
+  │  └───────────────────────┴──────────────────┴──────────────┘│
+  │  Utilization: 59%                                           │
+  └─────────────────────────────────────────────────────────────┘
+
+  Memory Leak (block not freed):
+  ┌─────────────────────────────────────────────────────────────┐
+  │  GPU Memory (80 GB HBM)                                      │
+  │  ┌───────────────────────┬─────────────────────────────────┐│
+  │  │ Model Weights (35 GB) │ KV Cache (growing... 45 GB)     ││
+  │  └───────────────────────┴─────────────────────────────────┘│
+  │  Utilization: 100%                                           │
+  │  CUDA Error: out of memory occurred at line 328             │
+  └─────────────────────────────────────────────────────────────┘
+
+  Recovery:
+  1. Process crashes → CUDA context destroyed
+  2. Kubernetes detects crash → restarts pod (30s)
+  3. Model weights reloaded → 45s
+  4. Health check passes → 5s
+  5. Pod back in service → total: ~80s downtime
+`} />
+
+**Detection:** GPU metrics dashboard shows memory utilization at 100%. CUDA error logs show "out of memory." Inference process disappears from the cluster. The error rate spikes to 100% for that GPU.
+
+**Recovery:**
+1. Kubernetes restarts the crashed pod (automatic, 30 seconds)
+2. Model weights are reloaded from S3 (45 seconds)
+3. Pre-warming reduces load time to 10 seconds (model kept in host memory)
+4. GPU returns to the active pool after health check passes (5 seconds)
+5. Total downtime: 60-90 seconds
+
+### Failure 2: GPU Thermal Throttling
+
+**What happens:** The GPU temperature exceeds 85°C. The GPU driver reduces clock speed to cool down. Inference throughput drops by 50-70%.
+
+**Why it happens:** Sustained 100% GPU utilization generates heat faster than the cooling system can dissipate. Poor airflow in the datacenter rack. Failed cooling fan on the GPU.
+
+**Blast radius:** All requests on the throttled GPU experience 2-3x higher latency. Other GPUs in the same instance may also throttle if they share the same cooling system.
+
+**Detection:** GPU temperature metric exceeds 85°C. GPU clock speed drops below base frequency. Tokens-per-second metric drops by 50%. The inference latency P99 spikes.
+
+**Recovery:**
+1. Reduce batch size to lower GPU utilization (manual intervention)
+2. Route traffic away from the affected GPU (load balancer marks it as degraded)
+3. If persistent, schedule maintenance to replace the GPU or improve cooling
+4. Prevention: set GPU power limit to 80% (reduces max temperature by 10°C, throughput by 10%)
+
+### Failure 3: Model Hallucination / Quality Degradation
+
+**What happens:** The model starts producing nonsensical or harmful output. The quality degradation is not detected by the serving system — it only monitors latency and throughput, not output quality.
+
+**Why it happens:** A model update introduced a regression. The prompt format changed. The model was fine-tuned on corrupted data. The temperature or sampling parameters were misconfigured.
+
+**Blast radius:** All users receive low-quality responses. User trust erodes. In a customer-facing chatbot, this can cause PR crises and user churn.
+
+**Detection:** No automated detection in the serving system. Detection relies on user reports, manual review, or a separate quality monitoring system (LLM-as-judge, cosine similarity against expected outputs, toxicity detection).
+
+**Recovery:**
+1. Roll back to the previous model version (blue-green deployment, 5 minutes)
+2. Investigate the root cause: check the model weights, training data, and prompt templates
+3. Add regression tests: 100+ prompts with known expected outputs, run before every deployment
+4. Deploy a safety classifier in front of the model (classifies output before sending to user)
+
+### Failure 4: Network Partition Between GPUs
+
+**What happens:** The NVLink or InfiniBand connection between GPUs in a tensor-parallel group fails. The all-reduce operation hangs or times out. All inference on that GPU group stops.
+
+**Why it happens:** Physical cable failure, switch failure, or GPU driver crash. The all-reduce operation requires all GPUs in the tensor-parallel group to participate. If one GPU is unreachable, the operation cannot complete.
+
+**Blast radius:** The entire tensor-parallel group (4-8 GPUs) is affected. All requests being processed on those GPUs are lost. Other GPU groups in the cluster are unaffected.
+
+**Detection:** All-reduce timeout errors in the inference logs. GPU-to-GPU bandwidth metrics drop to zero. The scheduler detects that the GPU group has failed health checks.
+
+**Recovery:**
+1. The scheduler removes the entire GPU group from the active pool
+2. In-flight requests on the failed group are re-queued (up to 3 retries)
+3. The GPU group is replaced by Kubernetes (pod restart, 5-10 minutes)
+4. If the failure is physical (cable, switch), on-call engineer replaces the hardware
+
+### Failure 5: Tokenization Explosion
+
+**What happens:** A user sends a prompt that tokenizes to an unexpectedly large number of tokens. A 100-character string of repeated characters tokenizes to 50,000 tokens instead of 50. The KV cache explodes. The model runs out of memory.
+
+**Why it happens:** Tokenizers are sensitive to character repetition. Input like "A A A A A..." tokenizes to one token per "A", while "A" repeated 50,000 times produces 50,000 tokens. This is a known attack vector for prompt injection.
+
+**Blast radius:** The affected request consumes 50,000 tokens of KV cache instead of 500. This crowds out other requests in the batch. If the KV cache overflows, the GPU crashes.
+
+**Detection:** Token count metric shows a spike for a single request. The prefill phase takes 10x longer than expected. The KV cache memory usage spikes.
+
+**Recovery:**
+1. Enforce a maximum token limit per request (e.g., 100,000 tokens)
+2. Pre-check the tokenized length before admitting to the batch
+3. Reject requests that exceed the token limit with HTTP 413 (Payload Too Large)
+4. Prevention: rate limit by token count, not just request count
+
+## Anti-Patterns Hall of Shame
+
+<AsciiDiagram id="llm-serving-tradeoffs/single-gpu-anti-pattern" alt="A side-by-side comparison showing the single-GPU anti-pattern vs the correct multi-GPU distributed serving pattern" caption="Figure 3: Single-GPU anti-pattern vs multi-GPU serving — the queue grows unbounded on the single GPU" content={`
+  ANTI-PATTERN: Single GPU, All Requests     CORRECT PATTERN: Distributed GPU Pool
+  ────────────────────────────────             ───────────────────────────────────
+
+  [Users]                             [Users]
+     │                                    │
+     │  all requests to one GPU            │  requests distributed by load balancer
+     v                                    v
+  ┌──────────────┐                  ┌──────────────┐ ┌──────────────┐
+  │  Single GPU   │                  │  GPU Pool     │ │  GPU Pool     │
+  │  Queue: 500   │                  │  Node 1       │ │  Node 2       │
+  │  wait: 45s   │                  │  Queue: 20    │ │  Queue: 15    │
+  └──────┬───────┘                  └──────┬───────┘ └──────┬───────┘
+         │                                 │                │
+         v                                 v                v
+  [All requests sequential]          [4 requests parallel] [4 requests parallel]
+  TTFT: 45s                          TTFT: 2s             TTFT: 1.5s
+  Throughput: 2 req/s                Throughput: 8 req/s
+  GPU util: 100% but useless         GPU util: 90% each
+`} />
+
+### Anti-Pattern 1: The Single GPU Bottleneck
+
+**The mistake:** Running all inference requests through a single GPU. The GPU is the most expensive resource, so the team tries to maximize its utilization by queuing requests.
+
+**Why it seemed reasonable:** The GPU is expensive ($30,000+). Using one GPU at 100% utilization seems efficient.
+
+**What went wrong:** The queue grows without bound. At 10 requests per second with 5-second responses, the queue depth is 50 requests per second. TTFT exceeds 30 seconds. Users time out and retry, making the queue worse. The single GPU is a single point of failure — when it crashes, the entire service is down.
+
+**The correct pattern:** Multiple GPU instances behind a load balancer. Each instance handles a fraction of the traffic. If one fails, traffic is routed to the others. The queue depth per instance stays manageable.
+
+### Anti-Pattern 2: The Fixed-Batch Trap
+
+**The mistake:** Using a fixed batch size. The system waits until the batch is full before running inference, even if some requests are waiting.
+
+**Why it seemed reasonable:** Larger batches mean higher GPU utilization. Running inference with a partially filled batch wastes GPU capacity.
+
+**What went wrong:** A request that arrives when the batch has 1 slot open waits for 63 more requests to fill the batch. With 10 requests per second, that is 6.3 seconds of wait time. The first request in the batch waits the longest. Every request experiences the same latency regardless of its urgency.
+
+**The correct pattern:** Continuous batching. Process requests as they arrive, adding them to the running batch dynamically. Never wait for a full batch — always process what you have.
+
+### Anti-Pattern 3: The One-Size-Fits-All Model
+
+**The mistake:** Using the same large model (70B) for all requests, regardless of complexity.
+
+**Why it seemed reasonable:** The large model is the most capable. Using it for everything ensures the best quality.
+
+**What went wrong:** Simple requests (translation, summarization, classification) pay the same latency and cost as complex reasoning tasks. A 70B model costs 10x more per token than a 7B model. The team spends $1.2M/month on GPU instances when 80% of requests could be handled by a 7B model.
+
+**The correct pattern:** Model routing. A classifier (small, fast model) determines the request complexity. Simple requests go to a 7B model (fast, cheap). Complex requests go to a 70B model (slow, expensive). This reduces cost by 60% while maintaining quality for the hard cases.
+
+### Anti-Pattern 4: The No-Cache Policy
+
+**The mistake:** Never caching responses. Every request runs inference from scratch.
+
+**Why it seemed reasonable:** Every prompt is unique. Caching would not help.
+
+**What went wrong:** In practice, 10-30% of prompts are identical or near-identical (frequently asked questions, system prompts, health checks). Each identical prompt costs $0.01-$0.10 in GPU compute. A system serving 1 million requests per day is wasting $1,000-$10,000 per day on redundant inference.
+
+**The correct pattern:** Response caching with exact-match and semantic-similarity caches. The exact-match cache handles identical prompts (5ms response). The semantic cache handles similar prompts (uses embeddings to find similar queries). Cache hit rates of 20-40% are typical.
+
+### Anti-Pattern 5: The Unlimited Context
+
+**The mistake:** Allowing arbitrarily long context windows. The model supports 32K tokens, so the system accepts any input length.
+
+**Why it seemed reasonable:** Longer context means better understanding. The model was trained on long contexts, so it should handle them.
+
+**What went wrong:** A user pastes a 30,000-token document. The prefill phase takes 2 seconds. The KV cache consumes 30 GB for this single request. The batch is full. All other requests are blocked. The GPU memory is exhausted. The system crashes.
+
+**The correct pattern:** Enforce per-client context limits. Set a default max of 4,096 tokens. Allow increases via quota requests (with cost implications). Implement context windowing — chunk the input and process it in segments, summarizing each chunk before moving to the next.
+
+## When NOT to Use This
+
+### You Do Not Need a Custom LLM Serving System If:
+
+**Your token volume is under 10 million per day:** Managed APIs (OpenAI, Anthropic, Together AI) handle this volume efficiently. The cost per token is higher, but the total cost of ownership (including engineering time for GPU management) is lower.
+
+**You only need a single model:** If you only serve one model and it fits on a single GPU, use a managed service like Hugging Face Inference Endpoints or Replicate. The operational overhead of self-hosting is not justified.
+
+**Your latency requirements are relaxed (over 10 seconds):** If users expect batch processing, not real-time responses, you can use a simpler architecture. A single GPU with a queue is sufficient.
+
+**You can tolerate best-effort quality:** If the application is non-critical (internal tools, prototypes), use a smaller model or a quantized version. The accuracy difference is often negligible, and the cost savings are substantial.
+
+### At What Scale Does This Become Necessary?
+
+The custom LLM serving system described in this chapter is justified when:
+- You serve more than 1 billion tokens per day
+- You need sub-second latency for interactive use cases
+- You have custom fine-tuned models that cannot use third-party APIs
+- You have data residency requirements that prevent sending data to external providers
+- You have a dedicated infrastructure team to manage GPU clusters
+- Your GPU bill exceeds $500,000 per month — the optimization techniques in this chapter can reduce costs by 30-50%
+
+---
+
+**Up next:** From theory to practice — how real companies build and operate LLM serving systems at scale.

@@ -1,0 +1,773 @@
+---
+id: alerting-deep-dive
+title: Alerting — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+An alerting engine is a state machine that transforms time-series data into notifications. At its core, it runs a loop: fetch data, evaluate rules, manage state, route results. Understanding this loop is essential to designing reliable alerting systems.
+
+<AsciiDiagram
+  id="alerting/deep-dive-internal-architecture"
+  title="Internal Architecture of the Alerting Engine"
+  alt="Component diagram showing the alerting engine with rule evaluator, state store, alert manager, notification router, and their data flows"
+  caption="The alerting engine has four core components: rule evaluator, state store, alert manager, and notification router"
+ content={`
+  ┌─────────────────────────────────────────────────────────────┐
+  │                  Alerting Engine                            │
+  │                                                             │
+  │  ┌──────────────────┐       ┌────────────────────────┐      │
+  │  │  Rule Evaluator   │       │     State Store        │      │
+  │  │                   │       │                        │      │
+  │  │  ┌──────────┐     │       │  ┌──────────────┐     │      │
+  │  │  │ Rule Sync │─────┐     │  │  Alert State  │     │      │
+  │  │  └──────────┘     │ └───────│  (in-memory)  │     │      │
+  │  │  ┌──────────┐     │       │  └──────────────┘     │      │
+  │  │  │ Query    │     │       │  ┌──────────────┐     │      │
+  │  │  │ Executor │──────────────>│  Rule State   │     │      │
+  │  │  └──────────┘     │       │  (persistent)  │     │      │
+  │  │  ┌──────────┐     │       │  └──────────────┘     │      │
+  │  │  │ Timeout  │     │       │  ┌──────────────┐     │      │
+  │  │  │ Manager  │     │       │  │  Silence     │     │      │
+  │  │  └──────────┘     │       │  │  State       │     │      │
+  │  └────────┬─────────┘       │  └──────────────┘     │      │
+  │           │                 └────────────────────────┘      │
+  │           ▼                                                  │
+  │  ┌────────────────────┐       ┌────────────────────────┐    │
+  │  │   Alert Manager     │       │ Notification Router    │    │
+  │  │                     │       │                        │    │
+  │  │  Deduplication      │──────>│ Channel Assignment     │    │
+  │  │  Grouping           │       │ Rate Limiting          │    │
+  │  │  Escalation Logic   │       │ Retry Queue            │    │
+  │  └────────────────────┘       └────────────────────────┘    │
+  └─────────────────────────────────────────────────────────────┘
+`} />
+
+**Rule Evaluator:** The heart of the engine. It loads rules, fetches the required data from the monitoring system, evaluates each condition, and produces an evaluation result. The evaluator runs on a fixed schedule controlled by the evaluation interval. It must handle multiple rule types (PromQL, SQL, log queries) and multiple data sources (Prometheus, Graphite, Loki, Elasticsearch).
+
+**State Store:** Tracks the current state of every alert rule. The state store knows which alerts are OK, which are pending, and which are firing. State is persisted to disk or a database so the engine can recover after a restart without losing the progress of alert evaluations. The state store also tracks silence rules, escalation timers, and notification delivery status.
+
+**Alert Manager:** Receives evaluation results and determines what to do. It handles deduplication by checking if an alert is already firing. It handles grouping by collecting related alerts into incidents. It manages silencing by checking whether the alert matches any active silence rules. The alert manager is the decision-making layer of the system.
+
+**Notification Router:** Takes resolved alerts from the alert manager and delivers them through the appropriate channels. The router handles retry logic, rate limiting, and channel-specific formatting (Slack uses blocks, PagerDuty uses events, SMS uses plain text). It also manages the escalation chain: if an alert is not acknowledged, the router ups the priority and tries the next contact method.
+
+### The Evaluation Loop in Detail
+
+The evaluation loop is the heart of the alerting engine. It runs continuously, processing rules in a fixed schedule.
+
+```
+while true:
+    for each rule group:
+        for each rule in group:
+            data = fetch_metric(rule.query)
+            result = evaluate(rule, data)
+            if result != rule.last_state:
+                state_store.update(rule.id, result)
+                if result == FIRING:
+                    alert_manager.process(rule, result, data)
+        sleep(rule_group.evaluation_interval)
+```
+
+The loop has three critical performance characteristics. First, it must execute within the evaluation interval. If the loop takes 90 seconds but the interval is 60 seconds, evaluations are skipped. Second, it must handle data fetching failures gracefully. If the metrics database is unreachable, the loop should use the last known state rather than failing the evaluation. Third, it must be interruptible. If a new rule is added or a silence rule is updated, the loop should pick up the change without restarting.
+
+## Data Structures and Algorithms
+
+### The Rule Trie
+
+When you have thousands of alert rules, evaluating each one sequentially is too slow. The rule evaluator uses a trie structure to partition rules by metric name. Rules for `http_request_duration_seconds` are grouped together. Rules for `cpu_usage_percent` are grouped separately. When a batch of metrics arrives, only the relevant subtrie is traversed.
+
+The trie is built at startup and rebuilt when rules are added or removed. Each node in the trie represents a prefix of the metric name. The leaf nodes contain the rules that match that metric. The tree depth is bounded by the number of segments in the metric name, typically 3 to 5 levels.
+
+### The Duration Queue
+
+The duration mechanism — requiring a condition to persist for N minutes — is implemented as a sliding window queue per rule. Each evaluation cycle appends the current state (OK or breached) to the queue. The queue has a maximum size based on the duration divided by the evaluation interval. When the queue is full and every entry is breached, the alert fires.
+
+<AsciiDiagram
+  id="alerting/deep-dive-duration-queue"
+  title="Duration Queue Sliding Window"
+  alt="Circular buffer showing evaluation results sliding through a queue; the alert fires only when all slots are breached"
+  caption="The duration queue uses a sliding window to ensure a condition persists before firing"
+ content={`
+  Evaluation Cycle:   1       2       3       4       5       6
+                      │       │       │       │       │       │
+  Breach Status:      OK    Breach  Breach  Breach  Breach  Breach
+                      │       │       │       │       │       │
+  Duration Queue (5 slots, 1 min each):
+                      ┌─────┬─────┬─────┬─────┬─────┐
+  Cycle 3:            │ OK  │ OK  │ Br  │ Br  │ Br  │  Not Firing
+                      └─────┴─────┴─────┴─────┴─────┘
+                      ┌─────┬─────┬─────┬─────┬─────┐
+  Cycle 6:            │ Br  │ Br  │ Br  │ Br  │ Br  │  FIRING!
+                      └─────┴─────┴─────┴─────┴─────┘
+`} />
+
+The queue is a circular buffer to avoid memory allocations. Each evaluation overwrites the oldest slot. The evaluator maintains a counter of consecutive breaches so it does not need to scan the entire queue every cycle. The counter is incremented on each breach and reset to zero on each OK. When the counter reaches the duration window size, the alert fires.
+
+### The Deduplication Hash Table
+
+Deduplication is implemented as a hash table keyed by (rule_id, labels_hash). When an alert fires, the alert manager computes the hash of the rule ID and the alert label set. It looks up the hash in the table. If an entry exists and the alert is still firing, the new alert is merged into the existing entry. If no entry exists, a new entry is created.
+
+The hash table must be efficient for lookups and updates. Lookups happen for every evaluation result — potentially thousands per second. The table uses open addressing with linear probing to minimize cache misses. The table is sized to twice the expected number of concurrent firing alerts to avoid clustering.
+
+### The Suppression Window
+
+Silence rules are stored in a suppression window data structure. Each silence rule has a start time, an end time, and a set of matchers (label-based, rule-based, or severity-based). The suppression window is a sorted list of silence rules ordered by start time. When the alert manager receives an evaluation result, it walks the suppression window to find any active silence rules that match.
+
+The suppression window is optimized for the common case: most alerts are not silenced. The first check is a fast path: if the current time is not within any silence window, skip the suppression check entirely. If the fast path passes, the manager walks the sorted list of active silence rules and evaluates each matcher against the alert.
+
+### The Aggregation Tree
+
+Grouping related alerts into incidents requires an aggregation tree. The tree is built from the service dependency graph. Each node in the tree represents a service or component. Edges represent dependencies. When an alert fires for a node, the alert manager traverses the tree upward to find the parent incident. If the parent node has a firing alert, the new alert is grouped under the parent.
+
+The aggregation tree is dynamically updated as the service mesh evolves. Changes to the dependency graph are pushed to the alert manager through a configuration API. The tree is rebuilt in the background without affecting the evaluation loop.
+
+## The Alert Lifecycle
+
+Follow a single alert through its complete lifecycle, from the moment the metric exceeds the threshold to the moment the incident is resolved and archived.
+
+### Lifecycle State Machine
+
+<AsciiDiagram
+  id="alerting/deep-dive-state-machine"
+  title="Alert State Machine"
+  alt="State machine diagram showing transitions between OK, Pending, Firing, Acknowledged, Resolved, and Auto-Closed states"
+  caption="An alert transitions through six states during its lifecycle"
+ content={`
+                    ┌──────────┐
+                    │          │
+                    ▼          │
+              ┌──────────┐     │
+              │    OK    │     │
+              └────┬─────┘     │
+                   │           │
+           Metric  │           │
+           exceeds │           │
+           ┌───────▼──────┐   │
+           │   Pending    │   │
+           └───────┬──────┘   │
+                   │           │
+           Duration│           │
+           elapsed │           │
+           ┌───────▼──────┐   │
+           │   Firing     │   │
+           └───────┬──────┘   │
+                   │           │
+           Acknowledged       │
+           ┌───────▼────────┐ │
+           │  Acknowledged   │ │
+           └───────┬────────┘ │
+                   │           │
+           Fixed   │           │
+           ┌───────▼──────┐   │
+           │  Resolved    │───┘
+           └───────┬──────┘
+                   │
+           Timer   │
+           ┌───────▼────────┐
+           │  Auto-Closed   │
+           └────────────────┘
+`} />
+
+### Step 1: Metric Breaches Threshold
+
+The first evaluation cycle after the metric crosses the threshold. The evaluator detects the breach and records the metric value, the timestamp, and the degree of breach (how far above the threshold). This information is stored in the state store for use in the postmortem.
+
+### Step 2: Enter Pending State
+
+The evaluator transitions the rule from OK to PENDING. The duration timer starts. The evaluator records the timestamp of the first breach. The pending state means the system suspects a problem but is not yet confident enough to alert.
+
+### Step 3: Duration Window Accumulates
+
+The evaluator continues to evaluate the rule on each cycle. Each consecutive breach advances the duration queue. If the metric returns to normal during this window, the queue is reset and the alert returns to OK. The duration window is the primary noise-reduction mechanism.
+
+### Step 4: Alert Fires
+
+When the duration queue is full (all slots show breach), the alert transitions from PENDING to FIRING. The evaluator creates an alert record with the rule ID, the metric value, the labels, the severity, and the timestamp. The alert record is sent to the alert manager for processing.
+
+### Step 5: Deduplication Check
+
+The alert manager receives the alert record. It computes the deduplication hash and looks up the hash table. If an alert with the same hash is already firing, the new alert is merged into the existing alert. The existing alert duration counter is updated. No new notification is sent.
+
+### Step 6: Silence Check
+
+The alert manager checks the suppression window. If an active silence rule matches the alert, the alert is recorded in the state store but not forwarded to the notification router. The alert is marked as "silenced" in the state store. The responder can see the silenced alert in the dashboard.
+
+### Step 7: Grouping
+
+The alert manager checks the aggregation tree. If the alert is related to a currently firing incident, the alert is grouped under that incident. The incident notification is updated to include the new alert. The responder sees a single notification with N related alerts.
+
+### Step 8: Enrich Alert
+
+The alert manager enriches the alert with context from external systems. The enrichment includes: the runbook URL, the dashboard URL, recent deployments (from the change management system), recent configuration changes, and the service dependency graph. Enrichment transforms a bare metric value into an actionable notification.
+
+### Step 9: Send Notification
+
+The notification router formats the alert for each configured channel and sends the notification. The router records the delivery attempt, the delivery status, and the delivery timestamp. If the notification fails, the router schedules a retry.
+
+### Step 10: Acknowledgment Timer Starts
+
+The escalation timer starts when the notification is sent. The timer is set to the acknowledgment timeout for the alert severity. The responder must acknowledge the alert before the timer expires. The timer is stored in the state store.
+
+### Step 11: Escalate if Not Acknowledged
+
+If the responder does not acknowledge within the timeout, the alert manager escalates to the next level in the escalation chain. The escalation notification is sent to the secondary on-call. The timer is reset for the secondary timeout. This process repeats until the alert is acknowledged or the escalation chain is exhausted.
+
+### Step 12: Responder Acknowledges
+
+The responder acknowledges the alert. The acknowledgment is recorded in the state store with the responder identity and the timestamp. The escalation timer is stopped. The alert is now in the ACKNOWLEDGED state. The responder begins investigation.
+
+### Step 13: Investigation and Fix
+
+The responder follows the runbook, identifies the root cause, and applies the fix. The investigation timeline is recorded in the incident management system. The responder may update the incident status as the investigation progresses.
+
+### Step 14: Metric Returns to Normal
+
+The next evaluation cycle after the fix detects that the metric is below the threshold. The evaluator transitions the rule from FIRING to RESOLVED. The state store records the resolution timestamp and the final metric value.
+
+### Step 15: Resolution Notification
+
+The alert manager sends a resolution notification through the same channels that were used for the firing notification. The notification includes the duration of the incident, the root cause, and the fix applied. The on-call team now knows the incident is over.
+
+### Step 16: Auto-Close
+
+After a configurable period (typically 48 hours) of being in the RESOLVED state, the alert transitions to AUTO-CLOSED. The alert record is moved to the alert history database. The incident management system may keep the incident open for postmortem analysis.
+
+### Evolving the State Machine
+
+The state machine evolves as the alerting system matures. Research the following state transitions to understand how real systems differ from the textbook model.
+
+<AsciiDiagram
+  id="alerting/deep-dive-lifecycle-evolution"
+  title="Alert Lifecycle Evolution Across Generations"
+  alt="Three generations of alert lifecycle: simple linear, sharded with state persistence, and streaming with incremental evaluation"
+  caption="The alert lifecycle has evolved from simple linear processing to streaming incremental evaluation"
+ content={`
+  Gen 1: Simple Linear
+  ┌────┐   ┌──────┐   ┌──────┐   ┌──────────┐
+  │ OK │──>│Fire  │──>│Notify│──>│Resolved  │
+  └────┘   └──────┘   └──────┘   └──────────┘
+  
+  Gen 2: Sharded with State
+  ┌────┐   ┌──────┐   ┌──────┐   ┌──────┐   ┌──────────┐
+  │ OK │──>│Pend  │──>│Fire  │──>│Ack   │──>│Resolved  │
+  └────┘   └──────┘   └──────┘   └──────┘   └──────────┘
+                        │
+                    ┌───┴───┐
+                    │Dedup  │
+                    │Group  │
+                    └───────┘
+  
+  Gen 3: Streaming
+  ┌────┐   ┌──┐   ┌──┐   ┌──┐   ┌──┐   ┌──┐
+  │OK  │──>│P1│──>│P2│──>│P3│──>│F1│──>│F2│──> Resolution
+  └────┘   └──┘   └──┘   └──┘   └──┘   └──┘
+  (Incremental evaluation at each data point)
+`} />
+
+## Consistency and State
+
+### Crash Recovery
+
+When the alerting engine crashes, it loses the in-memory evaluation state. On restart, the duration queues are empty. Every rule that was pending or firing starts from scratch. This means that if the engine crashes during a 5-minute duration window, the alert might not fire until the next evaluation cycle after restart, effectively resetting the detection.
+
+**Mitigation:** Persist evaluation state to a database after every evaluation cycle. On restart, the engine reads the last persisted state and replays any evaluation cycles that might have been missed. The cost is write amplification — every evaluation cycle generates a state write. At 10,000 evaluations per minute, that is 10,000 state writes per minute. Use a write-ahead log (WAL) to batch writes: accumulate state changes in memory for 1 second, then flush the batch to disk.
+
+### Duplicate Fires
+
+In a high-availability deployment, two evaluator shards might evaluate the same rule simultaneously. Both shards determine that the alert should fire. Two alert records are sent to the alert manager. Without deduplication, the responder receives two identical notifications.
+
+**Mitigation:** The deduplication hash table prevents duplicate notifications. The second alert record matches the hash of the first. The alert manager merges the second record into the existing entry. Only one notification is sent. The deduplication is idempotent — applying the same alert record twice produces the same result as applying it once.
+
+### Network Partition Isolates Alert Manager
+
+If the alert manager loses connectivity to the evaluator shards, it cannot receive new evaluation results. The alert manager continues to manage the currently firing alerts. Escalation timers continue to run. But the alert manager cannot detect new alerts or resolve existing ones.
+
+**Mitigation:** The evaluator shards detect the partition by monitoring the connection to the alert manager. If the connection is lost, the shards enter a local evaluation mode. They still evaluate rules and maintain state, but they cannot send alerts to the manager. When connectivity is restored, the shards replay the missed evaluation results.
+
+### Concurrent Evaluation
+
+Two rules that depend on the same metric might be evaluated concurrently by different shards. Both shards fetch the same metric data. Both produce evaluation results. The alert manager receives two evaluation results for the same metric. This is not a problem — the alert manager handles concurrent results gracefully. But it can cause confusion if the two results disagree.
+
+**Mitigation:** Use a version number on the metric data. When a shard fetches data, it records the data version. When the alert manager receives two evaluation results for the same metric, it uses the result with the higher version number. The version number is the timestamp of the data fetch.
+
+### Stale State
+
+The state store might contain state for a rule that has been deleted. The evaluator should periodically garbage-collect stale entries. A rule that has not been evaluated in twice its evaluation interval is removed from the state store. The garbage collection runs every 30 minutes and processes entries in batches of 1,000 to avoid blocking the evaluation loop.
+
+## Performance Characteristics
+
+Understanding alerting engine performance requires looking at three metrics: evaluation latency, notification latency, and system throughput.
+
+<AsciiDiagram
+  id="alerting/deep-dive-latency-breakdown"
+  title="Alerting Latency Breakdown"
+  alt="Timeline bar showing the components of alerting latency from data collection through evaluation to notification"
+  caption="End-to-end alerting latency is the sum of collection, evaluation, duration, and notification latencies"
+ content={`
+  Metric Value
+      ^
+      │          ┌──── Event Begins ────┐
+      │          │                       │
+  100%│          │                       │    ┌──── Human
+      │          │                       │    │    Notified
+  80% │          │                       │    │       │
+      │          │ Data       ┌──────────┤    │       │
+  60% │          │ Collects  │ Evaluates │    │       │
+      │    ┌─────┤           │           │    │       │
+  40% │    │     │           │ Duration  │    │       │
+      │    │     │           │ (5 min)   │    │       │
+  20% │    │     │           │           │    │       │
+      │    │     │           │           │    │       │
+      └────┴─────┴───────────┴───────────┴────┴───────┴───> Time
+          15s    60s         5 min       7s     30s
+`} />
+
+**Evaluation latency (p50):** The time from the start of an evaluation cycle to the state update. For a Prometheus-based system with 500 rules, p50 evaluation latency is typically 200-500ms. p99 evaluation latency is 2-5 seconds, dominated by slow queries to the monitoring system.
+
+**Notification latency (p50):** The time from alert firing to the notification being delivered. Slack messages arrive within 1-3 seconds. SMS within 5-15 seconds. Phone calls within 10-30 seconds. PagerDuty push notifications arrive within 2-5 seconds. The notification latency is dominated by the channel provider, not the alerting system.
+
+**System throughput:** The number of rules a single evaluator can handle per minute. A modern alerting engine can evaluate 5,000-10,000 rules per minute on a single core. Streaming engines can handle 50,000-100,000 rules per minute because they avoid the overhead of periodic queries. The throughput is limited by the query execution time and the state store write throughput.
+
+### Scaling Bottlenecks
+
+The query execution time is the dominant bottleneck. Fetching data from the monitoring system involves network I/O, query parsing, data scanning, and result serialization. At 10,000 rules with 1-minute evaluation intervals, the evaluator must execute 167 queries per second. Each query must complete within 200ms to keep up. If the metrics database is underprovisioned, query latencies spike and the evaluator falls behind.
+
+The state store write throughput is the second bottleneck. If every evaluation cycle writes to the state store, 10,000 evaluations per minute means 10,000 writes per minute. This is manageable for a single database but becomes a bottleneck in the sharded architecture where multiple shards write simultaneously. The solution is to batch writes: accumulate state changes in memory for 1 second, then write the batch as a single transaction.
+
+### The Notification Retry Scheduler
+
+Notifications can fail: the SMTP server is down, the Slack webhook is rate-limited, the PagerDuty API is unreachable. The notification router uses an exponential backoff scheduler. Failed notifications are retried after 30 seconds, then 1 minute, then 2 minutes, up to a maximum interval of 30 minutes. Each retry increments a counter. After 10 failed attempts, the alert is escalated to a fallback channel.
+
+The retry scheduler is implemented as a priority queue. Each retry job has a scheduled timestamp. The scheduler pops the job with the earliest timestamp, retries the notification, and either removes the job (success) or reschedules it with the next backoff interval. The priority queue is stored in memory for speed but checkpointed to disk every 60 seconds for crash recovery.
+
+### Memory Usage
+
+The alerting engine's memory usage is dominated by the state store. Each rule's state requires approximately 256 bytes: the rule ID (8 bytes), the current status (1 byte), the duration queue (200 bytes, assuming 5 1-minute slots with 40 bytes per slot), the last metric value (8 bytes), and the timestamp (8 bytes). For 10,000 rules, the state store requires 2.5 MB. For 100,000 rules, 25 MB. This is modest.
+
+The deduplication hash table requires additional memory. Each entry is approximately 128 bytes: the hash key (8 bytes), the alert record (100 bytes), and the pointer overhead (20 bytes). For 1,000 concurrent firing alerts, the hash table requires 128 KB. For 10,000 concurrent fires, 1.3 MB.
+
+## Configuration and Tuning
+
+### Rule Configuration Parameters
+
+Every alert rule has five critical parameters that must be tuned together:
+
+**Evaluation Interval:** The frequency of evaluation. Shorter intervals detect problems faster but increase load. A 1-minute interval is standard for critical metrics. A 5-minute interval is reasonable for less critical metrics. A 15-minute interval is appropriate for metrics that change slowly, like disk usage. The evaluation interval must be longer than the worst-case query execution time. If queries take 30 seconds, a 1-minute interval leaves only 30 seconds for the rest of the evaluation loop.
+
+**Duration (For):** How long the condition must persist. A 5-minute duration means the condition must be breached for 5 consecutive evaluation cycles. Longer durations reduce false positives but delay detection. The right duration depends on the metric volatility. CPU usage fluctuates constantly and needs a longer duration. Error rates are more stable and can use a shorter duration. A good starting point is 3 evaluation cycles. For a 1-minute interval, that is 3 minutes. For a 5-minute interval, that is 15 minutes.
+
+**Severity:** The urgency of the alert. Critical alerts page someone immediately. Warning alerts create a ticket or Slack message for next-day investigation. Info alerts are logged for reporting. Over-assigning severity is the most common tuning mistake. If every alert is critical, no alert is critical. A good rule of thumb: no more than 10 percent of alerts should be critical.
+
+**Notification Channel:** The delivery mechanism. Critical alerts should use multiple channels: PagerDuty (push), SMS (fallback), and phone call (last resort). Warning alerts should use a single channel, typically Slack. Info alerts should not notify anyone — they should appear on a dashboard or in a daily digest. The notification channel should match the expected response time. Critical alerts expect a response within 5 minutes. Warning alerts can wait hours.
+
+**Runbook Link:** The URL of the runbook. Every alert must have a runbook. If there is no runbook, the alert is not actionable. The runbook should explain: what this alert means, what to check first, common root causes, and how to fix each one. The runbook link is stored in the alert annotations and included in every notification.
+
+### Group-Wide Parameters
+
+When you have thousands of rules, tuning each one individually is impractical. Use group-wide parameters to apply consistent settings to related rules.
+
+**Rule groups** are collections of rules that share the same evaluation interval, duration, and notification channel. A rule group for "database health" might contain 20 rules about connection pools, replication lag, and query latency. All 20 rules share a 1-minute evaluation interval, a 5-minute duration, and a Slack notification channel.
+
+**Inheritance** allows rule groups to inherit parameters from parent groups. A parent group for "infrastructure health" sets the evaluation interval to 5 minutes. Child groups for "CPU," "memory," and "disk" inherit this interval. An individual rule can override the inherited value if needed. Inheritance reduces configuration duplication.
+
+**Rollout of parameter changes** follows a canary pattern. Change the duration for one rule in the group, observe for 24 hours, then apply to the full group. This prevents a badly tuned parameter change from creating a wave of noise. The canary rule should be representative of the group — same metric, same data source, same volatility.
+
+### Inhibitor Rules
+
+Inhibitor rules suppress alerts based on the presence of other alerts. If the database is down, inhibit all alerts from services that depend on the database. The database alert is the source. The dependent service alerts are targets. The inhibitor rule matches the source alert by label and suppresses the target alerts.
+
+Inhibitor rules are configured as a list of source matchers and target matchers. The source matcher identifies the alert that should inhibit others. The target matcher identifies the alerts that should be inhibited. The inhibitor rule is evaluated by the alert manager after deduplication and before notification.
+
+### Silences
+
+Silences are temporary suppression rules. They are used for planned maintenance, known outages, and deployments. Silences have a start time, an end time, and a set of matchers. Silences are created through the alerting system API or UI. They are stored in the state store.
+
+Best practices for silences:
+- Set a maximum silence duration of 24 hours. Any silence longer than 24 hours requires manager approval.
+- Require a ticket number for every silence. The ticket tracks the reason and the planned end time.
+- Automatically expire silences. A silence that has passed its end time is removed from the suppression window.
+- Audit silences weekly. Any silence that has been active for more than 7 days is flagged for review.
+
+### Observing the Alerting System
+
+The alerting system must expose its own internal metrics for debugging and capacity planning.
+
+**Alert state metrics:** Track the number of rules in each state (OK, pending, firing, resolved) over time. A sudden increase in firing alerts indicates a real incident or a misconfigured rule. Track the ratio of firing to OK rules. A ratio above 10 percent suggests the system is noisy.
+
+**Evaluation duration metrics:** Track the p50, p95, and p99 evaluation duration per shard. If p99 evaluation duration approaches the evaluation interval, the shard is overloaded and needs to be split. Track the number of evaluation cycles that exceed the evaluation interval — these are skipped cycles.
+
+**Deduplication effectiveness metrics:** Track the ratio of raw alerts to grouped incidents. A ratio above 10:1 means deduplication is working well. A ratio close to 1:1 means deduplication is ineffective and alert storms are hitting responders directly. Track the deduplication hit rate — the percentage of alerts that were matched to an existing incident.
+
+**Notification delivery metrics:** Track the delivery success rate per channel. If the Slack channel has a 5 percent failure rate, there is a configuration or rate-limit issue. Track the end-to-end latency from alert firing to notification delivery. Track the retry count per notification — high retry counts indicate a connectivity issue.
+
+**Silence effectiveness metrics:** Track the number of active silences over time. A high number of active silences suggests that permanent fixes are not being implemented. Track the number of alerts that were silenced versus the number that fired. If silences are suppressing more than 20 percent of firing alerts, the team is relying on silences instead of fixing the root cause.
+
+### Tuning Methodology
+
+Tuning is an iterative process. Here is the standard approach:
+
+**Step 1 — Baseline.** Collect 30 days of historical data for the metric. Compute the median, p90, p99, and maximum values. The static threshold should be at or above the p99 value during normal operation. If the p99 value varies significantly by time of day, use dynamic thresholds instead.
+
+**Step 2 — Set Duration.** Start with a duration equal to 3 evaluation intervals. If the evaluation interval is 1 minute, set the duration to 3 minutes. This gives the metric time to self-correct before alerting. Adjust based on the metric volatility. CPU usage needs a longer duration. Error rates need a shorter duration.
+
+**Step 3 — Observe for 7 Days.** Let the alert run in observation mode — fire the alert but do not notify anyone. Review the alerts daily. How many fired? How many were genuine problems? How many were false positives? The observation period should include at least one weekend and one deployment to capture variability.
+
+**Step 4 — Adjust.** If false positives are under 10 percent, the alert is ready for notification. If false positives are above 50 percent, raise the threshold or extend the duration. If the alert never fired during observation, lower the threshold or shorten the duration. If the alert fired but was never actionable, delete the rule.
+
+**Step 5 — Repeat.** After 30 days, review the alert performance. Delete alerts that have not fired in 30 days. Add notifications to alerts that have been reliable during observation. The tuning cycle is continuous. As the system evolves, the thresholds must evolve with it.
+
+### Step 17: Archival
+
+After auto-close, the alert record is moved to cold storage. The record includes the full evaluation chain: every evaluation result, every state transition, the notification delivery status, the acknowledgment timestamp, the resolution timestamp, and any manual notes from the responder. The archival is compressed and stored in object storage (S3, GCS). The archival retention period is 2 years.
+
+### Step 18: Postmortem Analysis
+
+The archived alert is analyzed as part of the incident postmortem. The postmortem analysis infrastructure queries the alert history to answer: when did the alert fire, how long was the duration, was the runbook followed, and what was the time to resolution. This analysis is automated. A dashboard shows the top 10 most frequent alerts, the alerts with the longest time to acknowledge, and the alerts that were never acknowledged.
+
+## Consistency and State: Advanced Scenarios
+
+### Split-Brain in the Alert Manager Cluster
+
+If the alert manager cluster experiences a network partition, two nodes might both believe they are the leader. Both nodes process alerts simultaneously. Two responders might be paged for the same incident. This is the split-brain problem.
+
+**Mitigation:** Use a consensus protocol (Raft, etcd) with strict quorum requirements. The leader must maintain a connection to a majority of nodes. If the leader loses the majority, it steps down. A new leader is elected only when a majority is available. This prevents split-brain scenarios.
+
+### Eventual Consistency in State Replication
+
+In a multi-region deployment, the state store is replicated asynchronously. A region might not have the latest state from another region. An alert that was resolved in one region might still be firing in another region.
+
+**Mitigation:** Use a per-region state store. Each region tracks its own alert state independently. The global aggregator reconciles cross-region state periodically (every 60 seconds). If two regions have conflicting states, the global aggregator uses the most recent timestamp.
+
+### Thundering Herd on Evaluator Startup
+
+When all evaluator shards restart simultaneously (during a deployment or outage recovery), they all try to load rules and begin evaluation at the same time. The metrics database is overwhelmed by the sudden load.
+
+**Mitigation:** Use a staggered startup. Each shard waits a random delay before starting evaluation. The delay is proportional to the shard index: shard 0 waits 0 seconds, shard 1 waits 5 seconds, shard 2 waits 10 seconds, and so on. The total stagger is under 60 seconds for 12 shards.
+
+### Data Race in the Duration Queue
+
+Two concurrent evaluations of the same rule by different shards could both write to the duration queue simultaneously. The queue might end up in an inconsistent state — two consecutive writes that should have been sequential become interleaved.
+
+**Mitigation:** Use a per-rule mutex. Each rule has a lock that serializes accesses to its duration queue. The lock is implemented as a distributed lock in the state store (using the state store compare-and-swap operation). The lock timeout is 5 seconds to prevent a hung shard from blocking the queue indefinitely.
+
+## Performance Characteristics: Advanced Analysis
+
+### The Impact of High Cardinality
+
+High cardinality metrics — metrics with many label combinations — cause performance problems for the alerting engine. A rule like "alert if p99 latency exceeds 500ms" evaluated for every service, every endpoint, every host, and every deployment version can generate millions of evaluations per cycle.
+
+**Example:** A service has 50 hosts, each with 20 endpoints, each running 2 versions. The rule evaluates for 50 x 20 x 2 = 2,000 label combinations. At 500 such rules, the evaluator must process 1 million evaluations per cycle. Each evaluation requires a state lookup and a duration queue update.
+
+**Mitigation:** Limit the cardinality of alert rules. Use aggregation operators (sum, avg, max) to reduce the number of label combinations. Set a maximum of 100 label combinations per rule. The rule should be redesigned if it needs more than 100 combinations.
+
+### The Cost of Log-Based Alerting
+
+Log-based alerting is computationally expensive. Each evaluation cycle requires scanning the log index for matching patterns. The scan time grows linearly with the log volume. At 10 TB of logs per day, a single log query can take 30 seconds to 5 minutes.
+
+**Mitigation:** Use pre-aggregated log metrics. Instead of running a raw log query for each evaluation, pre-aggregate logs into metrics. A stream processor (Flink, Kafka Streams) counts error occurrences per minute and stores the count as a metric. The alerting engine queries the metric, not the raw logs. The pre-aggregation reduces query time from minutes to milliseconds.
+
+### Memory-Bounded Evaluation
+
+The evaluator must bound its memory usage. If a single evaluation cycle generates too many alerts (during an alert storm), the evaluator could run out of memory.
+
+**Mitigation:** Use a bounded alert buffer. The evaluator maintains a fixed-size buffer (maximum 10,000 alerts per cycle). If the buffer fills, the oldest alerts are dropped and logged. The dropped alerts are recorded for post-incident review. The buffer size is configurable and should be tuned to the expected maximum alert volume.
+
+## Configuration and Tuning: Advanced Topics
+
+### Multi-Stage Alert Tuning
+
+Tuning is not a one-time activity. It is a multi-stage process that evolves as the system matures.
+
+**Stage 1 — Reactive tuning.** In the first 30 days, every time an alert fires, review it. Adjust the threshold, duration, or severity based on the review. This is reactive but effective. Most alerts require adjustment in the first 30 days.
+
+**Stage 2 — Proactive tuning.** After 30 days, review the top 10 most frequent alerts once per week. Adjust thresholds proactively based on the trend. If an alert is firing more frequently this week than last week, the threshold might need adjustment even if the alert is not currently noisy.
+
+**Stage 3 — Automated tuning.** After 90 days, implement automated threshold adjustment. The system adjusts thresholds based on the previous 7 days of data. If the threshold was never breached in 7 days, lower it by 5 percent. If it was breached more than 3 times, raise it by 5 percent. The automated tuning is limited to non-critical alerts. Critical alerts require manual review.
+
+### The Evaluation Interval Tuning Matrix
+
+The evaluation interval is not a fixed parameter. It should be tuned based on the metric type and the expected failure speed.
+
+| Metric Type | Example | Evaluation Interval | Rationale |
+|-------------|---------|---------------------|-----------|
+| Fast-moving | Error rate, latency | 30-60 seconds | Failures develop quickly |
+| Medium-moving | Queue depth, connection count | 1-5 minutes | Failures develop over minutes |
+| Slow-moving | Disk usage, memory | 5-15 minutes | Failures develop over hours |
+| Very slow | Certificate expiration, storage growth | 1-24 hours | Failures develop over days |
+
+### The Duration Tuning Formula
+
+The duration should be set based on the metric volatility and the cost of false positives. A formula to determine the duration:
+
+```
+duration = volatility_factor x evaluation_interval x false_positive_tolerance
+```
+
+Where volatility_factor is the ratio of the metric standard deviation to the mean. A volatile metric (high standard deviation relative to the mean) needs a higher volatility factor. The false_positive_tolerance is the number of consecutive evaluation cycles the team is willing to tolerate before acting.
+
+**Example:** A metric with a standard deviation of 10 percent and a mean of 50 percent has a volatility factor of 0.2. With a 60-second evaluation interval and a false_positive_tolerance of 3, the duration is 0.2 x 60 x 3 = 36 seconds. Round up to 60 seconds for a clean interval.
+
+### Advanced Silencing: Scheduled Maintenance Windows
+
+For systems with regular maintenance windows (nightly backups, weekly index rebuilds, monthly capacity tests), configure scheduled silence rules. These rules automatically suppress alerts during the maintenance window. The silence rule is configured once and runs on a recurring schedule.
+
+**Configuration example:** A nightly backup runs from 2 AM to 2:30 AM every day. Create a silence rule that suppresses backup-related alerts (disk I/O, database latency) from 2 AM to 2:30 AM daily. The silence rule is stored in the configuration store and evaluated by the alert manager.
+
+### Alert Rule Templates
+
+For services that share common characteristics (all REST APIs, all databases, all queues), use alert rule templates. A template defines a set of rules with parameterized thresholds. Each service instance provides values for the parameters.
+
+**Example template:** A REST API template includes rules for p99 latency (< 500ms), error rate (< 1 percent), and request rate (> 10 percent drop). The payment service uses this template with latency threshold=200ms and error rate threshold=0.5 percent. The search service uses the same template with latency threshold=1000ms and error rate threshold=2 percent.
+
+### The Evaluation Pipeline: A Walkthrough with Code
+
+The following pseudocode illustrates the evaluation pipeline for a single rule:
+
+```
+function evaluate_rule(rule, current_time):
+    // Phase 1: Fetch data
+    data = metrics_db.query(rule.expression, current_time - rule.evaluation_interval, current_time)
+    if data is None:
+        return EvaluationResult(ERROR, "No data returned")
+    
+    // Phase 2: Evaluate condition
+    if rule.condition == "greater_than":
+        is_breached = data.value > rule.threshold
+    elif rule.condition == "less_than":
+        is_breached = data.value < rule.threshold
+    elif rule.condition == "within_range":
+        is_breached = data.value < rule.lower_bound or data.value > rule.upper_bound
+    
+    // Phase 3: Update duration queue
+    state = state_store.get(rule.id)
+    state.duration_queue.append(is_breached)
+    state.consecutive_breaches = state.consecutive_breaches + 1 if is_breached else 0
+    
+    // Phase 4: Determine new state
+    if state.consecutive_breaches >= rule.duration_slots:
+        new_state = FIRING
+    elif is_breached:
+        new_state = PENDING
+    else:
+        new_state = OK
+    
+    // Phase 5: Handle state transition
+    if new_state != state.current_state:
+        state.current_state = new_state
+        state.transition_timestamp = current_time
+        if new_state == FIRING:
+            alert_manager.fire(rule, data.value, current_time)
+        elif new_state == OK and state.current_state == FIRING:
+            alert_manager.resolve(rule, current_time)
+    
+    // Phase 6: Persist state
+    state_store.put(rule.id, state)
+    return EvaluationResult(SUCCESS, new_state)
+```
+
+The pipeline is executed for every rule in every evaluation cycle. The critical path is the metrics database query (Phase 1). If the query is slow, the entire pipeline is delayed. The state store operations (Phase 6) are the second most critical path. If the state store is slow, the pipeline blocks.
+
+### The Notification Router: A Walkthrough with Code
+
+```
+function route_notification(alert):
+    // Phase 1: Determine channel
+    channel = get_channel_for_severity(alert.severity)
+    if channel is None:
+        log_warning("No channel configured for severity", alert.severity)
+        return
+    
+    // Phase 2: Format for channel
+    if channel.type == "slack":
+        message = format_slack_message(alert)
+    elif channel.type == "pagerduty":
+        message = format_pagerduty_event(alert)
+    elif channel.type == "email":
+        message = format_email_message(alert)
+    elif channel.type == "sms":
+        message = format_sms_message(alert)
+    
+    // Phase 3: Apply rate limiting
+    if rate_limiter.is_rate_limited(channel):
+        retry_scheduler.schedule(alert, exponential_backoff(alert.retry_count))
+        return
+    
+    // Phase 4: Send notification
+    try:
+        response = channel.send(message)
+        if response.success:
+            log_delivery(alert.id, channel.name, "success")
+            return
+        else:
+            throw DeliveryException(response.error)
+    except Exception as e:
+        alert.retry_count += 1
+        if alert.retry_count < 10:
+            retry_scheduler.schedule(alert, exponential_backoff(alert.retry_count))
+        else:
+            escalate(alert, channel)
+```
+
+### The State Store: Storage Schema
+
+The state store schema defines how alert state is persisted. The schema balances write performance (every evaluation cycle writes) with query performance (the alert manager queries for deduplication).
+
+```
+Table: alert_state
+  rule_id: UUID (primary key)
+  rule_name: VARCHAR(255)
+  current_state: ENUM('OK', 'PENDING', 'FIRING', 'RESOLVED')
+  duration_queue: JSON (array of booleans)
+  consecutive_breaches: INTEGER
+  last_metric_value: FLOAT
+  last_evaluation_timestamp: TIMESTAMP
+  first_breach_timestamp: TIMESTAMP
+  firing_timestamp: TIMESTAMP
+  resolved_timestamp: TIMESTAMP
+  version: INTEGER (for optimistic locking)
+```
+
+The state store is indexed by rule_id. The alert manager queries all rows with current_state = FIRING to build the deduplication hash table. The state store is partitioned by rule_id to distribute the load across shards.
+
+### The Metrics Database: Query Patterns
+
+The alerting engine has specific query patterns that differ from dashboard queries. Understanding these patterns helps optimize the metrics database.
+
+**Query pattern 1 — Last value query:** Fetch the most recent value of a metric. This is the most common query pattern. It is used for rules that evaluate the current metric value against a threshold. The query is: "SELECT value FROM metrics WHERE name = 'cpu_usage' AND labels = 'host=web-1' ORDER BY timestamp DESC LIMIT 1."
+
+**Query pattern 2 — Aggregation query:** Compute the average, max, or percentile over a time window. This is used for rules that evaluate the aggregate metric behavior. The query is: "SELECT p99(value) FROM metrics WHERE name = 'http_latency' AND timestamp > NOW() - 5m."
+
+**Query pattern 3 — Rate query:** Compute the rate of change over a time window. This is used for rules that detect trends. The query is: "SELECT rate(value) FROM metrics WHERE name = 'queue_depth' AND timestamp > NOW() - 10m."
+
+**Query pattern 4 — Existence query:** Check if a metric exists. This is used for dead man switch alerts. The query is: "SELECT COUNT(*) FROM metrics WHERE name = 'heartbeat' AND timestamp > NOW() - 5m."
+
+Each query pattern has a different optimization strategy. Last value queries benefit from a recent-value cache. Aggregation queries benefit from pre-computed rollups. Rate queries benefit from downsampling. Existence queries benefit from a bloom filter.
+
+### The Escalation Engine: Timer Management
+
+The escalation engine manages timers for every firing alert. The timers are distributed across the alert manager cluster. Each timer has a duration, a target (the escalation level), and a callback (the notification to send).
+
+**Timer data structure:** The timers are stored in a priority queue ordered by expiration time. The timer with the earliest expiration time is at the front of the queue. The escalation engine pops the front timer, checks if the alert has been acknowledged, and either escalates (if not acknowledged) or removes the timer (if acknowledged).
+
+**Timer recovery:** If the alert manager crashes, the timers are lost. The new leader reconstructs the timers from the state store. The escalation engine queries the state store for all firing alerts that have not been acknowledged. For each unacknowledged alert, the engine creates a new timer with the remaining time (original duration minus elapsed time).
+
+**Timer precision:** The escalation engine does not need sub-second precision. A 5-minute timer can be checked every 30 seconds. The engine pops the priority queue every 30 seconds and processes expired timers. This reduces the CPU overhead of timer management.
+
+## Code Example: The Duration Queue in Python
+
+The following Python code implements the duration queue as a circular buffer:
+
+```python
+class DurationQueue:
+    def __init__(self, size):
+        self.buffer = [False] * size  # False = OK, True = breached
+        self.size = size
+        self.index = 0
+        self.consecutive_breaches = 0
+    
+    def append(self, is_breached):
+        self.buffer[self.index] = is_breached
+        self.index = (self.index + 1) % self.size
+        if is_breached:
+            self.consecutive_breaches += 1
+        else:
+            self.consecutive_breaches = 0
+    
+    def is_firing(self):
+        return self.consecutive_breaches >= self.size
+    
+    def reset(self):
+        self.buffer = [False] * self.size
+        self.index = 0
+        self.consecutive_breaches = 0
+```
+
+The circular buffer avoids memory allocation. The consecutive_breaches counter avoids scanning the entire buffer. The reset method is called when the rule is reloaded or the state store is recovered.
+
+## Code Example: The Deduplication Hash Table
+
+```python
+class DeduplicationTable:
+    def __init__(self, capacity=10000):
+        self.capacity = capacity
+        self.table = [None] * capacity
+        self.size = 0
+    
+    def _hash(self, rule_id, labels_hash):
+        return hash((rule_id, labels_hash)) % self.capacity
+    
+    def lookup(self, rule_id, labels_hash):
+        h = self._hash(rule_id, labels_hash)
+        while self.table[h] is not None:
+            entry = self.table[h]
+            if entry.rule_id == rule_id and entry.labels_hash == labels_hash:
+                return entry
+            h = (h + 1) % self.capacity
+        return None
+    
+    def insert_or_merge(self, rule_id, labels_hash, alert_record):
+        existing = self.lookup(rule_id, labels_hash)
+        if existing is not None:
+            existing.merge(alert_record)
+            return existing
+        else:
+            h = self._hash(rule_id, labels_hash)
+            while self.table[h] is not None:
+                h = (h + 1) % self.capacity
+            self.table[h] = alert_record
+            self.size += 1
+            return alert_record
+    
+    def remove(self, rule_id, labels_hash):
+        h = self._hash(rule_id, labels_hash)
+        while self.table[h] is not None:
+            entry = self.table[h]
+            if entry.rule_id == rule_id and entry.labels_hash == labels_hash:
+                self.table[h] = None
+                self.size -= 1
+                return True
+            h = (h + 1) % self.capacity
+        return False
+```
+
+The open addressing with linear probing minimizes cache misses. The table is sized to twice the expected number of concurrent firing alerts to avoid clustering.
+
+## Code Example: The Consistent Hash Ring for Shard Assignment
+
+```python
+from hashlib import sha256
+
+class ConsistentHashRing:
+    def __init__(self, virtual_nodes=1000):
+        self.virtual_nodes = virtual_nodes
+        self.ring = {}  # hash -> shard_id
+        self.sorted_hashes = []
+    
+    def add_shard(self, shard_id):
+        for i in range(self.virtual_nodes):
+            h = int(sha256(f"{shard_id}:{i}".encode()).hexdigest(), 16)
+            self.ring[h] = shard_id
+            self.sorted_hashes.append(h)
+        self.sorted_hashes.sort()
+    
+    def remove_shard(self, shard_id):
+        for i in range(self.virtual_nodes):
+            h = int(sha256(f"{shard_id}:{i}".encode()).hexdigest(), 16)
+            del self.ring[h]
+            self.sorted_hashes.remove(h)
+    
+    def get_shard(self, rule_id):
+        h = int(sha256(rule_id.encode()).hexdigest(), 16)
+        for ring_hash in self.sorted_hashes:
+            if h <= ring_hash:
+                return self.ring[ring_hash]
+        return self.ring[self.sorted_hashes[0]]
+```
+
+The consistent hash ring has 1,000 virtual nodes per shard. When a shard is added or removed, only a fraction of the rules are reassigned. The hash function is SHA-256 for uniform distribution.
+
+This chapter showed you what happens inside the alerting engine — the data structures, the evaluation pipeline, the consistency challenges, and the performance characteristics. The next chapter scales this up and shows you how to build a production-grade alerting system that handles millions of rules across multiple regions and integrates with the rest of your observability stack.

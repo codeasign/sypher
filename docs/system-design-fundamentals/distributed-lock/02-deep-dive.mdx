@@ -1,0 +1,743 @@
+---
+id: distributed-lock-deep-dive
+title: Distributed Lock Pattern -- Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A distributed lock service is a state machine that maintains a lock registry, manages lease lifecycles, and coordinates access across multiple clients. The internal architecture consists of four subsystems that work together to provide mutual exclusion.
+
+### Lock Registry
+
+The lock registry is the core data store. It maps resource identifiers to lock records. Each lock record contains the owner identifier, fencing token, TTL, and lease metadata. The registry must support atomic read-modify-write operations because two concurrent requests cannot both observe the lock as free.
+
+### Lease Manager
+
+The lease manager maintains a timer wheel for all active leases. Each lease has a TTL and a renewal deadline. The timer wheel checks every 500 milliseconds for expired leases. When a lease expires, the lease manager triggers a lock release workflow that removes the lock record and notifies waiters.
+
+### Token Generator
+
+The token generator produces monotonically increasing 64-bit fencing tokens. The generator must be fault-tolerant -- if the token generator restarts, it must not reuse token values. The typical implementation persists the last-issued token to disk and increments from there after restart.
+
+### Wait Queue
+
+The wait queue maintains the ordered list of processes waiting for each lock. The queue is per-resource. When a lock is released, the wait queue pops the next waiter and grants it the lock. The wait queue must support both local and distributed notification mechanisms, such as ZooKeeper watches, Redis pub-sub channels, or etcd watchers.
+
+<AsciiDiagram
+  id="distributed-lock/internal-architecture"
+  title="Distributed Lock Service Internal Architecture"
+  alt="Four subsystems interacting: Lock Registry, Lease Manager with timer wheel, Token Generator, and Wait Queue, connected by internal event bus"
+  caption="Internal architecture of a distributed lock service with four subsystems"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│                    DISTRIBUTED LOCK SERVICE                       │
+│                                                                   │
+│  ┌─────────────────────┐     ┌───────────────────────────────┐  │
+│  │   Lock Registry      │     │      Lease Manager            │  │
+│  │  ┌─────────────────┐ │     │  ┌─────────────────────────┐  │  │
+│  │  │ resource_A:     │ │     │  │  Timer Wheel (500ms)    │  │  │
+│  │  │  owner: pod-7a9f│ │     │  │  ┌───────────────────┐  │  │  │
+│  │  │  token: 1042    │ │     │  │  │ pod-7a9f: 25s rem│  │  │  │
+│  │  │  ttl: 30s       │ │     │  │  │ pod-3c2e: 28s rem│  │  │  │
+│  │  │  lease_id: L1   │ │     │  │  │ pod-8b1f: 22s rem│  │  │  │
+│  │  └─────────────────┘ │     │  │  └───────────────────┘  │  │  │
+│  │  ┌─────────────────┐ │     │  └─────────────────────────┘  │  │
+│  │  │ resource_B:     │ │     │                               │  │
+│  │  │  owner: pod-3c2e│ │     │  ┌─────────────────────────┐  │  │
+│  │  │  token: 1043    │ │     │  │  Expiry Queue           │  │  │
+│  │  │  ttl: 15s       │ │     │  │  ┌─────────┐            │  │  │
+│  │  │  lease_id: L2   │ │     │  │  │ L1: 25s │            │  │  │
+│  │  └─────────────────┘ │     │  │  │ L2: 13s │            │  │  │
+│  │  ┌─────────────────┐ │     │  │  │ L3: 8s  │            │  │  │
+│  │  │ resource_C:     │ │     │  │  └─────────┘            │  │  │
+│  │  │  FREE           │ │     │  └─────────────────────────┘  │  │
+│  │  └─────────────────┘ │     └───────────────────────────────┘  │
+│  └─────────────────────┘                                          │
+│                                                                   │
+│  ┌─────────────────────┐     ┌───────────────────────────────┐  │
+│  │   Token Generator    │     │      Wait Queue               │  │
+│  │  ┌─────────────────┐ │     │  ┌─────────────────────────┐  │  │
+│  │  │ last_token: 1045│ │     │  │ resource_A waiters:     │  │  │
+│  │  │ next_token: 1046│ │     │  │  [pod-8b1f]             │  │  │
+│  │  │ persisted: true │ │     │  │ resource_B waiters:     │  │  │
+│  │  └─────────────────┘ │     │  │  [pod-9d2a, pod-4e1b]  │  │  │
+│  │                      │     │  └─────────────────────────┘  │  │
+│  │  ┌─────────────────┐ │     │  ┌─────────────────────────┐  │  │
+│  │  │ Startup: 1045   │ │     │  │  Notification Channels   │  │  │
+│  │  │ from disk       │ │     │  │  chan: resource_A ->     │  │  │
+│  │  │ no reuse        │ │     │  │  chan: resource_B ->     │  │  │
+│  │  └─────────────────┘ │     │  └─────────────────────────┘  │  │
+│  └─────────────────────┘     └───────────────────────────────┘  │
+│                                                                   │
+│  ┌────────────────────────────────────────────────────────────────┐│
+│  │                    Internal Event Bus                         ││
+│  │  lock_acquired -> register_lease -> assign_token              ││
+│  │  lock_released -> remove_lease -> notify_waiters              ││
+│  │  lease_expired -> force_release -> notify_waiters             ││
+│  └────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Data Structures
+
+Three data structures form the core of any distributed lock implementation. Each has specific correctness and performance requirements.
+
+### Lock Record
+
+The lock record is the fundamental data structure. It represents the state of a single lock at a single point in time. Each record contains the resource identifier, owner identifier, fencing token, TTL, lease identifier, and acquisition timestamp.
+
+The lock record must support atomic compare-and-swap operations. When two clients attempt to acquire the same lock simultaneously, the lock service must ensure that only one succeeds. This is typically achieved through a database transaction, a Redis Lua script, or a ZooKeeper sequential znode creation.
+
+<AsciiDiagram
+  id="distributed-lock/lock-record-structure"
+  title="Lock Record Data Structure"
+  alt="A detailed layout of the lock record showing fields: resource_id, owner_id, fencing_token, ttl_ms, lease_id, acquired_at, renew_count, version"
+  caption="Lock record data structure with all fields and their types"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│                    LOCK RECORD DATA STRUCTURE                     │
+│                                                                   │
+│  ┌───────────────┬─────────────────────────────────────────┐    │
+│  │ Field         │ Value                                    │    │
+│  ├───────────────┼─────────────────────────────────────────┤    │
+│  │ resource_id   │ resource_A                               │    │
+│  │               │ (string, 256 chars max, primary key)     │    │
+│  ├───────────────┼─────────────────────────────────────────┤    │
+│  │ owner_id      │ pod-7a9f                                 │    │
+│  │               │ (string, 128 chars, unique per holder)   │    │
+│  ├───────────────┼─────────────────────────────────────────┤    │
+│  │ fencing_token │ 1042                                     │    │
+│  │               │ (uint64, monotonically increasing)       │    │
+│  ├───────────────┼─────────────────────────────────────────┤    │
+│  │ ttl_ms        │ 30000                                    │    │
+│  │               │ (uint32, ms, 1000-60000 range)           │    │
+│  ├───────────────┼─────────────────────────────────────────┤    │
+│  │ lease_id      │ L1                                       │    │
+│  │               │ (string, 64 chars, links to lease)       │    │
+│  ├───────────────┼─────────────────────────────────────────┤    │
+│  │ acquired_at   │ 1712345678                               │    │
+│  │               │ (uint64, unix timestamp ms)              │    │
+│  ├───────────────┼─────────────────────────────────────────┤    │
+│  │ renew_count   │ 3                                        │    │
+│  │               │ (uint32, incremented on each renewal)    │    │
+│  ├───────────────┼─────────────────────────────────────────┤    │
+│  │ version       │ 7                                        │    │
+│  │               │ (uint32, optimisic concurrency token)    │    │
+│  └───────────────┴─────────────────────────────────────────┘    │
+│                                                                   │
+│  Memory overhead: ~512 bytes per record                           │
+│  Storage format: JSON or protobuf                                 │
+│  Index: primary on resource_id, secondary on owner_id            │
+└─────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Lease Table
+
+The lease table manages the time-to-live contracts for all active locks. Each lease record contains the lease identifier, owner identifier, TTL, expiry timestamp, and renewal count. The lease table is the backbone of liveness -- if the lease manager crashes, the system must recover the lease state from persistent storage.
+
+The lease manager operates on a timer wheel with configurable tick intervals. A tick interval of 500 milliseconds provides a good balance between responsiveness and CPU usage. On each tick, the lease manager scans for expired leases and triggers their release.
+
+<AsciiDiagram
+  id="distributed-lock/lease-table-structure"
+  title="Lease Table with Timer Wheel"
+  alt="Lease table showing lease records with owner, TTL, expiry timestamp, and renewal count, alongside a timer wheel with slots for each tick interval"
+  caption="Lease table data structure with timer wheel for expiry management"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│                    LEASE TABLE WITH TIMER WHEEL                   │
+│                                                                   │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Lease Records                                             │  │
+│  │  ┌─────────┬─────────┬──────┬──────────┬──────────────┐  │  │
+│  │  │lease_id │ owner   │ TTL  │ expires  │ renew_count  │  │  │
+│  │  ├─────────┼─────────┼──────┼──────────┼──────────────┤  │  │
+│  │  │ L1      │ pod-7a9f│ 30s  │ 12:00:30 │ 3            │  │  │
+│  │  │ L2      │ pod-3c2e│ 15s  │ 12:00:15 │ 1            │  │  │
+│  │  │ L3      │ pod-8b1f│ 60s  │ 12:01:00 │ 5            │  │  │
+│  │  └─────────┴─────────┴──────┴──────────┴──────────────┘  │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  Timer Wheel (tick = 500ms):                                      │
+│  ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐  │
+│  │ T0 │ T1 │ T2 │ T3 │ T4 │ T5 │ T6 │ T7 │ T8 │ T9 │ T10│ T11│  │
+│  ├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤  │
+│  │    │ L2 │    │    │ L1 │    │    │    │ L3 │    │    │    │  │
+│  │    │ 13s│    │    │ 25s│    │    │    │ 58s│    │    │    │  │
+│  └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘  │
+│                                                                   │
+│  On each tick (500ms):                                           │
+│  1. Advance wheel pointer to next slot                           │
+│  2. Check all leases in current slot                             │
+│  3. For each expired lease:                                      │
+│     a. Remove lock record from registry                          │
+│     b. Notify wait queue                                         │
+│     c. Log lease expiry event                                    │
+│     d. Increment lease_expired counter                           │
+│                                                                   │
+│  Memory overhead: ~128 bytes per lease                            │
+│  Timer wheel size: 120 slots (60s / 0.5s)                        │
+└─────────────────────────────────────────────────────────────────────┘
+`} />
+
+### Wait Queue
+
+The wait queue maintains the ordered list of processes waiting for each lock. The queue must support efficient insertion (O(1) amortized), removal (O(1) for the head), and notification (O(1) per waiter). The wait queue is per-resource, meaning each resource identifier has its own queue.
+
+The wait queue can be implemented as a linked list, a priority queue, or a set of ZooKeeper sequential znodes. The notification mechanism is critical -- when a lock is released, the wait queue must notify the next waiter without delay.
+
+<AsciiDiagram
+  id="distributed-lock/wait-queue-structure"
+  title="Wait Queue Data Structure"
+  alt="Multi-resource wait queue showing per-resource queues with linked list nodes containing owner_id, session_id, and notification channel references"
+  caption="Wait queue data structure with per-resource linked lists and notification channels"
+  content={`
+┌─────────────────────────────────────────────────────────────────┐
+│                    WAIT QUEUE DATA STRUCTURE                      │
+│                                                                   │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Wait Queue Index (hash map, keyed by resource_id)        │  │
+│  │                                                           │  │
+│  │  resource_A -> [pod-3c2e] -> [pod-8b1f]                  │  │
+│  │  resource_B -> [pod-9d2a] -> [pod-4e1b] -> [pod-5f3c]   │  │
+│  │  resource_C -> []                                         │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  Queue Node (linked list):                                       │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  +------------------+                                     │  │
+│  │  | owner_id:        |  pod-3c2e                          │  │
+│  │  | session_id:      |  sess_abc123                       │  │
+│  │  | enqueued_at:     |  12:00:01.047                      │  │
+│  │  | notify_channel:  |  chan_3c2e                         │  │
+│  │  | timeout_ms:      |  30000                             │  │
+│  │  | retry_count:     |  0                                 │  │
+│  │  | next:            |  -> pod-8b1f                       │  │
+│  │  | prev:            |  nil                               │  │
+│  │  +------------------+                                     │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  Operations:                                                      │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  enqueue(resource, owner) -> position                     │  │
+│  │    - O(1) amortized via hash map + linked list tail ptr   │  │
+│  │  dequeue(resource) -> owner                               │  │
+│  │    - O(1) via head pointer                                │  │
+│  │  remove(resource, owner) -> bool                          │  │
+│  │    - O(N) worst case, O(1) if owner is head              │  │
+│  │  notify_next(resource) -> bool                            │  │
+│  │    - O(1), sends signal on notify_channel                 │  │
+│  │  clear(resource) -> void                                  │  │
+│  │    - O(N), removes all waiters, sends cancel signals      │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  Memory overhead: ~256 bytes per waiter                           │
+│  Notification: channel-based (Go), CompletableFuture (Java)      │
+└─────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Request Lifecycle
+
+The request lifecycle traces a single lock acquisition from the client's first attempt through the final release. Each step involves specific network messages, state transitions, and consistency checks.
+
+### Step 1: Client Initialization
+
+The client creates a session with the lock service. The session includes authentication credentials, a client identifier, and a lease configuration. The lock service validates the credentials and creates a session record. The session becomes the client's identity for all subsequent lock operations.
+
+### Step 2: Lock Request Serialization
+
+The client serializes the lock request into a protocol buffer or JSON message. The message includes the resource identifier, the desired TTL, a client-generated request ID for idempotency, and the session token. The client sends the message over a persistent TCP connection or gRPC stream.
+
+### Step 3: Request Validation
+
+The lock service receives the request and validates it. Validation checks include resource identifier format, TTL bounds, session token validity, and rate limits. If validation fails, the service returns an error response with a specific error code. The client must handle each error code appropriately.
+
+### Step 4: Registry Lock
+
+The lock service acquires an internal mutex on the resource's registry entry. This internal mutex prevents concurrent modifications to the same resource's lock record. The internal mutex is held for the duration of the registry operation, typically 1 to 5 milliseconds.
+
+### Step 5: Registry Check
+
+The lock service checks whether the resource is currently locked. It reads the lock record from the registry. If the record exists and the TTL has not expired, the lock is held by another owner. If the record does not exist, or the TTL has expired, the resource is free.
+
+### Step 6: Token Generation
+
+If the resource is free, the lock service requests a new fencing token from the token generator. The token generator atomically increments its counter and returns the new value. The token is persisted to disk before it is returned, ensuring that a crash does not cause token reuse.
+
+### Step 7: Lock Record Creation
+
+The lock service creates a new lock record in the registry. The record is written with the owner identifier, fencing token, TTL, and current timestamp. The write is durable -- it must survive a crash of the lock service node. In a consensus-based system, this write is committed through the consensus protocol.
+
+### Step 8: Lease Registration
+
+The lock service registers a new lease in the lease manager. The lease is configured with the TTL and the owner identifier. The lease manager starts the timer for this lease. The lease links back to the lock record so that lease expiry can trigger lock release.
+
+### Step 9: Wait Queue Check
+
+The lock service checks whether there are any waiters in the resource's wait queue. If the queue is non-empty, the lock service notifies the next waiter that the lock was acquired by a different process. This step is important for fairness -- waiters should not be left waiting indefinitely.
+
+### Step 10: Response to Client
+
+The lock service serializes the success response. The response includes the fencing token, the lock identifier, the TTL, and the lease identifier. The client receives the response and enters the critical section. The client stores the fencing token for use with the protected resource.
+
+### Step 11: Periodic Renewal
+
+The client sends renewal requests at the configured interval. Each renewal request includes the resource identifier, the lease identifier, and the session token. The lock service extends the lease TTL by the original duration. The renewal response confirms the new expiry time.
+
+### Step 12: Release Request
+
+When the client completes the critical section, it sends a release request. The release request includes the resource identifier, the lock identifier, and the fencing token. The lock service validates that the requesting client is the current lock holder.
+
+### Step 13: Registry Cleanup
+
+The lock service removes the lock record from the registry. The removal is atomic -- if the lock record was already removed by a lease expiry, the release is a no-op. The client must handle the case where the release succeeds but the lock was already expired.
+
+### Step 14: Waiter Notification
+
+The lock service pops the next waiter from the wait queue. The waiter receives a notification that the lock is available. The waiter then initiates its own lock acquisition cycle, starting from Step 1.
+
+<AsciiDiagram
+  id="distributed-lock/request-lifecycle"
+  title="Complete Lock Request Lifecycle"
+  alt="Detailed sequence diagram showing 14 steps from client initialization through waiter notification, including all internal subsystems and network messages"
+  caption="Complete lock request lifecycle with all internal subsystem interactions"
+  content={`
+┌──────────┐   ┌──────────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│  Client  │   │ Lock Service │   │ Registry │   │  Token   │   │  Lease   │
+│          │   │  Frontend    │   │          │   │ Generator│   │ Manager  │
+└────┬─────┘   └──────┬───────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘
+     │                │                │              │              │
+     │ 1. Init session│                │              │              │
+     │ ───────────────>│               │              │              │
+     │                │ 2. Validate    │              │              │
+     │                │                │              │              │
+     │ 3. Acquire     │                │              │              │
+     │ ───────────────>│               │              │              │
+     │                │ 4. Lock entry  │              │              │
+     │                │ ──────────────>│              │              │
+     │                │                │              │              │
+     │                │ 5. Read lock   │              │              │
+     │                │ <──────────────│              │              │
+     │                │    FREE        │              │              │
+     │                │                │              │              │
+     │                │ 6. Get token   │              │              │
+     │                │ ────────────────────────────────────────────>│
+     │                │                │              │              │
+     │                │    token=1046  │              │              │
+     │                │ <────────────────────────────────────────────│
+     │                │                │              │              │
+     │                │ 7. Write lock  │              │              │
+     │                │ ──────────────>│              │              │
+     │                │    Durable     │              │              │
+     │                │                │              │              │
+     │                │ 8. Register    │              │              │
+     │                │ ────────────────────────────────────────────>│
+     │                │    lease TTL   │              │              │
+     │                │                │              │              │
+     │ 9. Grant       │                │              │              │
+     │ <───────────────│               │              │              │
+     │  token=1046    │                │              │              │
+     │                │                │              │              │
+     │ 10. Renew      │                │              │              │
+     │ ───────────────>│               │              │              │
+     │                │ 11. Extend     │              │              │
+     │                │ ────────────────────────────────────────────>│
+     │                │                │              │              │
+     │ 12. Release    │                │              │              │
+     │ ───────────────>│               │              │              │
+     │                │ 13. Remove     │              │              │
+     │                │ ──────────────>│              │              │
+     │                │                │              │              │
+     │                │ 14. Notify     │              │              │
+     │                │     waiter     │              │              │
+     │                │                │              │              │
+`} />
+
+## Consistency and State
+
+Distributed locks operate in a world where network partitions, process pauses, and clock drift are normal. Understanding how the lock service behaves under each scenario is essential for building reliable systems.
+
+### Scenario 1: Network Partition
+
+A network partition separates the lock holder from the lock service. The lock holder believes it still holds the lock. The lock service, unable to receive heartbeats, expires the lease and grants the lock to a new holder.
+
+**Effect**: Two processes may hold the lock simultaneously for a window equal to the lease TTL. The original holder continues writing to the protected resource. The new holder also writes to the protected resource. Without fencing tokens, data corruption is guaranteed.
+
+**Mitigation**: The protected resource must check fencing tokens. The original holder's token is stale (lower than the new holder's token). The resource rejects the original holder's writes. The original holder detects the rejection and aborts the critical section.
+
+### Scenario 2: GC Pause
+
+A Java application holding a distributed lock experiences a 15-second garbage collection pause. The JVM stops all application threads. The application cannot send heartbeats or access the protected resource. The lock TTL is 10 seconds.
+
+**Effect**: The lease expires after 10 seconds. The lock service grants the lock to a new holder. The new holder acquires a new fencing token and starts writing. After 5 more seconds, the GC pause ends. The original application resumes, unaware that its lock is gone. It continues writing to the protected resource.
+
+**Mitigation**: The original application must check the fencing token before each write. The GC pause causes the application to miss the lease expiry, but the fencing token check on the resource side catches the stale write. The application must also detect the missed renewals and abort the critical section.
+
+### Scenario 3: Clock Drift
+
+The lock service node and the client node have clocks that drift by 5 seconds per hour. The lock service uses TTL-based expiry, where the TTL is measured by the lock service's clock. The client renews the lease based on its own clock.
+
+**Effect**: If the client's clock is 5 seconds behind the lock service's clock, the client may believe the lease is still valid when the lock service has already expired it. The client continues writing to the protected resource while a new holder also writes.
+
+**Mitigation**: Clock drift is one of the hardest problems in distributed lock systems. The primary mitigation is to use a consensus-based lock service such as ZooKeeper or etcd, where lease expiry is based on session state rather than absolute time. The secondary mitigation is to use fencing tokens on the resource side, which catch stale writes regardless of the clock state.
+
+### Scenario 4: Leader Crash
+
+The lock service leader crashes. In a consensus-based system such as etcd or ZooKeeper, a new leader is elected. The new leader must replay the Raft log to recover the lock state. During the election and recovery, the lock service is unavailable for writes.
+
+**Effect**: Lock acquisition requests fail during the leader election. The election typically takes 300 to 1,000 milliseconds for Raft-based systems. Holders of existing locks continue to operate normally because they already have the fencing token. However, they cannot renew their leases, so the leases may expire during the leader outage.
+
+**Mitigation**: The lock service should be configured with a lease TTL that is longer than the expected leader election time. A typical configuration sets the lease TTL to 10 seconds and the leader election timeout to 300 milliseconds. This ensures that leases do not expire during a leader election.
+
+<AsciiDiagram
+  id="distributed-lock/consistency-scenarios"
+  title="Consistency Scenarios for Distributed Locks"
+  alt="Four scenarios shown side by side: network partition, GC pause, clock drift, and leader crash, each with timeline and mitigation"
+  caption="Four consistency scenarios and their impact on distributed lock safety"
+  content={`
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CONSISTENCY SCENARIOS FOR DISTRIBUTED LOCKS                │
+│                                                                             │
+│  SCENARIO 1: NETWORK PARTITION                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │  Holder  ----/ /----  Lock Service  ----   New Holder                │  │
+│  │  T0: Lock acquired                   T0: Lock acquired               │  │
+│  │  T5: Partition starts                T5: Heartbeat fails             │  │
+│  │  T10: Holder writes                  T10: Lease expires              │  │
+│  │  T12: Write rejected (stale token)   T12: New holder acquires        │  │
+│  │  Mitigation: fencing token check     Token: 1043                     │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  SCENARIO 2: GC PAUSE                                                       │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │  T0: Lock acquired, token=1042                                       │  │
+│  │  T5: GC pause starts (15s)                                           │  │
+│  │  T10: Lease expires, lock released                                   │  │
+│  │  T12: New holder acquires, token=1043                                │  │
+│  │  T20: GC pause ends, original holder resumes                         │  │
+│  │  T21: Original holder writes with token=1042 -> REJECTED             │  │
+│  │  Mitigation: fencing token check on resource                         │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  SCENARIO 3: CLOCK DRIFT                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │  Lock service clock: 12:00:00                                        │  │
+│  │  Client clock:       11:59:55 (5s behind)                            │  │
+│  │  T0: Lock acquired, TTL=30s (service time)                           │  │
+│  │  T25: Client thinks 20s elapsed, renews                              │  │
+│  │  T30: Service sees TTL expired, releases lock                        │  │
+│  │  T31: New holder acquires, token=1043                                │  │
+│  │  T32: Client writes with token=1042 -> REJECTED                      │  │
+│  │  Mitigation: consensus-based service, fencing tokens                  │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  SCENARIO 4: LEADER CRASH                                                   │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │  T0: Leader processes lock acquisition, token=1042                  │  │
+│  │  T5: Leader crashes                                                 │  │
+│  │  T5.3: Follower detects leader loss, starts election                │  │
+│  │  T5.6: New leader elected                                           │  │
+│  │  T5.8: WAL replayed, lock state recovered                           │  │
+│  │  T6.0: Lock operations resume                                       │  │
+│  │  Total outage: ~1 second                                            │  │
+│  │  Mitigation: lease TTL > election timeout                           │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Performance
+
+The performance of a distributed lock service is determined by three factors: the consistency protocol, the network topology, and the data structure efficiency.
+
+### Consistency Protocol Overhead
+
+The consistency protocol is the dominant factor in lock acquisition latency. A single-node Redis lock requires one round trip to the Redis server, approximately 1 to 3 milliseconds. A ZooKeeper lock requires two round trips: one to create the znode and one to list children. Additionally, the Zab protocol requires a consensus round trip for the znode creation. Total latency is 5 to 15 milliseconds.
+
+An etcd lock requires a Raft consensus round trip for each key write. The Raft leader must replicate the write to a majority of nodes. With a 3-node etcd cluster in the same datacenter, the consensus round trip adds approximately 3 to 8 milliseconds for the write. The lease creation adds another round trip.
+
+### Network Topology
+
+The physical distance between the client and the lock service adds latency. A client in us-east-1 accessing a lock service in us-west-2 incurs approximately 60 milliseconds of round-trip time. The same client accessing a lock service in the same availability zone incurs less than 1 millisecond.
+
+The recommended deployment topology places the lock service in the same region as the majority of clients. Cross-region lock acquisition should be avoided by partitioning resources by region.
+
+### Data Structure Efficiency
+
+The lock registry, lease table, and wait queue all use hash maps for O(1) average-case access. The lock registry uses a concurrent hash map keyed by resource identifier. The lease table uses a timer wheel for O(1) insertion and expiry. The wait queue uses a linked list per resource for O(1) enqueue and dequeue.
+
+### Performance Benchmarks
+
+The following table presents benchmark results for a 3-node lock service cluster with 10 concurrent clients.
+
+| Metric | Redis (SETNX) | ZooKeeper | etcd | MySQL (SELECT FOR UPDATE) |
+|---|---|---|---|---|
+| Average acquisition latency | 1.2 ms | 8.4 ms | 5.1 ms | 22.3 ms |
+| P99 acquisition latency | 3.7 ms | 22.1 ms | 14.8 ms | 87.2 ms |
+| Maximum throughput | 52,000 ops/s | 8,200 ops/s | 9,500 ops/s | 1,200 ops/s |
+| Renewal latency | 1.1 ms | 7.8 ms | 4.9 ms | 21.5 ms |
+| Release latency | 1.0 ms | 7.2 ms | 4.7 ms | 20.1 ms |
+| Connection overhead | 0.1 ms | 2.3 ms | 1.8 ms | 5.7 ms |
+| Memory per lock | 64 bytes | 256 bytes | 192 bytes | 512 bytes |
+
+### Performance Scaling
+
+The lock service's throughput scales with the number of resources, not the number of clients. A single lock service can handle 10,000 concurrent locks on 10,000 different resources because each lock acquisition is independent. The throughput limit is reached when all clients contend for the same resource, forcing serialization through the lock registry.
+
+For a single resource, the maximum throughput is limited by the lock acquisition latency. If acquisition takes 5 milliseconds, the maximum throughput for that resource is 200 operations per second. This is the serialization bottleneck -- distributed locks cannot improve throughput for a single resource beyond the inverse of the acquisition latency.
+
+## Configuration
+
+A distributed lock service has numerous configuration parameters that affect safety, liveness, and performance. Each parameter must be tuned based on the workload characteristics.
+
+### TTL Configuration
+
+The TTL is the most critical configuration parameter. The TTL must be longer than the maximum expected critical section duration, including any GC pauses, network delays, and retries.
+
+```
+TTL = max_critical_section_duration * 1.5 + max_gc_pause + max_network_delay
+```
+
+For a typical workload with a critical section of 5 seconds, a GC pause of 2 seconds, and a network delay of 1 second, the TTL should be:
+
+```
+TTL = 5 * 1.5 + 2 + 1 = 10.5 seconds (round up to 12 seconds)
+```
+
+The TTL must be short enough that a crashed holder does not block the system for too long. The maximum acceptable block time is a business decision. For a payment processing system, 30 seconds may be acceptable. For a real-time trading system, 500 milliseconds may be too long.
+
+### Renewal Interval
+
+The renewal interval determines how frequently the holder refreshes the lease. The interval should be short enough that the lease does not expire before the next renewal, but long enough that renewal overhead is negligible.
+
+```
+renewal_interval = TTL / 3
+```
+
+For a 12-second TTL, the renewal interval is 4 seconds. This gives the holder 8 seconds of buffer if a renewal fails. The holder should attempt renewal before the halfway point of the TTL.
+
+### Lease Duration
+
+The lease duration is the maximum time the lock service waits before declaring a lease expired. The lease duration should be equal to or slightly longer than the TTL. The lease duration determines how quickly the system recovers from a holder crash.
+
+### Connection Pool Size
+
+The lock service must maintain connections to all clients. The connection pool size should be:
+
+```
+connection_pool_size = max_concurrent_clients * 1.2
+```
+
+For a system with 500 concurrent clients, the connection pool should be 600. This provides a 20 percent buffer for connection bursts.
+
+### Request Timeout
+
+The request timeout is the maximum time the client waits for a lock acquisition response. The timeout should be:
+
+```
+request_timeout = TTL * 2 + network_timeout
+```
+
+For a 12-second TTL and a 5-second network timeout, the request timeout is 29 seconds. This ensures that the client does not give up before the lock is available.
+
+### Rate Limiting
+
+The lock service should rate-limit acquisition requests to prevent abuse. The rate limit should be:
+
+```
+rate_limit = max_throughput_per_resource * 1.5
+```
+
+For a resource with a maximum throughput of 200 operations per second, the rate limit is 300 requests per second. Excess requests receive a 429 (Too Many Requests) response.
+
+### Configuration Profile for Different Workloads
+
+| Parameter | High-Throughput | Low-Latency | Safety-Critical |
+|---|---|---|---|
+| Lock service | Redis | Redis | ZooKeeper / etcd |
+| TTL | 5 seconds | 1 second | 30 seconds |
+| Renewal interval | 1.5 seconds | 300 ms | 10 seconds |
+| Renewal attempts | 3 | 2 | 5 |
+| Request timeout | 15 seconds | 5 seconds | 60 seconds |
+| Rate limit per resource | 10,000/s | 5,000/s | 500/s |
+| Fencing tokens | Not required | Required | Required |
+| Connection pool | 200 | 100 | 500 |
+
+<AsciiDiagram
+  id="distributed-lock/configuration-tradeoffs"
+  title="Configuration Trade-offs for Distributed Locks"
+  alt="Two-dimensional chart showing TTL vs throughput trade-off for different lock implementations, with safety-critical, high-throughput, and low-latency zones"
+  caption="Configuration trade-off space for distributed lock workloads"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│              CONFIGURATION TRADE-OFF SPACE                            │
+│                                                                       │
+│  TTL (seconds)                                                        │
+│     60 ┤                                                             │
+│        │                                      SAFETY-CRITICAL        │
+│     30 ┤                                     ┌──────────────┐       │
+│        │                                     │ ZooKeeper    │       │
+│     15 ┤                                     │ TTL=30s      │       │
+│        │                                     │ tokens=yes   │       │
+│      5 ┤              ┌─────────────────┐    └──────────────┘       │
+│        │              │ HIGH-THROUGHPUT  │                          │
+│      2 ┤              │ Redis            │                          │
+│        │              │ TTL=5s           │                          │
+│      1 ┤              │ tokens=no        │──┐                       │
+│        │              └─────────────────┘  │ LOW-LATENCY            │
+│    0.5 ┤                                   │ Redis                  │
+│        │                                   │ TTL=1s                 │
+│    0.1 ┤                                   │ tokens=yes             │
+│        └─────────────────────────────────┴───────────────────────  │
+│                100     1K      10K      50K    100K                 │
+│                           Throughput (ops/sec)                      │
+│                                                                       │
+│  Key insight: As TTL decreases, throughput increases but             │
+│  renewal frequency increases. Safety-critical workloads              │
+│  prefer longer TTLs and consensus-based services.                    │
+└─────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Lock Service Implementation Patterns
+
+### Single-Node Pattern
+
+The simplest implementation uses a single server with in-memory state. The lock registry is a concurrent hash map. The lease manager is a goroutine or thread that periodically scans for expired leases. The wait queue is a set of channels.
+
+This pattern is suitable for testing and development but not for production. The single node is a single point of failure.
+
+### Replicated State Machine Pattern
+
+The production-grade implementation uses a replicated state machine built on Raft or Zab. The lock registry, lease table, and wait queue are replicated across all nodes. The state machine ensures that all nodes agree on the state of every lock.
+
+This pattern is used by ZooKeeper, etcd, and Consul. It provides strong consistency and fault tolerance at the cost of higher latency.
+
+### Sharded Pattern
+
+For very high throughput, the lock registry can be sharded across multiple lock service instances. Each shard is responsible for a subset of resources. The shard key is derived from the resource identifier, typically using a hash function.
+
+Sharding increases throughput linearly with the number of shards. A 10-shard lock service can handle 10 times the throughput of a single-instance lock service. However, sharding adds complexity -- the client must know which shard to contact, and cross-shard operations such as acquiring multiple locks require a distributed coordinator.
+
+<AsciiDiagram
+  id="distributed-lock/implementation-patterns"
+  title="Lock Service Implementation Patterns"
+  alt="Three patterns shown side by side: single-node with in-memory state, replicated state machine with Raft consensus, and sharded architecture with hash-based routing"
+  caption="Three implementation patterns for distributed lock services"
+  content={`
+┌─────────────────────────────────────────────────────────────────────┐
+│              LOCK SERVICE IMPLEMENTATION PATTERNS                     │
+│                                                                       │
+│  PATTERN 1: SINGLE-NODE                          PATTERN 2: REPLICATED│
+│  ┌──────────────────────┐                        ┌──────────────────┐│
+│  │  ┌────────────────┐  │                        │  ┌──────────────┐││
+│  │  │ Lock Registry  │  │                        │  │  Leader     │││
+│  │  │ (hash map)     │  │                        │  │ ┌────────┐  │││
+│  │  └────────────────┘  │                        │  │ │Registry│  │││
+│  │  ┌────────────────┐  │                        │  │ └────────┘  │││
+│  │  │ Lease Manager  │  │                        │  └──────┬───────┘││
+│  │  │ (timer wheel)  │  │                        │  ┌──────┴───────┐││
+│  │  └────────────────┘  │                        │  │ Follower 1  │││
+│  │  ┌────────────────┐  │                        │  │ ┌────────┐  │││
+│  │  │ Wait Queue     │  │                        │  │ │Registry│  │││
+│  │  │ (channels)     │  │                        │  │ └────────┘  │││
+│  │  └────────────────┘  │                        │  └──────────────┘││
+│  │  Single point of     │                        │  ┌──────────────┐││
+│  │  failure. Not for    │                        │  │ Follower 2  │││
+│  │  production.         │                        │  │ ┌────────┐  │││
+│  └──────────────────────┘                        │  │ │Registry│  │││
+│                                                   │  └────────┘  │││
+│  PATTERN 3: SHARDED                                └──────────────┘││
+│  ┌──────────────────────────────────────────────┐  └──────────────────┘│
+│  │  Client -> hash(resource) % N -> shard       │                      │
+│  │                                              │                      │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐   │                      │
+│  │  │ Shard 0  │  │ Shard 1  │  │ Shard 2  │   │                      │
+│  │  │ Raft(3)  │  │ Raft(3)  │  │ Raft(3)  │   │                      │
+│  │  │ resources│  │ resources│  │ resources│   │                      │
+│  │  │ A-D      │  │ E-H      │  │ I-L      │   │                      │
+│  │  └──────────┘  └──────────┘  └──────────┘   │                      │
+│  │                                              │                      │
+│  │  Advantages: Nx throughput, isolated faults  │                      │
+│  │  Disadvantages: complex routing, cross-shard │                      │
+│  │                locks require coordinator     │                      │
+│  └──────────────────────────────────────────────┘                      │
+└─────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Observability
+
+A distributed lock service must expose metrics for monitoring. The essential metrics are:
+
+- `lock_acquire_count`: Total number of successful lock acquisitions per resource.
+- `lock_acquire_failed_count`: Total number of failed acquisition attempts per resource.
+- `lock_acquire_latency_ms`: Histogram of acquisition latency.
+- `lock_hold_duration_ms`: Histogram of lock hold duration per resource.
+- `lease_expired_count`: Total number of lease expirations.
+- `lease_renewal_count`: Total number of successful lease renewals.
+- `lease_renewal_failed_count`: Total number of failed lease renewals.
+- `wait_queue_depth`: Current number of waiters per resource.
+- `wait_queue_wait_time_ms`: Histogram of wait time in the queue.
+- `registry_size`: Current number of active locks.
+- `connection_count`: Current number of active client connections.
+- `token_generator_current`: Current fencing token value.
+
+These metrics should be exposed via a Prometheus endpoint and visualized in a Grafana dashboard. Alert thresholds should be configured for elevated lease expiry rates, high acquisition latency, and deep wait queues.
+
+### Logging
+
+The lock service must log every lock operation for audit and debugging purposes. Each log entry should include:
+
+- Timestamp with microsecond precision.
+- Operation type (acquire, release, renew, expire).
+- Resource identifier.
+- Owner identifier.
+- Fencing token.
+- Client IP address.
+- Duration of the operation.
+- Result (success, failure, timeout).
+
+The audit log is critical for postmortem analysis. When a safety violation occurs, the audit log must provide enough information to reconstruct the sequence of events.
+
+## Lock Safety Verification
+
+Formal verification of distributed lock safety is a complex but important topic. The safety condition for a distributed lock can be stated as:
+
+For any resource R and any time T, at most one process P holds the lock for R at time T.
+
+This condition must hold even under network partitions, process pauses, and clock drift. Formal verification techniques include model checking (using TLA+ or Alloy) and runtime verification (using invariant checking).
+
+### Model Checking with TLA+
+
+TLA+ is a formal specification language for distributed systems. A TLA+ specification of a distributed lock defines the lock service state machine, the client behavior, and the failure model. The TLA+ model checker (TLC) explores all reachable states of the specification and checks that the safety invariant holds in every state.
+
+```tla
+------------------------------ MODULE LockService ------------------------------
+EXTENDS Integers, TLC
+
+CONSTANTS MaxClients, MaxTokens
+
+VARIABLES lockHolder, tokenCounter
+
+Init == /\ lockHolder = [r \in Resources |-> NULL]
+        /\ tokenCounter = 1
+
+Acquire(client, resource) ==
+    /\ lockHolder[resource] = NULL
+    /\ lockHolder' = [lockHolder EXCEPT ![resource] = client]
+    /\ tokenCounter' = tokenCounter + 1
+
+Release(client, resource) ==
+    /\ lockHolder[resource] = client
+    /\ lockHolder' = [lockHolder EXCEPT ![resource] = NULL]
+
+Safety == \A r \in Resources: Cardinality({c \in Clients: lockHolder[r] = c}) <= 1
+=============================================================================
+```
+
+### Runtime Verification
+
+Runtime verification checks the safety invariant during production operation. The lock service emits a verification event for every lock acquisition. A separate verification service consumes these events and checks that no two acquisitions for the same resource overlap. If a violation is detected, the verification service triggers an alert.
+
+Runtime verification cannot prevent safety violations, but it detects them immediately when they occur. This enables rapid response to data corruption incidents.

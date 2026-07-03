@@ -1,0 +1,502 @@
+---
+id: rate-limiter-tradeoffs
+title: Rate Limiter Pattern -- Trade-offs & Failure Modes
+sidebar_label: Trade-offs
+sidebar_position: 4
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Core Tension
+
+The fundamental tension in rate limiter design is between accuracy and performance. Every dimension of the design traces back to this axis. Perfect accuracy requires storing every request timestamp and checking every request against the full history. This consumes memory proportional to traffic volume and adds latency proportional to log size. Trading accuracy for performance means using approximations and windowed counters that might allow 5 percent more traffic than intended.
+
+The second tension is between strictness and availability. A strict rate limiter rejects every request that exceeds the limit, even by one. An available rate limiter tolerates some overage to avoid false positives. During a Redis failure, the choice between rejecting all requests (fail closed) and allowing all requests (fail open) directly impacts availability versus correctness. There is no universally correct answer -- it depends on the cost of false positives versus false negatives for your specific use case.
+
+The third tension is between granularity and complexity. Per-user, per-endpoint, per-region, per-method rate limiting gives precise control but requires complex configuration, more state, and careful ordering of limit evaluation. A single global limit is simple but offers no protection against noisy neighbors. The configuration surface grows exponentially with each additional dimension: 10 client tiers * 20 endpoints * 5 HTTP methods = 1,000 rate limit configurations that must be maintained and tested.
+
+## Decision Matrix
+
+The decision matrix compares five algorithms across six dimensions. Use this table to select the right algorithm for your specific requirements.
+
+| Dimension | Token Bucket | Leaky Bucket | Sliding Window Log | Sliding Window Counter | Fixed Window |
+|---|---|---|---|---|---|
+| Memory per client | 48 bytes | 48 bytes + queue | 96 bytes per request | 96 bytes (6 sub-windows) | 24 bytes |
+| Accuracy | Exact (burst) | Exact (rate) | Exact (full) | Approx (3-5% error) | Approx (boundary burst) |
+| Burst handling | Excellent | Poor | Good | Good | Poor (reset abuse) |
+| Computational cost | Low | Low | Medium (ZADD/ZCOUNT) | Low (HINCRBY) | Lowest |
+| Redis ops per check | 1 Lua call | 1 Lua call | 2-3 Redis calls | 1 Lua call | 1 Redis call |
+| p50 latency | 0.5ms | 0.5ms | 1.5ms | 0.8ms | 0.3ms |
+| Implementation complexity | Low | Low | Medium | Medium | Lowest |
+| Traffic smoothing | No | Yes | No | No | No |
+| Starvation resistance | Medium | High | High | Medium | Low |
+| Boundary burst vulnerability | None | None | None | Low | High |
+| Best use case | General API, bursty | Queue processing | Critical limits, billing | High-scale API | Low-traffic, simple |
+
+## CAP Theorem Positioning
+
+Rate limiting is a consistency-sensitive system. The C in CAP -- consistency -- means all rate limiter instances agree on the count of requests from a client. The A -- availability -- means the rate limiter responds to every request even if some nodes are down. The P -- partition tolerance -- means the system continues operating during network failures between the rate limiter and its data store.
+
+<AsciiDiagram
+  id="rate-limiter/tradeoffs-cap"
+  title="Rate Limiter CAP Trade-off Positioning"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    CAP TRADE-OFF FOR RATE LIMITERS                           │
+│                                                                              │
+│                         ┌─────────────────────┐                             │
+│                        /        CP            \\                             │
+│                       /  Consistency +        \\                            │
+│                      /   Partition Tolerance    \\                           │
+│                     /    (Billing limits)        \\                          │
+│                    /                              \\                         │
+│                   │    Fail closed on Redis loss   │                        │
+│                   │    WAIT for sync replication   │                        │
+│                   │    Lock clients to shard      │                        │
+│                   │                              │                        │
+│                   │    Use case: Payment API     │                        │
+│                   │    Cost of false positive:   │                        │
+│                   │    overcharge customer       │                        │
+│                   └──────────────┬───────────────┘                        │
+│                                  │                                         │
+│                                  │                                         │
+│   CONSISTENCY                    │                PARTITION TOLERANCE      │
+│                                  │                                         │
+│   ┌──────────────────────────────┼──────────────────────────────┐         │
+│   │                AP            │                              │         │
+│   │   Availability + Partition   │                              │         │
+│   │   Tolerance                  │                              │         │
+│   │        (Standard API limits)  │                              │         │
+│   │                              │                              │         │
+│   │   Fail open on Redis loss    │                              │         │
+│   │   Local cache with TTL      │                              │         │
+│   │   Async global sync         │                              │         │
+│   │   Memcached (no atomicity)  │                              │         │
+│   │                              │                              │         │
+│   │   Use case: General API     │                              │         │
+│   │   Cost of false positive:   │                              │         │
+│   │   temporary overage         │                              │         │
+│   └─────────────────────────────┘                              │         │
+│                                                                           │
+│   Most rate limiters choose AP for standard limits and CP for            │
+│   critical limits. The choice depends on the cost of a false            │
+│   positive (allowing a request that should be rejected) vs a            │
+│   false negative (rejecting a request that should be allowed).          │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="CAP triangle with rate limiter positioned toward availability and partition tolerance, with consistency options"
+  caption="Most rate limiters prioritize availability and partition tolerance over strict consistency"
+/>
+
+**CP Configuration** (for billing-critical limits): Use Redis Lua with `WAIT` for synchronous replication. If Redis is unreachable, reject all requests (fail closed). This ensures no client ever exceeds a hard limit, but it sacrifices availability during Redis failures. Use this for payment processing, quota enforcement, and any limit where exceeding the threshold causes financial loss.
+
+**AP Configuration** (for standard API limits): Use local caches with short TTLs. If Redis is unreachable, fall back to local limiting with conservative estimates. This maximizes availability but allows some overage during failover. Use this for general API rate limiting, where a few extra requests during a Redis failure are acceptable.
+
+## Failure Modes
+
+### Failure Mode 1: Thundering Herd from Retries
+
+When a client receives a 429, it might retry immediately without backoff. If 1,000 clients all do this, the rate limiter receives 1,000 retries at once. Each retry is a new request, consuming another token. The retries compound the problem. The rate limiter enters a death spiral: it rejects requests, the retries arrive, the retries consume tokens, legitimate requests are rejected, they also retry, and the retry volume grows exponentially.
+
+<AsciiDiagram
+  id="rate-limiter/tradeoffs-thundering"
+  title="Failure Mode 1 -- Thundering Herd from Retry Loops"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│               FAILURE MODE 1: THUNDERING HERD OF RETRIES                     │
+│                                                                              │
+│   Time   Client A    Client B    Client C    ... Client N    Rate Limiter   │
+│   ─────  ─────────   ─────────   ─────────       ─────────   ────────────  │
+│   T=0    Request ───> Request ──> Request ──> ... Request ──> All allowed   │
+│   T=1    Request ───> Request ──> Request ──> ... Request ──> Limit reached │
+│   T=1    429 <─────  429  <────  429  <────  ... 429  <────  429s sent     │
+│   T=1.1  Retry  ───> Retry  ───> Retry  ───> ... Retry  ───> 429s again   │
+│   T=1.2  Retry  ───> Retry  ───> Retry  ───> ... Retry  ───> 429s again   │
+│   T=1.3  Retry  ───> Retry  ───> Retry  ───> ... Retry  ───> 429s again   │
+│                                                                              │
+│   Retry volume: 1,000 clients * 10 retries = 10,000 requests/second        │
+│   Normal volume: 1,000 clients * 1 request = 1,000 requests/second         │
+│   Amplification factor: 10x                                                  │
+│                                                                              │
+│   Effect: Retry traffic is 10x the original traffic, consuming tokens       │
+│   that legitimate new requests need. The retry loop amplifies the problem.  │
+│                                                                              │
+│   Fix: Require Retry-After header compliance. Track retry rate per client   │
+│   and add exponential delay (1s, 2s, 4s, 8s, 16s, 32s). Block clients      │
+│   exceeding retry budget (max 5 retries per window).                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Timeline showing multiple clients receiving 429s and immediately retrying, creating a thundering herd"
+  caption="Uncontrolled retries amplify the traffic problem and can overwhelm the rate limiter itself"
+/>
+
+**Fix**: The server must enforce Retry-After compliance. Track the retry frequency per client using a separate counter. If a client retries more than 3 times within 60 seconds, escalate the response: 429 becomes 429 with a Retry-After of 300 seconds (5 minutes). On the 10th retry, block the client for 24 hours. The client must implement exponential backoff with jitter, starting at 1 second and doubling up to 60 seconds.
+
+### Failure Mode 2: Coordinated Client Rotation
+
+A determined attacker rotates through multiple API keys or IP addresses to bypass per-client limits. Each key stays under the individual limit, but the aggregate traffic overwhelms the system. The attacker uses a pool of 1,000 API keys, each sending 100 requests per minute. The total is 100,000 requests per minute, all within the per-key limit.
+
+**Fix**: Implement a global rate limit in addition to per-client limits. The global limit catches the aggregate traffic regardless of how many keys are used. Use behavioral analysis to detect coordinated rotation patterns: track the IP range, user agent fingerprint, and request pattern as secondary identifiers. If 10 keys from the same /24 IP range all hit exactly 99 percent of their limit simultaneously, flag them as a coordinated group and apply a shared limit.
+
+### Failure Mode 3: Rate Limiter as a Bottleneck
+
+The rate limiter itself becomes the bottleneck. At 200,000 requests per second, the Lua script execution on Redis saturates a CPU core. Redis cannot keep up, commands queue, and latency spikes. The rate limiter that was supposed to protect the backend now becomes the weakest link.
+
+<AsciiDiagram
+  id="rate-limiter/tradeoffs-bottleneck"
+  title="Failure Mode 3 -- Rate Limiter Becomes the Bottleneck"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│               FAILURE MODE 3: RATE LIMITER BOTTLENECK                         │
+│                                                                              │
+│   Normal conditions (under 25K req/s per Redis shard):                      │
+│   Request ──> RL (1ms) ──> Backend (50ms) ──> Response                       │
+│                                                                              │
+│   Bottleneck conditions (200K req/s, single Redis shard):                   │
+│   ┌────────┐   ┌──────────────┐   ┌────────────┐                            │
+│   │Request │   │  Redis Lua   │   │  Backend   │                            │
+│   │Queue   │──>│  CPU: 100%   │──>│  Waiting   │                            │
+│   │10K deep│   │  Latency:    │   │  for RL    │                            │
+│   │        │   │  200ms p99   │   │            │                            │
+│   └────────┘   └──────────────┘   └────────────┘                            │
+│                                                                              │
+│   Symptoms:                                                                  │
+│   - Redis CPU at 100%, command queue growing to 10,000+                     │
+│   - Rate limiter latency exceeds backend latency (200ms vs 50ms)           │
+│   - All backends underutilized -- traffic is stuck in the queue            │
+│   - False positives: stale counts cause premature rejections               │
+│   - The rate limiter is now the bottleneck, not the backend                 │
+│                                                                              │
+│   Monitoring signals:                                                        │
+│   - redis_cpu_sys > 90% for more than 30 seconds                           │
+│   - rate_limiter_latency > backend_processing_latency                      │
+│   - connected_clients approaching maxclients                                  │
+│                                                                              │
+│   Fix: Shard Redis across more nodes. Use local cache to bypass Redis       │
+│   for repeated clients. Offload non-critical checks to async pathway.       │
+│   Add Redis shards before CPU reaches 70%.                                 │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Queue diagram showing Redis CPU saturation causing latency spike and backend underutilization"
+  caption="When the rate limiter saturates, it becomes the bottleneck and prevents legitimate traffic from reaching backends"
+/>
+
+**Fix**: Shard Redis across more nodes. Each shard handles a subset of clients. The general rule is 1 Redis shard per 25,000 requests per second. Use local cache to bypass Redis for 60 percent of checks. Offload non-critical checks to an async pathway. Monitor Redis CPU utilization and add shards when utilization exceeds 70 percent.
+
+### Failure Mode 4: Stale State After Redis Restart
+
+When Redis restarts, all rate limit state is lost. Every client starts at zero. For the next window period, all clients can send their full quota simultaneously. The backend receives a traffic spike equal to the product of client count and per-client limit. With 10,000 clients each limited to 100 req/min, the spike is 1,000,000 requests in the first minute.
+
+**Fix**: Persist rate limit state using Redis AOF (Append-Only File). Configure `appendfsync everysec` for a balance of durability and performance. Use the `allkeys-lru` eviction policy with a maxmemory setting that leaves room for rate limit entries. Pre-warm Redis with conservative limits after restart by setting a `rl:warmup` flag that applies 50 percent limits for the first 60 seconds.
+
+### Failure Mode 5: Clock Drift in Distributed Algorithms
+
+The token bucket algorithm relies on timestamps to calculate refill. If the application server's clock is 30 seconds ahead of the Redis server's clock, the rate limiter computes a refill of 30 seconds worth of tokens, granting a massive burst that should not have been allowed. With a refill rate of 10 tokens per second, 30 seconds of drift grants 300 extra tokens.
+
+<AsciiDiagram
+  id="rate-limiter/tradeoffs-clock"
+  title="Failure Mode 5 -- Clock Drift Scenario and Consequences"
+  content={`
+┌──────────────────────────────────────────────────────────────────────────────┐
+│               FAILURE MODE 5: CLOCK DRIFT SCENARIO                           │
+│                                                                              │
+│  Correct scenario (synchronized clocks):                                     │
+│  ┌────────────────────┐     ┌────────────────────┐                          │
+│  │ App Server         │     │ Redis              │                          │
+│  │ Clock: 12:00:00    │     │ Clock: 12:00:00    │                          │
+│  │ last_refill: 11:59 │ ──> │ Tokens: 5          │                          │
+│  │ Elapsed: 1 sec     │     │ Refill: +10        │                          │
+│  │ New tokens: 15     │     │ Refill rate: 10/s  │                          │
+│  └────────────────────┘     └────────────────────┘                          │
+│                                                                              │
+│  Clock drift scenario (app server 30 seconds ahead):                        │
+│  ┌────────────────────┐     ┌────────────────────┐                          │
+│  │ App Server         │     │ Redis              │                          │
+│  │ Clock: 12:00:30    │     │ Clock: 12:00:00    │                          │
+│  │ last_refill: 11:59 │ ──> │ Tokens: 5          │                          │
+│  │ Elapsed: 31 sec    │     │ Refill: +310       │                          │
+│  │ New tokens: 315    │     │ BURST GRANTED!     │                          │
+│  └────────────────────┘     └────────────────────┘                          │
+│                                                                              │
+│  Result: Client receives 315 tokens instead of 15 -- 21x the limit        │
+│                                                                              │
+│  Consequences:                                                               │
+│  - Client can send 315 requests in 1 second instead of 15                  │
+│  - Backend receives 21x the expected traffic                               │
+│  - The rate limit is effectively bypassed by clock drift                    │
+│  - Hard to detect because the error is in the application code             │
+│                                                                              │
+│  Fix: Use Redis TIME command inside Lua script for authoritative timestamp  │
+│  Validate application-supplied timestamps against TIME inside the script    │
+│  Reject requests with timestamps that diverge by more than 1 second         │
+└────────────────────────────────────────────────────────────────────────────┘
+`}
+  alt="Comparison of correct clock scenario versus 30-second clock drift scenario causing illegal burst"
+  caption="Clock drift in the token bucket algorithm can grant massive unintended bursts to clients"
+/>
+
+**Fix**: Always use Redis's `TIME` command inside Lua scripts for the authoritative timestamp. Never rely on the application server's clock. If you must pass a timestamp from the application, pass it as a script argument and validate it against `TIME` inside the script. Reject requests with timestamps that differ by more than 1 second.
+
+### Failure Mode 6: Cache Stampede on L1 Miss
+
+When the L1 cache TTL expires for a popular client, all gateway instances will simultaneously miss the cache and hit Redis. With 50 gateway instances, this means 50 simultaneous Redis calls for the same client key. This creates a stampede that can overwhelm the Redis shard.
+
+**Fix**: Implement request coalescing for the L1 cache. When a cache miss occurs, only one request per key fetches from Redis. Other requests wait for the result. This is implemented using a mutex per key in the L1 cache. The Redis call is shared across all concurrent requests for the same client.
+
+### Failure Mode 7: Memory Fragmentation in Redis
+
+Redis stores rate limit state as hash keys with many fields. Over time, as keys are created and deleted, memory fragmentation can reach 30-50 percent. A Redis instance with 2 GB of rate limit data might use 3 GB of physical memory.
+
+**Fix**: Use Redis's `MEMORY PURGE` command periodically. Set `activedefrag yes` in Redis configuration to defragment memory automatically. Monitor fragmentation ratio with `INFO memory` and alert if it exceeds 1.5.
+
+## Anti-Patterns Hall of Shame
+
+### Anti-Pattern 1: Using `Thread.sleep()` for Rate Limiting
+
+Blocking the request processing thread on a rate limit decision. This scales terribly -- with 100 threads and a 1-second sleep, you can handle only 100 requests per second total, even if Redis is lightning fast. The thread pool is exhausted, and all other requests queue behind the blocked threads. Use asynchronous rate limit checks instead.
+
+### Anti-Pattern 2: Rate Limiting After Authentication
+
+Checking the rate limit after the request has been authenticated and authorized. Authentication is expensive -- database lookups, token validation, session checks. If the request is going to be rejected, reject it before doing expensive work. Move the rate limiter to the earliest possible point in the request pipeline. The rate limit check should be the first thing that happens after the edge router determines the route.
+
+### Anti-Pattern 3: Single Global Limit Without Per-Client Accounting
+
+A single global counter shared across all clients. A scraper with 500,000 requests consumes the entire limit, blocking legitimate users. Always implement per-client accounting with optional global limits as a secondary safety net. The per-client limit is the primary protection. The global limit is the emergency brake.
+
+### Anti-Pattern 4: Ignoring Retry-After Headers on the Client Side
+
+Clients that ignore 429 responses and retry immediately. This creates a retry storm that multiplies load. Servers should enforce retry compliance by incrementally increasing ban durations for clients that ignore Retry-After. The first violation: 5-minute ban. Second: 30-minute ban. Third: 24-hour ban. The client must use exponential backoff.
+
+### Anti-Pattern 5: Using Database Row Locks for Rate Limit State
+
+Using `SELECT ... FOR UPDATE` or row-level locks in PostgreSQL for rate limit state. This creates a serialization point that limits throughput to roughly 500 requests per second per row. The database becomes the bottleneck. Redis Lua scripts handle 25,000 operations per second per core -- 50x faster. Use the right tool for the job.
+
+### Anti-Pattern 6: Hard-Coded Rate Limits in Application Code
+
+Rate limits embedded as constants in the application code. Changing a limit requires a code change, a pull request, a build, and a deploy. Use external configuration with hot-reload. You should be able to change a rate limit from 100 to 200 in under 30 seconds without any deploy. A configuration service with pub/sub propagation enables this.
+
+### Anti-Pattern 7: No Rate Limit Metrics
+
+Running a rate limiter without monitoring its effectiveness. You cannot answer basic questions: How many requests are rejected per second? Which clients hit limits most often? Is the rate limiter itself healthy? Is Redis keeping up with the load? A rate limiter without metrics is a blind gatekeeper that could be silently failing.
+
+### Anti-Pattern 8: Symmetric Retry Limits
+
+Setting the same retry limit for all clients regardless of their tier. A free-tier client with 3 retries consumes 4x their quota (1 original + 3 retries). An enterprise client with 3 retries consumes the same 4x. The retry budget should be proportional to the tier: free gets 1 retry, pro gets 3, enterprise gets 10.
+
+### Anti-Pattern 9: All-or-Nothing Rate Limiting
+
+Applying the same rate limit to all endpoints regardless of their cost. An expensive endpoint (search with complex queries) and a cheap endpoint (ping health check) should have different limits. Group endpoints by cost and assign proportional limits: cheap endpoints get 1000 req/min, expensive endpoints get 10 req/min.
+
+## When NOT to Use Rate Limiting
+
+Rate limiting is not the right tool for every situation.
+
+**When the backend autoscales instantly**: If your system can spin up 100 instances in 2 seconds and the database can handle the load, rate limiting adds unnecessary complexity. Serverless functions with per-function concurrency limits might suffice. The autoscaling latency is measured in seconds, and the traffic spike is measured in minutes, so the system scales up before the spike causes damage.
+
+**When traffic is consistently low**: A personal API used by 10 people does not need Redis-backed rate limiting. A simple in-process counter is sufficient. The operational cost of running Redis for rate limiting exceeds any benefit. The memory and CPU overhead of the in-process counter is negligible.
+
+**When the cost of a false positive is catastrophic**: A medical device API or a 911 dispatch system must never reject a legitimate request. Use concurrency controls and resource quotas instead of rate limits. Invest in capacity planning and autoscaling. The risk of a false positive (rejecting a legitimate emergency request) outweighs the risk of a false negative (allowing a burst).
+
+**When you need traffic shaping, not rejection**: Rate limiting rejects excess traffic. Traffic shaping smooths traffic by delaying requests. If your use case tolerates latency better than rejection (queued job processing, video encoding), use a leaky bucket or a request queue instead of a rate limiter. The difference is semantic: rate limiting says "no," traffic shaping says "wait."
+
+**When you cannot identify the client**: Without a reliable client identifier, rate limiting is ineffective. Anonymous traffic, requests without API keys, and traffic from shared IPs (carrier-grade NAT) cannot be accurately limited per client. In these cases, focus on global limits and load shedding instead. The rate limiter is only as good as its client identification mechanism.
+
+**When the system is already protected by a more capable edge service**: If you are using Cloudflare, AWS WAF, or Google Cloud Armor, these services provide rate limiting at the edge with zero origin latency. Adding a second rate limiter at the application layer adds complexity without proportional benefit. Use the edge service's rate limiting and only add application-layer limiting for use cases that the edge service cannot handle (such as per-API-key limits).
+
+## Detailed Trade-Off Analysis: Decision Scenarios
+
+### Scenario A: High Traffic Social Media API
+
+Requirement: 500,000 requests per second peak, 200,000 requests per second sustained. Traffic is bursty: idle for 30 seconds, then 50,000 requests in 2 seconds. Must handle burst without false positives. p99 latency budget for rate limiter is under 10ms.
+
+**Recommended algorithm**: Token bucket with capacity = 50,000 and refill_rate = 200,000/sec. The high capacity handles the burst. The refill rate matches the sustained throughput.
+
+**Why not sliding window log**: Memory would be 50,000 timestamps * 96 bytes = 4.8 MB per burst per client. For 10,000 active clients, this is 48 GB -- impossible to store in Redis.
+
+**Why not fixed window**: The boundary burst problem would allow 100,000 requests at the window boundary instead of 50,000. This doubles the backend load.
+
+**Why not sliding window counter**: The approximation error of 3-5 percent translates to 2,500-7,500 requests per minute of overage. For a system at 90 percent capacity, this overage could trigger backend overload.
+
+### Scenario B: Financial Transaction API
+
+Requirement: Exact rate limit enforcement. No client can exceed 10 transactions per minute, even by one request. System handles 1,000 requests per second. Memory is not a constraint because there are only 5,000 clients.
+
+**Recommended algorithm**: Sliding window log. The exact accuracy guarantees no client exceeds the limit. With only 5,000 clients at 10 requests/minute, memory is 5,000 * 10 * 96 bytes = 4.8 MB, well within Redis capacity.
+
+**Why not token bucket**: Token bucket allows bursts up to the capacity. If capacity is set to 10, a client can send 10 requests at once, which is the same as the limit. But the token bucket also allows tokens to accumulate during idle periods (up to capacity), which means a client that was idle for an hour can still only send 10 requests. The sliding window log enforces the window more strictly: the client cannot send 10 requests at 12:59:59 and another 10 at 1:00:00.
+
+**Why not fixed window**: The boundary burst problem allows 20 requests in 2 seconds, which violates the exact enforcement requirement.
+
+### Scenario C: Multi-Tenant SaaS Platform
+
+Requirement: 100,000 tenants, each with a limit of 100 requests per minute. Traffic is steady with occasional bursts (conference announcements, product launches). Redis memory must be kept under 5 GB.
+
+**Recommended algorithm**: Sliding window counter with 12 sub-windows. Memory per client: 192 bytes (12 sub-windows * 16 bytes). Total: 100,000 * 192 = 19.2 MB. Well under the 5 GB budget. The approximation error of 1.5 percent is acceptable.
+
+**Why not token bucket**: Token bucket allows bursts, which is desirable. But with 100,000 tenants, each needing 48 bytes, the memory is 4.8 MB -- even lower than sliding window counter. The choice of token bucket would be correct if the accuracy requirement is not strict. For this scenario, either token bucket or sliding window counter would work.
+
+### Scenario D: IoT Device Data Ingestion
+
+Requirement: 1,000,000 devices, each sending 1 message per minute. Traffic is extremely steady. Redis memory must be under 1 GB. Latency budget is under 50ms.
+
+**Recommended algorithm**: Fixed window counter. Memory per device: 24 bytes. Total: 1,000,000 * 24 = 24 MB. The boundary burst problem is not a concern because each device sends only 1 message per minute -- there is no burst to exploit. Latency is under 0.3ms per check because fixed window requires only a single INCR command.
+
+**Why not more complex algorithms**: The sliding window counter would use 4x the memory (96 MB) for no benefit. The sliding window log would use 96 bytes per request = 96 bytes per minute per device = 96 MB growing unbounded. The simple fixed window is the right choice for steady, low-rate traffic.
+
+## Cost Analysis of Rate Limiting Decisions
+
+Every rate limit decision has a cost. Understanding these costs helps you configure the rate limiter optimally.
+
+**Cost of a false positive (rejecting a legitimate request)**:
+- Lost revenue: if the request was a transaction, the entire transaction value is lost
+- Lost user trust: the user receives an error and may abandon the platform
+- Support cost: the user contacts support, requiring engineering time to investigate
+- Estimated cost per false positive: $0.01 to $100, depending on the request type
+
+**Cost of a false negative (allowing a request that should be rejected)**:
+- Backend overload: the allowed request contributes to system load
+- Degraded experience: all users experience higher latency
+- Outage risk: if enough false negatives accumulate, the system may crash
+- Estimated cost per false negative: $0.001 to $1,000, depending on system utilization
+
+**Cost of Redis infrastructure**:
+- Redis cluster (6 shards with replicas): $500-$2,000/month on AWS
+- Engineering time to maintain: 0.25 FTE for a mature system
+- Downtime cost: $1,000-$100,000 per hour of outage
+
+**Optimization goal**: Minimize the total cost of rate limiting, which is the sum of infrastructure cost, false positive cost, and false negative cost. The optimal configuration is where the cost of tightening the limit (more false positives) equals the cost of loosening the limit (more false negatives).
+
+## Consistency Model Deep Dive
+
+### Eventual Consistency Model (AP)
+
+In the AP model, each rate limiter instance maintains a local counter that syncs to Redis asynchronously. During the sync window, instances may disagree on the client's current count.
+
+**Allowable overage calculation**:
+Allowable overage = sync_interval * number_of_instances * per_client_limit
+
+For 10 instances with a 5-second sync interval and a limit of 100 req/min:
+Allowable overage = 5 seconds * 10 instances * 100 req/min = 5,000 requests per 60 seconds
+
+This means a client could exceed the limit by 5,000 requests during a 5-second window. For most APIs, this is acceptable -- it is a temporary overage that the global sync corrects.
+
+### Strong Consistency Model (CP)
+
+In the CP model, every rate limit check requires a synchronous write to the Redis leader with WAIT for replication. This guarantees that all instances see the same count, but adds 5-15ms of latency per check.
+
+**Latency budget**:
+- Redis leader write: 3-5ms
+- WAIT for replica: 2-5ms (additional)
+- Total per check: 5-10ms (CP) vs 0.5-3ms (AP)
+
+The CP model is appropriate when the cost of overage exceeds the cost of additional latency. Billing systems, payment APIs, and resource allocation systems should use CP. General API rate limiting should use AP.
+
+## Network Partition Scenarios
+
+### Scenario: Redis Network Partition During Peak Traffic
+
+The network between the API gateway and Redis cluster is partitioned for 30 seconds. 50,000 requests per second are arriving.
+
+**AP configuration response**: The circuit breaker activates after 500ms of Redis unavailability. Local rate limiters take over with 50 percent of normal limits. For 30 seconds, each client's effective limit drops from 100 req/min to 50 req/min. Legitimate clients are slightly constrained, but the system remains operational. When Redis recovers, the local limiters sync their state and return to full limits.
+
+**CP configuration response**: The rate limiter rejects all requests because it cannot reach Redis to store the rate limit state. Every request receives a 429 response. For 30 seconds, no client can use the API. The system is technically correct (no client exceeds their limit) but completely unavailable.
+
+**Recommendation**: Use AP for standard API limits and CP only for billing-critical limits. The cost of 30 seconds of slightly constrained limits (AP) is far lower than 30 seconds of complete unavailability (CP).
+
+## Rate Limiter Configuration Comparison
+
+The following table compares the configuration parameters for different system types, showing how the trade-offs manifest in concrete settings.
+
+| System Type | Algorithm | Capacity | Refill Rate | Memory | Latency | Consistency |
+|---|---|---|---|---|---|---|
+| Social media API | Token bucket | 5,000 | 1,000/sec | 48 bytes/client | 0.5ms | AP |
+| Payment API | Sliding window log | 10/min | N/A | 960 bytes/client | 1.5ms | CP |
+| IoT data ingestion | Fixed window | 1,000/min | N/A | 24 bytes/device | 0.3ms | AP |
+| SaaS platform | Sliding window counter | 100/min | N/A | 96 bytes/tenant | 0.8ms | AP |
+| Real-time chat | Token bucket | 30/min | 0.5/sec | 48 bytes/user | 0.5ms | AP |
+| Stock trading | Sliding window log | 100/sec | N/A | 9,600 bytes/client | 1.5ms | CP |
+| CDN edge | Token bucket | 10,000 | 5,000/sec | 48 bytes/IP | 0.01ms | AP |
+| Database write queue | Leaky bucket | 5,000 | 500/sec | 48 bytes + queue | 0.5ms | AP |
+
+## Risk Assessment Matrix
+
+Each trade-off introduces specific risks. The following matrix assesses the severity and likelihood of each risk.
+
+| Risk | Severity | Likelihood | Mitigation |
+|---|---|---|---|
+| False positive (reject legitimate request) | High | Low | Increase capacity, add local cache |
+| False negative (allow excessive request) | Medium | Medium | Add global limit, tighten monitoring |
+| Redis failure | Critical | Low | Circuit breaker, local fallback |
+| Clock drift | Medium | Low | Use Redis TIME in Lua scripts |
+| Thundering herd from retries | High | Medium | Enforce Retry-After, exponential backoff |
+| Cache stampede | Medium | Low | Request coalescing in L1 cache |
+| Memory fragmentation | Low | Medium | Active defrag in Redis |
+| Multi-instance state divergence | Medium | Low | Consistent hashing, Redis Cluster |
+| Client key rotation (attack) | High | Low | Global limit, behavioral fingerprint |
+| Configuration error | Critical | Low | Canary rollout, shadow mode |
+
+## Operational Trade-Offs
+
+### Trade-Off: Redis Cluster Size vs. Latency
+
+More Redis shards mean lower latency per shard (less contention) but higher operational complexity (more nodes to manage, more cross-shard coordination). The optimal shard count balances throughput requirements with operational overhead.
+
+**Rule of thumb**: 1 shard per 25,000 req/s, with a minimum of 3 shards for redundancy. Beyond 20 shards, the operational overhead of managing the cluster exceeds the latency benefit. At that point, add local caching instead of more shards.
+
+### Trade-Off: Cache TTL vs. Accuracy
+
+Longer cache TTLs improve latency (more cache hits) but reduce accuracy (stale counters). The trade-off is a direct line: 1 second of stale data equals 1 second of potential overage at the client's peak rate.
+
+**Rule of thumb**: Set L1 cache TTL to 1 second for standard APIs, 500ms for latency-sensitive APIs, and 100ms for billing-critical APIs. The memory savings from longer TTLs are negligible compared to the accuracy cost.
+
+### Trade-Off: Local Fallback vs. Full Availability
+
+During a Redis failure, the rate limiter can either restrict all clients (fail closed, strict) or allow all requests (fail open, available). The middle ground is local fallback with conservative limits.
+
+**Rule of thumb**: Use local fallback with 50 percent of normal limits for standard APIs. Use fail closed (reject all) for billing-critical APIs. Use fail open (allow all) only when the backend can handle the increased load without crashing.
+
+### Trade-Off: Per-Client vs. Per-Endpoint Granularity
+
+Per-client limits treat all requests from a client equally regardless of the endpoint being accessed. Per-endpoint limits apply different limits to different endpoints for the same client. The trade-off is between state size and control granularity.
+
+Per-client limiting requires one state entry per client (48 bytes). Per-endpoint limiting requires one state entry per client per endpoint (48 bytes * N endpoints). For 10,000 clients and 50 endpoints, per-endpoint limiting uses 24 MB of state instead of 0.48 MB.
+
+**Rule of thumb**: Use per-client limits for most APIs. Use per-endpoint limits only when endpoints have dramatically different costs (e.g., a cheap health check endpoint and an expensive search endpoint). Use hierarchical limits (per-client with per-endpoint overrides) for the most control.
+
+### Trade-Off: Synchronous vs. Asynchronous Metric Emission
+
+Emitting rate limit metrics synchronously (in the request path) adds latency to every request. Emitting metrics asynchronously (background thread, message queue) adds zero latency but risks losing metrics during a crash.
+
+Synchronous emission adds 0.1-0.5ms per request for metric serialization and transport. Asynchronous emission adds 0ms to the request path but has a 1-5 second delay before metrics appear in dashboards.
+
+**Rule of thumb**: Use asynchronous metric emission with a buffer of 10,000 events. If the buffer is full, drop metrics before dropping requests. The 1-5 second delay is acceptable for monitoring. For alerting, use a separate synchronous health check that verifies the rate limiter is operational.
+
+### Trade-Off: Redis AOF fsync Frequency vs. Write Performance
+
+Redis AOF persistence writes rate limit state to disk for durability. The `appendfsync` setting controls how often the AOF buffer is flushed to disk. `always` flushes after every write (safest, slowest). `everysec` flushes once per second (balanced). `no` lets the OS decide (fastest, riskiest).
+
+With `appendfsync always`, each rate limit write waits for the disk write to complete. This adds 1-2ms of latency per write, which is acceptable for 1,000 writes per second but unacceptable for 50,000 writes per second. The disk becomes the bottleneck.
+
+With `appendfsync everysec`, writes are buffered in memory and flushed to disk once per second. This adds zero latency to the write path during normal operation. If the Redis process crashes, up to 1 second of state is lost. This is the standard configuration for rate limiters.
+
+With `appendfsync no`, the OS controls when the buffer is flushed. This can lose up to 30 seconds of state during a crash. This is only acceptable for non-critical rate limits.
+
+**Rule of thumb**: Use `appendfsync everysec` for all rate limiter Redis instances. The 1-second window of potential data loss is acceptable for the latency improvement over synchronous writes. The Redis AOF file is also used for backup and point-in-time recovery. For critical rate limits (billing, payment), consider using `appendfsync always` even though it adds 1-2ms of latency per write.
+
+### Trade-Off: Rate Limit Granularity vs. Operational Complexity
+
+A rate limiter with per-user, per-endpoint, per-method, and per-region limits provides precise control. But each additional dimension multiplies the configuration surface and the state size. With 10,000 users, 20 endpoints, 5 methods, and 3 regions, the configuration has 10,000 * 20 * 5 * 3 = 3,000,000 possible limit combinations. Debugging a rate limit issue becomes exponentially harder with more dimensions.
+
+**Rule of thumb**: Start with per-user limits only. Add per-endpoint limits when a single endpoint is overused. Add per-method limits when write operations need tighter control than read operations. Add per-region limits only when you deploy to multiple regions. Add each dimension one at a time, with a 2-week observation period between additions.
+
+## Key Takeaways
+
+Rate limiter design involves three core tensions: accuracy versus performance, strictness versus availability, and granularity versus complexity. The decision matrix provides a structured comparison across six major dimensions for five algorithms, helping you choose the right approach for your specific requirements.
+
+CAP theorem analysis positions rate limiters as AP systems for standard use cases and CP systems for critical limits. Seven failure modes -- thundering herds, client rotation, self-bottlenecking, stale state, clock drift, cache stampedes, and memory fragmentation -- each have specific fixes that must be designed into the system from the start.
+
+The anti-patterns hall of shame documents nine common mistakes with concrete alternatives. And six scenarios where rate limiting is the wrong tool help you recognize when to choose a different approach entirely. The key insight is that rate limiting is a powerful tool, but it is not a silver bullet -- it must be combined with proper capacity planning, autoscaling, and load shedding for a comprehensive reliability strategy.
+
+Four detailed decision scenarios demonstrate how to apply the trade-off analysis to real-world systems: social media APIs need token buckets for burst handling, financial APIs need sliding window logs for exact enforcement, multi-tenant SaaS platforms can use sliding window counters for memory efficiency, and IoT systems can use the simple fixed window for steady traffic. Each scenario has specific requirements that narrow the algorithm choice to one or two options.
+
+The cost analysis of false positives, false negatives, and infrastructure provides a framework for optimizing rate limiter configuration as a business decision rather than purely a technical one. The consistency model deep dive explains the mathematical overage calculation for AP systems and the latency budget for CP systems, helping you choose the right consistency model for your requirements.

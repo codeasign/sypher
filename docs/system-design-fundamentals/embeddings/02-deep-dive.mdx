@@ -1,0 +1,483 @@
+﻿---
+id: embeddings-deep-dive
+title: Embeddings — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+An embedding system is not a single black box. It is a pipeline of distinct components, each with its own engineering challenges. Understanding what lives inside each component is what separates engineers who can deploy an embedding system from those who can debug, optimize, and scale one.
+
+<AsciiDiagram title="Embedding Pipeline — Internal Components" content={`
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                      EMBEDDING PIPELINE                             │
+  └─────────────────────────────────────────────────────────────────────┘
+                                                                         
+  Raw Text ─> [Tokenizer] ─> [Embedding Model] ─> [Normalizer] ─> [Index]
+                                                                         
+  Tokenizer:             Embedding Model:         Normalizer:            
+  ┌─────────────────┐   ┌────────────────────┐   ┌──────────────────┐   
+  │ tiktoken/BPE     │   │ Transformer Encoder│   │ L2 Norm          │   
+  │ Vocabulary:      │   │                    │   │ ||v|| = 1.0      │   
+  │ 100,256 tokens   │   │ 12-48 layers       │   │ unit sphere      │   
+  │ Max tokens: 8192 │   │ 768-1536 hidden    │   └──────────────────┘   
+  │ Special tokens   │   │ Attention heads:12 │                          
+  └─────────────────┘   └────────────────────┘                          
+                                                                         
+  Index:                                                
+  ┌──────────────────────────────────────────────────────┐              
+  │  HNSW Graph / IVF / DiskANN                          │              
+  │  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  │              
+  │  │V1 0.9│─│V2 0.8│─│V3 0.7│─│V4 0.6│─│V5 0.9│  │              
+  │  └──────┘  └──────┘  └──────┘  └──────┘  └──────┘  │              
+  └──────────────────────────────────────────────────────┘              
+`} />
+
+## Data Structures and Algorithms
+
+### The Embedding Vector — Array of Float32
+
+The fundamental data structure is simple: a contiguous array of 32-bit floating-point numbers. A 1536-dimensional embedding occupies exactly 6,144 bytes (1536 x 4 bytes). That's tiny — a single JPEG image is often 100x larger. But when you have 100 million vectors, that's 614 GB of raw data before any index overhead.
+
+**Why float32?** Float16 (half-precision) is increasingly used for production systems. It halves storage to 3,072 bytes per 1536-d vector while losing only 0.1-0.5% accuracy. Quantization to int8 (1 byte per dimension) is possible but typically loses 1-3% recall.
+
+**What would break if you used a linked list?** You need O(1) access to any dimension by index for dot product computation. A linked list would require O(n) traversal to find dimension 512, making every similarity calculation 1000x slower.
+
+### The Cosine Similarity Hot Loop
+
+Every nearest-neighbor search computes this formula millions of times:
+
+```
+similarity = sum(A[i] * B[i] for i in range(dimensions))
+```
+
+For 1536-dimensional vectors, each comparison is 1536 multiply-add operations. At 10 million vectors, brute-force search requires 15 billion floating-point operations per query. Modern CPUs can do this in about 50ms with SIMD instructions (AVX-512), but that's still too slow for real-time search at scale.
+
+**Why not Euclidean distance?** Cosine similarity is invariant to vector length. A document about "Python" and a query about "Python" might have different lengths (one is a paragraph, one is a sentence), but their direction in embedding space should be the same. Euclidean distance would penalize the length difference. Cosine similarity ignores it.
+
+### The HNSW Graph — Hierarchical Navigable Small World
+
+HNSW is the most popular ANN index structure. It builds a multi-layer graph where the top layer has long-range connections (few nodes, large jumps) and lower layers have dense connections (many nodes, small refinements).
+
+<AsciiDiagram title="HNSW — Multi-Layer Navigation Graph" content={`
+  Layer 2 (top):     ┌───┐
+  (few nodes,      ──│ V1 │──
+  long jumps)        └───┘
+                    /    │    \
+                    v    v     v
+  Layer 1:       ┌───┐ ┌───┐ ┌───┐
+  (medium)       │V2 │─│V3 │─│V4 │
+                 └───┘ └───┘ └───┘
+                  / \   / \   / \
+                  v   v v   v v   v
+  Layer 0:     ┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌───┐
+  (dense)      │V5 │ │V6 │ │V7 │ │V8 │ │V9 │
+               └───┘ └───┘ └───┘ └───┘ └───┘
+                / \   / \   / \   / \   / \
+                v  v  v  v  v  v  v  v  v  v
+              ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐
+              │..│ │..│ │..│ │..│ │..│ │..│ │..│
+              └──┘ └──┘ └──┘ └──┘ └──┘ └──┘ └──┘
+`} />
+
+**Search in HNSW:**
+1. Start at the top layer (layer 2). Find the node closest to the query.
+2. Move to the next layer. From the closest node, explore its neighbors.
+3. Continue refining until you reach the bottom layer.
+4. At the bottom layer, run a greedy search with a large efSearch parameter (how many candidate nodes to track).
+
+**Complexity:** O(log n) search time, O(n log n) build time. The efConstruction parameter controls build quality (higher = better recall but slower build). The efSearch parameter controls search quality (higher = better recall but slower query).
+
+**Trade-off:** HNSW is memory-hungry. Each node stores pointers to its neighbors at each layer. For 1M vectors, the graph overhead can be 2-5x the vector data itself. DiskANN addresses this by storing vectors on SSD and using a compression scheme.
+
+### The IVF Index — Inverted File Index
+
+Instead of a graph, IVF partitions the vector space into regions (Voronoi cells). Each vector is assigned to the nearest cluster center. At query time, you only search the closest N clusters instead of the entire space.
+
+**Complexity:** O(sqrt(n)) search time. IVF is simpler and more memory-efficient than HNSW but typically has lower recall at the same speed.
+
+### Product Quantization
+
+To reduce memory further, Product Quantization (PQ) compresses each vector. The vector is split into subvectors (e.g., 1536 dimensions divided into 32 groups of 48). Each subvector is compressed to a single byte by looking up its nearest centroid in a codebook. This reduces storage by 32x (float32 → int8) but adds a decoding step during search.
+
+## The Request Lifecycle
+
+Here is exactly what happens when a query arrives at a production embedding search system.
+
+### Step 1: Receive and Parse the Query
+
+A user types "affordable electric vehicles with long range" into a search box. The API gateway receives the HTTP request, extracts the query text, and checks authentication. The request is routed to the embedding service.
+
+### Step 2: Tokenize the Query
+
+The embedding service passes the query text through the tokenizer. The tokenizer splits the text into tokens and maps each to an integer ID. The query has 6 words, which become 7-10 tokens (subword tokenization may split "affordable" into "afford" + "able").
+
+### Step 3: Generate the Query Embedding
+
+The token IDs are fed into the embedding model. The model runs a forward pass through all transformer layers. This is the most expensive step — typically 30-100ms for a single query on a CPU, or 5-15ms on a GPU.
+
+### Step 4: Normalize the Query Vector
+
+The raw output vector is L2-normalized to unit length. This is a cheap operation (one square root, one division per dimension).
+
+### Step 5: Search the ANN Index
+
+The normalized query vector is passed to the ANN index. The index returns the top-K nearest neighbors. With HNSW, this involves:
+- Traversing the graph from the top layer down
+- At each layer, computing cosine similarity to candidate nodes
+- Maintaining a priority queue of the best candidates found so far
+- Returning the K best matches
+
+### Step 6: Retrieve Original Documents
+
+The index returns vector IDs, not the original content. The system looks up each ID in a document store (typically a key-value database like Redis or DynamoDB) to get the original text, metadata, and any other fields needed for display.
+
+### Step 7: Score and Re-rank (Optional)
+
+If a re-ranker is configured, the top 100-200 results are sent to a cross-encoder model. This model processes each query-document pair together (not separately like the bi-encoder) and produces a more accurate relevance score. The re-ranker typically runs 10-50ms per pair, so it's only applied to a small candidate set.
+
+### Step 8: Return Results
+
+The final ranked results are returned to the client with relevance scores, metadata, and the original content.
+
+<AsciiDiagram title="Full Query Lifecycle — Every Hop" content={`
+  User                          API Gateway          Embedding Service
+  ────                          ───────────          ────────────────
+  [Search box] ──HTTP POST──> [Auth + routing] ──> [Tokenizer]
+                                                         │
+                                                         v
+                                                      [Model]
+                                                         │
+                                                         v
+                                                      [Normalizer]
+                                                         │
+                                                         v
+  Vector Index                  Document Store       [ANN Search]
+  ────────────                  ───────────────     ────────────────
+  [HNSW graph] <──query vector───┤                  [Top-K IDs]
+       │                          │                       │
+       │                          │                       v
+       └───K nearest IDs─────────>└───[Doc lookup]──> [Re-ranker]
+                                                               │
+                                                               v
+  User <──HTTP 200── [API Gateway] <── [Ranked results + docs]
+`} />
+
+## Consistency and State
+
+### What Happens When a Node Crashes Mid-Operation
+
+The embedding model itself is stateless — it's just a neural network loaded in memory. If the embedding service crashes, the model can be reloaded from disk in 1-5 seconds.
+
+The vector index, however, is stateful. If the index is in-memory (HNSW), a crash means the entire index must be rebuilt from the original vectors. This is why production systems persist the raw vectors to durable storage (S3, GCS) and only load the index into memory at startup.
+
+**Recovery strategy:** Write-ahead log (WAL) for vector writes. Every insert is logged to durable storage before the index is updated. On restart, replay the WAL to rebuild the index incrementally.
+
+### What Happens When the Network Partitions
+
+In a distributed embedding system, the index is sharded across multiple nodes. When a partition occurs, some nodes become unreachable. The system must decide: serve results from the available shards (potentially missing results) or return an error.
+
+**Resolution strategy:** Deploy the index as a consistent hash ring. When a shard is unreachable, the request is routed to a replica. If no replica is available, the system returns results from the remaining shards and notes that results are partial.
+
+### What Happens When Two Writes Happen Simultaneously
+
+Vector indexes are typically append-only data structures. Simultaneous writes are handled by locking the index (simplest) or using a versioned merge strategy (more complex). HNSW supports concurrent inserts through a fine-grained locking mechanism.
+
+**Resolution strategy:** For most production systems, writes are batched and applied in sequence. New vectors are collected in a buffer, then a background thread merges them into the main index. This avoids concurrent write conflicts entirely.
+
+### What Happens When a Read Returns Stale Data
+
+The vector index is a secondary index over the primary data. If the primary data is updated (e.g., a document is deleted), the vector should also be removed. But indexes are typically rebuilt periodically, not updated in real time.
+
+**Resolution strategy:** Soft deletes. When a document is deleted, its vector ID is added to a deletion list. During search, any result whose ID is in the deletion list is filtered out. The actual vector is removed during the next full index rebuild.
+
+## Performance Characteristics
+
+### Latency
+
+| Operation | CPU (AWS c6i) | GPU (A10G) | Notes |
+|-----------|--------------|-----------|-------|
+| Tokenize 100 chars | 0.1ms | 0.1ms | CPU-bound, negligible |
+| Embed 1 query | 30-50ms | 5-15ms | GPU is 3-10x faster |
+| HNSW search (1M, efSearch=128) | 2-5ms | 1-3ms | Depends on index size |
+| HNSW search (100M, efSearch=512) | 20-50ms | 10-30ms | Logarithmic scaling |
+| Brute force (1M, flat) | 50-100ms | 10-30ms | Not recommended over 100K |
+| Re-rank (100 pairs) | 500-2000ms | 50-200ms | Cross-encoder is expensive |
+| Full pipeline (p50) | 40-80ms | 10-25ms | GPU embedding + ANN search |
+| Full pipeline (p99) | 200-500ms | 50-150ms | GC pauses, network jitter |
+
+### Throughput
+
+| Configuration | QPS | Notes |
+|--------------|-----|-------|
+| 1 CPU node, HNSW | 200-500 qps | Model inference is the bottleneck |
+| 1 GPU node, HNSW | 1,000-3,000 qps | Batching queries helps |
+| 10 CPU nodes, sharded | 5,000-10,000 qps | Horizontal scaling |
+| With query caching | 10,000-50,000 qps | Common queries hit cache |
+
+### Memory Footprint
+
+| Component | 1M vectors (1536-d) | 100M vectors (1536-d) |
+|-----------|--------------------|----------------------|
+| Raw vectors (float32) | 6 GB | 600 GB |
+| HNSW graph overhead | 12-30 GB | 1.2-3 TB |
+| IVF (1024 centroids) | 6.5 GB | 650 GB |
+| PQ-compressed (int8) | 1.5 GB | 150 GB |
+| Document store (metadata) | 1-5 GB | 100-500 GB |
+
+### Real-World Numbers
+
+Pinecone, a managed vector database, reports p50 latency of 10-30ms and p99 of 100-300ms for typical workloads. Milvus, the leading open-source vector database, benchmarks at 10ms per query on 1 billion vectors with 95% recall using DiskANN. Jina AI's embedding service achieves 5ms per query on GPU with batched inference.
+
+## Configuration and Tuning
+
+### Embedding Model Settings
+
+| Setting | Controls | Safe Default | When to Change | What Breaks If Wrong |
+|---------|----------|-------------|----------------|---------------------|
+| Model name | Quality of embeddings | text-embedding-3-small | Need higher accuracy? Use 3-large. Need speed? Use 3-small | Wrong model gives different vector space — can't mix |
+| Dimensions | Vector size | 1536 (small) / 3072 (large) | Lower for cost savings, higher for accuracy | Lower dims lose nuance; higher dims cost more |
+| Max tokens | Input length limit | 8191 | Short queries (128) or long docs (8191) | Truncated inputs lose meaning |
+| Batch size | Parallel inference | 32 | Higher for throughput on GPU, lower for latency | OOM on GPU if too high; slow if too low |
+
+### ANN Index Settings
+
+| Setting | Controls | Safe Default | When to Change | What Breaks If Wrong |
+|---------|----------|-------------|----------------|---------------------|
+| efConstruction | Index build quality | 200 | Lower (100) for faster build, higher (500) for better recall | Slow build time if too high; poor recall if too low |
+| efSearch | Query search effort | 128 | Lower (64) for faster queries, higher (256) for better recall | Slow queries if too high; missed results if too low |
+| M | Graph connectivity | 16 | Lower (8) for less memory, higher (32) for better recall | High memory if too high; poor graph connectivity if too low |
+| numClusters (IVF) | Voronoi cells | sqrt(n) | Lower for faster search, higher for better recall | Empty clusters if too high; coarse search if too low |
+| nprobe (IVF) | Clusters to search | 10 | Lower for speed, higher for recall | Missed results if too low; slow if too high |
+
+### Production Deployment Settings
+
+| Setting | Controls | Safe Default | When to Change | What Breaks If Wrong |
+|---------|----------|-------------|----------------|---------------------|
+| Index rebuild interval | Freshness of new vectors | 24 hours | More frequent for real-time apps, less for batch | Stale results if too infrequent; CPU thrash if too frequent |
+| Query cache TTL | Cache duration | 5 minutes | Shorter for dynamic content, longer for static | Stale cached results if too long; high QPS to index if too short |
+| Max result window | Max results returned | 100 | Larger for batch processing, smaller for latency | Memory issues if too large; incomplete results if too small |
+| Replica count | Read throughput | 2 | More for higher QPS, fewer for cost | Hot shards if too few; wasted capacity if too many |
+
+### Dimensions and Their Meaning
+
+One of the most common questions from engineers new to embeddings is: "What does dimension 512 represent?" The honest answer is that no single dimension has a clean human-interpretable meaning. An embedding is a distributed representation — the meaning emerges from the pattern across all dimensions, not from any individual coordinate.
+
+But that does not mean embedding dimensions are pure noise. Through techniques like PCA (Principal Component Analysis) and SVD (Singular Value Decomposition), researchers have found that the aggregate directions in embedding space often correspond to recognizable semantic categories. For example, the principal component of a sentiment-tuned embedding model might capture the positive-to-negative sentiment axis. Other aggregate directions encode formality (formal vs. casual), abstractness (concrete vs. abstract), or domain-specific categories like "medical terminology" vs. "everyday language."
+
+The dimensionality of an embedding is a critical design parameter. Higher dimensions (3072 vs. 1536) provide more representational capacity — the model can encode more nuanced distinctions. But the cost is linear in storage and compute: 3072 dimensions means 2x the memory, 2x the similarity computation time, and 2x the ANN index memory. OpenAI's text-embedding-3 models support a "dimensions" parameter that lets you truncate the embedding to any size, giving you a direct accuracy-vs-cost trade-off.
+
+In practice, most teams start with 1536 dimensions and only move to 3072 if they have a specific recall problem that lower dimensions cannot solve. Going below 768 dimensions typically loses too much information for general-purpose use, though domain-specific embeddings can sometimes compress further without significant quality loss.
+
+The relationship between dimensionality and information is not linear. The first 128 dimensions of a PCA-reduced embedding typically capture 40-50% of the variance, while the last 128 dimensions might capture less than 1%. This is why dimensionality reduction techniques like PCA work well for visualization but can harm retrieval accuracy if applied too aggressively.
+
+<AsciiDiagram id="embeddings/dimension-reduction" title="Visualizing PCA Dimension Reduction on Embedding Space" content={`
+  Original 1536-d Space (conceptual):
+                                                                         
+        ┌────────────────────────────────────────────────┐              
+        │  .    .    .    .    .    .    .    .    .    │              
+        │    .    .    .    .    .    .    .    .    .  │              
+        │  .    .    .    .    .    .    .    .    .    │  Each dot is  
+        │    .    .    .    .    .    .    .    .    .  │  1536-d vector
+        │  .    .    .    .    .    .    .    .    .    │              
+        └────────────────────────────────────────────────┘              
+                              │                                          
+                              │ PCA (find top-2 components)              
+                              v                                          
+  After PCA — 2D Projection:                                             
+                                                                         
+              Sentiment Axis (+)                                         
+                  ▲                                                      
+                  │      .      .      .                                 
+                  │   .      .      .      .                            
+  Formal ─────────┼──────────┼──────────────▶ Informal                  
+                  │   .      .      .      .                            
+                  │      .      .      .                                 
+                  ▼                                                      
+              Sentiment Axis (-)                                         
+                                                                         
+  PCA reveals: sentiment polarity (vertical) and formality               
+  (horizontal) are dominant axes in this embedding space.                
+`} />
+
+### Quantization Deep Dive
+
+Product Quantization (PQ) is the most widely used compression technique for vector indexes. It works by splitting each vector into M subvectors and compressing each subvector independently. For a 1536-dimensional vector with M=32, each subvector has 48 dimensions. Each subvector is replaced by the index of its nearest centroid in a learned codebook of 256 centroids (8 bits). The original 1536 x 4 = 6144 bytes becomes 32 bytes — a 192x compression ratio.
+
+The key insight is that PQ does not store the original vector at all. It stores only the compressed representation. During search, distances are computed approximately using the codebook centroids rather than the original values. This is called ADC (Asymmetric Distance Computation): the query vector is kept in full precision, while the database vectors are represented by their PQ codes.
+
+**Scalar quantization** (SQ) is the simpler alternative: each dimension is independently quantized to int8 (1 byte) by finding the min and max values and mapping the float32 range to 0-255. SQ is faster to encode (no codebook training) but achieves lower compression ratios and typically worse recall than PQ at the same bit rate. The advantage of SQ is that it preserves the vector structure — you can still compute exact dot products on the quantized values, whereas PQ requires the ADC lookup table approach.
+
+The recall impact of PQ is well-studied: with 4-byte codes (M=4, 1536/4 = 384 dimensions per subvector), recall drops by 3-5%. With 32-byte codes (M=32), recall drops by only 1-3%. The sweet spot for most production systems is M=16 to M=32, giving 4-8x compression with less than 2% recall loss.
+
+**Codebook training** is a critical step. It uses k-means clustering on a sample of training vectors:
+1. Collect a representative sample of vectors (typically 100,000 to 1 million).
+2. For each subvector group, run k-means to find 256 centroids.
+3. The centroids form the codebook for that subvector group.
+4. Encode each database vector by finding the nearest centroid for each subvector.
+
+The codebook is trained once at index build time and remains fixed. If the data distribution shifts significantly (e.g., new document types are added), the codebook should be retrained. Some production systems retrain the codebook weekly or monthly as part of their index rebuild cycle.
+
+<AsciiDiagram id="embeddings/pq-encoding" title="Product Quantization — Encoding and Decoding Flow" content={`
+  Original Vector (1536-d float32, 6144 bytes):                          
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ d1..d48  │ d49..d96 │ d97..d144 │ ... │ d1489..d1536               │
+  └─────────────────────────────────────────────────────────────────────┘
+  └───Subvector 1────┘└───Subvector 2───┘     └───Subvector 32────┘
+      48 dims, float32    48 dims, float32        48 dims, float32
+      = 192 bytes          = 192 bytes             = 192 bytes
+            │                    │                         │
+            │ k-means            │ k-means                 │ k-means
+            v                    v                         v
+  ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────────────┐
+  │ [Codebook 1]     │ │ [Codebook 2]     │ │ [Codebook 32]           │
+  │ 256 centroids    │ │ 256 centroids    │ │ 256 centroids           │
+  │ c0 c1 c2 ...     │ │ c0 c1 c2 ...     │ │ c0 c1 c2 ...            │
+  └──────────────────┘ └──────────────────┘ └──────────────────────────┘
+            │                    │                         │
+            │ find nearest       │ find nearest            │ find nearest
+            v                    v                         v
+  ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────────────┐
+  │ PQ code: 142     │ │ PQ code: 057     │ │ PQ code: 203            │
+  └──────────────────┘ └──────────────────┘ └──────────────────────────┘
+                                                                         
+  Compressed vector: 142 057 203 ... 089 (32 bytes total, 192x)
+                                                                         
+  During search:
+  [Query vector] ─> Precompute distance table: 32 subvectors x 256
+                    centroids = 8192 float32 lookups
+                    Then for each DB vector: sum distances by PQ code
+                    No decoding of original vector needed
+`} />
+
+### Training Your Own Embedding Model
+
+For most applications, off-the-shelf embedding models from OpenAI, Cohere, or sentence-transformers work well. But there are three scenarios where fine-tuning becomes necessary:
+
+1. **Domain adaptation**: General-purpose models are trained on web text. Medical documents, legal contracts, and code repositories have vocabularies and semantic structures that differ significantly from general web content. A model fine-tuned on PubMed abstracts will outperform a general model on medical search by 10-20% in recall@10.
+
+2. **Specialized similarity semantics**: Off-the-shelf models optimize for semantic similarity. But your application might need a different notion of similarity. For example, "similar" in e-commerce might mean "same category and price range" rather than "same topic." Fine-tuning teaches the model your specific similarity definition.
+
+3. **Multilingual or code-switched data**: General models handle popular languages well but struggle with low-resource languages or code-switched text (e.g., Hinglish). Fine-tuning on your target language mix can close the gap significantly.
+
+**Data requirements**: Contrastive learning needs pairs of similar and dissimilar texts. The minimum viable dataset is 10,000 high-quality pairs, though 100,000+ pairs is recommended for production-quality results. Each pair should be an (anchor, positive) example where the two texts are semantically similar in your domain. Hard negatives (texts that are superficially similar but semantically different) are more valuable than random negatives because they force the model to learn finer distinctions.
+
+**Training infrastructure**: Fine-tuning a BERT-sized embedding model (110M parameters) requires:
+- GPU: 1x A10G (24GB VRAM) for batch sizes up to 64
+- GPU: 1x A100 (40GB) for batch sizes up to 256
+- Training time: 2-12 hours for 100K pairs, depending on epochs
+- Memory: 8-16GB of system RAM for data loading and preprocessing
+
+**Batch size matters**: Contrastive learning is highly sensitive to batch size. Larger batches provide more negative examples per training step, which improves the quality of the learned embeddings. A batch size of 128 or higher is recommended, with 256-512 being ideal for production training. If your GPU cannot fit a large batch, gradient accumulation can simulate larger batches at the cost of slower convergence.
+
+**The SimCSE approach**: SimCSE (Simple Contrastive Learning of Sentence Embeddings) is the most popular fine-tuning strategy. It works by:
+1. Taking a batch of sentences.
+2. For each sentence, generating two different dropout masks during the forward pass.
+3. Treating the two versions as positive pairs (they should have similar embeddings).
+4. Treating all other sentences in the batch as negatives.
+5. Training with the InfoNCE loss function.
+
+This simple approach achieves state-of-the-art results without requiring any labeled data. The dropout masks create natural noise that forces the model to learn robust representations that are invariant to surface-level variation.
+
+**Evaluation strategy**: To measure if your fine-tuned model is better:
+1. Create a held-out test set of 1000-5000 pairs with human-judged similarity scores.
+2. Measure Spearman correlation between your model's cosine similarity and human judgments.
+3. Compare against the base model on the same test set.
+4. Also evaluate on downstream tasks: retrieval recall@k, clustering purity, classification accuracy.
+
+A 3-5% improvement in Spearman correlation is considered significant for most applications. Anything less than 2% may not justify the operational cost of maintaining a custom model.
+
+<AsciiDiagram id="embeddings/fine-tuning-pipeline" title="SimCSE Fine-Tuning Pipeline for Domain Adaptation" content={`
+  Domain Corpus (e.g., medical papers)                                    
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  "The patient presented with acute myocardial infarction"            │
+  │  "Echocardiography revealed reduced ejection fraction"               │
+  │  "Statin therapy was initiated at 40mg daily"                        │
+  └──────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    v
+                           [Base Embedding Model]
+                           (e.g., BERT-base, 110M params)
+                                    │
+                                    v
+  ┌──────────────── SimCSE Training Loop ────────────────────────────────┐
+  │                                                                      │
+  │  Batch of N sentences ─────────────────────────────────────────────┐ │
+  │  ┌──────────────────────────────────────────────────────────────────┐│ │
+  │  │ s1: "acute MI"  s2: "reduced EF"  s3: "statin 40mg"            ││ │
+  │  │ s4: "chest pain"  s5: "beta blocker"  s6: "LVEF"               ││ │
+  │  └──────────────────────────────────────────────────────────────────┘│ │
+  │       │                                                          │   │ │
+  │       v                                                          v   │ │
+  │  [Forward pass]                                           [Forward] │ │
+  │  (dropout mask A)                                       (mask B)   │ │
+  │       │                                                          │   │ │
+  │       └─────────────── InfoNCE Loss ─────────────────────────────┘   │ │
+  │                  (pull positives close, push negatives apart)        │ │
+  │                                                                      │ │
+  └──────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    v
+  [Fine-Tuned Model] ──> [Evaluation: Spearman correlation vs base]
+                                    │
+                                    v
+  [Production Deployment] ──> [Index + Serve on domain data]
+                                    │
+                                    v
+  [Domain-specific search results: 10-20% better recall@10]
+`} />
+
+### Memory Layout and Optimization
+
+The way vectors are stored in memory has a direct impact on search performance. At the assembly level, a cosine similarity computation is a tight loop over contiguous memory. Every cache miss, every misaligned access, and every unnecessary memory allocation costs real microseconds.
+
+**Contiguous arrays**: Vectors should be stored in a single flat array of float32 values, not as an array of Python objects or a list of lists. A flat array of N vectors with D dimensions is a single allocation of N x D x 4 bytes. This layout is SIMD-friendly: the CPU can load 16 floats at once with AVX-512 instructions and compute dot products in a single instruction stream. A Python list of NumPy arrays, by contrast, requires chasing pointers for each vector, destroying cache locality.
+
+**Cache line alignment**: Modern CPUs load memory in 64-byte cache lines. If a vector is misaligned relative to cache line boundaries, a single vector read might span two cache lines, doubling the memory traffic. The fix is to align each vector to a 64-byte boundary by padding the allocation. For 1536-dimensional vectors (6144 bytes), this is automatically aligned since 6144 is a multiple of 64. But for 768-dimensional vectors (3072 bytes), padding to 3072 + 64 = 3136 bytes ensures alignment.
+
+**Float16 vs. Float32**: The trade-off is straightforward:
+- Float32: 4 bytes per dimension, full precision, no accuracy loss, SIMD-friendly.
+- Float16: 2 bytes per dimension, half the storage, 0.1-0.5% accuracy loss.
+- Int8: 1 byte per dimension, 4x compression, 1-3% accuracy loss.
+- Int8 with per-dimension scale factors: preserves more accuracy at the cost of extra metadata (4 bytes per dimension for the scale factors).
+
+In practice, float16 is the sweet spot for most production systems. The recall loss is negligible, and the 2x memory reduction means you can fit twice as many vectors in RAM. Many embedding models now output float16 natively, eliminating the conversion step entirely.
+
+**Memory-mapped indexes**: For indexes larger than available RAM, memory-mapped files (mmap) allow the OS to page vector data in and out on demand. This is the approach used by DiskANN and FAISS on-disk mode. The index is stored as a file on SSD, and the OS virtual memory system handles the caching. The key advantage is that you do not need to load the entire index into RAM — hot data stays in the OS page cache, while cold data lives on disk. The trade-off is that cache misses incur SSD read latency (10-100 microseconds) rather than RAM latency (100 nanoseconds), which is a 100-1000x slowdown for cache misses.
+
+<AsciiDiagram id="embeddings/memory-layout" title="Vector Memory Layout — Cache-Aligned and SIMD-Friendly" content={`
+  Flat Float32 Array (N vectors x D dimensions):                    
+                                                                         
+  Vector 0:          Vector 1:          Vector 2:                      
+  ┌──────────────────┐┌──────────────────┐┌──────────────────┐         
+  │d0 d1 d2...d(N-1) ││d0 d1 d2...d(N-1) ││d0 d1 d2...d(N-1)│         
+  └──────────────────┘└──────────────────┘└──────────────────┘         
+                                                                         
+  CPU Cache Line (64 bytes = 16 float32 values):                         
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ d0  d1  d2  d3  d4  d5  d6  d7  d8  d9  d10 d11 d12 d13 d14 d15  │
+  └─────────────────────────────────────────────────────────────────────┘
+                                                                         
+  AVX-512 dot product (one instruction = 16 float32 multiply-adds):      
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ vfmadd231ps zmm0, zmm1, [rax]      Load 16 floats, multiply, add  │
+  │ vfmadd231ps zmm0, zmm1, [rax+64]   Next 16 floats                 │
+  │ ...                                 Repeat for 1536/16 = 96 instrs │
+  └─────────────────────────────────────────────────────────────────────┘
+                                                                         
+  Memory-Mapped Index (mmap):                                           
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  [MMAP file on SSD] <── [OS Page Cache] <── [CPU reads vectors]   │
+  │                                                                     │
+  │  Hot pages: stay in RAM  (100ns access)                             │
+  │  Cold pages: evicted, reload from SSD  (10-100us access)           │
+  │  Trade-off: fit indexes larger than available RAM, at 100-1000x    │
+  │  slower access for cold data                                        │
+  └─────────────────────────────────────────────────────────────────────┘
+`} />
+
+On the next page, you will see how embeddings fit into a real production system — the naive implementation that fails at scale, the production architecture that handles millions of queries, and how to plan capacity for your own deployment.
+

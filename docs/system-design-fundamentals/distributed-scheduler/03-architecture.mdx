@@ -1,0 +1,1158 @@
+---
+id: distributed-scheduler-architecture
+title: Distributed Scheduler Pattern at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+Before examining a production-grade architecture, it is instructive to study a naive implementation and understand why it fails at scale.
+
+### Single-Node Polling Scheduler
+
+The simplest scheduler is a single process running on one machine with a cron-like loop:
+
+```python
+import time
+import sqlite3
+
+def poll_loop():
+    conn = sqlite3.connect('tasks.db')
+    while True:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE status='PENDING' "
+            "AND trigger_at <= datetime('now')"
+        ).fetchall()
+        for row in rows:
+            execute_task(row)
+            conn.execute(
+                "UPDATE tasks SET status='COMPLETED' WHERE id=?",
+                (row[0],)
+            )
+        conn.commit()
+        time.sleep(0.5)
+```
+
+This implementation has a fatal flaw: the `execute_task` call is synchronous. If a task takes 30 seconds, the entire scheduler blocks for 30 seconds. All subsequent tasks are delayed. Additionally, if the process crashes mid-execution, the completed task status is never persisted, and the task is lost forever.
+
+### Threaded Single-Node
+
+A small improvement uses a thread pool:
+
+```python
+def poll_loop():
+    conn = sqlite3.connect('tasks.db')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        while True:
+            rows = conn.execute("SELECT ...").fetchall()
+            for row in rows:
+                pool.submit(execute_and_update, conn, row)
+            time.sleep(0.5)
+```
+
+This solves the blocking problem but introduces new issues. The thread pool can accept tasks faster than workers can execute them, unboundedly growing the backlog. The SQLite database, which is single-writer, becomes a bottleneck. And if the process crashes, all in-flight tasks in the thread pool are lost.
+
+### Async Single-Node
+
+A third approach uses an async event loop:
+
+```python
+import asyncio
+import aiosqlite
+
+async def poll_loop():
+    conn = await aiosqlite.connect('tasks.db')
+    while True:
+        cursor = await conn.execute(
+            "SELECT * FROM tasks WHERE status='PENDING' "
+            "AND trigger_at <= datetime('now')"
+        )
+        rows = await cursor.fetchall()
+        tasks = [execute_task_async(row) for row in rows]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await conn.commit()
+        await asyncio.sleep(0.5)
+```
+
+The async variant handles concurrency better than the threaded version, using coroutines instead of OS threads. But it shares the same core problems: the `asyncio.gather` call blocks the event loop until the slowest task completes, the database is still single-writer, and process crashes lose all in-memory state. Asyncio does not fix architecture; it only improves resource utilization per node.
+
+### Failure Analysis at Scale
+
+Each naive implementation fails differently as load increases. The table below shows measured failure modes at 10,000 tasks per second:
+
+| Problem | Consequence | At Scale (10,000 tasks/s) |
+|---|---|---|
+| Single-writer DB | Queue contention | 10,000 writes/s exceeds SQLite capacity |
+| No lease mechanism | Duplicate execution on crash | 50%+ duplication rate |
+| In-memory queue state | Task loss on crash | 100% loss of in-flight tasks |
+| No backpressure | Memory exhaustion | OOM kill at 500,000 queued tasks |
+| No sharding | Single-node bottleneck | CPU saturation at 5,000 tasks/s |
+| No retry policy | Permanent task loss | 30% of transient failures unrecovered |
+| Synchronous execution | Pipeline stall | 1 slow task delays 200 pending tasks |
+| No health checking | Silent data loss | 15-minute detection latency |
+| No rate limiting | Downstream overload | 5 upstream service cascades |
+| No circuit breaker | Uncontrollable retry storms | 10x traffic amplification |
+
+### Concrete Failure Scenario
+
+Consider a task that sends a confirmation email and depends on a slow SMTP server. On the naive implementation:
+
+1. The poll loop picks up 20 email tasks at `14:00:00.000`
+2. Task 1 connects to SMTP. The SMTP server has a 30-second processing delay.
+3. The poll loop is blocked from `14:00:00.000` until `14:00:30.500` (task execution plus sleep)
+4. During this window, 60,000 new tasks become due (at 2,000 tasks per second)
+5. These tasks accumulate in the backlog, consuming memory
+6. By `14:00:10`, memory usage hits 500 MB
+7. By `14:00:30`, the process is paging heavily
+8. By `14:00:45`, the OOM killer terminates the process
+9. All 60,000 pending tasks and all 20 in-flight tasks are lost
+10. On restart, the SQLite database contains 60,020 tasks that never execute
+
+This scenario is not hypothetical. Production incidents at this scale have been documented at multiple large-scale SaaS companies. The fix for each failure mode requires a fundamental architectural change, not a code-level optimization.
+
+## Production-Grade Architecture
+
+A production-grade distributed scheduler combines multiple techniques to achieve reliability, scalability, and low latency.
+
+### Core Components
+
+<AsciiDiagram
+  id="distributed-scheduler/production-architecture"
+  title="Production-Grade Distributed Scheduler"
+  alt="Full architecture diagram showing API gateway, sharded schedule index, worker pool, state store, lease manager, and monitoring"
+  caption="Production-grade distributed scheduler architecture"
+  content={`
+                         ┌──────────────────────┐
+                         │   Load Balancer       │
+                         │   (Round Robin /      │
+                         │    Consistent Hash)   │
+                         └──────────┬───────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    │               │               │
+            ┌───────▼──────┐ ┌─────▼───────┐ ┌─────▼───────┐
+            │  API Node 1  │ │ API Node 2  │ │ API Node 3  │
+            │              │ │             │ │             │
+            │  Enqueue     │ │  Enqueue    │ │  Enqueue    │
+            │  Cancel      │ │  Cancel     │ │  Cancel     │
+            │  Status      │ │  Status     │ │  Status     │
+            └───────┬──────┘ └──────┬──────┘ └──────┬──────┘
+                    │               │               │
+                    └───────────────┼───────────────┘
+                                    │
+            ┌───────────────────────▼───────────────────────┐
+            │              Message Queue                    │
+            │         (Kafka / Pulsar / RabbitMQ)            │
+            │                                               │
+            │  Topic: scheduled_tasks (partitioned by ID)   │
+            └───────────────────────┬───────────────────────┘
+                                    │
+            ┌───────────────────────┼───────────────────────┐
+            │                       │                       │
+     ┌──────▼──────┐        ┌──────▼──────┐        ┌──────▼──────┐
+     │ Shard 0     │        │ Shard 1     │        │ Shard 2     │
+     │             │        │             │        │             │
+     │ ┌─────────┐ │        │ ┌─────────┐ │        │ ┌─────────┐ │
+     │ │Schedule │ │        │ │Schedule │ │        │ │Schedule │ │
+     │ │Index    │ │        │ │Index    │ │        │ │Index    │ │
+     │ └─────────┘ │        │ └─────────┘ │        │ └─────────┘ │
+     │ ┌─────────┐ │        │ ┌─────────┐ │        │ ┌─────────┐ │
+     │ │Lease    │ │        │ │Lease    │ │        │ │Lease    │ │
+     │ │Manager  │ │        │ │Manager  │ │        │ │Manager  │ │
+     │ └─────────┘ │        │ └─────────┘ │        │ └─────────┘ │
+     └──────┬──────┘        └──────┬──────┘        └──────┬──────┘
+            │                     │                       │
+            └─────────────────────┼───────────────────────┘
+                                  │
+            ┌─────────────────────▼───────────────────────┐
+            │           Worker Pool                       │
+            │                                             │
+            │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐       │
+            │  │ W1   │ │ W2   │ │ W3   │ │ W4   │  ...  │
+            │  └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘       │
+            │     │        │        │        │            │
+            │  ┌──▼────────▼────────▼────────▼──┐        │
+            │  │     Execution Engine            │        │
+            │  │  (Thread Pool / Async Runtime)  │        │
+            │  └─────────────────────────────────┘        │
+            └─────────────────────┬───────────────────────┘
+                                  │
+            ┌─────────────────────▼───────────────────────┐
+            │           State Store                       │
+            │                                             │
+            │  ┌──────────┐ ┌──────────┐ ┌──────────────┐ │
+            │  │PostgreSQL│ │ Redis    │ │  Object      │ │
+            │  │(durable) │ │(cache)   │ │  Store (S3)  │ │
+            │  └──────────┘ └──────────┘ └──────────────┘ │
+            └─────────────────────────────────────────────┘
+`} />
+
+### Component Deep Dive
+
+**Load Balancer**
+
+The load balancer sits at the entry point. It distributes API requests across the API node pool. For most deployments, round-robin is sufficient since API nodes are stateless. If you need request affinity (for example, for idempotent enqueue deduplication), consistent hashing on client ID or task ID routes the same client to the same node.
+
+**API Nodes**
+
+API nodes handle three operations: enqueue, cancel, and status query. They are stateless and horizontally scalable. Each node validates the request schema, sanitizes the payload, and publishes the task to the message queue. API nodes do not participate in scheduling or execution.
+
+The API nodes operate at a target latency under 10 milliseconds for enqueue operations. To achieve this, the enqueue path avoids any synchronous database writes. The API node publishes to Kafka with `acks=1` (leader acknowledgment), which provides a 2 to 5 millisecond publish latency on a well-tuned cluster.
+
+**Message Queue**
+
+The message queue is the backbone of the scheduler. It decouples the API layer from the scheduling layer. When a client enqueues a task, the API gateway publishes a message to a partitioned topic. The partition key is the task ID or a hash of the task type. Each shard consumes from its assigned partitions.
+
+The message queue provides:
+
+- **Buffering**: During traffic spikes, the queue absorbs the excess. The scheduler processes at its own pace.
+- **Persistence**: Enqueue events survive node failures. The queue stores messages on disk with replication.
+- **Replay**: If a shard fails, another shard can reconsume its partitions from the last committed offset.
+- **Ordering**: Within a partition, messages are ordered by offset. This provides a total order for tasks in the same partition.
+
+Configure the message queue retention to at least 72 hours. This gives you the ability to replay tasks for incident investigation or data recovery.
+
+**Schedule Index**
+
+The schedule index is the core data structure that tracks pending tasks. It supports two query patterns:
+
+1. **Time-range scan**: Find all tasks with `trigger_at` between now and `now + poll_interval`
+2. **Lookup by ID**: Fetch a specific task for cancellation or status update
+
+The index is typically a B-tree on `(shard_id, trigger_at, task_id)`. Each shard has its own index. The index does not store the full task payload -- it stores only metadata (ID, trigger time, status, lease holder). The full payload is stored in the state store.
+
+**Shard Design**
+
+Each shard is an independent scheduling unit. It has its own schedule index, lease manager, and worker assignment. Shards communicate through the message queue, not directly with each other.
+
+The shard count is determined by the throughput requirement:
+
+- 1 shard per 5,000 to 10,000 tasks per second
+- Each shard requires 2 to 5 workers
+- Each shard maintains its own database connection pool
+
+Shard assignment uses consistent hashing so that adding or removing shards requires minimal data movement.
+
+<AsciiDiagram
+  id="distributed-scheduler/shard-internal"
+  title="Internal Structure of a Single Shard"
+  alt="Detailed diagram of one shard showing its internal components: schedule index, lease manager, worker connections, and state store binding"
+  caption="Internal architecture of a single scheduler shard"
+  content={`
+                     ┌─────────────────────────────────┐
+                     │         Shard 3                  │
+                     │  (owns tasks where               │
+                     │   hash(id) in [50%, 75%))        │
+                     │                                  │
+                     │  ┌───────────────────────────┐   │
+                     │  │  Schedule Index            │   │
+                     │  │  ┌──────────────────────┐  │   │
+                     │  │  │  Priority Queue      │  │   │
+                     │  │  │  (Min-Heap)          │  │   │
+                     │  │  │  14,203 pending      │  │   │
+                     │  │  └──────────────────────┘  │   │
+                     │  │  ┌──────────────────────┐  │   │
+                     │  │  │  Time Index          │  │   │
+                     │  │  │  (B-Tree by trigger) │  │   │
+                     │  │  └──────────────────────┘  │   │
+                     │  └───────────────────────────┘   │
+                     │                                  │
+                     │  ┌───────────────────────────┐   │
+                     │  │  Lease Manager             │   │
+                     │  │  ┌──────────────────────┐  │   │
+                     │  │  │  Active Leases: 12   │  │   │
+                     │  │  ├──────────────────────┤  │   │
+                     │  │  │  W1: task#503 (exp:  │  │   │
+                     │  │  │      14:02:30)       │  │   │
+                     │  │  │  W2: task#510 (exp:  │  │   │
+                     │  │  │      14:02:45)       │  │   │
+                     │  │  │  ...                 │  │   │
+                     │  │  └──────────────────────┘  │   │
+                     │  │  ┌──────────────────────┐  │   │
+                     │  │  │  Reclaim Scanner     │  │   │
+                     │  │  │  Next scan: 14:03:00 │  │   │
+                     │  │  └──────────────────────┘  │   │
+                     │  └───────────────────────────┘   │
+                     │                                  │
+                     │  ┌───────────────────────────┐   │
+                     │  │  Worker Pool Connector     │   │
+                     │  │  ┌──────────────────────┐  │   │
+                     │  │  │  Connected: W3, W7,  │  │   │
+                     │  │  │  W11, W14            │  │   │
+                     │  │  │  Capacity: 80/100    │  │   │
+                     │  │  └──────────────────────┘  │   │
+                     │  └───────────────────────────┘   │
+                     │                                  │
+                     │  ┌───────────────────────────┐   │
+                     │  │  State Store Connection   │   │
+                     │  │  ┌──────────────────────┐  │   │
+                     │  │  │  PostgreSQL: shard_03 │  │   │
+                     │  │  │  Pool: 8 connections  │  │   │
+                     │  │  │  Latency: 2ms avg     │  │   │
+                     │  │  └──────────────────────┘  │   │
+                     │  └───────────────────────────┘   │
+                     └─────────────────────────────────┘
+`} />
+
+### Lease Manager
+
+The lease manager prevents duplicate execution. When a worker claims a task, the lease manager records the lease in the state store with an expiration time. The worker must heartbeat the lease to extend it. If the worker crashes, the lease expires and the task becomes available for another worker.
+
+The lease algorithm works as follows:
+
+```python
+class LeaseManager:
+    def __init__(self, redis_client):
+        self.redis = redis_client
+        self.default_lease_duration = 30
+
+    def acquire(self, task_id: str, worker_id: str) -> bool:
+        key = f"lease:{task_id}"
+        acquired = self.redis.set(
+            key, worker_id,
+            nx=True, ex=self.default_lease_duration
+        )
+        return acquired is not None
+
+    def heartbeat(self, task_id: str, worker_id: str) -> bool:
+        key = f"lease:{task_id}"
+        current = self.redis.get(key)
+        if current == worker_id:
+            self.redis.expire(key, self.default_lease_duration)
+            return True
+        return False
+
+    def release(self, task_id: str, worker_id: str) -> None:
+        lua = """
+        if redis.call("GET", KEYS[1]) == ARGV[1] then
+            return redis.call("DEL", KEYS[1])
+        end
+        return 0
+        """
+        self.redis.eval(lua, 1, f"lease:{task_id}", worker_id)
+```
+
+The reclaim scanner runs every 5 seconds in each shard. It queries the schedule index for tasks where the lease has expired and the task status is still `CLAIMED`. These tasks are reverted to `PENDING` and become available for the next poll cycle.
+
+### Worker Pool
+
+The worker pool is a fleet of processes that execute tasks. Workers are homogeneous -- any worker can execute any task type. The pool scales horizontally.
+
+Each worker maintains a polling loop:
+
+```python
+class Worker:
+    def __init__(self, worker_id, shard_endpoint):
+        self.worker_id = worker_id
+        self.shard_endpoint = shard_endpoint
+        self.running = True
+
+    async def run(self):
+        while self.running:
+            task = await self.poll_for_task()
+            if task is None:
+                await asyncio.sleep(0.1)
+                continue
+            try:
+                await self.execute_with_heartbeat(task)
+            except Exception as e:
+                await self.report_failure(task, e)
+
+    async def execute_with_heartbeat(self, task):
+        heartbeat_task = asyncio.create_task(
+            self.heartbeat_loop(task.id)
+        )
+        try:
+            result = await execute_task(task)
+            await self.report_success(task.id, result)
+        finally:
+            heartbeat_task.cancel()
+
+    async def heartbeat_loop(self, task_id):
+        while True:
+            await asyncio.sleep(5)
+            await self.shard.heartbeat(task_id, self.worker_id)
+```
+
+Workers report their capacity to the shard. The shard uses this information to decide how many tasks to assign to each worker. The worker capacity is based on CPU, memory, and currently executing tasks.
+
+### Component Interaction Flow
+
+The following diagram shows the end-to-end flow of a single task through all components:
+
+<AsciiDiagram
+  id="distributed-scheduler/task-lifecycle"
+  title="End-to-End Task Lifecycle"
+  alt="Sequence diagram tracing a task from enqueue through message queue, shard indexing, lease acquisition, worker execution, completion, and dead-letter handling"
+  caption="Complete lifecycle of a task through the distributed scheduler"
+  content={`
+  Client    API Node    Message Queue     Shard      Worker    State Store
+    │          │             │              │          │           │
+    │  enqueue │             │              │          │           │
+    │─────────>│             │              │          │           │
+    │          │  publish    │              │          │           │
+    │          │────────────>│              │          │           │
+    │          │    ack      │              │          │           │
+    │<─────────│────────────│              │          │           │
+    │          │             │              │          │           │
+    │          │             │  consume     │          │           │
+    │          │             │─────────────>│          │           │
+    │          │             │              │  index   │           │
+    │          │             │              │──────────│──────────>│
+    │          │             │              │<─────────│──────────│
+    │          │             │              │          │           │
+    │          │             │              │ poll     │           │
+    │          │             │              │<─────────│           │
+    │          │             │              │ task     │           │
+    │          │             │              │─────────>│           │
+    │          │             │              │          │           │
+    │          │             │              │ acquire  │           │
+    │          │             │              │──────────│──────────>│
+    │          │             │              │<─────────│──────────│
+    │          │             │              │          │           │
+    │          │             │              │          │ heartbeat │
+    │          │             │              │          │──────────>│
+    │          │             │              │          │<──────────│
+    │          │             │              │          │           │
+    │          │             │              │          │ exec done │
+    │          │             │              │          │──────────>│
+    │          │             │              │ complete │           │
+    │          │             │              │──────────│──────────>│
+    │          │             │              │<─────────│──────────│
+    │          │             │              │          │           │
+    │          │             │              │ (if all retries exhausted)
+    │          │             │              │ dead-letter           │
+    │          │             │              │──────────│──────────>│
+`} />
+
+### State Store Architecture
+
+The state store has three tiers:
+
+**Tier 1: Redis (Cache)**
+
+Redis stores active lease data, worker heartbeats, and the most recent task statuses. This is the hot path. Redis operations complete in under 1 millisecond. The Redis cluster is replicated with at least one replica per primary.
+
+**Tier 2: PostgreSQL (Durable)**
+
+PostgreSQL stores the authoritative schedule index, task metadata, and execution history. Each shard has its own PostgreSQL schema. Retention is 90 days for history, after which data is archived to object storage.
+
+The schema for the schedule index:
+
+```sql
+CREATE TABLE tasks (
+    id              UUID PRIMARY KEY,
+    shard_id        INT NOT NULL,
+    task_type       VARCHAR(64) NOT NULL,
+    payload         JSONB NOT NULL,
+    trigger_at      TIMESTAMPTZ NOT NULL,
+    status          VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+    lease_holder    VARCHAR(32),
+    lease_expires   TIMESTAMPTZ,
+    retry_count     INT NOT NULL DEFAULT 0,
+    max_retries     INT NOT NULL DEFAULT 3,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ
+);
+
+CREATE INDEX idx_tasks_shard_trigger
+    ON tasks (shard_id, trigger_at)
+    WHERE status = 'PENDING';
+
+CREATE INDEX idx_tasks_status_lease
+    ON tasks (status, lease_expires)
+    WHERE status = 'CLAIMED';
+```
+
+**Tier 3: Object Storage (Archive)**
+
+Object storage (S3 or compatible) stores completed task history older than 90 days and large task payloads exceeding 64 KB. The archive is partitioned by year, month, and shard.
+
+## Integration Patterns
+
+### Integration Pattern 1 -- Event-Driven Scheduling
+
+Services publish domain events to a message bus. A scheduler service subscribes to specific event types and creates delayed tasks in response. For example, an `OrderPlaced` event triggers a task to send a confirmation email in 5 minutes.
+
+```python
+def on_order_placed(event):
+    scheduler.enqueue(
+        task_type="send_confirmation_email",
+        payload={"order_id": event.order_id, "email": event.email},
+        trigger_at=now() + timedelta(minutes=5),
+        retry_policy=RetryPolicy(max_retries=3, backoff="exponential")
+    )
+```
+
+This pattern decouples the event producer from the timing logic. The event producer does not know or care about the 5-minute delay. The scheduler service is the single place where timing rules are defined.
+
+For high-volume events (10,000 events per second or more), batch the enqueues. Collect events over a 1-second window and enqueue them as a single batch. This reduces message queue pressure from 10,000 individual messages to 10 batches.
+
+### Integration Pattern 2 -- Circuit Breaker with Delayed Retry
+
+An upstream service returns `503 Service Unavailable`. Instead of immediately retrying and overwhelming the service, the calling code schedules a retry task with a delay. The scheduler becomes the circuit breaker's recovery mechanism.
+
+```python
+def call_payment_service(order):
+    try:
+        return payment_service.charge(order)
+    except ServiceUnavailable:
+        scheduler.enqueue(
+            task_type="retry_payment",
+            payload={"order_id": order.id},
+            trigger_at=now() + timedelta(seconds=30),
+            retry_policy=RetryPolicy(max_retries=5, backoff="exponential")
+        )
+        return PENDING_CONFIRMATION
+```
+
+The scheduler inherently provides backpressure. The delay prevents the retry storm that would occur if all clients retried immediately. The scheduler's capacity limits the rate of retries, protecting downstream services.
+
+A complete circuit breaker implementation also tracks the failure rate. If the failure rate exceeds a threshold (for example, 50% of retries fail), the circuit breaker opens and stops scheduling retries. The scheduler checks the circuit breaker state before scheduling each retry.
+
+### Integration Pattern 3 -- Saga Orchestration
+
+A distributed transaction spans multiple services. The saga orchestrator uses the scheduler to manage timeouts and compensation. Each saga step registers a timeout task. If the timeout fires before the step completes, the orchestrator triggers the compensating transaction.
+
+```python
+class SagaOrchestrator:
+    def start_saga(self, order_id):
+        step1 = self.scheduler.enqueue(
+            task_type="reserve_inventory",
+            payload={"order_id": order_id},
+            trigger_at=now(),
+            timeout=timedelta(seconds=30)
+        )
+        self.scheduler.enqueue(
+            task_type="saga_timeout",
+            payload={"order_id": order_id, "step": "reserve_inventory"},
+            trigger_at=now() + timedelta(seconds=35),
+            retry_policy=RetryPolicy(max_retries=0)
+        )
+```
+
+The timeout task runs only if the reservation step does not complete within 35 seconds. The timeout task triggers the compensation logic (release inventory, cancel order). This pattern prevents sagas from hanging indefinitely.
+
+For multi-step sagas, each step registers its own timeout. If step 1 completes successfully, it cancels step 1's timeout and starts step 2 with a new timeout. The saga orchestrator tracks completion of each step in a saga state table:
+
+```sql
+CREATE TABLE saga_state (
+    saga_id UUID PRIMARY KEY,
+    current_step INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### Integration Pattern 4 -- Scheduled Batch Processing
+
+A data pipeline runs nightly aggregations. The scheduler triggers each pipeline stage at a specific time, with dependencies between stages expressed as trigger times. Stage 2 triggers 5 minutes after Stage 1, or after Stage 1 completes, whichever is later.
+
+```python
+def schedule_pipeline():
+    stage1 = scheduler.enqueue(
+        task_type="etl_extract",
+        payload={"date": "2026-07-03"},
+        trigger_at="2026-07-03T02:00:00Z"
+    )
+    scheduler.enqueue(
+        task_type="etl_transform",
+        payload={"date": "2026-07-03"},
+        trigger_at="2026-07-03T02:05:00Z"
+    )
+```
+
+For more complex dependencies, the scheduler can implement a callback pattern. When Stage 1 completes, it enqueues Stage 2. This creates a chain of time-sensitive tasks without the overhead of a full workflow engine.
+
+The callback pattern provides strict ordering. Stage 2 never starts before Stage 1 completes, regardless of the schedule. Stage 1's completion handler is responsible for checking Stage 1's result and deciding whether to proceed with Stage 2 or abort the pipeline:
+
+```python
+def on_extract_complete(task):
+    if task.result["status"] == "success":
+        scheduler.enqueue(
+            task_type="etl_transform",
+            payload=task.payload,
+            trigger_at=now()
+        )
+    else:
+        alert_team(f"ETL extract failed: {task.result['error']}")
+```
+
+### Integration Pattern 5 -- Priority-Based Scheduling with SLA Tiers
+
+Not all tasks are equally important. A priority-based scheduler assigns tasks to tiers with different latency guarantees. Tier 1 tasks (SLA under 1 second) use a dedicated fast path with reserved workers. Tier 3 tasks (SLA under 5 minutes) use a shared queue with best-effort processing.
+
+```python
+def enqueue_with_priority():
+    scheduler.enqueue(
+        task_type="process_payment",
+        payload={"order_id": "order_123"},
+        trigger_at=now(),
+        priority_tier=1,
+        sla_seconds=1,
+        dedicated_queue="high_priority"
+    )
+
+    scheduler.enqueue(
+        task_type="generate_report",
+        payload={"report_id": "r_456"},
+        trigger_at=now() + timedelta(hours=1),
+        priority_tier=3,
+        sla_seconds=300,
+        dedicated_queue="batch"
+    )
+```
+
+The scheduler implements priority tiers by maintaining separate queues per tier. Tier 1 tasks preempt Tier 3 tasks when workers become available. Each tier is independently scalable. During a traffic spike, Tier 1 reserves 40% of worker capacity, Tier 2 gets 35%, and Tier 3 gets 25%.
+
+Priority inversion can occur if a Tier 1 task depends on a Tier 3 task. To prevent this, tasks with dependencies inherit the highest priority of any task in the dependency chain. The scheduler checks the dependency graph before assigning a priority tier.
+
+### Integration Pattern 6 -- Chained Task Pipeline with Fan-Out
+
+A single trigger event produces multiple downstream tasks that execute in parallel. This fan-out pattern is common in media processing, document generation, and notification systems.
+
+```python
+def on_video_uploaded(event):
+    for resolution in [1080, 720, 480, 360]:
+        scheduler.enqueue(
+            task_type="transcode_video",
+            payload={
+                "video_id": event.video_id,
+                "resolution": resolution,
+                "source_url": event.source_url
+            },
+            trigger_at=now()
+        )
+    scheduler.enqueue(
+        task_type="generate_thumbnails",
+        payload={"video_id": event.video_id},
+        trigger_at=now()
+    )
+```
+
+The fan-out pattern requires careful capacity planning. A single event that fans out to 10 tasks multiplies the throughput by 10. If the event rate is 1,000 events per second, the fan-out produces 10,000 tasks per second.
+
+For fan-out with aggregation, use a countdown latch. Each parallel task decrements a counter in Redis. When the counter reaches zero, the aggregation task fires:
+
+```python
+def on_transcode_complete(task, redis):
+    key = f"transcode_done:{task.payload['video_id']}"
+    remaining = redis.decr(key)
+    if remaining <= 0:
+        scheduler.enqueue(
+            task_type="merge_transcoded_segments",
+            payload={"video_id": task.payload["video_id"]},
+            trigger_at=now()
+        )
+```
+
+This pattern requires exactly-once semantics for the counter decrement. Use `WATCH` and `MULTI` in Redis to ensure the decrement and zero-check are atomic.
+
+<AsciiDiagram
+  id="distributed-scheduler/integration-patterns"
+  title="All Six Integration Patterns"
+  alt="Side-by-side diagrams showing event-driven, circuit breaker, saga, batch processing, priority-based, and chained fan-out integration patterns"
+  caption="Six integration patterns for distributed schedulers"
+  content={`
+Pattern 1: Event-Driven          Pattern 2: Circuit Breaker
+┌──────────┐   OrderPlaced      ┌──────────┐  503 Error
+│ Service  │───────────────────►│ Scheduler│◄──────────────────│ Service  │
+│  A       │   5 min delay      │ (backoff)│  30s + exponential│  B       │
+└──────────┘                    └──────────┘                   └──────────┘
+
+Pattern 3: Saga Timeout          Pattern 4: Batch Pipeline
+┌──────────┐   reserve inv      ┌──────────┐  02:00 ETL
+│Orchestrtr│───────────────────►│ Pipeline │─────────────────►│ Scheduler│
+│          │   timeout 35s      │ Trigger  │  stage 1 done     │ stage 2  │
+└──────────┘                    └──────────┘                   └──────────┘
+
+Pattern 5: Priority Tiers        Pattern 6: Fan-Out Chain
+┌──────────┐  SLA 1s      ┌────►│ Transcode│ 1080p
+│ Payment  │─────────────►│     └──────────┘
+│ Service  │  dedicated   │     ┌──────────┐
+└──────────┘  queue       ├────►│ Transcode│ 720p
+                           │     └──────────┘
+┌──────────┐  SLA 5min    │     ┌──────────┐
+│  Report  │─────────────►└────►│ Thumbnail│
+│  Gen     │  shared queue       └──────────┘
+└──────────┘
+`} />
+
+## Multi-Region Architecture
+
+Operating a distributed scheduler across multiple geographic regions introduces challenges of latency, consistency, and failover.
+
+### Active-Active
+
+Each region runs its own scheduler cluster. Tasks are enqueued in the region where the client is located. The schedule index is local to each region. Cross-region tasks are handled by a global task queue that replicates task metadata between regions.
+
+The key design decision is whether tasks should be tied to a specific region or can execute in any region. Region-tied tasks (for example, send SMS to a phone number in a specific country) must stay in their region. Region-independent tasks can execute in the least-loaded region.
+
+### Active-Passive
+
+One region is active. The passive region runs a hot standby with replicated data. If the active region fails, the passive region takes over. The failover requires DNS update, database promotion, and worker restart.
+
+The challenge is ensuring no tasks are lost during failover. The passive region must have a consistent snapshot of the schedule index up to the last committed task. This requires synchronous replication of the schedule index, which adds latency to every enqueue.
+
+### Data Replication Strategies
+
+**Strategy 1: Log-Based Replication**
+
+The message queue (Kafka) replicates logs across regions using MirrorMaker. Tasks published in one region are asynchronously replicated to the other region within 1 to 3 seconds. Each region's shards consume from both the local queue and the replicated queue.
+
+This strategy provides eventual consistency with a 3-second RPO (Recovery Point Objective). In the worst case, tasks created in the last 3 seconds before a regional failure are lost.
+
+**Strategy 2: Dual-Write**
+
+Each enqueue request writes to both the local and remote region before acknowledging. This provides strong consistency with an RPO of zero, but at a latency cost. The enqueue latency increases from 10 milliseconds to 80 to 120 milliseconds (round-trip between regions).
+
+Dual-write is appropriate for financial tasks where task loss is unacceptable. Use it selectively for critical task types only, not for the entire workload.
+
+**Strategy 3: Hybrid Approach**
+
+Use log-based replication as the default. Route critical task types (payment, refund, account change) through dual-write. The routing decision is based on the task type, which is part of the enqueue payload:
+
+```python
+def is_critical(task_type: str) -> bool:
+    critical_types = {"process_payment", "issue_refund", "update_balance"}
+    return task_type in critical_types
+```
+
+### Conflict Resolution
+
+In an active-active configuration, two regions can schedule the same task if the deduplication fails. Implement conflict resolution using a last-writer-wins strategy based on the task creation timestamp:
+
+```python
+def resolve_conflict(local_task, remote_task):
+    if local_task.status == "COMPLETED" and remote_task.status == "PENDING":
+        return local_task
+    if local_task.retry_count > remote_task.retry_count:
+        return local_task
+    if local_task.created_at > remote_task.created_at:
+        return local_task
+    return remote_task
+```
+
+Conflict resolution runs as a background reconciliation process every 60 seconds. It scans the schedule index for tasks with the same ID in different regions and applies the resolution rules.
+
+<AsciiDiagram
+  id="distributed-scheduler/multi-region"
+  title="Multi-Region Deployment Architecture"
+  alt="Three-region diagram showing active-active with global task queue and active-passive with hot standby replication"
+  caption="Multi-region scheduler deployment with active-active and active-passive configurations"
+  content={`
+                    ┌──────────────────────────────────┐
+                    │     Global DNS / Traffic Manager  │
+                    └──────┬──────────────┬────────────┘
+                           │              │
+              ┌────────────▼────┐   ┌─────▼────────────┐
+              │  Region US-EAST │   │  Region EU-WEST  │
+              │  (Active)       │   │  (Active)        │
+              │                 │   │                  │
+              │  ┌───────────┐  │   │  ┌────────────┐  │
+              │  │ Scheduler │  │   │  │ Scheduler  │  │
+              │  │ Cluster   │  │   │  │ Cluster    │  │
+              │  └─────┬─────┘  │   │  └─────┬──────┘  │
+              │        │        │   │        │         │
+              │  ┌─────▼─────┐  │   │  ┌─────▼──────┐  │
+              │  │ Workers   │  │   │  │ Workers    │  │
+              │  └───────────┘  │   │  └────────────┘  │
+              └────────┬────────┘   └────────┬─────────┘
+                       │                     │
+                       └──────────┬──────────┘
+                                  │
+                    ┌─────────────▼──────────────┐
+                    │   Global State Store       │
+                    │   (Cross-Region            │
+                    │    Replication via Kafka)  │
+                    └────────────────────────────┘
+
+              ┌──────────────────────────────────┐
+              │  Region AP-SOUTHEAST (Passive)   │
+              │                                  │
+              │  ┌──────────────────────────────┐│
+              │  │  Hot Standby                  ││
+              │  │  ┌──────────┐  ┌───────────┐  ││
+              │  │  │ Schedule │  │ Workers   │  ││
+              │  │  │ Replica  │  │ (Standby) │  ││
+              │  │  └──────────┘  └───────────┘  ││
+              │  └──────────────────────────────┘│
+              └──────────────────────────────────┘
+`} />
+
+### DNS Failover Procedure
+
+When a region becomes unhealthy, execute the following failover steps:
+
+1. Health check system detects that 80% of API nodes in the primary region are unresponsive for 30 seconds
+2. Traffic Manager updates DNS records to route traffic to the backup region
+3. The backup region's hot standby workers are activated
+4. The schedule index in the backup region is promoted to primary
+5. A full reconciliation run compares the backup region's task state against the message queue for the last 60 seconds
+6. Any gap tasks found during reconciliation are re-enqueued
+
+The entire failover completes in under 60 seconds under test conditions. The gap-window (RPO) depends on the replication strategy you choose.
+
+## Capacity Planning
+
+### Formula for Worker Count
+
+The number of workers needed depends on the task throughput, execution time, and reliability target:
+
+```
+workers = (tasks_per_second * p99_execution_time) / utilization_target
+```
+
+For a system processing 10,000 tasks per second with p99 execution time of 500ms and a utilization target of 70%:
+
+```
+workers = (10,000 * 0.5) / 0.7 = 7,143 workers
+```
+
+Each worker core handles approximately 1.4 tasks per second (1 / 0.7). The 70% utilization target leaves headroom for traffic spikes and worker failures.
+
+### Queue Size and Latency
+
+The average task queuing delay depends on the queue length and the drain rate:
+
+```
+queuing_delay = queue_depth / drain_rate
+```
+
+If the enqueue rate spikes to 12,000 tasks per second for 5 minutes while the drain rate is 10,000 tasks per second, the queue accumulates:
+
+```
+accumulated = (12,000 - 10,000) * 300 = 600,000 tasks
+```
+
+After the spike subsides, the drain rate of 10,000 tasks per second clears the backlog in 60 seconds. The average queuing delay during the spike recovery is:
+
+```
+avg_delay = 600,000 / 10,000 = 60 seconds
+```
+
+This calculation shows that a 20% traffic spike for 5 minutes causes a 60-second delay in task execution. If your SLA requires sub-10-second execution, you need more capacity. Either scale workers to 13,000 tasks per second (36% over-provisioning) or implement burst queues with dedicated resources.
+
+### Database Throughput
+
+The database backing the schedule index must handle:
+
+- **Reads**: workers_per_shard * (1 / poll_interval) reads per second per shard
+- **Writes**: enqueue_rate + completion_rate + lease_update_rate
+
+For 100 workers polling at 500ms across 16 shards, each shard handles approximately 12.5 reads per second. With 10,000 tasks per second, writes are 10,000 enqueues plus 10,000 completions plus 2,000 lease updates (for heartbeats) = 22,000 writes per second total.
+
+This is well within the capacity of a single PostgreSQL instance for the reads, but the writes require a write-scalable database. Options include:
+
+- **Citus**: Distributed PostgreSQL across shards
+- **DynamoDB**: 10,000 writes per second per partition
+- **Spanner**: Global transactional writes at scale
+
+### Memory Requirements
+
+The schedule index memory depends on the queue depth. A backlog of 1 million tasks with 1KB payload each requires 1 GB of memory. Plus the index overhead (B-tree, hash tables, metadata) adds approximately 20%:
+
+```
+memory = task_count * (payload_size + metadata_size) * 1.2
+```
+
+For 1 million 1KB tasks: 1 GB * 1.2 = 1.2 GB. This fits in a single node, but the index must be sharded for write throughput, not memory.
+
+### Network Capacity
+
+Each worker sends heartbeats and receives task assignments. The network bandwidth for a worker pool of 7,143 workers:
+
+- Heartbeat: 7,143 workers * 1 heartbeat every 5 seconds * 200 bytes = 286 KB/s
+- Task data: 10,000 tasks/s * 1 KB payload = 10 MB/s
+- Status updates: 10,000 tasks/s * 150 bytes = 1.5 MB/s
+
+Total network traffic: approximately 12 MB/s. This fits within a single 1 Gbps link (125 MB/s theoretical max) with plenty of headroom.
+
+### Cost Estimation
+
+For a system processing 10,000 tasks per second:
+
+| Component | Count | Unit Cost | Monthly Cost |
+|---|---|---|---|
+| API nodes (c6g.large) | 5 | USD 0.085/hr | USD 306 |
+| Workers (c6g.xlarge) | 900 | USD 0.170/hr | USD 110,160 |
+| Message queue (Kafka) | 3 brokers | USD 0.500/hr | USD 1,080 |
+| PostgreSQL (db.r6g.xlarge) | 4 instances | USD 0.550/hr | USD 1,584 |
+| Redis cache (cache.r6g.large) | 3 nodes | USD 0.200/hr | USD 432 |
+| Load balancer | 1 | USD 0.025/hr | USD 18 |
+| Total | | | USD 113,580 |
+
+This estimate is for an always-on deployment. For batch workloads, use spot instances to reduce worker costs by 60% to 70%.
+
+## Operations
+
+### Monitoring
+
+The critical metrics for a distributed scheduler:
+
+- **Queue depth**: Number of pending tasks, broken down by shard. Alert if queue depth grows faster than the drain rate.
+- **Drain rate**: Tasks completed per second. Should match or exceed enqueue rate in steady state.
+- **Lease expiry rate**: Tasks that expired without completion. A spike indicates worker failures or network issues.
+- **Age of oldest pending task**: Tasks stuck in `PENDING` beyond the expected delay indicate a shard stall.
+- **Dead-letter rate**: Tasks that exhausted retries. A rising rate indicates systemic issues with task execution.
+- **Worker utilization**: CPU, memory, and connection pool usage per worker.
+- **Enqueue latency**: Time from API node receipt to message queue acknowledgment. Target under 10 milliseconds at p99.
+- **Schedule index write latency**: Time to write a task to the database. Target under 5 milliseconds at p99.
+- **Reconciliation lag**: In multi-region mode, the time between task creation in the primary region and availability in the backup region.
+- **Shard imbalance**: The standard deviation of pending tasks across shards. A coefficient of variation above 30% indicates an uneven hash distribution.
+
+### Dashboards
+
+Create three dashboards:
+
+**Operator Dashboard**: Shows the health of the scheduler at a glance. Includes queue depth, drain rate vs enqueue rate, lease expiry rate, and dead-letter rate. Refresh every 10 seconds.
+
+**Shard Dashboard**: Shows per-shard metrics. Includes pending tasks per shard, poll latency, write latency, and connection pool utilization. Refresh every 5 seconds.
+
+**Worker Dashboard**: Shows worker fleet health. Includes worker count by status (active, idle, draining), heartbeat success rate, and task execution time distribution. Refresh every 15 seconds.
+
+### Alerts
+
+Configure alerts for the following conditions:
+
+- Queue depth exceeds 2x the normal maximum for more than 5 minutes: P1 alert, page the on-call engineer
+- Lease expiry rate exceeds 1% of total tasks for more than 1 minute: P1 alert, page the on-call engineer
+- Age of oldest pending task exceeds 5x the poll interval: P2 alert, investigate during business hours
+- Dead-letter rate exceeds 0.1% of total tasks: P2 alert, review task execution logs
+- Any shard has zero claims for more than 2 poll intervals: P1 alert, possible shard crash
+- Worker count drops below 90% of target for more than 2 minutes: P2 alert, check auto-scaling group
+- Enqueue latency exceeds 50ms at p99 for more than 1 minute: P3 alert, possible message queue throttling
+
+No silent alerts. Every alert must have a documented runbook procedure.
+
+### Runbook: Shard Stall
+
+If a shard stops processing:
+
+1. Identify the stalled shard: check the shard dashboard for zero claims in the last 10 seconds
+2. Check the shard's process health: `curl http://shard-3.internal:8080/health`
+3. If the process is unresponsive, restart it: `kubectl rollout restart deployment/shard-3`
+4. After restart, verify the shard resumes processing within 5 seconds
+5. If the restart does not help, check the shard's database connection: `curl http://shard-3.internal:8080/db-health`
+6. If the database is unreachable, fail over the shard's database connection to the replica
+7. If the shard remains stalled, redistribute the shard's partitions to other shards: run the rebalance script
+8. Document the incident with the root cause and resolution time
+
+### Runbook: Database Failure
+
+If the schedule index database becomes unavailable:
+
+1. Confirm the failure: check the database dashboard for connectivity loss
+2. The API gateway automatically buffers enqueue requests in the message queue. Workers pause polling until the database recovers.
+3. Verify the message queue backlog is within retention limits. At 10,000 tasks per second, a 30-minute outage produces 18 million messages. Kafka configured with 72-hour retention handles this easily.
+4. Restore the database from the latest backup. Target RTO (Recovery Time Objective) is 15 minutes.
+5. After restoration, replay the message queue from the last committed offset that matches the backup timestamp.
+6. Workers resume polling. Verify the drain rate returns to normal.
+7. Run a reconciliation query to find any tasks that were enqueued during the outage but not indexed:
+
+```sql
+SELECT id FROM tasks
+WHERE created_at > '2026-07-03T14:00:00Z'
+AND status = 'PENDING'
+AND NOT EXISTS (
+    SELECT 1 FROM schedule_index
+    WHERE schedule_index.task_id = tasks.id
+);
+```
+
+### Runbook: Worker Fleet Failure
+
+If a large percentage of workers fail simultaneously:
+
+1. The lease expiry rate spikes. The reclaim scanner in each shard marks CLAIMED tasks as PENDING.
+2. The auto-scaling group detects the worker deficit and provisions new instances. Provisioning takes 2 to 5 minutes.
+3. During provisioning, the remaining workers are overloaded. The queue depth grows.
+4. New workers join the pool and begin claiming tasks. The drain rate recovers.
+5. After recovery, verify that no tasks are stuck in CLAIMED status with expired leases:
+
+```sql
+SELECT COUNT(*) FROM tasks
+WHERE status = 'CLAIMED'
+AND lease_expires < NOW() - INTERVAL '1 minute';
+```
+
+### Runbook: Cascading Failure
+
+If tasks trigger other tasks, a failure pattern can cascade:
+
+1. Detect the cascade: monitor the task dependency depth. If the average depth exceeds 5, the cascade threshold is breached.
+2. Activate the circuit breaker at the task execution layer. Set the failure threshold to 20% of tasks failing within a 1-minute window.
+3. When the circuit breaker opens, pause enqueue of new tasks across all shards.
+4. Enter recovery mode: drain the existing queue without scheduling any new tasks.
+5. Analyze the failure pattern: identify the task type that is failing most frequently.
+6. Fix or temporarily disable the failing task type.
+7. Close the circuit breaker and resume normal operation.
+
+## Security Considerations
+
+### Authentication
+
+Every enqueue, cancel, and status API call must be authenticated. Use API keys for service-to-service communication and OAuth 2.0 for user-facing operations.
+
+```python
+def validate_api_key(request):
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        return 401, "Missing API key"
+    if not validate_key(api_key, request.path, request.method):
+        return 403, "Insufficient permissions"
+```
+
+Each API key is scoped to specific task types and rate limits. A key that can enqueue `email_notification` tasks cannot enqueue `payment_process` tasks unless explicitly granted.
+
+### Authorization
+
+Implement role-based access control (RBAC) with three roles:
+
+- **Admin**: Full access to all operations and configuration. Restricted to operations team.
+- **Service**: Can enqueue, cancel, and query task status. Cannot modify scheduler configuration.
+- **ReadOnly**: Can query task status and view dashboards. Cannot enqueue or cancel.
+
+Authorization checks happen at the API node layer before the request reaches the message queue. This prevents unauthenticated requests from consuming queue resources.
+
+### Payload Validation
+
+Task payloads are the primary injection vector. Validate every payload field:
+
+```python
+from pydantic import BaseModel, Field
+
+class EnqueueRequest(BaseModel):
+    task_type: str = Field(pattern=r'^[a-z_]{1,64}$')
+    payload: dict = Field(max_length=65536)
+    trigger_at: datetime
+    retry_policy: dict | None = None
+```
+
+Reject requests with payloads exceeding 64 KB. For larger payloads, require clients to upload the data to object storage and pass a reference URL in the payload.
+
+### Encryption
+
+Encrypt task payloads at rest in the message queue, database, and object storage. Encrypt task payloads in transit between API nodes, the message queue, and workers.
+
+Use TLS 1.3 for all network communication. Use AES-256-GCM for payload encryption at rest. Rotate encryption keys every 90 days.
+
+### Rate Limiting
+
+Protect the scheduler from abusive clients:
+
+```python
+class RateLimiter:
+    def __init__(self, redis):
+        self.redis = redis
+
+    def check_rate_limit(self, client_id: str) -> bool:
+        key = f"ratelimit:{client_id}"
+        current = self.redis.incr(key)
+        if current == 1:
+            self.redis.expire(key, 1)
+        return current <= 1000
+```
+
+Apply rate limits at the API gateway layer, before requests reach the API nodes. Rate limit by client ID and by task type separately. A client that exceeds the rate limit receives a `429 Too Many Requests` response with a `Retry-After` header.
+
+### Audit Logging
+
+Log every enqueue, cancel, status change, and configuration change. The audit log is append-only and stored in a separate system from the scheduler data:
+
+```python
+def log_audit_event(action, client_id, task_id, metadata):
+    audit_event = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "action": action,
+        "client_id": client_id,
+        "task_id": task_id,
+        "metadata": metadata,
+        "source_ip": request.remote_addr
+    }
+    audit_queue.publish(audit_event)
+```
+
+Retain audit logs for a minimum of 1 year. Use a separate Kafka cluster or S3 bucket for audit storage to avoid competing with scheduler throughput.
+
+## Testing Strategy
+
+### Unit Tests
+
+Test the core algorithms in isolation: the lease manager, the schedule index, the worker polling loop. Use mocked dependencies to avoid external systems:
+
+```python
+def test_lease_acquire_and_expire():
+    redis = FakeRedis()
+    lease_mgr = LeaseManager(redis)
+
+    acquired = lease_mgr.acquire("task_1", "worker_1")
+    assert acquired is True
+
+    acquired = lease_mgr.acquire("task_1", "worker_1")
+    assert acquired is True
+
+    acquired = lease_mgr.acquire("task_1", "worker_2")
+    assert acquired is False
+```
+
+Target 90% code coverage for the core scheduling logic. Each lease acquisition mode, each retry policy combination, and each queue state transition should have a dedicated test.
+
+### Integration Tests
+
+Test the scheduler against real dependencies (PostgreSQL, Redis, Kafka). Use Docker Compose to spin up the dependencies in a test environment:
+
+- Test that enqueue followed by poll returns the task
+- Test that a task with a future trigger_at does not appear in polls before its time
+- Test that lease expiry returns the task to PENDING
+- Test that retries increment the retry count and respect backoff
+- Test that dead-letter logic moves tasks after max_retries is exceeded
+
+Integration tests run in CI on every pull request. The full suite completes in under 3 minutes.
+
+### Chaos Tests
+
+Introduce failures to validate the scheduler's resilience:
+
+- Kill a worker process mid-execution. Verify the lease expires and another worker picks up the task.
+- Kill a shard process. Verify the partitions are reassigned.
+- Introduce network latency between the API node and the message queue. Verify the circuit breaker triggers.
+- Saturate the database connection pool. Verify the scheduler does not crash.
+- Drop database tables. Verify the restore and replay procedure works.
+
+Run chaos tests weekly in a staging environment. Each test produces a report of which components survived and which failed.
+
+### Performance Tests
+
+Establish baseline performance metrics:
+
+- Maximum enqueue throughput per API node: target 5,000 requests per second per node
+- Maximum poll throughput per shard: target 2,000 task assignments per second per shard
+- End-to-end latency from enqueue to execution: target p50 under 100ms, p99 under 500ms
+- Maximum queue depth before write latency degrades: target 10 million tasks
+
+Run performance tests monthly with a simulated workload that matches your production traffic pattern. Compare results against the previous run to detect regressions.
+
+### Load Test Configuration
+
+Use a stepped load test to find the scheduler's breaking point:
+
+```yaml
+# load_test.yaml
+phases:
+  - duration: 5 minutes
+    target: 2,000 tasks/s
+  - duration: 5 minutes
+    target: 5,000 tasks/s
+  - duration: 5 minutes
+    target: 8,000 tasks/s
+  - duration: 5 minutes
+    target: 12,000 tasks/s
+  - duration: 5 minutes
+    target: 15,000 tasks/s
+```
+
+Monitor the error rate and latency at each step. If the error rate exceeds 0.1% or p99 latency exceeds 10 seconds at any step, the scheduler has reached its limit. Document the limit and ensure the production traffic stays below 70% of the measured maximum.

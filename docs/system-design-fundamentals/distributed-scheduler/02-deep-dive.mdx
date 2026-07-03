@@ -1,0 +1,989 @@
+---
+id: distributed-scheduler-deep-dive
+title: Distributed Scheduler Pattern — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A distributed scheduler is not a single component. It is a layered system with distinct responsibilities at each layer. Understanding the internal architecture helps you reason about failure modes, scaling behavior, and configuration trade-offs.
+
+The architecture consists of five layers. Each layer is independently scalable and has its own failure semantics.
+
+**Layer 1 -- API Gateway**: Accepts enqueue, cancel, and status-check requests. Validates payloads, assigns IDs, and routes to the appropriate shard. This layer is stateless and scales horizontally behind a load balancer.
+
+The gateway performs request validation before routing. It checks that the task payload does not exceed the maximum size of 256 KB, that the trigger time is within the allowed window of 30 days, and that required fields like `task_type` and `payload` are present. It also applies per-client rate limiting using a token bucket algorithm. Each client gets 1000 tokens per second with a burst capacity of 5000.
+
+ID generation is handled at the gateway using UUID v7, which embeds a millisecond-precision timestamp in the first 48 bits. This gives you ordered UUIDs that sort chronologically, which helps the schedule index maintain a natural ordering without an extra timestamp field. The gateway returns the assigned ID to the client in the 201 response before the task is even persisted, so the client can immediately track the task.
+
+**Layer 2 -- Schedule Index**: The time-ordered data structure that tracks pending tasks. This is the heart of the scheduler. It must support efficient range queries for due tasks, atomic claim operations, and durable storage.
+
+The schedule index tracks a watermark -- the highest trigger timestamp that has been fully scanned. Workers poll the index by querying for tasks with a trigger time between the watermark and the current time. After claiming and processing all tasks in that window, the watermark advances. This prevents workers from repeatedly scanning the same time range.
+
+Sharding across multiple schedule index instances uses consistent hashing with 64 virtual nodes per physical shard. When a shard is added or removed, only data from the adjacent shards on the hash ring needs to be redistributed. The redistribution is handled by a background rebalancer that moves tasks in batches of 1000 with a cooldown of 100 milliseconds between batches to limit impact on live traffic.
+
+**Layer 3 -- Lease Manager**: Maintains lease state for claimed tasks. Tracks lease expiration, handles lease renewal for long-running tasks, and runs the reclaim cycle for expired leases.
+
+The lease manager runs a background reclaim scanner every 60 seconds. The scanner queries for all leases where `lease_until < NOW()`. For each expired lease, it performs a compare-and-swap: if the task status is still LEASED, it resets the status to PENDING. The scan is paginated in batches of 500 to avoid locking too many rows at once.
+
+The heartbeat protocol works as follows. Workers send a heartbeat request to the lease manager every 10 seconds with a list of task IDs they are actively executing. The lease manager extends the lease for each listed task. If a worker misses three consecutive heartbeats, the lease manager flags the worker as suspected dead and checks that worker tasks every 10 seconds instead of the standard 60.
+
+**Layer 4 -- Worker Pool**: Stateless execution processes that poll the schedule index, claim tasks, execute payloads, and report results. Workers can be processes, threads, containers, or serverless functions.
+
+Each worker implements backpressure using a semaphore that limits the number of in-flight tasks. When the semaphore is saturated, the worker skips its poll cycle. The semaphore size is typically configured as two times the thread pool size. This prevents overload when tasks take longer than expected.
+
+Graceful shutdown works as follows. When a worker receives a SIGTERM, it stops polling and waits for in-flight tasks to complete or reach their deadline. Uncompleted tasks at drain timeout (default 30 seconds) are logged and reclaimed by the lease manager.
+
+**Layer 5 -- State Store**: Durable storage for task metadata, execution history, and dead-letter records. This layer is typically a relational database or a distributed key-value store.
+
+The state store uses a write-ahead log (WAL) for durability. Every state transition is first appended to the WAL, then applied to the main table. The WAL flushes to disk every 10 milliseconds or every 1000 writes.
+
+Compaction runs every 5 minutes. It consolidates completed tasks into a history partition and purges tasks older than 30 days. The dead-letter table is never auto-purged -- a monitoring alert fires when its count exceeds 1000.
+
+<AsciiDiagram
+  id="distributed-scheduler/internal-layers"
+  title="Internal Layered Architecture"
+  alt="Five-layer diagram showing API Gateway, Schedule Index, Lease Manager, Worker Pool, and State Store with data flow arrows"
+  caption="The five internal layers of a distributed scheduler"
+  content={`
+┌────────────────────────────────────────────────────┐
+│  Layer 1: API Gateway                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
+│  │ enqueue  │  │  cancel  │  │  status  │        │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘        │
+│       │             │             │               │
+│  ┌────▼─────────────▼─────────────▼────┐          │
+│  │  Request Router + Shard Selector    │          │
+│  └─────────────────────────────────────┘          │
+└──────────────────────┬─────────────────────────────┘
+                       │
+┌──────────────────────▼─────────────────────────────┐
+│  Layer 2: Schedule Index                           │
+│  ┌──────────────────────────────────────────────┐  │
+│  │  Shard 0     Shard 1     Shard 2    Shard 3  │  │
+│  │  [0-25%)    [25-50%)   [50-75%)  [75-100%)   │  │
+│  │  ┌──────┐  ┌──────┐   ┌──────┐  ┌──────┐    │  │
+│  │  │ Sorted│  │Sorted│   │Sorted│  │Sorted│    │  │
+│  │  │ Set  │  │ Set  │   │ Set  │  │ Set  │    │  │
+│  │  └──────┘  └──────┘   └──────┘  └──────┘    │  │
+│  └──────────────────────────────────────────────┘  │
+└──────────────────────┬─────────────────────────────┘
+                       │
+┌──────────────────────▼─────────────────────────────┐
+│  Layer 3: Lease Manager                            │
+│  ┌────────────┐  ┌──────────────┐  ┌────────────┐ │
+│  │ Lease      │  │ Lease        │  │ Reclaim    │ │
+│  │ Acquisition│  │ Renewal      │  │ Scanner    │ │
+│  └────────────┘  └──────────────┘  └────────────┘ │
+└──────────────────────┬─────────────────────────────┘
+                       │
+┌──────────────────────▼─────────────────────────────┐
+│  Layer 4: Worker Pool                              │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────────┐ │
+│  │ W1   │ │ W2   │ │ W3   │ │ W4   │ │ ...  Wn  │ │
+│  └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──────────┘ │
+│     │        │        │        │                    │
+│  ┌──▼────────▼────────▼────────▼────────────────┐  │
+│  │  Execution Engine (thread pool, async loop)   │  │
+│  └───────────────────────────────────────────────┘  │
+└──────────────────────┬─────────────────────────────┘
+                       │
+┌──────────────────────▼─────────────────────────────┐
+│  Layer 5: State Store                              │
+│  ┌──────────────────────────────────────────────┐  │
+│  │  PostgreSQL / DynamoDB / etcd                │  │
+│  │  Tables: tasks, leases, history, dead_letter │  │
+│  └──────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────┘
+`} />
+
+## Data Structures
+
+### Data Structure 1 -- Sorted Set with Score = Trigger Timestamp
+
+The sorted set is the most common schedule index. Each task is a member, and its trigger timestamp is the score. Workers query for tasks with score less than or equal to the current time, then atomically remove or update them.
+
+In Redis, the sorted set is implemented as a skip list, giving O(log n) for insert, delete, and range queries. A single Redis sorted set can hold up to 10 million tasks before memory becomes a concern. The memory cost is approximately 80 bytes per entry plus the task payload. For a system with 500,000 pending tasks where each payload averages 512 bytes, the total memory footprint is roughly 300 MB.
+
+The range query operation works by scanning the skip list from the head node, following level-0 pointers through tasks whose score falls within the requested range. The forward pointers at higher levels allow the scan to skip over large swaths of out-of-range nodes, which is what gives the sorted set its O(log n + m) performance for range queries where m is the number of returned tasks.
+
+<AsciiDiagram
+  id="distributed-scheduler/sorted-set-structure"
+  title="Sorted Set Schedule Index"
+  alt="Diagram of a skip list structure showing task entries ordered by timestamp score with forward pointers between levels"
+  caption="Skip list backing a sorted set with timestamp scores"
+  content={`
+Level 3:  ┌──────────────────────────────────────────────┐
+          │  score: 14:00:00  ──────────────────────────►│
+          │  task: order#442                              │
+          └──────────────────────────────────────────────┘
+                         │
+Level 2:  ┌──────────────┼──────────────┐ ┌──────────────┐
+          │  score:      │              │ │  score:      │
+          │  14:00:00    │──────────────►│ │  14:05:00   │
+          │  task:#442   │              │ │  task:#445   │
+          └──────────────┘              │ └──────────────┘
+                         │              │               │
+Level 1:  ┌──────────────┼────┐ ┌──────┼┐ ┌────────────┼┐
+          │  score:      │    │ │      ││ │  score:    ││
+          │  14:00:00    │───►│ │──────►││ │  14:05:00 ││──►
+          │  task:#442   │    │ │      ││ │  task:#445││
+          └──────────────┘    └─┘      │└─┘────────────┘└┘
+                                        │
+Level 0:  ┌──────┐ ┌──────┐ ┌──────┐ ┌─┼────┐ ┌──────┐
+          │#442  │ │#443  │ │#444  │ │ │#445 │ │#446  │
+          │14:00 │ │14:01 │ │14:02 │ │ │14:05│ │14:06 │
+          └──────┘ └──────┘ └──────┘ └─┼────┘ └──────┘
+                                        │
+                                  ┌─────┴──────┐
+                                  │ task payload │
+                                  │ order#445    │
+                                  │ amount: 42   │
+                                  │ retry: 0     │
+                                  └──────────────┘
+`} />
+
+The range query operation works as follows in Redis:
+
+```redis
+ZRANGEBYSCORE schedule -inf NOW() LIMIT 0 100
+```
+
+This returns up to 100 tasks whose score is between negative infinity and the current time. After claiming, the worker removes the task with:
+
+```redis
+ZREM schedule task_id
+```
+
+For lease-based claiming, the pattern changes. Instead of removing, you move the task to a working set:
+
+```redis
+ZADD working_set worker_id + LEASE_DURATION
+ZREM schedule task_id
+```
+
+The atomicity of this operation determines whether duplicates are possible. In Redis, wrapping the claim in a Lua script executed with EVAL provides atomicity:
+
+```lua
+local task = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 1)
+if #task > 0 then
+  redis.call('ZREM', KEYS[1], task[1])
+  redis.call('ZADD', KEYS[2], ARGV[2], task[1])
+  redis.call('HSET', KEYS[3], task[1], ARGV[3])
+end
+return task
+```
+
+### Data Structure 2 -- Time-Wheel Bucket Array
+
+The time-wheel uses a circular array where each element is a bucket (typically a linked list or set) of tasks. The array size determines the wheel capacity. A pointer advances at each tick, firing all tasks in the current bucket.
+
+The time-wheel achieves O(1) insert, delete, and tick operations. The trade-off is precision: every task in a bucket fires at the same tick, regardless of its exact trigger time within the interval. If your tick interval is 100 milliseconds, all tasks within a 100-millisecond window fire simultaneously.
+
+Time-wheels are commonly implemented with multiple tiers to cover a wider range of delays without consuming excessive memory. A three-tier wheel with 100 slots per tier and 10-millisecond ticks on the first tier covers delays from 10 milliseconds to 100 seconds using only 300 total buckets. Compare this to a single-tier wheel that would need 10,000 buckets to cover the same range at the same precision.
+
+<AsciiDiagram
+  id="distributed-scheduler/time-wheel-buckets"
+  title="Time-Wheel Bucket Detail"
+  alt="Close-up of a single time-wheel bucket showing a linked list of tasks within the same time interval"
+  caption="Internal structure of a single time-wheel bucket"
+  content={`
+                     Bucket at tick interval 200-300ms
+                     ┌────────────────────────────────────┐
+                     │  ┌──────────┐  ┌──────────┐       │
+                     │  │ Task A   │  │ Task B   │       │
+                     │  │ trigger: │  │ trigger: │       │
+                     │  │ 250ms    │─►│ 280ms    │──►null│
+                     │  │ payload  │  │ payload  │       │
+                     │  └──────────┘  └──────────┘       │
+                     └────────────────────────────────────┘
+
+                     Multi-tier time-wheel:
+                     ┌────────────────────────────────────┐
+                     │  Tier 1 (100ms ticks, 10 slots)    │
+                     │  Covers: 0ms to 1000ms             │
+                     │  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐  │
+                     │  │ 0│ 1│ 2│ 3│ 4│ 5│ 6│ 7│ 8│ 9│  │
+                     │  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘  │
+                     │               ▲                    │
+                     │          pointer: 3                │
+                     └────────────────────────────────────┘
+                                     │
+                     overflow at 1000ms
+                                     ▼
+                     ┌────────────────────────────────────┐
+                     │  Tier 2 (1s ticks, 60 slots)       │
+                     │  Covers: 1s to 60s                 │
+                     │  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐│
+                     │  │ 0│ 1│ 2│ 3│...│  │  │  │  │59│ │
+                     │  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘│
+                     └────────────────────────────────────┘
+                                     │
+                     overflow at 60s
+                                     ▼
+                     ┌────────────────────────────────────┐
+                     │  Tier 3 (60s ticks, 60 slots)      │
+                     │  Covers: 1min to 60min             │
+                     └────────────────────────────────────┘
+`} />
+
+When a task is inserted with a delay that exceeds the tier 1 range, it cascades to higher tiers. At each tick of tier 1, tasks from the current slot of higher tiers that have now entered the tier 1 range are demoted and reinserted into the appropriate tier 1 slot. This cascading mechanism allows the time-wheel to handle a wide range of delays with bounded memory.
+
+The cascade uses a simple formula: `tier = floor(delay / tier_range)`, `slot = (tier_base + floor(delay % tier_range / tick_interval)) % slot_count`. The cascade happens at most once per task per tick, and the total cost per tick is bounded by the number of demoted tasks, which is a small fraction of the total task count.
+
+### Data Structure 3 -- Database Table with Composite Index
+
+A relational database table is the most straightforward schedule index. The schema typically looks like this:
+
+```sql
+CREATE TABLE scheduled_tasks (
+  id            UUID PRIMARY KEY,
+  task_type     VARCHAR(64) NOT NULL,
+  payload       JSONB NOT NULL,
+  trigger_at    TIMESTAMPTZ NOT NULL,
+  status        VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+  worker_id     VARCHAR(64),
+  lease_until   TIMESTAMPTZ,
+  retry_count   INTEGER DEFAULT 0,
+  max_retries   INTEGER DEFAULT 3,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_tasks_due
+  ON scheduled_tasks (status, trigger_at)
+  WHERE status = 'PENDING';
+```
+
+The partial index is critical. Without the WHERE clause, the index includes millions of completed and dead-letter rows, making it large and slow. The partial index stays small and fast because it only indexes rows that matter for polling.
+
+For a system processing 100,000 tasks per second, the table grows by 8.6 billion rows per day. The partial index on PENDING rows might contain only 10-100 million rows at any time, assuming tasks are processed within seconds of their trigger time. This is a reduction of two orders of magnitude.
+
+You can further optimize by partitioning the table on `trigger_at` by day. This allows the database to drop entire partitions instead of performing expensive DELETE operations for old completed tasks.
+
+```sql
+CREATE TABLE scheduled_tasks (
+  id            UUID NOT NULL,
+  task_type     VARCHAR(64) NOT NULL,
+  payload       JSONB NOT NULL,
+  trigger_at    TIMESTAMPTZ NOT NULL,
+  status        VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+  worker_id     VARCHAR(64),
+  lease_until   TIMESTAMPTZ,
+  retry_count   INTEGER DEFAULT 0,
+  max_retries   INTEGER DEFAULT 3,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (trigger_at);
+
+CREATE TABLE scheduled_tasks_2026_07_03
+  PARTITION OF scheduled_tasks
+  FOR VALUES FROM ('2026-07-03') TO ('2026-07-04');
+```
+
+<AsciiDiagram
+  id="distributed-scheduler/database-index-btree"
+  title="B-Tree Index Structure for Scheduler"
+  alt="B-tree diagram showing composite index on (status, trigger_at) with leaf nodes pointing to table rows"
+  caption="B-tree structure of the composite database index"
+  content={`
+                         Root
+                    ┌──────────┐
+                    │ PENDING  │
+                    │ 14:00    │
+                    └────┬─────┘
+                         │
+           ┌─────────────┼─────────────┐
+           │             │             │
+    ┌──────▼──────┐ ┌───▼──────┐ ┌───▼──────┐
+    │ PENDING     │ │ PENDING  │ │ PENDING  │
+    │ 14:00       │ │ 14:05    │ │ 14:10    │
+    │ 14:01       │ │ 14:06    │ │ 14:11    │
+    │ 14:02       │ │ 14:07    │ │ 14:12    │
+    └──────┬──────┘ └──────┬───┘ └──────┬───┘
+           │               │            │
+    ┌──────▼──────┐  ┌─────▼──────┐ ┌──▼────────┐
+    │ Leaf:       │  │ Leaf:      │ │ Leaf:     │
+    │ ┌──────────┐│  │ ┌────────┐│ │ ┌────────┐ │
+    │ │id: #442  ││  │ │id #445 ││ │ │id #450 │ │
+    │ │trig:1400 ││  │ │trig1405││ │ │trig1410│ │
+    │ │status:PND││  │ │status: ││ │ │status: │ │
+    │ │worker:   ││  │ │PND     ││ │ │PND     │ │
+    │ │ ...      ││  │ │ ...    ││ │ │ ...    │ │
+    │ └──────────┘│  │ └────────┘│ │ └────────┘ │
+    │ ┌──────────┐│  │ ┌────────┐│ │ ┌────────┐ │
+    │ │id: #443 ││  │ │id #446 ││ │ │id #451 │ │
+    │ │trig:1401││  │ │trig1406││ │ │trig1411│ │
+    │ └──────────┘│  │ └────────┘│ │ └────────┘ │
+    └─────────────┘  └──────────┘ └────────────┘
+`} />
+
+The SELECT FOR UPDATE SKIP LOCKED query is the workhorse:
+
+```sql
+WITH next_tasks AS (
+  SELECT id
+  FROM scheduled_tasks
+  WHERE status = 'PENDING'
+    AND trigger_at <= NOW()
+  ORDER BY trigger_at
+  LIMIT 100
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE scheduled_tasks
+SET status = 'LEASED',
+    worker_id = $1,
+    lease_until = NOW() + INTERVAL '30 seconds',
+    updated_at = NOW()
+WHERE id IN (SELECT id FROM next_tasks)
+RETURNING id, task_type, payload;
+```
+
+The CTE (Common Table Expression) atomically selects and locks rows, then updates them. The SKIP LOCKED clause prevents contention: if worker 1 has locked rows 1-100, worker 2 immediately gets rows 101-200 without waiting.
+
+You can also use this pattern for lease renewal. A worker that is still executing a task before the lease expires can extend the lease:
+
+```sql
+UPDATE scheduled_tasks
+SET lease_until = NOW() + INTERVAL '30 seconds',
+    updated_at = NOW()
+WHERE id = $1
+  AND worker_id = $2
+  AND status = 'LEASED'
+RETURNING id;
+```
+
+If this returns zero rows, the worker knows it has lost the lease and should stop executing the task immediately.
+
+### Data Structure 4 -- Priority Queue (Binary Min-Heap)
+
+A binary min-heap is a compact alternative to the sorted set when the scheduler runs in a single process or on a single shard. The heap is an array-based data structure where each node satisfies the heap property: the parent node trigger timestamp is less than or equal to its children trigger timestamps.
+
+The heap is stored as a flat array where the root is at index 1. For any node at index i, its left child is at index 2i and its right child is at index 2i + 1. This compact representation uses no extra memory for pointers -- only an array of task references.
+
+Key operations and their costs:
+
+- **Insert**: O(log n). Append the task to the end of the array, then sift it up by repeatedly swapping with its parent until the heap property is restored.
+- **Peek earliest**: O(1). Return the root element at index 1 without removing it.
+- **Pop earliest**: O(log n). Swap the root with the last element, remove the new last element, and sift the new root down by repeatedly swapping with the smaller child.
+- **Batch pop due tasks**: O(k log n) for k due tasks. Repeatedly peek, check if the task is due, and pop if it is.
+
+The memory advantage is significant. A heap with 1 million tasks uses roughly 8 MB for the array of 64-bit pointers, whereas a skip list uses approximately 80 MB due to forward pointers at multiple levels. The trade-off is that the heap does not support range queries -- you can only access the minimum element. This makes it suitable for schedulers where you always want the earliest task and do not need to scan arbitrary time ranges.
+
+<AsciiDiagram
+  id="distributed-scheduler/priority-queue-heap"
+  title="Binary Min-Heap Priority Queue"
+  alt="Diagram of a binary min-heap showing the tree structure and its underlying array representation with trigger timestamps as keys"
+  caption="Binary min-heap array representation and tree structure"
+  content={`
+Array representation (index 1-based):
+┌────┬────────┬────────┬────────┬────────┬────────┬────────┐
+│ -  │ #450   │ #442   │ #455   │ #443   │ #445   │ #460   │
+│    │14:00   │14:01   │14:03   │14:01   │14:02   │14:05   │
+└────┴────┬───┴────────┴────┬───┴────────┴────────┴────────┘
+          │                │
+          ▼                ▼
+     Tree form:
+                    #450 (14:00)
+                   /            \
+              #442 (14:01)    #455 (14:03)
+             /        \         /       \
+        #443(14:01) #445(14:02) #460(14:05)
+
+     Insert task #448 at 14:00:30:
+     1. Append to array: index 7
+     2. Compare with parent #460 (14:05)
+     3. #448 later than #460, so no swap
+     4. If #448 were earlier (e.g. 14:00:04),
+        it would sift up to root
+`} />
+
+A Python implementation of the priority queue scheduler is concise:
+
+```python
+import heapq
+import time
+
+class HeapScheduler:
+    def __init__(self):
+        self.heap: list[tuple[float, str, dict]] = []
+
+    def enqueue(self, delay_ms: int, task_id: str, payload: dict) -> None:
+        trigger_at = time.time() + delay_ms / 1000.0
+        heapq.heappush(self.heap, (trigger_at, task_id, payload))
+
+    def poll(self, batch_size: int = 10) -> list[tuple[str, dict]]:
+        now = time.time()
+        due = []
+        while self.heap and self.heap[0][0] <= now and len(due) < batch_size:
+            _, task_id, payload = heapq.heappop(self.heap)
+            due.append((task_id, payload))
+        return due
+```
+
+## Request Lifecycle
+
+A single task traverses a well-defined path through the system. Here is the complete lifecycle in 15 steps.
+
+### Step 1 -- Enqueue
+
+Client sends a POST request to `/tasks` with the task payload and trigger time. The API gateway validates the schema, checks for required fields, and assigns a unique ID (typically a UUID v7 that embeds a timestamp for ordered sorting).
+
+### Step 2 -- Validation and Rate Limiting
+
+The gateway applies per-client rate limiting using a token bucket. Each client is identified by an API key in the Authorization header. If the client has exceeded its rate limit of 1000 requests per second, the gateway returns 429 Too Many Requests with a Retry-After header indicating when the client can retry.
+
+The gateway also validates the payload schema against a JSON Schema registered for the task type. Rejected tasks return 422 Unprocessable Entity with a structured error message that includes the specific field violations.
+
+### Step 3 -- Shard Assignment
+
+The gateway hashes the task ID to determine the target shard. Consistent hashing ensures an even distribution of tasks across shards and minimizes reshuffling when shards are added or removed.
+
+### Step 4 -- Persist
+
+The shard leader writes the task to the schedule index. In a database-backed scheduler, this is an INSERT. In a Redis-backed scheduler, this is a ZADD. The write must be durable: acknowledged by a majority of replicas or flushed to disk.
+
+### Step 5 -- Index Update
+
+The schedule index adds the task to its time-ordered structure. With a sorted set, the task is inserted with score equal to the trigger timestamp. With a database, the new row is visible via the partial index.
+
+### Step 6 -- Poll
+
+A worker tick cycle fires. The worker sends a query for due tasks to its assigned shard. The poll interval is typically configurable from 100 milliseconds to 5 seconds, depending on latency requirements. Workers use an adaptive poll interval: if the previous poll returned no tasks, the interval increases by 50% up to a maximum of 5 seconds. If tasks were found, the interval resets to the configured minimum.
+
+```python
+class AdaptivePoller:
+    def __init__(self, min_interval=0.1, max_interval=5.0):
+        self.min_interval = min_interval
+        self.max_interval = max_interval
+        self.current_interval = min_interval
+
+    def on_poll_result(self, task_count: int) -> float:
+        if task_count == 0:
+            self.current_interval = min(
+                self.current_interval * 1.5, self.max_interval
+            )
+        else:
+            self.current_interval = self.min_interval
+        return self.current_interval
+```
+
+### Step 7 -- Claim
+
+The worker receives due tasks and attempts to claim them. The claim operation is atomic: it checks the status, updates it to LEASED, sets the worker ID, and sets the lease expiration. If another worker has already claimed a task, the claim operation returns zero rows for that task.
+
+### Step 8 -- Lease Validation
+
+The worker checks the lease expiration. A task with a past lease expiration is treated as unclaimed (the previous worker died). The worker reclaims it by resetting the status to PENDING and then re-claiming in the next cycle.
+
+### Step 9 -- Pre-execution Hook
+
+Before executing the task, the worker runs a chain of pre-execution hooks. These can modify the task payload, set up context for observability, or skip execution based on external conditions. Common pre-execution hooks include:
+
+- **Idempotency check**: Verify that this task has not already been processed by checking a deduplication store.
+- **Dependency resolution**: Check that upstream dependencies are satisfied before proceeding.
+- **Payload enrichment**: Add context from external systems, such as current user credentials or feature flags.
+- **Rate limit check**: Ensure the downstream system can accept the task before executing it.
+
+Each hook can return SKIP to abort execution, DEFER to reschedule the task for a later time, or CONTINUE to proceed. If a hook returns SKIP, the task is marked as COMPLETED without executing the payload. If it returns DEFER, the task is rescheduled with a computed delay and the reason is logged.
+
+### Step 10 -- Execute
+
+The worker executes the task payload. Execution can be in-process, out-of-process, or remote. The worker monitors the execution deadline. If the task defines a timeout, the worker enforces it by canceling or aborting the execution.
+
+### Step 11 -- Heartbeat
+
+For long-running tasks, the worker sends periodic heartbeats to the lease manager. Each heartbeat extends the lease by a configured duration. If heartbeats stop, the lease expires and the task becomes available for reclaim.
+
+### Step 12 -- Complete
+
+On successful execution, the worker updates the task status to COMPLETED in the state store. The lease is released. The task is removed from the schedule index.
+
+### Step 13 -- Post-execution Callback
+
+After the task completes or fails, the worker triggers post-execution callbacks. These are registered for the task type at deployment time. Common callbacks include:
+
+- **Webhook notification**: POST the result to a configured endpoint URL. The webhook includes the task ID, status, execution duration, and output payload. If the webhook URL is unreachable, the notification is retried up to 3 times with exponential backoff.
+- **Parent task chaining**: Update the status of a parent task that is waiting for this task to complete. This is essential for workflows that fan out into multiple subtasks.
+- **Metric emission**: Emit execution duration, result status, and payload size to the observability system.
+- **Dead letter routing**: If the task failed permanently, copy it to the dead-letter queue and emit an alert.
+
+Callbacks are executed synchronously by default. A slow callback delays the worker from claiming the next task. For latency-sensitive systems, configure critical callbacks as fire-and-forget operations that run on a separate thread pool with a maximum queue size of 100.
+
+### Step 14 -- Handle Failure
+
+On execution failure, the worker increments the retry count. If below the maximum retries, the worker computes the next trigger time using the backoff policy and updates the task status to PENDING with the new trigger_at. If above maximum retries, the task moves to DEAD_LETTER with the error details.
+
+The backoff calculation uses this formula:
+
+```python
+import random
+import math
+
+def compute_backoff(retry_count: int, base_delay: float, max_delay: float) -> float:
+    delay = base_delay * math.pow(2, retry_count)
+    jitter = random.uniform(0, min(1.0, delay * 0.1))
+    return min(delay + jitter, max_delay)
+```
+
+For retry 0, the delay is 1 second plus up to 100 milliseconds of jitter. For retry 1, the delay is 2 seconds plus jitter. For retry 2, the delay is 4 seconds plus jitter. For retry 3, the delay is 8 seconds plus jitter. Beyond retry 4, the delay caps at 30 seconds to prevent the retry window from growing unbounded.
+
+### Step 15 -- Audit
+
+The state store records the full lifecycle as an audit trail. Each transition (enqueued, leased, executing, completed, failed, dead-lettered) is timestamped and logged. This trail is essential for debugging, compliance, and capacity planning.
+
+The audit table schema supports efficient queries by task ID, time range, and status:
+
+```sql
+CREATE TABLE task_audit_log (
+  id          BIGSERIAL,
+  task_id     UUID NOT NULL,
+  from_status VARCHAR(16),
+  to_status   VARCHAR(16) NOT NULL,
+  worker_id   VARCHAR(64),
+  detail      JSONB,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_task_id ON task_audit_log (task_id, created_at);
+CREATE INDEX idx_audit_status ON task_audit_log (to_status, created_at);
+
+-- Query the full lifecycle of a specific task
+SELECT created_at, from_status, to_status, worker_id, detail
+FROM task_audit_log
+WHERE task_id = '550e8400-e29b-41d4-a716-446655440000'
+ORDER BY created_at;
+```
+
+<AsciiDiagram
+  id="distributed-scheduler/request-lifecycle"
+  title="Complete Task Lifecycle Sequence"
+  alt="Sequence diagram showing the 15-step lifecycle from enqueue through audit with all system components"
+  caption="The full 15-step lifecycle of a single scheduled task"
+  content={`
+Client    API       Shard     Schedule   Worker    State     External
+ │        │         │         Index      │        Store     System
+ │───────►│         │         │          │         │         │
+ │ POST   │────────►│         │          │         │         │
+ │ /tasks │         │────────►│          │         │         │
+ │        │         │  INSERT │          │         │         │
+ │        │         │         │─────────►│         │         │
+ │        │         │         │  ACK     │         │         │
+ │◄───────│         │         │          │         │         │
+ │  201   │         │         │          │         │         │
+ │        │         │         │  POLL    │         │         │
+ │        │         │◄───────────────────│         │         │
+ │        │         │         │          │         │         │
+ │        │         │  CLAIM  │          │         │         │
+ │        │         │─────────►──────────│         │         │
+ │        │         │         │          │─ ─ ─ ─►│         │
+ │        │         │         │          │ status │         │
+ │        │         │         │          │ LEASED │         │
+ │        │         │         │          │         │         │
+ │        │         │         │          │  Hook   │         │
+ │        │         │         │          │(checks │         │
+ │        │         │         │          │ idemp)  │         │
+ │        │         │         │          │         │         │
+ │        │         │         │          │──────► │         │
+ │        │         │         │          │execute  │         │
+ │        │         │         │          │         │         │
+ │        │         │         │          │─────────────────►│
+ │        │         │         │          │       result     │
+ │        │         │         │          │◄─────────────────│
+ │        │         │         │          │         │         │
+ │        │         │         │          │ COMPLETE│         │
+ │        │         │         │          │────────►│         │
+ │        │         │         │          │         │         │
+ │        │         │         │          │Callback │         │
+ │        │         │         │          │(webhook)│         │
+ │        │         │         │          │─────────────────►│
+ │        │         │         │          │         │         │
+ │        │         │         │  AUDIT   │         │         │
+ │        │         │         │◄───────────────────│         │
+`} />
+
+## Consistency and State
+
+### Scenario 1 -- Normal Operation
+
+Under normal operation, the scheduler state is consistent. The schedule index, lease manager, and state store agree on the status of every task. The watermark advances smoothly. The system processes tasks at the rate they are enqueued.
+
+During normal operation, the lease hit rate (tasks claimed without contention) should exceed 99.9%. The reclaim rate (tasks reclaimed due to expired leases) should be lower than 0.1% of total claims. If you observe a higher reclaim rate, investigate whether lease durations are too short or workers are overloaded.
+
+### Scenario 2 -- Worker Crash During Execution
+
+Worker A claims task T and begins executing. Worker A crashes at 14:00:05. The lease on task T expires at 14:00:35 (30-second lease duration). Worker B polls at 14:00:36, finds task T with an expired lease, and reclaims it. Worker B executes task T at 14:00:36.
+
+The task experiences a 31-second delay from its trigger time. This is within the expected recovery window. The critical property is that the task is eventually executed exactly once (at-least-once with idempotent downstream).
+
+<AsciiDiagram
+  id="distributed-scheduler/crash-scenario"
+  title="Worker Crash Recovery Timeline"
+  alt="Timeline showing worker A crashing, lease expiration, and worker B reclaiming the task"
+  caption="Timeline of worker crash and lease-based recovery"
+  content={`
+Time:  14:00:00    14:00:05    14:00:35    14:00:36    14:00:37
+          │           │           │           │           │
+          │   Task T  │           │           │           │
+          │   due     │           │           │           │
+          │     │     │           │           │           │
+Worker A  │─────┼─────┤           │           │           │
+          │claim│exec.│ crashes  │           │           │
+          │ T   │ T   │          │           │           │
+          │     │     │          │           │           │
+          │     │     │          │           │           │
+Lease     │     │◄────┼──────────┤           │           │
+          │     │30 sec lease   │ expires   │           │
+          │     │     │          │           │           │
+Worker B  │     │     │          │  poll ───►│           │
+          │     │     │          │  reclaims │ execute T │
+          │     │     │          │  T        │           │
+          │     │     │          │           │           │
+          │◄────┼─────┼──────────┼───────────┼──────────►│
+          │    31 second gap from trigger to execution   │
+`} />
+
+### Scenario 3 -- Network Partition
+
+The network splits into two partitions. Workers in partition A can reach the schedule index. Workers in partition B cannot. Workers in partition B cannot lease new tasks. Existing leases in partition B expire because workers cannot send heartbeats.
+
+When the partition heals, the reclaim scanner finds all expired leases from partition B workers and resets them to PENDING. The tasks are re-executed by available workers. No tasks are lost. Some tasks may execute twice if the partition B workers were still running but could not reach the schedule index to update status.
+
+This is the split-brain scenario. The scheduler cannot distinguish between a worker that crashed and a worker that is partitioned but still executing. The defense is idempotent task execution.
+
+### Scenario 4 -- Clock Drift
+
+Worker A has a clock that is 5 seconds behind the schedule index. Worker A polls for tasks due at or before 14:00:00, but the schedule index considers tasks due at 14:00:05 as not yet triggered. Worker A is 5 seconds late for every task.
+
+Worker B has a clock that is 5 seconds ahead. Worker B claims tasks that are not yet due by the schedule index clock, then waits for them to become due.
+
+The fix is monotonic clock reads and NTP synchronization. The schedule index should use a single authoritative clock source (typically the database NOW() function). Workers should use the schedule index clock for comparisons, not their local clock.
+
+You can detect clock drift by including a timestamp in the poll response from the schedule index. The worker compares its local clock to the server timestamp and logs a warning if the difference exceeds 500 milliseconds. Beyond 2 seconds of skew, the worker should refuse to claim tasks and enter a degraded mode where it only polls and validates, preventing false claims or missed tasks.
+
+### Scenario 5 -- Data Corruption in State Store
+
+A storage node experiences bit rot or a partial write. A scheduled task payload is corrupted. When the worker retrieves the task, it cannot deserialize the payload. The task cannot be executed and the worker does not know how to handle it.
+
+The first line of defense is checksums. Every task record includes a CRC32C checksum of the payload field. The checksum is computed when the task is inserted and verified when the task is read for execution.
+
+```sql
+-- Include a checksum column in the tasks table
+ALTER TABLE scheduled_tasks ADD COLUMN payload_checksum INTEGER;
+
+-- Verify on read
+SELECT id, task_type, payload
+FROM scheduled_tasks
+WHERE id = $1
+  AND payload_checksum = CRC32C(payload::text)::integer;
+```
+
+If the checksum does not match, the worker does not attempt to execute the task. Instead, it follows the corruption recovery protocol:
+
+1. Mark the task status as CORRUPTED in the state store, recording the expected and actual checksum values.
+2. Attempt a read-repair from a replica. If the task exists on another replica with a matching checksum, copy the correct payload back to the primary.
+3. If read-repair fails, copy the task record to the dead-letter table with a reason of DATA_CORRUPTION and alert the operator.
+4. The operator reviews the dead-letter entry, determines whether the task can be reconstructed from the audit log or must be re-enqueued manually.
+
+Corruption is rare, but you must handle it correctly when it occurs. A system that silently retries a corrupted task will loop forever, consuming resources and generating noise.
+
+### Scenario 6 -- Slow Consumer
+
+A downstream system becomes slow. Tasks that call this system take 10 seconds instead of 100 milliseconds. Workers accumulate in-progress tasks. The lease manager observes that leases are about to expire and starts reclaiming tasks that are still being executed.
+
+This scenario creates a positive feedback loop. Reclaimed tasks are reassigned to other workers, which also try to call the slow downstream system, making the problem worse. The reclaim rate spikes, the duplicate execution rate spikes, and the downstream system receives even more traffic.
+
+Breaking the feedback loop requires multiple defenses:
+
+- **Circuit breaker**: Each worker implements a circuit breaker for downstream calls. After 5 consecutive failures or timeouts, the circuit opens and tasks are marked FAILED with reason CIRCUIT_OPEN. The circuit resets after 30 seconds, preventing workers from piling on to a struggling downstream system.
+- **Separate worker pools**: Assign different task types to different worker pools so that a slow consumer affecting type A does not starve type B tasks. Each pool has its own thread count, poll interval, and backpressure semaphore.
+- **Task-level timeout**: Enforce a timeout at the task level so that no single task can consume a worker thread indefinitely. Set the timeout to 3 times the p99 execution time of the task type.
+- **Lease starvation prevention**: The lease manager should not re-lease tasks whose leases are about to expire if the worker has sent a heartbeat within the last 10 seconds. This prevents false reclaims during transient slowdowns.
+
+## Performance
+
+### Poll Efficiency
+
+The poll interval directly impacts latency and database load:
+
+| Poll Interval | Maximum Latency | Queries/Second (100 workers) | Queries/Day |
+|---|---|---|---|
+| 100ms | 100ms | 1,000 | 86.4 million |
+| 500ms | 500ms | 200 | 17.3 million |
+| 1s | 1s | 100 | 8.6 million |
+| 5s | 5s | 20 | 1.7 million |
+
+For sub-second latency requirements, use a push-based notification mechanism (Redis Pub/Sub or Kafka) where workers subscribe to new task notifications and only poll as a backup for crash recovery.
+
+### Batch Size
+
+Claiming tasks in batches improves throughput. The optimal batch size depends on task execution time:
+
+```
+batch_size = poll_interval / (average_execution_time + overhead)
+```
+
+If tasks average 50 milliseconds and overhead is 10 milliseconds, and the poll interval is 500 milliseconds, the optimal batch size is approximately 8 tasks per claim. Larger batches increase throughput but increase the risk of duplicate processing if the worker crashes after claiming but before executing.
+
+Here is a table showing throughput at different batch sizes for a system with 100 workers, 500ms poll interval, and 50ms average execution time:
+
+| Batch Size | Tasks/Claim | Claims/Second (per worker) | Total Throughput |
+|---|---|---|---|
+| 1 | 1 | 2 | 200 tasks/second |
+| 5 | 5 | 2 | 1,000 tasks/second |
+| 10 | 10 | 2 | 2,000 tasks/second |
+| 50 | 50 | 2 | 10,000 tasks/second |
+| 100 | 100 | 2 | 20,000 tasks/second |
+
+Throughput scales linearly with batch size up to the point where the database claim operation itself becomes the bottleneck. For most systems, this point is between 50 and 200 tasks per claim.
+
+### Lease Duration
+
+The lease duration is a critical tuning parameter:
+
+```
+lease_duration = p99_execution_time * 3 + network_timeout
+```
+
+A 3x multiplier on p99 execution time prevents false-positive reclaims due to transient slowdowns. For a task with p99 equal to 5 seconds, the lease should be at least 15 seconds plus network timeout.
+
+The reclaim interval should be set based on the lease duration and the acceptable recovery time:
+
+```
+reclaim_interval = lease_duration * 2
+```
+
+This ensures that a worker crash causes at most 2x the lease duration in recovery delay. With a 30-second lease, the maximum recovery time is 60 seconds (one full reclaim interval).
+
+### Resource Utilization
+
+Workers consume CPU, memory, and network bandwidth. Here are approximate resource requirements for different task sizes:
+
+| Task Type | CPU per Task | Memory per Task | Network per Task |
+|---|---|---|---|
+| Lightweight (API call) | 10ms | 1 MB | 2 KB |
+| Medium (file processing) | 100ms | 50 MB | 1 MB |
+| Heavy (image processing) | 2 seconds | 200 MB | 10 MB |
+
+To calculate the number of workers needed: `workers = tasks_per_second * average_execution_time / utilization_target`. For 500 tasks/second with 100ms CPU per task at 70 percent utilization, this gives approximately 85 workers after adding 20 percent headroom.
+
+Beyond 200 concurrent workers on a single database instance, add read replicas for the poll query and shard the claim query across multiple primary instances.
+
+## Configuration
+
+A production distributed scheduler requires tuning across multiple dimensions. Here are the key parameters and their typical values for a system processing 100,000 tasks per second.
+
+### Shard Configuration
+
+- **Shard count**: 16 to 64 (power of 2 for consistent hashing)
+- **Tasks per shard**: 10,000 to 100,000 pending
+- **Rebalance trigger**: 20% imbalance between shards
+- **Virtual nodes per shard**: 64 to 256
+
+The rebalance trigger evaluates imbalance as the difference between the most-loaded shard and the least-loaded shard, divided by the average load. When this value exceeds 0.2, the rebalancer activates. It moves tasks from the most-loaded shard to the least-loaded shard in batches of 100.
+
+### Worker Configuration
+
+- **Worker count**: 2x to 5x the number of shards
+- **Poll interval**: 500ms (default), 100ms (low-latency), 5s (batch)
+- **Batch size**: 10 to 100 tasks per claim
+- **Thread pool size**: 4 to 32 threads per worker
+- **Backpressure semaphore**: 2x the thread pool size
+- **Drain timeout**: 30 seconds for graceful shutdown
+
+The backpressure semaphore prevents the worker from claiming more tasks than it can handle. When the semaphore is full, the worker skips its poll cycle entirely.
+
+### Lease Configuration
+
+- **Lease duration**: 30 seconds (default)
+- **Lease renewal interval**: 1/3 of lease duration (10 seconds)
+- **Reclaim scanner interval**: 2x the lease duration (60 seconds)
+- **Accelerated reclaim interval**: 10 seconds for suspected-dead workers
+- **Heartbeat miss threshold**: 3 consecutive missed heartbeats
+
+Lease duration should be set per task type, not globally. A task that makes a database query needs a 10-second lease. A task that processes a video file needs a 5-minute lease. Store the lease duration in the task metadata so each worker claims the task with the appropriate duration.
+
+### Retry Configuration
+
+- **Max retries**: 3 (default), 5 (critical tasks), 0 (fire-and-forget)
+- **Backoff**: exponential with jitter: `base_delay * 2^retry + random(0, 1000ms)`
+- **Base delay**: 1 second (default), 100ms (low-latency), 60s (batch)
+- **Max delay cap**: 30 seconds (default), 5 minutes (critical)
+
+The jitter prevents the thundering herd problem during retry storms. If 1000 tasks fail simultaneously and all retry with the same base delay, they would all become due at the same time. Jitter spreads the retries across the jitter window.
+
+### Memory Configuration
+
+- **Schedule index memory**: 80 bytes per entry plus payload for sorted sets
+- **Worker heap**: 256 MB minimum, 2 GB recommended for heavy tasks
+- **Audit buffer**: 10,000 entries before flushing to disk
+- **Dead-letter queue**: unbounded with a 30-day retention policy
+
+For a Redis-backed scheduler with 500,000 pending tasks averaging 512 bytes each plus 80 bytes overhead, the memory is approximately 355 MB. With replication factor 3, the total cluster memory is 1.1 GB.
+
+### Network Configuration
+
+- **Max request size**: 256 KB for task payloads
+- **Connection pool**: 10 to 50 connections per worker to the state store
+- **Connection timeout**: 5 seconds for establishing new connections
+- **Socket timeout**: 30 seconds for read and write operations
+- **Idle timeout**: 60 seconds before closing idle connections
+
+Connection pooling is critical for database-backed schedulers. Each poll and claim operation opens a database connection. Without pooling, opening and closing connections adds 10-50 milliseconds of overhead per operation, reducing throughput by up to 50%.
+
+### Monitoring Configuration
+
+- **Claim latency**: alert if p99 exceeds 100ms
+- **Reclaim rate**: alert if above 1% of total claims
+- **Dead-letter count**: alert if exceeds 1000
+- **Backpressure utilization**: alert if above 80% for more than 60 seconds
+- **Lease expiry rate**: alert if above 0.5% of active leases per minute
+- **Clock skew**: alert if any worker reports more than 500ms of skew
+
+Configure these with a 5-minute evaluation window to avoid paging on transient spikes. Use a 1-minute window for latency alerts since spikes indicate immediate impact.
+
+<AsciiDiagram
+  id="distributed-scheduler/configuration-tradeoffs"
+  title="Configuration Tuning Trade-offs"
+  alt="Matrix showing relationships between poll interval, lease duration, batch size, and their effects on latency, throughput, and reliability"
+  caption="Trade-off relationships between key scheduler configuration parameters"
+  content={`
+                    Shorter                  Longer
+                    ◄──────────────────────────────────►
+
+Poll Interval:   ┌──────────────────────────────────────┐
+                 │  Lower latency         Higher latency │
+                 │  Higher DB load        Lower DB load  │
+                 │  More contention       Less contention│
+                 └──────────────────────────────────────┘
+
+Lease Duration:  ┌──────────────────────────────────────┐
+                 │  Faster recovery      Slower recovery │
+                 │  More false reclaims  Fewer false     │
+                 │                       reclaims        │
+                 └──────────────────────────────────────┘
+
+Batch Size:      ┌──────────────────────────────────────┐
+                 │  Higher throughput    Lower throughput│
+                 │  More duplicate risk  Less duplicate  │
+                 │                       risk            │
+                 └──────────────────────────────────────┘
+
+Retry Backoff:   ┌──────────────────────────────────────┐
+                 │  Faster retry         Slower retry    │
+                 │  Higher retry load    Lower retry     │
+                 │                       load            │
+                 └──────────────────────────────────────┘
+`} />
+
+The configuration parameters are interdependent. Reducing the poll interval to lower latency increases database load, which may require more shards. Reducing the lease duration for faster recovery increases false-positive reclaims, which increases duplicate executions. Every change has a cascade of effects across the system.
+
+## Common Pitfalls
+
+### Pitfall 1 -- Thundering Herd on Reclaim
+
+When a large batch of leases expires simultaneously, all workers see the same tasks as reclaimable and rush to claim them, causing a spike in write contention. This happens most often after a database failover: all workers reconnect at once and all in-flight task leases expire around the same time.
+
+The fix is to add jitter to the reclaim scanner. Instead of checking every 60 seconds on the dot, each worker checks at 60 seconds plus a random offset of up to 10 seconds.
+
+```
+reclaim_interval = 60 + random(0, 10)
+```
+
+For the reclaim operation itself, use a staggered claim that processes expired leases in small batches with delays between batches. This prevents any single reclaim cycle from generating a burst of writes.
+
+<AsciiDiagram
+  id="distributed-scheduler/thundering-herd"
+  title="Thundering Herd on Lease Reclaim"
+  alt="Timeline showing multiple workers simultaneously attempting to reclaim the same expired leases, with contention spikes on the database"
+  caption="Thundering herd effect when all workers reclaim simultaneously"
+  content={`
+Time:     14:00:00    14:00:01    14:00:02    14:00:03
+             │           │           │           │
+Leases      ◄───────────┼───────────►           │
+expire      all leases  │                       │
+at once     expire      │                       │
+             │           │                       │
+Worker 1    ────────────┼─────claim─────────►   │
+             │           │  ┌────────────────────┘
+Worker 2    ────────────┼──┼──claim──────────►   │
+             │           │  │  ┌─────────────────┘
+Worker 3    ────────────┼──┼──┼──claim───────►   │
+             │           │  │  │  ┌──────────────┘
+Worker n    ────────────┼──┼──┼──┼──claim────►   │
+             │           │  │  │  │               │
+Database    ┌────────────┼──┼──┼──┼──────────────┐│
+contention  │  UPDATE contention spike           ││
+            │  SKIP LOCKED helps but does not    ││
+            │  eliminate the spike               ││
+            └────────────────────────────────────┘│
+             │           │  │  │  │               │
+With jitter:│           │  │  │  │               │
+Worker 1    ────────────┼──┼──┼──┼────claim─────►│
+Worker 2    ────────────┼──┼──┼──┼────claim─────►│
+Worker 3    ────────────┼──┼──┼──┼────claim─────►│
+             │          │  │  │  │               │
+Contention   │        Spread over 10 seconds     │
+`} />
+
+### Pitfall 2 -- Lease Duration Too Short
+
+A common mistake is setting the lease duration based on the average execution time rather than the p99 or p99.9. When a task runs longer than expected -- due to a garbage collection pause, a network retry, or a temporary slow down -- the lease expires and another worker reclaims the task. Both workers execute the task simultaneously, causing duplicate side effects.
+
+The lease duration must account for variability. Use this formula:
+
+```
+lease_duration = max(p99_execution_time * 3, min_lease)
+```
+
+Set `min_lease` to 10 seconds to avoid excessively short leases for very fast tasks. A task that averages 1 millisecond should still get a 10-second lease because network delays and GC pauses can easily exceed 1 millisecond.
+
+Monitor the lease expiry rate. If more than 0.5 percent of active leases expire per minute, increase the lease duration or investigate why tasks are taking longer than expected.
+
+### Pitfall 3 -- Missing Idempotency
+
+Distributed schedulers provide at-least-once delivery. A task may execute more than once if the worker crashes after execution but before committing the result, during lease-based reclaim, or during network partitions. Every task handler must be idempotent.
+
+The standard approach is an idempotency key stored in a separate table with a unique constraint:
+
+```sql
+CREATE TABLE idempotency_keys (
+  task_id       UUID PRIMARY KEY,
+  result_hash   VARCHAR(64) NOT NULL,
+  processed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- The task handler checks this first
+INSERT INTO idempotency_keys (task_id, result_hash)
+VALUES ($1, $2)
+ON CONFLICT (task_id) DO NOTHING
+RETURNING processed_at;
+```
+
+If the INSERT returns a row, the task is being processed for the first time. If it returns zero rows (duplicate key), the task was already processed and the handler should skip execution.
+
+### Pitfall 4 -- Clock Skew Between Workers
+
+Uneven clock drift between workers and the state store causes subtle consistency problems. If a worker clock is 10 seconds ahead of the database clock, heartbeats carry future timestamps and the reclaim scanner never sees leases as expired.
+
+The fix is to use the database clock for all lease comparisons. Heartbeats should not include a timestamp -- the database sets `lease_until = NOW() + INTERVAL '30 seconds'` on each heartbeat, making the lease duration independent of any worker clock.
+
+### Pitfall 5 -- Monitoring Blind Spots
+
+Teams that only monitor throughput miss the reclaim rate, lease expiry rate, and dead-letter accumulation. These are leading indicators of system degradation.
+
+You should monitor these metrics at minimum:
+
+| Metric | Warning | Critical | Action |
+|---|---|---|---|
+| Claim latency p99 | Over 50ms | Over 100ms | Reduce batch size or add shards |
+| Reclaim rate | Over 0.5% | Over 2% | Check worker health, adjust lease |
+| Dead-letter count | Over 100 | Over 1000 | Investigate task failures |
+| Backpressure | Over 60% | Over 80% | Add workers or optimize tasks |
+| Lease expiry rate | Over 0.2%/min | Over 0.5%/min | Increase lease duration |
+| Clock skew | Over 200ms | Over 1s | Fix NTP configuration |
+
+A healthy scheduler shows a flat claim latency line, a reclaim rate near zero, and a dead-letter count that grows only during known failure events. Any sustained deviation from this baseline requires investigation.

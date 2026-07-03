@@ -1,0 +1,375 @@
+---
+id: llm-serving-architecture
+title: LLM Serving at Scale
+sidebar_label: Architecture
+sidebar_position: 3
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Naive Implementation
+
+The simplest LLM serving setup is a single GPU machine running a model directly. The application server loads the model on startup, accepts HTTP requests, runs inference, and returns the response. This works for a prototype. It fails catastrophically at scale.
+
+<AsciiDiagram id="llm-serving-arch/naive" alt="A diagram showing the simplest LLM serving setup where the app server loads the model directly and runs inference" caption="Figure 1: Naive LLM serving — model loaded directly in the app server" content={`
+  ┌─────────────────────────────┐
+  │  App Server (single process) │
+  │  ┌─────────────────────────┐│
+  │  │  On startup:            ││
+  │  │  model = load_model(    ││
+  │  │    "llama-70b")         ││
+  │  │  # 45 seconds           ││
+  │  │                         ││
+  │  │  On request:            ││
+  │  │  response = model.      ││
+  │  │    generate(prompt)     ││
+  │  │  # 3-30 seconds         ││
+  │  └─────────────────────────┘│
+  └─────────────────────────────┘
+       │
+       v
+  [GPU: NVIDIA A100-80GB]
+  [Model: 70B params = 140 GB]
+  [Only fits if quantized to 4-bit]
+`} />
+
+### What Breaks at 10 Users
+
+Ten concurrent users send requests. The single GPU processes them sequentially — each request waits for the previous one to complete. With 30-second responses, the last user waits 5 minutes. The app server's thread pool (default 4 threads) is exhausted. New connections queue in the OS TCP backlog. Users see connection timeouts. Symptoms: p99 latency of 300 seconds, CPU at 100%, memory at 95%.
+
+### What Breaks at 100 Users
+
+The naive system is completely overwhelmed. Requests queue up in the HTTP server's buffer (default 100 connections). Beyond 100, connections are refused. The GPU is maxed out but serving only 1-2 requests per minute. The KV cache is not managed — memory leaks as each request's cache persists. After 10 minutes, GPU memory is exhausted and the process crashes. Symptoms: HTTP 503 errors, GPU OOM crashes every 15 minutes, mean time between failures under 30 minutes.
+
+### What Breaks at 1,000 Users
+
+The system cannot be scaled by adding more servers because the model loading time (45 seconds per instance) makes horizontal scaling impractical. Load balancing is non-existent. Each server is a silo. The team tries to set up round-robin DNS to multiple GPU instances, but without a consistent routing strategy, a user's second request goes to a different server, which has no KV cache for their conversation. The user experience is awful. Symptoms: no consistent conversation state, 50% error rate due to OOM, $200,000/month GPU bill with 5% utilization.
+
+## Production-Grade Architecture
+
+The production-grade LLM serving system is a distributed inference platform with dedicated services for request management, scheduling, GPU execution, and observability. Each component is independently scalable and fault-isolated.
+
+<AsciiDiagram id="llm-serving-arch/production-grade" alt="A comprehensive architecture diagram showing all components of a production LLM serving system from ingress through GPU inference with redundancy and monitoring" caption="Figure 2: Production-grade LLM serving — each layer scales independently" content={`
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │                     PRODUCTION-GRADE LLM SERVING SYSTEM                       │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── LAYER 1: INGRESS ───────────────────────────────────────────────────────┐
+  │  [Cloud Load Balancer (ALB / GCLB)]                                         │
+  │       │                                                                    │
+  │  ┌────┴────┐  ┌────┴────┐  ┌────┴────┐  ┌────┴────┐                     │
+  │  │ API GW  │  │ API GW  │  │ API GW  │  │ API GW  │  → auth, rate limit   │
+  │  │ (Kong)  │  │ (Kong)  │  │ (Kong)  │  │ (Kong)  │                       │
+  │  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘                     │
+  │       │                                                                    │
+  │  ┌────┴────┐  ┌────┴────┐  ┌────┴────┐  ┌────┴────┐                     │
+  │  │ Router  │  │ Router  │  │ Router  │  │ Router  │  → request dispatch    │
+  │  │ (Enovy) │  │ (Enovy) │  │ (Enovy) │  │ (Enovy) │                       │
+  │  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘                     │
+  └───────┼────────────┼────────────┼────────────┼─────────────────────────────┘
+          │            │            │            │
+  ┌───────┼────────────┼────────────┼────────────┼─────────────────────────────┐
+  │  LAYER 2: INFERENCE CLUSTER ────┼────────────┼─────────────────────────── │
+  │       │            │            │            │                              │
+  │  ┌────┴────┐  ┌────┴────┐  ┌────┴────┐  ┌────┴────┐                      │
+  │  │ vLLM    │  │ vLLM    │  │ vLLM    │  │ vLLM    │                      │
+  │  │ Node 1  │  │ Node 2  │  │ Node 3  │  │ Node 4  │                      │
+  │  │ A100x4  │  │ A100x4  │  │ A100x4  │  │ A100x4  │                      │
+  │  │ 70B     │  │ 70B     │  │ 70B     │  │ 70B     │                      │
+  │  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘                      │
+  │       │            │            │            │                              │
+  │       └────────────┴────────────┴────────────┘                              │
+  │                  │                                                         │
+  │         [Kubernetes Cluster — auto-scaling based on queue depth]           │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── LAYER 3: STATE ────────────────────────────────────────────────────────┐
+  │  [Redis Cluster]          [PostgreSQL]           [Object Store (S3)]       │
+  │  - Rate limit counters    - API keys              - Model weights          │
+  │  - Request queue          - Usage logs            - Model artifacts        │
+  │  - KV cache swap          - User quotas           - Tokenizer files        │
+  │  - Distributed locks      - Audit trail                                     │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── LAYER 4: OBSERVABILITY ─────────────────────────────────────────────────┐
+  │  [Prometheus] ──> [Grafana] ──> [PagerDuty / Slack Alerts]                 │
+  │  Metrics: TTFT, TPOT, GPU util, queue depth, error rate, memory usage       │
+  │  Tracing: OpenTelemetry — per-request trace across API GW → Router → GPU    │
+  │  Logging: structured JSON — request_id, model, tokens, latency, status      │
+  └─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Integration Patterns
+
+### Integrating With an API Gateway
+
+The API gateway sits between the client and the inference cluster. It handles authentication, rate limiting, and request routing. The gateway runs on CPU-only instances and scales horizontally.
+
+**Pattern:** The gateway validates API keys against a Redis cache (2ms lookup). It checks the token bucket rate limiter (capacity: client's request limit). If the request passes, it proxies to an available inference node using gRPC. The gateway implements circuit breaking — if an inference node returns 5% errors over 30 seconds, the gateway routes around it.
+
+**Watch out for:** Request timeout mismatch. The gateway typically has a 30-second timeout, but LLM responses can take 60+ seconds for long documents. If the gateway times out before the model finishes, the client gets a 504 and the GPU work is wasted. Solution: configure the gateway's timeout to match the max generation time (e.g., 300 seconds) or use streaming, where the timeout resets with each token.
+
+### Integrating With a Queue for Async Workloads
+
+For batch workloads (document processing, data enrichment), requests go through a message queue instead of direct HTTP. This provides backpressure handling and retry semantics.
+
+**Pattern:** The client submits a batch job to a Kafka topic. The inference consumer reads from Kafka, processes requests, and writes results to an output topic. The consumer uses a priority queue — premium customers get a dedicated partition with higher consumer priority.
+
+**Watch out for:** Consumer lag. If the inference cluster is saturated, the Kafka consumer cannot keep up. The lag grows. Without monitoring, you discover the lag only when the batch job's deadline passes. Solution: monitor consumer lag and alert when it exceeds 10,000 messages. Auto-scale inference nodes based on lag.
+
+<AsciiDiagram id="llm-serving-arch/kafka-integration" alt="A diagram showing LLM serving integrated with Kafka for async batch processing workloads" caption="Figure 3: Async LLM serving — Kafka decouples request submission from inference" content={`
+  [Client submits batch job]
+       │
+       │  POST /v1/batch { input_file: "data.jsonl", model: "gpt-4" }
+       v
+  ┌─────────────────────────────────────────────────────────┐
+  │  Batch API Server                                        │
+  │  Writes requests to Kafka topic                          │
+  └──────────────────┬──────────────────────────────────────┘
+                     │
+                     v
+  ┌─────────────────────────────────────────────────────────┐
+  │  Kafka Topic: llm-batch-requests                         │
+  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐              │
+  │  │ Req │ │ Req │ │ Req │ │ Req │ │ Req │  ...          │
+  │  │  1  │ │  2  │ │  3  │ │  4  │ │  5  │              │
+  │  └─────┘ └─────┘ └─────┘ └─────┘ └─────┘              │
+  └─────────────────────────────────────────────────────────┘
+                     │
+                     │ (consumer reads from earliest offset)
+                     v
+  ┌─────────────────────────────────────────────────────────┐
+  │  LLM Inference Cluster                                   │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
+  │  │ Consumer │  │ Consumer │  │ Consumer │  ...          │
+  │  │  Group   │  │  Group   │  │  Group   │              │
+  │  │  Node 1  │  │  Node 2  │  │  Node 3  │              │
+  │  └────┬─────┘  └────┬─────┘  └────┬─────┘              │
+  │       │              │              │                    │
+  │       v              v              v                    │
+  │  [GPU infers]   [GPU infers]   [GPU infers]            │
+  └─────────────────────────────────────────────────────────┘
+                     │
+                     v
+  ┌─────────────────────────────────────────────────────────┐
+  │  Kafka Topic: llm-batch-results                          │
+  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                      │
+  │  │ Res │ │ Res │ │ Res │ │ Res │  ...                  │
+  │  │  1  │ │  2  │ │  3  │ │  4  │                      │
+  │  └─────┘ └─────┘ └─────┘ └─────┘                      │
+  └─────────────────────────────────────────────────────────┘
+                     │
+                     v
+  [Client polls job status → downloads results from S3]
+`} />
+
+### Integrating With a Relational Database
+
+The serving system reads configuration from a database: model metadata, API keys, usage quotas, and routing rules. The database is not in the inference path — it is read at startup and cached.
+
+**Pattern:** The inference node loads configuration from PostgreSQL on startup and refreshes every 60 seconds via a background goroutine. API key validation uses Redis cache (write-through from PostgreSQL). Usage tracking writes to PostgreSQL asynchronously through a buffer (batch every 10 seconds or 1,000 records).
+
+**Watch out for:** Database connection pool exhaustion. Each inference node opens connections for configuration refresh and usage logging. With 50 inference nodes, you need at least 100 connections in the pool. Use a dedicated connection pooler (PgBouncer) and separate read/write connections.
+
+### Integrating With External APIs and CDNs
+
+LLM serving systems often cache responses to reduce costs — identical prompts get the same response. The cache is stored in a CDN-like layer (Redis for hot cache, S3 for warm cache).
+
+**Pattern:** Before running inference, the system computes a hash of the prompt and generation parameters (temperature, top-p). It checks Redis for an exact match. If found, the cached response is returned immediately (5ms latency vs 5 seconds for inference). The cache TTL is configurable per model — short for chat (5 minutes), long for content generation (24 hours).
+
+**Watch out for:** Cache poisoning. A user might intentionally craft prompts that collide with privileged users' cached responses. Solution: include the API key hash in the cache key. Responses are only served from cache if the requesting user matches the original request's API key.
+
+## Multi-Region and Global Scale
+
+When the LLM serving system spans multiple regions, the architecture must account for model weight distribution, latency requirements, and data residency regulations.
+
+<AsciiDiagram id="llm-serving-arch/multi-region" alt="A diagram showing multi-region LLM serving with regional inference clusters and a global load balancer" caption="Figure 4: Multi-region LLM serving — regional clusters with global load balancing" content={`
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │                     MULTI-REGION LLM SERVING SYSTEM                           │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── US-EAST-1 ───────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  [Global LB] ──> [API Gateway] ──> [Inference Cluster (vLLM)]               │
+  │       │                     │              │                                 │
+  │       │                     │         [GPU Pool: 8×H100]                     │
+  │       │                     │              │                                 │
+  │       │                     │         [Redis: KV swap, rate limits]          │
+  │       │                     │              │                                 │
+  │       │                     └──────────────┘                                 │
+  │       │                                                                      │
+  │  [Model Weights: S3 us-east-1]   [User DB: DynamoDB Global Table]           │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── EU-WEST-1 ───────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  [Global LB] ──> [API Gateway] ──> [Inference Cluster (vLLM)]               │
+  │       │                     │              │                                 │
+  │       │                     │         [GPU Pool: 4×H100]                     │
+  │       │                     │              │                                 │
+  │       │                     │         [Redis: KV swap, rate limits]          │
+  │       │                     │              │                                 │
+  │       │                     └──────────────┘                                 │
+  │                                                                              │
+  │  [Model Weights: S3 eu-west-1]  [User DB: DynamoDB Global Table]            │
+  │  [GDPR compliance: all EU user data stays in EU region]                     │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌─── AP-SOUTHEAST-1 ──────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  [Global LB] ──> [API Gateway] ──> [Inference Cluster (vLLM)]               │
+  │       │                     │              │                                 │
+  │       │                     │         [GPU Pool: 4×H100]                     │
+  │       │                     │              │                                 │
+  │       │                     │         [Redis: KV swap, rate limits]          │
+  │       │                     │              │                                 │
+  │       │                     └──────────────┘                                 │
+  │                                                                              │
+  │  [Model Weights: S3 ap-southeast-1]  [User DB: DynamoDB Global Table]       │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  Global State:
+  - Model weights replicated to each region's S3 (cross-region replication)
+  - User data lives in home region (DynamoDB Global Tables → eventual consistency)
+  - Rate limits enforced per-region, with global quota in Redis (cross-region)
+  - Cold-start model loading: 45 seconds per region (mitigated by pre-warming)
+`} />
+
+### Key Multi-Region Decisions
+
+**Model weight distribution:** Model weights (140 GB for 70B) are stored in S3 with cross-region replication. Each region loads weights from its local S3 bucket. Initial load takes 45 seconds from local S3, 3 minutes from cross-region. Pre-warming keeps the model loaded in GPU memory, so new instances are ready in under 10 seconds.
+
+**Latency:** A user in London should hit the EU region, not US-East. DNS-based routing (Route53 latency records) directs users to the nearest region. Inter-region latency (London → US-East = 80ms) is acceptable for the first request but adds 40ms to each decode step, which compounds over a 500-token response.
+
+**Data residency:** EU user data must stay in the EU (GDPR). The system enforces this at the API gateway level — EU-authenticated requests are routed to EU-only inference nodes. The model weights can cross borders (they contain no user data), but prompts, responses, and KV caches cannot.
+
+**Failover:** If US-East fails, traffic is routed to EU-West and AP-Southeast. The surviving regions must have spare GPU capacity. Over-provision by 30% for failover headroom. During failover, latency increases for US-based users (150ms vs 20ms to Europe).
+
+## Capacity Planning
+
+### Step 1: Estimate QPS From User Count
+
+You are designing for 1 million daily active users (DAU). Each user sends 10 chat requests per day on average. Total requests per day: 10,000,000.
+
+Peak hour factor: 5x (traffic is 5x higher during peak hours than average). Peak requests per hour: 10,000,000 / 24 × 5 = 2,083,333. Peak requests per second: 2,083,333 / 3600 = 579.
+
+Average tokens per request: 500 prompt tokens, 200 response tokens. Peak tokens per second: 579 × 200 = 115,800 (decode) + 579 × 500 = 289,500 (prefill).
+
+### Step 2: Calculate GPU Requirements
+
+An H100 GPU generates roughly 2,000 tokens per second (7B model) to 500 tokens per second (70B model). For a 70B model:
+
+- Peak decode throughput needed: 115,800 tokens/second
+- Tokens per GPU per second: 500 (70B model on H100)
+- GPUs needed for decode: 115,800 / 500 = 232 GPUs
+- With 30% headroom: 302 GPUs
+- Each GPU instance: 8× H100 → 38 GPU instances
+
+### Step 3: Size the KV Cache Memory
+
+Each concurrent request needs KV cache memory. With 579 peak QPS and average response time of 5 seconds, concurrent requests in flight: 579 × 5 = 2,895.
+
+KV cache per request (70B model, 2,048 tokens): 12 GB. Total KV cache memory: 2,895 × 12 GB = 34.7 TB.
+
+This is obviously impractical. The solution is to trade off: reduce concurrent requests by queuing, or use a smaller model (7B vs 70B) for high-volume use cases. With 38 GPU instances (304 GPUs) and 12 GB KV cache per GPU, total KV capacity: 304 × 12 GB = 3.6 TB. This supports 3.6 TB / 12 GB = 300 concurrent requests. The queue depth at 579 QPS with 300 concurrent slots is roughly 579 × queue_time seconds. With a 10-second queue SLA, the queue depth is 5,790 requests.
+
+### Step 4: Determine Network Bandwidth
+
+Ingress traffic: 579 requests/s × 2 KB (average prompt) = 1.16 MB/s. Egress traffic: 579 requests/s × 400 bytes/token × 200 tokens = 46.3 MB/s. Peak: 46.3 × 5 = 231.5 MB/s = 1.85 Gbps.
+
+Model weight download (infrequent): 140 GB per instance. At 10 Gbps network, weight download takes 112 seconds. At 25 Gbps, 45 seconds.
+
+<AsciiDiagram id="llm-serving-arch/capacity-sizing" alt="A summary diagram showing the complete capacity sizing for 1M DAU LLM serving" caption="Figure 5: Capacity sizing summary — 1M DAU LLM serving system resources" content={`
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │  CAPACITY SIZING SUMMARY — 1 Million DAU (70B Model)                         │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │                                                                              │
+  │  REQUESTS                                                                   │
+  │  ┌─────────────────────────────────────────────────────────────────────────┐│
+  │  │  Peak QPS: 579                                                          ││
+  │  │  Avg prompt tokens: 500    │  Avg response tokens: 200                  ││
+  │  │  Peak decode tok/s: 115,800 │  Peak prefill tok/s: 289,500              ││
+  │  └─────────────────────────────────────────────────────────────────────────┘│
+  │                                                                              │
+  │  GPU COMPUTE                                                                 │
+  │  ┌─────────────────────────────────────────────────────────────────────────┐│
+  │  │  H100 GPUs needed: 232 (decode) + 30 (prefill overhead) = 262          ││
+  │  │  With 30% headroom: 302 GPUs = 38 instances (8×H100)                   ││
+  │  │  GPU util target: 85%                                                   ││
+  │  └─────────────────────────────────────────────────────────────────────────┘│
+  │                                                                              │
+  │  MEMORY                                                                     │
+  │  ┌─────────────────────────────────────────────────────────────────────────┐│
+  │  │  KV cache per GPU: 12 GB (128 concurrent seq × 2,048 tokens)           ││
+  │  │  Total KV capacity: 302 GPUs × 12 GB = 3.6 TB                          ││
+  │  │  Max concurrent requests: 3,600                                         ││
+  │  │  Queue depth at 579 QPS with 10s SLA: 5,790                             ││
+  │  └─────────────────────────────────────────────────────────────────────────┘│
+  │                                                                              │
+  │  NETWORK                                                                     │
+  │  ┌─────────────────────────────────────────────────────────────────────────┐│
+  │  │  Ingress: 1.16 MB/s (burst: 5.8 MB/s)                                   ││
+  │  │  Egress (streaming): 46.3 MB/s (burst: 231.5 MB/s = 1.85 Gbps)          ││
+  │  │  Inter-node (tensor parallel): 20 GB/s per GPU (NVLink)                 ││
+  │  └─────────────────────────────────────────────────────────────────────────┘│
+  │                                                                              │
+  │  COST ESTIMATE (per month, single region)                                   │
+  │  ┌─────────────────────────────────────────────────────────────────────────┐│
+  │  │  GPU instances: 38 × $30,000/month (p4d.24xlarge) = $1,140,000          ││
+  │  │  Networking: $50,000 (inter-node traffic, load balancer)                ││
+  │  │  Storage: $10,000 (S3, Redis, PostgreSQL)                               ││
+  │  │  Total: $1,200,000/month                                                ││
+  │  │  Cost per 1M tokens: $0.35                                              ││
+  │  └─────────────────────────────────────────────────────────────────────────┘│
+  └─────────────────────────────────────────────────────────────────────────────┘
+`} />
+
+## Deployment and Operations
+
+### Zero-Downtime Deployment
+
+The LLM serving system uses a blue-green deployment strategy because loading model weights takes 45+ seconds, which is too long for rolling updates.
+
+**Deployment steps:**
+1. Provision new GPU instances (green) alongside existing instances (blue)
+2. Load model weights on green instances (45 seconds)
+3. Run health checks on green (benchmark latency, run known prompts)
+4. Switch traffic from blue to green via load balancer (DNS change or upstream config)
+5. Monitor green for 5 minutes (error rates, latency, GPU utilization)
+6. Drain blue instances (allow in-flight requests to complete, max 5 minutes)
+7. Decommission blue instances
+
+### Monitoring
+
+**Critical metrics (alert on these):**
+- Time to first token (TTFT): alert if p99 exceeds 2 seconds (users notice latency)
+- Tokens per second: alert if drops below 50% of baseline (GPU or network issue)
+- GPU memory utilization: alert if exceeds 95% (OOM risk)
+- Queue depth: alert if exceeds 1,000 (saturation)
+- Error rate: alert if exceeds 1% (model or hardware failures)
+- GPU temperature: alert if exceeds 85°C (hardware damage risk)
+
+**Diagnostic metrics (dashboard, no alert):**
+- Request rate by model and client
+- Average tokens per request
+- KV cache hit rate (speculative decoding)
+- Token distribution (prompt vs response)
+- Client distribution (top 10 clients by request volume)
+
+### Debugging
+
+**Common debugging queries:**
+- "Why is latency spiking?" — check queue depth, GPU utilization, and KV cache swap rate
+- "Why is the GPU idle?" — check whether the batch builder is receiving requests, verify the scheduler is not stuck
+- "Why are responses truncated?" — check max_tokens settings, verify the client is not closing the connection
+- "Why are we getting OOM?" — check max_num_seqs, gpu_memory_utilization, and KV cache block size
+
+### Upgrades
+
+**Model version upgrades:** When a new model version is released, the blue-green deployment loads the new weights and runs a regression test suite (50+ prompts with known expected outputs). The test suite verifies that the new model does not regress on safety, accuracy, or latency. If tests pass (within 5% of baseline), traffic is switched to the new version.
+
+**Framework upgrades:** When upgrading the inference framework (vLLM, TensorRT-LLM), the deployment runs A/B testing for 24 hours. 5% of traffic goes to the new framework version. Metrics are compared: latency, throughput, error rate, and memory usage. If the new version is within 2% of baseline on all metrics, it is promoted.
+
+---
+
+**Up next:** You have seen the architecture. Now understand the trade-offs — the hard choices that separate good designs from great ones.

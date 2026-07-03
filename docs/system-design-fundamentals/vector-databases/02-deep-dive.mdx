@@ -1,0 +1,377 @@
+---
+id: vector-databases-deep-dive
+title: Vector Databases — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A vector database is not one component — it's a stack of layers, each with its own data structures and algorithms. Understanding what happens inside the black box is what separates passing an interview from acing it.
+
+<AsciiDiagram title="Vector Database — Full Internal Component Architecture" content={`
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                     Vector Database Internal Architecture              │
+  └──────────────────────────────────────────────────────────────────────┘
+  
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  API Layer (gRPC / HTTP)                                             │
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
+  │  │  Insert       │  │  Search       │  │  Manage       │               │
+  │  │  /vectors     │  │  /search      │  │  /collections │               │
+  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘               │
+  └─────────┼─────────────────┼──────────────────┼───────────────────────┘
+            │                 │                  │
+  ┌─────────┼─────────────────┼──────────────────┼───────────────────────┐
+  │         v                 v                  v                        │
+  │  ┌─────────────────────────────────────────────────────────────┐     │
+  │  │  Query Planner & Coordinator                                 │     │
+  │  │  ─ parses query, applies metadata filters                    │     │
+  │  │  ─ determines which shards/segments to search                │     │
+  │  │  ─ merges results from multiple segments                     │     │
+  │  └──────────────────────────┬───────────────────────────────────┘     │
+  │                             │                                        │
+  │  ┌──────────────────────────┼───────────────────────────────────┐     │
+  │  │  Segment 1                v  Segment 2          Segment N     │     │
+  │  │  ┌────────────────────┐  ┌────────────────────┐  ┌──────┐    │     │
+  │  │  │ HNSW Index (mem)   │  │ HNSW Index (mem)   │  │ ...  │    │     │
+  │  │  │     Graph layers   │  │     Graph layers   │  │      │    │     │
+  │  │  ├────────────────────┤  ├────────────────────┤  ├──────┤    │     │
+  │  │  │ Metadata Index     │  │ Metadata Index     │  │      │    │     │
+  │  │  │ (hash / B-tree)    │  │ (hash / B-tree)    │  │      │    │     │
+  │  │  ├────────────────────┤  ├────────────────────┤  ├──────┤    │     │
+  │  │  │ Vector Store (disk)│  │ Vector Store (disk)│  │      │    │     │
+  │  │  │ ┌──────┬──────┬───┐│  │ ┌──────┬──────┬───┐│  │      │    │     │
+  │  │  │ │vec001│vec002│...││  │ │vecN+1│vecN+2│...││  │      │    │     │
+  │  │  │ └──────┴──────┴───┘│  │ └──────┴──────┴───┘│  │      │    │     │
+  │  │  └────────────────────┘  └────────────────────┘  └──────┘    │     │
+  │  └──────────────────────────────────────────────────────────────┘     │
+  │                                                                       │
+  │  ┌──────────────────────────────────────────────────────────────┐     │
+  │  │  Write-Ahead Log (WAL) — crash recovery                        │     │
+  │  │  │ op:INSERT vec:001 │ op:DELETE vec:002 │ op:UPDATE vec:003 │     │
+  │  └──────────────────────────────────────────────────────────────┘     │
+  └──────────────────────────────────────────────────────────────────────┘
+`} />
+
+The architecture is organized into stacked layers: the API layer handles communication, the query planner coordinates search across segments, each segment holds its own HNSW index and metadata index in memory with vectors on disk, and the WAL ensures crash recovery.
+
+## Data Structures and Algorithms
+
+### The HNSW Graph
+
+HNSW is the canonical data structure for vector search. It's a multi-layer graph where each layer is a sub-sampled view of the layer below.
+
+```
+Structure: Directed graph with N layers (typically 16-32)
+Each node = one vector
+Each edge = "this node is a neighbor of that node"
+```
+
+**What structure is used:** A hierarchical graph. Each node stores a list of neighbor node IDs per layer. The top layer has approximately 1% of total nodes (exponentially decreasing). The bottom layer has 100% of nodes.
+
+**Why this structure:** A flat graph requires O(n) traversal in the worst case. A hierarchical graph gives O(log n) search by enabling coarse-to-fine navigation. Without the hierarchy, you'd have to check every node's neighbors.
+
+**Time complexity:**
+- Insert: O(log n × ef_construction × M) — log n for the top-layer navigation, ef_construction for the candidate expansion, M for neighbor updates
+- Search: O(log n × ef) — log n layers, ef candidate checks per layer
+- Memory: O(n × M × layers × 8 bytes) — each edge stored as a 64-bit pointer
+
+<AsciiDiagram title="HNSW Graph — Node Structure and Edge Layout" content={`
+  Individual Node Layout:
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Node: ID 3847                                               │
+  │  Vector: [0.23, -0.45, ..., 0.12]  (768 floats in memory)   │
+  │  Layer 3 neighbors: [N5, N12]       (coarse, long-range)     │
+  │  Layer 2 neighbors: [N3, N5, N8, N12, N22]                  │
+  │  Layer 1 neighbors: [N2, N3, N4, N5, N6, N8, N22, N31]     │
+  └──────────────────────────────────────────────────────────────┘
+
+  Memory Layout (HNSW graph, 1M vectors × 768 dims):
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Component              │ Size (GB)  │ % of total            │
+  │  ──────────────────────────────────────────────────────────── │
+  │  Raw vectors (float32)  │  3.07 GB   │  65%                   │
+  │  Graph edges            │  0.50 GB   │  11%                   │
+  │  Metadata index         │  0.15 GB   │   3%                   │
+  │  Node metadata          │  0.35 GB   │   7%                   │
+  │  Overhead/L2 cache      │  0.65 GB   │  14%                   │
+  │  TOTAL                  │  4.72 GB   │ 100%                   │
+  └──────────────────────────────────────────────────────────────┘
+`} />
+
+### The Reservoir Sampling Trick for Layer Assignment
+
+When a new vector is inserted into HNSW, the algorithm must decide which layers it belongs to. This is done using an exponentially decaying random function:
+
+```
+layer = floor(-ln(uniform(0,1)) × L)
+```
+
+Where L is a normalization factor (typically 1/log(M)). This means:
+- ~50% of vectors go to layer 1 only (bottom layer)
+- ~25% go to layers 1-2
+- ~12.5% go to layers 1-3
+- And so on, exponentially fewer as layers increase
+
+If you skip this and assigned all vectors to all layers, the top layer would have N nodes instead of exp(-N), and navigation would require O(n) checks at every layer.
+
+### Metadata Indexing
+
+Vector databases also need fast metadata filtering. Common data structures:
+
+- **Hash index:** O(1) lookups for exact match filters (category = "outerwear"). Used for low-cardinality fields.
+- **B-tree:** O(log n) range queries for numeric fields (price between 50 and 100). Used for high-cardinality fields.
+- **Bitmap index:** O(1) bitwise AND/OR for multi-value filters. Used when you need to combine many filters quickly.
+
+### Distance Computation
+
+The core operation: given two vectors, how similar are they? The database must compute this millions of times per second.
+
+<AsciiDiagram title="Distance Metrics — How Similarity Is Computed" content={`
+  1. Cosine Similarity (most common for text embeddings)
+     ─────────────────────────────────────────────────
+     cos(θ) = (A · B) / (║A║ × ║B║)
+     
+     Result: 1.0 = same direction, 0.0 = orthogonal, -1.0 = opposite
+     
+     A: [0.23, -0.45, 0.67]    B: [0.19, -0.38, 0.71]
+     A·B = 0.23×0.19 + (-0.45)×(-0.38) + 0.67×0.71
+         = 0.0437 + 0.171 + 0.4757
+         = 0.6904
+     ║A║ = √(0.23² + 0.45² + 0.67²) = 0.830
+     ║B║ = √(0.19² + 0.38² + 0.71²) = 0.817
+     cos(θ) = 0.6904 / (0.830 × 0.817) = 0.690
+
+  2. Euclidean Distance (L2) — good for image embeddings
+     ───────────────────────────────────────────────────
+     d(A,B) = √(Σ(Ai - Bi)²)
+     
+     Result: 0.0 = identical, larger = more different
+     A: [0.23, -0.45, 0.67]    B: [-0.15, 0.72, -0.33]
+     diff² = (0.38)² + (-1.17)² + (1.0)²
+           = 0.1444 + 1.3689 + 1.0 = 2.5133
+     d = √2.5133 = 1.585
+
+  3. Dot Product — for normalized vectors
+     ──────────────────────────────────────
+     A·B = Σ(Ai × Bi)
+     Result: larger = more similar
+     Requires vectors to be length-normalized first
+`} />
+
+Modern vector databases use SIMD (Single Instruction Multiple Data) instructions to compute distances in parallel. AVX-512 can process 16 float operations per cycle, reducing a 768-dimension dot product from hundreds of cycles to under 50.
+
+## The Request/Write/Read Lifecycle
+
+### Write Path: Inserting a Vector
+
+<AsciiDiagram title="Write Path — Full Insertion Lifecycle" content={`
+  Client sends Insert request
+  ──────────────────────────
+  
+  Step 1: API Layer receives request
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  POST /vectors { id: "prod_3847", vector: [0.23, -0.45, ...],   │
+  │  metadata: { category: "outerwear", price: 120 } }               │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+  Step 2: Write to WAL (crash recovery)              (if this step
+  ┌──────────────────────────────────────────────────┐  fails, nothing
+  │  WAL entry: INSERT │ prod_3847 │ timestamp │ ... │  is lost)
+  └──────────────────────┬───────────────────────────┘
+                         │
+  Step 3: Assign layer in HNSW                      (random decision)
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  layer = floor(-ln(uniform(0,1)) × 1.44)  →  layer 3              │
+  │  (this vector will exist in layers 1, 2, 3)                       │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+  Step 4: Find entry point (top of graph)
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Start at the global entry node (oldest inserted node)           │
+  │  Navigate greedily through top layer to find approximate region  │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+  Step 5: For each layer from top down:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Layer 3: find ef_construction=200 nearest neighbors             │
+  │  Layer 2: from Layer 3 best, find 200 nearest neighbors         │
+  │  Layer 1: from Layer 2 best, find 200 nearest neighbors         │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+  Step 6: Connect to M nearest neighbors at each layer
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Layer 3: connect to top 16 neighbors                           │
+  │  Layer 2: connect to top 16 neighbors                           │
+  │  Layer 1: connect to top 16 neighbors                           │
+  │  (bidirectional connections — update neighbors' edge lists too) │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+  Step 7: Store vector on disk, metadata in index
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Disk: append vector to segment file (sequential write)          │
+  │  Metadata index: update hash table with category → [IDs]        │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+  Step 8: Commit WAL, return success to client
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Response: { status: "ok", id: "prod_3847", took: "45ms" }      │
+  └──────────────────────────────────────────────────────────────────┘
+`} />
+
+If any step between 2 and 7 fails, the WAL entry is used to roll back or retry. Without the WAL, a crash during step 5 would leave a partially connected node that pollutes future searches.
+
+### Read Path: Searching
+
+<AsciiDiagram title="Read Path — Query Execution Lifecycle" content={`
+  Client sends Search request
+  ──────────────────────────
+  
+  Step 1: Query arrives (query vector + parameters)
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  POST /search { vector: [0.21, -0.42, ...], top_k: 10,           │
+  │  filter: { price: { $lt: 200 } }, ef: 200 }                      │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+  Step 2: Query planner determines search strategy
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  - Which segments to search (all active segments)                │
+  │  - Can metadata filter be pushed down to index? (yes — price)   │
+  │  - Pre-filter or post-filter? (pre-filter — more efficient)      │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+  Step 3: Each segment searches independently
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Segment 1:                         Segment 2:                    │
+  │  Start at entry point N1            Start at entry point N101     │
+  │  Navigate layer 3: N1→N5→N12       Navigate layer 3: N101→N105   │
+  │  Descend to layer 2                 Descend to layer 2            │
+  │  Descend to layer 1                 Descend to layer 1            │
+  │  Collect top 20 candidates          Collect top 20 candidates     │
+  │  (with ef=200 exploration)          (with ef=200 exploration)     │
+  └──────────────────────┬───────────────┬───────────────────────────┘
+                         │               │
+  Step 4: Apply metadata filter          │
+  ┌──────────────────────────────────────┘                           │
+  │  Segment 1: 20 candidates → 14 pass price filter                │
+  │  Segment 2: 20 candidates → 16 pass price filter                │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+  Step 5: Merge and re-rank
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Combined 30 candidates sorted by distance score                 │
+  │  Keep top 10                                                     │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+  Step 6: Fetch payloads and return
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Response:                                                       │
+  │  [{ id: "prod_3847", score: 0.94, payload: { ... } },           │
+  │   { id: "prod_9201", score: 0.91, payload: { ... } },           │
+  │   ... ]                                                          │
+  │  took: "8ms"                                                     │
+  └──────────────────────────────────────────────────────────────────┘
+`} />
+
+## Consistency and State
+
+### Node Crashes Mid-Operation
+
+**What happens:** The WAL contains every write operation that was acknowledged to a client. On restart, the database replays the WAL to reconstruct the in-memory index. Any writes that were in-progress but not acknowledged are lost — clients must retry.
+
+**Resolution strategy:** Write-ahead logging with periodic checkpointing. The database snapshots the in-memory index to disk every N operations (configurable, typically every 10,000-100,000 inserts). On recovery, it loads the latest snapshot then replays WAL entries after that snapshot.
+
+<AsciiDiagram title="Crash Recovery — WAL Replay Process" content={`
+  Timeline:
+  ────────
+  T1: Snapshot taken (index state at 100,000 vectors)
+  T2: Insert id=100001, Insert id=100002, Insert id=100003
+  T3: CRASH ❌
+  
+  Recovery sequence:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Step 1: Load last snapshot (100,000 vectors)                     │
+  │  Step 2: Read WAL from snapshot point forward                   │
+  │  Step 3: Replay Insert 100001 → add to index                     │
+  │  Step 4: Replay Insert 100002 → add to index                     │
+  │  Step 5: Replay Insert 100003 → add to index                     │
+  │  Step 6: Index is consistent with pre-crash state ✅             │
+  └──────────────────────────────────────────────────────────────────┘
+`} />
+
+### Network Partitions
+
+**What happens:** In a distributed vector database (Pinecone, Milvus cluster), a partition splits nodes into two groups that can't communicate. Each group continues accepting writes independently.
+
+**Resolution strategy:** Most vector databases are AP (available, partition-tolerant) rather than CP. During a partition, both sides accept writes. When the partition heals, the database uses last-writer-wins (LWW) conflict resolution based on timestamps or vector clocks. This means writes during a partition on the losing side may be lost.
+
+If you skip conflict resolution and kept both versions, you'd need application-level merging — something most teams aren't prepared for.
+
+### Two Writes Simultaneously
+
+**What happens:** Two clients send inserts for the same vector ID at the same time.
+
+**Resolution strategy:** Last-writer-wins. The database picks a winner based on a timestamp (client-side or server-side). The losing write is discarded. Some databases (Qdrant) support optimistic concurrency control — the client provides an expected version number, and the write fails if the version doesn't match.
+
+If you skipped deduplication and kept both copies, the index would have duplicate vectors for the same ID, and searches would return the same item twice with slightly different scores.
+
+### Stale Reads
+
+**What happens:** A vector was inserted 5ms ago but a search query returns results that don't include it.
+
+**Resolution strategy:** This is expected behavior in most vector databases — they offer eventual consistency by default. New vectors are visible only after the current segment finishes its indexing cycle (typically 1-10 seconds). For read-after-write consistency, some databases support "refresh" operations that flush pending writes to the index, at the cost of performance.
+
+If you skipped the consistency trade-off and forced every write to be immediately visible, the index would need to lock on every search — reducing throughput by 10x or more.
+
+## Performance Characteristics
+
+<AsciiDiagram title="Performance Benchmarks — Real-World Numbers" content={`
+  Query latency vs. dataset size:
+  ──────────────────────────────
+  Dataset size    HNSW (p99)    IVF (p99)    PQ (p99)
+  1M vectors      2-5 ms        8-15 ms      15-30 ms
+  10M vectors     5-15 ms       20-40 ms     30-60 ms
+  100M vectors    20-50 ms      80-150 ms    100-200 ms
+  1B vectors      50-100 ms     200-500 ms   N/A
+  
+  Throughput (queries per second, 10M vectors, 768 dims):
+  ──────────────────────────────────────────────────────────
+  HNSW (ef=200):      3,000 QPS (single core)
+  HNSW (ef=200):     12,000 QPS (4 cores)
+  IVF (nprobe=10):    8,000 QPS (single core)
+  
+  Memory costs (1M vectors × 768 dims):
+  ────────────────────────────────────────
+  HNSW:  4.7 GB (index in memory)
+  IVF:   3.2 GB (index in memory)
+  PQ:    0.5 GB (compressed)
+  Disk:  3.0 GB (raw vectors)
+  
+  Latency breakdown (HNSW search of 10M vectors):
+  ────────────────────────────────────────────────
+  Distance computation:  4.2 ms  (38%)
+  Graph traversal:       3.8 ms  (34%)
+  Metadata filtering:    1.5 ms  (14%)
+  Result merge:          0.8 ms  (7%)
+  Serialization:         0.7 ms  (6%)
+  Network:               varies  (excluded)
+`} />
+
+Performance numbers from public benchmarks by Milvus, Qdrant, and Pinecone engineering teams at 2023-2024 conferences. Actual performance varies by hardware, embedding dimension, and data distribution.
+
+## Configuration and Tuning
+
+| Setting | Controls | Safe Default | When to Change | What Breaks If Wrong |
+|---------|----------|-------------|----------------|----------------------|
+| **M** | Max neighbors per node in HNSW graph | 16 | Increase to 32-48 for higher recall on sparse datasets | Too high (M over 64): memory blows up, inserts slow down. Too low (M under 8): recall collapses. |
+| **ef_construction** | Search width during index build | 200 | Increase to 400-800 for higher recall on difficult datasets | Too high: index build takes hours instead of minutes. Too low: poor graph quality, low recall. |
+| **ef** | Search width at query time | 200 | Increase for higher recall (500), decrease for lower latency (50) | Too high: queries take 50ms instead of 5ms. Too low: recall drops below 0.85. |
+| **nlist** | Number of IVF clusters | 10× sqrt(n) | Increase for larger datasets | Too high: empty clusters waste memory. Too low: poor partition quality. |
+| **nprobe** | IVF cells to search | 10 | Increase for higher recall (20), decrease for lower latency (3) | Too high: queries become slow. Too low: miss close vectors in unsearched cells. |
+| **Segment size** | Max vectors per segment | 1M-10M | Larger for write-heavy workloads, smaller for read-heavy | Too large: compaction takes too long. Too small: too many segments, slow searches. |
+| **Replication factor** | Number of copies per shard | 1 | Set to 3 for production HA | Too low: data loss on node failure. Too high: expensive writes, wasted memory. |
+
+Proceed to the Architecture page to see how vector databases integrate into real production systems at scale.

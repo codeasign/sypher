@@ -1,0 +1,966 @@
+---
+id: url-shortener-pattern-deep-dive
+title: URL Shortener Pattern — Under the Hood
+sidebar_label: Deep Dive
+sidebar_position: 2
+---
+
+import AsciiDiagram from '@site/src/components/AsciiDiagram';
+
+## Internal Architecture
+
+A URL shortener at production scale is not a single service. It is a suite of cooperating subsystems that each handle a specific concern: key generation, storage, caching, redirect, analytics, and administration. Understanding how these subsystems interact is essential for designing a system that handles 10,000 requests per second with 99.9 percent uptime.
+
+### Subsystem Overview
+
+The shortener decomposes into six logical subsystems:
+
+1. **API Gateway**: Routes requests to the appropriate handler, enforces rate limits, terminates TLS, and authenticates API clients.
+2. **Key Generation Service**: Produces unique short codes using one of the strategies described in the concepts chapter. This service is stateless for hash-based and Snowflake approaches, requiring no persistent storage.
+3. **Storage Service**: Manages the CRUD operations on the URL mappings database. Handles read replicas, write masters, connection pooling, and query optimization.
+4. **Cache Service**: Maintains the hot set of mappings in memory. Handles cache invalidation, TTL management, and cache cluster topology.
+5. **Redirect Engine**: The highest-throughput component. Receives GET requests for short codes, resolves them through the cache and database, and issues HTTP redirects. This engine must handle millions of requests per minute with sub-10-millisecond latency.
+6. **Analytics Pipeline**: A decoupled, asynchronous system that processes click events, generates aggregate statistics, and feeds dashboards. This subsystem is write-heavy and can tolerate seconds of latency.
+
+### Communication Patterns
+
+The subsystems communicate through two primary patterns:
+
+**Synchronous request-response**: The API Gateway, Storage Service, and Cache Service communicate synchronously over HTTP or gRPC. The Redirect Engine calls the Cache Service first, then falls back to the Storage Service. The total latency budget for a redirect is 10 milliseconds: 5 milliseconds for the cache lookup, 5 milliseconds for the fallback database query.
+
+**Asynchronous event streaming**: The Redirect Engine emits click events to a message queue. The Analytics Pipeline consumes these events asynchronously. This decoupling ensures that a spike in analytics traffic does not slow down redirects. The message queue acts as a shock absorber, buffering events during traffic spikes.
+
+<AsciiDiagram
+  id="url-shortener-pattern/deepdive-subsystems"
+  title="Subsystem Communication Architecture"
+  alt="Six subsystems of a URL shortener showing synchronous and asynchronous communication paths"
+  caption="The redirect engine uses synchronous calls for fast lookups while the analytics pipeline uses async message queues"
+  content={`
+  ┌─────────────┐   HTTP/gRPC    ┌──────────────────┐
+  │  API Client │ ─────────────>  │  API Gateway     │
+  │  (Create)   │                │                  │
+  └─────────────┘                │  Rate Limiter    │
+                                 │  Auth           │
+  ┌─────────────┐   HTTP/2      │  TLS Term       │
+  │  Browser    │ ─────────────>  └────────┬─────────┘
+  │  (Redirect) │                          │
+  └─────────────┘                          │
+                                           ▼
+                                  ┌──────────────────┐
+                                  │  Key Generation  │
+                                  │  ┌────────────┐  │
+                                  │  │ Hash       │  │
+                                  │  │ Sequential │  │
+                                  │  │ Snowflake  │  │
+                                  │  └────────────┘  │
+                                  └────────┬─────────┘
+                                           │
+                    ┌──────────────────────┼──────────────────────┐
+                    │                      │                      │
+                    ▼                      ▼                      ▼
+           ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
+           │  Cache        │     │  Storage      │     │  Message      │
+           │  Service      │     │  Service      │     │  Queue        │
+           │  (Redis)      │     │  (MySQL/      │     │  (Kafka)      │
+           │  Read path    │     │   Postgres)   │     │  Async events │
+           └───────────────┘     └───────────────┘     └───────┬───────┘
+                                                               │
+                                                               ▼
+                                                      ┌───────────────┐
+                                                      │  Analytics    │
+                                                      │  Pipeline     │
+                                                      │  Stream proc  │
+                                                      │  Warehouse    │
+                                                      └───────────────┘
+`} />
+
+## Data Structures
+
+### Data Structure 1: The URL Mapping Table
+
+The core data structure is a relational table that maps short codes to long URLs. This is the system of record for all mappings.
+
+```sql
+CREATE TABLE url_mappings (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    short_code VARCHAR(8) NOT NULL,
+    long_url VARCHAR(2048) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    expires_at TIMESTAMP(6) NULL,
+    owner_id VARCHAR(64) NULL,
+    click_count BIGINT NOT NULL DEFAULT 0,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    is_custom BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata JSON NULL,
+    UNIQUE INDEX idx_short_code (short_code),
+    INDEX idx_owner_id (owner_id),
+    INDEX idx_expires_at (expires_at),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+```
+
+Key design decisions for this table:
+
+- **`short_code` as a unique index, not primary key**: Using a separate auto-increment `id` as the primary key allows the clustered index to remain compact and sequential. The `short_code` unique index is a secondary index that points to the primary key. This is a deliberate trade-off: insert performance is better with a sequential primary key, but lookups by short code require two index traversals instead of one.
+
+- **`VARCHAR(8)` for short code**: 8 characters supports up to 218 trillion combinations in base-62. The fixed maximum length lets the database allocate a fixed-size column, improving scan performance.
+
+- **`VARCHAR(2048)` for long URL**: 2048 characters is the practical maximum URL length supported by most web servers and browsers. The column is not indexed because full-text search on URLs is rarely needed.
+
+- **`JSON` metadata column**: Stores flexible metadata like the original user agent, referrer, and custom tags. This avoids schema changes for new features.
+
+- **`TIMESTAMP(6)` for microsecond precision**: Supports high-resolution tracking of link creation and update times.
+
+The table size for 1 billion rows is approximately 500 GB, including indexes. The `idx_short_code` index alone consumes approximately 25 GB (8 bytes per key plus overhead).
+
+<AsciiDiagram
+  id="url-shortener-pattern/deepdive-table-layout"
+  title="URL Mapping Table Physical Layout"
+  alt="Diagram showing the physical layout of the URL mappings table with clustered and secondary indexes"
+  caption="The clustered index on `id` provides fast sequential inserts while the secondary index on `short_code` enables fast lookups"
+  content={`
+  ┌─────────────────────────────────────────────────────┐
+  │  Clustered Index (Primary Key = id)                │
+  │                                                     │
+  │  Page 1:  ids 1-200                                 │
+  │  ┌─────┬──────────┬──────────┬──────────────────┐  │
+  │  │ id  │ short_cd │ long_url │ created_at ...   │  │
+  │  ├─────┼──────────┼──────────┼──────────────────┤  │
+  │  │ 1   │ aB3xK9   │ https:// │ 2025-07-03 ...   │  │
+  │  │ 2   │ 7qP2mN   │ https:// │ 2025-07-03 ...   │  │
+  │  │ ... │ ...      │ ...      │ ...              │  │
+  │  └─────┴──────────┴──────────┴──────────────────┘  │
+  │                                                     │
+  │  Page 2:  ids 201-400                               │
+  │  ...                                                │
+  │                                                     │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────┐
+  │  Secondary Index (idx_short_code)                   │
+  │                                                     │
+  │  B-tree leaf nodes:                                 │
+  │                                                     │
+  │  ┌──────────┬──────┐  ┌──────────┬──────┐          │
+  │  │ aB3xK9   │ 1    │  │ gH5jL2   │ 501  │          │
+  │  │ aB4xL0   │ 42   │  │ gH6kM3   │ 803  │          │
+  │  │ ...      │ ...  │  │ ...      │ ...  │          │
+  │  └──────────┴──────┘  └──────────┴──────┘          │
+  │                                                     │
+  │  Lookup: short_code = 'aB3xK9'                      │
+  │  1. Search B-tree -> leaf node -> id = 1            │
+  │  2. Search clustered index -> page 1 -> row 1       │
+  │  3. Return long_url                                 │
+  └─────────────────────────────────────────────────────┘
+`} />
+
+### Data Structure 2: The Cache Key-Value Store
+
+The cache layer stores the most frequently accessed mappings in memory. The cache is a simple key-value store where the key is the short code and the value is a serialized structure containing the long URL and metadata.
+
+```json
+Cache Key: "short:aB3xK9"
+Cache Value: {
+  "long_url": "https://www.example.com/blog/2025/07/top-ten-strategies",
+  "expires_at": 1751500000,
+  "is_active": true
+}
+Cache TTL: 86400 (24 hours)
+```
+
+The cache eviction policy is LRU (Least Recently Used). When the cache reaches its memory limit, the least recently accessed entries are evicted first. This keeps the hottest entries in memory while automatically removing cold entries.
+
+Cache sizing follows this formula:
+
+```
+Cache memory = (average entry size) * (number of hot entries) * (replication factor)
+Average entry size = 24 bytes (key) + 256 bytes (value) + 64 bytes (overhead) = 344 bytes
+Number of hot entries = 10 million (estimated working set)
+Replication factor = 3 (three replicas for high availability)
+Total cache memory = 344 * 10,000,000 * 3 = 10.3 GB
+```
+
+A 16 GB Redis cluster is sufficient for most systems. The cache hit rate for a 10 million entry cache serving 100 million mappings is typically 95-99 percent, depending on the access pattern distribution.
+
+Redis configuration for the cache:
+
+```
+# Memory management
+maxmemory 16gb
+maxmemory-policy allkeys-lru
+# Persistence (optional for cache-only use)
+save 900 1
+save 300 10
+save 60 10000
+# Networking
+timeout 300
+tcp-keepalive 60
+```
+
+### Data Structure 3: The Click Event Schema
+
+The analytics pipeline processes click events as structured records. Each click event captures the full context of a redirect.
+
+```json
+{
+  "event_id": "evt_abc123def456",
+  "short_code": "aB3xK9",
+  "timestamp": 1751500000123,
+  "redirect_type": "302",
+  "visitor": {
+    "ip": "203.0.113.42",
+    "user_agent": "Mozilla/5.0 ... Chrome/120.0.0.0",
+    "referer": "https://twitter.com/user/status/123456",
+    "accept_language": "en-US,en;q=0.9"
+  },
+  "geo": {
+    "country": "US",
+    "region": "CA",
+    "city": "San Francisco",
+    "lat": 37.7749,
+    "lon": -122.4194
+  },
+  "device": {
+    "type": "mobile",
+    "os": "iOS",
+    "browser": "Chrome",
+    "screen_resolution": "390x844"
+  },
+  "metadata": {
+    "campaign": "summer2025",
+    "channel": "twitter"
+  }
+}
+```
+
+The click events are produced by the redirect engine, sent to a Kafka topic with 64 partitions, and consumed by a stream processor that performs:
+
+1. **Deduplication**: Removes duplicate events caused by client retries or network retransmissions. The deduplication key is `event_id` with a 5-minute window.
+2. **Enrichment**: Adds geographic data by IP geolocation lookup. Adds device type classification from user agent parsing.
+3. **Aggregation**: Computes per-minute and per-hour click counts per short code. Stores these in a time-series database for dashboard queries.
+4. **Filtering**: Removes bot traffic and known bad actors. Bot clicks are stored separately for audit purposes.
+
+The raw click events are stored in a data warehouse (ClickHouse, BigQuery, or Snowflake) for historical analysis. The retention period is 90 days for raw events and 2 years for aggregated data.
+
+<AsciiDiagram
+  id="url-shortener-pattern/deepdive-click-schema"
+  title="Click Event Schema and Processing Pipeline"
+  alt="Flow diagram showing the click event schema fields and how they flow through the processing pipeline"
+  caption="Click events are enriched with geographic and device data before being aggregated and stored"
+  content={`
+  ┌─────────────────────────────────────────────────────────┐
+  │  Raw Click Event (from redirect engine)                 │
+  │                                                         │
+  │  ┌──────────┐  ┌─────────┐  ┌──────────┐  ┌─────────┐ │
+  │  │ event_id │  │short_cd │  │timestamp │  │ user_ag │ │
+  │  │  uuid    │  │ string  │  │  epoch   │  │ string  │ │
+  │  └──────────┘  └─────────┘  └──────────┘  └─────────┘ │
+  │  ┌──────────┐  ┌─────────┐  ┌──────────┐  ┌─────────┐ │
+  │  │ referer  │  │  ip     │  │  cookie  │  │ metadata│ │
+  │  │ string   │  │ addr    │  │  string  │  │  json   │ │
+  │  └──────────┘  └─────────┘  └──────────┘  └─────────┘ │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+                           ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  Stream Processor (Kafka Streams / Flink)               │
+  │                                                         │
+  │  1. Deduplicate by event_id                             │
+  │  2. Enrich: geo lookup, device classification           │
+  │  3. Aggregate: per-min, per-hour counts                 │
+  │  4. Filter: remove bots, detect anomalies               │
+  │                                                         │
+  └────────┬──────────────┬──────────────┬──────────────────┘
+           │              │              │
+           ▼              ▼              ▼
+  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+  │ Time-Series  │ │  ClickHouse  │ │  Alerting    │
+  │ DB (Counts)  │ │ (Raw Events) │ │  (Anomalies) │
+  │ 30 day       │ │ 90 day       │ │              │
+  │ retention    │ │  retention   │ │              │
+  └──────────────┘ └──────────────┘ └──────────────┘
+`} />
+
+## Request Lifecycle
+
+### Full Request Lifecycle: Create Short URL
+
+The complete lifecycle of a URL shortening request involves 15 distinct steps. Each step has a latency budget and a failure mode.
+
+```text
+Step 1:  Client sends POST /api/shorten with long URL
+Step 2:  API Gateway validates authentication token
+Step 3:  API Gateway checks rate limit for this user (100 req/min)
+Step 4:  Load balancer forwards to application server
+Step 5:  Application validates URL format and length
+Step 6:  Application checks URL against blocklist (Bloom filter)
+Step 7:  Application computes hash of normalized URL
+Step 8:  Application checks for existing mapping by hash
+Step 9:  If no existing mapping, generate short code
+Step 10: Begin database transaction
+Step 11: INSERT row into url_mappings table
+Step 12: Commit transaction
+Step 13: SET cache entry in Redis
+Step 14: Log success event to audit log
+Step 15: Return short URL to client
+```
+
+### Full Request Lifecycle: Redirect
+
+The redirect lifecycle is the performance-critical path. It must complete in under 10 milliseconds to maintain a good user experience.
+
+```text
+Step 1:  Browser sends GET /aB3xK9 to short domain
+Step 2:  DNS resolves short domain to CDN edge (cached)
+Step 3:  CDN edge checks for cached redirect response
+Step 4:  Cache miss: CDN forwards to origin load balancer
+Step 5:  Load balancer selects application server (round-robin)
+Step 6:  Application parses path to extract short code
+Step 7:  Application checks Redis cache: GET short:aB3xK9
+Step 8:  On cache hit: parse value, check expiration
+Step 9:  On cache miss: query database by short_code
+Step 10: Database returns row (or 404)
+Step 11: On database hit: set cache entry, return long URL
+Step 12: Application checks if link is active (not expired)
+Step 13: Application emits click event to Kafka (async)
+Step 14: Application constructs HTTP redirect response
+Step 15: CDN edge caches response (if 301) or passes through
+Step 16: Browser receives redirect and navigates to destination
+```
+
+<AsciiDiagram
+  id="url-shortener-pattern/deepdive-redirect-lifecycle"
+  title="Redirect Request Lifecycle Sequence"
+  alt="UML-style sequence diagram showing the full redirect lifecycle from browser to CDN to cache to database"
+  caption="The redirect lifecycle involves 16 steps across DNS, CDN, cache, and database, with a 10ms latency budget"
+  content={`
+  Browser          CDN            LB             App            Redis         DB
+    │               │              │              │              │             │
+    │ GET /aB3xK9   │              │              │              │             │
+    │──────────────>│              │              │              │             │
+    │               │ Check cache  │              │              │             │
+    │               │──────┐       │              │              │             │
+    │               │<─────┘       │              │              │             │
+    │               │              │              │              │             │
+    │               │ Miss         │              │              │             │
+    │               │─────────────>│─────────────>│              │             │
+    │               │              │              │ GET key      │             │
+    │               │              │              │──────────────>             │
+    │               │              │              │              │             │
+    │               │              │              │ Miss         │             │
+    │               │              │              │<──────────────             │
+    │               │              │              │              │             │
+    │               │              │              │ SELECT *     │             │
+    │               │              │              │───────────────             │
+    │               │              │              │              │────────────>│
+    │               │              │              │              │<────────────│
+    │               │              │              │<──────────────             │
+    │               │              │              │              │             │
+    │               │              │              │ SET key      │             │
+    │               │              │              │──────────────>             │
+    │               │              │              │<──────────────             │
+    │               │              │              │              │             │
+    │               │              │ 302 + Location│             │             │
+    │               │<─────────────│<─────────────│              │             │
+    │<──────────────│              │              │              │             │
+    │               │              │              │              │             │
+    │ Navigate to   │              │              │              │             │
+    │ destination   │              │              │              │             │
+    │──────────────>│              │              │              │             │
+    │               │              │              │              │             │
+`} />
+
+## Consistency and State
+
+### Scenario 1: Concurrent Writes
+
+Two users submit the same long URL simultaneously. The system uses a hash-based key generator. Both requests compute the same hash and attempt to insert the same short code. The database's unique constraint on `short_code` prevents both inserts from succeeding.
+
+The resolution depends on the isolation level:
+
+- **READ COMMITTED**: The second transaction sees the first transaction's committed insert. The system detects the duplicate and returns the existing short code. This is the default behavior and works correctly for most systems.
+- **SERIALIZABLE**: The second transaction is blocked until the first completes. This prevents the duplicate but reduces throughput.
+
+The recommended approach is to use `INSERT ... ON DUPLICATE KEY UPDATE` (MySQL) or `ON CONFLICT DO NOTHING` (PostgreSQL) to handle concurrent writes atomically:
+
+```sql
+INSERT INTO url_mappings (short_code, long_url, created_at, owner_id)
+VALUES ('aB3xK9', 'https://example.com', NOW(), 'user_42')
+ON DUPLICATE KEY UPDATE click_count = click_count + 0;
+```
+
+This statement attempts the insert. If a row with the same short code already exists, it does nothing (the `click_count + 0` is a no-op). The application then queries the existing row to retrieve the long URL and confirm it matches.
+
+### Scenario 2: Cache Inconsistency
+
+The database has a mapping for `aB3xK9` pointing to `https://example.com/page1`. An administrator updates the mapping to point to `https://example.com/page2`. The update succeeds in the database, but the cache still holds the old value.
+
+This creates a window where visitors see the old URL until the cache TTL expires or the cache is invalidated. The window length depends on the cache invalidation strategy:
+
+- **Cache-aside with TTL**: The cache entry expires after 24 hours. Visitors see the old URL for up to 24 hours. This is unacceptable for systems that require fast propagation of updates.
+- **Cache-aside with explicit invalidation**: The application issues a `DEL short:aB3xK9` command immediately after the database update. The window is reduced to the time between the database write and the cache delete, typically 1-5 milliseconds.
+- **Write-through cache**: The application updates the cache before returning the response to the client. The window is eliminated entirely, but write latency increases by the cache round-trip time.
+
+The recommended approach is write-through cache with explicit invalidation:
+
+```python
+def update_mapping(short_code, new_url):
+    # Begin transaction
+    db.execute(
+        "UPDATE url_mappings SET long_url = %s WHERE short_code = %s",
+        (new_url, short_code)
+    )
+    # Delete cache entry (not update -- let next read populate it)
+    redis.delete(f"short:{short_code}")
+    # Commit transaction
+    db.connection.commit()
+```
+
+This pattern ensures that the next read after the update always sees the new value, whether from the database or a freshly populated cache.
+
+### Scenario 3: Partial Cache Failure
+
+A Redis node in the cluster fails. The consistent hashing ring redistributes the keys that were on the failed node to the remaining nodes. However, the redistributed keys are not in memory -- they must be repopulated from the database.
+
+During the repopulation window, every request for a key that was on the failed node experiences a cache miss and a database query. The database must handle the increased load. If the database cannot handle the spike, the system degrades.
+
+Mitigation strategies:
+
+- **Redis replication**: Each shard has a primary and one or more replicas. If the primary fails, the replica takes over. The cache entries are preserved on the replica.
+- **Connection retry with circuit breaker**: The application retries the cache lookup once if the connection fails. If both attempts fail, it falls back to the database and sets a circuit breaker flag that bypasses the cache for 30 seconds.
+- **Database connection pool scaling**: The application monitors the cache hit rate and scales the database connection pool when the hit rate drops below 90 percent. This is a reactive measure that handles the transient load spike.
+
+### Scenario 4: Concurrent Delete and Redirect
+
+A user creates a short link and shares it. An administrator later deletes the link because the destination URL violates the terms of service. While the delete is in progress, a visitor clicks the short link. The system must handle this race condition correctly.
+
+The delete operation follows this sequence:
+
+1. The admin sends a DELETE request to `/api/shorten/aB3xK9`.
+2. The application begins a transaction.
+3. The application issues `DELETE FROM url_mappings WHERE short_code = 'aB3xK9'`.
+4. The application issues `DEL short:aB3xK9` in the cache.
+5. The application commits the transaction.
+
+If a redirect request arrives between steps 3 and 4, the cache still holds the mapping. The visitor receives a redirect to the deleted link. The cache TTL means the delete propagates to the cache only when the cache entry is explicitly deleted.
+
+The correct approach is to use a soft-delete pattern:
+
+```sql
+-- Soft delete: mark as inactive before deleting
+UPDATE url_mappings
+SET is_active = FALSE, updated_at = NOW()
+WHERE short_code = 'aB3xK9';
+
+-- Cache invalidation
+DEL short:aB3xK9
+
+-- Background cleanup: delete after 24 hours
+DELETE FROM url_mappings
+WHERE is_active = FALSE AND updated_at < NOW() - INTERVAL 24 HOUR;
+```
+
+The redirect engine checks `is_active` before returning the redirect. If `is_active` is false, it returns 410 Gone. The soft-delete also provides an audit trail and allows for link reactivation.
+
+### Scenario 5: Cross-Region Replication Conflict
+
+The shortener operates in two regions (us-east-1 and eu-west-1). Each region has its own database primary. The system uses a sequential ID generator in each region with region-specific prefixes. Region us-east-1 generates IDs starting with `1`, and region eu-west-1 generates IDs starting with `2`.
+
+When a user in Europe creates a short URL, the request goes to eu-west-1. The ID is generated and encoded. The mapping is written to the eu-west-1 database. A cross-region replication job copies the mapping to us-east-1 with a 1-second delay.
+
+If a us-east-1 user clicks the short URL immediately after creation, the request may hit the us-east-1 database before the replication completes. The cache miss and database lookup return 404 even though the link exists.
+
+Solutions for cross-region consistency:
+
+- **Global traffic routing**: Route all redirect requests for a short code to the region that owns the code. This is determined by the prefix of the short code. Route 53 geo-routing directs the request to the correct region.
+- **Global cache**: Use a global Redis cluster with cross-region replication. Writes in one region propagate to all regions within 100 milliseconds.
+- **Read-after-write consistency**: The create API returns the short code. The client immediately follows with a redirect to the same code. The redirect must succeed. Ensure that the region that owns the code always serves the first redirect.
+
+### Scenario 6: Bulk Import of Existing URLs
+
+A company acquires another company's URL shortener and needs to import 50 million existing mappings. The import must not disrupt the production service.
+
+The bulk import process:
+
+1. Export the source data as CSV files: `short_code, long_url, created_at, owner_id, metadata`.
+2. Validate each row: check URL format, check for short code collisions with existing mappings.
+3. Batch insert into the database in chunks of 10,000 rows per transaction.
+4. For each batch, check for collisions with existing codes. If a collision is found, the import script generates a new code and logs the mapping.
+5. After all rows are imported, warm the cache by reading the most popular 1 million mappings.
+
+```python
+def bulk_import(csv_file, batch_size=10000):
+    batch = []
+    collision_count = 0
+    for row in csv_file:
+        short_code = row['short_code']
+        if db.exists(short_code):
+            # Collision detected, generate new code
+            short_code = generate_unique_code(row['long_url'])
+            collision_count += 1
+            log_collision(row['short_code'], short_code)
+        batch.append((short_code, row['long_url'], row['created_at']))
+        if len(batch) >= batch_size:
+            db.bulk_insert(batch)
+            batch = []
+    if batch:
+        db.bulk_insert(batch)
+    print(f"Import complete. {collision_count} collisions resolved.")
+```
+
+The bulk import is typically run as a background job with a status endpoint. The production service continues to serve redirects during the import. New mappings created during the import are checked against the imported data to prevent collisions.
+
+### Scenario 7: Clock Skew in Snowflake IDs
+
+A Snowflake-based key generator relies on the system clock. If the clock on one worker jumps backward (due to NTP correction or manual adjustment), the worker may generate IDs that collide with IDs it generated before the clock jump.
+
+Collision detection for Snowflake IDs requires a heartbeat mechanism:
+
+```python
+class SafeSnowflakeGenerator(SnowflakeGenerator):
+    def next_id(self):
+        current_timestamp = int(time.time() * 1000) - self.epoch
+        if current_timestamp < self.last_timestamp:
+            # Clock jumped backward.
+            # Wait until clock catches up to last_timestamp
+            sleep_ms = self.last_timestamp - current_timestamp
+            time.sleep(sleep_ms / 1000.0)
+            current_timestamp = int(time.time() * 1000) - self.epoch
+        return super().next_id()
+```
+
+This approach blocks the thread until the clock catches up. For a 1-second clock skew, the thread blocks for 1 second. This is acceptable for key generation because the create-short-URL path is not the performance-critical path (the redirect path is).
+
+For systems where clock skew is a frequent concern, a hybrid approach combines Snowflake IDs with a database sequence as a fallback:
+
+```python
+def generate_robust_id():
+    try:
+        return snowflake_generator.next_id()
+    except ClockSkewError:
+        # Fall back to database sequence
+        return db_sequence.next_id()
+```
+
+## Performance
+
+### Latency Budgets
+
+A production URL shortener must meet strict latency targets for the redirect path. The total budget is 10 milliseconds from the application server receiving the request to the response being sent.
+
+| Component | Latency Budget | P99 Target |
+|-----------|---------------|------------|
+| DNS resolution | 1 ms (cached) | 5 ms |
+| TLS termination | 0.5 ms | 2 ms |
+| Request parsing | 0.1 ms | 0.5 ms |
+| Cache lookup | 0.5 ms | 2 ms |
+| Database query (fallback) | 3 ms | 10 ms |
+| Response construction | 0.1 ms | 0.5 ms |
+| Network I/O | 0.5 ms | 2 ms |
+| **Total** | **5.7 ms** | **22 ms** |
+
+The P99 target of 22 milliseconds means that 99 percent of requests complete within 22 milliseconds. The remaining 1 percent may take longer due to garbage collection, network congestion, or resource contention.
+
+### Load Testing Methodology
+
+Before deploying a URL shortener to production, you must validate the latency and throughput targets through load testing. A realistic load test simulates the production access pattern: 99 percent reads (redirects) and 1 percent writes (creates).
+
+```bash
+# Load test with locust: 10,000 users, 100,000 req/s target
+locust \
+  --host https://shortener.example.com \
+  --users 10000 \
+  --spawn-rate 100 \
+  --run-time 30m \
+  --headless \
+  --csv results/shortener-load-test
+```
+
+The load test should validate these scenarios:
+
+1. **Baseline**: 10,000 req/s with 90 percent cache hit rate. Expected P99 latency under 10 milliseconds.
+2. **Cache miss spike**: Flush the cache and continue the load test. Expected P99 latency under 50 milliseconds for 5 minutes while the cache repopulates.
+3. **Write contention**: 5,000 concurrent write requests. Expected P99 latency under 100 milliseconds for the create endpoint.
+4. **Hot key**: 20,000 req/s for a single short code. Expected P99 latency under 50 milliseconds with no errors.
+5. **Cold start**: All cache entries for a new short code. Expected P99 latency under 20 milliseconds after the first request.
+
+Load test results are compared against the latency budgets to identify bottlenecks:
+
+```text
+Scenario 1 (Baseline):
+  Average: 2.1 ms   P50: 1.8 ms   P95: 4.2 ms   P99: 8.7 ms
+  Errors: 0.02%
+
+Scenario 2 (Cache miss):
+  Average: 8.3 ms   P50: 5.1 ms   P95: 22.3 ms  P99: 45.6 ms
+  Errors: 0.15%
+
+Scenario 3 (Write contention):
+  Average: 45.2 ms  P50: 38.7 ms  P95: 82.1 ms  P99: 112.3 ms
+  Errors: 0.5%
+```
+
+Each bottleneck identified in load testing is documented and addressed before production deployment. Common bottlenecks include:
+- **Database connection pool exhaustion**: Increase pool size or add read replicas.
+- **Cache connection saturation**: Increase Redis cluster size or add application-side cache.
+- **TLS termination overhead**: Offload TLS to load balancer or CDN.
+- **Garbage collection pauses**: Reduce object allocation rate or switch to a low-pause GC.
+
+### Throughput Targets
+
+| Component | Throughput | Scaling Strategy |
+|-----------|-----------|-----------------|
+| Application server | 10,000 req/s per instance | Horizontal scaling (add instances) |
+| Redis cache | 100,000 ops/s per node | Cluster sharding (16 nodes = 1.6M ops/s) |
+| Database primary | 5,000 writes/s | Batch writes, avoid synchronous replication |
+| Database replicas | 50,000 reads/s | Add read replicas (10 replicas = 500K reads/s) |
+| Kafka | 500,000 events/s | 64 partitions, 3x replication |
+
+### Database Query Optimization
+
+Query optimization for the URL mappings table focuses on the primary query: lookup by short code. The query must return in under 5 milliseconds for 99 percent of requests.
+
+The query plan for a primary key lookup:
+
+```sql
+EXPLAIN SELECT long_url, expires_at, is_active
+FROM url_mappings
+WHERE short_code = 'aB3xK9';
+```
+
+```text
++----+-------------+--------------+------------+------+-----------------+---------+---------+-------+------+-------+
+| id | select_type | table        | partitions | type | possible_keys   | key     | key_len | ref   | rows | Extra |
++----+-------------+--------------+------------+------+-----------------+---------+---------+-------+------+-------+
+|  1 | SIMPLE      | url_mappings | NULL       | ref  | idx_short_code  | idx_sc  | 10      | const |    1 | NULL  |
++----+-------------+--------------+------------+------+-----------------+---------+---------+-------+------+-------+
+```
+
+The query uses the `idx_short_code` index for a single-row lookup. The `key_len` of 10 bytes indicates the index uses the full short code length (8 characters in utf8mb4 = 10 bytes with the VARCHAR length prefix).
+
+For large datasets (over 100 million rows), consider table partitioning by `short_code` prefix:
+
+```sql
+CREATE TABLE url_mappings (
+    -- columns as before
+) ENGINE=InnoDB
+PARTITION BY HASH(short_code) PARTITIONS 64;
+```
+
+Partitioning by hash spreads the data across 64 physical partitions. Each partition contains approximately 1/64 of the data, reducing the B-tree depth and improving lookup performance. The query planner automatically prunes partitions that do not contain the target short code.
+
+Partition pruning is verified with:
+
+```sql
+EXPLAIN PARTITIONS SELECT long_url FROM url_mappings WHERE short_code = 'aB3xK9';
+```
+
+The output should show a single partition accessed (for example, `p42`), confirming that the query does not scan all 64 partitions.
+
+For write-heavy workloads, consider a dedicated write buffer table that is periodically merged into the main table:
+
+```sql
+-- Write buffer: fast sequential inserts
+CREATE TABLE url_mappings_write_buffer (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    short_code VARCHAR(8) NOT NULL,
+    long_url VARCHAR(2048) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_short_code (short_code)
+) ENGINE=InnoDB;
+
+-- Background job: merge write buffer into main table every 60 seconds
+INSERT INTO url_mappings (short_code, long_url, created_at)
+SELECT short_code, long_url, created_at
+FROM url_mappings_write_buffer
+WHERE id > (SELECT max_imported_id FROM import_tracker)
+ORDER BY id;
+```
+
+### Monitoring and Alerting
+
+Each subsystem requires specific monitoring metrics and alert thresholds:
+
+| Metric | Warning | Critical | Action |
+|--------|---------|----------|--------|
+| Cache hit rate | &lt;95% | &lt;90% | Investigate cache eviction, add memory |
+| Redirect P99 latency | >15ms | >30ms | Scale application servers |
+| Database query P99 | >10ms | >25ms | Add read replicas, optimize queries |
+| Create endpoint P99 | >100ms | >200ms | Scale write path |
+| Kafka consumer lag | >10K | >100K | Scale stream processors |
+| DNS resolution time | >5ms | >20ms | Review DNS provider, add caching |
+| TLS handshake time | >30ms | >100ms | Offload TLS to CDN |
+| Error rate | >0.1% | >1% | Rollback deploy, engage on-call |
+
+Metrics are collected with Prometheus and visualized in Grafana dashboards. The redirect endpoint metrics are the most critical:
+
+```yaml
+# Prometheus metrics for the redirect endpoint
+http_requests_total{endpoint="redirect", status="302"}
+http_requests_total{endpoint="redirect", status="301"}
+http_requests_total{endpoint="redirect", status="404"}
+http_requests_total{endpoint="redirect", status="410"}
+http_request_duration_seconds{endpoint="redirect"}
+cache_hits_total{endpoint="redirect"}
+cache_misses_total{endpoint="redirect"}
+database_queries_total{endpoint="redirect"}
+```
+
+### Caching Strategy
+
+The cache is the most critical performance component. A well-tuned cache reduces database load by 95 percent or more.
+
+**Cache key design**: The key is `short:{short_code}`. This namespace prefix prevents collisions with other cached data in the same Redis instance.
+
+**Cache TTL tiers**:
+
+| Tier | Criteria | TTL | Reason |
+|------|----------|-----|--------|
+| Standard | All links | 24 hours | Default freshness window |
+| Popular | >1000 clicks/hour | 7 days | High access frequency justifies longer TTL |
+| Premium | Paid accounts | 30 days | SLA guarantees faster response |
+| Custom | User-specified slug | 48 hours | Custom slugs change less frequently |
+| Expiring | Has expiration date | Same as link TTL | Cache must expire before link |
+
+**Cache warming**: When a new short URL is created, the cache is populated immediately (write-through). This ensures the first visitor does not experience a cache miss. The cache is also warmed when a popular link is detected by the analytics pipeline.
+
+**Local cache layer**: On each application server, a small in-memory LRU cache provides the first line of defense before the Redis cache is queried. This local cache stores the 10,000 most recently accessed short codes. A local cache hit completes in under 0.1 milliseconds, compared to 0.5 milliseconds for a Redis round-trip. The local cache is invalidated when it reaches its maximum size by evicting the least recently used entry.
+
+The three-tier caching hierarchy:
+
+| Tier | Technology | Size | Latency | Hit Rate Contribution |
+|------|-----------|------|---------|----------------------|
+| L1: Process cache | In-memory LRU map | 10K entries | 0.05 ms | 60% of requests |
+| L2: Redis cluster | Distributed in-memory | 16 GB | 0.5 ms | 35% of requests |
+| L3: Database | MySQL/Postgres | Full dataset | 3 ms | 5% of requests |
+
+**CDN caching**: For 301 redirects, the CDN caches the HTTP response at the edge. The Cache-Control header with max-age=31536000 (1 year) tells CDN nodes to serve the cached redirect without contacting the origin. This reduces origin traffic by 90 percent for 301 redirects. CDN caching is not effective for 302 redirects because browsers (and CDNs) treat them as non-cacheable.
+
+```nginx
+# Nginx configuration for CDN caching of redirects
+location ~ ^/([a-zA-Z0-9]{6,8})$ {
+    # Short code redirect endpoint
+    proxy_pass http://application;
+    proxy_cache shortener_cache;
+    proxy_cache_key "$uri";
+    proxy_cache_valid 301 365d;
+    proxy_cache_valid 302 0s;  # Do not cache 302
+    proxy_cache_use_stale error timeout updating;
+    proxy_cache_lock on;
+}
+```
+
+**Cache stampede mitigation**: When a cache entry for a popular short code expires, multiple concurrent requests may all miss the cache and query the database simultaneously. This creates a stampede that can overwhelm the database. Mitigation strategies:
+- **Read-through cache with mutex**: Only one request per short code is allowed to query the database. Other requests wait for the mutex to release.
+- **Probabilistic early expiration**: Randomly expire cache entries before their TTL to spread the refresh load.
+- **Background refresh**: A background job refreshes cache entries for the top 1 million short codes every 5 minutes, preventing unexpected expiration.
+
+```python
+# Read-through cache with mutex to prevent stampede
+def get_long_url(short_code):
+    long_url = local_cache.get(short_code)
+    if long_url:
+        return long_url
+
+    long_url = redis.get(f"short:{short_code}")
+    if long_url:
+        local_cache.set(short_code, long_url)
+        return long_url
+
+    # Cache miss: acquire mutex for this short code
+    mutex_key = f"mutex:{short_code}"
+    if redis.setnx(mutex_key, "locked", ttl=5):
+        try:
+            long_url = db.query(
+                "SELECT long_url FROM url_mappings WHERE short_code = %s",
+                short_code
+            )
+            if long_url:
+                redis.setex(f"short:{short_code}", 86400, long_url)
+                local_cache.set(short_code, long_url)
+            return long_url
+        finally:
+            redis.delete(mutex_key)
+    else:
+        # Another request is loading the data. Wait and retry.
+        time.sleep(0.005)  # 5ms
+        return get_long_url(short_code)
+```
+
+## Configuration
+
+### Environment Configuration
+
+A production URL shortener requires configuration for each subsystem. The configuration is typically managed through a combination of environment variables, a configuration service, and feature flags.
+
+```yaml
+# config.yaml -- Application Configuration
+server:
+  port: 8080
+  read_timeout: 5s
+  write_timeout: 10s
+  max_header_size: 4096
+
+database:
+  host: db-primary.internal
+  port: 3306
+  database: url_shortener
+  pool_size: 50
+  max_overflow: 20
+  pool_recycle: 3600
+  ssl_mode: require
+
+cache:
+  host: redis-cluster.internal
+  port: 6379
+  cluster_mode: true
+  max_connections: 100
+  timeout: 1s
+  retry_count: 2
+
+kafka:
+  brokers:
+    - kafka-1.internal:9092
+    - kafka-2.internal:9092
+    - kafka-3.internal:9092
+  topic: click_events
+  partitions: 64
+  replication_factor: 3
+  acks: 1
+
+key_generation:
+  strategy: snowflake
+  worker_id: ${HOSTNAME_ID}
+  epoch: 1700000000000
+
+rate_limiting:
+  shorten_per_user_per_minute: 100
+  redirect_per_code_per_second: 10000
+  global_redirect_per_second: 500000
+
+features:
+  deduplication: true
+  custom_slugs: true
+  click_tracking: true
+  bot_detection: true
+  url_blocklist: true
+```
+
+### Database Connection Pool Tuning
+
+The database connection pool must be sized correctly to handle peak load without overwhelming the database.
+
+```python
+# Connection pool sizing calculation
+# Target: 10,000 req/s, 5ms per query, 50 connections max
+
+# Peak concurrent queries = 10,000 req/s * 0.005s = 50 concurrent queries
+# Pool size = peak concurrent queries * (1 + safety margin)
+# Safety margin = 50% for traffic spikes
+pool_size = int(50 * 1.5)  # = 75 connections
+
+# Max overflow = additional connections for burst traffic
+max_overflow = int(pool_size * 0.3)  # = 22 connections
+```
+
+Each database connection consumes approximately 10 MB of memory on the database server. A pool of 75 connections consumes 750 MB. The database server should have sufficient memory for the connection pool plus the buffer pool.
+
+### Cache Memory Budget
+
+The cache memory budget is determined by the working set size and the desired hit rate.
+
+```python
+# Cache memory budget calculation
+# Working set: 10 million active short codes
+# Average entry size: 344 bytes
+# Desired hit rate: 99%
+
+# Entries to cache = working set * hit rate factor
+# For 99% hit rate, cache 100% of working set (10 million entries)
+cache_entries = 10_000_000  # 10 million
+
+# Memory per entry = key + value + overhead
+# Key: "short:aB3xK9" = 14 bytes
+# Value: JSON with long_url + metadata = ~200 bytes
+# Overhead: Redis dict entry + allocator = ~130 bytes
+entry_size = 14 + 200 + 130  # = 344 bytes
+
+# Total memory = entries * entry_size * replication factor
+total_memory = cache_entries * entry_size * 3  # 3 replicas
+# = 10,000,000 * 344 * 3 = 10.32 GB
+```
+
+### Feature Flags
+
+Feature flags control the behavior of the shortener without requiring code deploys. Common flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `deduplication_enabled` | true | Return existing short code for duplicate URLs |
+| `custom_slugs_enabled` | true | Allow users to specify custom short codes |
+| `click_tracking_enabled` | true | Emit click events to analytics pipeline |
+| `bot_detection_enabled` | true | Separate bot clicks from human clicks |
+| `url_blocklist_enabled` | true | Check URLs against malicious domain blocklist |
+| `rate_limiting_enabled` | true | Enforce rate limits on create and redirect |
+| `cache_warming_enabled` | true | Pre-populate cache on first access |
+| `analytics_detailed` | false | Include full user agent and referrer in click events |
+
+Feature flags are managed through a centralized flag service (LaunchDarkly, Unleash, or a custom Redis-backed service). The flag service is polled every 60 seconds, and flags are cached locally for low-latency access.
+
+<AsciiDiagram
+  id="url-shortener-pattern/deepdive-config"
+  title="Configuration Architecture"
+  alt="Diagram showing how environment variables, config files, and feature flags combine to configure the shortener"
+  caption="Configuration is layered: environment variables override config files, which provide defaults for feature flags"
+  content={`
+  ┌─────────────────────────────────────────────────────────┐
+  │  Configuration Layering                                  │
+  │                                                          │
+  │  1. Defaults (hardcoded)                                 │
+  │     ┌──────────────────────────────────────────────┐    │
+  │     │ port: 8080, pool_size: 50, timeout: 5s       │    │
+  │     └──────────────────────────────────────────────┘    │
+  │                         │ Override                      │
+  │                         ▼                               │
+  │  2. Config File (config.yaml)                           │
+  │     ┌──────────────────────────────────────────────┐    │
+  │     │ database.host: db-primary.internal            │    │
+  │     │ cache.host: redis-cluster.internal            │    │
+  │     └──────────────────────────────────────────────┘    │
+  │                         │ Override                      │
+  │                         ▼                               │
+  │  3. Environment Variables                               │
+  │     ┌──────────────────────────────────────────────┐    │
+  │     │ DATABASE_URL=postgres://...                   │    │
+  │     │ REDIS_URL=redis://...                         │    │
+  │     │ KAFKA_BROKERS=kafka-1:9092,...                │    │
+  │     └──────────────────────────────────────────────┘    │
+  │                         │ Override                      │
+  │                         ▼                               │
+  │  4. Feature Flag Service                                │
+  │     ┌──────────────────────────────────────────────┐    │
+  │     │ deduplication: true                          │    │
+  │     │ custom_slugs: true                           │    │
+  │     │ analytics_detailed: false                    │    │
+  │     └──────────────────────────────────────────────┘    │
+  └─────────────────────────────────────────────────────────┘
+`} />
+
+## Summary
+
+The deep dive into URL shortener internals reveals several design principles that apply to many distributed systems:
+
+- **Decouple read and write paths**: The redirect path is read-heavy (99 percent of requests) and must be fast. The create path is write-heavy and can tolerate higher latency. Separate these paths at the architecture level.
+
+- **Cache aggressively**: The cache is not optional. A well-tuned cache with 95 percent hit rate reduces database load by 20x and improves P99 latency by 10x.
+
+- **Async everything non-critical**: Click events, analytics, and audit logs must never block the critical path. Emit them to a message queue and process them asynchronously.
+
+- **Design for cache failure**: The database must survive a full cache miss event. Size the database connection pool, configure query timeouts, and implement circuit breakers for the cache dependency.
+
+- **Consistency has trade-offs**: Strong consistency (write-through cache, synchronous replication) increases latency. Eventual consistency (cache-aside, async replication) increases complexity. Choose based on the business requirements, not the technology.
+
+- **Configuration is code**: Every tunable parameter -- pool sizes, timeouts, TTLs, feature flags -- should be externalized and manageable without a code deploy. Use a layered configuration approach with sensible defaults.
+
+You now understand how a URL shortener works at the implementation level. The architecture chapter shows you how to scale this design to handle millions of users and billions of redirects.
