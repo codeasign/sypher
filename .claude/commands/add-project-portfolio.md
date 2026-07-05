@@ -1,190 +1,242 @@
 # /add-project-portfolio
 
-Generate a complete Level 4 Portfolio Project for the Build with AI course on Sypher.
+Generate a complete Level 4 Portfolio Project for the Build with AI course on the Sypher platform.
 
-**Intent:** Student builds a large, resume-worthy AI system. Demonstrates architectural thinking, multi-component integration, production operations, and engineering judgment. Suitable for FAANG interviews and real products.
-
-## CRITICAL
-Run with Claude Sonnet. Verify every SDK method, model string, package version. No hardcoded secrets. No pseudocode. Every component must be justifiable in a system design interview.
+**Intent:** Large multi-day builds. Resume and interview-worthy. Enterprise architecture, real deployment, production concerns throughout. The student finishes with a system they can demo in interviews and extend in real work.
 
 ## Usage
+
 ```
 /add-project-portfolio TOPIC="Multi-Agent Research Platform" SLUG="multi-agent-research-platform"
 ```
 
 ## Arguments
+
 - `TOPIC` — Project display name
-- `SLUG` — kebab-case unique slug (portfolio projects are flat, no sections)
+- `SLUG` — URL-safe kebab-case
+- No SECTION — all portfolio projects are flat under "Portfolio Projects"
+
+---
+
+## CRITICAL
+
+**Run with Claude Sonnet.** These projects are complex and fast-moving.
+Verify every API, auth flow, deployment target, and SDK version.
+Never hardcode secrets. No pseudocode. Everything runs.
 
 ---
 
 ## Files to generate
+
 ```
 docs/build-with-ai/portfolio/$SLUG/
 ├── index.md
-├── 01-brief.mdx
-├── 02-architecture.mdx
-├── 03-build-core.mdx
-├── 04-build-advanced.mdx
-├── 05-evaluate.mdx
-└── 06-ship.mdx
+├── 01-architecture.mdx
+├── 02-build-core.mdx
+├── 03-build-advanced.mdx
+└── 04-deploy-and-scale.mdx
 ```
 
 ---
 
 ## Page 1 — index.md
+
 Standard DocCardList stub.
 
 ---
 
-## Page 2 — 01-brief.mdx
-
-**Target length:** 350–500 lines.
-
-### Structure:
-1. **The Mission** (no heading) — what this system does, who uses it, why it matters. Make it feel like a real product brief.
-2. **System Requirements** — functional and non-functional. Concrete numbers: latency targets, throughput, cost ceiling, availability.
-3. **What You'll Build** — every component listed, what the finished system can do end-to-end.
-4. **Skills This Demonstrates** — why this belongs in a portfolio. What it shows an interviewer.
-5. **Estimated Time and Cost** — hours to build, API cost to run at low volume.
-
-**Frontmatter:**
-```
----
-id: $SLUG-brief
-title: $TOPIC
-sidebar_label: Brief
-sidebar_position: 1
----
-```
-
----
-
-## Page 3 — 02-architecture.mdx
+## Page 2 — 01-architecture.mdx "The Full Plan"
 
 **Target length:** 500–700 lines.
 
-### Structure:
-1. **Full System Diagram** — one very large `<AsciiDiagram>` covering every component. Label technology choices inline (e.g. "Redis — session cache").
-2. **Technology Decisions** — table: layer, technology chosen, alternatives rejected, rationale.
-3. **Read Path and Write Path** — each as numbered steps with a diagram.
-4. **Security and Compliance Architecture** — auth, secrets, audit logging, input/output validation.
-5. **Scalability Analysis** — what breaks at 10× load, what the next architecture looks like.
-6. **Cost Model** — per-request cost breakdown at multiple scales.
+**Opening — The Real Problem (no heading)**
+3 paragraphs. Enterprise context. Who would buy this. What it replaces. Why it's hard to build well.
+
+**Mandatory sections:**
+
+### What You'll Build
+The complete system with every component, integration, and user-facing capability. Think product spec, not tutorial intro.
+
+### System Architecture
+Full diagram — every service, data store, external integration, and communication pattern.
+
+### Component Breakdown
+For each major component: responsibility, technology choice with rationale, interface to other components.
+
+### Technology Decisions
+Table — minimum 8 decisions with trade-offs.
+
+### Data Architecture
+Schemas, storage choices, migration strategy for each data type.
+
+### Security Architecture
+Auth model, authorization boundaries, secrets management, network policies.
+
+### Project Milestones
+How the 4 pages map to a real build sequence — what exists after each page.
 
 **Frontmatter:**
 ```
 ---
 id: $SLUG-architecture
-title: $TOPIC Architecture
+title: "$TOPIC — Architecture"
 sidebar_label: Architecture
+sidebar_position: 1
+---
+```
+
+Same MDX safety rules.
+
+---
+
+## Page 3 — 02-build-core.mdx "Build the Foundation"
+
+**Target length:** 700–950 lines.
+
+Builds the core system — the minimum that works end-to-end.
+
+**Mandatory sections:**
+
+### Prerequisites
+Full setup: packages, environment variables, services to provision, directory structure.
+
+### Build It — Core
+Minimum 10 numbered steps. Same standard as production: complete code, run command, expected output, explanation. End state: working core system with a real demo checkpoint.
+
+### Understand the Core
+Internals, cost model, bottlenecks, what the code is actually doing at the API level.
+
+**Frontmatter:**
+```
+---
+id: $SLUG-build-core
+title: "$TOPIC — Core Build"
+sidebar_label: Core Build
 sidebar_position: 2
 ---
 ```
 
 ---
 
-## Page 4 — 03-build-core.mdx
+## Page 4 — 03-build-advanced.mdx "Build the Advanced Features"
 
-**Target length:** 800–1100 lines.
+**Target length:** 600–850 lines.
 
-### Structure:
-1. **Setup** — complete project scaffold, all config, all installs, `.env` template.
-2. **Build the Core** — minimum 10 numbered steps covering the essential working system. Complete code. Run commands. Expected output verbatim. Checkpoints.
-3. **Core Integration Test** — one real end-to-end request, real output shown.
-4. **What Just Happened** — internals: API calls, token accounting, latency, cost.
+Builds on the core — adds what makes this portfolio-worthy.
+
+**Mandatory sections:**
+
+### Advanced Features
+Minimum 3 advanced features. Each:
+- What it adds and why it matters
+- Numbered build steps with complete code
+- Demo checkpoint
+- Common failure mode
+
+Cover at minimum: multi-tenancy or auth, observability, cost controls or rate limiting.
+
+### Testing
+Minimum 3 tests:
+- Unit test for core logic
+- Integration test for a key API interaction
+- End-to-end test for the main user flow
 
 **Frontmatter:**
 ```
 ---
-id: $SLUG-build-core
-title: Build $TOPIC — Core
-sidebar_label: Build Core
+id: $SLUG-build-advanced
+title: "$TOPIC — Advanced Features"
+sidebar_label: Advanced Features
 sidebar_position: 3
 ---
 ```
 
 ---
 
-## Page 5 — 04-build-advanced.mdx
+## Page 5 — 04-deploy-and-scale.mdx "Deploy and Scale"
 
-**Target length:** 700–950 lines.
+**Target length:** 500–650 lines.
 
-### Structure:
-1. **Advanced Features** — 4–5 features that elevate from MVP to portfolio-grade: streaming, multi-tenancy, caching layer, human-in-the-loop, cost guardrails, evaluation hooks. Each complete and runnable.
-2. **Observability Stack** — structured logging, distributed tracing, metrics endpoint, health check. Complete implementation.
-3. **Test Suite** — 5 meaningful tests covering critical paths. Runnable with `pytest` or equivalent.
-4. **End-to-End Verification** — one complex scenario that exercises all major paths.
+**Mandatory sections:**
+
+### Deploy It
+Full production deployment:
+- Dockerfile (multi-stage where appropriate)
+- Infrastructure config (fly.toml, docker-compose.yml, k8s manifest, or equivalent)
+- CI/CD pipeline — GitHub Actions workflow that tests, builds, and deploys on push
+- Environment variable management
+- Health checks and readiness probes
+- Verification the deployed system works
+
+### Monitoring and Observability
+- Structured logging setup
+- Key metrics to track
+- At least one alert to configure
+- How to debug a failure in production
+
+### Scale It
+- Capacity model: what handles how much load
+- First bottleneck and how to address it
+- Cost at 10x / 100x load
+- What requires architectural rethinking at scale
+
+### Portfolio Presentation
+How to present this project in interviews:
+- 3-sentence project summary
+- 5 technical decisions to highlight
+- 3 questions to expect and how to answer them
+- What to show in a live demo
 
 **Frontmatter:**
 ```
 ---
-id: $SLUG-build-advanced
-title: Build $TOPIC — Advanced
-sidebar_label: Build Advanced
+id: $SLUG-deploy-and-scale
+title: "$TOPIC — Deploy and Scale"
+sidebar_label: Deploy and Scale
 sidebar_position: 4
 ---
 ```
 
 ---
 
-## Page 6 — 05-evaluate.mdx
-
-**Target length:** 350–500 lines.
-
-### Structure:
-1. **Evaluation Suite** — build a real eval: golden dataset (minimum 10 examples), scoring function, automated run. Complete, runnable.
-2. **Benchmark Results** — show how to interpret the output. What good looks like. What bad looks like.
-3. **Regression Guard** — GitHub Actions workflow that runs evals on every PR and blocks merge on regression.
-4. **Portfolio Talking Points** — 5 things to highlight when presenting this project in interviews. What the system demonstrates about your engineering judgment.
-
-**Frontmatter:**
-```
----
-id: $SLUG-evaluate
-title: Evaluate $TOPIC
-sidebar_label: Evaluate
-sidebar_position: 5
----
-```
-
 ---
 
-## Page 7 — 06-ship.mdx
+**MDX Safety and Rendering Rules — MANDATORY:**
 
-**Target length:** 400–550 lines.
+**Build-breaking (prevent these at generation time):**
+- No bare `<` before digits in prose — write "under 100ms" not `<100ms`
+- No raw `{` or `}` in prose outside fenced code blocks — wrap all JSON/GraphQL/object examples in a fenced block
+- No `:::` admonitions — use plain `##` headers and bold text
+- No unescaped colon in frontmatter title — wrap value in quotes if it contains one
+- Never backtick inside an AsciiDiagram `content` block — escape as `\`` and `\${`
+- Always use the `content` prop pattern for AsciiDiagram — never children:
+  - WRONG: `<AsciiDiagram id="..." title="...">{\`...\`}</AsciiDiagram>`
+  - RIGHT: `<AsciiDiagram id="..." title="..." content={\`...\`} />`
+- `alt` and `caption` props must appear BEFORE `content` on the opening tag — never after the closing backtick
+- Never a blank line inside an AsciiDiagram `content` block
+- Import AsciiDiagram only if used: `import AsciiDiagram from '@site/src/components/AsciiDiagram';`
+- Unicode arrows only in diagrams (`→ ← ↔ ↑ ↓`) — never raw `->` or `<-` inside diagram content
+- Never hardcode API keys, tokens, or secrets — always `os.environ` or equivalent
 
-### Structure:
-1. **Dockerize** — complete multi-stage Dockerfile and docker-compose with all services.
-2. **Deploy to Production** — exact steps for Railway, Fly.io, or GCP Cloud Run. Working public URL.
-3. **CI/CD Pipeline** — complete GitHub Actions: test → eval gate → build → deploy. Blocks on eval regression.
-4. **Operate It** — runbook: what to watch, what alerts to set, how to roll back, how to scale.
-5. **Extend It** — 3 open-ended challenges that would make this a real product.
-
-**Frontmatter:**
-```
----
-id: $SLUG-ship
-title: Ship $TOPIC
-sidebar_label: Ship
-sidebar_position: 6
----
-```
-
----
-
-## MDX Safety Rules — MANDATORY
-- Import AsciiDiagram at top of any file using it: `import AsciiDiagram from '@site/src/components/AsciiDiagram';`
-- Every `<AsciiDiagram>` must have `title` prop; no blank line inside; close with `</AsciiDiagram>` never `/>`.
-- No bare `<` before digits. No raw `{`/`}` outside code fences. No `:::` admonitions.
-- No "reader"/"user"/"learner". No hardcoded API keys.
+**Rendering defects (pass build but display broken — prevent at generation):**
+- Write all `.mdx` files with explicit UTF-8 encoding — on Windows, Python defaults to cp1252 which silently corrupts `─` into `â"€`; always `open(path, "w", encoding="utf-8")`
+- Never generate an empty AsciiDiagram block — content under 20 characters is a defect
+- Every fenced code block must have a matching closing fence — unclosed fences swallow following content
+- Frontmatter must start with exactly `---` as the first characters in the file — no BOM, no whitespace, no stray character before it
+- No "reader"/"user"/"learner" — address as "you"
 
 ---
 
 ## Sidebar entry
-Target: `sidebars/build-with-ai.json` — create if absent (see mini command for full skeleton).
 
-Find the `"Portfolio Projects"` category. Insert:
+Target file: `sidebars/build-with-ai.json`
+
+**If `"Portfolio Projects"` does not exist yet,** add it to the `buildWithAiSidebar` array as a top-level category:
+```json
+{ "type": "category", "label": "Portfolio Projects", "collapsible": true, "collapsed": true, "items": [] }
+```
+
+**Then** locate `"Portfolio Projects"` → append to its `"items"`:
 ```json
 {
   "type": "category",
@@ -192,29 +244,84 @@ Find the `"Portfolio Projects"` category. Insert:
   "collapsible": true,
   "collapsed": true,
   "items": [
-    "build-with-ai/portfolio/$SLUG/$SLUG-brief",
     "build-with-ai/portfolio/$SLUG/$SLUG-architecture",
     "build-with-ai/portfolio/$SLUG/$SLUG-build-core",
     "build-with-ai/portfolio/$SLUG/$SLUG-build-advanced",
-    "build-with-ai/portfolio/$SLUG/$SLUG-evaluate",
-    "build-with-ai/portfolio/$SLUG/$SLUG-ship"
+    "build-with-ai/portfolio/$SLUG/$SLUG-deploy-and-scale"
   ]
 }
 ```
 
 ---
 
+## docusaurus.config.js
+
+If not already present, add to navbar between the `=== TOPICS ===` and `=== /TOPICS ===` markers:
+
+```js
+{ type: 'docSidebar', sidebarId: 'buildWithAiSidebar', position: 'left', label: 'Build with AI' },
+```
+
+Check the existing navbar array first — only add this once, on the first project generated for this course.
+
+---
+
+## Cost and Student Budget Rules — MANDATORY
+
+Every project must be completable for under $5 total. Enforce these in every page generated:
+
+**Starter code defaults:**
+- Use cheapest viable model by default: `claude-haiku-3-5` not Sonnet, `gpt-4o-mini` not `gpt-4o`, `text-embedding-3-small` not large
+- Prefer local/free alternatives where teaching value is equal: Ollama for embeddings and local inference, `smtplib` over SendGrid for email mini projects, TMDB/ESPN free APIs over paid data providers
+- Never default to a paid model when a free or local one teaches the same concept
+
+**Spend guards — required in every project with a loop, agent, or repeated API call:**
+```python
+import os
+MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "5"))
+MAX_TOKENS_PER_RUN = int(os.environ.get("MAX_TOKENS_PER_RUN", "10000"))
+total_tokens = 0
+
+for i in range(MAX_ITERATIONS):
+    if total_tokens > MAX_TOKENS_PER_RUN:
+        print(f"Token budget reached at iteration {i}. Set MAX_TOKENS_PER_RUN to increase.")
+        break
+    # ... call LLM, add response.usage.input_tokens + output_tokens to total_tokens
+```
+
+**Every project must include `.env.example`:**
+```bash
+# Copy to .env — never commit .env
+ANTHROPIC_API_KEY=      # free credits at console.anthropic.com
+OPENAI_API_KEY=         # optional
+MAX_ITERATIONS=5
+MAX_TOKENS_PER_RUN=10000
+```
+
+**Cost estimate section — required in every overview/build page:**
+```
+## Cost to Build This
+| Item | Cost |
+|---|---|
+| Setup (one-time) | ~$0.00–$0.10 |
+| Per run | ~$0.001–$0.02 |
+| Free tier sufficient | Yes / Partially |
+| Recommended spend cap | $2 |
+```
+
+**Warn before expensive operations:**
+Add a confirmation prompt before any operation that embeds a large document set, runs multiple agent loops, or calls a paid API more than once:
+```python
+print(f"This will process {len(files)} files and make approximately {estimated_calls} API calls.")
+print(f"Estimated cost: ~${estimated_cost:.3f}")
+confirm = input("Continue? (y/n): ")
+if confirm.lower() != "y":
+    print("Aborted.")
+    sys.exit(0)
+```
+
+---
+
 ## Pre-flight
-Run `npm run check:mdx` after writing all files. Do NOT run `npm start` or `npm run build`.
 
-## Final output
-| File | Lines | Status |
-|------|-------|--------|
-| 01-brief.mdx | N | ✅ |
-| 02-architecture.mdx | N | ✅ |
-| 03-build-core.mdx | N | ✅ |
-| 04-build-advanced.mdx | N | ✅ |
-| 05-evaluate.mdx | N | ✅ |
-| 06-ship.mdx | N | ✅ |
-
-Then run `npm run check:mdx` to confirm zero MDX compilation errors. Do NOT run `npm start` or `npm run build` — full builds are reserved for final deploy only.
+`npm run check:mdx` on all generated files. Do NOT run `npm start` or `npm run build`.

@@ -1,0 +1,381 @@
+---
+id: chat-with-pdfs-improve
+title: "Chat With PDFs — Improve and Deploy"
+sidebar_label: Improve and Deploy
+sidebar_position: 2
+---
+
+Your basic RAG system works. Now it's time to make it production-ready: add streaming, handle multiple PDFs, improve retrieval quality with metadata filtering, and deploy it as a web application so others can use it without touching the command line.
+
+## Improve It
+
+### 1. Add streaming responses
+
+The current implementation waits for the full LLM response before showing anything. Streaming shows tokens as they arrive, which feels faster and more responsive:
+
+```python
+def generate_answer_streaming(
+    query: str,
+    context_chunks: List[str],
+    conversation_history: List[dict]
+) -> str:
+    context = "\n\n".join(
+        f"[Chunk {i+1}] {chunk}"
+        for i, chunk in enumerate(context_chunks)
+    )
+    system_prompt = (
+        "You are a helpful assistant that answers questions based on the provided "
+        "document context. Answer concisely and accurately."
+    )
+    messages = conversation_history + [
+        {
+            "role": "user",
+            "content": f"Context:\n\n{context}\n\nQuestion: {query}"
+        }
+    ]
+    full_response = ""
+    with client.messages.stream(
+        model="claude-3-5-haiku-20241022",
+        max_tokens=1000,
+        system=system_prompt,
+        messages=messages
+    ) as stream:
+        for text_delta in stream.text_deltas:
+            print(text_delta, end="", flush=True)
+            full_response += text_delta
+    print()
+    return full_response
+```
+
+**Why it matters in production:** Streaming reduces perceived latency from 2–3 seconds to near-instant. Users start reading the first token in under 300ms while the rest of the response streams in. This dramatically improves the user experience, especially for long answers.
+
+### 2. Support multiple PDFs with a document store
+
+Instead of indexing one PDF per session, maintain a collection of indexed documents:
+
+```python
+import json
+
+class DocumentStore:
+    def __init__(self, store_path: str = "document_store.json"):
+        self.store_path = Path(store_path)
+        self.documents = {}  # name -> {"chunks": [...], "index_path": str}
+
+    def add_document(self, name: str, chunks: List[str], index: faiss.IndexFlatL2):
+        index_path = f"indexes/{name}.faiss"
+        Path("indexes").mkdir(exist_ok=True)
+        faiss.write_index(index, index_path)
+        self.documents[name] = {"chunks": chunks, "index_path": index_path}
+        self._save()
+
+    def list_documents(self) -> List[str]:
+        return list(self.documents.keys())
+
+    def _save(self):
+        with open(self.store_path, "w") as f:
+            json.dump(self.documents, f, indent=2)
+```
+
+**Why it matters in production:** Real users have multiple documents they need to query across. A document store lets you build a knowledge base incrementally, adding documents over time without re-indexing everything.
+
+### 3. Add metadata filtering (page numbers, sections)
+
+Track which page and section each chunk came from, then allow filtered retrieval:
+
+```python
+def extract_text_with_metadata(pdf_path: str) -> List[dict]:
+    """Extract text with page number metadata."""
+    doc = fitz.open(pdf_path)
+    chunks_with_meta = []
+    for page_num, page in enumerate(doc, 1):
+        page_text = page.get_text()
+        if page_text.strip():
+            chunks_with_meta.append({
+                "text": page_text,
+                "page": page_num,
+                "source": Path(pdf_path).name
+            })
+    doc.close()
+    return chunks_with_meta
+
+def filter_by_page(chunks_with_meta: List[dict], page: int) -> List[str]:
+    """Return only chunks from a specific page."""
+    return [c["text"] for c in chunks_with_meta if c["page"] == page]
+```
+
+**Why it matters in production:** When a user asks about something in a specific section, filtering by page or section narrows the search space and improves precision. This also enables source citations — "According to page 12, paragraph 3..."
+
+### 4. Add retry logic with exponential backoff
+
+Network calls to the API can fail transiently. Add retry logic:
+
+```python
+import time
+import random
+
+def call_with_retry(
+    client: anthropic.Anthropic,
+    model: str,
+    max_tokens: int,
+    system: str,
+    messages: list,
+    max_retries: int = 3
+) -> anthropic.types.Message:
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages
+            )
+        except (anthropic.APIError, anthropic.APITimeoutError,
+                anthropic.RateLimitError) as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"API error (attempt {attempt + 1}), retrying in {wait:.1f}s...")
+                time.sleep(wait)
+    raise last_error
+```
+
+**Why it matters in production:** API calls fail — network blips, rate limits, temporary outages. Without retry logic, a single transient failure ends the user's session. Exponential backoff (1s, 2s, 4s) with jitter prevents hammering the API during recovery.
+
+### 5. Add input validation and max document size
+
+Guard against problematic inputs:
+
+```python
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+VALID_EXTENSIONS = (".pdf",)
+
+def validate_pdf(pdf_path: str) -> bool:
+    path = Path(pdf_path)
+    if not path.exists():
+        print(f"Error: file not found: {pdf_path}")
+        return False
+    if path.suffix.lower() not in VALID_EXTENSIONS:
+        print(f"Error: invalid file type. Expected: {VALID_EXTENSIONS}")
+        return False
+    if path.stat().st_size > MAX_FILE_SIZE:
+        print(f"Error: file too large (max {MAX_FILE_SIZE // (1024*1024)} MB)")
+        return False
+    # Validate it's a real PDF
+    try:
+        doc = fitz.open(pdf_path)
+        doc.close()
+    except Exception:
+        print(f"Error: file is not a valid PDF")
+        return False
+    return True
+```
+
+**Why it matters in production:** Users upload corrupt files, wrong formats, and enormous PDFs. Validating at the entry point prevents crashes, out-of-memory errors, and wasted API calls on unreadable content.
+
+## Deploy It
+
+Deploy as a FastAPI web application on Railway. This turns your CLI tool into a web service with a simple HTML form.
+
+### Step 1: Create the web application
+
+Create `app.py`:
+
+```python
+import os
+import sys
+from pathlib import Path
+from typing import List
+import tempfile
+import numpy as np
+import faiss
+import fitz
+from sentence_transformers import SentenceTransformer
+import anthropic
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+
+app = FastAPI(title="Chat With PDFs")
+
+# --- Same functions from chat.py ---
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+if not ANTHROPIC_API_KEY:
+    print("Error: ANTHROPIC_API_KEY not set")
+    sys.exit(1)
+
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# In-memory store
+sessions = {}
+
+class QuestionRequest(BaseModel):
+    session_id: str
+    question: str
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return """
+    <html>
+    <head><title>Chat With PDFs</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 800px; margin: 0 auto; padding: 2rem; }
+      textarea, input { width: 100%; padding: 0.5rem; margin: 0.5rem 0; }
+      button { padding: 0.5rem 1rem; background: #007bff; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+      #response { white-space: pre-wrap; background: #f5f5f5; padding: 1rem; border-radius: 4px; margin-top: 1rem; }
+    </style></head>
+    <body>
+      <h1>Chat With PDFs</h1>
+      <form id="uploadForm" enctype="multipart/form-data">
+        <input type="file" name="file" accept=".pdf" required />
+        <button type="submit">Upload PDF</button>
+      </form>
+      <div id="sessionInfo"></div>
+      <div id="chatArea" style="display:none">
+        <input type="text" id="questionInput" placeholder="Ask a question about your PDF..." />
+        <button onclick="askQuestion()">Ask</button>
+        <div id="response"></div>
+      </div>
+      <script>
+        let sessionId = null;
+        document.getElementById("uploadForm").onsubmit = async (e) => {
+          e.preventDefault();
+          const form = new FormData(e.target);
+          const res = await fetch("/upload", { method: "POST", body: form });
+          const data = await res.json();
+          sessionId = data.session_id;
+          document.getElementById("sessionInfo").innerText = "Session: " + sessionId;
+          document.getElementById("chatArea").style.display = "block";
+        };
+        async function askQuestion() {
+          const q = document.getElementById("questionInput").value;
+          if (!q) return;
+          const res = await fetch("/ask", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId, question: q })
+          });
+          const data = await res.json();
+          document.getElementById("response").innerText = data.answer;
+        }
+      </script>
+    </body>
+    </html>
+    """
+
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files accepted")
+    content = await file.read()
+    if len(content) > 50 * 1024 * 1024:
+        raise HTTPException(400, "File too large (max 50 MB)")
+    # Save to temp file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    # Index
+    import uuid
+    session_id = str(uuid.uuid4())
+    try:
+        doc = fitz.open(tmp_path)
+        text_parts = []
+        for page in doc:
+            text_parts.append(page.get_text())
+        doc.close()
+        full_text = "\n\n".join(text_parts)
+        words = full_text.split()
+        chunks = [" ".join(words[i:i+500]) for i in range(0, len(words), 450)]
+        chunk_embeddings = embedding_model.encode(chunks, show_progress_bar=False)
+        dimension = chunk_embeddings.shape[1]
+        index = faiss.IndexFlatL2(dimension)
+        index.add(np.array(chunk_embeddings).astype("float32"))
+        sessions[session_id] = {"chunks": chunks, "index": index, "history": []}
+    finally:
+        os.unlink(tmp_path)
+    return {"session_id": session_id, "chunks": len(chunks)}
+
+@app.post("/ask")
+async def ask_question(req: QuestionRequest):
+    session = sessions.get(req.session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    query_embedding = embedding_model.encode([req.question])
+    distances, indices = session["index"].search(
+        np.array(query_embedding).astype("float32"), 5
+    )
+    retrieved = [session["chunks"][i] for i in indices[0]]
+    context = "\n\n".join(f"[Chunk {i+1}] {c}" for i, c in enumerate(retrieved))
+    messages = session["history"] + [
+        {"role": "user", "content": f"Context:\n\n{context}\n\nQuestion: {req.question}"}
+    ]
+    response = client.messages.create(
+        model="claude-3-5-haiku-20241022",
+        max_tokens=1000,
+        system="Answer concisely from the context. Say if you don't know.",
+        messages=messages
+    )
+    answer = response.content[0].text
+    session["history"].append({"role": "user", "content": req.question})
+    session["history"].append({"role": "assistant", "content": answer})
+    if len(session["history"]) > 10:
+        session["history"] = session["history"][-10:]
+    return {"answer": answer}
+```
+
+### Step 2: Create a `requirements.txt`
+
+```text
+anthropic==0.49.0
+fastapi==0.115.6
+uvicorn==0.34.0
+python-multipart==0.0.19
+sentence-transformers==3.3.1
+faiss-cpu==1.9.0.post1
+pymupdf==1.25.2
+python-dotenv==1.0.1
+numpy==1.26.4
+```
+
+### Step 3: Create a `Dockerfile`
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8000
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### Step 4: Deploy to Railway
+
+```bash
+# Install the Railway CLI
+npm install -g @railway/cli
+
+# Login
+railway login
+
+# Deploy from your project directory
+railway init
+railway up
+
+# Set the environment variable
+railway variables set ANTHROPIC_API_KEY=your-key-here
+
+# Open the deployed app
+railway open
+```
+
+**Verification:** Navigate to the Railway-provided URL. Upload a PDF, type a question, and confirm you get a grounded answer. The app should respond in under 5 seconds for most questions.
+
+## Challenge Yourself
+
+**Beginner — Add source citations.** Modify the answer template so the LLM always cites the page number and chunk number for each fact. Then add a "Sources" section below the answer that lists the actual source text snippets.
+
+**Intermediate — Hybrid search with BM25.** Embedding search is good at semantic similarity but can miss exact keyword matches (names, IDs, codes). Add BM25 keyword search (use the `rank_bm25` library) and combine results from both retrievers with reciprocal rank fusion. Test on a query that includes a specific product code — does hybrid search find it when pure embedding search doesn't?
+
+**Advanced — Incremental indexing with SQLite.** Store chunks, embeddings, and metadata in a SQLite database with `sqlite-vec` for on-disk vector search. This eliminates the startup re-indexing cost for previously seen documents. Add a `--rebuild` flag to force re-indexing after model updates. Test startup time against the in-memory approach on a 100-document library.

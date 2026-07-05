@@ -67,6 +67,8 @@ const config = {
                                 { type: 'docSidebar', sidebarId: 'systemDesignFundamentalsSidebar', position: 'left', label: 'System Design' },
                                                                 { type: 'docSidebar', sidebarId: 'gitGithubActionsSidebar', position: 'left', label: 'Git & GitHub Actions' },
                                 { type: 'docSidebar', sidebarId: 'aiEngineeringHandsOnSidebar', position: 'left', label: 'AI Engineering Crash Course' },
+                                { type: 'docSidebar', sidebarId: 'buildWithAiSidebar', position: 'left', label: 'Build with AI' },
+                                { type: 'docSidebar', sidebarId: 'softwareEngineeringSidebar', position: 'left', label: 'Software Engineering' },
                                         // === /TOPICS ===
       ],
     },

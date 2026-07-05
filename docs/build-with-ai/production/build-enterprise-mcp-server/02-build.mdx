@@ -1,0 +1,493 @@
+---
+id: build-enterprise-mcp-server-build
+title: "Build an Enterprise MCP Server — Build"
+sidebar_label: Build Enterprise MCP Server
+sidebar_position: 2
+---
+
+## Prerequisites
+
+```bash
+pip install \
+  mcp==1.0.0 \
+  httpx==0.28.0 \
+  pyyaml==6.0.2 \
+  pydantic==2.9.0 \
+  python-dotenv==1.0.1 \
+  psycopg2-binary==2.9.9
+```
+
+## Build It
+
+### Step 1: Configuration
+
+```yaml
+# config.yaml
+server:
+  name: enterprise-mcp
+  version: "1.0.0"
+  transport: sse
+  host: "0.0.0.0"
+  port: 8000
+
+auth:
+  enabled: true
+  tokens:
+    - user: admin
+      scopes: ["db:read", "db:write", "api:*", "notify"]
+    - user: analyst
+      scopes: ["db:read", "api:read"]
+
+tools:
+  - name: query_database
+    description: Execute SQL queries against the enterprise database
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: SQL query to execute
+        params:
+          type: array
+          items: {}
+      required: [query]
+    required_scopes: ["db:read"]
+    rate_limit: 30
+    backend: postgres
+
+  - name: search_documentation
+    description: Search internal documentation
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+        max_results:
+          type: integer
+          default: 5
+      required: [query]
+    required_scopes: ["api:read"]
+    rate_limit: 60
+    backend: http
+
+  - name: send_notification
+    description: Send a notification to a Slack channel
+    input_schema:
+      type: object
+      properties:
+        channel:
+          type: string
+        message:
+          type: string
+        priority:
+          type: string
+          enum: ["info", "warning", "critical"]
+      required: [channel, message]
+    required_scopes: ["notify"]
+    rate_limit: 10
+    backend: notify
+
+resources:
+  - uri: "db://tables/{table_name}"
+    name: Database Table
+    mime_type: application/json
+  - uri: "docs://{document_id}"
+    name: Internal Document
+    mime_type: text/markdown
+```
+
+```bash
+python -c "
+import yaml
+config = yaml.safe_load(open('config.yaml'))
+print(f'Configured {len(config[\"tools\"])} tools and {len(config[\"resources\"])} resources')
+# => Configured 3 tools and 2 resources
+"
+```
+
+**Milestone 1**: all tool and resource definitions live in a single YAML config file that's easy to version control and review.
+
+### Step 2: MCP Server Core
+
+```python
+# app/server.py
+from mcp.server import Server, NotificationOptions
+from mcp.server.models import InitializationOptions
+from mcp.types import (
+    Tool, TextContent, Resource, ResourceTemplate,
+    CallToolResult, ReadResourceResult
+)
+from app.config import load_config
+from app.auth import authenticate
+from app.rate_limit import check_rate_limit
+from app.backends import get_backend
+from app.audit import audit_log
+import anyio
+
+config = load_config()
+server = Server(config["server"]["name"])
+
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    return [
+        Tool(
+            name=t["name"],
+            description=t["description"],
+            inputSchema=t["input_schema"]
+        )
+        for t in config["tools"]
+    ]
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict, context) -> CallToolResult:
+    tool_def = next(t for t in config["tools"] if t["name"] == name)
+
+    # Auth
+    user = authenticate(context.request.headers)
+    if not user:
+        return CallToolResult(isError=True, content=[TextContent(type="text", text="Authentication failed")])
+
+    # Check scopes
+    for scope in tool_def["required_scopes"]:
+        if scope not in user["scopes"]:
+            return CallToolResult(isError=True, content=[TextContent(type="text", text=f"Missing scope: {scope}")])
+
+    # Rate limit
+    if not check_rate_limit(name, user["user"]):
+        return CallToolResult(isError=True, content=[TextContent(type="text", text="Rate limit exceeded")])
+
+    # Execute
+    backend = get_backend(tool_def["backend"])
+    import time
+    start = time.time()
+    try:
+        result = await backend.execute(name, arguments)
+        duration = int((time.time() - start) * 1000)
+        audit_log(user["user"], name, arguments, True, duration)
+        return CallToolResult(content=[TextContent(type="text", text=str(result))])
+    except Exception as e:
+        duration = int((time.time() - start) * 1000)
+        audit_log(user["user"], name, arguments, False, duration)
+        return CallToolResult(isError=True, content=[TextContent(type="text", text=str(e))])
+```
+
+### Step 3: Backend Connectors
+
+```python
+# app/backends.py
+import httpx
+import json
+from typing import Dict, Any
+
+class PostgresBackend:
+    def __init__(self, connection_string: str):
+        import psycopg2
+        self.conn = psycopg2.connect(connection_string)
+
+    async def execute(self, tool_name: str, args: Dict[str, Any]) -> str:
+        query = args["query"]
+        params = args.get("params", [])
+        with self.conn.cursor() as cur:
+            cur.execute(query, params)
+            if query.strip().upper().startswith("SELECT"):
+                columns = [desc[0] for desc in cur.description]
+                rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+                return json.dumps(rows, default=str)
+            self.conn.commit()
+            return json.dumps({"affected_rows": cur.rowcount})
+
+class HttpBackend:
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+
+    async def execute(self, tool_name: str, args: Dict[str, Any]) -> str:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/api/search",
+                json=args,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=10
+            )
+            response.raise_for_status()
+            return json.dumps(response.json(), indent=2)
+
+class NotificationBackend:
+    def __init__(self, webhook_url: str):
+        self.webhook_url = webhook_url
+
+    async def execute(self, tool_name: str, args: Dict[str, Any]) -> str:
+        payload = {
+            "text": f"[{args.get('priority', 'info').upper()}] {args['message']}",
+            "channel": args["channel"]
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(self.webhook_url, json=payload, timeout=5)
+            return json.dumps({"sent": response.status_code == 200})
+
+_backends = {}
+
+def get_backend(backend_type: str):
+    if backend_type not in _backends:
+        env_key = f"MCP_{backend_type.upper()}_CONNECTION"
+        import os
+        conn_str = os.environ.get(env_key, "")
+
+        if backend_type == "postgres":
+            _backends[backend_type] = PostgresBackend(conn_str)
+        elif backend_type == "http":
+            _backends[backend_type] = HttpBackend(
+                os.environ.get("MCP_API_BASE_URL", "http://localhost:8080"),
+                os.environ.get("MCP_API_KEY", "")
+            )
+        elif backend_type == "notify":
+            _backends[backend_type] = NotificationBackend(
+                os.environ.get("MCP_SLACK_WEBHOOK", "")
+            )
+    return _backends[backend_type]
+```
+
+```bash
+python -c "
+from app.backends import get_backend
+import os
+os.environ['MCP_POSTGRES_CONNECTION'] = 'postgresql://user:pass@localhost:5432/test'
+backend = get_backend('postgres')
+print(f'Backend type: {type(backend).__name__}')
+# => Backend type: PostgresBackend
+"
+```
+
+**Milestone 2**: backend connectors are abstracted behind a common interface.
+
+### Step 4: Authentication
+
+```python
+# app/auth.py
+import hashlib
+from typing import Optional, Dict
+
+TOKENS = {}  # In production, load from database
+
+def init_tokens(tokens_config: list[dict]):
+    for t in tokens_config:
+        key_hash = hashlib.sha256(t["token"].encode()).hexdigest()
+        TOKENS[key_hash] = {
+            "user": t["user"],
+            "scopes": t["scopes"]
+        }
+
+def authenticate(headers: Optional[Dict]) -> Optional[Dict]:
+    if not headers:
+        return None
+    auth_header = headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[7:]
+    key_hash = hashlib.sha256(token.encode()).hexdigest()
+    return TOKENS.get(key_hash)
+```
+
+### Step 5: Rate Limiting
+
+```python
+# app/rate_limit.py
+import time
+from collections import defaultdict
+
+_limits: Dict[str, list] = defaultdict(list)
+
+def check_rate_limit(tool_name: str, user: str) -> bool:
+    from app.config import config
+    tool_def = next(t for t in config["tools"] if t["name"] == tool_name)
+    max_rpm = tool_def["rate_limit"]
+    key = f"{user}:{tool_name}"
+    now = time.time()
+
+    _limits[key] = [t for t in _limits[key] if now - t < 60]
+    if len(_limits[key]) >= max_rpm:
+        return False
+    _limits[key].append(now)
+    return True
+```
+
+### Step 6: Audit Logging
+
+```python
+# app/audit.py
+import json, logging, sys
+from datetime import datetime
+
+logger = logging.getLogger("mcp.audit")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+logger.addHandler(handler)
+
+def audit_log(user: str, tool: str, inputs: dict, success: bool, duration_ms: int):
+    logger.info(json.dumps({
+        "event": "tool_call",
+        "user": user,
+        "tool": tool,
+        "success": success,
+        "duration_ms": duration_ms,
+        "timestamp": datetime.utcnow().isoformat()
+    }))
+```
+
+### Step 7: Main Entrypoint
+
+```python
+# app/main.py
+from app.server import server, config
+from app.auth import init_tokens
+from mcp.server.models import InitializationOptions
+import anyio
+
+async def main():
+    if config["auth"]["enabled"]:
+        init_tokens(config["auth"]["tokens"])
+
+    transport = config["server"].get("transport", "stdio")
+
+    if transport == "sse":
+        from mcp.server.sse import SseServerTransport
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+        import uvicorn
+
+        sse = SseServerTransport("/messages")
+
+        async def handle_sse(request):
+            async with sse.connect_sse(
+                request.scope, request.receive, request._send,
+                server.create_initialization_options()
+            ) as session:
+                await server.run(session)
+
+        app = Starlette(routes=[
+            Route("/sse", endpoint=handle_sse),
+            Route("/messages", endpoint=sse.handle_post_message),
+        ])
+
+        host = config["server"].get("host", "0.0.0.0")
+        port = config["server"].get("port", 8000)
+        print(f"MCP Server running on http://{host}:{port}/sse")
+        config = uvicorn.Config(app, host=host, port=port, log_level="info")
+        server_uv = uvicorn.Server(config)
+        await server_uv.serve()
+    else:
+        from mcp.server.stdio import stdio_server
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+
+if __name__ == "__main__":
+    anyio.run(main)
+```
+
+```bash
+# Start in SSE mode
+python app/main.py &
+sleep 2
+# => MCP Server running on http://0.0.0.0:8000/sse
+```
+
+**Milestone 3**: MCP server running with SSE transport, ready for clients to connect.
+
+### Step 8: Resource Templates
+
+```python
+# Add to server.py
+@server.list_resource_templates()
+async def list_resource_templates() -> list[ResourceTemplate]:
+    return [
+        ResourceTemplate(
+            uriTemplate=r["uri"],
+            name=r["name"],
+            mimeType=r.get("mime_type", "application/json")
+        )
+        for r in config["resources"]
+    ]
+
+@server.read_resource()
+async def read_resource(uri: str, context) -> ReadResourceResult:
+    from app.resources import resolve_resource
+    content, mime_type = await resolve_resource(uri)
+    return ReadResourceResult(
+        contents=[TextContent(type="text", text=content, mimeType=mime_type)]
+    )
+```
+
+### Step 9: Client Connection Test
+
+```python
+# test_client.py
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+import anyio
+
+async def test():
+    server_params = StdioServerParameters(
+        command="python",
+        args=["-m", "app.main"],
+        env={"MCP_TRANSPORT": "stdio"}
+    )
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            print(f"Available tools: {[t.name for t in tools]}")
+
+anyio.run(test())
+```
+
+```bash
+python test_client.py
+# => Available tools: ['query_database', 'search_documentation', 'send_notification']
+```
+
+**Milestone 4**: client successfully connects and discovers all tools.
+
+## Understand What Happened
+
+- **MCP SDK** handles protocol compliance — you define tools and resources, not message formats
+- **SSE transport** lets remote clients connect over HTTP. Stdio is for local Claude Desktop integration
+- **Backend abstraction** means adding a new data source requires just a new backend class and config entry
+- **Rate limiting** is per-tool, per-user, preventing any single user from overwhelming downstream services
+
+## Common Errors
+
+### Error 1: Transport Not Found
+
+```
+ValueError: Unsupported transport: websocket
+```
+
+**Root cause:** The config file specifies a transport that isn't implemented.
+
+**Fix:** Use `stdio` for local or `sse` for remote. These are the only two options.
+
+### Error 2: Token Authentication Fails
+
+```
+Authentication failed
+```
+
+**Root cause:** The token in the Authorization header doesn't match any configured token.
+
+**Fix:** Generate a token:
+```python
+import secrets, hashlib
+token = secrets.token_hex(32)
+print(f"Token: {token}")
+print(f"Hash: {hashlib.sha256(token.encode()).hexdigest()}")
+```
+
+## Cost to Build This
+
+| Item | Cost |
+|---|---|
+| Setup (one-time) | ~$0.00 |
+| Per tool invocation | ~$0.00 |
+| Free tier sufficient | Yes |
+| Recommended spend cap | $0 |

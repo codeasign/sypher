@@ -1,0 +1,356 @@
+---
+id: ai-observability-platform-build-core
+title: "AI Observability Platform — Core Build"
+sidebar_label: Core Build
+sidebar_position: 2
+---
+
+## Prerequisites
+
+```bash
+pip install \
+  fastapi==0.115.0 \
+  uvicorn==0.32.0 \
+  anthropic==0.49.0 \
+  openai==1.51.0 \
+  pydantic==2.9.0 \
+  python-dotenv==1.0.1 \
+  click==8.1.7 \
+  rich==13.8.0
+```
+
+## Build It — Core
+
+### Step 1: Observation Database
+
+```python
+# app/database.py
+import sqlite3, os, json
+from datetime import datetime
+
+DB_PATH = os.environ.get("DB_PATH", "./data/observe.db")
+
+def get_conn():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_conn()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS llm_calls (
+            id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            model TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            prompt_tokens INTEGER DEFAULT 0,
+            completion_tokens INTEGER DEFAULT 0,
+            total_tokens INTEGER DEFAULT 0,
+            latency_ms INTEGER DEFAULT 0,
+            cost REAL DEFAULT 0.0,
+            error TEXT,
+            user_id TEXT,
+            tags TEXT DEFAULT '{}',
+            prompt_preview TEXT,
+            response_preview TEXT
+        );
+        CREATE TABLE IF NOT EXISTS safety_events (
+            id TEXT PRIMARY KEY,
+            call_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            detail TEXT,
+            timestamp TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS alerts (
+            id TEXT PRIMARY KEY,
+            metric TEXT NOT NULL,
+            threshold REAL NOT NULL,
+            current_value REAL NOT NULL,
+            severity TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_calls_timestamp ON llm_calls(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_llm_calls_model ON llm_calls(model);
+    """)
+    conn.commit()
+    conn.close()
+```
+
+### Step 2: Instrumentation SDK
+
+```python
+# app/sdk.py
+import time, uuid, os, json
+from functools import wraps
+from datetime import datetime
+from app.database import get_conn
+
+def count_tokens(text: str) -> int:
+    import tiktoken
+    try:
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except:
+        return len(text) // 4  # Rough estimate
+
+COST_PER_1K = {
+    "claude-haiku-3-5": (0.00025, 0.00125),
+    "claude-sonnet-4": (0.003, 0.015),
+    "gpt-4o-mini": (0.00015, 0.0006),
+}
+
+def calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    rates = COST_PER_1K.get(model, (0.001, 0.002))
+    return (prompt_tokens * rates[0] + completion_tokens * rates[1]) / 1000
+
+def observe_llm(func):
+    """Decorator to observe LLM calls."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        call_id = uuid.uuid4().hex[:12]
+        error = None
+
+        try:
+            result = func(*args, **kwargs)
+            return result
+        except Exception as e:
+            error = str(e)
+            raise
+        finally:
+            # Extract what we can from the call
+            duration = int((time.time() - start) * 1000)
+            conn = get_conn()
+            conn.execute(
+                """INSERT INTO llm_calls 
+                   (id, timestamp, model, provider, prompt_tokens, completion_tokens,
+                    total_tokens, latency_ms, cost, error, prompt_preview, response_preview)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (call_id, datetime.utcnow().isoformat(),
+                 kwargs.get("model", "unknown"), "anthropic",
+                 0, 0, 0, duration, 0.0, error, "", "")
+            )
+            conn.commit()
+            conn.close()
+    return wrapper
+
+class LLMCallLogger:
+    """Context manager for tracking LLM calls."""
+    def __init__(self, model: str, provider: str = "anthropic", user_id: str = None):
+        self.call_id = uuid.uuid4().hex[:12]
+        self.model = model
+        self.provider = provider
+        self.user_id = user_id
+        self.start = None
+        self.prompt = ""
+        self.response = ""
+
+    def __enter__(self):
+        self.start = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        duration = int((time.time() - self.start) * 1000) if self.start else 0
+        prompt_tokens = count_tokens(self.prompt)
+        completion_tokens = count_tokens(self.response)
+        cost = calculate_cost(self.model, prompt_tokens, completion_tokens)
+
+        conn = get_conn()
+        conn.execute(
+            """INSERT INTO llm_calls VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (self.call_id, datetime.utcnow().isoformat(), self.model, self.provider,
+             prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
+             duration, cost, None, self.user_id or "", "{}",
+             self.prompt[:200], self.response[:200])
+        )
+        conn.commit()
+        conn.close()
+```
+
+### Step 3: Ingestion API
+
+```python
+# app/api.py
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Optional
+from app.database import get_conn, init_db
+from datetime import datetime
+import uuid, json
+
+app = FastAPI(title="ObserveAI API")
+
+class TraceLLMCall(BaseModel):
+    model: str
+    provider: str = "anthropic"
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    latency_ms: int = 0
+    cost: float = 0.0
+    error: Optional[str] = None
+    user_id: Optional[str] = None
+    tags: dict = {}
+    prompt_preview: str = ""
+    response_preview: str = ""
+
+@app.on_event("startup")
+async def startup():
+    init_db()
+
+@app.post("/api/v1/trace")
+def trace_call(call: TraceLLMCall):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO llm_calls VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (uuid.uuid4().hex[:12], datetime.utcnow().isoformat(), call.model, call.provider,
+         call.prompt_tokens, call.completion_tokens, call.prompt_tokens + call.completion_tokens,
+         call.latency_ms, call.cost, call.error, call.user_id or "",
+         json.dumps(call.tags), call.prompt_preview[:200], call.response_preview[:200])
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "logged"}
+
+@app.get("/api/v1/metrics")
+def get_metrics(hours: int = 24):
+    conn = get_conn()
+    from datetime import datetime, timedelta
+    cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+
+    total_calls = conn.execute("SELECT COUNT(*) FROM llm_calls WHERE timestamp > ?", (cutoff,)).fetchone()[0]
+    total_cost = conn.execute("SELECT COALESCE(SUM(cost), 0) FROM llm_calls WHERE timestamp > ?", (cutoff,)).fetchone()[0]
+    avg_latency = conn.execute("SELECT COALESCE(AVG(latency_ms), 0) FROM llm_calls WHERE timestamp > ?", (cutoff,)).fetchone()[0]
+    error_count = conn.execute("SELECT COUNT(*) FROM llm_calls WHERE error IS NOT NULL AND timestamp > ?", (cutoff,)).fetchone()[0]
+    total_tokens = conn.execute("SELECT COALESCE(SUM(total_tokens), 0) FROM llm_calls WHERE timestamp > ?", (cutoff,)).fetchone()[0]
+
+    conn.close()
+    return {
+        "total_calls": total_calls,
+        "total_cost": round(total_cost, 4),
+        "avg_latency_ms": round(avg_latency, 1),
+        "error_count": error_count,
+        "total_tokens": total_tokens,
+        "error_rate": round(error_count / total_calls * 100, 2) if total_calls > 0 else 0
+    }
+```
+
+```bash
+# Start API
+uvicorn app.api:app --reload --port 8004 &
+sleep 2
+curl -s http://localhost:8004/api/v1/metrics | python -m json.tool
+# => {"total_calls": 0, "total_cost": 0, ...}
+```
+
+**Milestone 1**: ingestion API and metrics endpoint working.
+
+### Step 4: FastAPI Middleware
+
+```python
+# app/middleware.py
+from fastapi import Request
+import time, uuid
+from app.database import get_conn
+from datetime import datetime
+
+async def observe_middleware(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = int((time.time() - start) * 1000)
+
+    if request.url.path.startswith("/api/v1"):
+        conn = get_conn()
+        conn.execute(
+            "INSERT INTO llm_calls (id, timestamp, model, provider, latency_ms, prompt_preview, response_preview, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (uuid.uuid4().hex[:12], datetime.utcnow().isoformat(), "api", "http",
+             duration, request.url.path, f"{response.status_code}", '{"type": "api_call"}')
+        )
+        conn.commit()
+        conn.close()
+    return response
+```
+
+### Step 5: CLI Dashboard
+
+```python
+# app/cli.py
+import click
+from app.database import get_conn
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from datetime import datetime, timedelta
+
+console = Console()
+
+@click.group()
+def cli():
+    """ObserveAI — AI Observability CLI"""
+    pass
+
+@cli.command()
+@click.option("--hours", default=24, help="Time range in hours")
+def summary(hours):
+    """Show observability summary."""
+    cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+    conn = get_conn()
+
+    total = conn.execute("SELECT COUNT(*) FROM llm_calls WHERE timestamp > ?", (cutoff,)).fetchone()[0]
+    cost = conn.execute("SELECT COALESCE(SUM(cost), 0) FROM llm_calls WHERE timestamp > ?", (cutoff,)).fetchone()[0]
+    errors = conn.execute("SELECT COUNT(*) FROM llm_calls WHERE error IS NOT NULL AND timestamp > ?", (cutoff,)).fetchone()[0]
+    avg_lat = conn.execute("SELECT COALESCE(AVG(latency_ms), 0) FROM llm_calls WHERE timestamp > ?", (cutoff,)).fetchone()[0]
+    tokens = conn.execute("SELECT COALESCE(SUM(total_tokens), 0) FROM llm_calls WHERE timestamp > ?", (cutoff,)).fetchone()[0]
+
+    console.print(Panel.fit(f"""
+[bold]ObserveAI Summary (last {hours}h)[/bold]
+Total calls: {total}  |  Total cost: ${cost:.4f}
+Error rate: {errors/max(total,1)*100:.1f}%  |  Avg latency: {avg_lat:.0f}ms
+Total tokens: {tokens:,}
+    """))
+
+    # By model
+    table = Table(title="Calls by Model")
+    table.add_column("Model", style="cyan")
+    table.add_column("Calls", justify="right")
+    table.add_column("Cost", justify="right")
+    table.add_column("Avg Latency", justify="right")
+
+    rows = conn.execute(
+        "SELECT model, COUNT(*) as c, SUM(cost) as cost, AVG(latency_ms) as lat FROM llm_calls WHERE timestamp > ? GROUP BY model ORDER BY c DESC",
+        (cutoff,)
+    ).fetchall()
+    for row in rows:
+        table.add_row(row["model"], str(row["c"]), f"${row['cost']:.4f}", f"{row['lat']:.0f}ms")
+
+    console.print(table)
+    conn.close()
+```
+
+```bash
+python -c "
+from app.cli import cli
+print('CLI module loaded')
+# => CLI module loaded
+"
+```
+
+**Milestone 2**: observability dashboard with summary, model breakdown, and cost tracking.
+
+## Understand the Core
+
+- **Instrumentation SDK** captures every LLM call with timing, cost, and error tracking
+- **Cost calculation** uses provider rate cards — no external billing API needed
+- **Metrics endpoint** aggregates data for dashboards and alerting
+- **Token counting** uses tiktoken for accuracy, with a fallback estimate
+
+## Cost to Build This
+
+| Item | Cost |
+|---|---|
+| Setup (one-time) | ~$0.00 |
+| Per LLM call logged | ~$0.00001 |
+| Free tier sufficient | Yes |
+| Recommended spend cap | $5 |

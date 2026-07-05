@@ -1,0 +1,416 @@
+---
+id: enterprise-rag-system-deploy
+title: "Enterprise RAG System — Deploy"
+sidebar_label: Deploy
+sidebar_position: 3
+---
+
+## Production Hardening
+
+Before deploying, harden the system against real-world failure modes.
+
+### 1. Error Handling and Retries
+
+Add structured error handling to the LLM client and embedding calls.
+
+```python
+# app/llm/client.py (additions)
+import time
+import random
+from functools import wraps
+
+def retry(max_attempts=3, base_delay=1.0):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_attempts - 1:
+                        delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                        print(f"Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_attempts})")
+                        time.sleep(delay)
+            raise last_error
+        return wrapper
+    return decorator
+
+class LLMClient:
+    @retry(max_attempts=3)
+    def query(self, query: str, context: list, stream: bool = False):
+        # existing implementation
+        pass
+```
+
+### 2. Input Validation and Sanitization
+
+Prevent injection attacks through document content.
+
+```python
+# app/ingest/loader.py (additions)
+import re
+
+def sanitize_content(text: str) -> str:
+    """Remove potential prompt injection from ingested content."""
+    # Remove null bytes
+    text = text.replace("\x00", "")
+    # Limit line length to prevent overflow
+    lines = []
+    for line in text.split("\n"):
+        if len(line) > 5000:
+            line = line[:5000] + "... [truncated]"
+        lines.append(line)
+    text = "\n".join(lines)
+    # Remove control characters (except newlines and tabs)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    return text.strip()
+
+def load_file(filepath: Path) -> tuple[str, str]:
+    content, content_type = _load_raw(filepath)
+    content = sanitize_content(content)
+    return content, content_type
+```
+
+### 3. Logging and Monitoring
+
+Add structured JSON logging for production observability.
+
+```python
+# app/audit/logger.py
+import json
+import logging
+import sys
+from datetime import datetime
+
+class AuditLogger:
+    def __init__(self):
+        self.logger = logging.getLogger("ragflow")
+        self.logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s"
+        ))
+        self.logger.addHandler(handler)
+
+    def log_query(self, user: str, query: str, tokens: int, latency: int, sources: list):
+        record = {
+            "event": "query",
+            "user": user,
+            "query_preview": query[:100],
+            "tokens_used": tokens,
+            "latency_ms": latency,
+            "sources_count": len(sources),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        self.logger.info(json.dumps(record))
+
+    def log_ingestion(self, user: str, doc_id: str, filename: str, chunks: int):
+        record = {
+            "event": "ingestion",
+            "user": user,
+            "document_id": doc_id,
+            "filename": filename,
+            "chunks_created": chunks,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        self.logger.info(json.dumps(record))
+
+    def log_error(self, operation: str, error: str, details: dict = None):
+        record = {
+            "event": "error",
+            "operation": operation,
+            "error": error,
+            "details": details or {},
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        self.logger.error(json.dumps(record))
+
+audit = AuditLogger()
+```
+
+### 4. Cost Controls — Token Budget and Rate Limiting
+
+Enforce per-user and global rate limits.
+
+```python
+# app/middleware/rate_limit.py
+import time
+from collections import defaultdict
+from fastapi import Request, HTTPException
+
+class RateLimiter:
+    def __init__(self, requests_per_minute: int = 60):
+        self.requests_per_minute = requests_per_minute
+        self.window = 60.0
+        self.requests: dict[str, list[float]] = defaultdict(list)
+
+    async def __call__(self, request: Request):
+        user = request.headers.get("authorization", "unknown")
+        now = time.time()
+
+        # Clean old entries
+        self.requests[user] = [
+            t for t in self.requests[user]
+            if now - t < self.window
+        ]
+
+        if len(self.requests[user]) >= self.requests_per_minute:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded. Max {self.requests_per_minute} requests/minute."
+            )
+
+        self.requests[user].append(now)
+
+# In app/main.py:
+# app.add_middleware(BaseHTTPMiddleware, dispatch=RateLimiter(requests_per_minute=60))
+```
+
+### 5. Caching Strategy
+
+Cache embeddings for common queries to reduce API costs.
+
+```python
+# app/search/cache.py
+import hashlib
+import json
+import sqlite3
+from datetime import datetime
+from app.config import settings
+
+class QueryCache:
+    def __init__(self, ttl_seconds: int = 3600):
+        self.ttl = ttl_seconds
+        self._init_cache_db()
+
+    def _init_cache_db(self):
+        conn = sqlite3.connect(settings.SQLITE_PATH)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS query_cache (
+                query_hash TEXT PRIMARY KEY,
+                response TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def get(self, query: str) -> dict | None:
+        q_hash = hashlib.sha256(query.encode()).hexdigest()
+        conn = sqlite3.connect(settings.SQLITE_PATH)
+        row = conn.execute(
+            "SELECT response, created_at FROM query_cache WHERE query_hash = ?",
+            (q_hash,)
+        ).fetchone()
+        conn.close()
+
+        if row:
+            created = datetime.fromisoformat(row["created_at"])
+            if (datetime.utcnow() - created).seconds < self.ttl:
+                return json.loads(row["response"])
+        return None
+
+    def set(self, query: str, response: dict):
+        q_hash = hashlib.sha256(query.encode()).hexdigest()
+        conn = sqlite3.connect(settings.SQLITE_PATH)
+        conn.execute(
+            "INSERT OR REPLACE INTO query_cache (query_hash, response, created_at) VALUES (?, ?, ?)",
+            (q_hash, json.dumps(response), datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
+```
+
+### 6. Security — Prompt Injection Guard
+
+Detect and block prompt injection in user queries.
+
+```python
+# app/guardrails/injection.py
+import re
+
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?(previous|above|prior)",
+    r"forget\s+(all\s+)?(instructions|rules|context)",
+    r"you\s+are\s+(now|not)\s+(a\s+)?(system|assistant|helpful)",
+    r"system\s+prompt",
+    r"<\|im_start\|>",
+    r"<\|\s*system\s*\|>",
+]
+
+async def check_injection(query: str) -> bool:
+    """Returns True if injection detected."""
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, query, re.IGNORECASE):
+            return True
+    return False
+
+# In query_routes.py:
+# from app.guardrails.injection import check_injection
+# detected = await check_injection(req.query)
+# if detected:
+#     raise HTTPException(status_code=400, detail="Query rejected: potential injection detected")
+```
+
+## Deploy It
+
+Deploy to Railway — the simplest platform for Python async apps.
+
+### Dockerfile
+
+```dockerfile
+# Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN mkdir -p data
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### railway.json
+
+```json
+{
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "healthcheckPath": "/docs",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3
+  }
+}
+```
+
+### Environment Variables in Railway
+
+Set these in the Railway dashboard under Variables:
+
+| Variable | Value | Notes |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | `sk-ant-...` | From console.anthropic.com |
+| `OPENAI_API_KEY` | `sk-...` | From platform.openai.com |
+| `MAX_TOKENS_PER_RUN` | `10000` | Budget cap |
+| `CHROMA_DB_PATH` | `/app/data/chroma` | Persistent volume |
+| `SQLITE_PATH` | `/app/data/ragflow.db` | Persistent volume |
+
+### Deploy Commands
+
+```bash
+# Install Railway CLI
+npm install -g @railway/cli
+
+# Login
+railway login
+
+# Deploy
+railway init
+railway up
+
+# Open the app
+railway open
+```
+
+```bash
+# Verify deployment
+curl -s https://your-app.railway.app/docs | head -5
+# => HTTP 200 — Swagger UI loads
+```
+
+### Health Check Verification
+
+```bash
+# Test the API is responding
+curl -s -o /dev/null -w "%{http_code}" https://your-app.railway.app/docs
+# => 200
+
+# Test an authenticated query
+curl -s -X POST https://your-app.railway.app/api/v1/query \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What documents are available?", "stream": false}' \
+  | python -m json.tool
+```
+
+### Post-Deploy Monitoring
+
+```bash
+# Tail logs
+railway logs
+
+# View metrics
+railway metrics
+
+# Set up uptime monitoring
+curl -s https://your-app.railway.app/api/v1/health
+# => {"status": "healthy", "documents": 42, "queries_today": 128}
+```
+
+## Scale It
+
+### What Breaks First at 10x Load
+
+At 100 concurrent users, the system shows these failure modes:
+
+| Load Level | Failure Point | Symptom |
+|---|---|---|
+| 10 concurrent | ChromaDB query latency | Queries take 500ms+ instead of 50ms |
+| 50 concurrent | SQLite write lock | Ingestion fails with `SQLITE_BUSY` |
+| 100 concurrent | Embedding API rate limit | Embedding requests fail with HTTP 429 |
+| 500 concurrent | Single-process GIL | Uvicorn can't parallelize Python CPU work |
+
+### Architectural Changes Required
+
+1. **Replace SQLite with PostgreSQL** — handles concurrent writes natively
+2. **Replace ChromaDB with Qdrant or Pinecone** — cloud-native vector DB with horizontal scaling
+3. **Add Redis cache** — cache frequent queries to reduce LLM calls by 40-60%
+4. **Replace single FastAPI process with Gunicorn + multiple workers** — scales to CPU cores
+5. **Add message queue (Redis Streams / SQS)** — async ingestion that doesn't block the API
+
+### Rough Cost at Scale
+
+| Component | 1 user / dev | 100 users | 10,000 users |
+|---|---|---|---|
+| LLM (Haiku) | ~$2/month | ~$50/month | ~$500/month |
+| Embeddings | ~$0.10/month | ~$5/month | ~$50/month |
+| Hosting (Railway) | $0 (hobby) | $25/month | $500/month |
+| Vector DB | Free (ChromaDB) | $50/month (Qdrant) | $500/month |
+| **Total** | **~$2/month** | **~$130/month** | **~$1,550/month** |
+
+## What's Next
+
+### Same Level: Enterprise RAG with Multi-Source Ingestion
+
+Add connectors for Slack, Notion, Confluence, and GitHub. Each connector implements the same `SourceConnector` interface — one weekend project per connector.
+
+### Portfolio Level: Multi-Agent Research Platform
+
+Add specialized sub-agents (summarizer, fact-checker, cross-referencer) that collaborate on research queries. This becomes a full research assistant with agentic workflows.
+
+---
+
+## Cost to Build This
+
+| Item | Cost |
+|---|---|
+| Setup (one-time) | ~$0.00–$0.10 |
+| Per query | ~$0.001–$0.02 |
+| Free tier sufficient | Yes (OpenAI $5 credit + free ChromaDB) |
+| Recommended spend cap | $5 |
