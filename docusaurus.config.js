@@ -6,6 +6,9 @@ const config = {
   tagline: 'Learn by building',
   favicon: 'img/favicon.ico',
 
+  scripts: [
+    '/js/sidebar-toggle.js',
+  ],
   plugins: [
     [
       '@docusaurus/plugin-client-redirects',
@@ -18,6 +21,7 @@ const config = {
         ],
       },
     ],
+    './plugins/access-control',
   ],
 
   future: {
@@ -37,6 +41,15 @@ const config = {
   i18n: {
     defaultLocale: 'en',
     locales: ['en'],
+  },
+
+  customFields: {
+    judge0BaseUrl: process.env.JUDGE0_BASE_URL ?? 'http://localhost:2358',
+    judge0AuthToken: process.env.JUDGE0_AUTH_TOKEN ?? '',
+    freeCourses: (process.env.FREE_COURSES ?? 'python-for-ai-engineers,coding-bootcamp').split(',').map(s => s.trim()),
+    freeAllCourses: process.env.FREE_ALL_COURSES === 'true',
+    showDurationOnLanding: process.env.SHOW_DURATION_ON_LANDING === 'true',
+    showDurationOnContent: process.env.SHOW_DURATION_ON_CONTENT === 'true',
   },
 
   presets: [
@@ -62,15 +75,14 @@ const config = {
       items: [
         // === TOPICS ===
         // Claude Code inserts new items here. Do not remove these markers.
-                                                                { type: 'docSidebar', sidebarId: 'pythonForAi', position: 'left', label: 'Python for AI' },
-                                { type: 'docSidebar', sidebarId: 'agenticAiFundamentals', position: 'left', label: 'Agentic AI Fundamentals' },
-                                { type: 'docSidebar', sidebarId: 'systemDesignFundamentalsSidebar', position: 'left', label: 'System Design' },
-                                                                { type: 'docSidebar', sidebarId: 'gitGithubActionsSidebar', position: 'left', label: 'Git & GitHub Actions' },
-                                { type: 'docSidebar', sidebarId: 'aiEngineeringHandsOnSidebar', position: 'left', label: 'AI Engineering Crash Course' },
-                                { type: 'docSidebar', sidebarId: 'buildWithAiSidebar', position: 'left', label: 'Build with AI' },
-                                { type: 'docSidebar', sidebarId: 'softwareEngineeringSidebar', position: 'left', label: 'Software Engineering' },
-                                        // === /TOPICS ===
+        { type: 'custom-exploreCourses', position: 'left' },
+        // === /TOPICS ===
       ],
+    },
+    docs: {
+      sidebar: {
+        hideable: true,
+      },
     },
     prism: {
       theme: prismThemes.github,

@@ -3,24 +3,83 @@ import Link from '@docusaurus/Link';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import HomepageFeatures from '@site/src/components/HomepageFeatures';
-
 import Heading from '@theme/Heading';
 import styles from './index.module.css';
 
-function HomepageHeader() {
-  const {siteConfig} = useDocusaurusContext();
+const stats = [
+  { value: '8', label: 'Courses' },
+  { value: '300+', label: 'Lessons' },
+  { value: '20+', label: 'Projects' },
+  { value: '200+', label: 'Exercises' },
+  { value: '6', label: 'Languages' },
+];
+
+const pillars = [
+  {
+    icon: '📖',
+    title: 'Text-First, Deep Learning',
+    description: 'No passive videos. Every concept is explained in clear, annotated text with real code — the way engineers actually learn best. You read, you code, you build.',
+  },
+  {
+    icon: '🧠',
+    title: 'AI-Powered & Current',
+    description: 'Courses updated for 2026 with LLMs, agents, MCP, and RAG. Learn the tools and patterns that define modern AI engineering — not yesterday\'s curriculum.',
+  },
+  {
+    icon: '🎯',
+    title: 'Interview-Ready Projects',
+    description: 'FAANG-level system design, LeetCode-style coding challenges, and production-grade portfolio projects. Build the skills that get you hired.',
+  },
+];
+
+const approach = [
+  {
+    step: '1',
+    title: 'Learn the Concept',
+    description: 'Every topic starts with a clear mental model — stories, analogies, and diagrams that build intuition before you write a single line of code.',
+  },
+  {
+    step: '2',
+    title: 'Build Something Real',
+    description: 'Annotated, progressive code examples. You never see unexplained code — every line is walked through, and every example is production-quality.',
+  },
+  {
+    step: '3',
+    title: 'Avoid Common Mistakes',
+    description: 'Each lesson surfaces the pitfalls that trip up most engineers. You learn what to watch for and how to debug when things go wrong.',
+  },
+  {
+    step: '4',
+    title: 'Practice & Test Yourself',
+    description: 'Exercises, quizzes, and challenges at every level — from quick checks to deep coding problems. Practice is built into every module.',
+  },
+];
+
+function HeroSection() {
+  const { siteConfig } = useDocusaurusContext();
   return (
-    <header className={clsx('hero hero--primary', styles.heroBanner)}>
-      <div className="container">
-        <Heading as="h1" className="hero__title">
-          {siteConfig.title}
+    <header className={styles.hero}>
+      <div className={styles.heroBg} />
+      <div className={styles.heroContent}>
+        <span className={styles.heroBadge}>Learn by Building</span>
+        <Heading as="h1" className={styles.heroTitle}>
+          Master AI Engineering<br />
+          <span className={styles.heroHighlight}>Through Real Projects</span>
         </Heading>
-        <p className="hero__subtitle">{siteConfig.tagline}</p>
-        <div className={styles.buttons}>
+        <p className={styles.heroSubtitle}>
+          A complete, hands-on curriculum — from Python fundamentals to production AI systems.
+          Text-first lessons, real projects, and interview-ready skills. No fluff, no filler.
+        </p>
+        <div className={styles.heroButtons}>
           <Link
-            className="button button--secondary button--lg"
-            to="/docs/intro">
-            Docusaurus Tutorial - 5min ⏱️
+            className={styles.primaryBtn}
+            to="/docs/python-for-ai-engineers/">
+            Start Learning →
+          </Link>
+          <Link
+            className={styles.secondaryBtn}
+            to="#courses">
+            Browse Courses
           </Link>
         </div>
       </div>
@@ -28,16 +87,82 @@ function HomepageHeader() {
   );
 }
 
+function StatsBar() {
+  return (
+    <section className={styles.statsBar}>
+      <div className={styles.statsContainer}>
+        {stats.map((stat) => (
+          <div key={stat.label} className={styles.statItem}>
+            <span className={styles.statValue}>{stat.value}</span>
+            <span className={styles.statLabel}>{stat.label}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function PillarsSection() {
+  return (
+    <section className={styles.pillars}>
+      <div className={styles.container}>
+        <div className={styles.sectionHeader}>
+          <Heading as="h2" className={styles.sectionTitle}>Why Sypher?</Heading>
+          <p className={styles.sectionSubtitle}>
+            We built the curriculum we wish we had — practical, deep, and built for the way engineers actually learn.
+          </p>
+        </div>
+        <div className={styles.pillarGrid}>
+          {pillars.map((pillar) => (
+            <div key={pillar.title} className={styles.pillarCard}>
+              <span className={styles.pillarIcon}>{pillar.icon}</span>
+              <Heading as="h3" className={styles.pillarTitle}>{pillar.title}</Heading>
+              <p className={styles.pillarDesc}>{pillar.description}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ApproachSection() {
+  return (
+    <section className={styles.approach}>
+      <div className={styles.container}>
+        <div className={styles.sectionHeader}>
+          <Heading as="h2" className={styles.sectionTitle}>How Every Lesson Works</Heading>
+          <p className={styles.sectionSubtitle}>
+            A consistent four-part structure across every topic — so you always know what to expect and how to progress.
+          </p>
+        </div>
+        <div className={styles.approachGrid}>
+          {approach.map((item) => (
+            <div key={item.step} className={styles.approachCard}>
+              <span className={styles.approachStep}>{item.step}</span>
+              <Heading as="h3" className={styles.approachTitle}>{item.title}</Heading>
+              <p className={styles.approachDesc}>{item.description}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 export default function Home() {
-  const {siteConfig} = useDocusaurusContext();
+  const { siteConfig } = useDocusaurusContext();
   return (
     <Layout
-      title={`Hello from ${siteConfig.title}`}
-      description="Description will go into a meta tag in <head />">
-      <HomepageHeader />
-      <main>
+      title="Learn AI Engineering & System Design"
+      description="Sypher is a hands-on learning platform for AI engineering, system design, Python, and software engineering. Text-first lessons with real projects.">
+      <HeroSection />
+      <StatsBar />
+      <PillarsSection />
+      <div id="courses">
         <HomepageFeatures />
-      </main>
+      </div>
+      <ApproachSection />
     </Layout>
   );
 }
