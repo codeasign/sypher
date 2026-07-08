@@ -80,7 +80,7 @@ function DocBookmarkExplorer({ docBookmarks, onRemove }) {
                 <div className={styles.fileList}>
                   {pages.map((p) => (
                     <div key={p.doc_path} className={styles.fileRow}>
-                      <Link to={`/docs/${p.doc_path}`} className={styles.fileLink}>
+                      <Link to={`/docs/${p.doc_path.replace(/\/index$/, '')}`} className={styles.fileLink}>
                         <FileIcon />
                         <span className={styles.fileName}>{p.title || p.doc_path}</span>
                       </Link>

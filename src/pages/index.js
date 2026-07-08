@@ -24,13 +24,13 @@ const pillars = [
   },
   {
     icon: '🧠',
-    title: 'AI-Powered & Current',
-    description: 'Courses updated for 2026 with LLMs, agents, MCP, and RAG. Learn the tools and patterns that define modern AI engineering — not yesterday\'s curriculum.',
+    title: 'Built for Modern AI Engineering',
+    description: 'Deep dives into LLMs, agents, MCP, and RAG — the tools and patterns shaping how AI systems are actually built today, not a decade-old curriculum.',
   },
   {
     icon: '🎯',
     title: 'Interview-Ready Projects',
-    description: 'FAANG-level system design, LeetCode-style coding challenges, and production-grade portfolio projects. Build the skills that get you hired.',
+    description: 'Real-world system design, coding challenges, and production-grade portfolio projects that build the skills employers actually look for.',
   },
 ];
 
@@ -57,6 +57,12 @@ const approach = [
   },
 ];
 
+const accentClasses = ['accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6'];
+
+function accentFor(index) {
+  return accentClasses[index % accentClasses.length];
+}
+
 function HeroSection() {
   const { siteConfig } = useDocusaurusContext();
   const { user } = useAuth();
@@ -66,27 +72,43 @@ function HeroSection() {
   return (
     <header className={styles.hero}>
       <div className={styles.heroBg} />
-      <div className={styles.heroContent}>
-        <span className={styles.heroBadge}>Learn by Building</span>
-        <Heading as="h1" className={styles.heroTitle}>
-          Master AI Engineering<br />
-          <span className={styles.heroHighlight}>Through Real Projects</span>
-        </Heading>
-        <p className={styles.heroSubtitle}>
-          A complete, hands-on curriculum — from Python fundamentals to production AI systems.
-          Text-first lessons, real projects, and interview-ready skills. No fluff, no filler.
-        </p>
-        <div className={styles.heroButtons}>
-          <Link
-            className={styles.primaryBtn}
-            to={startUrl}>
-            Start Learning →
-          </Link>
-          <Link
-            className={styles.secondaryBtn}
-            to="#courses">
-            Browse Courses
-          </Link>
+      <div className={styles.container}>
+        <div className={styles.heroGrid}>
+          <div className={styles.heroContent}>
+            <span className={styles.heroBadge}>Learn by Building</span>
+            <Heading as="h1" className={styles.heroTitle}>
+              Master AI Engineering<br />
+              <span className={styles.heroHighlight}>Through Real Projects</span>
+            </Heading>
+            <p className={styles.heroSubtitle}>
+              A complete, hands-on curriculum — from Python fundamentals to production AI systems.
+              Text-first lessons, real projects, and interview-ready skills. No fluff, no filler.
+            </p>
+            <div className={styles.heroButtons}>
+              <Link
+                className={styles.primaryBtn}
+                to={startUrl}>
+                Start Learning →
+              </Link>
+              <Link
+                className={styles.secondaryBtn}
+                to="#courses">
+                Browse Courses
+              </Link>
+            </div>
+          </div>
+          <div className={styles.heroVisual}>
+            {pillars.map((pillar, index) => (
+              <div
+                key={pillar.title}
+                className={`${styles.heroTile} ${styles[accentFor(index)]}`}
+              >
+                <span className={styles.heroTileIcon}>{pillar.icon}</span>
+                <span className={styles.heroTileTitle}>{pillar.title}</span>
+                <p className={styles.heroTileDesc}>{pillar.description}</p>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
     </header>
@@ -95,14 +117,19 @@ function HeroSection() {
 
 function StatsBar() {
   return (
-    <section className={styles.statsBar}>
-      <div className={styles.statsContainer}>
-        {stats.map((stat) => (
-          <div key={stat.label} className={styles.statItem}>
-            <span className={styles.statValue}>{stat.value}</span>
-            <span className={styles.statLabel}>{stat.label}</span>
-          </div>
-        ))}
+    <section className={styles.trustBand}>
+      <div className={styles.container}>
+        <div className={styles.statsGrid}>
+          {stats.map((stat, index) => (
+            <div
+              key={stat.label}
+              className={`${styles.statBadge} ${styles[accentFor(index)]}`}
+            >
+              <span className={styles.statValue}>{stat.value}</span>
+              <span className={styles.statLabel}>{stat.label}</span>
+            </div>
+          ))}
+        </div>
       </div>
     </section>
   );
@@ -119,8 +146,11 @@ function PillarsSection() {
           </p>
         </div>
         <div className={styles.pillarGrid}>
-          {pillars.map((pillar) => (
-            <div key={pillar.title} className={styles.pillarCard}>
+          {pillars.map((pillar, index) => (
+            <div
+              key={pillar.title}
+              className={`${styles.pillarCard} ${styles[accentFor(index)]}`}
+            >
               <span className={styles.pillarIcon}>{pillar.icon}</span>
               <Heading as="h3" className={styles.pillarTitle}>{pillar.title}</Heading>
               <p className={styles.pillarDesc}>{pillar.description}</p>
@@ -142,12 +172,13 @@ function ApproachSection() {
             A consistent four-part structure across every topic — so you always know what to expect and how to progress.
           </p>
         </div>
-        <div className={styles.approachGrid}>
+        <div className={styles.timeline}>
+          <div className={styles.timelineLine} aria-hidden="true" />
           {approach.map((item) => (
-            <div key={item.step} className={styles.approachCard}>
-              <span className={styles.approachStep}>{item.step}</span>
-              <Heading as="h3" className={styles.approachTitle}>{item.title}</Heading>
-              <p className={styles.approachDesc}>{item.description}</p>
+            <div key={item.step} className={styles.timelineStep}>
+              <div className={styles.timelineCircle}>{item.step}</div>
+              <Heading as="h3" className={styles.timelineTitle}>{item.title}</Heading>
+              <p className={styles.timelineDesc}>{item.description}</p>
             </div>
           ))}
         </div>
