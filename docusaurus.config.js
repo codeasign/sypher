@@ -43,6 +43,7 @@ const config = {
     showDurationOnContent: process.env.SHOW_DURATION_ON_CONTENT === 'true',
     supabaseUrl: process.env.SUPABASE_URL,
     supabaseAnonKey: process.env.SUPABASE_ANON_KEY,
+    web3formsAccessKey: process.env.WEB3FORMS_ACCESS_KEY ?? '',
   },
 
   presets: [
@@ -70,6 +71,7 @@ const config = {
         // Claude Code inserts new items here. Do not remove these markers.
         { type: 'custom-exploreCourses', position: 'left' },
         // === /TOPICS ===
+        { to: '/corporate-training', label: 'Corporate Training', position: 'left' },
         { type: 'custom-login', position: 'right' },
       ],
     },
