@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 import {themes as prismThemes} from 'prism-react-renderer';
 
 /** @type {import('@docusaurus/types').Config} */
@@ -10,17 +12,6 @@ const config = {
     '/js/sidebar-toggle.js',
   ],
   plugins: [
-    [
-      '@docusaurus/plugin-client-redirects',
-      {
-        redirects: [
-          {
-            to: '/',
-            from: ['/docs', '/docs/'],
-          },
-        ],
-      },
-    ],
     './plugins/access-control',
   ],
 
@@ -50,6 +41,8 @@ const config = {
     freeAllCourses: process.env.FREE_ALL_COURSES === 'true',
     showDurationOnLanding: process.env.SHOW_DURATION_ON_LANDING === 'true',
     showDurationOnContent: process.env.SHOW_DURATION_ON_CONTENT === 'true',
+    supabaseUrl: process.env.SUPABASE_URL,
+    supabaseAnonKey: process.env.SUPABASE_ANON_KEY,
   },
 
   presets: [
@@ -77,6 +70,7 @@ const config = {
         // Claude Code inserts new items here. Do not remove these markers.
         { type: 'custom-exploreCourses', position: 'left' },
         // === /TOPICS ===
+        { type: 'custom-login', position: 'right' },
       ],
     },
     docs: {

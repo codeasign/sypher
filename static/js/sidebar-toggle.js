@@ -4,6 +4,17 @@
   var STORAGE_KEY = 'sypher-sidebar-collapsed';
   var btn = null;
 
+  function isDocsPage() {
+    return window.location.pathname.indexOf('/docs/') === 0;
+  }
+
+  function removeToggle() {
+    if (btn && btn.parentNode) {
+      btn.parentNode.removeChild(btn);
+    }
+    document.body.classList.remove('sypher-sidebar-collapsed');
+  }
+
   function createToggle() {
     if (btn && btn.parentNode) return; // Already exists
 
@@ -39,21 +50,41 @@
     }
   }
 
+  function sync() {
+    if (isDocsPage()) {
+      createToggle();
+    } else {
+      removeToggle();
+    }
+  }
+
   // Create the button
   function init() {
     if (!document.body) {
       setTimeout(init, 50);
       return;
     }
-    createToggle();
+    sync();
 
-    // Watch for mutations — re-add if React removes it
+    // Watch for mutations — re-add if React removes it (only on docs pages)
     var observer = new MutationObserver(function() {
-      if (!btn || !btn.parentNode) {
+      if (isDocsPage() && (!btn || !btn.parentNode)) {
         createToggle();
       }
     });
     observer.observe(document.body, { childList: true, subtree: false });
+
+    // Docusaurus is a client-side-routed SPA — patch history APIs so we can
+    // react to navigation without a full page reload.
+    ['pushState', 'replaceState'].forEach(function(method) {
+      var original = history[method];
+      history[method] = function() {
+        var result = original.apply(this, arguments);
+        sync();
+        return result;
+      };
+    });
+    window.addEventListener('popstate', sync);
   }
 
   if (document.readyState === 'loading') {

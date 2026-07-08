@@ -4,6 +4,8 @@ import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import HomepageFeatures from '@site/src/components/HomepageFeatures';
 import Heading from '@theme/Heading';
+import { useAuth } from '@site/src/contexts/AuthContext';
+import RedirectIfAuthed from '@site/src/components/RedirectIfAuthed';
 import styles from './index.module.css';
 
 const stats = [
@@ -57,6 +59,10 @@ const approach = [
 
 function HeroSection() {
   const { siteConfig } = useDocusaurusContext();
+  const { user } = useAuth();
+  const startUrl = user
+    ? '/dashboard'
+    : `/login?redirect=${encodeURIComponent('/docs/python-for-ai-engineers/')}`;
   return (
     <header className={styles.hero}>
       <div className={styles.heroBg} />
@@ -73,7 +79,7 @@ function HeroSection() {
         <div className={styles.heroButtons}>
           <Link
             className={styles.primaryBtn}
-            to="/docs/python-for-ai-engineers/">
+            to={startUrl}>
             Start Learning →
           </Link>
           <Link
@@ -156,13 +162,15 @@ export default function Home() {
     <Layout
       title="Learn AI Engineering & System Design"
       description="Sypher is a hands-on learning platform for AI engineering, system design, Python, and software engineering. Text-first lessons with real projects.">
-      <HeroSection />
-      <StatsBar />
-      <PillarsSection />
-      <div id="courses">
-        <HomepageFeatures />
-      </div>
-      <ApproachSection />
+      <RedirectIfAuthed>
+        <HeroSection />
+        <StatsBar />
+        <PillarsSection />
+        <div id="courses">
+          <HomepageFeatures />
+        </div>
+        <ApproachSection />
+      </RedirectIfAuthed>
     </Layout>
   );
 }

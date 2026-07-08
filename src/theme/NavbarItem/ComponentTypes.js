@@ -8,6 +8,7 @@ import DocSidebarNavbarItem from '@theme/NavbarItem/DocSidebarNavbarItem';
 import DocsVersionNavbarItem from '@theme/NavbarItem/DocsVersionNavbarItem';
 import DocsVersionDropdownNavbarItem from '@theme/NavbarItem/DocsVersionDropdownNavbarItem';
 import ExploreCoursesNavbarItem from '@theme/NavbarItem/ExploreCoursesNavbarItem';
+import LoginNavbarItem from '@theme/NavbarItem/LoginNavbarItem';
 
 const ComponentTypes = {
   default: DefaultNavbarItem,
@@ -20,6 +21,7 @@ const ComponentTypes = {
   docsVersion: DocsVersionNavbarItem,
   docsVersionDropdown: DocsVersionDropdownNavbarItem,
   'custom-exploreCourses': ExploreCoursesNavbarItem,
+  'custom-login': LoginNavbarItem,
 };
 
 export default ComponentTypes;
