@@ -27,7 +27,6 @@ function DashboardContent(): JSX.Element {
         <>
           <div className={styles.subsectionHeader}>
             <h2 className={styles.coursesHeading}>Free Courses</h2>
-            <span className={styles.subsectionCount}>{freeCoursesList.length} courses</span>
           </div>
           <DashboardCourseListing
             courses={freeCoursesList}
@@ -39,7 +38,6 @@ function DashboardContent(): JSX.Element {
         <>
           <div className={styles.subsectionHeader}>
             <h2 className={styles.coursesHeading}>Premium Courses</h2>
-            <span className={styles.subsectionCount}>{premiumCoursesList.length} courses</span>
           </div>
           <DashboardCourseListing
             courses={premiumCoursesList}

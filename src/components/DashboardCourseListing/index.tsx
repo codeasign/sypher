@@ -24,8 +24,8 @@ function DashboardCourseCard({
   isFree,
   slug,
 }: CourseCardProps) {
-  return (
-    <article className={styles.card} style={{ '--card-gradient': gradient } as React.CSSProperties}>
+  const cardContent = (
+    <>
       <div className={styles.cardHeader}>
         <span className={styles.cardIcon}>{icon}</span>
         <div className={styles.cardHeaderRight}>
@@ -38,15 +38,33 @@ function DashboardCourseCard({
       </div>
       <Heading as="h3" className={styles.cardTitle}>{title}</Heading>
       <p className={styles.cardDesc}>{description}</p>
-      <div className={styles.cardActions}>
-        <Link to={`/docs/${slug}/`} className={styles.btnPrimary}>
-          Learn →
-        </Link>
-        <Link to={url} className={styles.btnSecondary}>
-          View Course
-        </Link>
-      </div>
-    </article>
+      {isFree && (
+        <div className={styles.cardActions}>
+          <Link to={`/docs/${slug}/`} className={styles.btnPrimary}>
+            Learn →
+          </Link>
+          <Link to={url} className={styles.btnSecondary}>
+            View Course
+          </Link>
+        </div>
+      )}
+    </>
+  );
+
+  if (isFree) {
+    return (
+      <article className={styles.card} style={{ '--card-gradient': gradient } as React.CSSProperties}>
+        {cardContent}
+      </article>
+    );
+  }
+
+  return (
+    <Link to={url} className={styles.cardLink} style={{ textDecoration: 'none', color: 'inherit' }}>
+      <article className={styles.card} style={{ '--card-gradient': gradient } as React.CSSProperties}>
+        {cardContent}
+      </article>
+    </Link>
   );
 }
 
