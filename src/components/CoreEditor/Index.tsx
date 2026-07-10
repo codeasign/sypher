@@ -40,6 +40,12 @@ const LANGUAGE_IDS: Record<string, number> = {
   c: 50, c_gcc8: 49, c_gcc7: 48,
   csharp: 51, csharp_mono54: 16, csharp_mono52: 17,
   go: 60, rust: 73, rust120: 42, typescript: 74,
+  // Search/Sorting Algorithms 9-language set. IDs are best-known placeholders
+  // against the public Judge0 CE demo instance — verify/update once the user's
+  // custom Judge0 docker image (exact versions: Python 3.11, GCC 13, Clang 17,
+  // Java 21, .NET 8, Node 20.10.0, TypeScript 5.1.6, Rust 1.79.0, Go 1.22) is live.
+  python311: 92, c_gcc13: 103, cpp_clang17: 76, java21: 91, csharp_dotnet8: 51,
+  javascript_node20: 97, typescript516: 94, rust179: 108, go122: 106,
 };
 
 const LANGUAGE_LABELS: Record<string, string> = {
@@ -53,6 +59,10 @@ const LANGUAGE_LABELS: Record<string, string> = {
   csharp_mono52: 'C# (Mono 5.2)',
   go: 'Go 1.13', rust: 'Rust 1.40', rust120: 'Rust 1.20',
   typescript: 'TypeScript 3.7',
+  python311: 'Python 3.11', c_gcc13: 'C (GCC 13)', cpp_clang17: 'C++ (Clang 17)',
+  java21: 'Java 21', csharp_dotnet8: 'C# / .NET 8',
+  javascript_node20: 'JavaScript (Node 20.10.0)', typescript516: 'TypeScript 5.1.6',
+  rust179: 'Rust 1.79.0', go122: 'Go 1.22',
 };
 
 const MONACO_LANGUAGES: Record<string, string> = {
@@ -62,6 +72,9 @@ const MONACO_LANGUAGES: Record<string, string> = {
   c: 'c', c_gcc8: 'c', c_gcc7: 'c',
   csharp: 'csharp', csharp_mono54: 'csharp', csharp_mono52: 'csharp',
   rust120: 'rust',
+  python311: 'python', c_gcc13: 'c', cpp_clang17: 'cpp', java21: 'java',
+  csharp_dotnet8: 'csharp', javascript_node20: 'javascript',
+  typescript516: 'typescript', rust179: 'rust', go122: 'go',
 };
 
 const BASE_LANGUAGE: Record<string, string> = {

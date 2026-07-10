@@ -159,6 +159,34 @@ const courses = [
       { label: 'Design', topics: ['Design HashMap', 'Min Stack', 'LRU Cache', 'Design Browser History', 'LFU Cache'] },
     ],
   },
+  {
+    slug: 'search-algorithms',
+    icon: '🔍',
+    title: 'Search Algorithms',
+    tag: 'New',
+    difficulty: 'Beginner → Advanced',
+    hours: '12–18h',
+    description: 'A reference course covering the search algorithms every engineer should know cold — from a plain linear scan to A* pathfinding.',
+    longDesc: 'Each module is a single self-contained page: pseudocode, algorithm explanation, time/space complexity, and complete runnable implementations in Java, Python, TypeScript, and C#, plus 5 shared practice test cases per module.',
+    gradient: 'linear-gradient(135deg, #00838F 0%, #4DD0E1 100%)',
+    modules: [
+      { label: 'Search Algorithms', topics: ['Linear Search', 'Binary Search', 'Binary Search Variants', 'Ternary Search', 'Jump Search', 'Interpolation Search', 'Exponential Search', 'Depth-First Search', 'Breadth-First Search', 'A* Search', 'Two-Pointer Search Patterns', 'Search in 2D Matrix'] },
+    ],
+  },
+  {
+    slug: 'sorting-algorithms',
+    icon: '🔀',
+    title: 'Sorting Algorithms',
+    tag: 'New',
+    difficulty: 'Beginner → Advanced',
+    hours: '10–15h',
+    description: 'A reference course covering the sorting algorithms every engineer should know cold — from Bubble Sort to the Tim Sort hybrid powering every modern language.',
+    longDesc: 'Each module is a single self-contained page: pseudocode, algorithm explanation, time/space complexity, stability, and complete runnable implementations in Python, C, C++, Java, C#, JavaScript, TypeScript, Rust, and Go, plus 5 shared practice test cases per module.',
+    gradient: 'linear-gradient(135deg, #4A148C 0%, #7B1FA2 100%)',
+    modules: [
+      { label: 'Sorting Algorithms', topics: ['Bubble Sort', 'Selection Sort', 'Insertion Sort', 'Merge Sort', 'Quick Sort', 'Heap Sort', 'Counting Sort', 'Radix Sort', 'Bucket Sort', 'Shell Sort', 'Tim Sort', 'Comparison & Selection Guide'] },
+    ],
+  },
 ];
 
 export default courses;

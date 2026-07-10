@@ -87,6 +87,28 @@ export const courses = [
     icon: '💻',
     tag: 'Interview Prep',
   },
+  {
+    title: 'Search Algorithms',
+    description: 'A reference course covering the search algorithms every engineer should know cold — from linear scan to A* pathfinding, with implementations in 4 languages.',
+    url: '/course/search-algorithms',
+    difficulty: 'Beginner to Advanced',
+    hours: '12–18h',
+    topics: ['Binary Search', 'DFS', 'BFS', 'A*', 'Two-Pointer'],
+    gradient: 'linear-gradient(135deg, #00838F 0%, #4DD0E1 100%)',
+    icon: '🔍',
+    tag: 'New',
+  },
+  {
+    title: 'Sorting Algorithms',
+    description: 'A reference course covering the sorting algorithms every engineer should know cold — from Bubble Sort to the Tim Sort hybrid powering every modern language, with implementations in 9 languages.',
+    url: '/course/sorting-algorithms',
+    difficulty: 'Beginner to Advanced',
+    hours: '10–15h',
+    topics: ['Merge Sort', 'Quick Sort', 'Heap Sort', 'Radix Sort', 'Tim Sort'],
+    gradient: 'linear-gradient(135deg, #4A148C 0%, #7B1FA2 100%)',
+    icon: '🔀',
+    tag: 'New',
+  },
 ];
 
 let cachedConfig = null;

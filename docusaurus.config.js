@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ override: true });
 
 import {themes as prismThemes} from 'prism-react-renderer';
 
@@ -72,6 +72,8 @@ const config = {
         { type: 'custom-exploreCourses', position: 'left' },
         // === /TOPICS ===
         { to: '/corporate-training', label: 'Corporate Training', position: 'left' },
+        { to: '/resume-review', label: 'Resume Review', position: 'left' },
+        { to: '/mock-interview', label: 'Mock Interview', position: 'left' },
         { type: 'custom-login', position: 'right' },
       ],
     },
@@ -83,7 +85,7 @@ const config = {
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
-      additionalLanguages: ['python', 'bash', 'json', 'typescript'],
+      additionalLanguages: ['python', 'bash', 'json', 'typescript', 'c', 'cpp', 'java', 'csharp', 'javascript', 'rust', 'go'],
     },
   }),
 };

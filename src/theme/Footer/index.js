@@ -1,10 +1,13 @@
 import React from 'react';
 import Link from '@docusaurus/Link';
+import { useLocation } from '@docusaurus/router';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
+import InsideFooter from '@site/src/components/InsideFooter';
 import styles from './styles.module.css';
 
 const corporateLinks = [
   { label: 'Corporate Training', to: '/corporate-training' },
+  { label: 'Resume Review', to: '/resume-review' },
 ];
 
 const legalLinks = [
@@ -14,7 +17,13 @@ const legalLinks = [
 
 export default function Footer() {
   const { siteConfig } = useDocusaurusContext();
+  const location = useLocation();
   const year = new Date().getFullYear();
+
+  // On doc/course pages, show a minimal footer with just copyright text
+  if (location.pathname.startsWith('/docs/')) {
+    return <InsideFooter />;
+  }
 
   return (
     <footer className={styles.footer}>
