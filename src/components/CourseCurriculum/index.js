@@ -91,7 +91,7 @@ export default function CourseCurriculum() {
 
   return (
     <div className="course-curriculum">
-      <h2>Course Curriculum</h2>
+      <h2>Course Details</h2>
       {sections.map((section) => {
         const topics = {};
         for (const docId of section.docIds) {

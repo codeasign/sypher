@@ -3,7 +3,14 @@ import styles from './styles.module.css';
 
 export default function YouTube({id, title = 'YouTube video player', start}) {
   if (!id) return null;
-  const params = new URLSearchParams({rel: '0'});
+  const params = new URLSearchParams({
+    rel: '0',
+    iv_load_policy: '3',
+    modestbranding: '1',
+    controls: '0',
+    loop: '1',
+    playlist: id,
+  });
   if (start) params.set('start', String(start));
   return (
     <div className={styles.wrapper}>

@@ -9,6 +9,19 @@ export const courses = [
     gradient: 'linear-gradient(135deg, #1E4D8C 0%, #357ABD 100%)',
     icon: '🐍',
     tag: 'Flagship',
+    videoId: 'z92nyOfBG9g',
+    modules: [
+      { label: 'Section 1 — Python Foundations', topics: ['Setup', 'First Program', 'Virtual Environments', 'Variables', 'Strings', 'Lists', 'Tuples', 'Dictionaries', 'Sets', 'Control Flow', 'Loops'] },
+      { label: 'Section 2 — Functions & Modular Code', topics: ['Functions', 'Modules', 'File Handling', 'Comprehensions', 'Generators', 'Decorators', 'Context Managers'] },
+      { label: 'Section 3 — Professional Python', topics: ['Error Handling', 'Dataclasses', 'Type Hints', 'Logging'] },
+      { label: 'Section 4 — Object-Oriented Python', topics: ['Classes', 'Inheritance', 'Composition', 'Magic Methods'] },
+      { label: 'Section 5 — Data & Analytics', topics: ['NumPy', 'Pandas', 'Data Visualization', 'JSON', 'CSV'] },
+      { label: 'Section 6 — APIs & Async', topics: ['Requests', 'HTTPX', 'API Authentication', 'Async Python'] },
+      { label: 'Section 7 — AI Engineering', topics: ['LLM API Basics', 'Prompt Engineering', 'Structured Output', 'Embeddings', 'RAG', 'AI Pipelines'] },
+      { label: 'Section 8 — Dev Tools', topics: ['Pytest', 'Docker', 'CI/CD', 'Packaging'] },
+      { label: 'Section 9 — Production Skills', topics: ['Project Structure', 'Clean Code', 'Performance'] },
+      { label: 'Practice', topics: ['Beginner Exercises', 'Intermediate Exercises', 'Advanced Exercises', 'Solutions'] },
+    ],
   },
   {
     title: 'Agentic AI Fundamentals',
@@ -20,6 +33,17 @@ export const courses = [
     gradient: 'linear-gradient(135deg, #6A1B9A 0%, #9C27B0 100%)',
     icon: '🤖',
     tag: 'Trending',
+    videoId: 'z92nyOfBG9g',
+    modules: [
+      { label: 'Section 1 — Foundations', topics: ['What Is AI Engineering?', 'LLM Fundamentals', 'Tokens and Context Windows', 'Prompt Engineering Basics', 'LLM APIs in Practice'] },
+      { label: 'Section 2 — Prompt Engineering Deep Dive', topics: ['System Prompts', 'Prompt Patterns', 'Few-Shot Prompting', 'Chain of Thought & Reasoning', 'Prompt Templates', 'Structured Output Prompting', 'Prompt Testing & Iteration'] },
+      { label: 'Section 3 — Agent Architecture', topics: ['What Is an Agent?', 'Agent vs Chatbot vs Workflow', 'Anatomy of an Agent', 'Reasoning vs Execution', 'Agent Memory', 'Agent Tools & Tool Calling', 'Planning & Decision Making'] },
+      { label: 'Section 4 — Agent Loops', topics: ['Observe-Think-Act Loop', 'ReAct Pattern', 'Plan and Execute', 'Reflection & Self-Correction', 'Loop Safety & Recovery', 'Human in the Loop'] },
+      { label: 'Section 5 — Multi-Agent Systems', topics: ['Orchestrator & Supervisor Patterns', 'Specialist Agents', 'Agent Communication & Coordination', 'Shared Memory & State', 'When to Use Multi-Agent'] },
+      { label: 'Section 6 — MCP', topics: ['What Is MCP?', 'MCP Architecture', 'MCP Primitives', 'Transports', 'Building an MCP Server', 'Building an MCP Client', 'MCP with Claude Code'] },
+      { label: 'Section 7 — Evaluation & Safety', topics: ['Evaluating Agents', 'Trajectory Evaluation', 'Tool Evaluation', 'Prompt Injection & Guardrails', 'Observability & Tracing', 'Cost & Latency Tracking'] },
+      { label: 'Section 8 — Production', topics: ['Deployment Patterns', 'Versioning Prompts & Tools', 'Configuration Management', 'Authentication', 'Scaling Agent Systems', 'Caching & Retries', 'Monitoring Production Agents'] },
+    ],
   },
   {
     title: 'System Design Fundamentals',
@@ -31,6 +55,14 @@ export const courses = [
     gradient: 'linear-gradient(135deg, #E65100 0%, #FF8F00 100%)',
     icon: '🏗️',
     tag: 'Popular',
+    videoId: 'z92nyOfBG9g',
+    modules: [
+      { label: 'Section 1 — Foundations of System Design', topics: ['What Is System Design?', 'Why System Design Matters', 'Functional vs Non-Functional Requirements', 'Scalability', 'Availability', 'Reliability', 'Durability', 'Consistency', 'Latency vs Throughput', 'Capacity Estimation', 'System Design Process'] },
+      { label: 'Section 2 — Core Building Blocks', topics: ['Load Balancing', 'Caching', 'Databases', 'CDNs', 'DNS', 'API Design', 'Proxies', 'Message Queues'] },
+      { label: 'Section 3 — Distributed Systems Concepts', topics: ['Consistent Hashing', 'Data Partitioning', 'Replication', 'CAP Theorem', 'PACELC', 'Gossip Protocol', 'Quorum', 'Leader Election'] },
+      { label: 'Section 4 — Design Patterns', topics: ['Microservices', 'Event-Driven Architecture', 'CQRS', 'Saga Pattern', 'Strangler Fig', 'Circuit Breaker', 'Bulkhead'] },
+      { label: 'Section 5 — Real-World Case Studies', topics: ['URL Shortener', 'Instagram', 'Twitter', 'Uber', 'Dropbox', 'Netflix', 'YouTube', 'WhatsApp'] },
+    ],
   },
   {
     title: 'Git & GitHub Actions',
@@ -42,6 +74,16 @@ export const courses = [
     gradient: 'linear-gradient(135deg, #1A237E 0%, #3949AB 100%)',
     icon: '🔀',
     tag: 'Essential',
+    videoId: 'z92nyOfBG9g',
+    modules: [
+      { label: 'Getting Started', topics: ['What Version Control Is', 'Using the Terminal', 'Installing & Configuring Git', 'Creating Your GitHub Account', 'Your First Repository'] },
+      { label: 'Git Foundations', topics: ['What Is Version Control', 'Init, Add, and Commit', 'The Staging Area', 'Log and History', 'Gitignore', 'Reset, Revert, and Checkout'] },
+      { label: 'Branching & Merging', topics: ['Branches', 'Merge', 'Rebase', 'Merge Conflicts', 'Cherry-Pick', 'Stash'] },
+      { label: 'Collaboration', topics: ['Remote Repositories', 'Pull, Push, Fetch', 'Pull Requests', 'Code Review', 'Forking Workflow'] },
+      { label: 'GitHub Actions Fundamentals', topics: ['What Is CI/CD?', 'Your First Workflow', 'Triggers & Events', 'Jobs & Steps', 'Matrix Builds'] },
+      { label: 'Advanced Actions & Delivery', topics: ['Custom Actions', 'Secrets & Environment', 'Deployment Strategies', 'Release Management', 'Scheduled Workflows'] },
+      { label: 'CI/CD as a Quality System', topics: ['Testing in CI', 'Linting & Formatting', 'Security Scanning', 'Artifact Management', 'Status Checks & Gates'] },
+    ],
   },
   {
     title: 'AI Engineering Crash Course',
@@ -53,6 +95,16 @@ export const courses = [
     gradient: 'linear-gradient(135deg, #00695C 0%, #26A69A 100%)',
     icon: '⚡',
     tag: 'Hands-On',
+    videoId: '1elYxgKplzY',
+    modules: [
+      { label: 'Getting Started', topics: ['What LLMs and APIs Actually Are', 'Installing Python & Using the Terminal', 'Environment Variables Explained', 'Using Claude Code from Day One'] },
+      { label: 'Calling LLMs Directly', topics: ['Overview of LLM Providers', 'Making Your First API Call', 'System Prompts and Temperature', 'Streaming Responses', 'Multimodal Inputs', 'Structured Outputs with Pydantic', 'Tool Calling and Function Calling'] },
+      { label: 'Building with MCP Servers', topics: ['What MCP Actually Is', 'Connecting to Existing MCP Servers', 'Exposing Tools via MCP', 'Building a Custom MCP Server'] },
+      { label: 'RAG & Data', topics: ['What Embeddings Are', 'Vector Databases', 'Building a RAG Pipeline', 'Chunking Strategies', 'Hybrid Search'] },
+      { label: 'Agent Patterns', topics: ['Building an Agent Loop', 'ReAct in Practice', 'Multi-Agent Systems', 'Agent Evaluation'] },
+      { label: 'Production & Deployment', topics: ['Observability', 'Prompt Management', 'Caching', 'Error Handling'] },
+      { label: 'Capstone', topics: ['End-to-End AI Application'] },
+    ],
   },
   {
     title: 'Build with AI',
@@ -64,6 +116,13 @@ export const courses = [
     gradient: 'linear-gradient(135deg, #4A148C 0%, #7B1FA2 100%)',
     icon: '🛠️',
     tag: 'Project-Based',
+    videoId: 'z92nyOfBG9g',
+    modules: [
+      { label: 'Mini Projects', topics: ['Daily AI News Digest', 'AI Movie Release Tracker', 'Job Listings Monitor', 'AI Research Paper Emailer', 'AI Recipe Finder', 'Travel Itinerary Planner', 'AI Interview Coach', 'Git Commit Message Generator', 'Pull Request Reviewer', 'README Generator'] },
+      { label: 'Intermediate Projects', topics: ['Chat with PDFs', 'AI Meeting Notes Summarizer', 'AI Resume Reviewer', 'AI Customer Support Bot', 'AI Voice Notes Summarizer'] },
+      { label: 'Production Projects', topics: ['Enterprise RAG System', 'AI Helpdesk', 'AI Coding Assistant', 'AI QA Engineer', 'Enterprise MCP Server', 'GitHub MCP Server', 'AI Customer Support Workflow', 'AI Ticket Routing System', 'ChatGPT Clone', 'AI Learning Platform'] },
+      { label: 'Portfolio Projects', topics: ['Multi-Agent Research Platform', 'AI Testing Framework', 'AI Observability Platform', 'Enterprise Knowledge Assistant'] },
+    ],
   },
   {
     title: 'Software Engineering',
@@ -75,6 +134,13 @@ export const courses = [
     gradient: 'linear-gradient(135deg, #B71C1C 0%, #E53935 100%)',
     icon: '📐',
     tag: 'Multi-Lang',
+    videoId: 'z92nyOfBG9g',
+    modules: [
+      { label: 'SOLID Principles', topics: ['Single Responsibility', 'Open/Closed', 'Liskov Substitution', 'Interface Segregation', 'Dependency Inversion'] },
+      { label: 'Creational Patterns', topics: ['Factory Method', 'Singleton', 'Abstract Factory', 'Prototype', 'Builder'] },
+      { label: 'Structural Patterns', topics: ['Adapter', 'Bridge', 'Composite', 'Decorator', 'Facade', 'Flyweight', 'Proxy'] },
+      { label: 'Behavioral Patterns', topics: ['Chain of Responsibility', 'Command', 'Interpreter', 'Iterator', 'Mediator', 'Memento', 'Observer', 'State', 'Strategy', 'Template Method', 'Visitor'] },
+    ],
   },
   {
     title: 'Coding Bootcamp',
@@ -86,6 +152,20 @@ export const courses = [
     gradient: 'linear-gradient(135deg, #0D47A1 0%, #1565C0 100%)',
     icon: '💻',
     tag: 'Interview Prep',
+    videoId: 'z92nyOfBG9g',
+    modules: [
+      { label: 'Arrays', topics: ['Two Sum', 'Best Time to Buy Stock', 'Remove Duplicates', 'Product of Array Except Self', 'Rotate Array', 'Container With Most Water', 'Maximum Subarray', 'Merge Sorted Array'] },
+      { label: 'Binary Search', topics: ['Find Minimum in Rotated', 'Search in Rotated', 'Binary Search'] },
+      { label: 'DFS & BFS', topics: ['Invert Binary Tree', 'Maximum Depth', 'Same Tree', 'Level Order Traversal', 'Diameter of Tree', 'Number of Islands', 'Binary Tree Max Path Sum', 'Word Ladder'] },
+      { label: 'BST', topics: ['Search in BST', 'Minimum Absolute Difference', 'Kth Smallest Element', 'Validate BST', 'Recover BST'] },
+      { label: 'Backtracking', topics: ['Subsets', 'Permutations', 'Combinations', 'N-Queens'] },
+      { label: 'Dynamic Programming', topics: ['Climbing Stairs', 'House Robber', 'Coin Change', 'Longest Increasing Subsequence', 'Unique Paths', 'Edit Distance', 'Word Break', 'Decode Ways'] },
+      { label: 'Fast & Slow Pointers', topics: ['Middle of Linked List', 'Find Duplicate Number', 'Happy Number', 'Circular Array Loop'] },
+      { label: 'Graph Algorithms', topics: ['Find Center of Star Graph', 'Keys and Rooms', 'Clone Graph', 'Max Area of Island', 'Word Ladder II'] },
+      { label: 'Greedy', topics: ['Assign Cookies', 'Lemonade Change', 'Jump Game', 'Non-Overlapping Intervals', 'Partition Labels', 'Min Arrows Burst Balloons'] },
+      { label: 'Bit Manipulation', topics: ['Single Number', 'Counting Bits', 'Missing Number', 'Reverse Bits', 'Sum of Two Integers'] },
+      { label: 'Design', topics: ['Design HashMap', 'Min Stack', 'LRU Cache', 'Design Browser History', 'LFU Cache'] },
+    ],
   },
   {
     title: 'Search Algorithms',
@@ -97,6 +177,10 @@ export const courses = [
     gradient: 'linear-gradient(135deg, #00838F 0%, #4DD0E1 100%)',
     icon: '🔍',
     tag: 'New',
+    videoId: 'z92nyOfBG9g',
+    modules: [
+      { label: 'Search Algorithms', topics: ['Linear Search', 'Binary Search', 'Binary Search Variants', 'Ternary Search', 'Jump Search', 'Interpolation Search', 'Exponential Search', 'Depth-First Search', 'Breadth-First Search', 'A* Search', 'Two-Pointer Search Patterns', 'Search in 2D Matrix'] },
+    ],
   },
   {
     title: 'Sorting Algorithms',
@@ -108,6 +192,10 @@ export const courses = [
     gradient: 'linear-gradient(135deg, #4A148C 0%, #7B1FA2 100%)',
     icon: '🔀',
     tag: 'New',
+    videoId: 'z92nyOfBG9g',
+    modules: [
+      { label: 'Sorting Algorithms', topics: ['Bubble Sort', 'Selection Sort', 'Insertion Sort', 'Merge Sort', 'Quick Sort', 'Heap Sort', 'Counting Sort', 'Radix Sort', 'Bucket Sort', 'Shell Sort', 'Tim Sort', 'Comparison & Selection Guide'] },
+    ],
   },
 ];
 
