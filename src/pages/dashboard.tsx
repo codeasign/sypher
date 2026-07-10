@@ -22,7 +22,6 @@ function DashboardContent(): JSX.Element {
       <div className={styles.header}>
         <h1 className={styles.heading}>Dashboard</h1>
       </div>
-      <p className={styles.welcome}>Signed in as {user?.email}</p>
 
       {freeCoursesList.length > 0 && (
         <>
