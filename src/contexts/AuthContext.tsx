@@ -3,11 +3,14 @@ import type { ReactNode } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import type { Session, SupabaseClient, User } from '@supabase/supabase-js';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
+import { getOwnProfile } from '@site/src/data/profiles';
+import type { Role } from '@site/src/types/roles';
 
 interface AuthContextValue {
   supabase: SupabaseClient | null;
   session: Session | null;
   user: User | null;
+  role: Role | null;
   loading: boolean;
 }
 
@@ -15,6 +18,7 @@ const AuthContext = createContext<AuthContextValue>({
   supabase: null,
   session: null,
   user: null,
+  role: null,
   loading: true,
 });
 
@@ -47,6 +51,7 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
   }, [supabaseUrl, supabaseAnonKey]);
 
   const [session, setSession] = useState<Session | null>(null);
+  const [role, setRole] = useState<Role | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -57,17 +62,38 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
 
     let isMounted = true;
 
-    supabase.auth.getSession().then(({ data }) => {
-      if (isMounted) {
-        setSession(data.session);
-        setLoading(false);
+    async function applySession(newSession: Session | null): Promise<void> {
+      if (newSession) {
+        const profile = await getOwnProfile(supabase, newSession.user.id);
+        if (profile?.deleted_at) {
+          await supabase.auth.signOut();
+          if (isMounted) {
+            setSession(null);
+            setRole(null);
+          }
+          return;
+        }
+        if (isMounted) {
+          setRole((profile?.role as Role) ?? null);
+        }
+      } else if (isMounted) {
+        setRole(null);
       }
-    });
-
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
       if (isMounted) {
         setSession(newSession);
       }
+    }
+
+    supabase.auth.getSession().then(({ data }) => {
+      applySession(data.session).finally(() => {
+        if (isMounted) {
+          setLoading(false);
+        }
+      });
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      applySession(newSession);
     });
 
     return () => {
@@ -80,6 +106,7 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
     supabase,
     session,
     user: session?.user ?? null,
+    role,
     loading,
   };
 
