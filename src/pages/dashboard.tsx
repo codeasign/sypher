@@ -3,12 +3,10 @@ import DashboardLayout from '@site/src/components/DashboardLayout';
 import { useAuth } from '@site/src/contexts/AuthContext';
 import { fetchAccessControlConfig, withCourseAccess } from '@site/src/data/homepageCourses';
 import DashboardCourseListing from '@site/src/components/DashboardCourseListing';
-import { useBookmarks } from '@site/src/hooks/useBookmarks';
 import styles from './dashboard.module.css';
 
 function DashboardContent(): JSX.Element {
   const { user } = useAuth();
-  const { isBookmarked, toggleBookmark } = useBookmarks();
   const [freeCourses, setFreeCourses] = useState<string[]>([]);
 
   useEffect(() => {
@@ -34,9 +32,6 @@ function DashboardContent(): JSX.Element {
           </div>
           <DashboardCourseListing
             courses={freeCoursesList}
-            showDuration
-            isBookmarked={isBookmarked}
-            onToggleBookmark={toggleBookmark}
           />
         </>
       )}
@@ -49,9 +44,6 @@ function DashboardContent(): JSX.Element {
           </div>
           <DashboardCourseListing
             courses={premiumCoursesList}
-            showDuration
-            isBookmarked={isBookmarked}
-            onToggleBookmark={toggleBookmark}
           />
         </>
       )}
