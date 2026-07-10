@@ -52,7 +52,7 @@ export default function DashboardLayout({
   children,
 }: DashboardLayoutProps): JSX.Element {
   return (
-    <Layout title={title} description={description}>
+    <Layout title={title} description={description} noFooter>
       <RequireAuth>
         <DashboardLayoutContent>{children}</DashboardLayoutContent>
       </RequireAuth>
