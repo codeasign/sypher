@@ -38,11 +38,10 @@ function buildSectionMap(sidebarItems) {
 
 module.exports = function () {
   return {
-    name: 'access-control',
+    name: 'course-sections',
 
     loadContent() {
       const sidebarsDir = path.resolve(__dirname, '../../sidebars');
-      const staticDir = path.resolve(__dirname, '../../static');
       const courseRegex = /^([\w-]+)\.json$/;
       const courseSectionMap = {};
 
@@ -62,34 +61,10 @@ module.exports = function () {
               courseSectionMap[courseSlug] = buildSectionMap(sidebarItems);
             }
           } catch (err) {
-            console.warn(`[access-control] Could not parse ${file}:`, err.message);
+            console.warn(`[course-sections] Could not parse ${file}:`, err.message);
           }
         }
       }
-
-      // Write runtime config to static/access-control.json
-      // This file can be updated independently (no rebuild needed)
-      const freeCoursesFromEnv = (process.env.FREE_COURSES ?? 'python-for-ai-engineers,coding-bootcamp')
-        .split(',').map(s => s.trim());
-
-      // When FREE_ALL_COURSES is true, override with ALL course slugs
-      const freeCourses = process.env.FREE_ALL_COURSES === 'true'
-        ? Object.keys(courseSectionMap)
-        : freeCoursesFromEnv;
-
-      const runtimeConfig = {
-        freeCourses,
-        freeSections: 3,
-      };
-
-      if (!fs.existsSync(staticDir)) {
-        fs.mkdirSync(staticDir, { recursive: true });
-      }
-      fs.writeFileSync(
-        path.join(staticDir, 'access-control.json'),
-        JSON.stringify(runtimeConfig, null, 2),
-        'utf-8',
-      );
 
       return { courseSectionMap };
     },
@@ -97,10 +72,6 @@ module.exports = function () {
     contentLoaded({ content, actions }) {
       const { setGlobalData } = actions;
       setGlobalData(content);
-    },
-
-    getClientModules() {
-      return [path.resolve(__dirname, 'client')];
     },
   };
 };

@@ -11,6 +11,7 @@ interface AuthContextValue {
   session: Session | null;
   user: User | null;
   role: Role | null;
+  companyName: string | null;
   loading: boolean;
 }
 
@@ -19,6 +20,7 @@ const AuthContext = createContext<AuthContextValue>({
   session: null,
   user: null,
   role: null,
+  companyName: null,
   loading: true,
 });
 
@@ -52,6 +54,7 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
 
   const [session, setSession] = useState<Session | null>(null);
   const [role, setRole] = useState<Role | null>(null);
+  const [companyName, setCompanyName] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -70,14 +73,17 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
           if (isMounted) {
             setSession(null);
             setRole(null);
+            setCompanyName(null);
           }
           return;
         }
         if (isMounted) {
           setRole((profile?.role as Role) ?? null);
+          setCompanyName(profile?.company_name ?? null);
         }
       } else if (isMounted) {
         setRole(null);
+        setCompanyName(null);
       }
       if (isMounted) {
         setSession(newSession);
@@ -107,6 +113,7 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
     session,
     user: session?.user ?? null,
     role,
+    companyName,
     loading,
   };
 

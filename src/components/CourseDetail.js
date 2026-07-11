@@ -3,7 +3,8 @@ import Link from '@docusaurus/Link';
 import Heading from '@theme/Heading';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import { useAuth } from '@site/src/contexts/AuthContext';
-import { fetchAccessControlConfig } from '@site/src/data/homepageCourses';
+import { fetchCourseAccessRows, hasCourseAccess } from '@site/src/data/courseAccess';
+import { fetchCompanyCourseAccessRows } from '@site/src/data/companyAccess';
 import ProUpgradeModal from '@site/src/components/ProUpgradeModal';
 import { useBookmarks } from '@site/src/hooks/useBookmarks';
 import styles from './CourseDetail.module.css';
@@ -11,18 +12,25 @@ import styles from './CourseDetail.module.css';
 export default function CourseDetail({ course, docUrl }) {
   const { siteConfig } = useDocusaurusContext();
   const { showDurationOnContent } = siteConfig.customFields;
-  const { user } = useAuth();
+  const { user, role, supabase, companyName } = useAuth();
   const { isBookmarked, toggleBookmark } = useBookmarks();
   const [openModules, setOpenModules] = useState(() => new Set([0, 1]));
   const [isFree, setIsFree] = useState(null);
+  const [companyAllowedSlugs, setCompanyAllowedSlugs] = useState(new Set());
   const [showProModal, setShowProModal] = useState(false);
   const startUrl = user ? docUrl : `/login?redirect=${encodeURIComponent(docUrl)}`;
 
   useEffect(() => {
-    fetchAccessControlConfig().then((cfg) => {
-      setIsFree((cfg.freeCourses ?? []).includes(course.slug));
+    if (role !== 'company_employees' || !companyName) return;
+    fetchCompanyCourseAccessRows(supabase, companyName).then(setCompanyAllowedSlugs);
+  }, [supabase, role, companyName]);
+
+  useEffect(() => {
+    fetchCourseAccessRows(supabase).then((rows) => {
+      const row = rows.find((r) => r.course_slug === course.slug);
+      setIsFree(hasCourseAccess(role, row?.allowed_roles ?? [], { slug: course.slug, companyAllowedSlugs }));
     });
-  }, [course.slug]);
+  }, [course.slug, role, supabase, companyAllowedSlugs]);
 
   function handleStartLearning(event) {
     if (isFree === false) {

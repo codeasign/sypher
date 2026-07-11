@@ -1,8 +1,12 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import Link from '@docusaurus/Link';
 import { useLocation } from '@docusaurus/router';
 import type { User } from '@supabase/supabase-js';
+import { useAuth } from '@site/src/contexts/AuthContext';
+import { listNavAccess, canSeeNavItem } from '@site/src/data/navAccess';
+import { fetchCompanyNavAccessRows } from '@site/src/data/companyAccess';
+import { NAV_SECTIONS } from '@site/src/data/navItems';
 import styles from './styles.module.css';
 
 interface DashboardSidebarProps {
@@ -12,6 +16,7 @@ interface DashboardSidebarProps {
 }
 
 interface NavItem {
+  key?: string;
   href: string;
   label: string;
   icon: (props: { className?: string }) => JSX.Element;
@@ -23,41 +28,33 @@ interface NavSection {
   items: NavItem[];
 }
 
+const ICONS_BY_KEY: Record<string, (props: { className?: string }) => JSX.Element> = {
+  'resume-review': ResumeIcon,
+  'mock-interview': InterviewIcon,
+  'add-job-post': JobPostIcon,
+  'manage-users': UsersIcon,
+  'manage-access': ManageAccessIcon,
+  'send-announcements': AnnouncementIcon,
+  'create-blog-post': BlogIcon,
+  'manage-blog-post': ManageBlogIcon,
+  'add-company-branding': BrandingIcon,
+};
+
 const NAV_ITEMS: NavItem[] = [
   { href: '/dashboard', label: 'Dashboard', icon: DashboardIcon },
   { href: '/bookmarks', label: 'Bookmarks', icon: BookmarkIcon },
 ];
 
-const SECTIONS: NavSection[] = [
-  {
-    title: 'Career Tools',
-    items: [
-      { href: '#', label: 'Resume Review', icon: ResumeIcon, comingSoon: true },
-      { href: '#', label: 'Mock Interview', icon: InterviewIcon, comingSoon: true },
-    ],
-  },
-  {
-    title: 'Job Management',
-    items: [
-      { href: '#', label: 'Add Job Post', icon: JobPostIcon, comingSoon: true },
-      { href: '/manage-users', label: 'Manage Users', icon: UsersIcon },
-      { href: '#', label: 'Send Announcements', icon: AnnouncementIcon, comingSoon: true },
-    ],
-  },
-  {
-    title: 'Content',
-    items: [
-      { href: '#', label: 'Create Blog Post', icon: BlogIcon, comingSoon: true },
-      { href: '#', label: 'Manage Blog Post', icon: ManageBlogIcon, comingSoon: true },
-    ],
-  },
-  {
-    title: 'Branding',
-    items: [
-      { href: '#', label: 'Add Company Branding', icon: BrandingIcon, comingSoon: true },
-    ],
-  },
-];
+const SECTIONS: NavSection[] = NAV_SECTIONS.map((section) => ({
+  title: section.title,
+  items: section.items.map((item) => ({
+    key: item.key,
+    href: item.href,
+    label: item.label,
+    comingSoon: item.comingSoon,
+    icon: ICONS_BY_KEY[item.key] ?? DashboardIcon,
+  })),
+}));
 
 const PROFILE_ITEM: NavItem = { href: '/profile', label: 'Profile', icon: ProfileIcon };
 
@@ -67,6 +64,7 @@ export default function DashboardSidebar({
   onToggleCollapsed,
 }: DashboardSidebarProps): JSX.Element {
   const { pathname } = useLocation();
+  const { supabase, role, companyName } = useAuth();
   const email = user?.email ?? '';
   const metadata = (user?.user_metadata ?? {}) as {
     full_name?: string;
@@ -76,14 +74,58 @@ export default function DashboardSidebar({
   const displayName = metadata.full_name || metadata.name || email.split('@')[0] || 'Guest';
   const avatarUrl = metadata.avatar_url;
 
+  const [navAccessLoading, setNavAccessLoading] = useState(true);
+  const [allowedRolesByKey, setAllowedRolesByKey] = useState<Record<string, string[]>>({});
+  const [companyAllowedItemKeys, setCompanyAllowedItemKeys] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (role === 'admin') {
+      setNavAccessLoading(false);
+      return;
+    }
+    let isMounted = true;
+    listNavAccess(supabase).then((rows) => {
+      if (!isMounted) return;
+      const map: Record<string, string[]> = {};
+      for (const row of rows) {
+        map[row.item_key] = row.allowed_roles ?? [];
+      }
+      setAllowedRolesByKey(map);
+      setNavAccessLoading(false);
+    });
+    return () => {
+      isMounted = false;
+    };
+  }, [supabase, role]);
+
+  useEffect(() => {
+    if (role !== 'company_employees' || !companyName) return;
+    fetchCompanyNavAccessRows(supabase, companyName).then(setCompanyAllowedItemKeys);
+  }, [supabase, role, companyName]);
+
+  const visibleSections: NavSection[] =
+    role === 'admin'
+      ? SECTIONS
+      : navAccessLoading
+      ? []
+      : SECTIONS.map((section) => ({
+          title: section.title,
+          items: section.items.filter((item) =>
+            canSeeNavItem(role, item.key ? allowedRolesByKey[item.key] : [], {
+              itemKey: item.key,
+              companyAllowedItemKeys,
+            }),
+          ),
+        })).filter((section) => section.items.length > 0);
+
   function isActive(href: string): boolean {
     return pathname === href || pathname.startsWith(`${href}/`);
   }
 
-  function renderNavItem({ href, label, icon: Icon, comingSoon }: NavItem): JSX.Element {
+  function renderNavItem({ key, href, label, icon: Icon, comingSoon }: NavItem): JSX.Element {
     return (
       <Link
-        key={href}
+        key={key ?? href}
         to={comingSoon ? undefined : href}
         className={clsx(
           styles.navItem,
@@ -144,7 +186,7 @@ export default function DashboardSidebar({
       <nav className={styles.nav}>
         {NAV_ITEMS.map(renderNavItem)}
         <div className={styles.sectionDivider} />
-        {SECTIONS.map(renderSection)}
+        {visibleSections.map(renderSection)}
       </nav>
 
       <div className={styles.footer}>{renderNavItem(PROFILE_ITEM)}</div>
@@ -297,6 +339,26 @@ function UsersIcon({ className }: { className?: string }): JSX.Element {
       <circle cx="9" cy="7" r="4" />
       <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
       <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    </svg>
+  );
+}
+
+function ManageAccessIcon({ className }: { className?: string }): JSX.Element {
+  return (
+    <svg
+      className={className}
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
     </svg>
   );
 }

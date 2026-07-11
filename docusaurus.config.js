@@ -12,7 +12,7 @@ const config = {
     '/js/sidebar-toggle.js',
   ],
   plugins: [
-    './plugins/access-control',
+    './plugins/course-sections',
   ],
 
   future: {
@@ -37,8 +37,6 @@ const config = {
   customFields: {
     judge0BaseUrl: process.env.JUDGE0_BASE_URL ?? 'http://localhost:2358',
     judge0AuthToken: process.env.JUDGE0_AUTH_TOKEN ?? '',
-    freeCourses: (process.env.FREE_COURSES ?? 'python-for-ai-engineers,coding-bootcamp').split(',').map(s => s.trim()),
-    freeAllCourses: process.env.FREE_ALL_COURSES === 'true',
     showDurationOnLanding: process.env.SHOW_DURATION_ON_LANDING === 'true',
     showDurationOnContent: process.env.SHOW_DURATION_ON_CONTENT === 'true',
     supabaseUrl: process.env.SUPABASE_URL,

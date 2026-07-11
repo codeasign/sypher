@@ -2,43 +2,9 @@ import React, { useEffect, useState } from 'react';
 import Link from '@docusaurus/Link';
 import { useLocation } from '@docusaurus/router';
 import { usePluginData } from '@docusaurus/useGlobalData';
-
-/**
- * Fetch runtime access control config, cached after first load.
- */
-let cachedConfig = null;
-let configPromise = null;
-
-function fetchConfig() {
-  if (cachedConfig) return Promise.resolve(cachedConfig);
-  if (configPromise) return configPromise;
-  configPromise = fetch('/access-control.json')
-    .then((res) => {
-      if (!res.ok) throw new Error('Failed to fetch access-control.json');
-      return res.json();
-    })
-    .then((data) => {
-      cachedConfig = data;
-      return data;
-    })
-    .catch(() => {
-      cachedConfig = { freeCourses: [], freeSections: 3 };
-      return cachedConfig;
-    });
-  return configPromise;
-}
-
-function getLessonSlugs(items, courseSlug) {
-  const slugs = [];
-  for (const item of items) {
-    if (typeof item === 'string') {
-      slugs.push(item.replace(`${courseSlug}/`, ''));
-    } else if (item.type === 'category' && Array.isArray(item.items)) {
-      slugs.push(...getLessonSlugs(item.items, courseSlug));
-    }
-  }
-  return slugs;
-}
+import { useAuth } from '@site/src/contexts/AuthContext';
+import { fetchCourseAccessRows, hasCourseAccess } from '@site/src/data/courseAccess';
+import { fetchCompanyCourseAccessRows } from '@site/src/data/companyAccess';
 
 function topicName(docId) {
   const parts = docId.split('/');
@@ -62,13 +28,20 @@ function pageLabel(type) {
 
 export default function CourseCurriculum() {
   const location = useLocation();
-  const data = usePluginData('access-control');
+  const data = usePluginData('course-sections');
   const courseSectionMap = data?.courseSectionMap ?? {};
-  const [config, setConfig] = useState(null);
+  const { role, supabase, companyName } = useAuth();
+  const [accessRows, setAccessRows] = useState([]);
+  const [companyAllowedSlugs, setCompanyAllowedSlugs] = useState(new Set());
 
   useEffect(() => {
-    fetchConfig().then(setConfig);
-  }, []);
+    fetchCourseAccessRows(supabase).then(setAccessRows);
+  }, [supabase]);
+
+  useEffect(() => {
+    if (role !== 'company_employees' || !companyName) return;
+    fetchCompanyCourseAccessRows(supabase, companyName).then(setCompanyAllowedSlugs);
+  }, [supabase, role, companyName]);
 
   const parts = location.pathname.split('/').filter(Boolean);
   if (parts.length < 2 || parts[0] !== 'docs') return null;
@@ -86,8 +59,8 @@ export default function CourseCurriculum() {
     return { index: idx, docIds };
   });
 
-  const freeCourses = config?.freeCourses ?? [];
-  const isFree = freeCourses.includes(courseSlug);
+  const accessRow = accessRows.find((r) => r.course_slug === courseSlug);
+  const isFree = hasCourseAccess(role, accessRow?.allowed_roles ?? [], { slug: courseSlug, companyAllowedSlugs });
 
   return (
     <div className="course-curriculum">

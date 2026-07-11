@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from 'react';
 import { useLocation } from '@docusaurus/router';
-import { usePluginData } from '@docusaurus/useGlobalData';
 import clsx from 'clsx';
 import { HtmlClassNameProvider, ThemeClassNames } from '@docusaurus/theme-common';
 import {
@@ -10,58 +9,28 @@ import {
 import DocRootLayout from '@theme/DocRoot/Layout';
 import NotFoundContent from '@theme/NotFound/Content';
 import { useAuth } from '@site/src/contexts/AuthContext';
-
-/**
- * Fetch runtime access control config, cached after first load.
- */
-let cachedConfig = null;
-let configPromise = null;
-
-function fetchConfig() {
-  if (cachedConfig) return Promise.resolve(cachedConfig);
-  if (configPromise) return configPromise;
-  configPromise = fetch('/access-control.json')
-    .then((res) => {
-      if (!res.ok) throw new Error('Failed to fetch access-control.json');
-      return res.json();
-    })
-    .then((data) => {
-      cachedConfig = data;
-      return data;
-    })
-    .catch(() => {
-      cachedConfig = { freeCourses: [], freeSections: 3 };
-      return cachedConfig;
-    });
-  return configPromise;
-}
-
-function getSectionIndex(docPath, courseSectionMap) {
-  const parts = docPath.split('/').filter(Boolean);
-  if (parts.length < 3 || parts[0] !== 'docs') return -1;
-
-  const courseSlug = parts[1];
-  const courseMap = courseSectionMap[courseSlug];
-  if (!courseMap) return -1;
-
-  const docId = parts.slice(1).join('/');
-  if (courseMap[docId] !== undefined) return courseMap[docId];
-
-  const partialId = parts.slice(1, 3).join('/');
-  if (courseMap[partialId] !== undefined) return courseMap[partialId];
-
-  return -1;
-}
+import { fetchCourseAccessRows, hasCourseAccess } from '@site/src/data/courseAccess';
+import { fetchCompanyCourseAccessRows } from '@site/src/data/companyAccess';
 
 function useAccessGuard(pathname) {
-  const data = usePluginData('access-control');
-  const courseSectionMap = data?.courseSectionMap ?? {};
-  const [config, setConfig] = useState(null);
-  const { user, loading: authLoading } = useAuth();
+  const { user, role, companyName, loading: authLoading, supabase } = useAuth();
+  const [accessRows, setAccessRows] = useState(null);
+  const [companyAllowedSlugs, setCompanyAllowedSlugs] = useState(null);
 
   useEffect(() => {
-    fetchConfig().then(setConfig);
-  }, []);
+    if (!pathname.startsWith('/docs/') || authLoading || !user) return;
+    fetchCourseAccessRows(supabase).then(setAccessRows);
+  }, [pathname, authLoading, user, supabase]);
+
+  useEffect(() => {
+    if (!pathname.startsWith('/docs/') || authLoading || !user) return;
+    if (role !== 'company_employees') {
+      setCompanyAllowedSlugs(new Set());
+      return;
+    }
+    if (!companyName) return;
+    fetchCompanyCourseAccessRows(supabase, companyName).then(setCompanyAllowedSlugs);
+  }, [pathname, authLoading, user, supabase, role, companyName]);
 
   useEffect(() => {
     if (!pathname.startsWith('/docs/')) return;
@@ -74,26 +43,23 @@ function useAccessGuard(pathname) {
       return;
     }
 
-    if (!config) return;
+    if (!accessRows || !companyAllowedSlugs) return;
 
     const parts = pathname.split('/').filter(Boolean);
     if (parts.length < 2) return;
 
     const courseSlug = parts[1];
-    const freeCourses = config.freeCourses ?? [];
+    const accessRow = accessRows.find((r) => r.course_slug === courseSlug);
+    const allowedRoles = accessRow?.allowed_roles ?? [];
 
-    if (freeCourses.includes(courseSlug)) return;
-
-    const freeSections = config.freeSections ?? 3;
-    const sectionIndex = getSectionIndex(pathname, courseSectionMap);
-    if (sectionIndex === -1 || sectionIndex >= freeSections) {
+    if (!hasCourseAccess(role, allowedRoles, { slug: courseSlug, companyAllowedSlugs })) {
       document.title = 'Redirecting...';
       document.body.innerHTML = '';
       window.location.replace('/');
     }
-  }, [pathname, config, user, authLoading]);
+  }, [pathname, accessRows, companyAllowedSlugs, user, role, authLoading]);
 
-  return { blocked: pathname.startsWith('/docs/') && (authLoading || !user) };
+  return { blocked: pathname.startsWith('/docs/') && (authLoading || !user || !accessRows || !companyAllowedSlugs) };
 }
 
 export default function DocRoot(props) {

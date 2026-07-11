@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import Heading from '@theme/Heading';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
-import { fetchAccessControlConfig, withCourseAccess } from '@site/src/data/homepageCourses';
+import { withCourseAccess } from '@site/src/data/homepageCourses';
+import { fetchCourseAccessRows } from '@site/src/data/courseAccess';
+import { fetchCompanyCourseAccessRows } from '@site/src/data/companyAccess';
 import { CourseGrid } from '@site/src/components/CourseCard';
 import { useAuth } from '@site/src/contexts/AuthContext';
 import { useBookmarks } from '@site/src/hooks/useBookmarks';
@@ -10,15 +12,21 @@ import styles from './styles.module.css';
 export default function HomepageFeatures() {
   const { siteConfig } = useDocusaurusContext();
   const { showDurationOnLanding } = siteConfig.customFields;
-  const { user } = useAuth();
+  const { user, supabase, role, companyName } = useAuth();
   const { isBookmarked, toggleBookmark } = useBookmarks();
-  const [freeCourses, setFreeCourses] = useState([]);
+  const [accessRows, setAccessRows] = useState([]);
+  const [companyAllowedSlugs, setCompanyAllowedSlugs] = useState(new Set());
 
   useEffect(() => {
-    fetchAccessControlConfig().then((cfg) => setFreeCourses(cfg.freeCourses ?? []));
-  }, []);
+    fetchCourseAccessRows(supabase).then(setAccessRows);
+  }, [supabase]);
 
-  const withSlugs = withCourseAccess(freeCourses);
+  useEffect(() => {
+    if (role !== 'company_employees' || !companyName) return;
+    fetchCompanyCourseAccessRows(supabase, companyName).then(setCompanyAllowedSlugs);
+  }, [supabase, role, companyName]);
+
+  const withSlugs = withCourseAccess(role, accessRows, companyAllowedSlugs);
 
   const freeCoursesList = withSlugs.filter((c) => c.isFree);
   const premiumCoursesList = withSlugs.filter((c) => !c.isFree);

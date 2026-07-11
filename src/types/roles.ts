@@ -16,3 +16,9 @@ export const ROLES: { value: Role; label: string }[] = [
   { value: 'company_employees', label: 'Company Employees' },
   { value: 'branders', label: 'Branders' },
 ];
+
+// company_employees access is configured per-company on the Companies tab,
+// not globally — so it's excluded from the global Courses/Sidebar grids.
+export const GLOBALLY_CONFIGURABLE_ROLES = ROLES.filter(
+  (r) => r.value !== 'admin' && r.value !== 'company_employees'
+);

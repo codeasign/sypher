@@ -2,10 +2,13 @@ import React, { useCallback, useEffect, useState } from 'react';
 import DashboardLayout from '@site/src/components/DashboardLayout';
 import RequireAdmin from '@site/src/components/RequireAdmin';
 import ConfirmDialog from '@site/src/components/ConfirmDialog';
+import CsvInviteModal from '@site/src/components/CsvInviteModal';
 import { useAuth } from '@site/src/contexts/AuthContext';
 import { listProfiles, updateProfileRole, softDeleteProfile } from '@site/src/data/profiles';
 import { ROLES } from '@site/src/types/roles';
 import type { Role } from '@site/src/types/roles';
+import { SIGNUP_SOURCES } from '@site/src/types/signupSource';
+import type { SignupSource } from '@site/src/types/signupSource';
 import styles from './manage-users.module.css';
 
 /* ── Types ── */
@@ -15,8 +18,13 @@ interface Profile {
   email: string;
   full_name: string | null;
   role: Role;
+  signup_source: SignupSource;
+  company_name: string | null;
+  confirmed_at: string | null;
   created_at: string;
 }
+
+const CORPORATE_ROLES: Role[] = ['company_hr', 'company_employees'];
 
 /* ── Helpers ── */
 
@@ -36,6 +44,10 @@ function formatJoined(iso: string): string {
 
 function getRoleLabel(role: Role): string {
   return ROLES.find((r) => r.value === role)?.label ?? role;
+}
+
+function getSignupSourceLabel(source: SignupSource): string {
+  return SIGNUP_SOURCES.find((s) => s.value === source)?.label ?? source;
 }
 
 /* ── SVG icons ── */
@@ -231,6 +243,7 @@ function ManageUsersContent(): JSX.Element {
   const [pendingDelete, setPendingDelete] = useState<Profile | null>(null);
   const [editingProfile, setEditingProfile] = useState<Profile | null>(null);
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
+  const [inviteModalOpen, setInviteModalOpen] = useState(false);
 
   const fetchUsers = useCallback(async () => {
     setLoading(true);
@@ -332,11 +345,16 @@ function ManageUsersContent(): JSX.Element {
   return (
     <div className={styles.container}>
       {/* ── Header ── */}
-      <div className={styles.header}>
-        <h1 className={styles.heading}>Manage Users</h1>
-        <p className={styles.subtitle}>
-          View and manage all registered users on the platform.
-        </p>
+      <div className={styles.header} style={{ flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+        <div>
+          <h1 className={styles.heading}>Manage Users</h1>
+          <p className={styles.subtitle}>
+            View and manage all registered users on the platform.
+          </p>
+        </div>
+        <button type="button" className={styles.inviteBtn} onClick={() => setInviteModalOpen(true)}>
+          Invite Employees
+        </button>
       </div>
 
       {/* ── Stats ── */}
@@ -416,6 +434,8 @@ function ManageUsersContent(): JSX.Element {
             <span>User</span>
             <span>Email</span>
             <span>Role</span>
+            <span>Source</span>
+            <span>Company</span>
             <span>Joined</span>
             <span>Actions</span>
           </div>
@@ -430,10 +450,21 @@ function ManageUsersContent(): JSX.Element {
                 <span className={styles.tableCell}>{user.email}</span>
                 <div className={styles.tableCell}>
                   <span className={styles.roleLabel}>{getRoleLabel(user.role)}</span>
+                  {CORPORATE_ROLES.includes(user.role) && (
+                    <span
+                      className={`${styles.statusBadge} ${
+                        user.confirmed_at ? styles.statusActive : styles.statusInvited
+                      }`}
+                    >
+                      {user.confirmed_at ? 'Active' : 'Invited'}
+                    </span>
+                  )}
                   {rowErrors[user.id] && (
                     <p className={styles.rowError}>{rowErrors[user.id]}</p>
                   )}
                 </div>
+                <span className={styles.tableCell}>{getSignupSourceLabel(user.signup_source)}</span>
+                <span className={styles.tableCell}>{user.company_name || '—'}</span>
                 <span className={styles.tableCell}>{formatJoined(user.created_at)}</span>
                 <div className={styles.actions}>
                   <button
@@ -479,6 +510,12 @@ function ManageUsersContent(): JSX.Element {
         profile={editingProfile}
         onSave={handleSaveRole}
         onCancel={() => setEditingProfile(null)}
+      />
+
+      <CsvInviteModal
+        open={inviteModalOpen}
+        onClose={() => setInviteModalOpen(false)}
+        onInvited={fetchUsers}
       />
     </div>
   );

@@ -6,7 +6,10 @@ import { CourseGrid } from '@site/src/components/CourseCard';
 import ConfirmDialog from '@site/src/components/ConfirmDialog';
 import { useBookmarks } from '@site/src/hooks/useBookmarks';
 import { useDocBookmarks } from '@site/src/hooks/useDocBookmarks';
-import { fetchAccessControlConfig, withCourseAccess } from '@site/src/data/homepageCourses';
+import { withCourseAccess } from '@site/src/data/homepageCourses';
+import { fetchCourseAccessRows } from '@site/src/data/courseAccess';
+import { fetchCompanyCourseAccessRows } from '@site/src/data/companyAccess';
+import { useAuth } from '@site/src/contexts/AuthContext';
 import courses from '@site/src/data/courses';
 import styles from './bookmarks.module.css';
 
@@ -150,16 +153,23 @@ function DocBookmarkExplorer({ docBookmarks, onRemove }) {
 }
 
 function BookmarksContent(): JSX.Element {
+  const { supabase, role, companyName } = useAuth();
   const { bookmarkedSlugs, isBookmarked, toggleBookmark, loading } = useBookmarks();
   const { bookmarks: docBookmarks, toggleDocBookmark, loading: docLoading } = useDocBookmarks();
-  const [freeCourses, setFreeCourses] = useState<string[]>([]);
+  const [accessRows, setAccessRows] = useState([]);
+  const [companyAllowedSlugs, setCompanyAllowedSlugs] = useState(new Set());
   const [pendingRemoval, setPendingRemoval] = useState(null);
 
   useEffect(() => {
-    fetchAccessControlConfig().then((cfg) => setFreeCourses(cfg.freeCourses ?? []));
-  }, []);
+    fetchCourseAccessRows(supabase).then(setAccessRows);
+  }, [supabase]);
 
-  const bookmarkedCourses = withCourseAccess(freeCourses).filter((course) =>
+  useEffect(() => {
+    if (role !== 'company_employees' || !companyName) return;
+    fetchCompanyCourseAccessRows(supabase, companyName).then(setCompanyAllowedSlugs);
+  }, [supabase, role, companyName]);
+
+  const bookmarkedCourses = withCourseAccess(role, accessRows, companyAllowedSlugs).filter((course) =>
     bookmarkedSlugs.has(course.slug)
   );
 

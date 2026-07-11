@@ -1,3 +1,5 @@
+import { hasCourseAccess } from './courseAccess';
+
 export const courses = [
   {
     title: 'Python for AI Engineers',
@@ -199,35 +201,11 @@ export const courses = [
   },
 ];
 
-let cachedConfig = null;
-let configPromise = null;
-
-/**
- * Fetch runtime access control config, cached after first load.
- */
-export function fetchAccessControlConfig() {
-  if (cachedConfig) return Promise.resolve(cachedConfig);
-  if (configPromise) return configPromise;
-  configPromise = fetch('/access-control.json')
-    .then((res) => {
-      if (!res.ok) throw new Error('Failed to fetch access-control.json');
-      return res.json();
-    })
-    .then((data) => {
-      cachedConfig = data;
-      return data;
-    })
-    .catch(() => {
-      cachedConfig = { freeCourses: [], freeSections: 3 };
-      return cachedConfig;
-    });
-  return configPromise;
-}
-
-export function withCourseAccess(freeCourses) {
+export function withCourseAccess(role, accessRows, companyAllowedSlugs) {
+  const accessBySlug = new Map((accessRows ?? []).map((r) => [r.course_slug, r.allowed_roles]));
   return courses.map((course) => {
     const slug = course.url.replace('/course/', '');
-    const isFree = freeCourses.includes(slug);
-    return { ...course, slug, isFree };
+    const allowedRoles = accessBySlug.get(slug) ?? [];
+    return { ...course, slug, isFree: hasCourseAccess(role, allowedRoles, { slug, companyAllowedSlugs }) };
   });
 }
