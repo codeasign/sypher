@@ -1,10 +1,12 @@
+'use client';
+
 import React, { useCallback, useEffect, useState } from 'react';
-import DashboardLayout from '@site/src/components/DashboardLayout';
-import RequireNavAccess from '@site/src/components/RequireNavAccess';
-import ConfirmDialog from '@site/src/components/ConfirmDialog';
-import BlogPostEditor from '@site/src/components/BlogPostEditor';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import { listBlogPosts, getBlogPostById, deleteBlogPost } from '@site/src/data/blogPosts';
+import DashboardLayout from '@/components/DashboardLayout';
+import RequireNavAccess from '@/components/RequireNavAccess';
+import ConfirmDialog from '@/components/ConfirmDialog';
+import BlogPostEditor from '@/components/BlogPostEditor';
+import { useAuth } from '@/contexts/AuthContext';
+import { listBlogPosts, getBlogPostById, deleteBlogPost } from '@/data/blogPosts';
 import styles from './manage-blog.module.css';
 
 interface BlogPostSummary {
@@ -27,7 +29,7 @@ function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
-function TrashIcon(): JSX.Element {
+function TrashIcon(): React.JSX.Element {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <polyline points="3 6 5 6 21 6" />
@@ -36,7 +38,7 @@ function TrashIcon(): JSX.Element {
   );
 }
 
-function EditIcon(): JSX.Element {
+function EditIcon(): React.JSX.Element {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z" />
@@ -44,7 +46,7 @@ function EditIcon(): JSX.Element {
   );
 }
 
-function PlusIcon(): JSX.Element {
+function PlusIcon(): React.JSX.Element {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <line x1="12" y1="5" x2="12" y2="19" />
@@ -53,7 +55,7 @@ function PlusIcon(): JSX.Element {
   );
 }
 
-function ManageBlogContent(): JSX.Element {
+function ManageBlogContent(): React.JSX.Element {
   const { supabase } = useAuth();
   const [posts, setPosts] = useState<BlogPostSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -224,7 +226,7 @@ function ManageBlogContent(): JSX.Element {
   );
 }
 
-export default function ManageBlogPage(): JSX.Element {
+export default function ManageBlogPage(): React.JSX.Element {
   return (
     <DashboardLayout title="Manage Blog Posts" description="Draft, edit, publish, and delete blog posts.">
       <RequireNavAccess itemKey="manage-blog-post">

@@ -1,7 +1,9 @@
+'use client';
+
 import React, { useEffect, useRef, useState } from 'react';
 import Papa from 'papaparse';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import { distinctCompanyNames, bulkInviteFromCsv } from '@site/src/data/pendingInvites';
+import { useAuth } from '@/contexts/AuthContext';
+import { distinctCompanyNames, bulkInviteFromCsv } from '@/data/pendingInvites';
 import styles from './styles.module.css';
 
 const INVITABLE_ROLES = ['company_hr', 'company_employees'];
@@ -61,7 +63,7 @@ function parseCsv(text: string): ParsedRow[] {
   return rows;
 }
 
-export default function CsvInviteModal({ open, onClose, onInvited }: CsvInviteModalProps): JSX.Element | null {
+export default function CsvInviteModal({ open, onClose, onInvited }: CsvInviteModalProps): React.JSX.Element | null {
   const { supabase, user } = useAuth();
   const [companyName, setCompanyName] = useState('');
   const [companyOptions, setCompanyOptions] = useState<string[]>([]);

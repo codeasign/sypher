@@ -1,7 +1,8 @@
+'use client';
+
 import React, { useState } from 'react';
-import Link from '@docusaurus/Link';
-import Heading from '@theme/Heading';
-import CourseSlidePanel from '@site/src/components/CourseSlidePanel';
+import Link from 'next/link';
+import CourseSlidePanel from '@/components/CourseSlidePanel';
 import styles from './styles.module.css';
 
 interface CourseData {
@@ -46,11 +47,11 @@ function DashboardCourseCard({
             <span className={styles.cardTag}>{tag}</span>
         </div>
       </div>
-      <Heading as="h3" className={styles.cardTitle}>{title}</Heading>
+      <h3 className={styles.cardTitle}>{title}</h3>
       <p className={styles.cardDesc}>{description}</p>
       {isFree && (
         <div className={styles.cardActions}>
-          <Link to={`/docs/${slug}/`} className={styles.btnPrimary}>
+          <Link href={`/docs/${slug}/`} className={styles.btnPrimary}>
             Learn →
           </Link>
           <button
@@ -157,9 +158,9 @@ export default function DashboardCourseListing({
               )}
               {selectedCourse.modules && selectedCourse.modules.length > 0 && (
                 <div className={styles.panelCurriculumHeader}>
-                  <Heading as="h4" className={styles.panelModulesTitle}>Course Curriculum</Heading>
+                  <h4 className={styles.panelModulesTitle}>Course Curriculum</h4>
                   {selectedCourse.isFree ? (
-                    <Link to={`/docs/${selectedCourse.slug}/`} className={styles.curriculumLearnBtn}>
+                    <Link href={`/docs/${selectedCourse.slug}/`} className={styles.curriculumLearnBtn}>
                       Learn →
                     </Link>
                   ) : (

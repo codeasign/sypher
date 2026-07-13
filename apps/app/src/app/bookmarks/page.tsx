@@ -1,17 +1,33 @@
+'use client';
+
 import React, { useEffect, useMemo, useState } from 'react';
-import Link from '@docusaurus/Link';
-import Heading from '@theme/Heading';
-import DashboardLayout from '@site/src/components/DashboardLayout';
-import { CourseGrid } from '@site/src/components/CourseCard';
-import ConfirmDialog from '@site/src/components/ConfirmDialog';
-import { useBookmarks } from '@site/src/hooks/useBookmarks';
-import { useDocBookmarks } from '@site/src/hooks/useDocBookmarks';
-import { withCourseAccess } from '@site/src/data/homepageCourses';
-import { fetchCourseAccessRows } from '@site/src/data/courseAccess';
-import { fetchCompanyCourseAccessRows } from '@site/src/data/companyAccess';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import courses from '@site/src/data/courses';
+import Link from 'next/link';
+import DashboardLayout from '@/components/DashboardLayout';
+import { CourseGrid } from '@/components/CourseCard';
+import ConfirmDialog from '@/components/ConfirmDialog';
+import { useBookmarks } from '@/hooks/useBookmarks';
+import { useDocBookmarks } from '@/hooks/useDocBookmarks';
+import { withCourseAccess } from '@/data/homepageCourses';
+import { fetchCourseAccessRows } from '@/data/courseAccess';
+import { fetchCompanyCourseAccessRows } from '@/data/companyAccess';
+import { useAuth } from '@/contexts/AuthContext';
+import courses from '@/data/courses';
 import styles from './bookmarks.module.css';
+
+interface DocBookmark {
+  doc_path: string;
+  course_slug: string | null;
+  title: string | null;
+}
+
+interface CourseAccessRow {
+  course_slug: string;
+  allowed_roles: string[];
+}
+
+type PendingRemoval =
+  | { type: 'course'; slug: string; title: string }
+  | { type: 'doc'; docPath: string; title: string };
 
 const COURSE_BY_SLUG = new Map(courses.map((c) => [c.slug, c]));
 
@@ -75,13 +91,18 @@ function BookmarkEmptyIcon() {
   );
 }
 
-function DocBookmarkExplorer({ docBookmarks, onRemove }) {
+interface DocBookmarkExplorerProps {
+  docBookmarks: DocBookmark[];
+  onRemove: (docPath: string, title?: string) => void;
+}
+
+function DocBookmarkExplorer({ docBookmarks, onRemove }: DocBookmarkExplorerProps) {
   const groups = useMemo(() => {
-    const bySlug = new Map();
+    const bySlug = new Map<string, DocBookmark[]>();
     docBookmarks.forEach((b) => {
       const slug = b.course_slug || 'other';
       if (!bySlug.has(slug)) bySlug.set(slug, []);
-      bySlug.get(slug).push(b);
+      bySlug.get(slug)!.push(b);
     });
     return Array.from(bySlug.entries()).map(([slug, pages]) => ({
       slug,
@@ -90,9 +111,9 @@ function DocBookmarkExplorer({ docBookmarks, onRemove }) {
     }));
   }, [docBookmarks]);
 
-  const [collapsed, setCollapsed] = useState(() => new Set());
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
 
-  const toggleGroup = (slug) => {
+  const toggleGroup = (slug: string) => {
     setCollapsed((prev) => {
       const next = new Set(prev);
       if (next.has(slug)) next.delete(slug);
@@ -126,9 +147,9 @@ function DocBookmarkExplorer({ docBookmarks, onRemove }) {
               </button>
               {isOpen && (
                 <div className={styles.fileList}>
-                  {pages.map((p) => (
+                  {pages.map((p: DocBookmark) => (
                     <div key={p.doc_path} className={styles.fileRow}>
-                      <Link to={`/docs/${p.doc_path.replace(/\/index$/, '')}`} className={styles.fileLink}>
+                      <Link href={`/docs/${p.doc_path.replace(/\/index$/, '')}`} className={styles.fileLink}>
                         <span className={styles.fileLinkIcon}><FileDocIcon /></span>
                         <span className={styles.fileName}>{p.title || p.doc_path}</span>
                       </Link>
@@ -152,13 +173,13 @@ function DocBookmarkExplorer({ docBookmarks, onRemove }) {
   );
 }
 
-function BookmarksContent(): JSX.Element {
+function BookmarksContent(): React.JSX.Element {
   const { supabase, role, companyName } = useAuth();
   const { bookmarkedSlugs, isBookmarked, toggleBookmark, loading } = useBookmarks();
   const { bookmarks: docBookmarks, toggleDocBookmark, loading: docLoading } = useDocBookmarks();
-  const [accessRows, setAccessRows] = useState([]);
-  const [companyAllowedSlugs, setCompanyAllowedSlugs] = useState(new Set());
-  const [pendingRemoval, setPendingRemoval] = useState(null);
+  const [accessRows, setAccessRows] = useState<CourseAccessRow[]>([]);
+  const [companyAllowedSlugs, setCompanyAllowedSlugs] = useState<Set<string>>(new Set());
+  const [pendingRemoval, setPendingRemoval] = useState<PendingRemoval | null>(null);
 
   useEffect(() => {
     fetchCourseAccessRows(supabase).then(setAccessRows);
@@ -177,7 +198,7 @@ function BookmarksContent(): JSX.Element {
   const hasAnyBookmarks = bookmarkedCourses.length > 0 || docBookmarks.length > 0;
   const totalBookmarks = bookmarkedCourses.length + docBookmarks.length;
 
-  function handleToggleCourseBookmark(slug) {
+  function handleToggleCourseBookmark(slug: string) {
     if (isBookmarked(slug)) {
       const course = bookmarkedCourses.find((c) => c.slug === slug);
       setPendingRemoval({ type: 'course', slug, title: course?.title ?? slug });
@@ -186,7 +207,7 @@ function BookmarksContent(): JSX.Element {
     toggleBookmark(slug);
   }
 
-  function handleRemoveDocBookmark(docPath, title) {
+  function handleRemoveDocBookmark(docPath: string, title?: string) {
     setPendingRemoval({ type: 'doc', docPath, title: title || docPath });
   }
 
@@ -267,7 +288,7 @@ function BookmarksContent(): JSX.Element {
   );
 }
 
-export default function BookmarksPage(): JSX.Element {
+export default function BookmarksPage(): React.JSX.Element {
   return (
     <DashboardLayout title="Bookmarks" description="Your saved Sypher courses">
       <BookmarksContent />

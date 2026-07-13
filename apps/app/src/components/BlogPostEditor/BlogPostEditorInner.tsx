@@ -1,8 +1,9 @@
+'use client';
+
 import React, { useRef, useState } from 'react';
 import clsx from 'clsx';
-import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
-import { useColorMode } from '@docusaurus/theme-common';
-import BlogPostArticle from '@site/src/components/BlogPostPage/BlogPostArticle';
+import { useColorMode } from '@/hooks/useColorMode';
+import BlogPostArticle from '@/components/BlogPostPage/BlogPostArticle';
 import {
   MDXEditor,
   headingsPlugin,
@@ -25,16 +26,16 @@ import {
   ChangeCodeMirrorLanguage,
 } from '@mdxeditor/editor';
 import type { MDXEditorMethods } from '@mdxeditor/editor';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import { createBlogPost, updateBlogPost, setBlogPostStatus } from '@site/src/data/blogPosts';
-import { uploadToBunny } from '@site/src/data/bunnyUpload';
+import { useAuth } from '@/contexts/AuthContext';
+import { createBlogPost, updateBlogPost, setBlogPostStatus } from '@/data/blogPosts';
+import { uploadToBunny } from '@/data/bunnyUpload';
 import '@mdxeditor/editor/style.css';
 import styles from './styles.module.css';
 
 const TITLE_MAX = 80;
 const DESCRIPTION_MAX = 120;
 
-function EyeIcon(): JSX.Element {
+function EyeIcon(): React.JSX.Element {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z" />
@@ -43,7 +44,7 @@ function EyeIcon(): JSX.Element {
   );
 }
 
-function EyeOffIcon(): JSX.Element {
+function EyeOffIcon(): React.JSX.Element {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a18.6 18.6 0 0 1 4.22-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
@@ -69,8 +70,14 @@ interface BlogPostEditorProps {
   onBack?: () => void;
 }
 
-export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }: BlogPostEditorProps): JSX.Element {
-  const { siteConfig } = useDocusaurusContext();
+const BUNNY_CONFIG = {
+  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
+  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
+  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
+  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
+};
+
+export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }: BlogPostEditorProps): React.JSX.Element {
   const { colorMode } = useColorMode();
   const { supabase, user } = useAuth();
   const [title, setTitle] = useState(post?.title ?? '');
@@ -108,7 +115,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
     setCoverUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, 'blog/covers', siteConfig.customFields);
+      const url = await uploadToBunny(file, 'blog/covers', BUNNY_CONFIG);
       setCoverImageUrl(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload cover image.');
@@ -118,7 +125,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
   }
 
   async function handleImageUpload(file: File): Promise<string> {
-    return uploadToBunny(file, 'blog/content', siteConfig.customFields);
+    return uploadToBunny(file, 'blog/content', BUNNY_CONFIG);
   }
 
   async function persist(nextStatus?: 'draft' | 'published'): Promise<string | null> {

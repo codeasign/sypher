@@ -1,15 +1,16 @@
+'use client';
+
 import React, { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
-import BrowserOnly from '@docusaurus/BrowserOnly';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import { getNavItemAllowedRoles } from '@site/src/data/navAccess';
+import { useAuth } from '@/contexts/AuthContext';
+import { getNavItemAllowedRoles } from '@/data/navAccess';
 
 interface RequireNavAccessProps {
   itemKey: string;
   children: ReactNode;
 }
 
-function RequireNavAccessInner({ itemKey, children }: RequireNavAccessProps): JSX.Element | null {
+function RequireNavAccessInner({ itemKey, children }: RequireNavAccessProps): React.JSX.Element | null {
   const { supabase, role, loading: authLoading } = useAuth();
   const [allowedRoles, setAllowedRoles] = useState<string[] | null>(null);
 
@@ -41,10 +42,6 @@ function RequireNavAccessInner({ itemKey, children }: RequireNavAccessProps): JS
   return <>{children}</>;
 }
 
-export default function RequireNavAccess({ itemKey, children }: RequireNavAccessProps): JSX.Element {
-  return (
-    <BrowserOnly fallback={<p role="status">Loading…</p>}>
-      {() => <RequireNavAccessInner itemKey={itemKey}>{children}</RequireNavAccessInner>}
-    </BrowserOnly>
-  );
+export default function RequireNavAccess({ itemKey, children }: RequireNavAccessProps): React.JSX.Element {
+  return <RequireNavAccessInner itemKey={itemKey}>{children}</RequireNavAccessInner>;
 }

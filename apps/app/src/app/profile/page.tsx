@@ -1,30 +1,38 @@
+'use client';
+
 import React, { useEffect, useRef, useState } from 'react';
-import DashboardLayout from '@site/src/components/DashboardLayout';
-import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import { createRazorpayOrder, verifyRazorpayPayment, loadRazorpayCheckout } from '@site/src/data/payments';
-import { updateOwnBio } from '@site/src/data/profiles';
-import { uploadToBunny } from '@site/src/data/bunnyUpload';
-import PdfEmbed from '@site/src/components/PdfEmbed';
-import { LOOKING_FOR_OPTIONS } from '@site/src/types/lookingFor';
-import type { LookingFor } from '@site/src/types/lookingFor';
-import { EDUCATION_STATUS_OPTIONS, EXPERIENCE_YEARS_OPTIONS, PASSING_YEAR_OPTIONS } from '@site/src/types/educationStatus';
-import type { EducationStatus } from '@site/src/types/educationStatus';
-import { CURRENT_STATUS_OPTIONS, NOTICE_PERIOD_OPTIONS } from '@site/src/types/currentStatus';
-import type { CurrentStatus, NoticePeriod } from '@site/src/types/currentStatus';
-import { SOCIAL_PLATFORM_OPTIONS } from '@site/src/types/socialLinks';
-import type { SocialLinks } from '@site/src/types/socialLinks';
-import { fetchTaxonomy } from '@site/src/data/taxonomy';
+import DashboardLayout from '@/components/DashboardLayout';
+import { useAuth } from '@/contexts/AuthContext';
+import { createRazorpayOrder, verifyRazorpayPayment, loadRazorpayCheckout } from '@/data/payments';
+import { updateOwnBio } from '@/data/profiles';
+import { uploadToBunny } from '@/data/bunnyUpload';
+import PdfEmbed from '@/components/PdfEmbed';
+import { LOOKING_FOR_OPTIONS } from '@/types/lookingFor';
+import type { LookingFor } from '@/types/lookingFor';
+import { EDUCATION_STATUS_OPTIONS, EXPERIENCE_YEARS_OPTIONS, PASSING_YEAR_OPTIONS } from '@/types/educationStatus';
+import type { EducationStatus } from '@/types/educationStatus';
+import { CURRENT_STATUS_OPTIONS, NOTICE_PERIOD_OPTIONS } from '@/types/currentStatus';
+import type { CurrentStatus, NoticePeriod } from '@/types/currentStatus';
+import { SOCIAL_PLATFORM_OPTIONS } from '@/types/socialLinks';
+import type { SocialLinks } from '@/types/socialLinks';
+import { fetchTaxonomy } from '@/data/taxonomy';
 import {
   getOwnSkills,
   getOwnTechnologies,
   setOwnSkills,
   setOwnTechnologies,
   setOwnDesignation,
-} from '@site/src/data/userTaxonomy';
-import { SENIORITY_LEVEL_OPTIONS } from '@site/src/types/seniority';
-import type { SeniorityLevel } from '@site/src/types/seniority';
+} from '@/data/userTaxonomy';
+import { SENIORITY_LEVEL_OPTIONS } from '@/types/seniority';
+import type { SeniorityLevel } from '@/types/seniority';
 import styles from './profile.module.css';
+
+const BUNNY_CONFIG = {
+  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
+  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
+  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
+  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
+};
 
 const BIO_WORD_LIMIT = 250;
 const PROFICIENCY_OPTIONS = ['beginner', 'intermediate', 'advanced', 'expert'];
@@ -46,6 +54,18 @@ interface TechnologyPick {
   technologyId: string;
   proficiency: string;
   yearsExperience: string;
+}
+
+interface SkillRow {
+  skill_id: string;
+  proficiency: string | null;
+  years_experience: number | null;
+}
+
+interface TechnologyRow {
+  technology_id: string;
+  proficiency: string | null;
+  years_experience: number | null;
 }
 
 function countWords(text: string): number {
@@ -70,13 +90,10 @@ function isExpiringSoon(paidUntil: string): boolean {
   return daysLeft <= EXPIRING_SOON_DAYS;
 }
 
-export default function ProfilePage(): JSX.Element {
-  const { siteConfig } = useDocusaurusContext();
-  const { razorpayKeyId, apiBaseUrl, paidUpgradePriceInrPaise } = (siteConfig.customFields ?? {}) as {
-    razorpayKeyId?: string;
-    apiBaseUrl?: string;
-    paidUpgradePriceInrPaise?: string;
-  };
+export default function ProfilePage(): React.JSX.Element {
+  const razorpayKeyId = process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID;
+  const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL;
+  const paidUpgradePriceInrPaise = process.env.NEXT_PUBLIC_PAID_UPGRADE_PRICE_INR_PAISE;
 
   const {
     supabase,
@@ -183,7 +200,7 @@ export default function ProfilePage(): JSX.Element {
 
   useEffect(() => {
     if (!supabase || !session?.user.id) return;
-    getOwnSkills(supabase, session.user.id).then((rows) =>
+    getOwnSkills(supabase, session.user.id).then((rows: SkillRow[]) =>
       setSkillPicks(
         rows.map((r) => ({
           skillId: r.skill_id,
@@ -192,7 +209,7 @@ export default function ProfilePage(): JSX.Element {
         }))
       )
     );
-    getOwnTechnologies(supabase, session.user.id).then((rows) =>
+    getOwnTechnologies(supabase, session.user.id).then((rows: TechnologyRow[]) =>
       setTechnologyPicks(
         rows.map((r) => ({
           technologyId: r.technology_id,
@@ -393,7 +410,7 @@ export default function ProfilePage(): JSX.Element {
     setResumeError(null);
     setIsUploadingResume(true);
     try {
-      const url = await uploadToBunny(file, `resume/${session.user.id}`, siteConfig.customFields);
+      const url = await uploadToBunny(file, `resume/${session.user.id}`, BUNNY_CONFIG);
       const { error } = await updateOwnBio(
         supabase,
         bioInput.trim(),

@@ -1,14 +1,16 @@
+'use client';
+
 import React, { useEffect, useState } from 'react';
 import clsx from 'clsx';
-import Link from '@docusaurus/Link';
-import { useLocation } from '@docusaurus/router';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 import type { User } from '@supabase/supabase-js';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import { listNavAccess, canSeeNavItem } from '@site/src/data/navAccess';
-import { fetchCompanyNavAccessRows } from '@site/src/data/companyAccess';
-import { NAV_SECTIONS } from '@site/src/data/navItems';
-import { ROLES } from '@site/src/types/roles';
-import type { Role } from '@site/src/types/roles';
+import { useAuth } from '@/contexts/AuthContext';
+import { listNavAccess, canSeeNavItem } from '@/data/navAccess';
+import { fetchCompanyNavAccessRows } from '@/data/companyAccess';
+import { NAV_SECTIONS } from '@/data/navItems';
+import { ROLES } from '@/types/roles';
+import type { Role } from '@/types/roles';
 import styles from './styles.module.css';
 
 function getRoleLabel(role: Role | null): string {
@@ -26,7 +28,7 @@ interface NavItem {
   key?: string;
   href: string;
   label: string;
-  icon: (props: { className?: string }) => JSX.Element;
+  icon: (props: { className?: string }) => React.JSX.Element;
   comingSoon?: boolean;
 }
 
@@ -35,7 +37,7 @@ interface NavSection {
   items: NavItem[];
 }
 
-const ICONS_BY_KEY: Record<string, (props: { className?: string }) => JSX.Element> = {
+const ICONS_BY_KEY: Record<string, (props: { className?: string }) => React.JSX.Element> = {
   'resume-review': ResumeIcon,
   'mock-interview': InterviewIcon,
   'add-job-post': JobPostIcon,
@@ -69,8 +71,8 @@ export default function DashboardSidebar({
   user,
   collapsed,
   onToggleCollapsed,
-}: DashboardSidebarProps): JSX.Element {
-  const { pathname } = useLocation();
+}: DashboardSidebarProps): React.JSX.Element {
+  const pathname = usePathname();
   const { supabase, role, companyName } = useAuth();
   const email = user?.email ?? '';
   const metadata = (user?.user_metadata ?? {}) as {
@@ -129,11 +131,11 @@ export default function DashboardSidebar({
     return pathname === href || pathname.startsWith(`${href}/`);
   }
 
-  function renderNavItem({ key, href, label, icon: Icon, comingSoon }: NavItem): JSX.Element {
+  function renderNavItem({ key, href, label, icon: Icon, comingSoon }: NavItem): React.JSX.Element {
     return (
       <Link
         key={key ?? href}
-        to={comingSoon ? undefined : href}
+        href={href}
         className={clsx(
           styles.navItem,
           isActive(href) && !comingSoon && styles.navItemActive,
@@ -154,7 +156,7 @@ export default function DashboardSidebar({
     );
   }
 
-  function renderSection({ title, items }: NavSection): JSX.Element {
+  function renderSection({ title, items }: NavSection): React.JSX.Element {
     return (
       <div key={title} className={styles.section}>
         {!collapsed && <span className={styles.sectionHeader}>{title}</span>}
@@ -206,7 +208,7 @@ export default function DashboardSidebar({
   );
 }
 
-function DashboardIcon({ className }: { className?: string }): JSX.Element {
+function DashboardIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}
@@ -228,7 +230,7 @@ function DashboardIcon({ className }: { className?: string }): JSX.Element {
   );
 }
 
-function BookmarkIcon({ className }: { className?: string }): JSX.Element {
+function BookmarkIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}
@@ -247,7 +249,7 @@ function BookmarkIcon({ className }: { className?: string }): JSX.Element {
   );
 }
 
-function ProfileIcon({ className }: { className?: string }): JSX.Element {
+function ProfileIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}
@@ -267,7 +269,7 @@ function ProfileIcon({ className }: { className?: string }): JSX.Element {
   );
 }
 
-function ResumeIcon({ className }: { className?: string }): JSX.Element {
+function ResumeIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}
@@ -290,7 +292,7 @@ function ResumeIcon({ className }: { className?: string }): JSX.Element {
   );
 }
 
-function InterviewIcon({ className }: { className?: string }): JSX.Element {
+function InterviewIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}
@@ -312,7 +314,7 @@ function InterviewIcon({ className }: { className?: string }): JSX.Element {
   );
 }
 
-function JobPostIcon({ className }: { className?: string }): JSX.Element {
+function JobPostIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}
@@ -333,7 +335,7 @@ function JobPostIcon({ className }: { className?: string }): JSX.Element {
   );
 }
 
-function UsersIcon({ className }: { className?: string }): JSX.Element {
+function UsersIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}
@@ -355,7 +357,7 @@ function UsersIcon({ className }: { className?: string }): JSX.Element {
   );
 }
 
-function ManageAccessIcon({ className }: { className?: string }): JSX.Element {
+function ManageAccessIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}
@@ -375,7 +377,7 @@ function ManageAccessIcon({ className }: { className?: string }): JSX.Element {
   );
 }
 
-function AnnouncementIcon({ className }: { className?: string }): JSX.Element {
+function AnnouncementIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}
@@ -395,7 +397,7 @@ function AnnouncementIcon({ className }: { className?: string }): JSX.Element {
   );
 }
 
-function BlogIcon({ className }: { className?: string }): JSX.Element {
+function BlogIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}
@@ -415,7 +417,7 @@ function BlogIcon({ className }: { className?: string }): JSX.Element {
   );
 }
 
-function ManageBlogIcon({ className }: { className?: string }): JSX.Element {
+function ManageBlogIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}
@@ -435,7 +437,7 @@ function ManageBlogIcon({ className }: { className?: string }): JSX.Element {
   );
 }
 
-function BrandingIcon({ className }: { className?: string }): JSX.Element {
+function BrandingIcon({ className }: { className?: string }): React.JSX.Element {
   return (
     <svg
       className={className}

@@ -1,13 +1,15 @@
+'use client';
+
 import React, { useEffect, useState } from 'react';
-import DashboardLayout from '@site/src/components/DashboardLayout';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import { fetchCourseAccessRows } from '@site/src/data/courseAccess';
-import { fetchCompanyCourseAccessRows } from '@site/src/data/companyAccess';
-import { withCourseAccess } from '@site/src/data/homepageCourses';
-import DashboardCourseListing from '@site/src/components/DashboardCourseListing';
+import DashboardLayout from '@/components/DashboardLayout';
+import { useAuth } from '@/contexts/AuthContext';
+import { fetchCourseAccessRows } from '@/data/courseAccess';
+import { fetchCompanyCourseAccessRows } from '@/data/companyAccess';
+import { withCourseAccess } from '@/data/homepageCourses';
+import DashboardCourseListing from '@/components/DashboardCourseListing';
 import styles from './dashboard.module.css';
 
-function DashboardContent(): JSX.Element {
+function DashboardContent(): React.JSX.Element {
   const { supabase, role, companyName } = useAuth();
   const [accessRows, setAccessRows] = useState<{ course_slug: string; allowed_roles: string[] }[]>([]);
   const [companyAllowedSlugs, setCompanyAllowedSlugs] = useState<Set<string>>(new Set());
@@ -56,7 +58,7 @@ function DashboardContent(): JSX.Element {
   );
 }
 
-export default function DashboardPage(): JSX.Element {
+export default function DashboardPage(): React.JSX.Element {
   return (
     <DashboardLayout title="Dashboard" description="Your Sypher dashboard">
       <DashboardContent />

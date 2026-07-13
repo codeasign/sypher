@@ -1,10 +1,11 @@
+'use client';
+
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import { fetchTaxonomy, saveTaxonomyCategory } from '@site/src/data/taxonomy';
-import { SENIORITY_PREFIXES } from '@site/src/types/seniority';
-import type { SeniorityLevel } from '@site/src/types/seniority';
-import manageAccessStyles from '../../pages/manage-access.module.css';
+import { useAuth } from '@/contexts/AuthContext';
+import { fetchTaxonomy, saveTaxonomyCategory } from '@/data/taxonomy';
+import { SENIORITY_PREFIXES } from '@/types/seniority';
+import type { SeniorityLevel } from '@/types/seniority';
+import manageAccessStyles from '@/app/manage-access/manage-access.module.css';
 import styles from './styles.module.css';
 
 /* ── Types (mirrors api/taxonomy.js's assembled response) ── */
@@ -137,9 +138,8 @@ function guessKind(name: string): 'skill' | 'technology' {
 
 const UNCATEGORIZED_SENTINEL = '__new__';
 
-export default function TaxonomyTab(): JSX.Element {
-  const { siteConfig } = useDocusaurusContext();
-  const { apiBaseUrl } = (siteConfig.customFields ?? {}) as { apiBaseUrl?: string };
+export default function TaxonomyTab(): React.JSX.Element {
+  const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL;
   const { supabase } = useAuth();
 
   const [catalog, setCatalog] = useState<TaxonomyData | null>(null);

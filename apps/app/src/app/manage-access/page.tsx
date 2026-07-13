@@ -1,21 +1,23 @@
+'use client';
+
 import React, { useCallback, useEffect, useState } from 'react';
-import DashboardLayout from '@site/src/components/DashboardLayout';
-import RequireAdmin from '@site/src/components/RequireAdmin';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import courses from '@site/src/data/courses';
-import { listCourseAccess, setCourseRoles } from '@site/src/data/courseAccess';
-import { listNavAccess, setNavItemRoles } from '@site/src/data/navAccess';
-import { NAV_SECTIONS } from '@site/src/data/navItems';
+import DashboardLayout from '@/components/DashboardLayout';
+import RequireAdmin from '@/components/RequireAdmin';
+import { useAuth } from '@/contexts/AuthContext';
+import courses from '@/data/courses';
+import { listCourseAccess, setCourseRoles } from '@/data/courseAccess';
+import { listNavAccess, setNavItemRoles } from '@/data/navAccess';
+import { NAV_SECTIONS } from '@/data/navItems';
 import {
   distinctCompanyNames,
   listCompanyCourseAccess,
   listCompanyNavAccess,
   setCompanyCourseAccess,
   setCompanyNavAccess,
-} from '@site/src/data/companyAccess';
-import { ROLES, GLOBALLY_CONFIGURABLE_ROLES } from '@site/src/types/roles';
-import type { Role } from '@site/src/types/roles';
-import TaxonomyTab from '@site/src/components/TaxonomyTab';
+} from '@/data/companyAccess';
+import { ROLES, GLOBALLY_CONFIGURABLE_ROLES } from '@/types/roles';
+import type { Role } from '@/types/roles';
+import TaxonomyTab from '@/components/TaxonomyTab';
 import styles from './manage-access.module.css';
 
 /* ── Types ── */
@@ -36,7 +38,7 @@ interface AccessModalItem {
 
 /* ── SVG icons ── */
 
-function AlertCircleIcon(): JSX.Element {
+function AlertCircleIcon(): React.JSX.Element {
   return (
     <svg
       className={styles.errorIcon}
@@ -77,7 +79,7 @@ function RoleAccessModal({
   rowErrors: Record<string, string>;
   onToggle: (itemKey: string, role: Role, checked: boolean) => void;
   onClose: () => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const roleLabel = ROLES.find((r) => r.value === role)?.label ?? role;
   let lastSection = '';
 
@@ -160,7 +162,7 @@ function CompanyAccessModal({
   rowErrors: Record<string, string>;
   onToggle: (itemKey: string, checked: boolean) => void;
   onClose: () => void;
-}): JSX.Element {
+}): React.JSX.Element {
   let lastSection = '';
 
   useEffect(() => {
@@ -231,7 +233,7 @@ const COURSE_ITEMS: AccessModalItem[] = (courses as Course[]).map((course) => ({
   sublabel: course.tag,
 }));
 
-function CoursesTab(): JSX.Element {
+function CoursesTab(): React.JSX.Element {
   const { supabase } = useAuth();
   const [allowedByKey, setAllowedByKey] = useState<Record<string, Role[]>>({});
   const [loading, setLoading] = useState(true);
@@ -348,7 +350,7 @@ const FLAT_NAV_ITEMS: AccessModalItem[] = NAV_SECTIONS.flatMap((section) =>
   })),
 );
 
-function NavAccessTab(): JSX.Element {
+function NavAccessTab(): React.JSX.Element {
   const { supabase } = useAuth();
   const [allowedByKey, setAllowedByKey] = useState<Record<string, Role[]>>({});
   const [loading, setLoading] = useState(true);
@@ -456,7 +458,7 @@ function NavAccessTab(): JSX.Element {
 
 /* ── Companies tab ── */
 
-function CompaniesTab(): JSX.Element {
+function CompaniesTab(): React.JSX.Element {
   const { supabase } = useAuth();
   const [companyOptions, setCompanyOptions] = useState<string[]>([]);
   const [companyName, setCompanyName] = useState('');
@@ -613,7 +615,7 @@ function CompaniesTab(): JSX.Element {
 
 /* ── Content component ── */
 
-function ManageAccessContent(): JSX.Element {
+function ManageAccessContent(): React.JSX.Element {
   const [activeTab, setActiveTab] = useState<'courses' | 'nav' | 'companies' | 'taxonomy'>('courses');
 
   return (
@@ -671,7 +673,7 @@ function ManageAccessContent(): JSX.Element {
 
 /* ── Page component ── */
 
-export default function ManageAccessPage(): JSX.Element {
+export default function ManageAccessPage(): React.JSX.Element {
   return (
     <DashboardLayout
       title="Manage Course Access"

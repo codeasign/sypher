@@ -1,14 +1,16 @@
+'use client';
+
 import React, { useCallback, useEffect, useState } from 'react';
-import DashboardLayout from '@site/src/components/DashboardLayout';
-import RequireAdmin from '@site/src/components/RequireAdmin';
-import ConfirmDialog from '@site/src/components/ConfirmDialog';
-import CsvInviteModal from '@site/src/components/CsvInviteModal';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import { listProfiles, updateProfileRole, softDeleteProfile } from '@site/src/data/profiles';
-import { ROLES } from '@site/src/types/roles';
-import type { Role } from '@site/src/types/roles';
-import { SIGNUP_SOURCES } from '@site/src/types/signupSource';
-import type { SignupSource } from '@site/src/types/signupSource';
+import DashboardLayout from '@/components/DashboardLayout';
+import RequireAdmin from '@/components/RequireAdmin';
+import ConfirmDialog from '@/components/ConfirmDialog';
+import CsvInviteModal from '@/components/CsvInviteModal';
+import { useAuth } from '@/contexts/AuthContext';
+import { listProfiles, updateProfileRole, softDeleteProfile } from '@/data/profiles';
+import { ROLES } from '@/types/roles';
+import type { Role } from '@/types/roles';
+import { SIGNUP_SOURCES } from '@/types/signupSource';
+import type { SignupSource } from '@/types/signupSource';
 import styles from './manage-users.module.css';
 
 /* ── Types ── */
@@ -63,7 +65,7 @@ function getSignupSourceLabel(source: SignupSource): string {
 
 /* ── SVG icons ── */
 
-function SearchIcon(): JSX.Element {
+function SearchIcon(): React.JSX.Element {
   return (
     <svg
       width="16"
@@ -83,7 +85,7 @@ function SearchIcon(): JSX.Element {
   );
 }
 
-function TrashIcon(): JSX.Element {
+function TrashIcon(): React.JSX.Element {
   return (
     <svg
       width="14"
@@ -102,7 +104,7 @@ function TrashIcon(): JSX.Element {
   );
 }
 
-function EditIcon(): JSX.Element {
+function EditIcon(): React.JSX.Element {
   return (
     <svg
       width="14"
@@ -120,7 +122,7 @@ function EditIcon(): JSX.Element {
   );
 }
 
-function AlertCircleIcon(): JSX.Element {
+function AlertCircleIcon(): React.JSX.Element {
   return (
     <svg
       className={styles.errorIcon}
@@ -141,7 +143,7 @@ function AlertCircleIcon(): JSX.Element {
   );
 }
 
-function UsersIcon(): JSX.Element {
+function UsersIcon(): React.JSX.Element {
   return (
     <svg
       className={styles.emptyIcon}
@@ -172,7 +174,7 @@ interface EditRoleModalProps {
   onCancel: () => void;
 }
 
-function EditRoleModal({ open, profile, onSave, onCancel }: EditRoleModalProps): JSX.Element | null {
+function EditRoleModal({ open, profile, onSave, onCancel }: EditRoleModalProps): React.JSX.Element | null {
   const [selectedRole, setSelectedRole] = useState<Role>('free_users');
   const [saving, setSaving] = useState(false);
 
@@ -244,7 +246,7 @@ function EditRoleModal({ open, profile, onSave, onCancel }: EditRoleModalProps):
 
 /* ── Content component ── */
 
-function ManageUsersContent(): JSX.Element {
+function ManageUsersContent(): React.JSX.Element {
   const { supabase } = useAuth();
   const [users, setUsers] = useState<Profile[]>([]);
   const [loading, setLoading] = useState(true);
@@ -534,7 +536,7 @@ function ManageUsersContent(): JSX.Element {
 
 /* ── Page component ── */
 
-export default function ManageUsersPage(): JSX.Element {
+export default function ManageUsersPage(): React.JSX.Element {
   return (
     <DashboardLayout
       title="Manage Users"

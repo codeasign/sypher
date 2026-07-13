@@ -1,6 +1,7 @@
+'use client';
+
 import React, { useEffect, useState } from 'react';
 import type { ComponentType } from 'react';
-import BrowserOnly from '@docusaurus/BrowserOnly';
 // @mdxeditor/editor -> @lexical/code statically imports a fixed set of
 // prism-*.js language files, some of which extend a base language that must
 // already be registered (e.g. objectivec/cpp extend c, which extends
@@ -43,7 +44,7 @@ interface BlogPostEditorProps {
   onBack?: () => void;
 }
 
-function BlogPostEditorLoader(props: BlogPostEditorProps): JSX.Element {
+function BlogPostEditorLoader(props: BlogPostEditorProps): React.JSX.Element {
   const [Inner, setInner] = useState<ComponentType<BlogPostEditorProps> | null>(null);
 
   useEffect(() => {
@@ -57,10 +58,6 @@ function BlogPostEditorLoader(props: BlogPostEditorProps): JSX.Element {
   return <Inner {...props} />;
 }
 
-export default function BlogPostEditor(props: BlogPostEditorProps): JSX.Element {
-  return (
-    <BrowserOnly fallback={<p role="status">Loading editor…</p>}>
-      {() => <BlogPostEditorLoader {...props} />}
-    </BrowserOnly>
-  );
+export default function BlogPostEditor(props: BlogPostEditorProps): React.JSX.Element {
+  return <BlogPostEditorLoader {...props} />;
 }
