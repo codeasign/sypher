@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import { listBookmarkedSlugs, addBookmark, removeBookmark } from '@site/src/data/bookmarks';
+import { useAuth } from '@/contexts/AuthContext';
+import { listBookmarkedSlugs, addBookmark, removeBookmark } from '@/data/bookmarks';
 
 export function useBookmarks() {
   const { supabase, user } = useAuth();

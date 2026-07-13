@@ -1,15 +1,16 @@
+'use client';
+
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import type { Session, SupabaseClient, User } from '@supabase/supabase-js';
-import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
-import { getOwnProfile } from '@site/src/data/profiles';
-import type { Role } from '@site/src/types/roles';
-import type { LookingFor } from '@site/src/types/lookingFor';
-import type { EducationStatus } from '@site/src/types/educationStatus';
-import type { CurrentStatus, NoticePeriod } from '@site/src/types/currentStatus';
-import type { SocialLinks } from '@site/src/types/socialLinks';
-import type { SeniorityLevel } from '@site/src/types/seniority';
+import { getOwnProfile } from '@/data/profiles';
+import type { Role } from '@/types/roles';
+import type { LookingFor } from '@/types/lookingFor';
+import type { EducationStatus } from '@/types/educationStatus';
+import type { CurrentStatus, NoticePeriod } from '@/types/currentStatus';
+import type { SocialLinks } from '@/types/socialLinks';
+import type { SeniorityLevel } from '@/types/seniority';
 
 interface AuthContextValue {
   supabase: SupabaseClient | null;
@@ -57,12 +58,9 @@ const AuthContext = createContext<AuthContextValue>({
   refreshProfile: async () => {},
 });
 
-export function AuthProvider({ children }: { children: ReactNode }): JSX.Element {
-  const { siteConfig } = useDocusaurusContext();
-  const { supabaseUrl, supabaseAnonKey } = (siteConfig.customFields ?? {}) as {
-    supabaseUrl?: string;
-    supabaseAnonKey?: string;
-  };
+export function AuthProvider({ children }: { children: ReactNode }): React.JSX.Element {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
   const supabase = useMemo<SupabaseClient | null>(() => {
     if (typeof window === 'undefined') {
@@ -119,7 +117,7 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
       if (newSession) {
         const profile = await getOwnProfile(supabase, newSession.user.id);
         if (profile?.deleted_at) {
-          await supabase.auth.signOut();
+          await supabase!.auth.signOut();
           if (isMounted) {
             setSession(null);
             setRole(null);
