@@ -22,9 +22,11 @@ interface Profile {
   company_name: string | null;
   confirmed_at: string | null;
   created_at: string;
+  paid_until: string | null;
 }
 
 const CORPORATE_ROLES: Role[] = ['company_hr', 'company_employees'];
+const EXPIRING_SOON_DAYS = 30;
 
 /* ── Helpers ── */
 
@@ -40,6 +42,15 @@ function getInitials(name: string): string {
 
 function formatJoined(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, { month: 'short', year: 'numeric' });
+}
+
+function formatExpiry(iso: string): string {
+  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function isExpiringSoon(paidUntil: string): boolean {
+  const daysLeft = (new Date(paidUntil).getTime() - Date.now()) / (1000 * 60 * 60 * 24);
+  return daysLeft <= EXPIRING_SOON_DAYS;
 }
 
 function getRoleLabel(role: Role): string {
@@ -306,12 +317,10 @@ function ManageUsersContent(): JSX.Element {
     return matchesSearch && matchesRole;
   });
 
-  const stats = {
-    total: users.length,
-    admins: users.filter((u) => u.role === 'admin').length,
-    free: users.filter((u) => u.role === 'free_users').length,
-    paid: users.filter((u) => u.role === 'paid_users').length,
-  };
+  const roleCounts = ROLES.map((r) => ({
+    ...r,
+    count: users.filter((u) => u.role === r.value).length,
+  }));
 
   /* ── Loading state ── */
 
@@ -360,21 +369,15 @@ function ManageUsersContent(): JSX.Element {
       {/* ── Stats ── */}
       <div className={styles.statsBar}>
         <div className={styles.statCard}>
-          <span className={styles.statValue}>{stats.total}</span>
+          <span className={styles.statValue}>{users.length}</span>
           <span className={styles.statLabel}>Total Users</span>
         </div>
-        <div className={styles.statCard}>
-          <span className={styles.statValue}>{stats.admins}</span>
-          <span className={styles.statLabel}>Admins</span>
-        </div>
-        <div className={styles.statCard}>
-          <span className={styles.statValue}>{stats.free}</span>
-          <span className={styles.statLabel}>Free Users</span>
-        </div>
-        <div className={styles.statCard}>
-          <span className={styles.statValue}>{stats.paid}</span>
-          <span className={styles.statLabel}>Paid Users</span>
-        </div>
+        {roleCounts.map((r) => (
+          <div key={r.value} className={styles.statCard}>
+            <span className={styles.statValue}>{r.count}</span>
+            <span className={styles.statLabel}>{r.label}</span>
+          </div>
+        ))}
       </div>
 
       {/* ── Controls ── */}
@@ -458,6 +461,14 @@ function ManageUsersContent(): JSX.Element {
                     >
                       {user.confirmed_at ? 'Active' : 'Invited'}
                     </span>
+                  )}
+                  {user.role === 'paid_users' && user.paid_until && (
+                    <>
+                      {isExpiringSoon(user.paid_until) && (
+                        <span className={`${styles.statusBadge} ${styles.statusInvited}`}>Expiring soon</span>
+                      )}
+                      <p className={styles.rowExpiry}>Expires {formatExpiry(user.paid_until)}</p>
+                    </>
                   )}
                   {rowErrors[user.id] && (
                     <p className={styles.rowError}>{rowErrors[user.id]}</p>

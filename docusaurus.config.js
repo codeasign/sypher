@@ -13,6 +13,7 @@ const config = {
   ],
   plugins: [
     './plugins/course-sections',
+    './plugins/blog-routes',
   ],
 
   future: {
@@ -42,6 +43,14 @@ const config = {
     supabaseUrl: process.env.SUPABASE_URL,
     supabaseAnonKey: process.env.SUPABASE_ANON_KEY,
     web3formsAccessKey: process.env.WEB3FORMS_ACCESS_KEY ?? '',
+    bunnyStorageZone: process.env.BUNNY_STORAGE_ZONE ?? '',
+    bunnyStorageAccessKey: process.env.BUNNY_STORAGE_ACCESS_KEY ?? '',
+    bunnyStorageHostname: process.env.BUNNY_STORAGE_HOSTNAME ?? 'storage.bunnycdn.com',
+    bunnyPullZoneUrl: process.env.BUNNY_PULL_ZONE_URL ?? '',
+    razorpayKeyId: process.env.RAZORPAY_KEY_ID ?? '',
+    apiBaseUrl: process.env.API_BASE_URL ?? '',
+    paidUpgradePriceInrPaise: process.env.PAID_UPGRADE_PRICE_INR_PAISE ?? '',
+    paidUpgradeDurationDays: process.env.PAID_UPGRADE_DURATION_DAYS ?? '365',
   },
 
   presets: [
@@ -69,6 +78,7 @@ const config = {
         // Claude Code inserts new items here. Do not remove these markers.
         { type: 'custom-exploreCourses', position: 'left' },
         // === /TOPICS ===
+        { to: '/blog', label: 'Blog', position: 'left' },
         { to: '/corporate-training', label: 'Corporate Training', position: 'left' },
         { to: '/resume-review', label: 'Resume Review', position: 'left' },
         { to: '/mock-interview', label: 'Mock Interview', position: 'left' },

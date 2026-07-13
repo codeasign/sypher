@@ -7,7 +7,14 @@ import { useAuth } from '@site/src/contexts/AuthContext';
 import { listNavAccess, canSeeNavItem } from '@site/src/data/navAccess';
 import { fetchCompanyNavAccessRows } from '@site/src/data/companyAccess';
 import { NAV_SECTIONS } from '@site/src/data/navItems';
+import { ROLES } from '@site/src/types/roles';
+import type { Role } from '@site/src/types/roles';
 import styles from './styles.module.css';
+
+function getRoleLabel(role: Role | null): string {
+  if (!role) return '';
+  return ROLES.find((r) => r.value === role)?.label ?? role;
+}
 
 interface DashboardSidebarProps {
   user?: User | null;
@@ -179,6 +186,11 @@ export default function DashboardSidebar({
           <div className={styles.userInfo}>
             <span className={styles.name}>{displayName}</span>
             <span className={styles.email}>{email}</span>
+            {role && (
+              <span className={clsx(styles.roleBadge, styles[`role-${role}`])}>
+                {getRoleLabel(role)}
+              </span>
+            )}
           </div>
         )}
       </div>

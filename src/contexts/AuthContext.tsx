@@ -5,6 +5,11 @@ import type { Session, SupabaseClient, User } from '@supabase/supabase-js';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import { getOwnProfile } from '@site/src/data/profiles';
 import type { Role } from '@site/src/types/roles';
+import type { LookingFor } from '@site/src/types/lookingFor';
+import type { EducationStatus } from '@site/src/types/educationStatus';
+import type { CurrentStatus, NoticePeriod } from '@site/src/types/currentStatus';
+import type { SocialLinks } from '@site/src/types/socialLinks';
+import type { SeniorityLevel } from '@site/src/types/seniority';
 
 interface AuthContextValue {
   supabase: SupabaseClient | null;
@@ -12,7 +17,21 @@ interface AuthContextValue {
   user: User | null;
   role: Role | null;
   companyName: string | null;
+  paidUntil: string | null;
+  fullName: string | null;
+  bio: string | null;
+  currentStatus: CurrentStatus | null;
+  noticePeriod: NoticePeriod | null;
+  lookingFor: LookingFor[];
+  educationStatus: EducationStatus | null;
+  experienceYears: number | null;
+  passingYear: number | null;
+  resumeUrl: string | null;
+  socialLinks: SocialLinks;
+  designationId: string | null;
+  designationSeniority: SeniorityLevel | null;
   loading: boolean;
+  refreshProfile: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue>({
@@ -21,7 +40,21 @@ const AuthContext = createContext<AuthContextValue>({
   user: null,
   role: null,
   companyName: null,
+  paidUntil: null,
+  fullName: null,
+  bio: null,
+  currentStatus: null,
+  noticePeriod: null,
+  lookingFor: [],
+  educationStatus: null,
+  experienceYears: null,
+  passingYear: null,
+  resumeUrl: null,
+  socialLinks: {},
+  designationId: null,
+  designationSeniority: null,
   loading: true,
+  refreshProfile: async () => {},
 });
 
 export function AuthProvider({ children }: { children: ReactNode }): JSX.Element {
@@ -55,6 +88,19 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
   const [session, setSession] = useState<Session | null>(null);
   const [role, setRole] = useState<Role | null>(null);
   const [companyName, setCompanyName] = useState<string | null>(null);
+  const [paidUntil, setPaidUntil] = useState<string | null>(null);
+  const [fullName, setFullName] = useState<string | null>(null);
+  const [bio, setBio] = useState<string | null>(null);
+  const [currentStatus, setCurrentStatus] = useState<CurrentStatus | null>(null);
+  const [noticePeriod, setNoticePeriod] = useState<NoticePeriod | null>(null);
+  const [lookingFor, setLookingFor] = useState<LookingFor[]>([]);
+  const [educationStatus, setEducationStatus] = useState<EducationStatus | null>(null);
+  const [experienceYears, setExperienceYears] = useState<number | null>(null);
+  const [passingYear, setPassingYear] = useState<number | null>(null);
+  const [resumeUrl, setResumeUrl] = useState<string | null>(null);
+  const [socialLinks, setSocialLinks] = useState<SocialLinks>({});
+  const [designationId, setDesignationId] = useState<string | null>(null);
+  const [designationSeniority, setDesignationSeniority] = useState<SeniorityLevel | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -64,6 +110,10 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
     }
 
     let isMounted = true;
+    // Tracks the signed-in user id outside React state so the auth-event
+    // listener below can tell "same user, token refresh" apart from a real
+    // sign-in/out without a stale closure over `session`.
+    let currentUserId: string | null = null;
 
     async function applySession(newSession: Session | null): Promise<void> {
       if (newSession) {
@@ -74,17 +124,57 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
             setSession(null);
             setRole(null);
             setCompanyName(null);
+            setPaidUntil(null);
+            setFullName(null);
+            setBio(null);
+            setCurrentStatus(null);
+            setNoticePeriod(null);
+            setLookingFor([]);
+            setEducationStatus(null);
+            setExperienceYears(null);
+            setPassingYear(null);
+            setResumeUrl(null);
+            setSocialLinks({});
+            setDesignationId(null);
+            setDesignationSeniority(null);
           }
           return;
         }
         if (isMounted) {
           setRole((profile?.role as Role) ?? null);
           setCompanyName(profile?.company_name ?? null);
+          setPaidUntil(profile?.paid_until ?? null);
+          setFullName(profile?.full_name ?? null);
+          setBio(profile?.bio ?? null);
+          setCurrentStatus((profile?.current_status as CurrentStatus) ?? null);
+          setNoticePeriod((profile?.notice_period as NoticePeriod) ?? null);
+          setLookingFor((profile?.looking_for as LookingFor[]) ?? []);
+          setEducationStatus((profile?.education_status as EducationStatus) ?? null);
+          setExperienceYears(profile?.experience_years ?? null);
+          setPassingYear(profile?.passing_year ?? null);
+          setResumeUrl(profile?.resume_url ?? null);
+          setSocialLinks((profile?.social_links as SocialLinks) ?? {});
+          setDesignationId(profile?.designation_id ?? null);
+          setDesignationSeniority((profile?.designation_seniority as SeniorityLevel) ?? null);
         }
       } else if (isMounted) {
         setRole(null);
         setCompanyName(null);
+        setPaidUntil(null);
+        setFullName(null);
+        setBio(null);
+        setCurrentStatus(null);
+        setNoticePeriod(null);
+        setLookingFor([]);
+        setEducationStatus(null);
+        setExperienceYears(null);
+        setPassingYear(null);
+        setResumeUrl(null);
+        setSocialLinks({});
+        setDesignationId(null);
+        setDesignationSeniority(null);
       }
+      currentUserId = newSession?.user.id ?? null;
       if (isMounted) {
         setSession(newSession);
       }
@@ -98,7 +188,18 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
       });
     });
 
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+    const { data: listener } = supabase.auth.onAuthStateChange((event, newSession) => {
+      // A token refresh (e.g. triggered by switching browser tabs and back)
+      // doesn't mean the profile changed — re-running applySession would
+      // re-fetch and reset every profile field to its last-saved value,
+      // wiping out any unsaved edits in open forms (like /profile). Only
+      // re-apply when the signed-in user actually changed.
+      if (event === 'TOKEN_REFRESHED' && (newSession?.user.id ?? null) === currentUserId) {
+        if (isMounted) {
+          setSession(newSession);
+        }
+        return;
+      }
       applySession(newSession);
     });
 
@@ -108,13 +209,48 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
     };
   }, [supabase]);
 
+  async function refreshProfile(): Promise<void> {
+    if (!supabase || !session?.user.id) return;
+    const profile = await getOwnProfile(supabase, session.user.id);
+    if (!profile) return;
+    setRole((profile.role as Role) ?? null);
+    setCompanyName(profile.company_name ?? null);
+    setPaidUntil(profile.paid_until ?? null);
+    setFullName(profile.full_name ?? null);
+    setBio(profile.bio ?? null);
+    setCurrentStatus((profile.current_status as CurrentStatus) ?? null);
+    setNoticePeriod((profile.notice_period as NoticePeriod) ?? null);
+    setLookingFor((profile.looking_for as LookingFor[]) ?? []);
+    setEducationStatus((profile.education_status as EducationStatus) ?? null);
+    setExperienceYears(profile.experience_years ?? null);
+    setPassingYear(profile.passing_year ?? null);
+    setResumeUrl(profile.resume_url ?? null);
+    setSocialLinks((profile.social_links as SocialLinks) ?? {});
+    setDesignationId(profile.designation_id ?? null);
+    setDesignationSeniority((profile.designation_seniority as SeniorityLevel) ?? null);
+  }
+
   const value: AuthContextValue = {
     supabase,
     session,
     user: session?.user ?? null,
     role,
     companyName,
+    paidUntil,
+    fullName,
+    bio,
+    currentStatus,
+    noticePeriod,
+    lookingFor,
+    educationStatus,
+    experienceYears,
+    passingYear,
+    resumeUrl,
+    socialLinks,
+    designationId,
+    designationSeniority,
     loading,
+    refreshProfile,
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

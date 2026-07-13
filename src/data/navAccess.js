@@ -9,6 +9,21 @@ export async function listNavAccess(supabase) {
   return data;
 }
 
+export async function getNavItemAllowedRoles(supabase, itemKey) {
+  if (!supabase || !itemKey) return [];
+  const { data, error } = await supabase
+    .from('nav_access')
+    .select('allowed_roles')
+    .eq('item_key', itemKey)
+    .maybeSingle();
+  if (error) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to load nav access for item:', error.message);
+    return [];
+  }
+  return data?.allowed_roles ?? [];
+}
+
 export async function setNavItemRoles(supabase, itemKey, roles) {
   if (!supabase || !itemKey) return { error: 'Not authenticated' };
   const { error } = await supabase

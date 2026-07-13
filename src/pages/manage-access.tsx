@@ -15,6 +15,7 @@ import {
 } from '@site/src/data/companyAccess';
 import { ROLES, GLOBALLY_CONFIGURABLE_ROLES } from '@site/src/types/roles';
 import type { Role } from '@site/src/types/roles';
+import TaxonomyTab from '@site/src/components/TaxonomyTab';
 import styles from './manage-access.module.css';
 
 /* ── Types ── */
@@ -297,6 +298,12 @@ function CoursesTab(): JSX.Element {
     <>
       <div className={styles.adminNote}>Admin always has access to every course.</div>
       <div className={styles.roleGrid}>
+        <div className={`${styles.roleCard} ${styles.roleCardStatic}`}>
+          <span className={styles.roleCardLabel}>Admin</span>
+          <span className={styles.roleCardCount}>
+            {COURSE_ITEMS.length} of {COURSE_ITEMS.length} courses accessible — always full access
+          </span>
+        </div>
         {NON_ADMIN_ROLES.map((r) => {
           const accessibleCount = COURSE_ITEMS.filter((item) => (allowedByKey[item.key] ?? []).includes(r.value)).length;
           return (
@@ -408,6 +415,12 @@ function NavAccessTab(): JSX.Element {
     <>
       <div className={styles.adminNote}>Admin always has access to every sidebar item.</div>
       <div className={styles.roleGrid}>
+        <div className={`${styles.roleCard} ${styles.roleCardStatic}`}>
+          <span className={styles.roleCardLabel}>Admin</span>
+          <span className={styles.roleCardCount}>
+            {FLAT_NAV_ITEMS.length} of {FLAT_NAV_ITEMS.length} items visible — always full access
+          </span>
+        </div>
         {NON_ADMIN_ROLES.map((r) => {
           const visibleCount = FLAT_NAV_ITEMS.filter((item) => (allowedByKey[item.key] ?? []).includes(r.value)).length;
           return (
@@ -601,7 +614,7 @@ function CompaniesTab(): JSX.Element {
 /* ── Content component ── */
 
 function ManageAccessContent(): JSX.Element {
-  const [activeTab, setActiveTab] = useState<'courses' | 'nav' | 'companies'>('courses');
+  const [activeTab, setActiveTab] = useState<'courses' | 'nav' | 'companies' | 'taxonomy'>('courses');
 
   return (
     <div className={styles.container}>
@@ -634,9 +647,24 @@ function ManageAccessContent(): JSX.Element {
         >
           Companies
         </button>
+        <button
+          type="button"
+          className={activeTab === 'taxonomy' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
+          onClick={() => setActiveTab('taxonomy')}
+        >
+          Roles & Skills
+        </button>
       </div>
 
-      {activeTab === 'courses' ? <CoursesTab /> : activeTab === 'nav' ? <NavAccessTab /> : <CompaniesTab />}
+      {activeTab === 'courses' ? (
+        <CoursesTab />
+      ) : activeTab === 'nav' ? (
+        <NavAccessTab />
+      ) : activeTab === 'companies' ? (
+        <CompaniesTab />
+      ) : (
+        <TaxonomyTab />
+      )}
     </div>
   );
 }

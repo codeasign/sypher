@@ -3,7 +3,6 @@ import type { ReactNode } from 'react';
 import Layout from '@theme/Layout';
 import RequireAuth from '@site/src/components/RequireAuth';
 import DashboardSidebar from '@site/src/components/DashboardSidebar';
-import InsideFooter from '@site/src/components/InsideFooter';
 import { useAuth } from '@site/src/contexts/AuthContext';
 import styles from './styles.module.css';
 
@@ -40,7 +39,6 @@ function DashboardLayoutContent({ children }: { children: ReactNode }): JSX.Elem
       />
       <div className={styles.wrapper}>
         {children}
-        <InsideFooter />
       </div>
     </div>
   );

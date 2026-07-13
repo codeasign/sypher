@@ -18,8 +18,7 @@ export const NAV_SECTIONS = [
   {
     title: 'Content',
     items: [
-      { key: 'create-blog-post', href: '#', label: 'Create Blog Post', comingSoon: true },
-      { key: 'manage-blog-post', href: '#', label: 'Manage Blog Post', comingSoon: true },
+      { key: 'manage-blog-post', href: '/manage-blog', label: 'Manage Blog Posts' },
     ],
   },
   {
