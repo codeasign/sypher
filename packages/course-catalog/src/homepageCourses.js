@@ -89,6 +89,11 @@ export const courses = [
     title: 'AI Engineering Crash Course',
     description: 'Build real AI applications with LLM APIs, local models, MCP servers, and autonomous agents — API call to production system.',
     url: '/course/ai-engineering-crash-course',
+    // slug (below, derived from url) stays 'ai-engineering-crash-course' --
+    // it's the course_access.course_slug key and the docs marketing route.
+    // The actual docs content folder is 'ai-engineering-hands-on', so any
+    // link into the docs content itself must use docsSlug, not slug.
+    docsSlug: 'ai-engineering-hands-on',
     difficulty: 'Intermediate to Advanced',
     hours: '35–50h',
     topics: ['LLMs', 'RAG', 'Agents', 'MCP', 'Deploy'],
@@ -203,7 +208,8 @@ export function withCourseAccess(hasCourseAccess, role, accessRows, companyAllow
   const accessBySlug = new Map((accessRows ?? []).map((r) => [r.course_slug, r.allowed_roles]));
   return courses.map((course) => {
     const slug = course.url.replace('/course/', '');
+    const docsSlug = course.docsSlug ?? slug;
     const allowedRoles = accessBySlug.get(slug) ?? [];
-    return { ...course, slug, isFree: hasCourseAccess(role, allowedRoles, { slug, companyAllowedSlugs }) };
+    return { ...course, slug, docsSlug, isFree: hasCourseAccess(role, allowedRoles, { slug, companyAllowedSlugs }) };
   });
 }

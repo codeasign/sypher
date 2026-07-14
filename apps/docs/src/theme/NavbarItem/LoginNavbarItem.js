@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React from 'react';
 import BrowserOnly from '@docusaurus/BrowserOnly';
-import Link from '@docusaurus/Link';
 import { useAuth } from '@site/src/contexts/AuthContext';
+import { getAppOrigin, getAppLoginUrl, getAppLogoutUrl } from '@sypher/auth-core/src/urls';
 
 function DashboardIcon() {
   return (
@@ -46,63 +46,32 @@ function LogoutIcon() {
   );
 }
 
+// Docs never initiates login/logout itself -- app.sypher is the only place
+// those Supabase calls happen (see apps/app/src/contexts/AuthContext.tsx).
+// This just links out, deriving the target from the shared cookie-config
+// domain so the prod placeholder swaps both sides at once.
 function LoginButton() {
-  const { supabase, user } = useAuth();
-  const [loading, setLoading] = useState(false);
-
-  async function handleLogin() {
-    if (!supabase) {
-      window.location.href = '/login';
-      return;
-    }
-    setLoading(true);
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: 'google',
-      options: { redirectTo: `${window.location.origin}/dashboard` },
-    });
-    if (error) {
-      window.location.href = '/login';
-    }
-  }
-
-  async function handleLogout() {
-    setLoading(true);
-    try {
-      await supabase?.auth.signOut();
-    } finally {
-      window.location.href = '/';
-    }
-  }
+  const { user } = useAuth();
 
   if (user) {
     return (
       <span className="login-link-group">
-        <Link to="/dashboard" className="navbar__link login-link dashboard-link">
+        <a href={`${getAppOrigin()}/dashboard`} className="navbar__link login-link dashboard-link">
           <DashboardIcon />
           Dashboard
-        </Link>
-        <button
-          type="button"
-          className="navbar__link login-link logout-link"
-          onClick={handleLogout}
-          disabled={loading}
-        >
+        </a>
+        <a href={getAppLogoutUrl()} className="navbar__link login-link logout-link">
           <LogoutIcon />
-          {loading ? '…' : 'Log out'}
-        </button>
+          Log out
+        </a>
       </span>
     );
   }
 
   return (
-    <button
-      type="button"
-      className="navbar__link login-link"
-      onClick={handleLogin}
-      disabled={loading}
-    >
-      {loading ? '…' : 'Log in'}
-    </button>
+    <a href={getAppLoginUrl()} className="navbar__link login-link">
+      Log in
+    </a>
   );
 }
 

@@ -2,8 +2,9 @@
 
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
-import { createClient } from '@supabase/supabase-js';
-import type { Session, SupabaseClient, User } from '@supabase/supabase-js';
+import { createClient } from '@/lib/supabase/client';
+import type { SupabaseClient, Session, User } from '@supabase/supabase-js';
+import { getAppOrigin } from '@sypher/auth-core/src/urls';
 import { getOwnProfile } from '@/data/profiles';
 import type { Role } from '@/types/roles';
 import type { LookingFor } from '@/types/lookingFor';
@@ -33,6 +34,25 @@ interface AuthContextValue {
   designationSeniority: SeniorityLevel | null;
   loading: boolean;
   refreshProfile: () => Promise<void>;
+  signInWithGoogle: (redirectTo?: string) => Promise<{ error: string | null }>;
+  signInWithWorkEmail: (
+    email: string,
+    redirectTo?: string
+  ) => Promise<{ error: string | null; status: 'sent' | 'not_recognized' | 'error' }>;
+  signOut: () => Promise<void>;
+}
+
+const NOT_CONFIGURED_ERROR = 'Auth is not configured. Check Supabase environment variables.';
+
+// OAuth/magic-link redirects must always land back on app.sypher (getAppOrigin),
+// never window.location.origin -- that's whatever origin the sign-in form
+// happened to load from, which can be localhost or docs.sypher during dev/proxying.
+// The callback route exchanges the code server-side and writes the session
+// cookie with the shared .sypher.local domain, then forwards on to `next`.
+function getAuthCallbackUrl(next: string): string {
+  const url = new URL('/auth/callback', getAppOrigin());
+  url.searchParams.set('next', next);
+  return url.toString();
 }
 
 const AuthContext = createContext<AuthContextValue>({
@@ -56,32 +76,25 @@ const AuthContext = createContext<AuthContextValue>({
   designationSeniority: null,
   loading: true,
   refreshProfile: async () => {},
+  signInWithGoogle: async () => ({ error: NOT_CONFIGURED_ERROR }),
+  signInWithWorkEmail: async () => ({ error: NOT_CONFIGURED_ERROR, status: 'error' }),
+  signOut: async () => {},
 });
 
 export function AuthProvider({ children }: { children: ReactNode }): React.JSX.Element {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
   const supabase = useMemo<SupabaseClient | null>(() => {
     if (typeof window === 'undefined') {
       return null;
     }
-    if (!supabaseUrl || !supabaseAnonKey) {
+    if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
       // eslint-disable-next-line no-console
       console.error(
-        'Missing Supabase config: set SUPABASE_URL and SUPABASE_ANON_KEY in .env and restart the dev server.'
+        'Missing Supabase config: set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in .env.local and restart the dev server.'
       );
       return null;
     }
-    return createClient(supabaseUrl, supabaseAnonKey, {
-      auth: {
-        persistSession: true,
-        autoRefreshToken: true,
-        detectSessionInUrl: true,
-      },
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [supabaseUrl, supabaseAnonKey]);
+    return createClient();
+  }, []);
 
   const [session, setSession] = useState<Session | null>(null);
   const [role, setRole] = useState<Role | null>(null);
@@ -228,6 +241,43 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
     setDesignationSeniority((profile.designation_seniority as SeniorityLevel) ?? null);
   }
 
+  async function signInWithGoogle(redirectTo = '/dashboard'): Promise<{ error: string | null }> {
+    if (!supabase) return { error: NOT_CONFIGURED_ERROR };
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo: getAuthCallbackUrl(redirectTo) },
+    });
+    return { error: error?.message ?? null };
+  }
+
+  async function signInWithWorkEmail(
+    email: string,
+    redirectTo = '/dashboard'
+  ): Promise<{ error: string | null; status: 'sent' | 'not_recognized' | 'error' }> {
+    if (!supabase) return { error: NOT_CONFIGURED_ERROR, status: 'error' };
+
+    const normalized = email.trim().toLowerCase();
+    const { data: isInvited, error: rpcError } = await supabase.rpc('email_is_invited', {
+      check_email: normalized,
+    });
+    if (rpcError) return { error: rpcError.message, status: 'error' };
+    if (!isInvited) return { error: null, status: 'not_recognized' };
+
+    const { error: otpError } = await supabase.auth.signInWithOtp({
+      email: normalized,
+      options: {
+        shouldCreateUser: true,
+        emailRedirectTo: getAuthCallbackUrl(redirectTo),
+      },
+    });
+    if (otpError) return { error: otpError.message, status: 'error' };
+    return { error: null, status: 'sent' };
+  }
+
+  async function signOut(): Promise<void> {
+    await supabase?.auth.signOut();
+  }
+
   const value: AuthContextValue = {
     supabase,
     session,
@@ -249,6 +299,9 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
     designationSeniority,
     loading,
     refreshProfile,
+    signInWithGoogle,
+    signInWithWorkEmail,
+    signOut,
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

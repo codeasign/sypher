@@ -2,6 +2,7 @@ import React, { useEffect } from 'react';
 import type { ReactNode } from 'react';
 import BrowserOnly from '@docusaurus/BrowserOnly';
 import { useAuth } from '@site/src/contexts/AuthContext';
+import { getAppOrigin } from '@sypher/auth-core/src/urls';
 import type { Role } from '@site/src/types/roles';
 
 interface RequireRoleProps {
@@ -15,7 +16,7 @@ function RequireRoleInner({ allow, children }: RequireRoleProps): JSX.Element | 
 
   useEffect(() => {
     if (!loading && !permitted) {
-      window.location.href = '/dashboard';
+      window.location.href = `${getAppOrigin()}/dashboard`;
     }
   }, [loading, permitted]);
 

@@ -1,14 +1,34 @@
-// TODO(Phase 5): real courseAccess.js lives in apps/app/src/data/courseAccess.js
-// and reads the `course_access` table via Supabase. Docs has no Supabase client
-// of its own anymore (see AuthContext.tsx), so there's no way to know a
-// visitor's real role or the real access rows here. Every course is treated
-// as locked until Phase 5 wires up read-only access data from app.sypher —
-// locked-by-default is the safe choice, since the alternative would expose
-// paid/gated courses as freely readable.
-export function fetchCourseAccessRows() {
-  return Promise.resolve([]);
+async function listCourseAccess(supabase) {
+  if (!supabase) return [];
+  const { data, error } = await supabase.from('course_access').select('course_slug, allowed_roles');
+  if (error) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to load course access:', error.message);
+    return [];
+  }
+  return data;
 }
 
-export function hasCourseAccess() {
+export function hasCourseAccess(role, allowedRoles, ctx) {
+  if (role === 'admin') return true;
+  if (role === null) return (allowedRoles ?? []).includes('free_users');
+  if ((allowedRoles ?? []).includes(role)) return true;
+  if (role === 'company_employees' && ctx?.companyAllowedSlugs && ctx.slug) {
+    return ctx.companyAllowedSlugs.has(ctx.slug);
+  }
   return false;
+}
+
+let cachedRows = null;
+let rowsPromise = null;
+
+export function fetchCourseAccessRows(supabase) {
+  if (cachedRows) return Promise.resolve(cachedRows);
+  if (rowsPromise) return rowsPromise;
+  rowsPromise = listCourseAccess(supabase).then((rows) => {
+    cachedRows = rows;
+    rowsPromise = null;
+    return rows;
+  });
+  return rowsPromise;
 }

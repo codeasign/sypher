@@ -5,7 +5,7 @@ import Layout from '@theme/Layout';
 import HomepageFeatures from '@site/src/components/HomepageFeatures';
 import Heading from '@theme/Heading';
 import { useAuth } from '@site/src/contexts/AuthContext';
-import RedirectIfAuthed from '@site/src/components/RedirectIfAuthed';
+import { getAppOrigin } from '@sypher/auth-core/src/urls';
 import styles from './index.module.css';
 
 const stats = [
@@ -66,9 +66,13 @@ function accentFor(index) {
 function HeroSection() {
   const { siteConfig } = useDocusaurusContext();
   const { user } = useAuth();
-  const startUrl = user
-    ? '/dashboard'
-    : `/login?redirect=${encodeURIComponent('/docs/python-for-ai-engineers/')}`;
+  // Docs has no /dashboard of its own -- a logged-in user's "Start Learning"
+  // goes cross-domain to app.sypher instead of 404ing on docs.
+  // Logged-out: no redirect target -- a docs-relative path (e.g. /docs/...)
+  // would get forwarded through app's /login and /auth/callback, which only
+  // know about app's own routes, and 404 there. Land on the app dashboard
+  // after login instead, consistent with the logged-in case above.
+  const startUrl = user ? `${getAppOrigin()}/dashboard` : '/login';
   return (
     <header className={styles.hero}>
       <div className={styles.heroBg} />
@@ -193,15 +197,13 @@ export default function Home() {
     <Layout
       title="Learn AI Engineering & System Design"
       description="Sypher is a hands-on learning platform for AI engineering, system design, Python, and software engineering. Text-first lessons with real projects.">
-      <RedirectIfAuthed>
-        <HeroSection />
-        <StatsBar />
-        <PillarsSection />
-        <div id="courses">
-          <HomepageFeatures />
-        </div>
-        <ApproachSection />
-      </RedirectIfAuthed>
+      <HeroSection />
+      <StatsBar />
+      <PillarsSection />
+      <div id="courses">
+        <HomepageFeatures />
+      </div>
+      <ApproachSection />
     </Layout>
   );
 }

@@ -73,7 +73,7 @@ export default function DashboardSidebar({
   onToggleCollapsed,
 }: DashboardSidebarProps): React.JSX.Element {
   const pathname = usePathname();
-  const { supabase, role, companyName } = useAuth();
+  const { supabase, role, companyName, signOut } = useAuth();
   const email = user?.email ?? '';
   const metadata = (user?.user_metadata ?? {}) as {
     full_name?: string;
@@ -203,7 +203,20 @@ export default function DashboardSidebar({
         {visibleSections.map(renderSection)}
       </nav>
 
-      <div className={styles.footer}>{renderNavItem(PROFILE_ITEM)}</div>
+      <div className={styles.footer}>
+        {renderNavItem(PROFILE_ITEM)}
+        <button
+          type="button"
+          className={clsx(styles.navItem, styles.logoutButton)}
+          onClick={async () => {
+            await signOut();
+            window.location.href = '/login';
+          }}
+        >
+          <LogoutIcon className={styles.navIcon} />
+          {!collapsed && <span className={styles.navLabel}>Log out</span>}
+        </button>
+      </div>
     </aside>
   );
 }
@@ -245,6 +258,27 @@ function BookmarkIcon({ className }: { className?: string }): React.JSX.Element 
       aria-hidden="true"
     >
       <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+    </svg>
+  );
+}
+
+function LogoutIcon({ className }: { className?: string }): React.JSX.Element {
+  return (
+    <svg
+      className={className}
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+      <polyline points="16 17 21 12 16 7" />
+      <line x1="21" y1="12" x2="9" y2="12" />
     </svg>
   );
 }

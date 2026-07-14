@@ -1,8 +1,8 @@
 'use client';
 
 import React, { useState } from 'react';
-import Link from 'next/link';
 import CourseSlidePanel from '@/components/CourseSlidePanel';
+import { getDocsOrigin } from '@sypher/auth-core/src/urls';
 import styles from './styles.module.css';
 
 interface CourseData {
@@ -14,6 +14,7 @@ interface CourseData {
   tag: string;
   isFree: boolean;
   slug: string;
+  docsSlug?: string;
   videoId?: string;
   topics?: string[];
   modules?: Array<{ label: string; topics: string[] }>;
@@ -32,12 +33,13 @@ function DashboardCourseCard({
   tag,
   isFree,
   slug,
+  docsSlug,
   videoId,
   topics,
   modules,
   onOpenPanel,
 }: CourseCardProps) {
-  const course = { title, description, url, gradient, icon, tag, isFree, slug, videoId, topics, modules };
+  const course = { title, description, url, gradient, icon, tag, isFree, slug, docsSlug, videoId, topics, modules };
 
   const cardContent = (
     <>
@@ -51,9 +53,9 @@ function DashboardCourseCard({
       <p className={styles.cardDesc}>{description}</p>
       {isFree && (
         <div className={styles.cardActions}>
-          <Link href={`/docs/${slug}/`} className={styles.btnPrimary}>
+          <a href={`${getDocsOrigin()}/docs/${docsSlug ?? slug}/`} className={styles.btnPrimary}>
             Learn →
-          </Link>
+          </a>
           <button
             type="button"
             className={styles.btnSecondary}
@@ -160,9 +162,12 @@ export default function DashboardCourseListing({
                 <div className={styles.panelCurriculumHeader}>
                   <h4 className={styles.panelModulesTitle}>Course Curriculum</h4>
                   {selectedCourse.isFree ? (
-                    <Link href={`/docs/${selectedCourse.slug}/`} className={styles.curriculumLearnBtn}>
+                    <a
+                      href={`${getDocsOrigin()}/docs/${selectedCourse.docsSlug ?? selectedCourse.slug}/`}
+                      className={styles.curriculumLearnBtn}
+                    >
                       Learn →
-                    </Link>
+                    </a>
                   ) : (
                     <button type="button" className={styles.curriculumGoProBtn}>
                       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">

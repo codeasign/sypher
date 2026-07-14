@@ -1,3 +1,5 @@
+import { getAppOrigin } from '@sypher/auth-core/src/urls';
+
 const INVITABLE_ROLES = ['company_hr', 'company_employees'];
 
 export async function distinctCompanyNames(supabase) {
@@ -97,11 +99,14 @@ export async function bulkInviteFromCsv(supabase, { rows, companyName, adminUser
         continue;
       }
 
+      const callbackUrl = new URL('/auth/callback', getAppOrigin());
+      callbackUrl.searchParams.set('next', '/dashboard');
+
       const { error: otpError } = await supabase.auth.signInWithOtp({
         email: row.email,
         options: {
           shouldCreateUser: true,
-          emailRedirectTo: `${window.location.origin}/dashboard`,
+          emailRedirectTo: callbackUrl.toString(),
           data: row.name ? { full_name: row.name } : undefined,
         },
       });

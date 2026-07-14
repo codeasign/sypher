@@ -1,64 +1,33 @@
-import React, { useState } from 'react';
-import { useAuth } from '@site/src/contexts/AuthContext';
-import styles from './WorkEmailSignIn.module.css';
+'use client';
 
-function normalizeEmail(email: string): string {
-  return email.trim().toLowerCase();
-}
+import React, { useState } from 'react';
+import { useAuth } from '@/contexts/AuthContext';
+import styles from './WorkEmailSignIn.module.css';
 
 export default function WorkEmailSignIn({
   redirectTo = '/dashboard',
 }: {
   redirectTo?: string;
-}): JSX.Element {
-  const { supabase } = useAuth();
+}): React.JSX.Element {
+  const { signInWithWorkEmail } = useAuth();
   const [email, setEmail] = useState('');
   const [status, setStatus] = useState<'idle' | 'checking' | 'sent' | 'not_recognized' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState('');
 
   async function handleSubmit(event: React.FormEvent): Promise<void> {
     event.preventDefault();
-    if (!supabase) {
-      setStatus('error');
-      setErrorMessage('Auth is not configured. Check Supabase environment variables.');
-      return;
-    }
-
-    const normalized = normalizeEmail(email);
-    if (!normalized) return;
+    if (!email.trim()) return;
 
     setStatus('checking');
+    const { error, status: resultStatus } = await signInWithWorkEmail(email, redirectTo);
 
-    const { data: isInvited, error: rpcError } = await supabase.rpc('email_is_invited', {
-      check_email: normalized,
-    });
-
-    if (rpcError) {
+    if (error) {
       setStatus('error');
-      setErrorMessage(rpcError.message);
+      setErrorMessage(error);
       return;
     }
 
-    if (!isInvited) {
-      setStatus('not_recognized');
-      return;
-    }
-
-    const { error: otpError } = await supabase.auth.signInWithOtp({
-      email: normalized,
-      options: {
-        shouldCreateUser: true,
-        emailRedirectTo: `${window.location.origin}${redirectTo}`,
-      },
-    });
-
-    if (otpError) {
-      setStatus('error');
-      setErrorMessage(otpError.message);
-      return;
-    }
-
-    setStatus('sent');
+    setStatus(resultStatus);
   }
 
   if (status === 'sent') {

@@ -1,5 +1,7 @@
+'use client';
+
 import React, { useState } from 'react';
-import { useAuth } from '@site/src/contexts/AuthContext';
+import { useAuth } from '@/contexts/AuthContext';
 import styles from './OAuthButtons.module.css';
 
 export default function OAuthButtons({
@@ -8,22 +10,15 @@ export default function OAuthButtons({
 }: {
   onError: (message: string) => void;
   redirectTo?: string;
-}): JSX.Element {
-  const { supabase } = useAuth();
+}): React.JSX.Element {
+  const { signInWithGoogle } = useAuth();
   const [loading, setLoading] = useState(false);
 
   async function handleGoogleSignIn(): Promise<void> {
-    if (!supabase) {
-      onError('Auth is not configured. Check Supabase environment variables.');
-      return;
-    }
     setLoading(true);
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: 'google',
-      options: { redirectTo: `${window.location.origin}${redirectTo}` },
-    });
+    const { error } = await signInWithGoogle(redirectTo);
     if (error) {
-      onError(error.message);
+      onError(error);
       setLoading(false);
     }
   }
@@ -43,7 +38,7 @@ export default function OAuthButtons({
   );
 }
 
-function GoogleIcon(): JSX.Element {
+function GoogleIcon(): React.JSX.Element {
   return (
     <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
       <path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.9c1.7-1.57 2.7-3.88 2.7-6.62z" />
