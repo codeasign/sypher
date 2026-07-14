@@ -18,6 +18,8 @@ const DASHBOARD_ROUTE_PREFIXES = [
   '/manage-access',
   '/manage-blog',
   '/manage-users',
+  '/resume-review',
+  '/mock-interview',
 ];
 
 // Flat, always-visible top-level links rather than a dropdown: this navbar

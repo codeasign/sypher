@@ -208,12 +208,12 @@ export default function ResumeReviewContactForm({ onSuccess }) {
           id="resume"
           name="resume"
           type="file"
-          accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          accept=".pdf,application/pdf"
           required
           ref={fileInputRef}
           onChange={handleFileChange}
         />
-        <span className={styles.fileHint}>PDF, DOC, or DOCX — max 5 MB</span>
+        <span className={styles.fileHint}>PDF only — max 5 MB</span>
         {resumeFile && !fileError && (
           <span className={styles.fileMeta}>{resumeFile.name} ({formatFileSize(resumeFile.size)})</span>
         )}

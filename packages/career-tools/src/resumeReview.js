@@ -3,7 +3,7 @@ export const RESUME_EXPERIENCE_OPTIONS = ['Fresher', '0–2 Years', '3–5 Years
 // Web3Forms' standard multipart uploader caps attachments at 5 MB per file
 // (its Advanced File Uploader lifts this but requires a paid plan + FilePond).
 export const RESUME_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
-export const RESUME_ALLOWED_EXTENSIONS = ['.pdf', '.doc', '.docx'];
+export const RESUME_ALLOWED_EXTENSIONS = ['.pdf'];
 
 export const RESUME_REVIEW_INITIAL_FIELDS = {
   name: '',
@@ -21,7 +21,7 @@ export function formatFileSize(bytes) {
 export function validateResumeFile(file) {
   const extension = `.${file.name.split('.').pop().toLowerCase()}`;
   if (!RESUME_ALLOWED_EXTENSIONS.includes(extension)) {
-    return 'Please upload a PDF, DOC, or DOCX file.';
+    return 'Please upload a PDF file.';
   }
   if (file.size > RESUME_MAX_FILE_SIZE_BYTES) {
     return 'File is too large. Please upload a file under 5 MB.';
