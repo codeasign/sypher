@@ -1,10 +1,17 @@
 #!/usr/bin/env node
 /**
- * Runs before `docusaurus build` (wired as npm's `prebuild`). Queries
- * Supabase for all published blog posts and writes each as a Markdown
- * file with YAML frontmatter into blog-content/, so the blog-routes
- * plugin can bake real static HTML for each post at build time instead
- * of fetching from Supabase in the browser.
+ * DISCONNECTED as of Phase 7 (blog migrated to apps/app as real Next.js
+ * SSR/ISR pages) — no longer wired into `prebuild`. Kept on disk, along
+ * with watch-blog-posts.mjs, plugins/blog-routes/, and blog-content/, as
+ * a rollback path for one release cycle. Safe to delete this whole set
+ * once Phase 7 is confirmed stable. Still runnable manually via
+ * `npm run blog:bake` / `npm run blog:preview` if a rollback is needed.
+ *
+ * Original behavior: runs before `docusaurus build` (wired as npm's
+ * `prebuild`). Queries Supabase for all published blog posts and writes
+ * each as a Markdown file with YAML frontmatter into blog-content/, so
+ * the blog-routes plugin can bake real static HTML for each post at
+ * build time instead of fetching from Supabase in the browser.
  *
  * A Supabase query/connection failure fails the build loudly (deploy
  * should not silently ship a blog missing posts). Zero published posts

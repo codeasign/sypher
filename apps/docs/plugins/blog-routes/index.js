@@ -2,10 +2,16 @@ const fs = require('fs');
 const path = require('path');
 const matter = require('gray-matter');
 
+// Phase 7: the live blog moved to apps/app (real Next.js SSR/ISR pages);
+// bake-blog-posts.mjs/watch-blog-posts.mjs are disconnected from the docs
+// build/dev scripts, so blog-content/ is now a frozen snapshot rather than
+// live content. This plugin + blog-content/ are kept registered as a
+// rollback path for one release cycle and are safe to delete afterward.
+//
 // Post content is baked into blog-content/*.md by scripts/bake-blog-posts.mjs
-// (an npm `prebuild` step) before Docusaurus builds, so slugs and content are
-// known at plugin-load time and can be registered as real static routes —
-// no client-side Supabase fetch on the public blog pages.
+// (formerly an npm `prebuild` step) before Docusaurus builds, so slugs and
+// content are known at plugin-load time and can be registered as real
+// static routes — no client-side Supabase fetch on the public blog pages.
 module.exports = function () {
   return {
     name: 'blog-routes',

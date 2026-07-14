@@ -8,6 +8,27 @@ export function slugify(title) {
     .replace(/^-|-$/g, '');
 }
 
+// manage-blog writes go straight to Supabase from the browser (anon key +
+// user session), which never touches Next's cache. Only the Supabase DB
+// webhook invalidates /blog's cache otherwise, and that webhook can't reach
+// localhost/.sypher.local in dev -- so without this, edits made here would
+// sit stale on /blog for up to the 1h revalidate TTL. Best-effort: a failed
+// revalidate shouldn't block the save, since the TTL is still a backstop.
+async function revalidateBlogCache(supabase) {
+  try {
+    const { data } = await supabase.auth.getSession();
+    const token = data?.session?.access_token;
+    if (!token) return;
+    await fetch('/api/blog/revalidate', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to revalidate blog cache:', err.message);
+  }
+}
+
 async function findAvailableSlug(supabase, baseSlug) {
   let slug = baseSlug || 'post';
   let suffix = 2;
@@ -115,6 +136,7 @@ export async function updateBlogPost(supabase, id, fields) {
     console.error('Failed to update blog post:', error.message);
     return { error: error.message };
   }
+  await revalidateBlogCache(supabase);
   return { error: null };
 }
 
@@ -131,6 +153,7 @@ export async function setBlogPostStatus(supabase, id, status) {
     console.error('Failed to update blog post status:', error.message);
     return { error: error.message };
   }
+  await revalidateBlogCache(supabase);
   return { error: null };
 }
 
@@ -142,5 +165,6 @@ export async function deleteBlogPost(supabase, id) {
     console.error('Failed to delete blog post:', error.message);
     return { error: error.message };
   }
+  await revalidateBlogCache(supabase);
   return { error: null };
 }

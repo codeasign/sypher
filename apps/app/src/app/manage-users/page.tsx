@@ -42,12 +42,13 @@ function getInitials(name: string): string {
     .slice(0, 2);
 }
 
+// Explicit locale, not `undefined` -- see BlogList/index.tsx for why.
 function formatJoined(iso: string): string {
-  return new Date(iso).toLocaleDateString(undefined, { month: 'short', year: 'numeric' });
+  return new Date(iso).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' });
 }
 
 function formatExpiry(iso: string): string {
-  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  return new Date(iso).toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
 function isExpiringSoon(paidUntil: string): boolean {

@@ -70,11 +70,11 @@ Static assets: images → static/img/  PDFs → static/pdf/  diagrams → static
 
 ## Local dev server
 
-`npm run dev` and `npm run start` both run `docusaurus start` alongside
-`scripts/watch-blog-posts.mjs` (via `concurrently`), which bakes published
-Supabase posts into `blog-content/` and keeps them live-synced. Always use
-one of these two — never bare `docusaurus start` — or the blog content
-won't stay in sync.
+`npm run dev` and `npm run start` run plain `docusaurus start`. The blog
+now lives in `apps/app` (real Next.js SSR/ISR pages reading Supabase
+directly) — `scripts/watch-blog-posts.mjs` / `scripts/bake-blog-posts.mjs`
+are Phase-7-disconnected leftovers kept only as a rollback path for one
+release cycle; they no longer run as part of `dev`/`start`/`build`.
 
 When debugging/verifying anything in a browser (Puppeteer or otherwise):
 1. Check port 3000: `netstat -ano | grep ":3000" | grep LISTENING`

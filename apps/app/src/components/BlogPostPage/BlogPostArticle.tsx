@@ -17,8 +17,9 @@ interface BlogPostArticleProps {
   date: string | null;
 }
 
+// Explicit locale, not `undefined` -- see BlogList/index.tsx for why.
 function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' });
+  return new Date(iso).toLocaleDateString('en-IN', { month: 'long', day: 'numeric', year: 'numeric' });
 }
 
 export default function BlogPostArticle({ title, content, coverImageUrl, date }: BlogPostArticleProps): React.JSX.Element {

@@ -1,3 +1,5 @@
+'use client';
+
 import React, { useRef, useState, isValidElement } from 'react';
 import { Highlight, themes } from 'prism-react-renderer';
 import { useColorMode } from '@/hooks/useColorMode';

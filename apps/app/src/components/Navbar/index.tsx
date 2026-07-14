@@ -23,14 +23,13 @@ const DASHBOARD_ROUTE_PREFIXES = [
 // Flat, always-visible top-level links rather than a dropdown: this navbar
 // is part of the server-rendered layout, so a flat list costs nothing extra
 // for SEO/crawlability and guarantees every link is a plain <a href> in the
-// initial HTML -- no hover/JS-gated menu to get wrong. Blog/Corporate
-// Training/Resume Review/Mock Interview only exist on docs.sypher, so they
-// render as plain <a> tags (cross-domain, same pattern docs uses to link
-// back to app.sypher) rather than next/link.
+// initial HTML -- no hover/JS-gated menu to get wrong. Corporate Training/
+// Resume Review/Mock Interview only exist on docs.sypher, so they render as
+// plain <a> tags (cross-domain, same pattern docs uses to link back to
+// app.sypher) rather than next/link. Blog moved to this app in Phase 7, so
+// it's a same-origin next/link alongside Courses instead of living here.
 const DOCS_ORIGIN = getDocsOrigin();
 const NAV_LINKS = [
-  // docs-hosted for now; TODO(Phase 7): move to app's own /blog once Phase 7 ships
-  { key: 'blog', href: `${DOCS_ORIGIN}/blog`, label: 'Blog' },
   { key: 'corporate-training', href: `${DOCS_ORIGIN}/corporate-training`, label: 'Corporate Training' },
   { key: 'resume-review', href: `${DOCS_ORIGIN}/resume-review`, label: 'Resume Review' },
   { key: 'mock-interview', href: `${DOCS_ORIGIN}/mock-interview`, label: 'Mock Interview' },
@@ -72,6 +71,9 @@ export default function Navbar() {
         <nav className={mobileOpen ? `${styles.links} ${styles.linksOpen}` : styles.links}>
           <Link href="/#courses" className={styles.link} onClick={() => setMobileOpen(false)}>
             Courses
+          </Link>
+          <Link href="/blog" className={styles.link} onClick={() => setMobileOpen(false)}>
+            Blog
           </Link>
           {NAV_LINKS.map((item) => (
             <a key={item.key} href={item.href} className={styles.link}>
