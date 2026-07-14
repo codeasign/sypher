@@ -1,15 +1,17 @@
-import { applyCors } from '../_lib/cors.js';
-import { getSupabaseAdmin } from '../_lib/supabaseAdmin.js';
+import { getCorsHeaders, handleCorsPreflight } from '@/lib/cors';
+import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 
-export default async function handler(req, res) {
-  if (applyCors(req, res)) return;
-  if (req.method !== 'GET') {
-    res.status(405).json({ error: 'Method not allowed' });
-    return;
-  }
-  if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
-    res.status(401).json({ error: 'Unauthorized' });
-    return;
+export const dynamic = 'force-dynamic';
+
+export async function OPTIONS() {
+  return handleCorsPreflight();
+}
+
+export async function GET(req: Request) {
+  const corsHeaders = getCorsHeaders() ?? undefined;
+
+  if (req.headers.get('authorization') !== `Bearer ${process.env.CRON_SECRET}`) {
+    return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
   }
 
   const admin = getSupabaseAdmin();
@@ -33,8 +35,7 @@ export default async function handler(req, res) {
   });
 
   if (error) {
-    res.status(500).json({ error: 'Cron job failed' });
-    return;
+    return Response.json({ error: 'Cron job failed' }, { status: 500, headers: corsHeaders });
   }
-  res.status(200).json({ ok: true, rowsAffected: data.length });
+  return Response.json({ ok: true, rowsAffected: data.length }, { status: 200, headers: corsHeaders });
 }

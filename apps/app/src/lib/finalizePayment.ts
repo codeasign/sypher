@@ -1,14 +1,25 @@
+import type { SupabaseClient } from '@supabase/supabase-js';
+
+interface FinalizePaymentParams {
+  razorpayOrderId: string;
+  razorpayPaymentId: string;
+  expectedUserId?: string;
+}
+
 // Idempotent: safe to call twice for the same order (client retry + webhook
 // both firing, or a webhook retry). user_id always comes from our own
-// payments row (set at creation in create-order.js under an authenticated
+// payments row (set at creation in create-order under an authenticated
 // JWT) — never from Razorpay's order.notes, which keeps Razorpay-supplied
 // data out of the trust chain for who gets upgraded.
 //
-// expectedUserId is optional, defense-in-depth: verify-payment.js passes
-// the JWT-derived caller id and this asserts it matches the payments row's
-// user_id; webhook.js has no JWT to compare, so it omits it and trusts the
+// expectedUserId is optional, defense-in-depth: verify-payment passes the
+// JWT-derived caller id and this asserts it matches the payments row's
+// user_id; webhook has no JWT to compare, so it omits it and trusts the
 // payments row alone.
-export async function finalizePayment(admin, { razorpayOrderId, razorpayPaymentId, expectedUserId }) {
+export async function finalizePayment(
+  admin: SupabaseClient,
+  { razorpayOrderId, razorpayPaymentId, expectedUserId }: FinalizePaymentParams
+) {
   const { data: payment } = await admin
     .from('payments')
     .select('status, user_id')
