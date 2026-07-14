@@ -13,6 +13,22 @@ export async function createRazorpayOrder(accessToken, apiBaseUrl = '') {
   return data;
 }
 
+export async function createCreditPackOrder(accessToken, packTier, apiBaseUrl = '') {
+  const response = await fetch(`${apiBaseUrl}/api/razorpay/create-order`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ kind: 'credit_pack', packTier }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || 'Failed to create order');
+  }
+  return data;
+}
+
 export async function verifyRazorpayPayment(accessToken, payload, apiBaseUrl = '') {
   const response = await fetch(`${apiBaseUrl}/api/razorpay/verify-payment`, {
     method: 'POST',

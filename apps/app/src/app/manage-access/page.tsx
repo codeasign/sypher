@@ -18,6 +18,7 @@ import {
 import { ROLES, GLOBALLY_CONFIGURABLE_ROLES } from '@/types/roles';
 import type { Role } from '@/types/roles';
 import TaxonomyTab from '@/components/TaxonomyTab';
+import ResumeMockCreditsTab from '@/components/ResumeMockCreditsTab';
 import styles from './manage-access.module.css';
 
 /* ── Types ── */
@@ -616,7 +617,7 @@ function CompaniesTab(): React.JSX.Element {
 /* ── Content component ── */
 
 function ManageAccessContent(): React.JSX.Element {
-  const [activeTab, setActiveTab] = useState<'courses' | 'nav' | 'companies' | 'taxonomy'>('courses');
+  const [activeTab, setActiveTab] = useState<'courses' | 'nav' | 'companies' | 'taxonomy' | 'resumeMock'>('courses');
 
   return (
     <div className={styles.container}>
@@ -656,6 +657,13 @@ function ManageAccessContent(): React.JSX.Element {
         >
           Roles & Skills
         </button>
+        <button
+          type="button"
+          className={activeTab === 'resumeMock' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
+          onClick={() => setActiveTab('resumeMock')}
+        >
+          Resume Reviews & Mock Interview
+        </button>
       </div>
 
       {activeTab === 'courses' ? (
@@ -664,8 +672,10 @@ function ManageAccessContent(): React.JSX.Element {
         <NavAccessTab />
       ) : activeTab === 'companies' ? (
         <CompaniesTab />
-      ) : (
+      ) : activeTab === 'taxonomy' ? (
         <TaxonomyTab />
+      ) : (
+        <ResumeMockCreditsTab />
       )}
     </div>
   );

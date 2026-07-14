@@ -3,6 +3,7 @@ import Link from '@docusaurus/Link';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
 import MockInterviewContactForm from '@site/src/components/MockInterviewContactForm';
+import FeatureGate from '@site/src/components/FeatureGate';
 import styles from './corporate-training.module.css';
 
 const heroHighlights = [
@@ -285,7 +286,9 @@ function FaqContactSection() {
               <p className={styles.contactFormSubtitle}>
                 Tell us about your background and goals — we'll schedule your live mock interview.
               </p>
-              <MockInterviewContactForm />
+              <FeatureGate feature="mock_interview">
+                {({ onSuccess }) => <MockInterviewContactForm onSuccess={onSuccess} />}
+              </FeatureGate>
             </div>
           </div>
         </div>

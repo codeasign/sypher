@@ -2,8 +2,8 @@ export const NAV_SECTIONS = [
   {
     title: 'Career Tools',
     items: [
-      { key: 'resume-review', href: '#', label: 'Resume Review', comingSoon: true },
-      { key: 'mock-interview', href: '#', label: 'Mock Interview', comingSoon: true },
+      { key: 'resume-review', href: '/resume-review', label: 'Resume Review' },
+      { key: 'mock-interview', href: '/mock-interview', label: 'Mock Interview' },
     ],
   },
   {

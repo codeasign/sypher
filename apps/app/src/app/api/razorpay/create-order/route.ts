@@ -19,11 +19,45 @@ export async function POST(req: Request) {
 
   const admin = getSupabaseAdmin();
 
-  let gst;
+  let body: { kind?: string; packTier?: string } = {};
   try {
-    gst = computeGstSplit();
-  } catch (err) {
-    return Response.json({ error: (err as Error).message }, { status: 500, headers: corsHeaders });
+    body = await req.json();
+  } catch {
+    // No body (or non-JSON) means the default subscription-upgrade flow.
+  }
+  const kind = body.kind === 'credit_pack' ? 'credit_pack' : 'subscription';
+
+  let gst;
+  let plan = 'paid_users_1y';
+  let packTier: string | null = null;
+  let credits: number | null = null;
+
+  if (kind === 'credit_pack') {
+    if (!body.packTier) {
+      return Response.json({ error: 'Missing packTier' }, { status: 400, headers: corsHeaders });
+    }
+    const { data: pack, error: packError } = await admin
+      .from('credit_packs')
+      .select('tier, credits, price_paise, is_active')
+      .eq('tier', body.packTier)
+      .single();
+    if (packError || !pack || !pack.is_active) {
+      return Response.json({ error: 'Unknown or inactive credit pack' }, { status: 400, headers: corsHeaders });
+    }
+    packTier = pack.tier;
+    credits = pack.credits;
+    try {
+      gst = computeGstSplit(pack.price_paise, Number(process.env.PAID_UPGRADE_GST_RATE));
+    } catch (err) {
+      return Response.json({ error: (err as Error).message }, { status: 500, headers: corsHeaders });
+    }
+    plan = `credit_pack_${pack.tier}`;
+  } else {
+    try {
+      gst = computeGstSplit();
+    } catch (err) {
+      return Response.json({ error: (err as Error).message }, { status: 500, headers: corsHeaders });
+    }
   }
 
   const razorpay = new Razorpay({
@@ -39,7 +73,7 @@ export async function POST(req: Request) {
       // Kept for dashboard observability only — never read back as a
       // trust source by finalizePayment(), which always resolves user_id
       // from our own payments row instead.
-      notes: { user_id: user.id, plan: 'paid_users_1y' },
+      notes: { user_id: user.id, plan },
     });
   } catch {
     return Response.json({ error: 'Failed to create Razorpay order' }, { status: 502, headers: corsHeaders });
@@ -52,7 +86,10 @@ export async function POST(req: Request) {
     base_amount_paise: gst.baseAmountPaise,
     gst_amount_paise: gst.gstAmountPaise,
     gst_rate: gst.gstRate,
-    plan: 'paid_users_1y',
+    plan,
+    kind,
+    pack_tier: packTier,
+    credits,
     status: 'created',
   });
   if (insertError) {

@@ -22,7 +22,7 @@ export async function finalizePayment(
 ) {
   const { data: payment } = await admin
     .from('payments')
-    .select('status, user_id')
+    .select('id, status, user_id, kind, pack_tier, credits')
     .eq('razorpay_order_id', razorpayOrderId)
     .single();
 
@@ -42,6 +42,21 @@ export async function finalizePayment(
     .eq('razorpay_order_id', razorpayOrderId)
     .eq('status', 'created'); // guard: only transitions created -> paid, never re-runs on a racing second call
   if (paymentError) throw paymentError;
+
+  if (payment.kind === 'credit_pack') {
+    // Mints a new credit lot (expires 1 year from now) via the
+    // service-role-only RPC — see SupabaseSchema.md's grant_credit_lot.
+    const { data: lotId, error: lotError } = await admin.rpc('grant_credit_lot', {
+      p_user_id: payment.user_id,
+      p_credits: payment.credits,
+      p_source: 'pack_purchase',
+      p_pack_tier: payment.pack_tier,
+      p_payment_id: payment.id,
+    });
+    if (lotError) throw lotError;
+
+    return { alreadyProcessed: false, lotId, credits: payment.credits };
+  }
 
   // Additive renewal via a single atomic Postgres function — see
   // SupabaseSchema.md's extend_paid_until: extends from the later of "now"

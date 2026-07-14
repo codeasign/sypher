@@ -3,6 +3,7 @@ import Link from '@docusaurus/Link';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
 import ResumeReviewContactForm from '@site/src/components/ResumeReviewContactForm';
+import FeatureGate from '@site/src/components/FeatureGate';
 import styles from './corporate-training.module.css';
 import pageStyles from './resume-review.module.css';
 
@@ -286,7 +287,9 @@ function FaqContactSection() {
                 Tell us about yourself and attach your resume — we'll get back to you with
                 detailed feedback.
               </p>
-              <ResumeReviewContactForm />
+              <FeatureGate feature="resume_review">
+                {({ onSuccess }) => <ResumeReviewContactForm onSuccess={onSuccess} />}
+              </FeatureGate>
             </div>
           </div>
         </div>

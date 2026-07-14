@@ -1,44 +1,18 @@
 import React, { useState } from 'react';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
+import {
+  MOCK_INTERVIEW_EXPERIENCE_OPTIONS as EXPERIENCE_OPTIONS,
+  MOCK_INTERVIEW_TYPE_OPTIONS as INTERVIEW_TYPE_OPTIONS,
+  MOCK_INTERVIEW_TIME_SLOT_OPTIONS as TIME_SLOT_OPTIONS,
+  MOCK_INTERVIEW_INITIAL_FIELDS as initialFields,
+  getTodayDateString,
+  buildMockInterviewPayload,
+  submitToWeb3Forms,
+} from '@sypher/career-tools';
 import baseStyles from '../TrainingContactForm/styles.module.css';
 import styles from './styles.module.css';
 
-const EXPERIENCE_OPTIONS = ['Fresher', '0–2 Years', '3–5 Years', '6–10 Years', '10+ Years'];
-const INTERVIEW_TYPE_OPTIONS = [
-  'Data Structures & Algorithms',
-  'System Design',
-  'Software Testing',
-  'Test Automation',
-  'Behavioral',
-  'Frontend Development',
-  'Backend Development',
-  'Full Stack Development',
-  'Custom',
-];
-const TIME_SLOT_OPTIONS = ['Morning', 'Afternoon', 'Evening', 'Flexible'];
-
-function getTodayDateString() {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-  const day = String(now.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-}
-
-const initialFields = {
-  name: '',
-  email: '',
-  phone: '',
-  yearsOfExperience: '',
-  currentRole: '',
-  interviewType: '',
-  targetCompanies: '',
-  aboutMe: '',
-  preferredDate: '',
-  timeSlot: '',
-};
-
-export default function MockInterviewContactForm() {
+export default function MockInterviewContactForm({ onSuccess }) {
   const { siteConfig } = useDocusaurusContext();
   const accessKey = siteConfig.customFields?.web3formsAccessKey;
 
@@ -70,32 +44,18 @@ export default function MockInterviewContactForm() {
     setErrorMessage('');
 
     try {
-      const response = await fetch('https://api.web3forms.com/submit', {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          access_key: accessKey,
-          subject: 'New Mock Interview Booking',
-          from_name: fields.name,
-          name: fields.name,
-          email: fields.email,
-          phone: fields.phone,
-          years_of_experience: fields.yearsOfExperience,
-          current_role: fields.currentRole,
-          preferred_interview_type: fields.interviewType,
-          target_companies: fields.targetCompanies,
-          about_me: fields.aboutMe,
-          preferred_interview_date: fields.preferredDate,
-          preferred_time_slot: fields.timeSlot,
-        }),
-      });
-
-      const result = await response.json();
+      const payload = buildMockInterviewPayload({ accessKey, fields });
+      const result = await submitToWeb3Forms(payload);
 
       if (result.success) {
+        if (onSuccess) {
+          const consumeError = await onSuccess();
+          if (consumeError) {
+            setStatus('error');
+            setErrorMessage('Your booking was submitted, but we could not update your allowance. Contact support.');
+            return;
+          }
+        }
         setStatus('success');
         setFields(initialFields);
       } else {

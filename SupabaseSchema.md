@@ -1618,6 +1618,442 @@ so a stale one never blocks a retry.
 
 ---
 
+## Resume Reviews & Mock Interview (credits)
+
+Gates the "Resume Review" / "Mock Interview" features behind a per-user
+allowance: every role gets a plan-level default number of free uses,
+any individual user can get an additive bonus on top of that from an
+admin, and once both are exhausted further uses are paid for out of a
+**credits** balance (bought in packs, converted to feature-uses at an
+admin-configurable rate, each purchased lot expiring exactly 1 year after
+purchase). This mirrors the two existing patterns in this file: pure
+admin-config tables are written directly from the client under an
+`is_admin()` RLS policy (same as `course_access`), and anything that
+mutates a balance goes through a `security definer` RPC with an explicit
+`revoke`/`grant` block (same as `extend_paid_until`).
+
+```sql
+-- ============================================================
+-- 1. PLAN_FEATURE_DEFAULTS (admin-editable per-role allowance — src/data/featureCredits.js)
+-- ============================================================
+create table if not exists public.plan_feature_defaults (
+  role text primary key check (role in ('free_users', 'paid_users')),
+  resume_reviews_included integer not null default 0,
+  mock_interviews_included integer not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.plan_feature_defaults enable row level security;
+
+create policy "authenticated read plan feature defaults"
+  on public.plan_feature_defaults for select
+  to authenticated
+  using (true);
+
+create policy "admins write plan feature defaults"
+  on public.plan_feature_defaults for all
+  to authenticated
+  using (public.is_admin())
+  with check (public.is_admin());
+
+insert into public.plan_feature_defaults (role, resume_reviews_included, mock_interviews_included)
+values ('free_users', 0, 0), ('paid_users', 2, 3)
+on conflict (role) do nothing;
+
+-- ============================================================
+-- 2. USER_FEATURE_OVERRIDES (per-user additive bonus — src/data/featureCredits.js)
+-- ============================================================
+create table if not exists public.user_feature_overrides (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  resume_reviews_bonus integer not null default 0,
+  mock_interviews_bonus integer not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.user_feature_overrides enable row level security;
+
+create policy "users read own feature overrides"
+  on public.user_feature_overrides for select
+  to authenticated
+  using (auth.uid() = user_id or public.is_admin());
+
+create policy "admins write feature overrides"
+  on public.user_feature_overrides for all
+  to authenticated
+  using (public.is_admin())
+  with check (public.is_admin());
+
+-- ============================================================
+-- 3. FEATURE_USAGE (tracks drawdown of included allowance — mutated only via consume_feature RPC)
+-- ============================================================
+create table if not exists public.feature_usage (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  feature text not null check (feature in ('resume_review', 'mock_interview')),
+  used_count integer not null default 0,
+  updated_at timestamptz not null default now(),
+  primary key (user_id, feature)
+);
+
+alter table public.feature_usage enable row level security;
+
+create policy "users read own feature usage"
+  on public.feature_usage for select
+  to authenticated
+  using (auth.uid() = user_id or public.is_admin());
+
+-- No insert/update policy for anon/authenticated on purpose — this table
+-- is only ever mutated inside consume_feature(), which is security
+-- definer and checks auth.uid() = p_user_id itself. Same "no client
+-- write path" shape as payments.
+
+-- ============================================================
+-- 4. CREDIT_CONVERSION_RATES (admin-editable credits-per-use — src/data/featureCredits.js)
+-- ============================================================
+create table if not exists public.credit_conversion_rates (
+  feature text primary key check (feature in ('resume_review', 'mock_interview')),
+  credits_per_use integer not null,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.credit_conversion_rates enable row level security;
+
+create policy "authenticated read conversion rates"
+  on public.credit_conversion_rates for select
+  to authenticated
+  using (true);
+
+create policy "admins write conversion rates"
+  on public.credit_conversion_rates for all
+  to authenticated
+  using (public.is_admin())
+  with check (public.is_admin());
+
+insert into public.credit_conversion_rates (feature, credits_per_use)
+values ('resume_review', 5), ('mock_interview', 20)
+on conflict (feature) do nothing;
+
+-- ============================================================
+-- 5. CREDIT_PACKS (admin-editable Bronze/Silver/Gold/Ultra packs — src/data/featureCredits.js)
+-- ============================================================
+create table if not exists public.credit_packs (
+  id uuid primary key default gen_random_uuid(),
+  tier text unique not null check (tier in ('bronze', 'silver', 'gold', 'ultra')),
+  name text not null,
+  credits integer not null,
+  price_paise integer not null,
+  currency text not null default 'INR',
+  is_active boolean not null default true,
+  sort_order integer not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.credit_packs enable row level security;
+
+-- anon too: the public marketing pages show pack pricing to logged-out
+-- visitors as part of the upgrade/buy-credits CTA.
+create policy "anyone reads active credit packs"
+  on public.credit_packs for select
+  to anon, authenticated
+  using (is_active or public.is_admin());
+
+create policy "admins write credit packs"
+  on public.credit_packs for all
+  to authenticated
+  using (public.is_admin())
+  with check (public.is_admin());
+
+-- Seed prices are placeholders — edit from the admin tab at any time.
+insert into public.credit_packs (tier, name, credits, price_paise, sort_order)
+values
+  ('bronze', 'Bronze Pack', 20, 19900, 1),
+  ('silver', 'Silver Pack', 50, 39900, 2),
+  ('gold', 'Gold Pack', 120, 79900, 3),
+  ('ultra', 'Ultra Pack', 300, 149900, 4)
+on conflict (tier) do nothing;
+
+-- ============================================================
+-- 6. CREDIT_LOTS (purchased/granted credit balances, FIFO by expiry — src/data/featureCredits.js)
+-- ============================================================
+create table if not exists public.credit_lots (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  credits_purchased integer not null,
+  credits_remaining integer not null,
+  source text not null check (source in ('pack_purchase', 'admin_grant')),
+  pack_tier text,
+  payment_id uuid references public.payments(id),
+  purchased_at timestamptz not null default now(),
+  expires_at timestamptz not null
+);
+
+alter table public.credit_lots enable row level security;
+
+create index if not exists credit_lots_user_expiry_idx
+  on public.credit_lots (user_id, expires_at);
+
+create policy "users read own credit lots"
+  on public.credit_lots for select
+  to authenticated
+  using (auth.uid() = user_id or public.is_admin());
+
+-- No client write policy — every lot expires exactly 1 year after
+-- purchase (purchased_at + interval '1 year'), and every row is minted
+-- exclusively by grant_credit_lot() (service_role only) or drained by
+-- consume_feature() (security definer). A user's own anon-key session
+-- can never insert or top up a lot directly.
+
+-- ============================================================
+-- 7. CREDIT_TRANSACTIONS (audit ledger, mirrors why `payments` is separate — src/data/featureCredits.js)
+-- ============================================================
+create table if not exists public.credit_transactions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  delta integer not null,
+  reason text not null check (reason in ('pack_purchase', 'admin_grant', 'feature_consumed')),
+  feature text check (feature is null or feature in ('resume_review', 'mock_interview')),
+  lot_id uuid references public.credit_lots(id),
+  created_at timestamptz not null default now()
+);
+
+alter table public.credit_transactions enable row level security;
+
+create policy "users read own credit transactions"
+  on public.credit_transactions for select
+  to authenticated
+  using (auth.uid() = user_id or public.is_admin());
+
+-- ============================================================
+-- 8. PAYMENTS — add credit-pack columns (extends table in the Payments section above)
+-- ============================================================
+alter table public.payments
+  add column if not exists kind text not null default 'subscription' check (kind in ('subscription', 'credit_pack')),
+  add column if not exists pack_tier text,
+  add column if not exists credits integer;
+
+-- ============================================================
+-- 9. get_feature_status(p_user_id) — single-round-trip read for dashboard + marketing gate
+-- ============================================================
+create or replace function public.get_feature_status(p_user_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+stable
+as $$
+declare
+  v_role text;
+  v_resume_default int;
+  v_mock_default int;
+  v_resume_bonus int;
+  v_mock_bonus int;
+  v_resume_used int;
+  v_mock_used int;
+  v_resume_rate int;
+  v_mock_rate int;
+  v_credit_balance int;
+begin
+  if auth.uid() <> p_user_id and not public.is_admin() then
+    raise exception 'forbidden';
+  end if;
+
+  select role::text into v_role from public.profiles where id = p_user_id;
+
+  select resume_reviews_included, mock_interviews_included
+    into v_resume_default, v_mock_default
+    from public.plan_feature_defaults
+    where role = v_role;
+  v_resume_default := coalesce(v_resume_default, 0);
+  v_mock_default := coalesce(v_mock_default, 0);
+
+  select resume_reviews_bonus, mock_interviews_bonus
+    into v_resume_bonus, v_mock_bonus
+    from public.user_feature_overrides
+    where user_id = p_user_id;
+  v_resume_bonus := coalesce(v_resume_bonus, 0);
+  v_mock_bonus := coalesce(v_mock_bonus, 0);
+
+  select used_count into v_resume_used
+    from public.feature_usage where user_id = p_user_id and feature = 'resume_review';
+  v_resume_used := coalesce(v_resume_used, 0);
+
+  select used_count into v_mock_used
+    from public.feature_usage where user_id = p_user_id and feature = 'mock_interview';
+  v_mock_used := coalesce(v_mock_used, 0);
+
+  select credits_per_use into v_resume_rate from public.credit_conversion_rates where feature = 'resume_review';
+  select credits_per_use into v_mock_rate from public.credit_conversion_rates where feature = 'mock_interview';
+
+  select coalesce(sum(credits_remaining), 0) into v_credit_balance
+    from public.credit_lots
+    where user_id = p_user_id and expires_at > now() and credits_remaining > 0;
+
+  return jsonb_build_object(
+    'role', v_role,
+    'resumeReview', jsonb_build_object(
+      'included', v_resume_default + v_resume_bonus,
+      'used', v_resume_used,
+      'remainingIncluded', greatest(v_resume_default + v_resume_bonus - v_resume_used, 0),
+      'creditsPerUse', coalesce(v_resume_rate, 0)
+    ),
+    'mockInterview', jsonb_build_object(
+      'included', v_mock_default + v_mock_bonus,
+      'used', v_mock_used,
+      'remainingIncluded', greatest(v_mock_default + v_mock_bonus - v_mock_used, 0),
+      'creditsPerUse', coalesce(v_mock_rate, 0)
+    ),
+    'creditBalance', v_credit_balance
+  );
+end;
+$$;
+
+revoke execute on function public.get_feature_status(uuid) from public, anon;
+grant execute on function public.get_feature_status(uuid) to authenticated;
+
+-- ============================================================
+-- 10. consume_feature(p_user_id, p_feature) — atomic drawdown: included allowance first, then credits FIFO by expiry
+-- ============================================================
+create or replace function public.consume_feature(p_user_id uuid, p_feature text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_role text;
+  v_default int;
+  v_bonus int;
+  v_used int;
+  v_included int;
+  v_rate int;
+  v_lot record;
+  v_remaining_needed int;
+  v_deduct int;
+  v_credits_deducted int := 0;
+begin
+  if auth.uid() <> p_user_id then
+    raise exception 'forbidden';
+  end if;
+  if p_feature not in ('resume_review', 'mock_interview') then
+    raise exception 'invalid feature: %', p_feature;
+  end if;
+
+  select role::text into v_role from public.profiles where id = p_user_id;
+
+  if p_feature = 'resume_review' then
+    select resume_reviews_included into v_default from public.plan_feature_defaults where role = v_role;
+    select resume_reviews_bonus into v_bonus from public.user_feature_overrides where user_id = p_user_id;
+  else
+    select mock_interviews_included into v_default from public.plan_feature_defaults where role = v_role;
+    select mock_interviews_bonus into v_bonus from public.user_feature_overrides where user_id = p_user_id;
+  end if;
+  v_included := coalesce(v_default, 0) + coalesce(v_bonus, 0);
+
+  select used_count into v_used from public.feature_usage where user_id = p_user_id and feature = p_feature;
+  v_used := coalesce(v_used, 0);
+
+  if v_used < v_included then
+    insert into public.feature_usage (user_id, feature, used_count, updated_at)
+    values (p_user_id, p_feature, 1, now())
+    on conflict (user_id, feature)
+    do update set used_count = feature_usage.used_count + 1, updated_at = now();
+
+    return jsonb_build_object('source', 'included', 'remainingIncluded', v_included - v_used - 1);
+  end if;
+
+  select credits_per_use into v_rate from public.credit_conversion_rates where feature = p_feature;
+  if v_rate is null then
+    raise exception 'no conversion rate configured for %', p_feature;
+  end if;
+
+  v_remaining_needed := v_rate;
+
+  for v_lot in
+    select id, credits_remaining
+    from public.credit_lots
+    where user_id = p_user_id and expires_at > now() and credits_remaining > 0
+    order by expires_at asc
+    for update
+  loop
+    exit when v_remaining_needed <= 0;
+    v_deduct := least(v_lot.credits_remaining, v_remaining_needed);
+    update public.credit_lots set credits_remaining = credits_remaining - v_deduct where id = v_lot.id;
+    v_remaining_needed := v_remaining_needed - v_deduct;
+    v_credits_deducted := v_credits_deducted + v_deduct;
+  end loop;
+
+  if v_remaining_needed > 0 then
+    raise exception 'insufficient allowance and credits for %', p_feature;
+  end if;
+
+  insert into public.credit_transactions (user_id, delta, reason, feature, created_at)
+  values (p_user_id, -v_credits_deducted, 'feature_consumed', p_feature, now());
+
+  return jsonb_build_object('source', 'credits', 'creditsDeducted', v_credits_deducted);
+end;
+$$;
+
+revoke execute on function public.consume_feature(uuid, text) from public, anon;
+grant execute on function public.consume_feature(uuid, text) to authenticated;
+
+-- ============================================================
+-- 11. grant_credit_lot(...) — mints a credit lot; service_role only (called from finalizePayment.ts)
+-- ============================================================
+create or replace function public.grant_credit_lot(
+  p_user_id uuid,
+  p_credits integer,
+  p_source text,
+  p_pack_tier text default null,
+  p_payment_id uuid default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_lot_id uuid;
+begin
+  if p_source not in ('pack_purchase', 'admin_grant') then
+    raise exception 'invalid source: %', p_source;
+  end if;
+
+  insert into public.credit_lots (
+    user_id, credits_purchased, credits_remaining, source, pack_tier, payment_id, purchased_at, expires_at
+  )
+  values (
+    p_user_id, p_credits, p_credits, p_source, p_pack_tier, p_payment_id, now(), now() + interval '1 year'
+  )
+  returning id into v_lot_id;
+
+  insert into public.credit_transactions (user_id, delta, reason, feature, lot_id, created_at)
+  values (p_user_id, p_credits, p_source, null, v_lot_id, now());
+
+  return v_lot_id;
+end;
+$$;
+
+revoke execute on function public.grant_credit_lot(uuid, integer, text, text, uuid) from public, anon, authenticated;
+grant execute on function public.grant_credit_lot(uuid, integer, text, text, uuid) to service_role;
+
+notify pgrst, 'reload schema';
+```
+
+### Verifying the lockdown
+
+```sql
+select routine_name, grantee, privilege_type
+from information_schema.role_routine_grants
+where routine_name in ('get_feature_status', 'consume_feature', 'grant_credit_lot')
+order by routine_name, grantee;
+```
+
+Expect `get_feature_status`/`consume_feature` → `authenticated` only,
+`grant_credit_lot` → `service_role` only. If `anon` or `public` shows up
+for any of the three, the revoke didn't take — re-run the `revoke`
+statement for that function.
+
+---
+
 ## Troubleshooting
 
 ### `ERROR: 42710: type "user_role" already exists`
