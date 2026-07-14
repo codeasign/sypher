@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import Heading from '@theme/Heading';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
-import { withCourseAccess } from '@site/src/data/homepageCourses';
-import { fetchCourseAccessRows } from '@site/src/data/courseAccess';
+import { withCourseAccess } from '@sypher/course-catalog/src/homepageCourses';
+import { fetchCourseAccessRows, hasCourseAccess } from '@site/src/data/courseAccess';
 import { fetchCompanyCourseAccessRows } from '@site/src/data/companyAccess';
 import { CourseGrid } from '@site/src/components/CourseCard';
 import { useAuth } from '@site/src/contexts/AuthContext';
@@ -26,7 +26,7 @@ export default function HomepageFeatures() {
     fetchCompanyCourseAccessRows(supabase, companyName).then(setCompanyAllowedSlugs);
   }, [supabase, role, companyName]);
 
-  const withSlugs = withCourseAccess(role, accessRows, companyAllowedSlugs);
+  const withSlugs = withCourseAccess(hasCourseAccess, role, accessRows, companyAllowedSlugs);
 
   const freeCoursesList = withSlugs.filter((c) => c.isFree);
   const premiumCoursesList = withSlugs.filter((c) => !c.isFree);

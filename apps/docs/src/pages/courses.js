@@ -4,7 +4,7 @@ import Heading from '@theme/Heading';
 import Link from '@docusaurus/Link';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import styles from './courses.module.css';
-import courses from '../data/courses';
+import courses from '@sypher/course-catalog/src/courses';
 
 function CourseSection({ course, showDuration }) {
   return (

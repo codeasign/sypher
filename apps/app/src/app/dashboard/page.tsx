@@ -3,9 +3,9 @@
 import React, { useEffect, useState } from 'react';
 import DashboardLayout from '@/components/DashboardLayout';
 import { useAuth } from '@/contexts/AuthContext';
-import { fetchCourseAccessRows } from '@/data/courseAccess';
+import { fetchCourseAccessRows, hasCourseAccess } from '@/data/courseAccess';
 import { fetchCompanyCourseAccessRows } from '@/data/companyAccess';
-import { withCourseAccess } from '@/data/homepageCourses';
+import { withCourseAccess } from '@sypher/course-catalog/src/homepageCourses';
 import DashboardCourseListing from '@/components/DashboardCourseListing';
 import styles from './dashboard.module.css';
 
@@ -23,7 +23,7 @@ function DashboardContent(): React.JSX.Element {
     fetchCompanyCourseAccessRows(supabase, companyName).then(setCompanyAllowedSlugs);
   }, [supabase, role, companyName]);
 
-  const courses = withCourseAccess(role, accessRows, companyAllowedSlugs);
+  const courses = withCourseAccess(hasCourseAccess, role, accessRows, companyAllowedSlugs);
   const freeCoursesList = courses.filter((c) => c.isFree);
   const premiumCoursesList = courses.filter((c) => !c.isFree);
 

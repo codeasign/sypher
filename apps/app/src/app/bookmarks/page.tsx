@@ -7,11 +7,11 @@ import { CourseGrid } from '@/components/CourseCard';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import { useBookmarks } from '@/hooks/useBookmarks';
 import { useDocBookmarks } from '@/hooks/useDocBookmarks';
-import { withCourseAccess } from '@/data/homepageCourses';
-import { fetchCourseAccessRows } from '@/data/courseAccess';
+import { withCourseAccess } from '@sypher/course-catalog/src/homepageCourses';
+import { fetchCourseAccessRows, hasCourseAccess } from '@/data/courseAccess';
 import { fetchCompanyCourseAccessRows } from '@/data/companyAccess';
 import { useAuth } from '@/contexts/AuthContext';
-import courses from '@/data/courses';
+import courses from '@sypher/course-catalog/src/courses';
 import styles from './bookmarks.module.css';
 
 interface DocBookmark {
@@ -190,7 +190,7 @@ function BookmarksContent(): React.JSX.Element {
     fetchCompanyCourseAccessRows(supabase, companyName).then(setCompanyAllowedSlugs);
   }, [supabase, role, companyName]);
 
-  const bookmarkedCourses = withCourseAccess(role, accessRows, companyAllowedSlugs).filter((course) =>
+  const bookmarkedCourses = withCourseAccess(hasCourseAccess, role, accessRows, companyAllowedSlugs).filter((course) =>
     bookmarkedSlugs.has(course.slug)
   );
 

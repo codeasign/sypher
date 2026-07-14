@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import DashboardLayout from '@/components/DashboardLayout';
 import RequireAdmin from '@/components/RequireAdmin';
 import { useAuth } from '@/contexts/AuthContext';
-import courses from '@/data/courses';
+import courses from '@sypher/course-catalog/src/courses';
 import { listCourseAccess, setCourseRoles } from '@/data/courseAccess';
 import { listNavAccess, setNavItemRoles } from '@/data/navAccess';
 import { NAV_SECTIONS } from '@/data/navItems';
