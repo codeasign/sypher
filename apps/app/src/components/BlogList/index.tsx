@@ -3,7 +3,6 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useAuth } from '@/contexts/AuthContext';
-import { listPublishedBlogPosts } from '@/data/blogPosts';
 import styles from './styles.module.css';
 
 interface PostSummary {
@@ -24,9 +23,10 @@ function formatDate(iso: string): string {
 }
 
 // Seeds from the server-rendered `initialPosts` (real SEO/link-preview
-// HTML), then re-queries on any blog_posts change so an open tab picks up
-// new/edited/unpublished posts live -- RLS on the anon client already
-// keeps this to published rows, so no extra filtering is needed here.
+// HTML). On any blog_posts change, hits /api/blog/live-refresh -- which
+// revalidates the shared 'blog' cache tag and returns the fresh list --
+// instead of running its own raw Supabase query, so N open tabs share one
+// cache repopulation rather than issuing N parallel queries.
 export default function BlogList({ initialPosts }: { initialPosts: PostSummary[] }) {
   const { supabase } = useAuth();
   const [posts, setPosts] = useState<PostSummary[]>(initialPosts);
@@ -37,7 +37,9 @@ export default function BlogList({ initialPosts }: { initialPosts: PostSummary[]
     const channel = supabase
       .channel('blog_posts_public')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'blog_posts' }, () => {
-        listPublishedBlogPosts(supabase).then((data) => setPosts(data));
+        fetch('/api/blog/live-refresh', { method: 'POST' })
+          .then((res) => res.json())
+          .then((data) => setPosts(data));
       })
       .subscribe();
 

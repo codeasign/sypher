@@ -47,7 +47,7 @@ export async function listOpenJobPosts(supabase) {
   if (!supabase) return [];
   const { data, error } = await supabase
     .from('job_posts')
-    .select('slug, title, company_name, location, employment_type, created_at')
+    .select('slug, title, company_name, location, employment_type, work_mode, created_at, include_branding, category_domain_id, category_role_id, required_experience_years, required_experience_months')
     .eq('status', 'open')
     .order('created_at', { ascending: false });
   if (error) {
@@ -62,7 +62,7 @@ export async function listJobPosts(supabase, companyName) {
   if (!supabase || !companyName) return [];
   const { data, error } = await supabase
     .from('job_posts')
-    .select('id, slug, title, location, employment_type, status, updated_at, created_at')
+    .select('id, slug, title, location, employment_type, work_mode, status, updated_at, created_at, include_branding, category_domain_id, category_role_id, required_experience_years, required_experience_months')
     .eq('company_name', companyName)
     .order('updated_at', { ascending: false });
   if (error) {
@@ -79,7 +79,7 @@ export async function listJobPostsByCreator(supabase, userId) {
   if (!supabase || !userId) return [];
   const { data, error } = await supabase
     .from('job_posts')
-    .select('id, slug, title, company_name, location, employment_type, status, updated_at, created_at')
+    .select('id, slug, title, company_name, location, employment_type, work_mode, status, updated_at, created_at, include_branding, category_domain_id, category_role_id, required_experience_years, required_experience_months')
     .eq('created_by', userId)
     .order('updated_at', { ascending: false });
   if (error) {
@@ -101,7 +101,7 @@ export async function getJobPostById(supabase, id) {
   return data;
 }
 
-export async function createJobPost(supabase, { companyName, title, description, location, employmentType, experienceLevel, salaryMin, salaryMax, applyUrl, applyEmail, createdBy }) {
+export async function createJobPost(supabase, { companyName, title, description, location, employmentType, workMode, salaryMin, salaryMax, applyUrl, applyEmail, includeBranding, createdBy, categoryDomainId, categoryRoleId, requiredExperienceYears, requiredExperienceMonths }) {
   if (!supabase) return { error: 'Not authenticated', post: null };
   const slug = await findAvailableSlug(supabase, slugify(title));
   const { data, error } = await supabase
@@ -113,13 +113,18 @@ export async function createJobPost(supabase, { companyName, title, description,
       description,
       location: location ?? null,
       employment_type: employmentType ?? null,
-      experience_level: experienceLevel ?? null,
+      work_mode: workMode ?? null,
       salary_min: salaryMin ?? null,
       salary_max: salaryMax ?? null,
       apply_url: applyUrl ?? null,
       apply_email: applyEmail ?? null,
+      include_branding: includeBranding ?? false,
       status: 'draft',
       created_by: createdBy ?? null,
+      category_domain_id: categoryDomainId ?? null,
+      category_role_id: categoryRoleId ?? null,
+      required_experience_years: requiredExperienceYears ?? null,
+      required_experience_months: requiredExperienceMonths ?? null,
     })
     .select()
     .single();

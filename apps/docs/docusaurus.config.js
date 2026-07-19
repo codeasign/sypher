@@ -1,6 +1,7 @@
 require('dotenv').config({ override: true });
 
 import {themes as prismThemes} from 'prism-react-renderer';
+import { getAppOrigin } from '@sypher/auth-core/src/urls';
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
@@ -80,7 +81,7 @@ const config = {
         { type: 'custom-exploreCourses', position: 'left' },
         // === /TOPICS ===
         { to: '/blog', label: 'Blog', position: 'left' },
-        { to: '/careers', label: 'Careers', position: 'left' },
+        { href: `${getAppOrigin()}/careers`, label: 'Careers', position: 'left' },
         { to: '/corporate-training', label: 'Corporate Training', position: 'left' },
         { to: '/resume-review', label: 'Resume Review', position: 'left' },
         { to: '/mock-interview', label: 'Mock Interview', position: 'left' },

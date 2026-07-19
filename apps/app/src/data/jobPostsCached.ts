@@ -11,7 +11,7 @@ import { getSupabaseAnon } from '@/lib/supabaseAdmin';
 async function listOpenJobPosts(supabase: ReturnType<typeof getSupabaseAnon>) {
   const { data, error } = await supabase
     .from('job_posts')
-    .select('id, slug, title, company_name, location, employment_type, created_at')
+    .select('id, slug, title, company_name, location, employment_type, work_mode, created_at')
     .eq('status', 'open')
     .order('created_at', { ascending: false });
   if (error) {
@@ -25,7 +25,7 @@ async function listOpenJobPosts(supabase: ReturnType<typeof getSupabaseAnon>) {
 async function getOpenJobPostBySlug(supabase: ReturnType<typeof getSupabaseAnon>, slug: string) {
   const { data, error } = await supabase
     .from('job_posts')
-    .select('id, slug, title, company_name, description, location, employment_type, experience_level, salary_min, salary_max, apply_url, apply_email, created_at')
+    .select('id, slug, title, company_name, description, location, employment_type, work_mode, experience_level, salary_min, salary_max, apply_url, apply_email, created_at')
     .eq('slug', slug)
     .eq('status', 'open')
     .maybeSingle();

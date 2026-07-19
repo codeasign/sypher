@@ -9,7 +9,7 @@ import { uploadToBunny } from '@/data/bunnyUpload';
 import PdfEmbed from '@/components/PdfEmbed';
 import { LOOKING_FOR_OPTIONS } from '@/types/lookingFor';
 import type { LookingFor } from '@/types/lookingFor';
-import { EDUCATION_STATUS_OPTIONS, EXPERIENCE_YEARS_OPTIONS, PASSING_YEAR_OPTIONS } from '@/types/educationStatus';
+import { EDUCATION_STATUS_OPTIONS, EXPERIENCE_YEARS_OPTIONS, EXPERIENCE_MONTHS_OPTIONS, PASSING_YEAR_OPTIONS } from '@/types/educationStatus';
 import type { EducationStatus } from '@/types/educationStatus';
 import { CURRENT_STATUS_OPTIONS, NOTICE_PERIOD_OPTIONS } from '@/types/currentStatus';
 import type { CurrentStatus, NoticePeriod } from '@/types/currentStatus';
@@ -19,8 +19,7 @@ import { fetchTaxonomy } from '@/data/taxonomy';
 import { getOwnSkills, setOwnSkills, setOwnDesignation } from '@/data/userTaxonomy';
 import { fetchLocations } from '@/data/locations';
 import { getOwnOpenToLocations, setOwnOpenToLocations, setOwnLocationAndCategory } from '@/data/userLocations';
-import { SENIORITY_LEVEL_OPTIONS } from '@/types/seniority';
-import type { SeniorityLevel } from '@/types/seniority';
+import SkillsModal from '@/components/SkillsModal';
 import styles from './profile.module.css';
 
 const BUNNY_CONFIG = {
@@ -31,11 +30,10 @@ const BUNNY_CONFIG = {
 };
 
 const BIO_WORD_LIMIT = 250;
-const PROFICIENCY_OPTIONS = ['beginner', 'intermediate', 'advanced', 'expert'];
 
 interface TaxonomyCatalog {
   domains: { id: string; name: string; roleIds: string[]; skillIds: string[]; technologyIds: string[] }[];
-  roles: { id: string; name: string; seniorityLevels: SeniorityLevel[] }[];
+  roles: { id: string; name: string }[];
   skills: { id: string; name: string }[];
   technologies: { id: string; name: string }[];
 }
@@ -45,16 +43,8 @@ interface LocationsCatalog {
   locations: { id: string; name: string; slug: string; stateId: string }[];
 }
 
-interface SkillPick {
-  skillId: string;
-  proficiency: string;
-  yearsExperience: string;
-}
-
 interface SkillRow {
   skill_id: string;
-  proficiency: string | null;
-  years_experience: number | null;
 }
 
 type AboutSection =
@@ -79,18 +69,6 @@ const ALL_SECTIONS_EXPANDED: Record<AboutSection, boolean> = {
   socialLinks: true,
   billing: true,
 };
-
-const NAV_ITEMS: { key: AboutSection; label: string }[] = [
-  { key: 'bio', label: 'About me' },
-  { key: 'resume', label: 'Resume' },
-  { key: 'status', label: 'Status & Availability' },
-  { key: 'currentRole', label: 'Current Role' },
-  { key: 'skills', label: 'Skills' },
-  { key: 'currentLocation', label: 'Current Location' },
-  { key: 'openToLocation', label: 'Open to Location' },
-  { key: 'socialLinks', label: 'Social Links' },
-  { key: 'billing', label: 'Billing' },
-];
 
 function SectionHeader({
   label,
@@ -127,22 +105,6 @@ function SectionHeader({
       </button>
     </div>
   );
-}
-
-const SECTION_BG_CLASS: Record<AboutSection, string> = {
-  bio: 'sectionBgBio',
-  resume: 'sectionBgResume',
-  status: 'sectionBgStatus',
-  currentRole: 'sectionBgCurrentRole',
-  skills: 'sectionBgSkills',
-  currentLocation: 'sectionBgCurrentLocation',
-  openToLocation: 'sectionBgOpenToLocation',
-  socialLinks: 'sectionBgSocialLinks',
-  billing: 'sectionBgBilling',
-};
-
-function sectionCardClass(key: AboutSection): string {
-  return `${styles.sectionCard} ${styles[SECTION_BG_CLASS[key]]}`;
 }
 
 function countWords(text: string): number {
@@ -185,10 +147,10 @@ export default function ProfilePage(): React.JSX.Element {
     lookingFor,
     educationStatus,
     experienceYears,
+    experienceMonths,
     passingYear,
     resumeUrl,
     socialLinks,
-    designationSeniority,
     categoryDomainId,
     categoryRoleId,
     currentLocationId,
@@ -203,6 +165,7 @@ export default function ProfilePage(): React.JSX.Element {
   const [lookingForInput, setLookingForInput] = useState<LookingFor[]>([]);
   const [educationStatusInput, setEducationStatusInput] = useState<EducationStatus | null>(null);
   const [experienceYearsInput, setExperienceYearsInput] = useState<number | null>(null);
+  const [experienceMonthsInput, setExperienceMonthsInput] = useState<number | null>(null);
   const [passingYearInput, setPassingYearInput] = useState<number | null>(null);
   const [socialLinksInput, setSocialLinksInput] = useState<SocialLinks>({});
   const [expandedSections, setExpandedSections] = useState<Record<AboutSection, boolean>>(
@@ -219,10 +182,8 @@ export default function ProfilePage(): React.JSX.Element {
   const [taxonomyCatalog, setTaxonomyCatalog] = useState<TaxonomyCatalog | null>(null);
   const [taxonomyError, setTaxonomyError] = useState<string | null>(null);
 
-  const [designationSeniorityInput, setDesignationSeniorityInput] = useState('');
-
-  const [skillPicks, setSkillPicks] = useState<SkillPick[]>([]);
-  const [skillToAdd, setSkillToAdd] = useState('');
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const [isSkillsModalOpen, setIsSkillsModalOpen] = useState(false);
 
   const [locationsCatalog, setLocationsCatalog] = useState<LocationsCatalog | null>(null);
   const [locationsError, setLocationsError] = useState<string | null>(null);
@@ -232,6 +193,7 @@ export default function ProfilePage(): React.JSX.Element {
   const [currentStateId, setCurrentStateId] = useState('');
   const [currentLocationInput, setCurrentLocationInput] = useState('');
   const [openToLocationPicks, setOpenToLocationPicks] = useState<string[]>([]);
+  const [openToLocationStateId, setOpenToLocationStateId] = useState('');
   const [openToLocationToAdd, setOpenToLocationToAdd] = useState('');
 
   useEffect(() => {
@@ -259,6 +221,10 @@ export default function ProfilePage(): React.JSX.Element {
   }, [experienceYears]);
 
   useEffect(() => {
+    setExperienceMonthsInput(experienceMonths ?? null);
+  }, [experienceMonths]);
+
+  useEffect(() => {
     setPassingYearInput(passingYear ?? null);
   }, [passingYear]);
 
@@ -283,22 +249,12 @@ export default function ProfilePage(): React.JSX.Element {
   useEffect(() => {
     if (!supabase || !session?.user.id) return;
     getOwnSkills(supabase, session.user.id).then((rows: SkillRow[]) =>
-      setSkillPicks(
-        rows.map((r) => ({
-          skillId: r.skill_id,
-          proficiency: r.proficiency ?? '',
-          yearsExperience: r.years_experience != null ? String(r.years_experience) : '',
-        }))
-      )
+      setSelectedSkillIds(rows.map((r) => r.skill_id))
     );
     getOwnOpenToLocations(supabase, session.user.id).then((rows: { location_id: string }[]) =>
       setOpenToLocationPicks(rows.map((r) => r.location_id))
     );
   }, [supabase, session?.user.id]);
-
-  useEffect(() => {
-    setDesignationSeniorityInput(designationSeniority ?? '');
-  }, [designationSeniority]);
 
   useEffect(() => {
     let active = true;
@@ -337,6 +293,7 @@ export default function ProfilePage(): React.JSX.Element {
     setEducationStatusInput(value);
     if (value !== 'experienced') {
       setExperienceYearsInput(null);
+      setExperienceMonthsInput(null);
     }
     if (value === 'passed_out') {
       setPassingYearInput((prev) => prev ?? new Date().getFullYear() - 1);
@@ -353,66 +310,39 @@ export default function ProfilePage(): React.JSX.Element {
     setExpandedSections((prev) => ({ ...prev, [key]: !prev[key] }));
   }
 
-  const sectionRefs = useRef<Partial<Record<AboutSection, HTMLDivElement>>>({});
-
-  function setSectionRef(key: AboutSection, el: HTMLDivElement | null): void {
-    if (el) sectionRefs.current[key] = el;
-  }
-
-  function scrollToSection(key: AboutSection): void {
-    setExpandedSections((prev) => (prev[key] ? prev : { ...prev, [key]: true }));
-    sectionRefs.current[key]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }
-
   const selectedCategoryDomain = taxonomyCatalog?.domains.find((d) => d.id === categoryDomainInput) ?? null;
   const rolesForSelectedCategoryDomain = selectedCategoryDomain
     ? taxonomyCatalog!.roles.filter((r) => selectedCategoryDomain.roleIds.includes(r.id))
     : [];
-  const selectedRole = taxonomyCatalog?.roles.find((r) => r.id === categoryRoleInput) ?? null;
-  const seniorityOptionsForSelectedRole = selectedRole
-    ? SENIORITY_LEVEL_OPTIONS.filter((o) => selectedRole.seniorityLevels.includes(o.value))
-    : SENIORITY_LEVEL_OPTIONS;
 
   function handleCategoryDomainChange(domainId: string): void {
     setCategoryDomainInput(domainId);
     setCategoryRoleInput('');
-    setDesignationSeniorityInput('');
   }
 
   function handleCategoryRoleChange(roleId: string): void {
     setCategoryRoleInput(roleId);
-    const role = taxonomyCatalog?.roles.find((r) => r.id === roleId);
-    setDesignationSeniorityInput(role?.seniorityLevels[0] ?? '');
   }
 
-  const availableSkills = (taxonomyCatalog?.skills ?? []).filter(
-    (s) => !skillPicks.some((p) => p.skillId === s.id)
-  );
-
-  function addSkillPick(): void {
-    if (!skillToAdd) return;
-    setSkillPicks((prev) => [...prev, { skillId: skillToAdd, proficiency: '', yearsExperience: '' }]);
-    setSkillToAdd('');
-  }
-
-  function updateSkillPick(skillId: string, field: 'proficiency' | 'yearsExperience', value: string): void {
-    setSkillPicks((prev) => prev.map((p) => (p.skillId === skillId ? { ...p, [field]: value } : p)));
-  }
-
-  function removeSkillPick(skillId: string): void {
-    setSkillPicks((prev) => prev.filter((p) => p.skillId !== skillId));
-  }
+  const skillsForCurrentDomain = selectedCategoryDomain
+    ? (taxonomyCatalog?.skills ?? []).filter((s) => selectedCategoryDomain.skillIds.includes(s.id))
+    : [];
 
   const locationsForCurrentState = (locationsCatalog?.locations ?? []).filter(
     (l) => l.stateId === currentStateId
   );
-  const availableOpenToLocations = (locationsCatalog?.locations ?? []).filter(
-    (l) => !openToLocationPicks.includes(l.id)
+  const locationsForOpenToLocationState = (locationsCatalog?.locations ?? []).filter(
+    (l) => l.stateId === openToLocationStateId
   );
 
   function handleCurrentStateChange(stateId: string): void {
     setCurrentStateId(stateId);
     setCurrentLocationInput('');
+  }
+
+  function handleOpenToLocationStateChange(stateId: string): void {
+    setOpenToLocationStateId(stateId);
+    setOpenToLocationToAdd('');
   }
 
   function addOpenToLocationPick(): void {
@@ -421,8 +351,8 @@ export default function ProfilePage(): React.JSX.Element {
     setOpenToLocationToAdd('');
   }
 
-  function removeOpenToLocationPick(locationId: string): void {
-    setOpenToLocationPicks((prev) => prev.filter((id) => id !== locationId));
+  function removeOpenToLocationPick(index: number): void {
+    setOpenToLocationPicks((prev) => prev.filter((_, i) => i !== index));
   }
 
   const bioWordCount = countWords(bioInput);
@@ -445,7 +375,8 @@ export default function ProfilePage(): React.JSX.Element {
           currentStatusInput,
           noticePeriodInput,
           passingYearInput,
-          socialLinksInput
+          socialLinksInput,
+          experienceMonthsInput
         ),
         setOwnLocationAndCategory(
           supabase,
@@ -455,15 +386,15 @@ export default function ProfilePage(): React.JSX.Element {
         ),
         setOwnOpenToLocations(supabase, session.user.id, openToLocationPicks),
         categoryRoleInput
-          ? setOwnDesignation(supabase, categoryRoleInput, designationSeniorityInput || null)
+          ? setOwnDesignation(supabase, categoryRoleInput, null)
           : Promise.resolve({ error: null }),
         setOwnSkills(
           supabase,
           session.user.id,
-          skillPicks.map((p) => ({
-            skillId: p.skillId,
-            proficiency: p.proficiency || null,
-            yearsExperience: p.yearsExperience ? Number(p.yearsExperience) : null,
+          selectedSkillIds.map((skillId) => ({
+            skillId,
+            proficiency: null,
+            yearsExperience: null,
           }))
         ),
       ]);
@@ -518,7 +449,8 @@ export default function ProfilePage(): React.JSX.Element {
         currentStatusInput,
         noticePeriodInput,
         passingYearInput,
-        socialLinksInput
+        socialLinksInput,
+        experienceMonthsInput
       );
       if (error) {
         setResumeError(error);
@@ -594,25 +526,9 @@ export default function ProfilePage(): React.JSX.Element {
           <h1 className={styles.heading}>Profile</h1>
         </div>
 
-        <div className={styles.splitScreen}>
-          <aside className={styles.sidebar}>
-            <nav className={styles.sidebarNav}>
-              {NAV_ITEMS.map((item) => (
-                <button
-                  key={item.key}
-                  type="button"
-                  className={styles.sidebarNavItem}
-                  onClick={() => scrollToSection(item.key)}
-                >
-                  {item.label}
-                </button>
-              ))}
-            </nav>
-          </aside>
-
-          <div className={styles.mainPanel}>
+        <div className={styles.mainPanel}>
           <div className={styles.card}>
-            <div className={sectionCardClass('bio')} ref={(el) => setSectionRef('bio', el)}>
+            <div className={styles.sectionCard}>
               <SectionHeader
                 label="About me"
                 expanded={expandedSections.bio}
@@ -635,7 +551,7 @@ export default function ProfilePage(): React.JSX.Element {
               ) : null}
             </div>
 
-            <div className={sectionCardClass('resume')} ref={(el) => setSectionRef('resume', el)}>
+            <div className={styles.sectionCard}>
               <SectionHeader label="Resume" expanded={expandedSections.resume} onToggle={() => toggleSection('resume')} />
               {expandedSections.resume ? (
                 <>
@@ -678,7 +594,7 @@ export default function ProfilePage(): React.JSX.Element {
               ) : null}
             </div>
 
-            <div className={sectionCardClass('status')} ref={(el) => setSectionRef('status', el)}>
+            <div className={styles.sectionCard}>
               <SectionHeader
                 label="Status & Availability"
                 expanded={expandedSections.status}
@@ -759,22 +675,35 @@ export default function ProfilePage(): React.JSX.Element {
 
                   {educationStatusInput === 'experienced' ? (
                     <div className={styles.formField}>
-                      <label className={styles.formLabel} htmlFor="profile-experience-years">
-                        Total Years of Experience
-                      </label>
-                      <select
-                        id="profile-experience-years"
-                        className={styles.formSelect}
-                        value={experienceYearsInput ?? ''}
-                        onChange={(e) => setExperienceYearsInput(e.target.value ? Number(e.target.value) : null)}
-                      >
-                        <option value="">Select…</option>
-                        {EXPERIENCE_YEARS_OPTIONS.map((year) => (
-                          <option key={year} value={year}>
-                            {year}
-                          </option>
-                        ))}
-                      </select>
+                      <span className={styles.formLabel}>Total Experience</span>
+                      <div className={styles.cascadeRow}>
+                        <select
+                          id="profile-experience-years"
+                          className={styles.formSelect}
+                          value={experienceYearsInput ?? ''}
+                          onChange={(e) => setExperienceYearsInput(e.target.value ? Number(e.target.value) : null)}
+                        >
+                          <option value="">Years…</option>
+                          {EXPERIENCE_YEARS_OPTIONS.map((year) => (
+                            <option key={year} value={year}>
+                              {year}
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          id="profile-experience-months"
+                          className={styles.formSelect}
+                          value={experienceMonthsInput ?? ''}
+                          onChange={(e) => setExperienceMonthsInput(e.target.value ? Number(e.target.value) : null)}
+                        >
+                          <option value="">Months…</option>
+                          {EXPERIENCE_MONTHS_OPTIONS.map((month) => (
+                            <option key={month} value={month}>
+                              {month}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
                     </div>
                   ) : null}
 
@@ -801,7 +730,7 @@ export default function ProfilePage(): React.JSX.Element {
               ) : null}
             </div>
 
-            <div className={sectionCardClass('currentRole')} ref={(el) => setSectionRef('currentRole', el)}>
+            <div className={styles.sectionCard}>
               <SectionHeader
                 label="Current Role"
                 expanded={expandedSections.currentRole}
@@ -842,7 +771,7 @@ export default function ProfilePage(): React.JSX.Element {
               ) : null}
             </div>
 
-            <div className={sectionCardClass('skills')} ref={(el) => setSectionRef('skills', el)}>
+            <div className={styles.sectionCard}>
               <SectionHeader
                 label="Skills"
                 expanded={expandedSections.skills}
@@ -850,89 +779,33 @@ export default function ProfilePage(): React.JSX.Element {
                 underline
               />
               {expandedSections.skills ? (
-                <>
-                  <div className={styles.formField}>
-                    <span className={styles.formLabel}>Seniority</span>
-                    <select
-                      className={styles.formSelect}
-                      value={designationSeniorityInput}
-                      onChange={(e) => setDesignationSeniorityInput(e.target.value)}
-                      disabled={!categoryRoleInput}
-                    >
-                      {seniorityOptionsForSelectedRole.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div className={styles.formField}>
-                    <span className={styles.formLabel}>Skills</span>
-                    {skillPicks.map((pick) => {
-                      const skill = taxonomyCatalog?.skills.find((s) => s.id === pick.skillId);
-                      return (
-                        <div key={pick.skillId} className={styles.pickRow}>
-                          <span className={styles.pickName}>{skill?.name ?? pick.skillId}</span>
-                          <select
-                            className={styles.pickSelect}
-                            value={pick.proficiency}
-                            onChange={(e) => updateSkillPick(pick.skillId, 'proficiency', e.target.value)}
-                          >
-                            <option value="">Proficiency…</option>
-                            {PROFICIENCY_OPTIONS.map((option) => (
-                              <option key={option} value={option}>
-                                {option}
-                              </option>
-                            ))}
-                          </select>
-                          <input
-                            type="number"
-                            min={0}
-                            className={styles.pickYearsInput}
-                            placeholder="Years"
-                            value={pick.yearsExperience}
-                            onChange={(e) => updateSkillPick(pick.skillId, 'yearsExperience', e.target.value)}
-                          />
-                          <button
-                            type="button"
-                            className={styles.pickRemoveBtn}
-                            onClick={() => removeSkillPick(pick.skillId)}
-                            aria-label={`Remove ${skill?.name ?? 'skill'}`}
-                          >
-                            ✕
-                          </button>
-                        </div>
-                      );
-                    })}
-                    <div className={styles.addItemRow}>
-                      <select
-                        className={styles.formSelect}
-                        value={skillToAdd}
-                        onChange={(e) => setSkillToAdd(e.target.value)}
-                      >
-                        <option value="">Add a skill…</option>
-                        {availableSkills.map((skill) => (
-                          <option key={skill.id} value={skill.id}>
-                            {skill.name}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        type="button"
-                        className={styles.addItemBtn}
-                        disabled={!skillToAdd}
-                        onClick={addSkillPick}
-                      >
-                        Add
-                      </button>
+                <div className={styles.formField}>
+                  <button
+                    type="button"
+                    className={styles.addItemBtn}
+                    onClick={() => setIsSkillsModalOpen(true)}
+                  >
+                    Skills
+                  </button>
+                  {selectedSkillIds.length > 0 ? (
+                    <div className={styles.skillChipRow}>
+                      {selectedSkillIds.map((skillId) => {
+                        const skill = taxonomyCatalog?.skills.find((s) => s.id === skillId);
+                        return (
+                          <span key={skillId} className={styles.skillChip}>
+                            {skill?.name ?? skillId}
+                          </span>
+                        );
+                      })}
                     </div>
-                  </div>
-                </>
+                  ) : (
+                    <p className={styles.helpText}>No skills selected yet.</p>
+                  )}
+                </div>
               ) : null}
             </div>
 
-            <div className={sectionCardClass('currentLocation')} ref={(el) => setSectionRef('currentLocation', el)}>
+            <div className={styles.sectionCard}>
               <SectionHeader
                 label="Current Location"
                 expanded={expandedSections.currentLocation}
@@ -946,7 +819,7 @@ export default function ProfilePage(): React.JSX.Element {
                       value={currentStateId}
                       onChange={(e) => handleCurrentStateChange(e.target.value)}
                     >
-                      <option value="">Select a state…</option>
+                      <option value="">Select a state</option>
                       {(locationsCatalog?.states ?? []).map((state) => (
                         <option key={state.id} value={state.id}>
                           {state.name}
@@ -959,7 +832,7 @@ export default function ProfilePage(): React.JSX.Element {
                       onChange={(e) => setCurrentLocationInput(e.target.value)}
                       disabled={!currentStateId}
                     >
-                      <option value="">Select a location…</option>
+                      <option value="">Select a location</option>
                       {locationsForCurrentState.map((location) => (
                         <option key={location.id} value={location.id}>
                           {location.name}
@@ -972,7 +845,7 @@ export default function ProfilePage(): React.JSX.Element {
               ) : null}
             </div>
 
-            <div className={sectionCardClass('openToLocation')} ref={(el) => setSectionRef('openToLocation', el)}>
+            <div className={styles.sectionCard}>
               <SectionHeader
                 label="Open to Location"
                 expanded={expandedSections.openToLocation}
@@ -980,15 +853,21 @@ export default function ProfilePage(): React.JSX.Element {
               />
               {expandedSections.openToLocation ? (
                 <>
-                  {openToLocationPicks.map((locationId) => {
+                  {openToLocationPicks.map((locationId, index) => {
                     const location = locationsCatalog?.locations.find((l) => l.id === locationId);
+                    const state = locationsCatalog?.states.find((s) => s.id === location?.stateId);
+                    const label = location
+                      ? state
+                        ? `${state.name} — ${location.name}`
+                        : location.name
+                      : locationId;
                     return (
-                      <div key={locationId} className={styles.pickRow}>
-                        <span className={styles.pickName}>{location?.name ?? locationId}</span>
+                      <div key={`${locationId}-${index}`} className={styles.pickRow}>
+                        <span className={styles.pickName}>{label}</span>
                         <button
                           type="button"
                           className={styles.pickRemoveBtn}
-                          onClick={() => removeOpenToLocationPick(locationId)}
+                          onClick={() => removeOpenToLocationPick(index)}
                           aria-label={`Remove ${location?.name ?? 'location'}`}
                         >
                           ✕
@@ -996,14 +875,27 @@ export default function ProfilePage(): React.JSX.Element {
                       </div>
                     );
                   })}
-                  <div className={styles.addItemRow}>
+                  <div className={styles.cascadeRow}>
+                    <select
+                      className={styles.formSelect}
+                      value={openToLocationStateId}
+                      onChange={(e) => handleOpenToLocationStateChange(e.target.value)}
+                    >
+                      <option value="">Select a state</option>
+                      {(locationsCatalog?.states ?? []).map((state) => (
+                        <option key={state.id} value={state.id}>
+                          {state.name}
+                        </option>
+                      ))}
+                    </select>
                     <select
                       className={styles.formSelect}
                       value={openToLocationToAdd}
                       onChange={(e) => setOpenToLocationToAdd(e.target.value)}
+                      disabled={!openToLocationStateId}
                     >
-                      <option value="">Add a location…</option>
-                      {availableOpenToLocations.map((location) => (
+                      <option value="">Select a location</option>
+                      {locationsForOpenToLocationState.map((location) => (
                         <option key={location.id} value={location.id}>
                           {location.name}
                         </option>
@@ -1022,7 +914,7 @@ export default function ProfilePage(): React.JSX.Element {
               ) : null}
             </div>
 
-            <div className={sectionCardClass('socialLinks')} ref={(el) => setSectionRef('socialLinks', el)}>
+            <div className={styles.sectionCard}>
               <SectionHeader
                 label="Social Links"
                 expanded={expandedSections.socialLinks}
@@ -1066,7 +958,7 @@ export default function ProfilePage(): React.JSX.Element {
               ) : null}
             </div>
 
-            <div className={sectionCardClass('billing')} ref={(el) => setSectionRef('billing', el)}>
+            <div className={styles.sectionCard}>
               <SectionHeader label="Billing" expanded={expandedSections.billing} onToggle={() => toggleSection('billing')} />
               {expandedSections.billing ? (
                 <>
@@ -1130,7 +1022,6 @@ export default function ProfilePage(): React.JSX.Element {
               </div>
             ) : null}
           </div>
-          </div>
         </div>
       </div>
 
@@ -1161,6 +1052,14 @@ export default function ProfilePage(): React.JSX.Element {
           </div>
         </div>
       ) : null}
+
+      <SkillsModal
+        open={isSkillsModalOpen}
+        onClose={() => setIsSkillsModalOpen(false)}
+        allSkills={skillsForCurrentDomain}
+        selectedSkillIds={selectedSkillIds}
+        onSave={setSelectedSkillIds}
+      />
     </DashboardLayout>
   );
 }

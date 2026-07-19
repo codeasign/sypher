@@ -55,7 +55,7 @@ export async function getOwnProfile(supabase, userId) {
   if (!supabase || !userId) return null;
   const { data, error } = await supabase
     .from('profiles')
-    .select('role, deleted_at, company_name, paid_until, full_name, bio, current_status, notice_period, looking_for, education_status, experience_years, passing_year, resume_url, social_links, designation_id, designation_seniority, category_domain_id, category_role_id, current_location_id')
+    .select('role, deleted_at, company_name, paid_until, full_name, bio, current_status, notice_period, looking_for, education_status, experience_years, experience_months, passing_year, resume_url, social_links, designation_id, designation_seniority, category_domain_id, category_role_id, current_location_id')
     .eq('id', userId)
     .single();
   if (error) {
@@ -76,7 +76,8 @@ export async function updateOwnBio(
   currentStatus,
   noticePeriod,
   passingYear,
-  socialLinks
+  socialLinks,
+  experienceMonths
 ) {
   if (!supabase) return { error: 'Not authenticated' };
   const cleanedSocialLinks = socialLinks
@@ -93,6 +94,7 @@ export async function updateOwnBio(
     p_notice_period: noticePeriod ?? null,
     p_passing_year: educationStatus === 'passed_out' ? (passingYear ?? null) : null,
     p_social_links: cleanedSocialLinks && Object.keys(cleanedSocialLinks).length ? cleanedSocialLinks : null,
+    p_experience_months: educationStatus === 'experienced' ? (experienceMonths ?? null) : null,
   });
   if (error) {
     // eslint-disable-next-line no-console

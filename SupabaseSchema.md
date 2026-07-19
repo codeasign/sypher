@@ -891,6 +891,86 @@ multiple overloaded signatures side by side.
 
 ---
 
+## Profile total experience — months (`experience_months`)
+
+`experience_years` alone can't express "2 years 6 months" — this adds a
+sibling `experience_months` column (0-11) so total experience is captured
+as years + months together on `/profile`. Follows `experience_years`'
+exact pattern: capped by a `check` constraint, and nulled server-side by
+`update_own_profile` whenever `education_status` isn't `'experienced'`.
+
+```sql
+alter table public.profiles
+  add column if not exists experience_months integer;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'profiles_experience_months_range'
+  ) then
+    alter table public.profiles
+      add constraint profiles_experience_months_range
+      check (experience_months is null or experience_months between 0 and 11);
+  end if;
+end;
+$$;
+
+drop function if exists public.update_own_profile(text, text, public.looking_for_type[], text, public.education_status_type, integer, public.current_status_type, public.notice_period_type, integer, jsonb);
+
+create or replace function public.update_own_profile(
+  p_full_name text,
+  p_bio text,
+  p_looking_for public.looking_for_type[] default null,
+  p_resume_url text default null,
+  p_education_status public.education_status_type default null,
+  p_experience_years integer default null,
+  p_current_status public.current_status_type default null,
+  p_notice_period public.notice_period_type default null,
+  p_passing_year integer default null,
+  p_social_links jsonb default null,
+  p_experience_months integer default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if p_bio is not null
+     and array_length(regexp_split_to_array(trim(p_bio), '\s+'), 1) > 250 then
+    raise exception 'Bio must be 250 words or fewer';
+  end if;
+
+  update public.profiles
+  set
+    full_name = coalesce(p_full_name, full_name),
+    bio = p_bio,
+    looking_for = p_looking_for,
+    resume_url = coalesce(p_resume_url, resume_url),
+    education_status = p_education_status,
+    experience_years = case when p_education_status = 'experienced' then p_experience_years else null end,
+    experience_months = case when p_education_status = 'experienced' then p_experience_months else null end,
+    current_status = p_current_status,
+    notice_period = p_notice_period,
+    passing_year = case when p_education_status = 'passed_out' then p_passing_year else null end,
+    social_links = p_social_links
+  where id = auth.uid();
+end;
+$$;
+
+revoke execute on function public.update_own_profile(text, text, public.looking_for_type[], text, public.education_status_type, integer, public.current_status_type, public.notice_period_type, integer, jsonb, integer) from public;
+grant execute on function public.update_own_profile(text, text, public.looking_for_type[], text, public.education_status_type, integer, public.current_status_type, public.notice_period_type, integer, jsonb, integer) to authenticated;
+
+notify pgrst, 'reload schema';
+```
+
+`experience_months` mirrors `experience_years` exactly: same conditional
+nulling tied to `education_status = 'experienced'`, same self-scoped RPC
+(`where id = auth.uid()`), just a narrower 0-11 range since it represents
+the remainder-months component of total experience, not a standalone value.
+
+---
+
 ## Corporate invites and per-company access
 
 Adds bulk CSV invites for `company_hr`/`company_employees` (`/manage-users`),
@@ -2191,7 +2271,7 @@ create table if not exists public.job_posts (
   title text not null,
   description text not null,
   location text,
-  employment_type text check (employment_type in ('full_time', 'part_time', 'contract', 'internship')),
+  employment_type text check (employment_type in ('full_time', 'part_time', 'contract', 'internship', 'freelance')),
   experience_level text,
   salary_min integer,
   salary_max integer,
@@ -2249,6 +2329,7 @@ create table if not exists public.company_branding (
   logo_url text,
   tagline text,
   about text,
+  created_by uuid references auth.users(id) on delete set null,
   updated_at timestamptz not null default now()
 );
 
@@ -2312,15 +2393,16 @@ just being assigned the role (before an admin ever granted feature access)
 was enough to write to every company's `company_branding` row directly via
 PostgREST.
 
-Scoping differs from `company_hr` in two ways:
-- `job_posts`: an external poster can only see/edit the rows they
-  personally created (`created_by = auth.uid()`), regardless of which
-  company_name they used — not all posts for a given company, since
-  several external posters could be working across overlapping companies.
-- `company_branding`: an external poster can create/update the branding
-  row for *any* company_name — there's one row per company (primary key),
-  so this is a shared-edit model, same as if they were that company's own
-  `company_hr` for branding purposes only.
+Scoping differs from `company_hr` in one way, and used to differ in a
+second: both `job_posts` and `company_branding` now scope an external
+poster to the rows they personally created (`created_by = auth.uid()`).
+`company_branding` originally had no `created_by` column and let an
+external poster edit *any* company's branding row (a shared-edit model,
+since it's one row per company primary key) — that's been replaced below
+by an owned-row model to match `job_posts`, so an external poster only
+sees/edits brandings they themselves created; a different external poster
+working with the same company_name gets their own row lineage tracked via
+`created_by`, not silent shared access.
 
 ```sql
 alter type public.user_role add value if not exists 'external_job_poster';
@@ -2354,12 +2436,34 @@ create policy "external job posters manage own created job posts" on public.job_
   for all using (public.is_external_job_poster('add-job-post') and created_by = auth.uid())
   with check (public.is_external_job_poster('add-job-post') and created_by = auth.uid());
 
+-- company_branding used to be a shared-edit-any-company model for this
+-- role (no created_by column existed). Adding created_by here moves it
+-- to the same owned-row model as job_posts -- existing rows predate the
+-- column and backfill to null, which the policy below treats as
+-- unowned/inaccessible to external posters (a company_hr can still see
+-- their own company's pre-existing row fine, since that policy doesn't
+-- reference created_by at all).
+alter table public.company_branding add column if not exists created_by uuid references auth.users(id) on delete set null;
+
 drop policy if exists "external job posters manage any company branding" on public.company_branding;
-create policy "external job posters manage any company branding" on public.company_branding
-  for all using (public.is_external_job_poster('add-company-branding'))
-  with check (public.is_external_job_poster('add-company-branding'));
+drop policy if exists "external job posters manage own created company branding" on public.company_branding;
+create policy "external job posters manage own created company branding" on public.company_branding
+  for all using (public.is_external_job_poster('add-company-branding') and created_by = auth.uid())
+  with check (public.is_external_job_poster('add-company-branding') and created_by = auth.uid());
 
 notify pgrst, 'reload schema';
+```
+
+Rows created before this migration have `created_by = null`, so no
+external poster will see them in their list until someone re-saves that
+company's branding (which sets `created_by` on upsert going forward). To
+attribute a specific pre-existing row to a specific poster instead of
+leaving it unowned, run this once per row, by hand:
+
+```sql
+update public.company_branding
+set created_by = (select id from auth.users where email = 'poster@example.com')
+where company_name = 'Some Company' and created_by is null;
 ```
 
 No seed rows needed in `nav_access` — same rule as every other item: an
@@ -2367,6 +2471,299 @@ admin grants `external_job_poster` access to `add-job-post` and
 `add-company-branding` from `/manage-access` when ready. Until that grant
 exists, an `external_job_poster` account is denied by RLS even with the
 role assigned, matching `company_hr`'s behavior.
+
+---
+
+## Job posts — include company branding (`include_branding`)
+
+A poster can opt in to showing their company's branding (logo/tagline/
+about, from `company_branding`) alongside a job post on the signed-in
+Jobs feed. Explicit boolean rather than inferring from "does a
+`company_branding` row exist for this company_name" — a poster may have
+branding set up but not want it shown on a specific posting.
+
+```sql
+alter table public.job_posts add column if not exists include_branding boolean not null default false;
+
+notify pgrst, 'reload schema';
+```
+
+No RLS change needed — `include_branding` is just another column covered
+by the existing `job_posts` policies (`can_manage_company_content`/
+`is_external_job_poster` for writes, `status = 'open'` for public reads).
+
+---
+
+## Job posts — taxonomy tagging (Domain, Role, Skills, required experience)
+
+Job posts have had zero connection to the Domain/Role/Skills taxonomy that
+drives `/profile` — a poster could only describe a role in free text
+(`experience_level`), and the signed-in Jobs feed could only filter on
+employment type and a text search. This adds the same Domain → Role
+cascade and Skills concept from `/profile` to `job_posts`, plus a numeric
+required-experience years/months pair (mirroring the new
+`profiles.experience_months`, above) so Jobs feed can filter on structured
+data instead of free text. `experience_level` (free text, e.g. "3-5
+years") is untouched — these are new, additive columns alongside it, not
+a replacement.
+
+```sql
+alter table public.job_posts add column if not exists category_domain_id uuid references public.domains(id);
+alter table public.job_posts add column if not exists category_role_id uuid references public.base_roles(id);
+
+alter table public.job_posts add column if not exists required_experience_years integer;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'job_posts_required_experience_years_range'
+  ) then
+    alter table public.job_posts
+      add constraint job_posts_required_experience_years_range
+      check (required_experience_years is null or required_experience_years between 0 and 30);
+  end if;
+end;
+$$;
+
+alter table public.job_posts add column if not exists required_experience_months integer;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'job_posts_required_experience_months_range'
+  ) then
+    alter table public.job_posts
+      add constraint job_posts_required_experience_months_range
+      check (required_experience_months is null or required_experience_months between 0 and 11);
+  end if;
+end;
+$$;
+
+-- one row per (job, required skill) -- mirrors user_skills' shape, but
+-- scoped by job ownership (via a join back to job_posts) instead of a
+-- user_id column, since job_post_skills has no owner column of its own.
+create table if not exists public.job_post_skills (
+  job_id uuid not null references public.job_posts(id) on delete cascade,
+  skill_id uuid not null references public.skills(id) on delete cascade,
+  primary key (job_id, skill_id)
+);
+
+alter table public.job_post_skills enable row level security;
+
+-- Public read: the signed-in Jobs feed's skill filter and skill-chip
+-- display run as the candidate viewing an open job, not the poster.
+drop policy if exists "anyone can read skills of open job posts" on public.job_post_skills;
+create policy "anyone can read skills of open job posts" on public.job_post_skills
+  for select using (
+    exists (select 1 from public.job_posts jp where jp.id = job_id and jp.status = 'open')
+  );
+
+-- Write access is re-derived by joining back to job_posts and reusing
+-- the exact same authorization check job_posts itself uses for writes
+-- (can_manage_company_content for company_hr/admin, is_external_job_poster
+-- + created_by for external posters) -- job_post_skills has no created_by
+-- of its own, so ownership can only be checked through the parent row.
+drop policy if exists "posters manage skills of own job posts" on public.job_post_skills;
+create policy "posters manage skills of own job posts" on public.job_post_skills
+  for all using (
+    exists (
+      select 1 from public.job_posts jp where jp.id = job_id and (
+        public.can_manage_company_content(jp.company_name, 'add-job-post')
+        or (public.is_external_job_poster('add-job-post') and jp.created_by = auth.uid())
+      )
+    )
+  )
+  with check (
+    exists (
+      select 1 from public.job_posts jp where jp.id = job_id and (
+        public.can_manage_company_content(jp.company_name, 'add-job-post')
+        or (public.is_external_job_poster('add-job-post') and jp.created_by = auth.uid())
+      )
+    )
+  );
+
+notify pgrst, 'reload schema';
+```
+
+No seniority field is added to job posts — the user explicitly scoped
+this to Domain, Role, Skills, and years+months of experience only, unlike
+`base_roles.seniority_levels`/`profiles.designation_seniority`.
+
+---
+
+## Job posts — work mode (On Site / Hybrid / Remote / Work From Home)
+
+`employment_type` (full_time/part_time/contract/internship) already
+captures the *contract* shape of a role, but nothing captured the
+*where-you-work* shape. This adds a sibling `work_mode` column, same
+plain scalar check-constrained pattern as `employment_type` — no new
+table needed since it's a single fixed-choice field per job post.
+
+```sql
+alter table public.job_posts add column if not exists work_mode text;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'job_posts_work_mode_check'
+  ) then
+    alter table public.job_posts
+      add constraint job_posts_work_mode_check
+      check (work_mode is null or work_mode in ('onsite', 'hybrid', 'remote', 'work_from_home'));
+  end if;
+end;
+$$;
+
+notify pgrst, 'reload schema';
+```
+
+Values mirror `apps/app/src/types/workMode.ts`'s `WorkMode` union exactly
+(`onsite`, `hybrid`, `remote`, `work_from_home`) — labelled "On Site",
+"Hybrid", "Remote", "Work From Home" in the UI. Shown in Add Job Post
+(`JobPostEditor`), the signed-in Jobs feed detail pane, and the public
+`/careers` list + job page, same places `employment_type` already
+appears.
+
+`employment_type` also gained a `freelance` option at the same time (UI
+dropdown in `JobPostEditor` was missing it). On an existing database the
+`create table if not exists` above won't touch the already-created
+`employment_type` check constraint, so it needs its own migration:
+
+```sql
+alter table public.job_posts drop constraint if exists job_posts_employment_type_check;
+
+alter table public.job_posts
+  add constraint job_posts_employment_type_check
+  check (employment_type is null or employment_type in ('full_time', 'part_time', 'contract', 'internship', 'freelance'));
+
+notify pgrst, 'reload schema';
+```
+
+(The original inline `check (employment_type in (...))` on the table
+definition has no name of its own — Postgres auto-names unnamed column
+checks `job_posts_employment_type_check` by convention, which is what
+this `drop constraint if exists` targets.)
+
+---
+
+## Job applications (`job_applications`) — in-app Apply + Applies view
+
+Lets a signed-in `free_users`/`paid_users` account apply to an open job
+post directly (using their existing Profile data — no separate
+application form), and lets that job's poster (`company_hr` or
+`external_job_poster`, whichever `created_by` on `job_posts` is) see who
+applied. `created_by` is already set unconditionally on every job post
+regardless of poster role, so a single `created_by = auth.uid()` check
+covers both roles without branching — same pattern as the owned-row
+policies for `job_posts`/`company_branding` above.
+
+Applicant profile data can't be read directly by the poster — `profiles`
+RLS only allows reading your own row — so `get_job_applicants` is a
+security-definer function scoped to the caller's own jobs, mirroring
+`can_manage_company_content`/`is_external_job_poster`'s "helper enforces
+the real check server-side" reasoning.
+
+```sql
+create table if not exists public.job_applications (
+  id uuid primary key default gen_random_uuid(),
+  job_id uuid not null references public.job_posts(id) on delete cascade,
+  applicant_id uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  unique (job_id, applicant_id)
+);
+
+alter table public.job_applications enable row level security;
+
+drop policy if exists "applicants manage own application" on public.job_applications;
+create policy "applicants manage own application" on public.job_applications
+  for all using (auth.uid() = applicant_id)
+  with check (
+    auth.uid() = applicant_id
+    and exists (select 1 from public.job_posts jp where jp.id = job_id and jp.status = 'open')
+  );
+
+drop policy if exists "posters view applications to own jobs" on public.job_applications;
+create policy "posters view applications to own jobs" on public.job_applications
+  for select using (
+    exists (select 1 from public.job_posts jp where jp.id = job_id and jp.created_by = auth.uid())
+  );
+
+-- security-definer: returns each applicant's profile snapshot for one job,
+-- restricted to that job's creator -- profiles RLS otherwise only allows
+-- reading your own row, so a poster can't see applicant rows directly.
+create or replace function public.get_job_applicants(p_job_id uuid)
+returns table (
+  applicant_id uuid,
+  full_name text,
+  email text,
+  resume_url text,
+  social_links jsonb,
+  current_status text,
+  designation_name text,
+  designation_seniority public.seniority_level,
+  skills text[],
+  applied_at timestamptz
+)
+language sql
+security definer
+set search_path = public
+stable
+as $body$
+  select
+    p.id, p.full_name, p.email, p.resume_url, p.social_links, p.current_status,
+    br.name, p.designation_seniority,
+    coalesce(array_agg(distinct s.name) filter (where s.name is not null), '{}'),
+    ja.created_at
+  from public.job_applications ja
+  join public.profiles p on p.id = ja.applicant_id
+  left join public.base_roles br on br.id = p.designation_id
+  left join public.user_skills us on us.user_id = p.id
+  left join public.skills s on s.id = us.skill_id
+  where ja.job_id = p_job_id
+    and exists (select 1 from public.job_posts jp where jp.id = p_job_id and jp.created_by = auth.uid())
+  group by p.id, p.full_name, p.email, p.resume_url, p.social_links, p.current_status, br.name, p.designation_seniority, ja.created_at;
+$body$;
+
+notify pgrst, 'reload schema';
+```
+
+No seed rows needed in `nav_access` for the poster-facing Applies view —
+it's nested inside the already-gated `/add-job-post` page, and the RLS/RPC
+`created_by = auth.uid()` check is what actually restricts visibility to
+the job's own poster, not a separate nav item. The signed-in Jobs feed
+that applicants use to apply is a new page (`/jobs`) with its own
+`nav_access` item — see "Sidebar — Jobs" below.
+
+---
+
+## Saved jobs (`saved_jobs`) — "Saved For Later" tab on `/jobs`
+
+Lets a signed-in candidate bookmark an open job post to revisit later,
+without applying. Same shape and RLS style as `job_applications` above,
+minus the poster-facing view policy — saving is private to the candidate,
+the poster has no need to see who saved their job.
+
+```sql
+create table if not exists public.saved_jobs (
+  id uuid primary key default gen_random_uuid(),
+  job_id uuid not null references public.job_posts(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  unique (job_id, user_id)
+);
+
+alter table public.saved_jobs enable row level security;
+
+drop policy if exists "users manage own saved jobs" on public.saved_jobs;
+create policy "users manage own saved jobs" on public.saved_jobs
+  for all using (auth.uid() = user_id)
+  with check (
+    auth.uid() = user_id
+    and exists (select 1 from public.job_posts jp where jp.id = job_id and jp.status = 'open')
+  );
+
+notify pgrst, 'reload schema';
+```
 
 ---
 

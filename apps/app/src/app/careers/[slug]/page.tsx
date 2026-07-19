@@ -46,6 +46,7 @@ export default async function JobPostPage({
         description={post.description}
         location={post.location}
         employmentType={post.employment_type}
+        workMode={post.work_mode}
         experienceLevel={post.experience_level}
         salaryMin={post.salary_min}
         salaryMax={post.salary_max}

@@ -27,6 +27,7 @@ interface AuthContextValue {
   lookingFor: LookingFor[];
   educationStatus: EducationStatus | null;
   experienceYears: number | null;
+  experienceMonths: number | null;
   passingYear: number | null;
   resumeUrl: string | null;
   socialLinks: SocialLinks;
@@ -72,6 +73,7 @@ const AuthContext = createContext<AuthContextValue>({
   lookingFor: [],
   educationStatus: null,
   experienceYears: null,
+  experienceMonths: null,
   passingYear: null,
   resumeUrl: null,
   socialLinks: {},
@@ -113,6 +115,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
   const [lookingFor, setLookingFor] = useState<LookingFor[]>([]);
   const [educationStatus, setEducationStatus] = useState<EducationStatus | null>(null);
   const [experienceYears, setExperienceYears] = useState<number | null>(null);
+  const [experienceMonths, setExperienceMonths] = useState<number | null>(null);
   const [passingYear, setPassingYear] = useState<number | null>(null);
   const [resumeUrl, setResumeUrl] = useState<string | null>(null);
   const [socialLinks, setSocialLinks] = useState<SocialLinks>({});
@@ -152,6 +155,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
             setLookingFor([]);
             setEducationStatus(null);
             setExperienceYears(null);
+            setExperienceMonths(null);
             setPassingYear(null);
             setResumeUrl(null);
             setSocialLinks({});
@@ -174,6 +178,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
           setLookingFor((profile?.looking_for as LookingFor[]) ?? []);
           setEducationStatus((profile?.education_status as EducationStatus) ?? null);
           setExperienceYears(profile?.experience_years ?? null);
+          setExperienceMonths(profile?.experience_months ?? null);
           setPassingYear(profile?.passing_year ?? null);
           setResumeUrl(profile?.resume_url ?? null);
           setSocialLinks((profile?.social_links as SocialLinks) ?? {});
@@ -194,6 +199,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
         setLookingFor([]);
         setEducationStatus(null);
         setExperienceYears(null);
+        setExperienceMonths(null);
         setPassingYear(null);
         setResumeUrl(null);
         setSocialLinks({});
@@ -252,6 +258,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
     setLookingFor((profile.looking_for as LookingFor[]) ?? []);
     setEducationStatus((profile.education_status as EducationStatus) ?? null);
     setExperienceYears(profile.experience_years ?? null);
+    setExperienceMonths(profile.experience_months ?? null);
     setPassingYear(profile.passing_year ?? null);
     setResumeUrl(profile.resume_url ?? null);
     setSocialLinks((profile.social_links as SocialLinks) ?? {});
@@ -313,6 +320,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
     lookingFor,
     educationStatus,
     experienceYears,
+    experienceMonths,
     passingYear,
     resumeUrl,
     socialLinks,

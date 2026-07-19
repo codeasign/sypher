@@ -5,8 +5,14 @@ import DashboardLayout from '@/components/DashboardLayout';
 import RequireNavAccess from '@/components/RequireNavAccess';
 import { useAuth } from '@/contexts/AuthContext';
 import { uploadToBunny } from '@/data/bunnyUpload';
-import { getCompanyBranding, upsertCompanyBranding } from '@/data/companyBranding';
+import { getCompanyBranding, upsertCompanyBranding, listCompanyBrandings } from '@/data/companyBranding';
+import { fetchLocations } from '@/data/locations';
 import styles from './add-company-branding.module.css';
+
+interface LocationsCatalog {
+  states: { id: string; name: string; slug: string; locationIds: string[] }[];
+  locations: { id: string; name: string; slug: string; stateId: string }[];
+}
 
 const BUNNY_CONFIG = {
   bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
@@ -24,7 +30,7 @@ const EMPLOYEE_RANGES = [
 ];
 
 function AddCompanyBrandingContent(): React.JSX.Element {
-  const { supabase, companyName, role } = useAuth();
+  const { supabase, companyName, role, user } = useAuth();
   const isExternalPoster = role === 'external_job_poster';
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -34,6 +40,7 @@ function AddCompanyBrandingContent(): React.JSX.Element {
 
   const [lookupCompanyName, setLookupCompanyName] = useState('');
   const [activeCompanyName, setActiveCompanyName] = useState<string | null>(null);
+  const [brandings, setBrandings] = useState<Array<{ company_name: string; display_name: string | null; logo_url: string | null }>>([]);
 
   const [displayName, setDisplayName] = useState('');
   const [logoUrl, setLogoUrl] = useState<string | null>(null);
@@ -42,6 +49,8 @@ function AddCompanyBrandingContent(): React.JSX.Element {
   const [linkedinUrl, setLinkedinUrl] = useState('');
   const [employeeRange, setEmployeeRange] = useState('');
   const [locations, setLocations] = useState<string[]>([]);
+  const [locationsCatalog, setLocationsCatalog] = useState<LocationsCatalog | null>(null);
+  const [locationStateId, setLocationStateId] = useState('');
   const [locationInput, setLocationInput] = useState('');
 
   const logoInputRef = useRef<HTMLInputElement>(null);
@@ -54,11 +63,18 @@ function AddCompanyBrandingContent(): React.JSX.Element {
     setLinkedinUrl('');
     setEmployeeRange('');
     setLocations([]);
+    setLocationStateId('');
+    setLocationInput('');
   }
+
+  useEffect(() => {
+    fetchLocations().then((data) => setLocationsCatalog(data as LocationsCatalog));
+  }, []);
 
   useEffect(() => {
     if (isExternalPoster) {
       setLoading(false);
+      if (supabase && user?.id) listCompanyBrandings(supabase, user.id).then(setBrandings);
       return;
     }
     let active = true;
@@ -88,10 +104,10 @@ function AddCompanyBrandingContent(): React.JSX.Element {
     return () => {
       active = false;
     };
-  }, [supabase, companyName, isExternalPoster]);
+  }, [supabase, companyName, isExternalPoster, user?.id]);
 
-  async function handleLookup(): Promise<void> {
-    const name = lookupCompanyName.trim();
+  async function handleLookup(nameOverride?: string): Promise<void> {
+    const name = (nameOverride ?? lookupCompanyName).trim();
     if (!name || !supabase) return;
     setLoading(true);
     setError(null);
@@ -135,13 +151,20 @@ function AddCompanyBrandingContent(): React.JSX.Element {
     }
   }
 
+  const locationsForState = (locationsCatalog?.locations ?? []).filter((l) => l.stateId === locationStateId);
+
+  function handleLocationStateChange(stateId: string): void {
+    setLocationStateId(stateId);
+    setLocationInput('');
+  }
+
   function addLocation(): void {
-    const value = locationInput.trim();
-    if (!value || locations.includes(value)) {
+    const location = (locationsCatalog?.locations ?? []).find((l) => l.id === locationInput);
+    if (!location || locations.includes(location.name)) {
       setLocationInput('');
       return;
     }
-    setLocations((prev) => [...prev, value]);
+    setLocations((prev) => [...prev, location.name]);
     setLocationInput('');
   }
 
@@ -149,33 +172,34 @@ function AddCompanyBrandingContent(): React.JSX.Element {
     setLocations((prev) => prev.filter((loc) => loc !== value));
   }
 
-  function handleLocationKeyDown(event: React.KeyboardEvent<HTMLInputElement>): void {
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      addLocation();
-    }
-  }
-
   async function handleSave(): Promise<void> {
     if (!supabase || !activeCompanyName) return;
     setSaving(true);
     setError(null);
     setSaved(false);
-    const { error: saveError } = await upsertCompanyBranding(supabase, activeCompanyName, {
-      display_name: displayName.trim() || null,
-      logo_url: logoUrl,
-      tagline: tagline.trim() || null,
-      about: about.trim() || null,
-      linkedin_url: linkedinUrl.trim() || null,
-      employee_range: employeeRange || null,
-      locations,
-    });
+    const { error: saveError } = await upsertCompanyBranding(
+      supabase,
+      activeCompanyName,
+      {
+        display_name: displayName.trim() || null,
+        logo_url: logoUrl,
+        tagline: tagline.trim() || null,
+        about: about.trim() || null,
+        linkedin_url: linkedinUrl.trim() || null,
+        employee_range: employeeRange || null,
+        locations,
+      },
+      isExternalPoster ? user?.id : undefined
+    );
     setSaving(false);
     if (saveError) {
       setError(saveError);
       return;
     }
     setSaved(true);
+    if (isExternalPoster && user?.id) {
+      listCompanyBrandings(supabase, user.id).then(setBrandings);
+    }
   }
 
   if (loading) {
@@ -220,12 +244,37 @@ function AddCompanyBrandingContent(): React.JSX.Element {
           <button
             type="button"
             className={styles.saveBtn}
-            onClick={handleLookup}
+            onClick={() => handleLookup()}
             disabled={!lookupCompanyName.trim()}
           >
             Load / Create
           </button>
         </div>
+
+        {brandings.length > 0 && (
+          <div className={styles.card}>
+            <span className={styles.fieldLabel}>Existing company brandings</span>
+            <div className={styles.brandingList}>
+              {brandings.map((b) => (
+                <div key={b.company_name} className={styles.brandingListRow}>
+                  {b.logo_url ? (
+                    <img src={b.logo_url} alt="" className={styles.brandingListLogo} />
+                  ) : (
+                    <div className={styles.brandingListLogoPlaceholder} />
+                  )}
+                  <span className={styles.brandingListName}>{b.display_name || b.company_name}</span>
+                  <button
+                    type="button"
+                    className={styles.brandingListEditBtn}
+                    onClick={() => handleLookup(b.company_name)}
+                  >
+                    Edit
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -359,17 +408,34 @@ function AddCompanyBrandingContent(): React.JSX.Element {
               Locations
             </label>
             <div className={styles.locationInputRow}>
-              <input
+              <select
+                className={styles.select}
+                value={locationStateId}
+                onChange={(e) => handleLocationStateChange(e.target.value)}
+                disabled={saving}
+              >
+                <option value="">Select a state</option>
+                {(locationsCatalog?.states ?? []).map((state) => (
+                  <option key={state.id} value={state.id}>
+                    {state.name}
+                  </option>
+                ))}
+              </select>
+              <select
                 id="branding-location-input"
-                type="text"
-                className={styles.input}
+                className={styles.select}
                 value={locationInput}
                 onChange={(e) => setLocationInput(e.target.value)}
-                onKeyDown={handleLocationKeyDown}
-                placeholder="e.g. Bengaluru"
-                disabled={saving}
-              />
-              <button type="button" className={styles.addLocationBtn} onClick={addLocation} disabled={saving}>
+                disabled={saving || !locationStateId}
+              >
+                <option value="">Select a location</option>
+                {locationsForState.map((location) => (
+                  <option key={location.id} value={location.id}>
+                    {location.name}
+                  </option>
+                ))}
+              </select>
+              <button type="button" className={styles.addLocationBtn} onClick={addLocation} disabled={saving || !locationInput}>
                 Add
               </button>
             </div>

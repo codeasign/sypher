@@ -23,13 +23,32 @@ export const metadata: Metadata = {
     "Sypher is a hands-on learning platform for AI engineering, system design, Python, and software engineering. Text-first lessons with real projects.",
 };
 
+// Runs before paint (blocking <head> script) to set data-theme from the
+// stored preference, same flash-of-wrong-theme fix Docusaurus ships --
+// without this, the page would paint in light mode and then flip.
+const SET_THEME_SCRIPT = `
+(function() {
+  try {
+    var mode = localStorage.getItem('sypher-color-mode');
+    if (mode === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+  } catch (e) {}
+})();
+`;
+
 export default function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`}>
+    <html
+      lang="en"
+      className={`${geistSans.variable} ${geistMono.variable}`}
+      suppressHydrationWarning
+    >
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: SET_THEME_SCRIPT }} />
+      </head>
       <body>
         <AuthProvider>
           <Navbar />

@@ -1,4 +1,5 @@
 import React from 'react';
+import { WORK_MODE_LABEL } from '@/types/workMode';
 import styles from './styles.module.css';
 
 const EMPLOYMENT_TYPE_LABEL: Record<string, string> = {
@@ -6,6 +7,7 @@ const EMPLOYMENT_TYPE_LABEL: Record<string, string> = {
   part_time: 'Part-time',
   contract: 'Contract',
   internship: 'Internship',
+  freelance: 'Freelance',
 };
 
 interface JobPostArticleProps {
@@ -14,6 +16,7 @@ interface JobPostArticleProps {
   description: string;
   location: string | null;
   employmentType: string | null;
+  workMode: string | null;
   experienceLevel: string | null;
   salaryMin: number | null;
   salaryMax: number | null;
@@ -34,6 +37,7 @@ export default function JobPostArticle({
   description,
   location,
   employmentType,
+  workMode,
   experienceLevel,
   salaryMin,
   salaryMax,
@@ -50,6 +54,9 @@ export default function JobPostArticle({
         {location && <span className={styles.metaBadge}>{location}</span>}
         {employmentType && (
           <span className={styles.metaBadge}>{EMPLOYMENT_TYPE_LABEL[employmentType] ?? employmentType}</span>
+        )}
+        {workMode && (
+          <span className={styles.metaBadge}>{WORK_MODE_LABEL[workMode] ?? workMode}</span>
         )}
         {experienceLevel && <span className={styles.metaBadge}>{experienceLevel}</span>}
         {salary && <span className={styles.metaBadge}>{salary}</span>}

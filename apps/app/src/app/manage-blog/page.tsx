@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useState } from 'react';
+import useSWR, { useSWRConfig } from 'swr';
 import DashboardLayout from '@/components/DashboardLayout';
 import RequireNavAccess from '@/components/RequireNavAccess';
 import ConfirmDialog from '@/components/ConfirmDialog';
@@ -66,31 +67,30 @@ function PlusIcon(): React.JSX.Element {
   );
 }
 
+const MANAGE_BLOG_POSTS_KEY = 'manageBlogPosts';
+
 function ManageBlogContent(): React.JSX.Element {
   const { supabase } = useAuth();
-  const [posts, setPosts] = useState<BlogPostSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { mutate } = useSWRConfig();
   const [pendingDelete, setPendingDelete] = useState<BlogPostSummary | null>(null);
   const [mode, setMode] = useState<'list' | 'new' | 'edit'>('list');
   const [editingPost, setEditingPost] = useState<BlogPostFull | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
-  const fetchPosts = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    if (!supabase) {
-      setError('Auth is not configured. Check Supabase environment variables.');
-      setLoading(false);
-      return;
-    }
-    const data = await listBlogPosts(supabase);
-    setPosts(data);
-    setLoading(false);
-  }, [supabase]);
-
-  useEffect(() => {
-    fetchPosts();
-  }, [fetchPosts]);
+  const swrKey = supabase ? MANAGE_BLOG_POSTS_KEY : null;
+  const {
+    data: posts = [],
+    isLoading: loading,
+    error: swrError,
+    mutate: refetch,
+  } = useSWR<BlogPostSummary[]>(swrKey, () => listBlogPosts(supabase));
+  const error =
+    actionError ??
+    (!supabase
+      ? 'Auth is not configured. Check Supabase environment variables.'
+      : swrError
+      ? 'Failed to load blog posts.'
+      : null);
 
   async function openEdit(summary: BlogPostSummary): Promise<void> {
     const full = await getBlogPostById(supabase, summary.id);
@@ -111,7 +111,7 @@ function ManageBlogContent(): React.JSX.Element {
   }
 
   async function handleSaved(): Promise<void> {
-    await fetchPosts();
+    await mutate(MANAGE_BLOG_POSTS_KEY);
     backToList();
   }
 
@@ -119,12 +119,13 @@ function ManageBlogContent(): React.JSX.Element {
     if (!pendingDelete) return;
     const target = pendingDelete;
     setPendingDelete(null);
+    setActionError(null);
     const { error: deleteError } = await deleteBlogPost(supabase, target.id);
     if (deleteError) {
-      setError(deleteError);
+      setActionError(deleteError);
       return;
     }
-    setPosts((prev) => prev.filter((p) => p.id !== target.id));
+    mutate(MANAGE_BLOG_POSTS_KEY, posts.filter((p) => p.id !== target.id), false);
   }
 
   if (mode !== 'list') {
@@ -156,7 +157,7 @@ function ManageBlogContent(): React.JSX.Element {
       <div className={styles.container}>
         <div className={styles.errorState}>
           <p className={styles.errorText}>{error}</p>
-          <button type="button" className={styles.retryBtn} onClick={fetchPosts}>
+          <button type="button" className={styles.retryBtn} onClick={() => { setActionError(null); refetch(); }}>
             Retry
           </button>
         </div>

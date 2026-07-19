@@ -38,6 +38,7 @@ interface NavSection {
 }
 
 const ICONS_BY_KEY: Record<string, (props: { className?: string }) => React.JSX.Element> = {
+  'jobs': JobsIcon,
   'careers': CareersIcon,
   'resume-review': ResumeIcon,
   'mock-interview': InterviewIcon,
@@ -50,10 +51,13 @@ const ICONS_BY_KEY: Record<string, (props: { className?: string }) => React.JSX.
   'add-company-branding': BrandingIcon,
 };
 
-const NAV_ITEMS: NavItem[] = [
-  { href: '/dashboard', label: 'Dashboard', icon: DashboardIcon },
-  { href: '/bookmarks', label: 'Bookmarks', icon: BookmarkIcon },
-];
+const OVERVIEW_SECTION: NavSection = {
+  title: 'Overview',
+  items: [
+    { href: '/dashboard', label: 'Dashboard', icon: DashboardIcon },
+    { href: '/bookmarks', label: 'Bookmarks', icon: BookmarkIcon },
+  ],
+};
 
 const SECTIONS: NavSection[] = NAV_SECTIONS.map((section) => ({
   title: section.title,
@@ -113,7 +117,7 @@ export default function DashboardSidebar({
     fetchCompanyNavAccessRows(supabase, companyName).then(setCompanyAllowedItemKeys);
   }, [supabase, role, companyName]);
 
-  const visibleSections: NavSection[] =
+  const accessGatedSections: NavSection[] =
     role === 'admin'
       ? SECTIONS
       : navAccessLoading
@@ -127,6 +131,8 @@ export default function DashboardSidebar({
             }),
           ),
         })).filter((section) => section.items.length > 0);
+
+  const visibleSections: NavSection[] = [OVERVIEW_SECTION, ...accessGatedSections];
 
   function isActive(href: string): boolean {
     return pathname === href || pathname.startsWith(`${href}/`);
@@ -199,8 +205,6 @@ export default function DashboardSidebar({
       </div>
 
       <nav className={styles.nav}>
-        {NAV_ITEMS.map(renderNavItem)}
-        <div className={styles.sectionDivider} />
         {visibleSections.map(renderSection)}
       </nav>
 
@@ -259,6 +263,27 @@ function BookmarkIcon({ className }: { className?: string }): React.JSX.Element 
       aria-hidden="true"
     >
       <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+    </svg>
+  );
+}
+
+function JobsIcon({ className }: { className?: string }): React.JSX.Element {
+  return (
+    <svg
+      className={className}
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="2" y="7" width="20" height="14" rx="2" ry="2" />
+      <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16" />
+      <line x1="2" y1="13" x2="22" y2="13" />
     </svg>
   );
 }

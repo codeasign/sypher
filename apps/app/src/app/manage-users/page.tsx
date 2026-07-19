@@ -385,7 +385,7 @@ function ManageUsersContent(): React.JSX.Element {
 
       {/* ── Controls ── */}
       <div className={styles.controls}>
-        <div style={{ position: 'relative', flex: 1, minWidth: 200 }}>
+        <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
           <div
             style={{
               position: 'absolute',
@@ -404,7 +404,7 @@ function ManageUsersContent(): React.JSX.Element {
             placeholder="Search by name or email..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            style={{ paddingLeft: '2rem' }}
+            style={{ paddingLeft: '2rem', width: '50%' }}
           />
         </div>
         <select

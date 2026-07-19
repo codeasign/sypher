@@ -1,5 +1,11 @@
 export const NAV_SECTIONS = [
   {
+    title: 'Jobs',
+    items: [
+      { key: 'jobs', href: '/jobs', label: 'Jobs' },
+    ],
+  },
+  {
     title: 'Career Tools',
     items: [
       { key: 'careers', href: '/careers', label: 'Careers' },
