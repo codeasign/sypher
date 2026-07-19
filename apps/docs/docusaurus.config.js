@@ -14,6 +14,7 @@ const config = {
   plugins: [
     './plugins/course-sections',
     './plugins/blog-routes',
+    './plugins/course-chunk-isolation',
   ],
 
   future: {
@@ -79,6 +80,7 @@ const config = {
         { type: 'custom-exploreCourses', position: 'left' },
         // === /TOPICS ===
         { to: '/blog', label: 'Blog', position: 'left' },
+        { to: '/careers', label: 'Careers', position: 'left' },
         { to: '/corporate-training', label: 'Corporate Training', position: 'left' },
         { to: '/resume-review', label: 'Resume Review', position: 'left' },
         { to: '/mock-interview', label: 'Mock Interview', position: 'left' },

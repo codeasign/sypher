@@ -18,6 +18,7 @@ import {
 import { ROLES, GLOBALLY_CONFIGURABLE_ROLES } from '@/types/roles';
 import type { Role } from '@/types/roles';
 import TaxonomyTab from '@/components/TaxonomyTab';
+import LocationsTab from '@/components/LocationsTab';
 import ResumeMockCreditsTab from '@/components/ResumeMockCreditsTab';
 import styles from './manage-access.module.css';
 
@@ -25,6 +26,7 @@ import styles from './manage-access.module.css';
 
 interface Course {
   slug: string;
+  docsSlug: string;
   icon: string;
   title: string;
   tag: string;
@@ -229,7 +231,7 @@ function CompanyAccessModal({
 /* ── Courses tab ── */
 
 const COURSE_ITEMS: AccessModalItem[] = (courses as Course[]).map((course) => ({
-  key: course.slug,
+  key: course.docsSlug,
   label: course.title,
   sublabel: course.tag,
 }));
@@ -548,7 +550,7 @@ function CompaniesTab(): React.JSX.Element {
         className={styles.searchInput}
         value={companyName}
         onChange={(e) => setCompanyName(e.target.value)}
-        placeholder="Acme Inc."
+        placeholder="Company Name"
         list="companies-tab-name-options"
       />
       <datalist id="companies-tab-name-options">
@@ -617,7 +619,9 @@ function CompaniesTab(): React.JSX.Element {
 /* ── Content component ── */
 
 function ManageAccessContent(): React.JSX.Element {
-  const [activeTab, setActiveTab] = useState<'courses' | 'nav' | 'companies' | 'taxonomy' | 'resumeMock'>('courses');
+  const [activeTab, setActiveTab] = useState<
+    'courses' | 'nav' | 'companies' | 'taxonomy' | 'locations' | 'resumeMock'
+  >('courses');
 
   return (
     <div className={styles.container}>
@@ -659,6 +663,13 @@ function ManageAccessContent(): React.JSX.Element {
         </button>
         <button
           type="button"
+          className={activeTab === 'locations' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
+          onClick={() => setActiveTab('locations')}
+        >
+          Locations
+        </button>
+        <button
+          type="button"
           className={activeTab === 'resumeMock' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
           onClick={() => setActiveTab('resumeMock')}
         >
@@ -674,6 +685,8 @@ function ManageAccessContent(): React.JSX.Element {
         <CompaniesTab />
       ) : activeTab === 'taxonomy' ? (
         <TaxonomyTab />
+      ) : activeTab === 'locations' ? (
+        <LocationsTab />
       ) : (
         <ResumeMockCreditsTab />
       )}

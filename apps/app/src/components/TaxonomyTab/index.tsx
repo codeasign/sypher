@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
-import { fetchTaxonomy, saveTaxonomyCategory } from '@/data/taxonomy';
+import { fetchTaxonomy, invalidateTaxonomyCache, saveTaxonomyCategory } from '@/data/taxonomy';
 import { SENIORITY_PREFIXES } from '@/types/seniority';
 import type { SeniorityLevel } from '@/types/seniority';
 import manageAccessStyles from '@/app/manage-access/manage-access.module.css';
@@ -153,6 +153,7 @@ export default function TaxonomyTab(): React.JSX.Element {
   const [designationsInput, setDesignationsInput] = useState('');
   const [itemsInput, setItemsInput] = useState('');
 
+  const [forceSkillClassification, setForceSkillClassification] = useState(false);
   const [classificationOverrides, setClassificationOverrides] = useState<Record<string, 'skill' | 'technology'>>({});
   const [categorySelections, setCategorySelections] = useState<Record<string, string>>({});
   const [newCategoryNames, setNewCategoryNames] = useState<Record<string, string>>({});
@@ -161,11 +162,11 @@ export default function TaxonomyTab(): React.JSX.Element {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
 
-  const fetchCatalog = useCallback(async () => {
+  const fetchCatalog = useCallback(async (forceRefresh = false) => {
     setLoading(true);
     setError(null);
     try {
-      const data = await fetchTaxonomy(apiBaseUrl);
+      const data = await fetchTaxonomy(apiBaseUrl, { forceRefresh });
       setCatalog(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load taxonomy');
@@ -213,7 +214,7 @@ export default function TaxonomyTab(): React.JSX.Element {
         existingId = existingTech.id;
         existingCategoryId = existingTech.categoryId;
       } else {
-        kind = classificationOverrides[slug] ?? guessKind(line);
+        kind = classificationOverrides[slug] ?? (forceSkillClassification ? 'skill' : guessKind(line));
       }
 
       const linkedDomainNames = existingId
@@ -233,7 +234,7 @@ export default function TaxonomyTab(): React.JSX.Element {
       });
     }
     return rows;
-  }, [itemsInput, catalog, classificationOverrides]);
+  }, [itemsInput, catalog, classificationOverrides, forceSkillClassification]);
 
   function toggleClassification(slug: string, current: 'skill' | 'technology'): void {
     setClassificationOverrides((prev) => ({ ...prev, [slug]: current === 'skill' ? 'technology' : 'skill' }));
@@ -251,6 +252,7 @@ export default function TaxonomyTab(): React.JSX.Element {
     setCategoryNameInput('');
     setDesignationsInput('');
     setItemsInput('');
+    setForceSkillClassification(false);
     setClassificationOverrides({});
     setCategorySelections({});
     setNewCategoryNames({});
@@ -322,7 +324,8 @@ export default function TaxonomyTab(): React.JSX.Element {
       return;
     }
     setSaveSuccess(true);
-    await fetchCatalog();
+    invalidateTaxonomyCache();
+    await fetchCatalog(true);
     resetForm();
     setMode('list');
   }
@@ -340,7 +343,7 @@ export default function TaxonomyTab(): React.JSX.Element {
     return (
       <div className={manageAccessStyles.errorState}>
         <p className={manageAccessStyles.errorText}>{error ?? 'Failed to load taxonomy'}</p>
-        <button type="button" className={manageAccessStyles.retryBtn} onClick={fetchCatalog}>
+        <button type="button" className={manageAccessStyles.retryBtn} onClick={() => fetchCatalog(true)}>
           Retry
         </button>
       </div>
@@ -388,6 +391,19 @@ export default function TaxonomyTab(): React.JSX.Element {
       >
         ← Back to categories
       </button>
+
+      <div className={styles.saveBar}>
+        <button
+          type="button"
+          className={manageAccessStyles.retryBtn}
+          disabled={saving || !categoryNameInput.trim()}
+          onClick={handleConfirmSave}
+        >
+          {saving ? 'Saving…' : editingDomainId ? 'Confirm & Save Changes' : 'Confirm & Save'}
+        </button>
+        {saveError && <p className={manageAccessStyles.errorText}>{saveError}</p>}
+        {saveSuccess && !saveError && <p className={styles.successMessage}>Saved.</p>}
+      </div>
 
       <div className={manageAccessStyles.fieldLabel}>
         <label htmlFor="taxonomy-category-name">Category name</label>
@@ -446,6 +462,14 @@ export default function TaxonomyTab(): React.JSX.Element {
         <div className={styles.column}>
           <label className={manageAccessStyles.fieldLabel} htmlFor="taxonomy-items">
             Skills / technologies (one per line)
+          </label>
+          <label className={styles.checkboxRow}>
+            <input
+              type="checkbox"
+              checked={forceSkillClassification}
+              onChange={(e) => setForceSkillClassification(e.target.checked)}
+            />
+            Mark new items above as Skills (unchecked: auto-detect skill vs technology)
           </label>
           <textarea
             id="taxonomy-items"
@@ -521,19 +545,6 @@ export default function TaxonomyTab(): React.JSX.Element {
             </div>
           )}
         </div>
-      </div>
-
-      <div className={styles.saveBar}>
-        <button
-          type="button"
-          className={manageAccessStyles.retryBtn}
-          disabled={saving || !categoryNameInput.trim()}
-          onClick={handleConfirmSave}
-        >
-          {saving ? 'Saving…' : editingDomainId ? 'Confirm & Save Changes' : 'Confirm & Save'}
-        </button>
-        {saveError && <p className={manageAccessStyles.errorText}>{saveError}</p>}
-        {saveSuccess && !saveError && <p className={styles.successMessage}>Saved.</p>}
       </div>
     </div>
   );

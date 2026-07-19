@@ -37,8 +37,8 @@ Tables:
 | `user_skills`, `user_technologies` | Per-user picks (FK into `skills`/`technologies`) with proficiency + years — live, never cached | `src/data/userTaxonomy.js`, `/profile` |
 
 Roles (`public.user_role` enum): `admin`, `free_users`, `paid_users`,
-`internal_hr`, `company_hr`, `company_employees`, `branders`. New signups
-default to `free_users`.
+`internal_hr`, `company_hr`, `company_employees`, `branders`,
+`external_job_poster`. New signups default to `free_users`.
 
 `profiles.confirmed_at` is set the first time an invited corporate user
 actually signs in (magic link click), not when the invite is sent — it
@@ -134,7 +134,7 @@ drop type if exists public.looking_for_type;
 
 create type public.user_role as enum (
   'admin', 'free_users', 'paid_users', 'internal_hr',
-  'company_hr', 'company_employees', 'branders'
+  'company_hr', 'company_employees', 'branders', 'external_job_poster'
 );
 
 create type public.signup_source as enum ('google', 'email');
@@ -463,6 +463,95 @@ access to a course.
 `nav_access` follows the same rule — a missing row means `allowed_roles =
 []`, so nobody but the hardcoded admin bypass sees the item until an admin
 explicitly grants it on `/manage-access`.
+
+### Fixing the `ai-engineering-crash-course` / `ai-engineering-hands-on` mismatch
+
+Before this fix, `packages/course-catalog/src/courses.js`'s catalog `slug`
+for this course (`ai-engineering-crash-course`) didn't match its real
+Docusaurus docs folder (`ai-engineering-hands-on`) — so any access grant
+made from `/manage-access` for this course upserted a `course_access` row
+under the wrong key, one `DocRoot`'s guard (and `check_course_access`) never
+actually reads. The catalog now has a `docsSlug` field that corrects this,
+and `/manage-access`'s Courses tab keys off it — so **no raw SQL is
+required**: an admin just needs to open `/manage-access` → Courses tab and
+re-toggle this course's role checkboxes once (even unchecking then
+rechecking the same box works), which re-upserts the row under the correct
+`ai-engineering-hands-on` key. The old row keyed under
+`ai-engineering-crash-course` is simply orphaned afterward (nothing reads
+it) — safe to leave, or delete explicitly:
+
+```sql
+delete from public.course_access where course_slug = 'ai-engineering-crash-course';
+```
+
+---
+
+## Server-side course access check (`check_course_access`)
+
+`hasCourseAccess()` (`src/data/courseAccess.js`, now shared from
+`@sypher/course-catalog/src/courseAccess`) is a pure client-side function —
+until now the only place it was ever called was `apps/docs`'s `DocRoot`
+guard, a `useEffect` that runs *after* the page and its content chunk have
+already downloaded. That's enforceable in the browser but not against a
+direct HTTP request (curl, a disabled-JS client, or a request straight at
+the compiled chunk file). `check_course_access` is a `security definer` RPC
+that runs the exact same access logic server-side, in one round trip, under
+`auth.uid()` — used by `apps/docs/middleware.ts` (Vercel Edge Middleware) to
+gate both premium doc pages and their isolated content chunks before any
+bytes are served. Safe to call from anon/authenticated: it only returns a
+boolean, never row data, and a course with no `course_access` row at all
+resolves to "admin only" — same default-locked-down behavior described
+above, so a brand-new course is safe the moment its docs folder exists,
+before an admin has granted anyone access to it.
+
+```sql
+create or replace function public.check_course_access(p_course_slug text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_role public.user_role;
+  v_company text;
+  v_allowed_roles public.user_role[];
+begin
+  if auth.uid() is null then
+    return false;
+  end if;
+
+  select role, company_name into v_role, v_company
+  from public.profiles where id = auth.uid();
+
+  if v_role = 'admin' then
+    return true;
+  end if;
+
+  select allowed_roles into v_allowed_roles
+  from public.course_access where course_slug = p_course_slug;
+
+  if v_role is null then
+    return coalesce('free_users' = any(v_allowed_roles), false);
+  end if;
+
+  if coalesce(v_role = any(v_allowed_roles), false) then
+    return true;
+  end if;
+
+  if v_role = 'company_employees' and v_company is not null then
+    return exists (
+      select 1 from public.company_course_access
+      where company_name = v_company and course_slug = p_course_slug
+    );
+  end if;
+
+  return false;
+end;
+$$;
+
+revoke execute on function public.check_course_access(text) from public;
+grant execute on function public.check_course_access(text) to anon, authenticated;
+```
 
 ---
 
@@ -1221,7 +1310,13 @@ create policy "admins manage" on public.taxonomy_slugs for all using (public.is_
 -- admin) -> upsert domain by slug -> for each role/skill/technology, look
 -- up its slug in taxonomy_slugs FIRST (global dedupe across kinds — this
 -- is what makes classification sticky) or insert a new catalog row +
--- registry entry -> resolve each technology's category (by id, by name —
+-- registry entry. If the slug is already registered under a DIFFERENT kind
+-- than the caller sent it as (e.g. pasted into the technologies box here,
+-- but it's an existing skill from another category's save), this does not
+-- raise — it links the existing item under its true kind instead. A bulk
+-- paste has no way to know every name's prior classification ahead of
+-- time, so a mismatch is corrected silently rather than failing the whole
+-- save -> resolve each technology's category (by id, by name —
 -- creating it inline if new — or fall back to Uncategorized) -> sync
 -- domain_roles/domain_skills/domain_technologies for this domain to
 -- exactly the given sets (insert new links, delete links no longer
@@ -1287,7 +1382,14 @@ begin
 
     select item_id, kind into v_id, v_kind from public.taxonomy_slugs where slug = v_slug;
     if v_id is not null and v_kind <> 'role' then
-      raise exception 'slug "%" is already registered as a %, cannot register as a role', v_slug, v_kind;
+      if v_kind = 'skill' then
+        update public.skills set name = v_name, updated_at = now() where id = v_id;
+        v_skill_ids := v_skill_ids || v_id;
+      elsif v_kind = 'technology' then
+        update public.technologies set name = v_name, updated_at = now() where id = v_id;
+        v_tech_ids := v_tech_ids || v_id;
+      end if;
+      continue;
     end if;
 
     if v_id is null then
@@ -1317,7 +1419,14 @@ begin
 
     select item_id, kind into v_id, v_kind from public.taxonomy_slugs where slug = v_slug;
     if v_id is not null and v_kind <> 'skill' then
-      raise exception 'slug "%" is already registered as a %, cannot register as a skill', v_slug, v_kind;
+      if v_kind = 'role' then
+        update public.base_roles set name = v_name, updated_at = now() where id = v_id;
+        v_role_ids := v_role_ids || v_id;
+      elsif v_kind = 'technology' then
+        update public.technologies set name = v_name, updated_at = now() where id = v_id;
+        v_tech_ids := v_tech_ids || v_id;
+      end if;
+      continue;
     end if;
 
     if v_id is null then
@@ -1356,7 +1465,14 @@ begin
 
     select item_id, kind into v_id, v_kind from public.taxonomy_slugs where slug = v_slug;
     if v_id is not null and v_kind <> 'technology' then
-      raise exception 'slug "%" is already registered as a %, cannot register as a technology', v_slug, v_kind;
+      if v_kind = 'role' then
+        update public.base_roles set name = v_name, updated_at = now() where id = v_id;
+        v_role_ids := v_role_ids || v_id;
+      elsif v_kind = 'skill' then
+        update public.skills set name = v_name, updated_at = now() where id = v_id;
+        v_skill_ids := v_skill_ids || v_id;
+      end if;
+      continue;
     end if;
 
     if v_id is null then
@@ -2051,6 +2167,444 @@ Expect `get_feature_status`/`consume_feature` → `authenticated` only,
 `grant_credit_lot` → `service_role` only. If `anon` or `public` shows up
 for any of the three, the revoke didn't take — re-run the `revoke`
 statement for that function.
+
+---
+
+## Company HR — job posts & branding (`job_posts`, `company_branding`)
+
+Adds `/add-job-post` and `/add-company-branding` (plus the public `/careers`
++ `/careers/:slug` pages). Both tables are scoped by the free-text
+`profiles.company_name` a `company_hr` account was invited with — an HR user
+can only ever see/edit rows matching their own company. Authoring access
+follows the same `nav_access`-driven convention as `manage-blog-post`
+(admin, plus whichever roles an admin grants `nav_access` for the relevant
+`item_key` on `/manage-access`), so one generic helper —
+`can_manage_company_content(company_name, item_key)` — covers both tables
+instead of a bespoke check per feature. Idempotent, safe to re-run against
+an existing database.
+
+```sql
+create table if not exists public.job_posts (
+  id uuid primary key default gen_random_uuid(),
+  company_name text not null,
+  slug text unique not null,
+  title text not null,
+  description text not null,
+  location text,
+  employment_type text check (employment_type in ('full_time', 'part_time', 'contract', 'internship')),
+  experience_level text,
+  salary_min integer,
+  salary_max integer,
+  apply_url text,
+  apply_email text,
+  status text not null default 'draft' check (status in ('draft', 'open', 'closed')),
+  created_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.job_posts enable row level security;
+
+-- security-definer helper: true if caller is admin, or caller's profile
+-- company_name matches p_company_name AND caller's role is listed in
+-- nav_access.allowed_roles for p_item_key. Shared by job_posts and
+-- company_branding below -- same "reuse nav_access, no bespoke access
+-- table per feature" reasoning as can_manage_blog().
+create or replace function public.can_manage_company_content(p_company_name text, p_item_key text)
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (
+    select 1 from public.profiles p
+    where p.id = auth.uid()
+      and (
+        p.role = 'admin'
+        or (
+          p.company_name = p_company_name
+          and p.role::text = any(
+            select unnest(allowed_roles)::text from public.nav_access
+            where item_key = p_item_key
+          )
+        )
+      )
+  );
+$$;
+
+drop policy if exists "anyone can read open job posts" on public.job_posts;
+create policy "anyone can read open job posts" on public.job_posts
+  for select using (status = 'open');
+
+drop policy if exists "authorized roles manage own company job posts" on public.job_posts;
+create policy "authorized roles manage own company job posts" on public.job_posts
+  for all using (public.can_manage_company_content(company_name, 'add-job-post'))
+  with check (public.can_manage_company_content(company_name, 'add-job-post'));
+
+-- Settings-only for now (logo/tagline/about) -- nothing else reads this
+-- yet, so there's no public-select policy, unlike job_posts.
+create table if not exists public.company_branding (
+  company_name text primary key,
+  logo_url text,
+  tagline text,
+  about text,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.company_branding enable row level security;
+
+drop policy if exists "authorized roles manage own company branding" on public.company_branding;
+create policy "authorized roles manage own company branding" on public.company_branding
+  for all using (public.can_manage_company_content(company_name, 'add-company-branding'))
+  with check (public.can_manage_company_content(company_name, 'add-company-branding'));
+
+notify pgrst, 'reload schema';
+```
+
+No seed rows are needed in `nav_access` -- same rule as every other item:
+a missing row means `allowed_roles = []`, so only the hardcoded admin
+bypass sees `/add-job-post`/`/add-company-branding` until an admin grants
+`company_hr` access to both `item_key`s from `/manage-access`.
+
+---
+
+## Company branding — profile fields (`display_name`, `linkedin_url`, `employee_range`, `locations`)
+
+Extends `company_branding` (above) with company-profile fields alongside
+the existing logo/colors/tagline/about -- same table, same RLS policy,
+no new migration surface. `display_name` is a separate column rather than
+reusing the `company_name` primary key, since `company_name` is the
+free-text value shared with `profiles.company_name` for RLS scoping and
+may not be the friendly name HR wants shown publicly.
+
+```sql
+alter table public.company_branding
+  add column if not exists display_name text,
+  add column if not exists linkedin_url text,
+  add column if not exists employee_range text check (
+    employee_range in ('1-10', '11-50', '51-200', '201-500', '500+')
+  ),
+  add column if not exists locations text[] not null default '{}';
+
+notify pgrst, 'reload schema';
+```
+
+---
+
+## External job posters (`external_job_poster`)
+
+A new role for people who post jobs *on behalf of* a company rather than
+being that company's own HR — e.g. an internal recruiting team handling
+postings for multiple client companies. Unlike `company_hr`, this role has
+no fixed `company_name`: the company is chosen per job post (free-text
+field on the form) and per branding edit, not read from `profiles`. Access
+follows the same `nav_access`-driven convention as everything else — an
+admin still has to grant `external_job_poster` access to `add-job-post`/
+`add-company-branding` from `/manage-access` before the pages are visible.
+
+`is_external_job_poster(p_item_key)` mirrors `can_manage_company_content`'s
+`nav_access` check (minus the `company_name` match, since this role isn't
+scoped to one company) so that grant is actually enforced server-side, not
+just by the client hiding the page — an earlier version of this helper
+took no argument and skipped the `nav_access` check entirely, which meant
+just being assigned the role (before an admin ever granted feature access)
+was enough to write to every company's `company_branding` row directly via
+PostgREST.
+
+Scoping differs from `company_hr` in two ways:
+- `job_posts`: an external poster can only see/edit the rows they
+  personally created (`created_by = auth.uid()`), regardless of which
+  company_name they used — not all posts for a given company, since
+  several external posters could be working across overlapping companies.
+- `company_branding`: an external poster can create/update the branding
+  row for *any* company_name — there's one row per company (primary key),
+  so this is a shared-edit model, same as if they were that company's own
+  `company_hr` for branding purposes only.
+
+```sql
+alter type public.user_role add value if not exists 'external_job_poster';
+
+-- security-definer helper: true if caller's own role is external_job_poster
+-- AND that role is listed in nav_access.allowed_roles for p_item_key --
+-- same nav_access-is-the-real-gate reasoning as can_manage_company_content,
+-- just without the company_name match (this role isn't scoped to one company).
+create or replace function public.is_external_job_poster(p_item_key text)
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (
+    select 1 from public.profiles p
+    where p.id = auth.uid()
+      and p.role = 'external_job_poster'
+      and p.role::text = any(
+        select unnest(allowed_roles)::text from public.nav_access
+        where item_key = p_item_key
+      )
+  );
+$$;
+
+drop function if exists public.is_external_job_poster();
+
+drop policy if exists "external job posters manage own created job posts" on public.job_posts;
+create policy "external job posters manage own created job posts" on public.job_posts
+  for all using (public.is_external_job_poster('add-job-post') and created_by = auth.uid())
+  with check (public.is_external_job_poster('add-job-post') and created_by = auth.uid());
+
+drop policy if exists "external job posters manage any company branding" on public.company_branding;
+create policy "external job posters manage any company branding" on public.company_branding
+  for all using (public.is_external_job_poster('add-company-branding'))
+  with check (public.is_external_job_poster('add-company-branding'));
+
+notify pgrst, 'reload schema';
+```
+
+No seed rows needed in `nav_access` — same rule as every other item: an
+admin grants `external_job_poster` access to `add-job-post` and
+`add-company-branding` from `/manage-access` when ready. Until that grant
+exists, an `external_job_poster` account is denied by RLS even with the
+role assigned, matching `company_hr`'s behavior.
+
+---
+
+## Locations catalog (States & Locations)
+
+Backs the "Locations" tab in Manage Course Access (`/manage-access`),
+mirroring the "Roles & Skills" tab's paste-a-category / paste-its-items UX.
+Simpler than the taxonomy tables on purpose: a location belongs to exactly
+one state, so this is a plain one-to-many (`locations.state_id`), not a
+junction table — no `taxonomy_slugs`-style cross-kind registry needed.
+
+```sql
+create table if not exists public.states (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  slug text not null unique,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.locations (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  slug text not null,
+  state_id uuid not null references public.states(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (state_id, slug)
+);
+
+create table if not exists public.locations_meta (
+  id smallint primary key default 1 check (id = 1),
+  version integer not null default 1,
+  updated_at timestamptz not null default now()
+);
+insert into public.locations_meta (id, version)
+  values (1, 1)
+  on conflict (id) do nothing;
+```
+
+RLS — same `"public read"` / `"admins manage"` pair used by every taxonomy
+table, reusing the existing `public.is_admin()`:
+
+```sql
+alter table public.states enable row level security;
+alter table public.locations enable row level security;
+alter table public.locations_meta enable row level security;
+
+drop policy if exists "public read" on public.states;
+drop policy if exists "admins manage" on public.states;
+create policy "public read" on public.states for select using (true);
+create policy "admins manage" on public.states
+  for all using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists "public read" on public.locations;
+drop policy if exists "admins manage" on public.locations;
+create policy "public read" on public.locations for select using (true);
+create policy "admins manage" on public.locations
+  for all using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists "public read" on public.locations_meta;
+drop policy if exists "admins manage" on public.locations_meta;
+create policy "public read" on public.locations_meta for select using (true);
+create policy "admins manage" on public.locations_meta
+  for all using (public.is_admin()) with check (public.is_admin());
+```
+
+`admin_save_location_state(payload jsonb)` — upserts one state by name,
+upserts/updates each pasted location scoped to `(state_id, slug)`, then
+deletes any location under that state not present in this save (an empty
+`locations` array clears the state), and bumps `locations_meta.version`
+for `/api/locations`'s cache to pick up:
+
+```sql
+create or replace function public.admin_save_location_state(payload jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $function$
+declare
+  v_state_id uuid;
+  v_state_slug text;
+  v_state_name text;
+  v_location jsonb;
+  v_slug text;
+  v_name text;
+  v_id uuid;
+  v_location_ids uuid[] := '{}';
+  v_seen_slugs text[] := '{}';
+begin
+  if not public.is_admin() then
+    raise exception 'not authorized';
+  end if;
+
+  v_state_name := payload->'state'->>'name';
+  if v_state_name is null or trim(v_state_name) = '' then
+    raise exception 'state name is required';
+  end if;
+  v_state_slug := public.slugify(v_state_name);
+
+  select id into v_state_id
+    from public.states
+    where slug = v_state_slug;
+  if v_state_id is null then
+    insert into public.states (name, slug)
+      values (trim(v_state_name), v_state_slug)
+      returning id into v_state_id;
+  else
+    update public.states
+      set name = trim(v_state_name)
+      where id = v_state_id;
+  end if;
+
+  for v_location in
+    select * from jsonb_array_elements(coalesce(payload->'locations', '[]'::jsonb))
+  loop
+    v_name := trim(v_location->>'name');
+    if v_name is null or v_name = '' then
+      continue;
+    end if;
+    v_slug := public.slugify(v_name);
+    if v_slug = any(v_seen_slugs) then
+      continue;
+    end if;
+    v_seen_slugs := v_seen_slugs || v_slug;
+
+    select id into v_id
+      from public.locations
+      where state_id = v_state_id and slug = v_slug;
+
+    if v_id is null then
+      insert into public.locations (name, slug, state_id)
+        values (v_name, v_slug, v_state_id)
+        returning id into v_id;
+    else
+      update public.locations
+        set name = v_name, updated_at = now()
+        where id = v_id;
+    end if;
+
+    v_location_ids := v_location_ids || v_id;
+  end loop;
+
+  delete from public.locations
+    where state_id = v_state_id and id <> all (v_location_ids);
+
+  update public.locations_meta
+    set version = version + 1, updated_at = now()
+    where id = 1;
+
+  return jsonb_build_object(
+    'stateId', v_state_id,
+    'locationIds', v_location_ids
+  );
+end;
+$function$;
+
+revoke all on function public.admin_save_location_state(jsonb) from public, anon;
+grant execute on function public.admin_save_location_state(jsonb) to authenticated;
+
+notify pgrst, 'reload schema';
+```
+
+No seed rows needed — the tab starts empty and admins populate it the same
+way they populate Roles & Skills.
+
+---
+
+## Profile category & location
+
+Backs three fields on `/profile`: **Current Role** (domain→role pick from
+the Roles & Skills catalog), **Current Location** (single pick from the
+Locations catalog), and **Open to Location** (multi-pick from the Locations
+catalog). `category_domain_id`/`category_role_id` are deliberately their
+own columns rather than reusing the Designation card's domain/role — a
+user's Designation role is their skills-profile designation, but Current
+Role (what they're interested in / describe themselves as) shouldn't be
+forced to match it; the two pickers stay independent. All three of
+`category_domain_id`, `category_role_id`, and `current_location_id` live on
+`profiles`, so — like `designation_id` — they can only be written through a
+`security definer` RPC, since `profiles` has no direct `update` RLS policy
+(that would let a user update any column on their own row, including
+`role`).
+
+```sql
+alter table public.profiles add column if not exists category_domain_id uuid references public.domains(id);
+alter table public.profiles add column if not exists category_role_id uuid references public.base_roles(id);
+alter table public.profiles add column if not exists current_location_id uuid references public.locations(id);
+
+create table if not exists public.user_open_to_locations (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  location_id uuid not null references public.locations(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (user_id, location_id)
+);
+
+alter table public.user_open_to_locations enable row level security;
+
+drop policy if exists "users manage own open-to locations" on public.user_open_to_locations;
+create policy "users manage own open-to locations" on public.user_open_to_locations
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+drop policy if exists "admins read all open-to locations" on public.user_open_to_locations;
+create policy "admins read all open-to locations" on public.user_open_to_locations
+  for select using (public.is_admin());
+
+drop function if exists public.update_own_location_and_category(uuid, uuid);
+
+create or replace function public.update_own_location_and_category(
+  p_category_domain_id uuid,
+  p_category_role_id uuid,
+  p_current_location_id uuid
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.profiles
+  set category_domain_id = p_category_domain_id,
+      category_role_id = p_category_role_id,
+      current_location_id = p_current_location_id
+  where id = auth.uid();
+end;
+$$;
+
+revoke all on function public.update_own_location_and_category(uuid, uuid, uuid) from public, anon;
+grant execute on function public.update_own_location_and_category(uuid, uuid, uuid) to authenticated;
+
+notify pgrst, 'reload schema';
+```
+
+`user_open_to_locations` has no sensitive column (same reasoning as
+`user_skills`/`user_technologies`), so `/profile` reads/writes it with
+direct `supabase.from('user_open_to_locations')...` calls under RLS — no RPC
+indirection needed. `update_own_location_and_category` is kept as its own
+function, mirroring `update_own_designation`, so `update_own_profile`'s
+argument list doesn't keep growing.
 
 ---
 

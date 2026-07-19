@@ -55,7 +55,7 @@ export async function getOwnProfile(supabase, userId) {
   if (!supabase || !userId) return null;
   const { data, error } = await supabase
     .from('profiles')
-    .select('role, deleted_at, company_name, paid_until, full_name, bio, current_status, notice_period, looking_for, education_status, experience_years, passing_year, resume_url, social_links, designation_id, designation_seniority')
+    .select('role, deleted_at, company_name, paid_until, full_name, bio, current_status, notice_period, looking_for, education_status, experience_years, passing_year, resume_url, social_links, designation_id, designation_seniority, category_domain_id, category_role_id, current_location_id')
     .eq('id', userId)
     .single();
   if (error) {

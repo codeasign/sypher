@@ -77,6 +77,9 @@ export default function Navbar() {
           <Link href="/blog" className={styles.link} onClick={() => setMobileOpen(false)}>
             Blog
           </Link>
+          <Link href="/careers" className={styles.link} onClick={() => setMobileOpen(false)}>
+            Careers
+          </Link>
           {NAV_LINKS.map((item) => (
             <a key={item.key} href={item.href} className={styles.link}>
               {item.label}

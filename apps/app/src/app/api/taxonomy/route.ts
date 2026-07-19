@@ -1,5 +1,6 @@
 import { getCorsHeaders, handleCorsPreflight } from '@/lib/cors';
 import { getSupabaseAnon } from '@/lib/supabaseAdmin';
+import { fetchAllRows } from '@/lib/fetchAllRows';
 
 export const dynamic = 'force-dynamic';
 
@@ -10,40 +11,36 @@ let cache: { version: string | null; data: Record<string, unknown> | null } = { 
 async function fetchAssembledTaxonomy(supabase: ReturnType<typeof getSupabaseAnon>) {
   const [domains, roles, skills, technologies, technologyCategories, domainRoles, domainSkills, domainTechnologies] =
     await Promise.all([
-      supabase.from('domains').select('id, name, slug'),
-      supabase.from('base_roles').select('id, name, slug, seniority_levels'),
-      supabase.from('skills').select('id, name, slug'),
-      supabase.from('technologies').select('id, name, slug, technology_category_id'),
-      supabase.from('technology_categories').select('id, name, slug'),
-      supabase.from('domain_roles').select('domain_id, role_id'),
-      supabase.from('domain_skills').select('domain_id, skill_id'),
-      supabase.from('domain_technologies').select('domain_id, technology_id'),
+      fetchAllRows(supabase.from('domains').select('id, name, slug')),
+      fetchAllRows(supabase.from('base_roles').select('id, name, slug, seniority_levels')),
+      fetchAllRows(supabase.from('skills').select('id, name, slug')),
+      fetchAllRows(supabase.from('technologies').select('id, name, slug, technology_category_id')),
+      fetchAllRows(supabase.from('technology_categories').select('id, name, slug')),
+      fetchAllRows(supabase.from('domain_roles').select('domain_id, role_id')),
+      fetchAllRows(supabase.from('domain_skills').select('domain_id, skill_id')),
+      fetchAllRows(supabase.from('domain_technologies').select('domain_id, technology_id')),
     ]);
 
-  for (const result of [domains, roles, skills, technologies, technologyCategories, domainRoles, domainSkills, domainTechnologies]) {
-    if (result.error) throw result.error;
-  }
-
-  const assembledDomains = (domains.data ?? []).map((domain) => ({
+  const assembledDomains = domains.map((domain) => ({
     id: domain.id,
     name: domain.name,
     slug: domain.slug,
-    roleIds: (domainRoles.data ?? []).filter((r) => r.domain_id === domain.id).map((r) => r.role_id),
-    skillIds: (domainSkills.data ?? []).filter((s) => s.domain_id === domain.id).map((s) => s.skill_id),
-    technologyIds: (domainTechnologies.data ?? []).filter((t) => t.domain_id === domain.id).map((t) => t.technology_id),
+    roleIds: domainRoles.filter((r) => r.domain_id === domain.id).map((r) => r.role_id),
+    skillIds: domainSkills.filter((s) => s.domain_id === domain.id).map((s) => s.skill_id),
+    technologyIds: domainTechnologies.filter((t) => t.domain_id === domain.id).map((t) => t.technology_id),
   }));
 
   return {
     domains: assembledDomains,
-    roles: (roles.data ?? []).map((r) => ({ id: r.id, name: r.name, slug: r.slug, seniorityLevels: r.seniority_levels ?? [] })),
-    skills: (skills.data ?? []).map((s) => ({ id: s.id, name: s.name, slug: s.slug })),
-    technologies: (technologies.data ?? []).map((t) => ({
+    roles: roles.map((r) => ({ id: r.id, name: r.name, slug: r.slug, seniorityLevels: r.seniority_levels ?? [] })),
+    skills: skills.map((s) => ({ id: s.id, name: s.name, slug: s.slug })),
+    technologies: technologies.map((t) => ({
       id: t.id,
       name: t.name,
       slug: t.slug,
       categoryId: t.technology_category_id,
     })),
-    technologyCategories: (technologyCategories.data ?? []).map((c) => ({ id: c.id, name: c.name, slug: c.slug })),
+    technologyCategories: technologyCategories.map((c) => ({ id: c.id, name: c.name, slug: c.slug })),
   };
 }
 

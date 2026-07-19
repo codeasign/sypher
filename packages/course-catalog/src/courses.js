@@ -9,6 +9,8 @@ const courses = [
     description: 'A complete, job-ready Python course designed for engineers who want to build AI applications — from your first script to production-grade AI pipelines.',
     longDesc: 'Every lesson follows the same four-part format: you learn the concept, build something real with it, avoid the common mistakes, and then test what you have learned. Code is never shown unexplained — every example is annotated, production-quality, and progressive.',
     gradient: 'linear-gradient(135deg, #1E4D8C 0%, #357ABD 100%)',
+    topics: ['Python', 'NumPy', 'Pandas', 'FastAPI', 'LLMs', 'Testing'],
+    videoId: 'z92nyOfBG9g',
     modules: [
       { label: 'Section 1 — Python Foundations', topics: ['Setup', 'First Program', 'Virtual Environments', 'Variables', 'Strings', 'Lists', 'Tuples', 'Dictionaries', 'Sets', 'Control Flow', 'Loops'] },
       { label: 'Section 2 — Functions & Modular Code', topics: ['Functions', 'Modules', 'File Handling', 'Comprehensions', 'Generators', 'Decorators', 'Context Managers'] },
@@ -32,6 +34,8 @@ const courses = [
     description: 'Bridge the gap between prompt engineering and autonomous agents. Build memory, tools, planning loops, multi-agent systems, and production MCP servers.',
     longDesc: 'Start by understanding what agents are and how they differ from chatbots and deterministic workflows. From there build each component of an agent system — memory, tools, planning, execution loops — until you have a complete working agent architecture.',
     gradient: 'linear-gradient(135deg, #6A1B9A 0%, #9C27B0 100%)',
+    topics: ['Agents', 'MCP', 'Tool Use', 'Planning', 'Guardrails'],
+    videoId: 'z92nyOfBG9g',
     modules: [
       { label: 'Section 1 — Foundations', topics: ['What Is AI Engineering?', 'LLM Fundamentals', 'Tokens and Context Windows', 'Prompt Engineering Basics', 'LLM APIs in Practice'] },
       { label: 'Section 2 — Prompt Engineering Deep Dive', topics: ['System Prompts', 'Prompt Patterns', 'Few-Shot Prompting', 'Chain of Thought & Reasoning', 'Prompt Templates', 'Structured Output Prompting', 'Prompt Testing & Iteration'] },
@@ -53,6 +57,8 @@ const courses = [
     description: 'FAANG-level guide to system design — from foundations to advanced distributed systems patterns. Learn to design systems that scale to billions of users.',
     longDesc: 'A comprehensive, FAANG-level guide to system design. Each topic covers mental models, deep dives, architecture tradeoffs, real-world case studies, and interview practice with a challenge section.',
     gradient: 'linear-gradient(135deg, #E65100 0%, #FF8F00 100%)',
+    topics: ['Scalability', 'Databases', 'Microservices', 'Patterns'],
+    videoId: 'z92nyOfBG9g',
     modules: [
       { label: 'Section 1 — Foundations of System Design', topics: ['What Is System Design?', 'Why System Design Matters', 'Functional vs Non-Functional Requirements', 'Scalability', 'Availability', 'Reliability', 'Durability', 'Consistency', 'Latency vs Throughput', 'Capacity Estimation', 'System Design Process'] },
       { label: 'Section 2 — Core Building Blocks', topics: ['Load Balancing', 'Caching', 'Databases', 'CDNs', 'DNS', 'API Design', 'Proxies', 'Message Queues'] },
@@ -71,6 +77,8 @@ const courses = [
     description: 'Version control from first commit to production CI/CD. Master branching strategies, collaboration workflows, and automated deployment pipelines.',
     longDesc: 'This course teaches Git from the ground up — from your first commit to production CI/CD pipelines. You will learn version control fundamentals, branching strategies, collaboration workflows, and GitHub Actions for automated testing and deployment.',
     gradient: 'linear-gradient(135deg, #1A237E 0%, #3949AB 100%)',
+    topics: ['Git', 'GitHub', 'CI/CD', 'Actions', 'Deployment'],
+    videoId: 'z92nyOfBG9g',
     modules: [
       { label: 'Getting Started', topics: ['What Version Control Is', 'Using the Terminal', 'Installing & Configuring Git', 'Creating Your GitHub Account', 'Your First Repository'] },
       { label: 'Git Foundations', topics: ['What Is Version Control', 'Init, Add, and Commit', 'The Staging Area', 'Log and History', 'Gitignore', 'Reset, Revert, and Checkout'] },
@@ -83,6 +91,7 @@ const courses = [
   },
   {
     slug: 'ai-engineering-crash-course',
+    docsSlug: 'ai-engineering-hands-on',
     icon: '⚡',
     title: 'AI Engineering Crash Course',
     tag: 'Hands-On',
@@ -91,6 +100,8 @@ const courses = [
     description: 'Build real AI applications fast — from your first LLM API call to a production-ready agent system. Designed for engineers who learn by doing.',
     longDesc: 'This course teaches you to build real AI applications with LLM APIs, local models, MCP servers, and autonomous agents — from your first API call to a production-ready agent system.',
     gradient: 'linear-gradient(135deg, #00695C 0%, #26A69A 100%)',
+    topics: ['LLMs', 'RAG', 'Agents', 'MCP', 'Deploy'],
+    videoId: '1elYxgKplzY',
     modules: [
       { label: 'Getting Started', topics: ['What LLMs and APIs Actually Are', 'Installing Python & Using the Terminal', 'Environment Variables Explained', 'Using Claude Code from Day One'] },
       { label: 'Calling LLMs Directly', topics: ['Overview of LLM Providers', 'Making Your First API Call', 'System Prompts and Temperature', 'Streaming Responses', 'Multimodal Inputs', 'Structured Outputs with Pydantic', 'Tool Calling and Function Calling'] },
@@ -111,6 +122,8 @@ const courses = [
     description: '20+ real-world AI projects organized by complexity — from quick mini apps to production-grade systems and portfolio-worthy platforms.',
     longDesc: 'A project-based course organized by difficulty tier. Build everything from a daily AI news digest to a multi-agent research platform, with architecture, build, and deploy phases for production projects.',
     gradient: 'linear-gradient(135deg, #4A148C 0%, #7B1FA2 100%)',
+    topics: ['10+ Projects', 'RAG', 'Agents', 'SaaS', 'MCP'],
+    videoId: 'z92nyOfBG9g',
     modules: [
       { label: 'Mini Projects', topics: ['Daily AI News Digest', 'AI Movie Release Tracker', 'Job Listings Monitor', 'AI Research Paper Emailer', 'AI Recipe Finder', 'Travel Itinerary Planner', 'AI Interview Coach', 'Git Commit Message Generator', 'Pull Request Reviewer', 'README Generator'] },
       { label: 'Intermediate Projects', topics: ['Chat with PDFs', 'AI Meeting Notes Summarizer', 'AI Resume Reviewer', 'AI Customer Support Bot', 'AI Voice Notes Summarizer'] },
@@ -128,6 +141,8 @@ const courses = [
     description: 'SOLID principles and 23 design patterns implemented across JavaScript, TypeScript, Python, Java, C#, and Rust.',
     longDesc: 'Reference-style course covering the five SOLID principles and all 23 Gang-of-Four design patterns. Each topic has an overview page plus one implementation page per language.',
     gradient: 'linear-gradient(135deg, #B71C1C 0%, #E53935 100%)',
+    topics: ['SOLID', 'Patterns', '6 Languages', 'Clean Code'],
+    videoId: 'z92nyOfBG9g',
     modules: [
       { label: 'SOLID Principles', topics: ['Single Responsibility', 'Open/Closed', 'Liskov Substitution', 'Interface Segregation', 'Dependency Inversion'] },
       { label: 'Creational Patterns', topics: ['Factory Method', 'Singleton', 'Abstract Factory', 'Prototype', 'Builder'] },
@@ -145,6 +160,8 @@ const courses = [
     description: 'Master essential coding patterns with hundreds of LeetCode-style exercises. Each topic has easy, medium, and hard problems with detailed solutions.',
     longDesc: 'A DSA / LeetCode-style course covering 27 algorithm patterns. Each section has an index page and exercises split into Easy, Medium, and Hard with paired solutions.',
     gradient: 'linear-gradient(135deg, #0D47A1 0%, #1565C0 100%)',
+    topics: ['Algorithms', 'Data Structures', 'LeetCode', 'Patterns'],
+    videoId: 'z92nyOfBG9g',
     modules: [
       { label: 'Arrays', topics: ['Two Sum', 'Best Time to Buy Stock', 'Remove Duplicates', 'Product of Array Except Self', 'Rotate Array', 'Container With Most Water', 'Maximum Subarray', 'Merge Sorted Array'] },
       { label: 'Binary Search', topics: ['Find Minimum in Rotated', 'Search in Rotated', 'Binary Search'] },
@@ -169,6 +186,8 @@ const courses = [
     description: 'A reference course covering the search algorithms every engineer should know cold — from a plain linear scan to A* pathfinding.',
     longDesc: 'Each module is a single self-contained page: pseudocode, algorithm explanation, time/space complexity, and complete runnable implementations in Java, Python, TypeScript, and C#, plus 5 shared practice test cases per module.',
     gradient: 'linear-gradient(135deg, #00838F 0%, #4DD0E1 100%)',
+    topics: ['Binary Search', 'DFS', 'BFS', 'A*', 'Two-Pointer'],
+    videoId: 'z92nyOfBG9g',
     modules: [
       { label: 'Search Algorithms', topics: ['Linear Search', 'Binary Search', 'Binary Search Variants', 'Ternary Search', 'Jump Search', 'Interpolation Search', 'Exponential Search', 'Depth-First Search', 'Breadth-First Search', 'A* Search', 'Two-Pointer Search Patterns', 'Search in 2D Matrix'] },
     ],
@@ -183,10 +202,28 @@ const courses = [
     description: 'A reference course covering the sorting algorithms every engineer should know cold — from Bubble Sort to the Tim Sort hybrid powering every modern language.',
     longDesc: 'Each module is a single self-contained page: pseudocode, algorithm explanation, time/space complexity, stability, and complete runnable implementations in Python, C, C++, Java, C#, JavaScript, TypeScript, Rust, and Go, plus 5 shared practice test cases per module.',
     gradient: 'linear-gradient(135deg, #4A148C 0%, #7B1FA2 100%)',
+    topics: ['Merge Sort', 'Quick Sort', 'Heap Sort', 'Radix Sort', 'Tim Sort'],
+    videoId: 'z92nyOfBG9g',
     modules: [
       { label: 'Sorting Algorithms', topics: ['Bubble Sort', 'Selection Sort', 'Insertion Sort', 'Merge Sort', 'Quick Sort', 'Heap Sort', 'Counting Sort', 'Radix Sort', 'Bucket Sort', 'Shell Sort', 'Tim Sort', 'Comparison & Selection Guide'] },
     ],
   },
 ];
 
-export default courses;
+// docsSlug is the real Docusaurus docs folder name a course's lessons live
+// under — it's what DocRoot's access guard and the middleware/RPC key off.
+// It defaults to `slug` and only needs to be set explicitly when the two
+// diverge (see ai-engineering-crash-course above). `url` (the marketing/
+// catalog route) always derives from `slug`, never set per-course.
+//
+// Built via .map() (a new array) rather than mutating `courses` in place —
+// TypeScript infers a plain .js module's export type from the object
+// literals as written, not from later mutations, so an in-place loop here
+// would make `url`/`docsSlug` invisible to consumers doing `tsc --noEmit`.
+const normalizedCourses = courses.map((course) => ({
+  ...course,
+  docsSlug: course.docsSlug ?? course.slug,
+  url: `/course/${course.slug}`,
+}));
+
+export default normalizedCourses;

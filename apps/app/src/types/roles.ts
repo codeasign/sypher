@@ -5,7 +5,8 @@ export type Role =
   | 'internal_hr'
   | 'company_hr'
   | 'company_employees'
-  | 'branders';
+  | 'branders'
+  | 'external_job_poster';
 
 export const ROLES: { value: Role; label: string }[] = [
   { value: 'admin', label: 'Admin' },
@@ -15,6 +16,7 @@ export const ROLES: { value: Role; label: string }[] = [
   { value: 'company_hr', label: 'Company HR' },
   { value: 'company_employees', label: 'Company Employees' },
   { value: 'branders', label: 'Branders' },
+  { value: 'external_job_poster', label: 'External Job Poster' },
 ];
 
 // company_employees access is configured per-company on the Companies tab,

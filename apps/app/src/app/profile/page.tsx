@@ -16,13 +16,9 @@ import type { CurrentStatus, NoticePeriod } from '@/types/currentStatus';
 import { SOCIAL_PLATFORM_OPTIONS } from '@/types/socialLinks';
 import type { SocialLinks } from '@/types/socialLinks';
 import { fetchTaxonomy } from '@/data/taxonomy';
-import {
-  getOwnSkills,
-  getOwnTechnologies,
-  setOwnSkills,
-  setOwnTechnologies,
-  setOwnDesignation,
-} from '@/data/userTaxonomy';
+import { getOwnSkills, setOwnSkills, setOwnDesignation } from '@/data/userTaxonomy';
+import { fetchLocations } from '@/data/locations';
+import { getOwnOpenToLocations, setOwnOpenToLocations, setOwnLocationAndCategory } from '@/data/userLocations';
 import { SENIORITY_LEVEL_OPTIONS } from '@/types/seniority';
 import type { SeniorityLevel } from '@/types/seniority';
 import styles from './profile.module.css';
@@ -44,14 +40,13 @@ interface TaxonomyCatalog {
   technologies: { id: string; name: string }[];
 }
 
-interface SkillPick {
-  skillId: string;
-  proficiency: string;
-  yearsExperience: string;
+interface LocationsCatalog {
+  states: { id: string; name: string; slug: string; locationIds: string[] }[];
+  locations: { id: string; name: string; slug: string; stateId: string }[];
 }
 
-interface TechnologyPick {
-  technologyId: string;
+interface SkillPick {
+  skillId: string;
   proficiency: string;
   yearsExperience: string;
 }
@@ -62,10 +57,92 @@ interface SkillRow {
   years_experience: number | null;
 }
 
-interface TechnologyRow {
-  technology_id: string;
-  proficiency: string | null;
-  years_experience: number | null;
+type AboutSection =
+  | 'bio'
+  | 'resume'
+  | 'status'
+  | 'currentRole'
+  | 'skills'
+  | 'currentLocation'
+  | 'openToLocation'
+  | 'socialLinks'
+  | 'billing';
+
+const ALL_SECTIONS_EXPANDED: Record<AboutSection, boolean> = {
+  bio: true,
+  resume: true,
+  status: true,
+  currentRole: true,
+  skills: true,
+  currentLocation: true,
+  openToLocation: true,
+  socialLinks: true,
+  billing: true,
+};
+
+const NAV_ITEMS: { key: AboutSection; label: string }[] = [
+  { key: 'bio', label: 'About me' },
+  { key: 'resume', label: 'Resume' },
+  { key: 'status', label: 'Status & Availability' },
+  { key: 'currentRole', label: 'Current Role' },
+  { key: 'skills', label: 'Skills' },
+  { key: 'currentLocation', label: 'Current Location' },
+  { key: 'openToLocation', label: 'Open to Location' },
+  { key: 'socialLinks', label: 'Social Links' },
+  { key: 'billing', label: 'Billing' },
+];
+
+function SectionHeader({
+  label,
+  expanded,
+  onToggle,
+  extra,
+  underline,
+}: {
+  label: string;
+  expanded: boolean;
+  onToggle: () => void;
+  extra?: React.ReactNode;
+  underline?: boolean;
+}): React.JSX.Element {
+  return (
+    <div className={styles.sectionHeaderRow}>
+      <div className={styles.sectionHeaderLeft}>
+        <span className={underline ? `${styles.sectionLabel} ${styles.sectionLabelUnderline}` : styles.sectionLabel}>
+          {label}
+        </span>
+        {extra}
+      </div>
+      <button
+        type="button"
+        className={
+          expanded ? styles.collapseToggleBtn : `${styles.collapseToggleBtn} ${styles.collapseToggleBtnCollapsed}`
+        }
+        onClick={onToggle}
+        aria-expanded={expanded}
+        aria-label={expanded ? `Collapse ${label.toLowerCase()}` : `Expand ${label.toLowerCase()}`}
+        title={expanded ? 'Collapse' : 'Expand'}
+      >
+        <span className={styles.collapseToggleIcon}>⌄</span>
+      </button>
+    </div>
+  );
+}
+
+const SECTION_BG_CLASS: Record<AboutSection, string> = {
+  bio: 'sectionBgBio',
+  resume: 'sectionBgResume',
+  status: 'sectionBgStatus',
+  currentRole: 'sectionBgCurrentRole',
+  skills: 'sectionBgSkills',
+  currentLocation: 'sectionBgCurrentLocation',
+  openToLocation: 'sectionBgOpenToLocation',
+  socialLinks: 'sectionBgSocialLinks',
+  billing: 'sectionBgBilling',
+};
+
+function sectionCardClass(key: AboutSection): string {
+  return `${styles.sectionCard} ${styles[SECTION_BG_CLASS[key]]}`;
 }
 
 function countWords(text: string): number {
@@ -111,11 +188,12 @@ export default function ProfilePage(): React.JSX.Element {
     passingYear,
     resumeUrl,
     socialLinks,
-    designationId,
     designationSeniority,
+    categoryDomainId,
+    categoryRoleId,
+    currentLocationId,
     refreshProfile,
   } = useAuth();
-  const [activeTab, setActiveTab] = useState<'aboutMe' | 'billing'>('aboutMe');
   const [isProcessing, setIsProcessing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -127,10 +205,12 @@ export default function ProfilePage(): React.JSX.Element {
   const [experienceYearsInput, setExperienceYearsInput] = useState<number | null>(null);
   const [passingYearInput, setPassingYearInput] = useState<number | null>(null);
   const [socialLinksInput, setSocialLinksInput] = useState<SocialLinks>({});
-  const [isSocialLinksExpanded, setIsSocialLinksExpanded] = useState(false);
-  const [isSavingAbout, setIsSavingAbout] = useState(false);
-  const [aboutError, setAboutError] = useState<string | null>(null);
-  const [aboutSaved, setAboutSaved] = useState(false);
+  const [expandedSections, setExpandedSections] = useState<Record<AboutSection, boolean>>(
+    ALL_SECTIONS_EXPANDED
+  );
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveSuccess, setSaveSuccess] = useState(false);
 
   const [isUploadingResume, setIsUploadingResume] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
@@ -139,18 +219,20 @@ export default function ProfilePage(): React.JSX.Element {
   const [taxonomyCatalog, setTaxonomyCatalog] = useState<TaxonomyCatalog | null>(null);
   const [taxonomyError, setTaxonomyError] = useState<string | null>(null);
 
-  const [designationDomainId, setDesignationDomainId] = useState('');
-  const [designationRoleId, setDesignationRoleId] = useState('');
   const [designationSeniorityInput, setDesignationSeniorityInput] = useState('');
 
   const [skillPicks, setSkillPicks] = useState<SkillPick[]>([]);
-  const [technologyPicks, setTechnologyPicks] = useState<TechnologyPick[]>([]);
   const [skillToAdd, setSkillToAdd] = useState('');
-  const [technologyToAdd, setTechnologyToAdd] = useState('');
 
-  const [isSavingSkills, setIsSavingSkills] = useState(false);
-  const [skillsError, setSkillsError] = useState<string | null>(null);
-  const [skillsSaved, setSkillsSaved] = useState(false);
+  const [locationsCatalog, setLocationsCatalog] = useState<LocationsCatalog | null>(null);
+  const [locationsError, setLocationsError] = useState<string | null>(null);
+
+  const [categoryDomainInput, setCategoryDomainInput] = useState('');
+  const [categoryRoleInput, setCategoryRoleInput] = useState('');
+  const [currentStateId, setCurrentStateId] = useState('');
+  const [currentLocationInput, setCurrentLocationInput] = useState('');
+  const [openToLocationPicks, setOpenToLocationPicks] = useState<string[]>([]);
+  const [openToLocationToAdd, setOpenToLocationToAdd] = useState('');
 
   useEffect(() => {
     setBioInput(bio ?? '');
@@ -209,25 +291,41 @@ export default function ProfilePage(): React.JSX.Element {
         }))
       )
     );
-    getOwnTechnologies(supabase, session.user.id).then((rows: TechnologyRow[]) =>
-      setTechnologyPicks(
-        rows.map((r) => ({
-          technologyId: r.technology_id,
-          proficiency: r.proficiency ?? '',
-          yearsExperience: r.years_experience != null ? String(r.years_experience) : '',
-        }))
-      )
+    getOwnOpenToLocations(supabase, session.user.id).then((rows: { location_id: string }[]) =>
+      setOpenToLocationPicks(rows.map((r) => r.location_id))
     );
   }, [supabase, session?.user.id]);
 
   useEffect(() => {
-    setDesignationRoleId(designationId ?? '');
     setDesignationSeniorityInput(designationSeniority ?? '');
-    if (taxonomyCatalog && designationId) {
-      const domain = taxonomyCatalog.domains.find((d) => d.roleIds.includes(designationId));
-      if (domain) setDesignationDomainId(domain.id);
+  }, [designationSeniority]);
+
+  useEffect(() => {
+    let active = true;
+    fetchLocations(apiBaseUrl)
+      .then((data) => {
+        if (active) setLocationsCatalog(data as LocationsCatalog);
+      })
+      .catch((err) => {
+        if (active) setLocationsError(err instanceof Error ? err.message : 'Failed to load locations catalog');
+      });
+    return () => {
+      active = false;
+    };
+  }, [apiBaseUrl]);
+
+  useEffect(() => {
+    setCategoryDomainInput(categoryDomainId ?? '');
+    setCategoryRoleInput(categoryRoleId ?? '');
+  }, [categoryDomainId, categoryRoleId]);
+
+  useEffect(() => {
+    setCurrentLocationInput(currentLocationId ?? '');
+    if (locationsCatalog && currentLocationId) {
+      const location = locationsCatalog.locations.find((l) => l.id === currentLocationId);
+      if (location) setCurrentStateId(location.stateId);
     }
-  }, [designationId, designationSeniority, taxonomyCatalog]);
+  }, [currentLocationId, locationsCatalog]);
 
   function toggleLookingFor(value: LookingFor): void {
     setLookingForInput((prev) =>
@@ -251,32 +349,44 @@ export default function ProfilePage(): React.JSX.Element {
     setSocialLinksInput((prev) => ({ ...prev, [platform]: url }));
   }
 
-  const selectedDomain = taxonomyCatalog?.domains.find((d) => d.id === designationDomainId) ?? null;
-  const rolesForSelectedDomain = selectedDomain
-    ? taxonomyCatalog!.roles.filter((r) => selectedDomain.roleIds.includes(r.id))
+  function toggleSection(key: AboutSection): void {
+    setExpandedSections((prev) => ({ ...prev, [key]: !prev[key] }));
+  }
+
+  const sectionRefs = useRef<Partial<Record<AboutSection, HTMLDivElement>>>({});
+
+  function setSectionRef(key: AboutSection, el: HTMLDivElement | null): void {
+    if (el) sectionRefs.current[key] = el;
+  }
+
+  function scrollToSection(key: AboutSection): void {
+    setExpandedSections((prev) => (prev[key] ? prev : { ...prev, [key]: true }));
+    sectionRefs.current[key]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  const selectedCategoryDomain = taxonomyCatalog?.domains.find((d) => d.id === categoryDomainInput) ?? null;
+  const rolesForSelectedCategoryDomain = selectedCategoryDomain
+    ? taxonomyCatalog!.roles.filter((r) => selectedCategoryDomain.roleIds.includes(r.id))
     : [];
-  const selectedRole = taxonomyCatalog?.roles.find((r) => r.id === designationRoleId) ?? null;
+  const selectedRole = taxonomyCatalog?.roles.find((r) => r.id === categoryRoleInput) ?? null;
   const seniorityOptionsForSelectedRole = selectedRole
     ? SENIORITY_LEVEL_OPTIONS.filter((o) => selectedRole.seniorityLevels.includes(o.value))
     : SENIORITY_LEVEL_OPTIONS;
 
-  function handleDesignationDomainChange(domainId: string): void {
-    setDesignationDomainId(domainId);
-    setDesignationRoleId('');
+  function handleCategoryDomainChange(domainId: string): void {
+    setCategoryDomainInput(domainId);
+    setCategoryRoleInput('');
     setDesignationSeniorityInput('');
   }
 
-  function handleDesignationRoleChange(roleId: string): void {
-    setDesignationRoleId(roleId);
+  function handleCategoryRoleChange(roleId: string): void {
+    setCategoryRoleInput(roleId);
     const role = taxonomyCatalog?.roles.find((r) => r.id === roleId);
     setDesignationSeniorityInput(role?.seniorityLevels[0] ?? '');
   }
 
   const availableSkills = (taxonomyCatalog?.skills ?? []).filter(
     (s) => !skillPicks.some((p) => p.skillId === s.id)
-  );
-  const availableTechnologies = (taxonomyCatalog?.technologies ?? []).filter(
-    (t) => !technologyPicks.some((p) => p.technologyId === t.id)
   );
 
   function addSkillPick(): void {
@@ -293,31 +403,59 @@ export default function ProfilePage(): React.JSX.Element {
     setSkillPicks((prev) => prev.filter((p) => p.skillId !== skillId));
   }
 
-  function addTechnologyPick(): void {
-    if (!technologyToAdd) return;
-    setTechnologyPicks((prev) => [...prev, { technologyId: technologyToAdd, proficiency: '', yearsExperience: '' }]);
-    setTechnologyToAdd('');
+  const locationsForCurrentState = (locationsCatalog?.locations ?? []).filter(
+    (l) => l.stateId === currentStateId
+  );
+  const availableOpenToLocations = (locationsCatalog?.locations ?? []).filter(
+    (l) => !openToLocationPicks.includes(l.id)
+  );
+
+  function handleCurrentStateChange(stateId: string): void {
+    setCurrentStateId(stateId);
+    setCurrentLocationInput('');
   }
 
-  function updateTechnologyPick(technologyId: string, field: 'proficiency' | 'yearsExperience', value: string): void {
-    setTechnologyPicks((prev) =>
-      prev.map((p) => (p.technologyId === technologyId ? { ...p, [field]: value } : p))
-    );
+  function addOpenToLocationPick(): void {
+    if (!openToLocationToAdd) return;
+    setOpenToLocationPicks((prev) => [...prev, openToLocationToAdd]);
+    setOpenToLocationToAdd('');
   }
 
-  function removeTechnologyPick(technologyId: string): void {
-    setTechnologyPicks((prev) => prev.filter((p) => p.technologyId !== technologyId));
+  function removeOpenToLocationPick(locationId: string): void {
+    setOpenToLocationPicks((prev) => prev.filter((id) => id !== locationId));
   }
 
-  async function handleSaveSkills(): Promise<void> {
-    if (!session?.user.id) return;
-    setIsSavingSkills(true);
-    setSkillsError(null);
-    setSkillsSaved(false);
+  const bioWordCount = countWords(bioInput);
+  const isBioOverLimit = bioWordCount > BIO_WORD_LIMIT;
+
+  async function handleSaveProfile(): Promise<void> {
+    if (!session?.user.id || isBioOverLimit) return;
+    setSaveError(null);
+    setSaveSuccess(false);
+    setIsSaving(true);
     try {
       const results = await Promise.all([
-        designationRoleId
-          ? setOwnDesignation(supabase, designationRoleId, designationSeniorityInput || null)
+        updateOwnBio(
+          supabase,
+          bioInput.trim(),
+          lookingForInput,
+          undefined,
+          educationStatusInput,
+          experienceYearsInput,
+          currentStatusInput,
+          noticePeriodInput,
+          passingYearInput,
+          socialLinksInput
+        ),
+        setOwnLocationAndCategory(
+          supabase,
+          categoryDomainInput || null,
+          categoryRoleInput || null,
+          currentLocationInput || null
+        ),
+        setOwnOpenToLocations(supabase, session.user.id, openToLocationPicks),
+        categoryRoleInput
+          ? setOwnDesignation(supabase, categoryRoleInput, designationSeniorityInput || null)
           : Promise.resolve({ error: null }),
         setOwnSkills(
           supabase,
@@ -328,57 +466,16 @@ export default function ProfilePage(): React.JSX.Element {
             yearsExperience: p.yearsExperience ? Number(p.yearsExperience) : null,
           }))
         ),
-        setOwnTechnologies(
-          supabase,
-          session.user.id,
-          technologyPicks.map((p) => ({
-            technologyId: p.technologyId,
-            proficiency: p.proficiency || null,
-            yearsExperience: p.yearsExperience ? Number(p.yearsExperience) : null,
-          }))
-        ),
       ]);
       const firstError = results.find((r) => r.error)?.error;
       if (firstError) {
-        setSkillsError(firstError);
+        setSaveError(firstError);
       } else {
-        setSkillsSaved(true);
+        setSaveSuccess(true);
         await refreshProfile();
       }
     } finally {
-      setIsSavingSkills(false);
-    }
-  }
-
-  const bioWordCount = countWords(bioInput);
-  const isBioOverLimit = bioWordCount > BIO_WORD_LIMIT;
-
-  async function handleSaveAbout(): Promise<void> {
-    if (!session?.user.id || isBioOverLimit) return;
-    setAboutError(null);
-    setAboutSaved(false);
-    setIsSavingAbout(true);
-    try {
-      const { error } = await updateOwnBio(
-        supabase,
-        bioInput.trim(),
-        lookingForInput,
-        undefined,
-        educationStatusInput,
-        experienceYearsInput,
-        currentStatusInput,
-        noticePeriodInput,
-        passingYearInput,
-        socialLinksInput
-      );
-      if (error) {
-        setAboutError(error);
-      } else {
-        setAboutSaved(true);
-        await refreshProfile();
-      }
-    } finally {
-      setIsSavingAbout(false);
+      setIsSaving(false);
     }
   }
 
@@ -386,13 +483,13 @@ export default function ProfilePage(): React.JSX.Element {
   // form state from the last-saved profile, clearing any unsaved edits.
   // Auto-saving right as the tab is hidden means there's nothing left to
   // lose by the time that happens.
-  const handleSaveAboutRef = useRef(handleSaveAbout);
-  handleSaveAboutRef.current = handleSaveAbout;
+  const handleSaveProfileRef = useRef(handleSaveProfile);
+  handleSaveProfileRef.current = handleSaveProfile;
 
   useEffect(() => {
     function handleVisibilityChange(): void {
       if (document.hidden) {
-        handleSaveAboutRef.current();
+        handleSaveProfileRef.current();
       }
     }
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -497,208 +594,440 @@ export default function ProfilePage(): React.JSX.Element {
           <h1 className={styles.heading}>Profile</h1>
         </div>
 
-        <div className={styles.tabs}>
-          <button
-            type="button"
-            className={activeTab === 'aboutMe' ? styles.tabActive : styles.tab}
-            onClick={() => setActiveTab('aboutMe')}
-          >
-            About Me
-          </button>
-          <button
-            type="button"
-            className={activeTab === 'billing' ? styles.tabActive : styles.tab}
-            onClick={() => setActiveTab('billing')}
-          >
-            Billing
-          </button>
-        </div>
-
-        {activeTab === 'aboutMe' ? (
-          <>
-          <div className={styles.card}>
-            <div className={styles.formField}>
-              <div className={styles.formLabelRow}>
-                <label className={styles.formLabel} htmlFor="profile-bio">About me</label>
-                <span className={isBioOverLimit ? styles.wordCountOver : styles.wordCount}>
-                  {bioWordCount}/{BIO_WORD_LIMIT} words
-                </span>
-              </div>
-              <textarea
-                id="profile-bio"
-                className={styles.formTextarea}
-                rows={4}
-                value={bioInput}
-                onChange={(e) => setBioInput(e.target.value)}
-                placeholder="Tell us a bit about yourself…"
-              />
-            </div>
-
-            <div className={styles.formField}>
-              <span className={styles.formLabel}>Resume</span>
-              <div className={styles.resumeRow}>
-                {resumeUrl ? (
-                  <button
-                    type="button"
-                    className={styles.resumeIconBtn}
-                    onClick={() => setIsResumeModalOpen(true)}
-                    aria-label="View resume"
-                    title="View resume"
-                  >
-                    <svg viewBox="0 0 24 24" width="52" height="52" aria-hidden="true">
-                      <path
-                        d="M6 2h8l5 5v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"
-                        fill="#f1f5f9"
-                        stroke="#94a3b8"
-                        strokeWidth="1"
-                      />
-                      <path d="M14 2v5h5z" fill="#cbd5e1" stroke="#94a3b8" strokeWidth="1" />
-                      <text x="12" y="14" fontSize="5" fontWeight="700" textAnchor="middle" dominantBaseline="middle" fill="#c53030">
-                        PDF
-                      </text>
-                    </svg>
-                  </button>
-                ) : null}
-                <label className={styles.resumeUploadBtn}>
-                  {isUploadingResume ? 'Uploading…' : resumeUrl ? 'Replace resume (PDF)' : 'Upload resume (PDF)'}
-                  <input
-                    type="file"
-                    accept="application/pdf"
-                    onChange={handleResumeChange}
-                    disabled={isUploadingResume}
-                    hidden
-                  />
-                </label>
-              </div>
-              {resumeError ? <p className={styles.errorMessage}>{resumeError}</p> : null}
-            </div>
-
-            <div className={styles.formField}>
-              <span className={styles.formLabel}>Current Status</span>
-              <div className={styles.radioGroup}>
-                {CURRENT_STATUS_OPTIONS.map((option) => (
-                  <label key={option.value} className={styles.radioOption}>
-                    <input
-                      type="radio"
-                      name="current-status"
-                      value={option.value}
-                      checked={currentStatusInput === option.value}
-                      onChange={() => setCurrentStatusInput(option.value)}
-                    />
-                    {option.label}
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            <div className={styles.formField}>
-              <span className={styles.formLabel}>Notice Period</span>
-              <div className={styles.radioGroup}>
-                {NOTICE_PERIOD_OPTIONS.map((option) => (
-                  <label key={option.value} className={styles.radioOption}>
-                    <input
-                      type="radio"
-                      name="notice-period"
-                      value={option.value}
-                      checked={noticePeriodInput === option.value}
-                      onChange={() => setNoticePeriodInput(option.value)}
-                    />
-                    {option.label}
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            <div className={styles.formField}>
-              <span className={styles.formLabel}>Looking for</span>
-              <div className={styles.radioGroup}>
-                {LOOKING_FOR_OPTIONS.map((option) => (
-                  <label key={option.value} className={styles.radioOption}>
-                    <input
-                      type="checkbox"
-                      value={option.value}
-                      checked={lookingForInput.includes(option.value)}
-                      onChange={() => toggleLookingFor(option.value)}
-                    />
-                    {option.label}
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            <div className={styles.formField}>
-              <span className={styles.formLabel}>Status</span>
-              <div className={styles.radioGroup}>
-                {EDUCATION_STATUS_OPTIONS.map((option) => (
-                  <label key={option.value} className={styles.radioOption}>
-                    <input
-                      type="radio"
-                      name="education-status"
-                      value={option.value}
-                      checked={educationStatusInput === option.value}
-                      onChange={() => handleEducationStatusChange(option.value)}
-                    />
-                    {option.label}
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            {educationStatusInput === 'experienced' ? (
-              <div className={styles.formField}>
-                <label className={styles.formLabel} htmlFor="profile-experience-years">
-                  Total Years of Experience
-                </label>
-                <select
-                  id="profile-experience-years"
-                  className={styles.formSelect}
-                  value={experienceYearsInput ?? ''}
-                  onChange={(e) => setExperienceYearsInput(e.target.value ? Number(e.target.value) : null)}
-                >
-                  <option value="">Select…</option>
-                  {EXPERIENCE_YEARS_OPTIONS.map((year) => (
-                    <option key={year} value={year}>
-                      {year}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ) : null}
-
-            {educationStatusInput === 'passed_out' ? (
-              <div className={styles.formField}>
-                <label className={styles.formLabel} htmlFor="profile-passing-year">
-                  Year of Passing Out
-                </label>
-                <select
-                  id="profile-passing-year"
-                  className={styles.formSelect}
-                  value={passingYearInput ?? ''}
-                  onChange={(e) => setPassingYearInput(e.target.value ? Number(e.target.value) : null)}
-                >
-                  {PASSING_YEAR_OPTIONS.map((year) => (
-                    <option key={year} value={year}>
-                      {year}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ) : null}
-
-            <div className={styles.formField}>
-              <div className={styles.formLabelRow}>
-                <span className={styles.formLabel}>Social Links</span>
+        <div className={styles.splitScreen}>
+          <aside className={styles.sidebar}>
+            <nav className={styles.sidebarNav}>
+              {NAV_ITEMS.map((item) => (
                 <button
+                  key={item.key}
                   type="button"
-                  className={styles.collapseToggleBtn}
-                  onClick={() => setIsSocialLinksExpanded((prev) => !prev)}
-                  aria-expanded={isSocialLinksExpanded}
-                  aria-label={isSocialLinksExpanded ? 'Collapse social links' : 'Expand social links'}
-                  title={isSocialLinksExpanded ? 'Collapse' : 'Expand'}
+                  className={styles.sidebarNavItem}
+                  onClick={() => scrollToSection(item.key)}
                 >
-                  {isSocialLinksExpanded ? '▾' : '▸'}
+                  {item.label}
                 </button>
-              </div>
+              ))}
+            </nav>
+          </aside>
+
+          <div className={styles.mainPanel}>
+          <div className={styles.card}>
+            <div className={sectionCardClass('bio')} ref={(el) => setSectionRef('bio', el)}>
+              <SectionHeader
+                label="About me"
+                expanded={expandedSections.bio}
+                onToggle={() => toggleSection('bio')}
+                extra={
+                  <span className={isBioOverLimit ? styles.wordCountOver : styles.wordCount}>
+                    {bioWordCount}/{BIO_WORD_LIMIT} words
+                  </span>
+                }
+              />
+              {expandedSections.bio ? (
+                <textarea
+                  id="profile-bio"
+                  className={styles.formTextarea}
+                  rows={4}
+                  value={bioInput}
+                  onChange={(e) => setBioInput(e.target.value)}
+                  placeholder="Tell us a bit about yourself…"
+                />
+              ) : null}
+            </div>
+
+            <div className={sectionCardClass('resume')} ref={(el) => setSectionRef('resume', el)}>
+              <SectionHeader label="Resume" expanded={expandedSections.resume} onToggle={() => toggleSection('resume')} />
+              {expandedSections.resume ? (
+                <>
+                  <div className={styles.resumeRow}>
+                    {resumeUrl ? (
+                      <button
+                        type="button"
+                        className={styles.resumeIconBtn}
+                        onClick={() => setIsResumeModalOpen(true)}
+                        aria-label="View resume"
+                        title="View resume"
+                      >
+                        <svg viewBox="0 0 24 24" width="52" height="52" aria-hidden="true">
+                          <path
+                            d="M6 2h8l5 5v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"
+                            fill="#f1f5f9"
+                            stroke="#94a3b8"
+                            strokeWidth="1"
+                          />
+                          <path d="M14 2v5h5z" fill="#cbd5e1" stroke="#94a3b8" strokeWidth="1" />
+                          <text x="12" y="14" fontSize="5" fontWeight="700" textAnchor="middle" dominantBaseline="middle" fill="#c53030">
+                            PDF
+                          </text>
+                        </svg>
+                      </button>
+                    ) : null}
+                    <label className={styles.resumeUploadBtn}>
+                      {isUploadingResume ? 'Uploading…' : resumeUrl ? 'Replace resume (PDF)' : 'Upload resume (PDF)'}
+                      <input
+                        type="file"
+                        accept="application/pdf"
+                        onChange={handleResumeChange}
+                        disabled={isUploadingResume}
+                        hidden
+                      />
+                    </label>
+                  </div>
+                  {resumeError ? <p className={styles.errorMessage}>{resumeError}</p> : null}
+                </>
+              ) : null}
+            </div>
+
+            <div className={sectionCardClass('status')} ref={(el) => setSectionRef('status', el)}>
+              <SectionHeader
+                label="Status & Availability"
+                expanded={expandedSections.status}
+                onToggle={() => toggleSection('status')}
+              />
+              {expandedSections.status ? (
+                <div className={styles.sectionGroup}>
+                  <div className={styles.formField}>
+                    <span className={styles.formLabel}>Current Status</span>
+                    <div className={styles.radioGroup}>
+                      {CURRENT_STATUS_OPTIONS.map((option) => (
+                        <label key={option.value} className={styles.radioOption}>
+                          <input
+                            type="radio"
+                            name="current-status"
+                            value={option.value}
+                            checked={currentStatusInput === option.value}
+                            onChange={() => setCurrentStatusInput(option.value)}
+                          />
+                          {option.label}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className={styles.formField}>
+                    <span className={styles.formLabel}>Notice Period</span>
+                    <div className={styles.radioGroup}>
+                      {NOTICE_PERIOD_OPTIONS.map((option) => (
+                        <label key={option.value} className={styles.radioOption}>
+                          <input
+                            type="radio"
+                            name="notice-period"
+                            value={option.value}
+                            checked={noticePeriodInput === option.value}
+                            onChange={() => setNoticePeriodInput(option.value)}
+                          />
+                          {option.label}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className={styles.formField}>
+                    <span className={styles.formLabel}>Looking for</span>
+                    <div className={styles.radioGroup}>
+                      {LOOKING_FOR_OPTIONS.map((option) => (
+                        <label key={option.value} className={styles.radioOption}>
+                          <input
+                            type="checkbox"
+                            value={option.value}
+                            checked={lookingForInput.includes(option.value)}
+                            onChange={() => toggleLookingFor(option.value)}
+                          />
+                          {option.label}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className={styles.formField}>
+                    <span className={styles.formLabel}>Status</span>
+                    <div className={styles.radioGroup}>
+                      {EDUCATION_STATUS_OPTIONS.map((option) => (
+                        <label key={option.value} className={styles.radioOption}>
+                          <input
+                            type="radio"
+                            name="education-status"
+                            value={option.value}
+                            checked={educationStatusInput === option.value}
+                            onChange={() => handleEducationStatusChange(option.value)}
+                          />
+                          {option.label}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+
+                  {educationStatusInput === 'experienced' ? (
+                    <div className={styles.formField}>
+                      <label className={styles.formLabel} htmlFor="profile-experience-years">
+                        Total Years of Experience
+                      </label>
+                      <select
+                        id="profile-experience-years"
+                        className={styles.formSelect}
+                        value={experienceYearsInput ?? ''}
+                        onChange={(e) => setExperienceYearsInput(e.target.value ? Number(e.target.value) : null)}
+                      >
+                        <option value="">Select…</option>
+                        {EXPERIENCE_YEARS_OPTIONS.map((year) => (
+                          <option key={year} value={year}>
+                            {year}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : null}
+
+                  {educationStatusInput === 'passed_out' ? (
+                    <div className={styles.formField}>
+                      <label className={styles.formLabel} htmlFor="profile-passing-year">
+                        Year of Passing Out
+                      </label>
+                      <select
+                        id="profile-passing-year"
+                        className={styles.formSelect}
+                        value={passingYearInput ?? ''}
+                        onChange={(e) => setPassingYearInput(e.target.value ? Number(e.target.value) : null)}
+                      >
+                        {PASSING_YEAR_OPTIONS.map((year) => (
+                          <option key={year} value={year}>
+                            {year}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+
+            <div className={sectionCardClass('currentRole')} ref={(el) => setSectionRef('currentRole', el)}>
+              <SectionHeader
+                label="Current Role"
+                expanded={expandedSections.currentRole}
+                onToggle={() => toggleSection('currentRole')}
+                underline
+              />
+              {expandedSections.currentRole ? (
+                <>
+                  <div className={styles.cascadeRow}>
+                    <select
+                      className={styles.formSelect}
+                      value={categoryDomainInput}
+                      onChange={(e) => handleCategoryDomainChange(e.target.value)}
+                    >
+                      <option value="">Select a domain…</option>
+                      {(taxonomyCatalog?.domains ?? []).map((domain) => (
+                        <option key={domain.id} value={domain.id}>
+                          {domain.name}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      className={styles.formSelect}
+                      value={categoryRoleInput}
+                      onChange={(e) => handleCategoryRoleChange(e.target.value)}
+                      disabled={!categoryDomainInput}
+                    >
+                      <option value="">Select a role…</option>
+                      {rolesForSelectedCategoryDomain.map((role_) => (
+                        <option key={role_.id} value={role_.id}>
+                          {role_.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {taxonomyError ? <p className={styles.errorMessage}>{taxonomyError}</p> : null}
+                </>
+              ) : null}
+            </div>
+
+            <div className={sectionCardClass('skills')} ref={(el) => setSectionRef('skills', el)}>
+              <SectionHeader
+                label="Skills"
+                expanded={expandedSections.skills}
+                onToggle={() => toggleSection('skills')}
+                underline
+              />
+              {expandedSections.skills ? (
+                <>
+                  <div className={styles.formField}>
+                    <span className={styles.formLabel}>Seniority</span>
+                    <select
+                      className={styles.formSelect}
+                      value={designationSeniorityInput}
+                      onChange={(e) => setDesignationSeniorityInput(e.target.value)}
+                      disabled={!categoryRoleInput}
+                    >
+                      {seniorityOptionsForSelectedRole.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className={styles.formField}>
+                    <span className={styles.formLabel}>Skills</span>
+                    {skillPicks.map((pick) => {
+                      const skill = taxonomyCatalog?.skills.find((s) => s.id === pick.skillId);
+                      return (
+                        <div key={pick.skillId} className={styles.pickRow}>
+                          <span className={styles.pickName}>{skill?.name ?? pick.skillId}</span>
+                          <select
+                            className={styles.pickSelect}
+                            value={pick.proficiency}
+                            onChange={(e) => updateSkillPick(pick.skillId, 'proficiency', e.target.value)}
+                          >
+                            <option value="">Proficiency…</option>
+                            {PROFICIENCY_OPTIONS.map((option) => (
+                              <option key={option} value={option}>
+                                {option}
+                              </option>
+                            ))}
+                          </select>
+                          <input
+                            type="number"
+                            min={0}
+                            className={styles.pickYearsInput}
+                            placeholder="Years"
+                            value={pick.yearsExperience}
+                            onChange={(e) => updateSkillPick(pick.skillId, 'yearsExperience', e.target.value)}
+                          />
+                          <button
+                            type="button"
+                            className={styles.pickRemoveBtn}
+                            onClick={() => removeSkillPick(pick.skillId)}
+                            aria-label={`Remove ${skill?.name ?? 'skill'}`}
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      );
+                    })}
+                    <div className={styles.addItemRow}>
+                      <select
+                        className={styles.formSelect}
+                        value={skillToAdd}
+                        onChange={(e) => setSkillToAdd(e.target.value)}
+                      >
+                        <option value="">Add a skill…</option>
+                        {availableSkills.map((skill) => (
+                          <option key={skill.id} value={skill.id}>
+                            {skill.name}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        className={styles.addItemBtn}
+                        disabled={!skillToAdd}
+                        onClick={addSkillPick}
+                      >
+                        Add
+                      </button>
+                    </div>
+                  </div>
+                </>
+              ) : null}
+            </div>
+
+            <div className={sectionCardClass('currentLocation')} ref={(el) => setSectionRef('currentLocation', el)}>
+              <SectionHeader
+                label="Current Location"
+                expanded={expandedSections.currentLocation}
+                onToggle={() => toggleSection('currentLocation')}
+              />
+              {expandedSections.currentLocation ? (
+                <>
+                  <div className={styles.cascadeRow}>
+                    <select
+                      className={styles.formSelect}
+                      value={currentStateId}
+                      onChange={(e) => handleCurrentStateChange(e.target.value)}
+                    >
+                      <option value="">Select a state…</option>
+                      {(locationsCatalog?.states ?? []).map((state) => (
+                        <option key={state.id} value={state.id}>
+                          {state.name}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      className={styles.formSelect}
+                      value={currentLocationInput}
+                      onChange={(e) => setCurrentLocationInput(e.target.value)}
+                      disabled={!currentStateId}
+                    >
+                      <option value="">Select a location…</option>
+                      {locationsForCurrentState.map((location) => (
+                        <option key={location.id} value={location.id}>
+                          {location.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {locationsError ? <p className={styles.errorMessage}>{locationsError}</p> : null}
+                </>
+              ) : null}
+            </div>
+
+            <div className={sectionCardClass('openToLocation')} ref={(el) => setSectionRef('openToLocation', el)}>
+              <SectionHeader
+                label="Open to Location"
+                expanded={expandedSections.openToLocation}
+                onToggle={() => toggleSection('openToLocation')}
+              />
+              {expandedSections.openToLocation ? (
+                <>
+                  {openToLocationPicks.map((locationId) => {
+                    const location = locationsCatalog?.locations.find((l) => l.id === locationId);
+                    return (
+                      <div key={locationId} className={styles.pickRow}>
+                        <span className={styles.pickName}>{location?.name ?? locationId}</span>
+                        <button
+                          type="button"
+                          className={styles.pickRemoveBtn}
+                          onClick={() => removeOpenToLocationPick(locationId)}
+                          aria-label={`Remove ${location?.name ?? 'location'}`}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    );
+                  })}
+                  <div className={styles.addItemRow}>
+                    <select
+                      className={styles.formSelect}
+                      value={openToLocationToAdd}
+                      onChange={(e) => setOpenToLocationToAdd(e.target.value)}
+                    >
+                      <option value="">Add a location…</option>
+                      {availableOpenToLocations.map((location) => (
+                        <option key={location.id} value={location.id}>
+                          {location.name}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      className={styles.addItemBtn}
+                      disabled={!openToLocationToAdd}
+                      onClick={addOpenToLocationPick}
+                    >
+                      Add
+                    </button>
+                  </div>
+                </>
+              ) : null}
+            </div>
+
+            <div className={sectionCardClass('socialLinks')} ref={(el) => setSectionRef('socialLinks', el)}>
+              <SectionHeader
+                label="Social Links"
+                expanded={expandedSections.socialLinks}
+                onToggle={() => toggleSection('socialLinks')}
+              />
               {SOCIAL_PLATFORM_OPTIONS.some((option) => socialLinks[option.value]) ? (
                 <div className={styles.socialLinksDisplay}>
                   {SOCIAL_PLATFORM_OPTIONS.map((option) =>
@@ -716,7 +1045,7 @@ export default function ProfilePage(): React.JSX.Element {
                   )}
                 </div>
               ) : null}
-              {isSocialLinksExpanded ? (
+              {expandedSections.socialLinks ? (
                 <div className={styles.socialLinksGrid}>
                   {SOCIAL_PLATFORM_OPTIONS.map((option) => (
                     <div key={option.value} className={styles.formField}>
@@ -737,19 +1066,62 @@ export default function ProfilePage(): React.JSX.Element {
               ) : null}
             </div>
 
+            <div className={sectionCardClass('billing')} ref={(el) => setSectionRef('billing', el)}>
+              <SectionHeader label="Billing" expanded={expandedSections.billing} onToggle={() => toggleSection('billing')} />
+              {expandedSections.billing ? (
+                <>
+                  <div className={styles.planRow}>
+                    <span className={`${styles.statusBadge} ${isPaidAndActive ? styles.statusPaid : styles.statusFree}`}>
+                      {isPaidAndActive ? 'Paid plan' : 'Free plan'}
+                    </span>
+                  </div>
+
+                  {isPaidAndActive && paidUntil ? (
+                    <p className={styles.expiry}>
+                      Expires {formatDate(paidUntil)}
+                      {isExpiringSoon(paidUntil) ? (
+                        <span className={`${styles.statusBadge} ${styles.statusFree}`} style={{ marginLeft: '0.5rem' }}>
+                          Expiring soon
+                        </span>
+                      ) : null}
+                    </p>
+                  ) : null}
+
+                  {showUpgradeButton ? (
+                    <button
+                      type="button"
+                      className={styles.upgradeBtn}
+                      disabled={isProcessing}
+                      onClick={handleUpgrade}
+                    >
+                      {isProcessing
+                        ? 'Processing…'
+                        : isPaidAndActive
+                          ? 'Renew'
+                          : priceLabel
+                            ? `Upgrade to Paid — ₹${priceLabel}/year`
+                            : 'Upgrade to Paid'}
+                    </button>
+                  ) : null}
+
+                  {errorMessage ? <p className={styles.errorMessage}>{errorMessage}</p> : null}
+                </>
+              ) : null}
+            </div>
+
             <div className={styles.saveRow}>
               <button
                 type="button"
                 className={styles.upgradeBtn}
-                disabled={isSavingAbout || isBioOverLimit}
-                onClick={handleSaveAbout}
+                disabled={isSaving || isBioOverLimit}
+                onClick={handleSaveProfile}
               >
-                {isSavingAbout ? 'Saving…' : 'Save'}
+                {isSaving ? 'Saving…' : 'Save'}
               </button>
             </div>
 
-            {aboutError ? <p className={styles.errorMessage}>{aboutError}</p> : null}
-            {aboutSaved && !aboutError ? <p className={styles.savedMessage}>Saved.</p> : null}
+            {saveError ? <p className={styles.errorMessage}>{saveError}</p> : null}
+            {saveSuccess && !saveError ? <p className={styles.savedMessage}>Saved.</p> : null}
 
             {companyName && role !== 'free_users' && role !== 'paid_users' ? (
               <div className={styles.aboutField}>
@@ -758,236 +1130,8 @@ export default function ProfilePage(): React.JSX.Element {
               </div>
             ) : null}
           </div>
-
-          <div className={styles.card}>
-            <h2 className={styles.sectionHeading}>Skills & Technologies</h2>
-
-            {taxonomyError ? (
-              <p className={styles.errorMessage}>{taxonomyError}</p>
-            ) : (
-              <>
-                <div className={styles.formField}>
-                  <span className={styles.formLabel}>Designation</span>
-                  <div className={styles.designationRow}>
-                    <select
-                      className={styles.formSelect}
-                      value={designationDomainId}
-                      onChange={(e) => handleDesignationDomainChange(e.target.value)}
-                    >
-                      <option value="">Select a domain…</option>
-                      {(taxonomyCatalog?.domains ?? []).map((domain) => (
-                        <option key={domain.id} value={domain.id}>
-                          {domain.name}
-                        </option>
-                      ))}
-                    </select>
-                    <select
-                      className={styles.formSelect}
-                      value={designationRoleId}
-                      onChange={(e) => handleDesignationRoleChange(e.target.value)}
-                      disabled={!designationDomainId}
-                    >
-                      <option value="">Select a role…</option>
-                      {rolesForSelectedDomain.map((role_) => (
-                        <option key={role_.id} value={role_.id}>
-                          {role_.name}
-                        </option>
-                      ))}
-                    </select>
-                    <select
-                      className={styles.formSelect}
-                      value={designationSeniorityInput}
-                      onChange={(e) => setDesignationSeniorityInput(e.target.value)}
-                      disabled={!designationRoleId}
-                    >
-                      {seniorityOptionsForSelectedRole.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-
-                <div className={styles.formField}>
-                  <span className={styles.formLabel}>Skills</span>
-                  {skillPicks.map((pick) => {
-                    const skill = taxonomyCatalog?.skills.find((s) => s.id === pick.skillId);
-                    return (
-                      <div key={pick.skillId} className={styles.pickRow}>
-                        <span className={styles.pickName}>{skill?.name ?? pick.skillId}</span>
-                        <select
-                          className={styles.pickSelect}
-                          value={pick.proficiency}
-                          onChange={(e) => updateSkillPick(pick.skillId, 'proficiency', e.target.value)}
-                        >
-                          <option value="">Proficiency…</option>
-                          {PROFICIENCY_OPTIONS.map((option) => (
-                            <option key={option} value={option}>
-                              {option}
-                            </option>
-                          ))}
-                        </select>
-                        <input
-                          type="number"
-                          min={0}
-                          className={styles.pickYearsInput}
-                          placeholder="Years"
-                          value={pick.yearsExperience}
-                          onChange={(e) => updateSkillPick(pick.skillId, 'yearsExperience', e.target.value)}
-                        />
-                        <button
-                          type="button"
-                          className={styles.pickRemoveBtn}
-                          onClick={() => removeSkillPick(pick.skillId)}
-                          aria-label={`Remove ${skill?.name ?? 'skill'}`}
-                        >
-                          ✕
-                        </button>
-                      </div>
-                    );
-                  })}
-                  <div className={styles.addItemRow}>
-                    <select
-                      className={styles.formSelect}
-                      value={skillToAdd}
-                      onChange={(e) => setSkillToAdd(e.target.value)}
-                    >
-                      <option value="">Add a skill…</option>
-                      {availableSkills.map((skill) => (
-                        <option key={skill.id} value={skill.id}>
-                          {skill.name}
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      className={styles.addItemBtn}
-                      disabled={!skillToAdd}
-                      onClick={addSkillPick}
-                    >
-                      Add
-                    </button>
-                  </div>
-                </div>
-
-                <div className={styles.formField}>
-                  <span className={styles.formLabel}>Technologies</span>
-                  {technologyPicks.map((pick) => {
-                    const technology = taxonomyCatalog?.technologies.find((t) => t.id === pick.technologyId);
-                    return (
-                      <div key={pick.technologyId} className={styles.pickRow}>
-                        <span className={styles.pickName}>{technology?.name ?? pick.technologyId}</span>
-                        <select
-                          className={styles.pickSelect}
-                          value={pick.proficiency}
-                          onChange={(e) => updateTechnologyPick(pick.technologyId, 'proficiency', e.target.value)}
-                        >
-                          <option value="">Proficiency…</option>
-                          {PROFICIENCY_OPTIONS.map((option) => (
-                            <option key={option} value={option}>
-                              {option}
-                            </option>
-                          ))}
-                        </select>
-                        <input
-                          type="number"
-                          min={0}
-                          className={styles.pickYearsInput}
-                          placeholder="Years"
-                          value={pick.yearsExperience}
-                          onChange={(e) => updateTechnologyPick(pick.technologyId, 'yearsExperience', e.target.value)}
-                        />
-                        <button
-                          type="button"
-                          className={styles.pickRemoveBtn}
-                          onClick={() => removeTechnologyPick(pick.technologyId)}
-                          aria-label={`Remove ${technology?.name ?? 'technology'}`}
-                        >
-                          ✕
-                        </button>
-                      </div>
-                    );
-                  })}
-                  <div className={styles.addItemRow}>
-                    <select
-                      className={styles.formSelect}
-                      value={technologyToAdd}
-                      onChange={(e) => setTechnologyToAdd(e.target.value)}
-                    >
-                      <option value="">Add a technology…</option>
-                      {availableTechnologies.map((technology) => (
-                        <option key={technology.id} value={technology.id}>
-                          {technology.name}
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      className={styles.addItemBtn}
-                      disabled={!technologyToAdd}
-                      onClick={addTechnologyPick}
-                    >
-                      Add
-                    </button>
-                  </div>
-                </div>
-
-                <div className={styles.saveRow}>
-                  <button
-                    type="button"
-                    className={styles.upgradeBtn}
-                    disabled={isSavingSkills}
-                    onClick={handleSaveSkills}
-                  >
-                    {isSavingSkills ? 'Saving…' : 'Save Skills & Technologies'}
-                  </button>
-                </div>
-                {skillsError ? <p className={styles.errorMessage}>{skillsError}</p> : null}
-                {skillsSaved && !skillsError ? <p className={styles.savedMessage}>Saved.</p> : null}
-              </>
-            )}
           </div>
-          </>
-        ) : (
-          <div className={styles.card}>
-            <div className={styles.planRow}>
-              <span className={`${styles.statusBadge} ${isPaidAndActive ? styles.statusPaid : styles.statusFree}`}>
-                {isPaidAndActive ? 'Paid plan' : 'Free plan'}
-              </span>
-            </div>
-
-            {isPaidAndActive && paidUntil ? (
-              <p className={styles.expiry}>
-                Expires {formatDate(paidUntil)}
-                {isExpiringSoon(paidUntil) ? (
-                  <span className={`${styles.statusBadge} ${styles.statusFree}`} style={{ marginLeft: '0.5rem' }}>
-                    Expiring soon
-                  </span>
-                ) : null}
-              </p>
-            ) : null}
-
-            {showUpgradeButton ? (
-              <button
-                type="button"
-                className={styles.upgradeBtn}
-                disabled={isProcessing}
-                onClick={handleUpgrade}
-              >
-                {isProcessing
-                  ? 'Processing…'
-                  : isPaidAndActive
-                    ? 'Renew'
-                    : priceLabel
-                      ? `Upgrade to Paid — ₹${priceLabel}/year`
-                      : 'Upgrade to Paid'}
-              </button>
-            ) : null}
-
-            {errorMessage ? <p className={styles.errorMessage}>{errorMessage}</p> : null}
-          </div>
-        )}
+        </div>
       </div>
 
       {isResumeModalOpen && resumeUrl ? (

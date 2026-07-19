@@ -185,12 +185,12 @@ export default function CsvInviteModal({ open, onClose, onInvited }: CsvInviteMo
                 <tbody>
                   <tr>
                     <td>Jane Doe</td>
-                    <td>jane.doe@acme.com</td>
+                    <td>jane.doe@anorganization.com</td>
                     <td>company_hr</td>
                   </tr>
                   <tr>
                     <td>John Smith</td>
-                    <td>john.smith@acme.com</td>
+                    <td>john.smith@anorganization.com</td>
                     <td>company_employees</td>
                   </tr>
                 </tbody>
@@ -206,7 +206,7 @@ export default function CsvInviteModal({ open, onClose, onInvited }: CsvInviteMo
               className={styles.textInput}
               value={companyName}
               onChange={(e) => setCompanyName(e.target.value)}
-              placeholder="Acme Inc."
+              placeholder="Company Name"
               list="csv-invite-company-options"
               disabled={sending}
             />

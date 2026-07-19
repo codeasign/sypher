@@ -101,7 +101,8 @@ export default function MockInterviewPage(): React.JSX.Element {
 
   useEffect(() => {
     if (user?.email) {
-      setFields((prev) => (prev.email === user.email ? prev : { ...prev, email: user.email }));
+      const email = user.email;
+      setFields((prev) => (prev.email === email ? prev : { ...prev, email }));
     }
   }, [user?.email]);
 

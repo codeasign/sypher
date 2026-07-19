@@ -32,6 +32,9 @@ interface AuthContextValue {
   socialLinks: SocialLinks;
   designationId: string | null;
   designationSeniority: SeniorityLevel | null;
+  categoryDomainId: string | null;
+  categoryRoleId: string | null;
+  currentLocationId: string | null;
   loading: boolean;
   refreshProfile: () => Promise<void>;
   signInWithGoogle: (redirectTo?: string) => Promise<{ error: string | null }>;
@@ -74,6 +77,9 @@ const AuthContext = createContext<AuthContextValue>({
   socialLinks: {},
   designationId: null,
   designationSeniority: null,
+  categoryDomainId: null,
+  categoryRoleId: null,
+  currentLocationId: null,
   loading: true,
   refreshProfile: async () => {},
   signInWithGoogle: async () => ({ error: NOT_CONFIGURED_ERROR }),
@@ -112,6 +118,9 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
   const [socialLinks, setSocialLinks] = useState<SocialLinks>({});
   const [designationId, setDesignationId] = useState<string | null>(null);
   const [designationSeniority, setDesignationSeniority] = useState<SeniorityLevel | null>(null);
+  const [categoryDomainId, setCategoryDomainId] = useState<string | null>(null);
+  const [categoryRoleId, setCategoryRoleId] = useState<string | null>(null);
+  const [currentLocationId, setCurrentLocationId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -148,6 +157,9 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
             setSocialLinks({});
             setDesignationId(null);
             setDesignationSeniority(null);
+            setCategoryDomainId(null);
+            setCategoryRoleId(null);
+            setCurrentLocationId(null);
           }
           return;
         }
@@ -167,6 +179,9 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
           setSocialLinks((profile?.social_links as SocialLinks) ?? {});
           setDesignationId(profile?.designation_id ?? null);
           setDesignationSeniority((profile?.designation_seniority as SeniorityLevel) ?? null);
+          setCategoryDomainId(profile?.category_domain_id ?? null);
+          setCategoryRoleId(profile?.category_role_id ?? null);
+          setCurrentLocationId(profile?.current_location_id ?? null);
         }
       } else if (isMounted) {
         setRole(null);
@@ -184,6 +199,9 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
         setSocialLinks({});
         setDesignationId(null);
         setDesignationSeniority(null);
+        setCategoryDomainId(null);
+        setCategoryRoleId(null);
+        setCurrentLocationId(null);
       }
       currentUserId = newSession?.user.id ?? null;
       if (isMounted) {
@@ -239,6 +257,9 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
     setSocialLinks((profile.social_links as SocialLinks) ?? {});
     setDesignationId(profile.designation_id ?? null);
     setDesignationSeniority((profile.designation_seniority as SeniorityLevel) ?? null);
+    setCategoryDomainId(profile.category_domain_id ?? null);
+    setCategoryRoleId(profile.category_role_id ?? null);
+    setCurrentLocationId(profile.current_location_id ?? null);
   }
 
   async function signInWithGoogle(redirectTo = '/dashboard'): Promise<{ error: string | null }> {
@@ -297,6 +318,9 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
     socialLinks,
     designationId,
     designationSeniority,
+    categoryDomainId,
+    categoryRoleId,
+    currentLocationId,
     loading,
     refreshProfile,
     signInWithGoogle,
