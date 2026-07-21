@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
 import { listDocBookmarks, addDocBookmark, removeDocBookmark } from '@/data/docBookmarks';
+import { trackEvent } from '@/lib/analytics';
 
 export function useDocBookmarks() {
   const { supabase, user } = useAuth();
@@ -29,6 +30,7 @@ export function useDocBookmarks() {
     async (docPath, { courseSlug, title } = {}) => {
       if (!supabase || !user) return;
       const alreadyBookmarked = bookmarks.some((b) => b.doc_path === docPath);
+      trackEvent('bookmark_doc_toggle', { doc_path: docPath, action: alreadyBookmarked ? 'remove' : 'add' });
       setBookmarks((prev) =>
         alreadyBookmarked
           ? prev.filter((b) => b.doc_path !== docPath)

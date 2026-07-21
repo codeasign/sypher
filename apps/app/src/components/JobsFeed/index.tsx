@@ -16,6 +16,7 @@ import {
 import { fetchTaxonomy } from '@/data/taxonomy';
 import { WORK_MODE_LABEL } from '@/types/workMode';
 import { JobsIcon } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 interface Branding {
@@ -138,6 +139,10 @@ export default function JobsFeed(): React.JSX.Element {
   const { data: jobsTabCount = 0 } = useSWR(countKey, () => countAvailableJobs(supabase, excludeForCount));
 
   useEffect(() => {
+    trackEvent('jobs_page_view');
+  }, []);
+
+  useEffect(() => {
     setPage(1);
   }, [activeTab]);
 
@@ -181,6 +186,7 @@ export default function JobsFeed(): React.JSX.Element {
   }, [jobs]);
 
   function handleDomainFilterChange(domainId: string): void {
+    trackEvent('jobs_domain_filter_change', { domain: domainId });
     setDomainFilter(domainId);
     setPage(1);
   }
@@ -188,6 +194,7 @@ export default function JobsFeed(): React.JSX.Element {
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
 
   async function handleApply(jobId: string): Promise<void> {
+    trackEvent('job_apply_click', { job_id: jobId });
     setApplyingId(jobId);
     setError(null);
     const { error: applyError } = await applyToJob(supabase, jobId);
@@ -200,9 +207,10 @@ export default function JobsFeed(): React.JSX.Element {
   }
 
   async function handleSaveToggle(jobId: string): Promise<void> {
+    const isSaved = savedIds.has(jobId);
+    trackEvent(isSaved ? 'job_unsave_click' : 'job_save_click', { job_id: jobId });
     setSavingId(jobId);
     setError(null);
-    const isSaved = savedIds.has(jobId);
     const { error: saveError } = isSaved ? await unsaveJob(supabase, jobId) : await saveJob(supabase, jobId);
     setSavingId(null);
     if (saveError) {
@@ -247,21 +255,30 @@ export default function JobsFeed(): React.JSX.Element {
         <button
           type="button"
           className={activeTab === 'jobs' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-          onClick={() => setActiveTab('jobs')}
+          onClick={() => {
+            trackEvent('jobs_tab_switch', { tab: 'jobs' });
+            setActiveTab('jobs');
+          }}
         >
           Jobs ({jobsTabCount})
         </button>
         <button
           type="button"
           className={activeTab === 'saved' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-          onClick={() => setActiveTab('saved')}
+          onClick={() => {
+            trackEvent('jobs_tab_switch', { tab: 'saved' });
+            setActiveTab('saved');
+          }}
         >
           Saved For Later ({Array.from(savedIds).filter((id) => !appliedIds.has(id)).length})
         </button>
         <button
           type="button"
           className={activeTab === 'applied' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-          onClick={() => setActiveTab('applied')}
+          onClick={() => {
+            trackEvent('jobs_tab_switch', { tab: 'applied' });
+            setActiveTab('applied');
+          }}
         >
           Applied ({appliedIds.size})
         </button>
@@ -285,6 +302,7 @@ export default function JobsFeed(): React.JSX.Element {
               className={styles.filterSelect}
               value={employmentFilter}
               onChange={(e) => {
+                trackEvent('jobs_employment_filter_change', { employment_type: e.target.value });
                 setEmploymentFilter(e.target.value);
                 setPage(1);
               }}
@@ -318,7 +336,10 @@ export default function JobsFeed(): React.JSX.Element {
                       key={job.id}
                       type="button"
                       className={clsx(styles.listItem, job.id === selectedId && styles.listItemActive)}
-                      onClick={() => setSelectedId(job.id)}
+                      onClick={() => {
+                        trackEvent('job_select_view', { job_id: job.id });
+                        setSelectedId(job.id);
+                      }}
                     >
                       <div className={styles.listItemRow}>
                         {job.branding?.logo_url ? (
@@ -354,7 +375,10 @@ export default function JobsFeed(): React.JSX.Element {
                   <button
                     type="button"
                     className={styles.pageBtn}
-                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    onClick={() => {
+                      trackEvent('jobs_pagination_click', { direction: 'prev', page: page - 1 });
+                      setPage((p) => Math.max(1, p - 1));
+                    }}
                     disabled={page <= 1}
                   >
                     Prev
@@ -365,7 +389,10 @@ export default function JobsFeed(): React.JSX.Element {
                   <button
                     type="button"
                     className={styles.pageBtn}
-                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    onClick={() => {
+                      trackEvent('jobs_pagination_click', { direction: 'next', page: page + 1 });
+                      setPage((p) => Math.min(totalPages, p + 1));
+                    }}
                     disabled={page >= totalPages}
                   >
                     Next

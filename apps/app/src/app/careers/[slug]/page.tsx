@@ -41,6 +41,7 @@ export default async function JobPostPage({
   return (
     <div className={styles.page}>
       <JobPostArticle
+        slug={slug}
         title={post.title}
         companyName={post.company_name}
         description={post.description}

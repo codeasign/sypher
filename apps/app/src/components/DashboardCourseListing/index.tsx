@@ -3,6 +3,7 @@
 import React, { useState } from 'react';
 import CourseSlidePanel from '@/components/CourseSlidePanel';
 import { getDocsOrigin } from '@sypher/auth-core/src/urls';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 interface CourseData {
@@ -53,7 +54,11 @@ function DashboardCourseCard({
       <p className={styles.cardDesc}>{description}</p>
       {isFree && (
         <div className={styles.cardActions}>
-          <a href={`${getDocsOrigin()}/docs/${docsSlug ?? slug}/`} className={styles.btnPrimary}>
+          <a
+            href={`${getDocsOrigin()}/docs/${docsSlug ?? slug}/`}
+            className={styles.btnPrimary}
+            onClick={() => trackEvent('course_learn_click', { slug })}
+          >
             Learn →
           </a>
           <button
@@ -106,15 +111,24 @@ function DashboardCourseCard({
 
 interface DashboardCourseListingProps {
   courses: CourseData[];
+  // 'home' = public, pre-login catalog (a different funnel question --
+  // "what hooks a visitor before they sign up" -- than 'dashboard's
+  // logged-in browsing), so it gets its own event name.
+  trackingContext?: 'dashboard' | 'home';
 }
 
 export default function DashboardCourseListing({
   courses,
+  trackingContext = 'dashboard',
 }: DashboardCourseListingProps) {
   const [selectedCourse, setSelectedCourse] = useState<CourseData | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
 
   function handleOpenPanel(course: CourseData) {
+    trackEvent(trackingContext === 'home' ? 'home_course_card_click' : 'course_card_click', {
+      slug: course.slug,
+      is_free: course.isFree,
+    });
     setSelectedCourse(course);
     setPanelOpen(true);
   }

@@ -19,6 +19,7 @@ interface AuthContextValue {
   user: User | null;
   role: Role | null;
   companyName: string | null;
+  signupSource: string | null;
   paidUntil: string | null;
   fullName: string | null;
   bio: string | null;
@@ -67,6 +68,7 @@ const AuthContext = createContext<AuthContextValue>({
   user: null,
   role: null,
   companyName: null,
+  signupSource: null,
   paidUntil: null,
   fullName: null,
   bio: null,
@@ -111,6 +113,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
   const [session, setSession] = useState<Session | null>(null);
   const [role, setRole] = useState<Role | null>(null);
   const [companyName, setCompanyName] = useState<string | null>(null);
+  const [signupSource, setSignupSource] = useState<string | null>(null);
   const [paidUntil, setPaidUntil] = useState<string | null>(null);
   const [fullName, setFullName] = useState<string | null>(null);
   const [bio, setBio] = useState<string | null>(null);
@@ -153,6 +156,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
             setSession(null);
             setRole(null);
             setCompanyName(null);
+            setSignupSource(null);
             setPaidUntil(null);
             setFullName(null);
             setBio(null);
@@ -178,6 +182,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
         if (isMounted) {
           setRole((profile?.role as Role) ?? null);
           setCompanyName(profile?.company_name ?? null);
+          setSignupSource(profile?.signup_source ?? null);
           setPaidUntil(profile?.paid_until ?? null);
           setFullName(profile?.full_name ?? null);
           setBio(profile?.bio ?? null);
@@ -201,6 +206,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
       } else if (isMounted) {
         setRole(null);
         setCompanyName(null);
+        setSignupSource(null);
         setPaidUntil(null);
         setFullName(null);
         setBio(null);
@@ -262,6 +268,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
     if (!profile) return;
     setRole((profile.role as Role) ?? null);
     setCompanyName(profile.company_name ?? null);
+    setSignupSource(profile.signup_source ?? null);
     setPaidUntil(profile.paid_until ?? null);
     setFullName(profile.full_name ?? null);
     setBio(profile.bio ?? null);
@@ -326,6 +333,7 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
     user: session?.user ?? null,
     role,
     companyName,
+    signupSource,
     paidUntil,
     fullName,
     bio,

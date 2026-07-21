@@ -11,6 +11,7 @@ import { useVisibleNavSections } from '@/hooks/useVisibleNavSections';
 import { ROLES } from '@/types/roles';
 import type { Role } from '@/types/roles';
 import { DashboardIcon, BookmarkIcon, LogoutIcon, ProfileIcon, NAV_ICONS_BY_KEY } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 function getRoleLabel(role: Role | null): string {
@@ -54,7 +55,7 @@ export default function DashboardSidebar({
 }: DashboardSidebarProps): React.JSX.Element {
   const pathname = usePathname();
   const { role, paidUntil, signOut } = useAuth();
-  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid();
+  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid('sidebar');
   const { sections: accessGatedSections } = useVisibleNavSections();
   const email = user?.email ?? '';
   const metadata = (user?.user_metadata ?? {}) as {
@@ -86,7 +87,7 @@ export default function DashboardSidebar({
     return pathname === href || pathname.startsWith(`${href}/`);
   }
 
-  function renderNavItem({ key, href, label, icon: Icon, comingSoon }: NavItem): React.JSX.Element {
+  function renderNavItem({ key, href, label, icon: Icon, comingSoon }: NavItem, section = 'Footer'): React.JSX.Element {
     return (
       <Link
         key={key ?? href}
@@ -96,7 +97,13 @@ export default function DashboardSidebar({
           isActive(href) && !comingSoon && styles.navItemActive,
           comingSoon && styles.navItemComingSoon,
         )}
-        onClick={comingSoon ? (e) => e.preventDefault() : undefined}
+        onClick={(e) => {
+          if (comingSoon) {
+            e.preventDefault();
+            return;
+          }
+          trackEvent('sidebar_nav_click', { item_key: key ?? href, section });
+        }}
         role={comingSoon ? 'link' : undefined}
         aria-disabled={comingSoon ? true : undefined}
       >
@@ -115,7 +122,7 @@ export default function DashboardSidebar({
     return (
       <div key={title} className={styles.section}>
         {!collapsed && <span className={styles.sectionHeader}>{title}</span>}
-        {items.map(renderNavItem)}
+        {items.map((item) => renderNavItem(item, title))}
       </div>
     );
   }
@@ -125,7 +132,10 @@ export default function DashboardSidebar({
       <button
         type="button"
         className={styles.toggle}
-        onClick={onToggleCollapsed}
+        onClick={() => {
+          trackEvent('sidebar_collapse_toggle', { collapsed: !collapsed });
+          onToggleCollapsed();
+        }}
         aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
       >
         {collapsed ? '▶' : '◀'}
@@ -178,6 +188,7 @@ export default function DashboardSidebar({
           type="button"
           className={clsx(styles.navItem, styles.logoutButton)}
           onClick={async () => {
+            trackEvent('logout_click');
             await signOut();
             window.location.href = '/login';
           }}

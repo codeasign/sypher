@@ -10,6 +10,7 @@ import {
   saveConversionRate,
   saveCreditPack,
 } from '@/data/featureCredits';
+import { trackEvent } from '@/lib/analytics';
 import manageAccessStyles from '@/app/manage-access/manage-access.module.css';
 import styles from './styles.module.css';
 
@@ -135,6 +136,7 @@ export default function ResumeMockCreditsTab(): React.JSX.Element {
     const { error: saveError } = await savePlanFeatureDefault(supabase, role, resume, mock);
     setFieldErrors((prev) => ({ ...prev, [`default:${role}`]: saveError ?? '' }));
     setSaveStatus((prev) => ({ ...prev, [`default:${role}`]: saveError ? 'error' : 'saved' }));
+    trackEvent('manageaccess_credit_config_save', { config: 'plan_default', role, success: !saveError });
   }
 
   function handleRateChange(feature: string, value: number): void {
@@ -147,6 +149,7 @@ export default function ResumeMockCreditsTab(): React.JSX.Element {
     const { error: saveError } = await saveConversionRate(supabase, feature, rates[feature]);
     setFieldErrors((prev) => ({ ...prev, [`rate:${feature}`]: saveError ?? '' }));
     setSaveStatus((prev) => ({ ...prev, [`rate:${feature}`]: saveError ? 'error' : 'saved' }));
+    trackEvent('manageaccess_credit_config_save', { config: 'conversion_rate', feature, success: !saveError });
   }
 
   function handlePackChange(tier: string, field: keyof PackDraft, value: string | number | boolean): void {
@@ -159,6 +162,7 @@ export default function ResumeMockCreditsTab(): React.JSX.Element {
     const { error: saveError } = await saveCreditPack(supabase, tier, packs[tier]);
     setFieldErrors((prev) => ({ ...prev, [`pack:${tier}`]: saveError ?? '' }));
     setSaveStatus((prev) => ({ ...prev, [`pack:${tier}`]: saveError ? 'error' : 'saved' }));
+    trackEvent('manageaccess_credit_config_save', { config: 'credit_pack', tier, success: !saveError });
   }
 
   async function handleLookupOverride(): Promise<void> {
@@ -192,6 +196,7 @@ export default function ResumeMockCreditsTab(): React.JSX.Element {
     );
     setFieldErrors((prev) => ({ ...prev, override: saveError ?? '' }));
     setSaveStatus((prev) => ({ ...prev, override: saveError ? 'error' : 'saved' }));
+    trackEvent('manageaccess_credit_config_save', { config: 'user_override', success: !saveError });
   }
 
   if (loading) {

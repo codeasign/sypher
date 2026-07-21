@@ -12,6 +12,7 @@ import type { Role } from '@/types/roles';
 import { SIGNUP_SOURCES } from '@/types/signupSource';
 import type { SignupSource } from '@/types/signupSource';
 import { UsersIcon as UsersHeaderIcon } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import styles from './manage-users.module.css';
 
 /* ── Types ── */
@@ -277,6 +278,10 @@ function ManageUsersContent(): React.JSX.Element {
     fetchUsers();
   }, [fetchUsers]);
 
+  useEffect(() => {
+    trackEvent('manageusers_page_view');
+  }, []);
+
   async function handleRoleChange(profile: Profile, nextRole: Role): Promise<void> {
     const prevRole = profile.role;
     setUsers((prev) => prev.map((u) => (u.id === profile.id ? { ...u, role: nextRole } : u)));
@@ -294,6 +299,7 @@ function ManageUsersContent(): React.JSX.Element {
     if (!editingProfile) return;
     try {
       await handleRoleChange(editingProfile, nextRole);
+      trackEvent('manageusers_role_save', { new_role: nextRole });
       setEditingProfile(null);
     } catch {
       // error is surfaced inline on the row via rowErrors; keep the modal open
@@ -303,6 +309,7 @@ function ManageUsersContent(): React.JSX.Element {
   async function confirmDelete(): Promise<void> {
     if (!pendingDelete) return;
     const target = pendingDelete;
+    trackEvent('manageusers_delete_confirm');
     setPendingDelete(null);
 
     const { error: deleteError } = await softDeleteProfile(supabase, target.id);
@@ -370,7 +377,14 @@ function ManageUsersContent(): React.JSX.Element {
             </p>
           </div>
         </div>
-        <button type="button" className={styles.inviteBtn} onClick={() => setInviteModalOpen(true)}>
+        <button
+          type="button"
+          className={styles.inviteBtn}
+          onClick={() => {
+            trackEvent('manageusers_invite_click');
+            setInviteModalOpen(true);
+          }}
+        >
           Invite Employees
         </button>
       </div>
@@ -409,14 +423,20 @@ function ManageUsersContent(): React.JSX.Element {
             className={styles.searchInput}
             placeholder="Search by name or email..."
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => {
+              setSearchQuery(e.target.value);
+              trackEvent('manageusers_search', { query_length: e.target.value.length });
+            }}
             style={{ paddingLeft: '2rem', width: '50%' }}
           />
         </div>
         <select
           className={styles.filterSelect}
           value={roleFilter}
-          onChange={(e) => setRoleFilter(e.target.value as 'all' | Role)}
+          onChange={(e) => {
+            setRoleFilter(e.target.value as 'all' | Role);
+            trackEvent('manageusers_role_filter_change', { role: e.target.value });
+          }}
           aria-label="Filter by role"
         >
           <option value="all">All Roles</option>

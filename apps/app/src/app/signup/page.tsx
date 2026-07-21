@@ -1,17 +1,22 @@
 'use client';
 
-import React, { Suspense, useState } from 'react';
+import React, { Suspense, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import OAuthButtons from '@/components/OAuthButtons';
 import RedirectIfAuthed from '@/components/RedirectIfAuthed';
 import { getSafeRedirect } from '@/utils/safeRedirect';
+import { trackEvent } from '@/lib/analytics';
 import styles from '../auth.module.css';
 
 function SignUpForm(): React.JSX.Element {
   const [errorMessage, setErrorMessage] = useState('');
   const searchParams = useSearchParams();
   const redirectTarget = getSafeRedirect(searchParams.get('redirect'));
+
+  useEffect(() => {
+    trackEvent('signup_page_view', { referrer: typeof document !== 'undefined' ? document.referrer : '' });
+  }, []);
 
   return (
     <div className={styles.card}>
@@ -20,6 +25,7 @@ function SignUpForm(): React.JSX.Element {
 
       <OAuthButtons
         redirectTo={redirectTarget}
+        context="signup"
         onError={(message) => setErrorMessage(message)}
       />
 

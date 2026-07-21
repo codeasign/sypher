@@ -3,8 +3,9 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import DashboardLayout from '@/components/DashboardLayout';
 import { useAuth } from '@/contexts/AuthContext';
+import { useUpgradeToPaid } from '@/hooks/useUpgradeToPaid';
+import { useBuyCreditPack } from '@/hooks/useBuyCreditPack';
 import { fetchFeatureStatus, consumeFeature, fetchCreditPacks } from '@/data/featureCredits';
-import { createRazorpayOrder, createCreditPackOrder, verifyRazorpayPayment, loadRazorpayCheckout } from '@/data/payments';
 import {
   MOCK_INTERVIEW_EXPERIENCE_OPTIONS as EXPERIENCE_OPTIONS,
   MOCK_INTERVIEW_TYPE_OPTIONS as INTERVIEW_TYPE_OPTIONS,
@@ -15,6 +16,7 @@ import {
   submitToWeb3Forms,
 } from '@sypher/career-tools';
 import { InterviewIcon } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import styles from '@/styles/careerForm.module.css';
 
 interface FeatureStatus {
@@ -62,18 +64,14 @@ const TIER_ICON: Record<string, string> = {
 };
 
 export default function MockInterviewPage(): React.JSX.Element {
-  const razorpayKeyId = process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID;
-  const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL;
   const paidUpgradePriceInrPaise = process.env.NEXT_PUBLIC_PAID_UPGRADE_PRICE_INR_PAISE;
 
-  const { supabase, user, session, role, refreshProfile } = useAuth();
+  const { supabase, user, role } = useAuth();
 
   const [statusLoading, setStatusLoading] = useState(true);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [featureStatus, setFeatureStatus] = useState<FeatureStatus | null>(null);
   const [packs, setPacks] = useState<CreditPack[]>([]);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [paymentError, setPaymentError] = useState<string | null>(null);
 
   const [fields, setFields] = useState(initialFields);
   const [formStatus, setFormStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
@@ -99,6 +97,21 @@ export default function MockInterviewPage(): React.JSX.Element {
   useEffect(() => {
     loadStatus();
   }, [loadStatus]);
+
+  useEffect(() => {
+    trackEvent('mock_interview_page_view');
+  }, []);
+
+  const { handleUpgrade, isProcessing: isUpgradeProcessing, errorMessage: upgradeError } = useUpgradeToPaid(
+    'mock_interview',
+    loadStatus
+  );
+  const { handleBuyPack, isProcessing: isPackProcessing, errorMessage: packError } = useBuyCreditPack(
+    'mock_interview',
+    loadStatus
+  );
+  const isProcessing = isUpgradeProcessing || isPackProcessing;
+  const paymentError = upgradeError ?? packError;
 
   useEffect(() => {
     if (user?.email) {
@@ -148,89 +161,15 @@ export default function MockInterviewPage(): React.JSX.Element {
         return;
       }
 
+      trackEvent('mock_interview_form_submit', {
+        used_included: (featureStatus?.mockInterview.remainingIncluded ?? 0) > 0,
+      });
       setFormStatus('success');
       setFields({ ...initialFields, email: user?.email ?? '' });
       await loadStatus();
     } catch {
       setFormStatus('error');
       setFormErrorMessage('Something went wrong. Please check your connection and try again.');
-    }
-  }
-
-  async function handleUpgrade(): Promise<void> {
-    if (!session?.access_token) return;
-    setPaymentError(null);
-    setIsProcessing(true);
-    try {
-      const Razorpay = await loadRazorpayCheckout();
-      const order = await createRazorpayOrder(session.access_token, apiBaseUrl);
-      const checkout = new Razorpay({
-        key: razorpayKeyId,
-        order_id: order.orderId,
-        amount: order.amount,
-        currency: order.currency,
-        name: 'Sypher',
-        description: 'Paid plan — 1 year',
-        prefill: { email: user?.email ?? '' },
-        handler: async (response: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) => {
-          try {
-            await verifyRazorpayPayment(session.access_token, response, apiBaseUrl);
-            await refreshProfile();
-            await loadStatus();
-          } catch (err) {
-            setPaymentError(err instanceof Error ? err.message : 'Payment verification failed');
-          } finally {
-            setIsProcessing(false);
-          }
-        },
-        modal: { ondismiss: () => setIsProcessing(false) },
-      });
-      checkout.on('payment.failed', () => {
-        setPaymentError('Payment failed — please try again.');
-        setIsProcessing(false);
-      });
-      checkout.open();
-    } catch (err) {
-      setPaymentError(err instanceof Error ? err.message : 'Something went wrong');
-      setIsProcessing(false);
-    }
-  }
-
-  async function handleBuyPack(tier: string): Promise<void> {
-    if (!session?.access_token) return;
-    setPaymentError(null);
-    setIsProcessing(true);
-    try {
-      const Razorpay = await loadRazorpayCheckout();
-      const order = await createCreditPackOrder(session.access_token, tier, apiBaseUrl);
-      const checkout = new Razorpay({
-        key: razorpayKeyId,
-        order_id: order.orderId,
-        amount: order.amount,
-        currency: order.currency,
-        name: 'Sypher',
-        description: `Credit pack — ${tier}`,
-        prefill: { email: user?.email ?? '' },
-        handler: async (response: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) => {
-          try {
-            await verifyRazorpayPayment(session.access_token, response, apiBaseUrl);
-            await loadStatus();
-          } catch (err) {
-            setPaymentError(err instanceof Error ? err.message : 'Payment verification failed');
-          } finally {
-            setIsProcessing(false);
-          }
-        },
-        modal: { ondismiss: () => setIsProcessing(false) },
-      });
-      checkout.on('payment.failed', () => {
-        setPaymentError('Payment failed — please try again.');
-        setIsProcessing(false);
-      });
-      checkout.open();
-    } catch (err) {
-      setPaymentError(err instanceof Error ? err.message : 'Something went wrong');
-      setIsProcessing(false);
     }
   }
 
@@ -475,7 +414,7 @@ export default function MockInterviewPage(): React.JSX.Element {
                             type="button"
                             className={`${styles.packBuyBtn} ${accentClass}`}
                             disabled={isProcessing}
-                            onClick={() => handleBuyPack(pack.tier)}
+                            onClick={() => handleBuyPack(pack.tier, pack.price_paise)}
                           >
                             {isProcessing ? 'Processing…' : packPriceLabel}
                           </button>

@@ -17,6 +17,7 @@ import DashboardCourseListing from '@/components/DashboardCourseListing';
 import EmptySection from '@/components/EmptySection';
 import { FULL_DASHBOARD_ROLES, ROLES } from '@/types/roles';
 import { DashboardIcon, BookmarkIcon, CoursesIcon, PlanIcon, UsersIcon, NAV_ICONS_BY_KEY } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import styles from './dashboard.module.css';
 
 interface RoleCount {
@@ -53,7 +54,7 @@ function formatRelativeTime(iso: string): string {
 // (Manage Access, Applicants, Add Job Post, ...), not this learner view.
 function LearnerDashboardContent(): React.JSX.Element {
   const { supabase, role, paidUntil, fullName } = useAuth();
-  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid();
+  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid('dashboard');
   const { bookmarkedSlugs, loading: courseBookmarksLoading } = useBookmarks();
   const { bookmarks: docBookmarks, loading: docBookmarksLoading } = useDocBookmarks();
   const { sections: visibleNavSections } = useVisibleNavSections();
@@ -81,6 +82,10 @@ function LearnerDashboardContent(): React.JSX.Element {
     .flatMap((section) => section.items)
     .filter((item) => !item.comingSoon);
 
+  useEffect(() => {
+    trackEvent('dashboard_view');
+  }, []);
+
   return (
     <>
       <div className={styles.header}>
@@ -103,14 +108,26 @@ function LearnerDashboardContent(): React.JSX.Element {
             {isPaidAndActive ? 'Paid' : 'Free'}
           </span>
           {!isPaidAndActive && (
-            <button type="button" className={styles.statCardAction} disabled={isProcessing} onClick={handleUpgrade}>
+            <button
+              type="button"
+              className={styles.statCardAction}
+              disabled={isProcessing}
+              onClick={() => {
+                trackEvent('plan_card_go_pro_click');
+                handleUpgrade();
+              }}
+            >
               {isProcessing ? 'Processing…' : 'Go Pro'}
             </button>
           )}
           {errorMessage && <span className={styles.statCardError}>{errorMessage}</span>}
         </div>
 
-        <Link href="/bookmarks" className={styles.statCardLink}>
+        <Link
+          href="/bookmarks"
+          className={styles.statCardLink}
+          onClick={() => trackEvent('bookmarks_card_click')}
+        >
           <div className={styles.statCardTop}>
             <BookmarkIcon />
             <span className={styles.statCardLabel}>Bookmarks</span>
@@ -185,6 +202,10 @@ function AdminDashboardContent(): React.JSX.Element {
 
   const totalUsers = roleCounts.reduce((sum, r) => sum + Number(r.user_count), 0);
 
+  useEffect(() => {
+    trackEvent('admin_dashboard_view');
+  }, []);
+
   return (
     <>
       <div className={styles.header}>
@@ -258,6 +279,10 @@ function AdminDashboardContent(): React.JSX.Element {
 }
 
 function EmptyDashboardSection(): React.JSX.Element {
+  useEffect(() => {
+    trackEvent('empty_dashboard_view');
+  }, []);
+
   return (
     <>
       <div className={styles.header}>

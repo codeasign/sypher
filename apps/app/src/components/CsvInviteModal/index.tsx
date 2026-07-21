@@ -4,6 +4,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import Papa from 'papaparse';
 import { useAuth } from '@/contexts/AuthContext';
 import { distinctCompanyNames, bulkInviteFromCsv } from '@/data/pendingInvites';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 const INVITABLE_ROLES = ['company_hr', 'company_employees'];
@@ -108,6 +109,7 @@ export default function CsvInviteModal({ open, onClose, onInvited }: CsvInviteMo
   async function handleSendInvites(): Promise<void> {
     if (!canSend) return;
     setSending(true);
+    trackEvent('manageusers_invite_submit', { row_count: validRows.length });
     try {
       const outcome = await bulkInviteFromCsv(supabase, {
         rows: validRows,
@@ -116,14 +118,26 @@ export default function CsvInviteModal({ open, onClose, onInvited }: CsvInviteMo
       });
       onInvited();
 
-      const hasErrors = (outcome as InviteResult[]).some((r) => r.outcome === 'error');
+      const results = outcome as InviteResult[];
+      trackEvent('manageusers_invite_result', {
+        invited_count: results.filter((r) => r.outcome === 'invited').length,
+        updated_count: results.filter((r) => r.outcome === 'updated_existing').length,
+        error_count: results.filter((r) => r.outcome === 'error').length,
+      });
+
+      const hasErrors = results.some((r) => r.outcome === 'error');
       if (hasErrors) {
-        setResults(outcome as InviteResult[]);
+        setResults(results);
       } else {
         handleClose();
         return;
       }
     } catch (err) {
+      trackEvent('manageusers_invite_result', {
+        invited_count: 0,
+        updated_count: 0,
+        error_count: validRows.length,
+      });
       setResults(
         validRows.map((row) => ({
           email: row.email,

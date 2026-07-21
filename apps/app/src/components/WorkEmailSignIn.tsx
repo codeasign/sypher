@@ -2,6 +2,7 @@
 
 import React, { useState } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
+import { trackEvent } from '@/lib/analytics';
 import styles from './WorkEmailSignIn.module.css';
 
 export default function WorkEmailSignIn({
@@ -18,6 +19,7 @@ export default function WorkEmailSignIn({
     event.preventDefault();
     if (!email.trim()) return;
 
+    trackEvent('work_email_submit');
     setStatus('checking');
     const { error, status: resultStatus } = await signInWithWorkEmail(email, redirectTo);
 
@@ -27,6 +29,8 @@ export default function WorkEmailSignIn({
       return;
     }
 
+    if (resultStatus === 'sent') trackEvent('magic_link_sent');
+    if (resultStatus === 'not_recognized') trackEvent('magic_link_not_recognized');
     setStatus(resultStatus);
   }
 

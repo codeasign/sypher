@@ -48,6 +48,7 @@ export default async function BlogPostPage({
   return (
     <div className={styles.page}>
       <BlogPostArticle
+        slug={slug}
         title={post.title}
         content={post.content}
         coverImageUrl={post.cover_image_url}

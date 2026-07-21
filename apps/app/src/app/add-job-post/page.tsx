@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import useSWR from 'swr';
 import DashboardLayout from '@/components/DashboardLayout';
 import RequireNavAccess from '@/components/RequireNavAccess';
@@ -9,6 +9,7 @@ import JobPostEditor from '@/components/JobPostEditor';
 import { useAuth } from '@/contexts/AuthContext';
 import { listJobPosts, listJobPostsByCreator, getJobPostById, deleteJobPost } from '@/data/jobPosts';
 import { JobPostIcon } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import styles from './add-job-post.module.css';
 
 interface JobPostSummary {
@@ -117,7 +118,12 @@ function AddJobPostContent(): React.JSX.Element {
       ? 'Failed to load job posts.'
       : null);
 
+  useEffect(() => {
+    trackEvent('jobpost_page_view');
+  }, []);
+
   async function openEdit(summary: JobPostSummary): Promise<void> {
+    trackEvent('jobpost_edit_click', { job_id: summary.id });
     const full = await getJobPostById(supabase, summary.id);
     if (full) {
       setEditingPost(full);
@@ -126,6 +132,7 @@ function AddJobPostContent(): React.JSX.Element {
   }
 
   function openNew(): void {
+    trackEvent('jobpost_create_click');
     setEditingPost(null);
     setMode('new');
   }
@@ -143,6 +150,7 @@ function AddJobPostContent(): React.JSX.Element {
   async function confirmDelete(): Promise<void> {
     if (!pendingDelete) return;
     const target = pendingDelete;
+    trackEvent('jobpost_delete_confirm', { job_id: target.id });
     setPendingDelete(null);
     setActionError(null);
     const { error: deleteError } = await deleteJobPost(supabase, target.id);

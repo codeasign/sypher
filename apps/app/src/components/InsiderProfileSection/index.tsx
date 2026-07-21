@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 function RabbitScene(): React.JSX.Element {
@@ -134,7 +135,12 @@ function NestScene(): React.JSX.Element {
   );
 }
 
-const SCENES: (() => React.JSX.Element)[] = [RabbitScene, DogCatScene, SpaceScene, NestScene];
+const SCENES: { name: string; Component: () => React.JSX.Element }[] = [
+  { name: 'rabbit', Component: RabbitScene },
+  { name: 'dog_cat', Component: DogCatScene },
+  { name: 'space', Component: SpaceScene },
+  { name: 'nest', Component: NestScene },
+];
 
 interface InsiderProfileSectionProps {
   heading?: string;
@@ -152,12 +158,16 @@ export default function InsiderProfileSection({
   heading = 'One of Us…',
   message = "No candidate profile here — you run the place. Carry on.",
 }: InsiderProfileSectionProps): React.JSX.Element {
-  const [Scene] = useState(() => SCENES[Math.floor(Math.random() * SCENES.length)]);
+  const [scene] = useState(() => SCENES[Math.floor(Math.random() * SCENES.length)]);
+
+  useEffect(() => {
+    trackEvent('insider_profile_view', { scene: scene.name });
+  }, [scene.name]);
 
   return (
     <div className={styles.container}>
       <div className={styles.sceneWrap}>
-        <Scene />
+        <scene.Component />
       </div>
       <h2 className={styles.heading}>{heading}</h2>
       <p className={styles.message}>{message}</p>

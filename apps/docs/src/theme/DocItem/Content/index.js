@@ -1,9 +1,27 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import DocItemContent from '@theme-original/DocItem/Content';
 import { useDoc } from '@docusaurus/plugin-content-docs/client';
 import { useAuth } from '@site/src/contexts/AuthContext';
 import { useDocBookmarks } from '@site/src/hooks/useDocBookmarks';
+import { trackEvent } from '@site/src/lib/analytics';
 import styles from './styles.module.css';
+
+// Named event (distinct from the generic per-route page_view AnalyticsSession
+// already fires) so GA4 can report "which course/page is viewed most"
+// without unpacking page_path patterns.
+function DocPageViewTracker() {
+  const { metadata } = useDoc();
+  const lastTracked = useRef(null);
+
+  useEffect(() => {
+    if (lastTracked.current === metadata.id) return;
+    lastTracked.current = metadata.id;
+    const courseSlug = metadata.id.split('/')[0];
+    trackEvent('doc_page_view', { doc_path: metadata.id, course_slug: courseSlug, title: metadata.title });
+  }, [metadata.id, metadata.title]);
+
+  return null;
+}
 
 function BookmarkGlyph({ filled }) {
   return (
@@ -53,6 +71,7 @@ function DocBookmarkButton() {
 export default function DocItemContentWrapper(props) {
   return (
     <>
+      <DocPageViewTracker />
       <div className={styles.toolbar}>
         <DocBookmarkButton />
       </div>

@@ -3,6 +3,7 @@
 import React from 'react';
 import { useAuth } from '@/contexts/AuthContext';
 import { getDocsOrigin } from '@sypher/auth-core/src/urls';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 const corporateLinks = [
@@ -40,7 +41,11 @@ export default function Footer(): React.JSX.Element | null {
             <ul className={styles.linkList}>
               {corporateLinks.map((link) => (
                 <li key={link.href}>
-                  <a href={`${getDocsOrigin()}${link.href}`} className={styles.link}>
+                  <a
+                    href={`${getDocsOrigin()}${link.href}`}
+                    className={styles.link}
+                    onClick={() => trackEvent('footer_link_click', { label: link.label, destination: link.href })}
+                  >
                     {link.label}
                   </a>
                 </li>
@@ -53,7 +58,11 @@ export default function Footer(): React.JSX.Element | null {
             <ul className={styles.linkList}>
               {legalLinks.map((link) => (
                 <li key={link.href}>
-                  <a href={`${getDocsOrigin()}${link.href}`} className={styles.link}>
+                  <a
+                    href={`${getDocsOrigin()}${link.href}`}
+                    className={styles.link}
+                    onClick={() => trackEvent('footer_link_click', { label: link.label, destination: link.href })}
+                  >
                     {link.label}
                   </a>
                 </li>

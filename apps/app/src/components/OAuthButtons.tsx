@@ -2,22 +2,27 @@
 
 import React, { useState } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
+import { trackEvent } from '@/lib/analytics';
 import styles from './OAuthButtons.module.css';
 
 export default function OAuthButtons({
   onError,
   redirectTo = '/dashboard',
+  context = 'login',
 }: {
   onError: (message: string) => void;
   redirectTo?: string;
+  context?: 'login' | 'signup';
 }): React.JSX.Element {
   const { signInWithGoogle } = useAuth();
   const [loading, setLoading] = useState(false);
 
   async function handleGoogleSignIn(): Promise<void> {
+    trackEvent(context === 'signup' ? 'signup_google_click' : 'login_google_click');
     setLoading(true);
     const { error } = await signInWithGoogle(redirectTo);
     if (error) {
+      trackEvent('login_google_error', { error_message: error, context });
       onError(error);
       setLoading(false);
     }

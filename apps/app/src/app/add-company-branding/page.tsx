@@ -8,6 +8,7 @@ import { uploadToBunny } from '@/data/bunnyUpload';
 import { getCompanyBranding, upsertCompanyBranding, listCompanyBrandings } from '@/data/companyBranding';
 import { fetchLocations } from '@/data/locations';
 import { BrandingIcon } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import styles from './add-company-branding.module.css';
 
 interface LocationsCatalog {
@@ -55,6 +56,10 @@ function AddCompanyBrandingContent(): React.JSX.Element {
   const [locationInput, setLocationInput] = useState('');
 
   const logoInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    trackEvent('branding_page_view');
+  }, []);
 
   function resetFields(): void {
     setDisplayName('');
@@ -110,6 +115,7 @@ function AddCompanyBrandingContent(): React.JSX.Element {
   async function handleLookup(nameOverride?: string): Promise<void> {
     const name = (nameOverride ?? lookupCompanyName).trim();
     if (!name || !supabase) return;
+    trackEvent('branding_company_lookup_submit');
     setLoading(true);
     setError(null);
     setSaved(false);
@@ -130,6 +136,7 @@ function AddCompanyBrandingContent(): React.JSX.Element {
   }
 
   function switchCompany(): void {
+    trackEvent('branding_switch_company_click');
     setActiveCompanyName(null);
     setLookupCompanyName('');
     resetFields();
@@ -144,6 +151,7 @@ function AddCompanyBrandingContent(): React.JSX.Element {
     setError(null);
     try {
       const url = await uploadToBunny(file, `branding/${activeCompanyName}`, BUNNY_CONFIG);
+      trackEvent('branding_logo_upload');
       setLogoUrl(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload logo.');
@@ -165,6 +173,7 @@ function AddCompanyBrandingContent(): React.JSX.Element {
       setLocationInput('');
       return;
     }
+    trackEvent('branding_location_add');
     setLocations((prev) => [...prev, location.name]);
     setLocationInput('');
   }
@@ -175,6 +184,7 @@ function AddCompanyBrandingContent(): React.JSX.Element {
 
   async function handleSave(): Promise<void> {
     if (!supabase || !activeCompanyName) return;
+    trackEvent('branding_save_click');
     setSaving(true);
     setError(null);
     setSaved(false);
@@ -194,6 +204,7 @@ function AddCompanyBrandingContent(): React.JSX.Element {
     );
     setSaving(false);
     if (saveError) {
+      trackEvent('branding_save_error', { error: saveError });
       setError(saveError);
       return;
     }

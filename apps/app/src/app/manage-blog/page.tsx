@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import useSWR, { useSWRConfig } from 'swr';
 import DashboardLayout from '@/components/DashboardLayout';
 import RequireNavAccess from '@/components/RequireNavAccess';
@@ -9,6 +9,7 @@ import BlogPostEditor from '@/components/BlogPostEditor';
 import { useAuth } from '@/contexts/AuthContext';
 import { listBlogPosts, getBlogPostById, deleteBlogPost } from '@/data/blogPosts';
 import { ManageBlogIcon } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import styles from './manage-blog.module.css';
 
 interface BlogPostSummary {
@@ -93,7 +94,12 @@ function ManageBlogContent(): React.JSX.Element {
       ? 'Failed to load blog posts.'
       : null);
 
+  useEffect(() => {
+    trackEvent('manageblog_page_view');
+  }, []);
+
   async function openEdit(summary: BlogPostSummary): Promise<void> {
+    trackEvent('manageblog_edit_click', { post_id: summary.id });
     const full = await getBlogPostById(supabase, summary.id);
     if (full) {
       setEditingPost(full);
@@ -102,6 +108,7 @@ function ManageBlogContent(): React.JSX.Element {
   }
 
   function openNew(): void {
+    trackEvent('manageblog_create_click');
     setEditingPost(null);
     setMode('new');
   }
@@ -119,6 +126,7 @@ function ManageBlogContent(): React.JSX.Element {
   async function confirmDelete(): Promise<void> {
     if (!pendingDelete) return;
     const target = pendingDelete;
+    trackEvent('manageblog_delete_confirm', { post_id: target.id });
     setPendingDelete(null);
     setActionError(null);
     const { error: deleteError } = await deleteBlogPost(supabase, target.id);

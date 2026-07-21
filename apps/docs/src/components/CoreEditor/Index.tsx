@@ -2,6 +2,7 @@ import React, { useState, useCallback } from 'react';
 import Editor from '@monaco-editor/react';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import { useColorMode } from '@docusaurus/theme-common';
+import { trackEvent } from '@site/src/lib/analytics';
 
 interface TestCase {
   stdin: string;
@@ -178,14 +179,16 @@ export default function CodeEditor({ meta, testCases, starterCode, harness, defa
   const [customRunning, setCustomRunning] = useState(false);
 
   const handleLanguageChange = useCallback((lang: string) => {
+    trackEvent('coding_problem_language_change', { problem_id: meta.id, language: lang });
     setLanguage(lang);
     setCode(starterCode[lang] ?? '');
     setResults([]);
     setCompileError(null);
     setCustomResult(null);
-  }, [starterCode]);
+  }, [starterCode, meta.id]);
 
   const runAll = useCallback(async () => {
+    trackEvent('coding_problem_run_click', { problem_id: meta.id, language });
     setRunning(true);
     setResults(testCases.map((_, i) => ({ index: i, status: 'pending' as const, statusDescription: 'Running…', stdout: null, stderr: null, compileOutput: null, time: null, memory: null })));
     setCompileError(null);
@@ -221,6 +224,12 @@ export default function CodeEditor({ meta, testCases, starterCode, harness, defa
       const firstCompile = settled.find((r) => r.compileOutput);
       if (firstCompile) setCompileError(firstCompile.compileOutput ?? null);
       setResults(settled);
+      trackEvent('coding_problem_run_result', {
+        problem_id: meta.id,
+        language,
+        passed: settled.filter((r) => r.status === 'accepted').length,
+        total: settled.length,
+      });
     } catch (err) {
       setCompileError(err instanceof Error ? err.message : 'Unknown error');
       setResults([]);
@@ -230,6 +239,7 @@ export default function CodeEditor({ meta, testCases, starterCode, harness, defa
   }, [code, language, testCases, meta, baseUrl, authToken]);
 
   const runCustom = useCallback(async () => {
+    trackEvent('coding_problem_run_custom_click', { problem_id: meta.id, language });
     setCustomRunning(true);
     setCustomResult(null);
     try {

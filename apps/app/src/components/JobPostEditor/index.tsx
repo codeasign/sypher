@@ -10,6 +10,7 @@ import { fetchLocations } from '@/data/locations';
 import { EXPERIENCE_YEARS_OPTIONS, EXPERIENCE_MONTHS_OPTIONS } from '@/types/educationStatus';
 import { WORK_MODE_OPTIONS } from '@/types/workMode';
 import SkillsModal from '@/components/SkillsModal';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 interface TaxonomyCatalog {
@@ -210,6 +211,7 @@ export default function JobPostEditor({ post, onSaved, onCancel, onBack }: JobPo
             setError(statusError);
             return null;
           }
+          if (nextStatus === 'open') trackEvent('jobpost_publish_click', { job_id: created.id });
         }
         await setJobPostSkills(supabase, created.id, selectedSkillIds);
         return created.id;
@@ -242,6 +244,11 @@ export default function JobPostEditor({ post, onSaved, onCancel, onBack }: JobPo
           setError(statusError);
           return null;
         }
+        if (nextStatus === 'open' && post!.status === 'draft') {
+          trackEvent('jobpost_publish_click', { job_id: post!.id });
+        } else {
+          trackEvent('jobpost_status_change', { from_status: post!.status, to_status: nextStatus });
+        }
       }
       await setJobPostSkills(supabase, post!.id, selectedSkillIds);
       return post!.id;
@@ -251,6 +258,7 @@ export default function JobPostEditor({ post, onSaved, onCancel, onBack }: JobPo
   }
 
   async function handleSaveDraft(): Promise<void> {
+    trackEvent('jobpost_save_draft_click');
     const id = await persist('draft');
     if (id) onSaved();
   }

@@ -29,6 +29,7 @@ import type { MDXEditorMethods } from '@mdxeditor/editor';
 import { useAuth } from '@/contexts/AuthContext';
 import { createBlogPost, updateBlogPost, setBlogPostStatus } from '@/data/blogPosts';
 import { uploadToBunny } from '@/data/bunnyUpload';
+import { trackEvent } from '@/lib/analytics';
 import '@mdxeditor/editor/style.css';
 import styles from './styles.module.css';
 
@@ -180,6 +181,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
   }
 
   async function handleSaveDraft(): Promise<void> {
+    trackEvent('manageblog_save_draft_click');
     const id = await persist('draft');
     if (id) onSaved();
   }
@@ -187,12 +189,22 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
   async function handlePublishToggle(): Promise<void> {
     const nextStatus = post?.status === 'published' ? 'draft' : 'published';
     const id = await persist(nextStatus);
-    if (id) onSaved();
+    if (id) {
+      if (nextStatus === 'published') {
+        trackEvent('manageblog_publish_click', { post_id: id });
+      } else {
+        trackEvent('manageblog_status_change', { post_id: id, from_status: 'published', to_status: 'draft' });
+      }
+      onSaved();
+    }
   }
 
   async function handleRepublish(): Promise<void> {
     const id = await persist('published');
-    if (id) onSaved();
+    if (id) {
+      trackEvent('manageblog_publish_click', { post_id: id });
+      onSaved();
+    }
   }
 
   return (
@@ -234,7 +246,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
       {error && <p className={styles.error}>{error}</p>}
 
       {previewMode ? (
-        <BlogPostArticle title={title || 'Untitled post'} content={draftMarkdown} coverImageUrl={coverImageUrl} date={null} />
+        <BlogPostArticle slug={post?.slug ?? 'preview'} title={title || 'Untitled post'} content={draftMarkdown} coverImageUrl={coverImageUrl} date={null} trackView={false} />
       ) : (
         <>
           <div className={clsx(styles.card, styles.metaCard)}>

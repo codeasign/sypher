@@ -1,5 +1,8 @@
-import React from 'react';
+'use client';
+
+import React, { useEffect } from 'react';
 import { WORK_MODE_LABEL } from '@/types/workMode';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 const EMPLOYMENT_TYPE_LABEL: Record<string, string> = {
@@ -11,6 +14,7 @@ const EMPLOYMENT_TYPE_LABEL: Record<string, string> = {
 };
 
 interface JobPostArticleProps {
+  slug: string;
   title: string;
   companyName: string;
   description: string;
@@ -32,6 +36,7 @@ function formatSalary(min: number | null, max: number | null): string | null {
 }
 
 export default function JobPostArticle({
+  slug,
   title,
   companyName,
   description,
@@ -45,6 +50,10 @@ export default function JobPostArticle({
   applyEmail,
 }: JobPostArticleProps): React.JSX.Element {
   const salary = formatSalary(salaryMin, salaryMax);
+
+  useEffect(() => {
+    trackEvent('careers_job_view', { slug });
+  }, [slug]);
 
   return (
     <article className={styles.article}>
@@ -69,6 +78,7 @@ export default function JobPostArticle({
             href={applyUrl || `mailto:${applyEmail}`}
             target={applyUrl ? '_blank' : undefined}
             rel={applyUrl ? 'noopener noreferrer' : undefined}
+            onClick={() => trackEvent('careers_apply_click', { slug })}
           >
             Apply now
           </a>

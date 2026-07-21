@@ -12,6 +12,7 @@ import { fetchCourseAccessRows, hasCourseAccess } from '@/data/courseAccess';
 import { fetchCompanyCourseAccessRows } from '@/data/companyAccess';
 import { useAuth } from '@/contexts/AuthContext';
 import { BookmarkIcon, CoursesIcon } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import courses from '@sypher/course-catalog/src/courses';
 import styles from './bookmarks.module.css';
 
@@ -166,6 +167,10 @@ function BookmarksContent(): React.JSX.Element {
   const [pendingRemoval, setPendingRemoval] = useState<PendingRemoval | null>(null);
 
   useEffect(() => {
+    trackEvent('bookmarks_page_view');
+  }, []);
+
+  useEffect(() => {
     fetchCourseAccessRows(supabase).then(setAccessRows);
   }, [supabase]);
 
@@ -197,6 +202,7 @@ function BookmarksContent(): React.JSX.Element {
 
   function confirmRemoval() {
     if (!pendingRemoval) return;
+    trackEvent('bookmark_remove_confirm', { type: pendingRemoval.type });
     if (pendingRemoval.type === 'course') {
       toggleBookmark(pendingRemoval.slug);
     } else {

@@ -2,6 +2,9 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { AuthProvider } from "@/contexts/AuthContext";
 import Navbar from "@/components/Navbar";
+import AnalyticsBootstrap from "@/components/AnalyticsBootstrap";
+import AnalyticsSession from "@/components/AnalyticsSession";
+import CookieConsentBanner from "@/components/CookieConsentBanner";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -50,9 +53,15 @@ export default function RootLayout({
         <script dangerouslySetInnerHTML={{ __html: SET_THEME_SCRIPT }} />
       </head>
       <body>
+        {/* next/script hoists beforeInteractive scripts into <head> itself
+            regardless of where in the tree they're declared -- body is the
+            documented placement, not <head> directly. */}
+        <AnalyticsBootstrap />
         <AuthProvider>
+          <AnalyticsSession />
           <Navbar />
           {children}
+          <CookieConsentBanner />
         </AuthProvider>
       </body>
     </html>

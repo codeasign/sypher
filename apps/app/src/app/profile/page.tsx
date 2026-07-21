@@ -26,6 +26,7 @@ import EmptySection from '@/components/EmptySection';
 import InsiderProfileSection from '@/components/InsiderProfileSection';
 import { FULL_DASHBOARD_ROLES } from '@/types/roles';
 import { ProfileIcon } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import ExpandMoreRoundedIcon from '@mui/icons-material/ExpandMoreRounded';
 import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded';
 import styles from './profile.module.css';
@@ -163,7 +164,11 @@ function LearnerProfileContent(): React.JSX.Element {
     expectedCtc,
     refreshProfile,
   } = useAuth();
-  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid();
+  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid('profile');
+
+  useEffect(() => {
+    trackEvent('profile_view');
+  }, []);
 
   const [bioInput, setBioInput] = useState('');
   const [currentStatusInput, setCurrentStatusInput] = useState<CurrentStatus | null>(null);
@@ -328,6 +333,7 @@ function LearnerProfileContent(): React.JSX.Element {
   }
 
   function toggleSection(key: AboutSection): void {
+    trackEvent('profile_section_toggle', { section: key });
     setExpandedSections((prev) => ({ ...prev, [key]: !prev[key] }));
   }
 
@@ -372,11 +378,13 @@ function LearnerProfileContent(): React.JSX.Element {
 
   function addOpenToLocationPick(): void {
     if (!openToLocationToAdd) return;
+    trackEvent('profile_open_to_location_add');
     setOpenToLocationPicks((prev) => [...prev, openToLocationToAdd]);
     setOpenToLocationToAdd('');
   }
 
   function removeOpenToLocationPick(index: number): void {
+    trackEvent('profile_open_to_location_remove');
     setOpenToLocationPicks((prev) => prev.filter((_, i) => i !== index));
   }
 
@@ -430,8 +438,10 @@ function LearnerProfileContent(): React.JSX.Element {
       ]);
       const firstError = results.find((r) => r.error)?.error;
       if (firstError) {
+        trackEvent('profile_save_error', { error: firstError });
         setSaveError(firstError);
       } else {
+        trackEvent('profile_save_success');
         setSaveSuccess(true);
         await refreshProfile();
       }
@@ -467,6 +477,7 @@ function LearnerProfileContent(): React.JSX.Element {
     }
     setResumeError(null);
     setIsUploadingResume(true);
+    trackEvent('profile_resume_upload_click');
     try {
       const url = await uploadToBunny(file, `resume/${session.user.id}`, BUNNY_CONFIG);
       const { error } = await updateOwnBio(
@@ -485,6 +496,7 @@ function LearnerProfileContent(): React.JSX.Element {
       if (error) {
         setResumeError(error);
       } else {
+        trackEvent('profile_resume_upload_success');
         await refreshProfile();
       }
     } catch (err) {
@@ -585,7 +597,10 @@ function LearnerProfileContent(): React.JSX.Element {
                       <button
                         type="button"
                         className={styles.resumeIconBtn}
-                        onClick={() => setIsResumeModalOpen(true)}
+                        onClick={() => {
+                          trackEvent('profile_resume_preview_click');
+                          setIsResumeModalOpen(true);
+                        }}
                         aria-label="View resume"
                         title="View resume"
                       >
@@ -861,7 +876,10 @@ function LearnerProfileContent(): React.JSX.Element {
                   <button
                     type="button"
                     className={styles.addItemBtn}
-                    onClick={() => setIsSkillsModalOpen(true)}
+                    onClick={() => {
+                      trackEvent('profile_skills_modal_open');
+                      setIsSkillsModalOpen(true);
+                    }}
                   >
                     Skills
                   </button>
@@ -1041,7 +1059,10 @@ function LearnerProfileContent(): React.JSX.Element {
                 type="button"
                 className={styles.upgradeBtn}
                 disabled={isSaving || isBioOverLimit}
-                onClick={handleSaveProfile}
+                onClick={() => {
+                  trackEvent('profile_save_click');
+                  handleSaveProfile();
+                }}
               >
                 {isSaving ? 'Saving…' : 'Save'}
               </button>
@@ -1085,13 +1106,20 @@ function LearnerProfileContent(): React.JSX.Element {
         onClose={() => setIsSkillsModalOpen(false)}
         allSkills={skillsForCurrentDomain}
         selectedSkillIds={selectedSkillIds}
-        onSave={setSelectedSkillIds}
+        onSave={(ids) => {
+          trackEvent('profile_skills_save', { skill_count: ids.length });
+          setSelectedSkillIds(ids);
+        }}
       />
     </>
   );
 }
 
 function EmptyProfileSection(): React.JSX.Element {
+  useEffect(() => {
+    trackEvent('empty_profile_view');
+  }, []);
+
   return (
     <div className={styles.container}>
       <div className={styles.header}>

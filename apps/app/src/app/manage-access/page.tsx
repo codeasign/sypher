@@ -21,6 +21,7 @@ import TaxonomyTab from '@/components/TaxonomyTab';
 import LocationsTab from '@/components/LocationsTab';
 import ResumeMockCreditsTab from '@/components/ResumeMockCreditsTab';
 import { ManageAccessIcon } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import styles from './manage-access.module.css';
 
 /* ── Types ── */
@@ -277,6 +278,7 @@ function CoursesTab(): React.JSX.Element {
       setAllowedByKey((prev) => ({ ...prev, [slug]: prevRoles }));
       setRowErrors((p) => ({ ...p, [slug]: updateError }));
     }
+    trackEvent('manageaccess_course_toggle', { course_slug: slug, role, granted: checked });
   }
 
   if (loading) {
@@ -394,6 +396,7 @@ function NavAccessTab(): React.JSX.Element {
       setAllowedByKey((prev) => ({ ...prev, [itemKey]: prevRoles }));
       setRowErrors((p) => ({ ...p, [itemKey]: updateError }));
     }
+    trackEvent('manageaccess_nav_toggle', { item_key: itemKey, role, granted: checked });
   }
 
   if (loading) {
@@ -501,6 +504,7 @@ function CompaniesTab(): React.JSX.Element {
       setNavAllowedKeys(new Set());
       return;
     }
+    trackEvent('manageaccess_company_lookup');
     fetchCompanyRows(trimmed);
   }, [companyName, fetchCompanyRows]);
 
@@ -517,6 +521,7 @@ function CompaniesTab(): React.JSX.Element {
       setCourseAllowedKeys(prev);
       setRowErrors((p) => ({ ...p, [slug]: updateError }));
     }
+    trackEvent('manageaccess_company_course_toggle', { course_slug: slug, granted: checked });
   }
 
   async function handleToggleNav(itemKey: string, checked: boolean): Promise<void> {
@@ -532,6 +537,7 @@ function CompaniesTab(): React.JSX.Element {
       setNavAllowedKeys(prev);
       setRowErrors((p) => ({ ...p, [itemKey]: updateError }));
     }
+    trackEvent('manageaccess_company_nav_toggle', { item_key: itemKey, granted: checked });
   }
 
   const trimmedName = companyName.trim();
@@ -624,6 +630,15 @@ function ManageAccessContent(): React.JSX.Element {
     'courses' | 'nav' | 'companies' | 'taxonomy' | 'locations' | 'resumeMock'
   >('courses');
 
+  useEffect(() => {
+    trackEvent('manageaccess_page_view');
+  }, []);
+
+  function selectTab(tab: typeof activeTab): void {
+    setActiveTab(tab);
+    trackEvent('manageaccess_tab_switch', { tab });
+  }
+
   return (
     <div className={styles.container}>
       <div className={styles.header}>
@@ -642,42 +657,42 @@ function ManageAccessContent(): React.JSX.Element {
         <button
           type="button"
           className={activeTab === 'courses' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-          onClick={() => setActiveTab('courses')}
+          onClick={() => selectTab('courses')}
         >
           Courses
         </button>
         <button
           type="button"
           className={activeTab === 'nav' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-          onClick={() => setActiveTab('nav')}
+          onClick={() => selectTab('nav')}
         >
           Sidebar Navigation
         </button>
         <button
           type="button"
           className={activeTab === 'companies' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-          onClick={() => setActiveTab('companies')}
+          onClick={() => selectTab('companies')}
         >
           Companies
         </button>
         <button
           type="button"
           className={activeTab === 'taxonomy' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-          onClick={() => setActiveTab('taxonomy')}
+          onClick={() => selectTab('taxonomy')}
         >
           Roles & Skills
         </button>
         <button
           type="button"
           className={activeTab === 'locations' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-          onClick={() => setActiveTab('locations')}
+          onClick={() => selectTab('locations')}
         >
           Locations
         </button>
         <button
           type="button"
           className={activeTab === 'resumeMock' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-          onClick={() => setActiveTab('resumeMock')}
+          onClick={() => selectTab('resumeMock')}
         >
           Resume Reviews & Mock Interview
         </button>

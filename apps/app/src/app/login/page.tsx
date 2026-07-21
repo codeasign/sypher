@@ -1,12 +1,13 @@
 'use client';
 
-import React, { Suspense, useState } from 'react';
+import React, { Suspense, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import OAuthButtons from '@/components/OAuthButtons';
 import WorkEmailSignIn from '@/components/WorkEmailSignIn';
 import RedirectIfAuthed from '@/components/RedirectIfAuthed';
 import { getSafeRedirect } from '@/utils/safeRedirect';
+import { trackEvent } from '@/lib/analytics';
 import styles from '../auth.module.css';
 
 function LoginForm(): React.JSX.Element {
@@ -14,6 +15,15 @@ function LoginForm(): React.JSX.Element {
   const [activeTab, setActiveTab] = useState<'individual' | 'work'>('individual');
   const searchParams = useSearchParams();
   const redirectTarget = getSafeRedirect(searchParams.get('redirect'));
+
+  useEffect(() => {
+    trackEvent('login_page_view', { referrer: typeof document !== 'undefined' ? document.referrer : '' });
+  }, []);
+
+  function selectTab(tab: 'individual' | 'work'): void {
+    trackEvent('login_tab_click', { tab });
+    setActiveTab(tab);
+  }
 
   return (
     <div className={styles.card}>
@@ -23,14 +33,14 @@ function LoginForm(): React.JSX.Element {
         <button
           type="button"
           className={activeTab === 'individual' ? styles.tabActive : styles.tab}
-          onClick={() => setActiveTab('individual')}
+          onClick={() => selectTab('individual')}
         >
           Individual
         </button>
         <button
           type="button"
           className={activeTab === 'work' ? styles.tabActive : styles.tab}
-          onClick={() => setActiveTab('work')}
+          onClick={() => selectTab('work')}
         >
           Work or School
         </button>

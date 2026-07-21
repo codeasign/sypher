@@ -38,7 +38,7 @@ export default function HomeCourseCatalog({ freeCourses, premiumCourses }: HomeC
               <h3 className={styles.subsectionTitle}>Free Courses</h3>
               <span className={styles.subsectionCount}>{freeCourses.length} courses</span>
             </div>
-            <DashboardCourseListing courses={freeCourses} />
+            <DashboardCourseListing courses={freeCourses} trackingContext="home" />
           </>
         )}
 
@@ -48,7 +48,7 @@ export default function HomeCourseCatalog({ freeCourses, premiumCourses }: HomeC
               <h3 className={styles.subsectionTitle}>Premium Courses</h3>
               <span className={styles.subsectionCount}>{premiumCourses.length} courses</span>
             </div>
-            <DashboardCourseListing courses={premiumCourses} />
+            <DashboardCourseListing courses={premiumCourses} trackingContext="home" />
           </>
         )}
       </div>

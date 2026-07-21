@@ -18,6 +18,7 @@ import { SOCIAL_PLATFORM_OPTIONS } from '@/types/socialLinks';
 import { SENIORITY_LEVEL_OPTIONS } from '@/types/seniority';
 import { NEXT_ACTION_OPTIONS } from '@/types/nextAction';
 import { formatCtc } from '@/utils/ctc';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 interface Applicant {
@@ -134,6 +135,11 @@ export default function JobApplicantsView({ status, jobId }: JobApplicantsViewPr
   }, [selectedKey]);
 
   async function handleMove(applicant: Applicant, nextStatus: 'applied' | 'shortlisted' | 'not_fit'): Promise<void> {
+    if (nextStatus === 'shortlisted') {
+      trackEvent('applicant_shortlist_click', { applicant_id: applicant.applicant_id, job_id: applicant.job_id });
+    } else if (nextStatus === 'not_fit') {
+      trackEvent('applicant_reject_click', { applicant_id: applicant.applicant_id, job_id: applicant.job_id });
+    }
     setMovingId(applicant.applicant_id);
     const { error } = await setApplicantStatus(supabase, applicant.job_id, applicant.applicant_id, nextStatus);
     if (!error && nextStatus === 'shortlisted') {
@@ -149,6 +155,7 @@ export default function JobApplicantsView({ status, jobId }: JobApplicantsViewPr
   }
 
   async function handleNextActionChange(applicant: Applicant, nextAction: string): Promise<void> {
+    trackEvent('applicant_next_action_change', { next_action: nextAction });
     setEditingNextAction(false);
     const { error } = await setApplicantNextAction(supabase, applicant.job_id, applicant.applicant_id, nextAction);
     if (error) return;
@@ -199,7 +206,10 @@ export default function JobApplicantsView({ status, jobId }: JobApplicantsViewPr
                   key={key}
                   type="button"
                   className={clsx(styles.listItem, key === selectedKey && styles.listItemActive)}
-                  onClick={() => setSelectedKey(key)}
+                  onClick={() => {
+                    trackEvent('applicant_select_view', { applicant_id: applicant.applicant_id });
+                    setSelectedKey(key);
+                  }}
                   disabled={moving}
                 >
                   <div className={styles.listItemRow}>
@@ -224,7 +234,10 @@ export default function JobApplicantsView({ status, jobId }: JobApplicantsViewPr
             <button
               type="button"
               className={styles.pageBtn}
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              onClick={() => {
+                trackEvent('applicants_pagination_click', { direction: 'prev', page: page - 1 });
+                setPage((p) => Math.max(1, p - 1));
+              }}
               disabled={page <= 1}
             >
               Prev
@@ -235,7 +248,10 @@ export default function JobApplicantsView({ status, jobId }: JobApplicantsViewPr
             <button
               type="button"
               className={styles.pageBtn}
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              onClick={() => {
+                trackEvent('applicants_pagination_click', { direction: 'next', page: page + 1 });
+                setPage((p) => Math.min(totalPages, p + 1));
+              }}
               disabled={page >= totalPages}
             >
               Next
@@ -266,7 +282,7 @@ export default function JobApplicantsView({ status, jobId }: JobApplicantsViewPr
                 </div>
                 <div className={styles.detailBannerActions}>
                   {selected.resume_url && (
-                    <button type="button" className={styles.saveBtn} onClick={() => setIsResumeModalOpen(true)}>
+                    <button type="button" className={styles.saveBtn} onClick={() => { trackEvent('applicant_resume_preview_click'); setIsResumeModalOpen(true); }}>
                       Preview resume
                     </button>
                   )}
@@ -436,7 +452,7 @@ export default function JobApplicantsView({ status, jobId }: JobApplicantsViewPr
                   <div className={styles.sectionGroup}>
                     <span className={styles.sectionLabel}>Resume</span>
                     <div className={styles.chipRow}>
-                      <button type="button" className={styles.saveBtn} onClick={() => setIsResumeModalOpen(true)}>
+                      <button type="button" className={styles.saveBtn} onClick={() => { trackEvent('applicant_resume_preview_click'); setIsResumeModalOpen(true); }}>
                         Preview
                       </button>
                       <a

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import useSWR from 'swr';
 import { useAuth } from '@/contexts/AuthContext';
 import { listJobPosts, listJobPostsByCreator } from '@/data/jobPosts';
@@ -8,6 +8,7 @@ import DashboardLayout from '@/components/DashboardLayout';
 import RequireNavAccess from '@/components/RequireNavAccess';
 import JobApplicantsView from '@/components/JobApplicantsView';
 import { ApplicantsIcon } from '@/components/NavIcons';
+import { trackEvent } from '@/lib/analytics';
 import styles from './applicants.module.css';
 
 type ApplicantsTab = 'applied' | 'shortlisted';
@@ -34,6 +35,10 @@ function ApplicantsContent(): React.JSX.Element {
     isExternalPoster ? listJobPostsByCreator(supabase, user!.id) : listJobPosts(supabase, companyName)
   );
 
+  useEffect(() => {
+    trackEvent('applicants_page_view');
+  }, []);
+
   return (
     <div className={styles.container}>
       <div className={styles.header}>
@@ -51,7 +56,10 @@ function ApplicantsContent(): React.JSX.Element {
           <select
             className={styles.jobFilterSelect}
             value={selectedJobId}
-            onChange={(e) => setSelectedJobId(e.target.value)}
+            onChange={(e) => {
+              trackEvent('applicants_job_filter_change', { job_id: e.target.value || null });
+              setSelectedJobId(e.target.value);
+            }}
           >
             <option value="">All jobs</option>
             {jobPosts.map((post) => (
@@ -67,14 +75,20 @@ function ApplicantsContent(): React.JSX.Element {
         <button
           type="button"
           className={activeTab === 'applied' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-          onClick={() => setActiveTab('applied')}
+          onClick={() => {
+            trackEvent('applicants_tab_switch', { tab: 'applied' });
+            setActiveTab('applied');
+          }}
         >
           Applied
         </button>
         <button
           type="button"
           className={activeTab === 'shortlisted' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-          onClick={() => setActiveTab('shortlisted')}
+          onClick={() => {
+            trackEvent('applicants_tab_switch', { tab: 'shortlisted' });
+            setActiveTab('shortlisted');
+          }}
         >
           Shortlisted
         </button>
