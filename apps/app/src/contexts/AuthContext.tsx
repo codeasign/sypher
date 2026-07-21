@@ -36,6 +36,8 @@ interface AuthContextValue {
   categoryDomainId: string | null;
   categoryRoleId: string | null;
   currentLocationId: string | null;
+  currentCtc: number | null;
+  expectedCtc: number | null;
   loading: boolean;
   refreshProfile: () => Promise<void>;
   signInWithGoogle: (redirectTo?: string) => Promise<{ error: string | null }>;
@@ -82,6 +84,8 @@ const AuthContext = createContext<AuthContextValue>({
   categoryDomainId: null,
   categoryRoleId: null,
   currentLocationId: null,
+  currentCtc: null,
+  expectedCtc: null,
   loading: true,
   refreshProfile: async () => {},
   signInWithGoogle: async () => ({ error: NOT_CONFIGURED_ERROR }),
@@ -124,6 +128,8 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
   const [categoryDomainId, setCategoryDomainId] = useState<string | null>(null);
   const [categoryRoleId, setCategoryRoleId] = useState<string | null>(null);
   const [currentLocationId, setCurrentLocationId] = useState<string | null>(null);
+  const [currentCtc, setCurrentCtc] = useState<number | null>(null);
+  const [expectedCtc, setExpectedCtc] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -164,6 +170,8 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
             setCategoryDomainId(null);
             setCategoryRoleId(null);
             setCurrentLocationId(null);
+            setCurrentCtc(null);
+            setExpectedCtc(null);
           }
           return;
         }
@@ -187,6 +195,8 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
           setCategoryDomainId(profile?.category_domain_id ?? null);
           setCategoryRoleId(profile?.category_role_id ?? null);
           setCurrentLocationId(profile?.current_location_id ?? null);
+          setCurrentCtc(profile?.current_ctc ?? null);
+          setExpectedCtc(profile?.expected_ctc ?? null);
         }
       } else if (isMounted) {
         setRole(null);
@@ -208,6 +218,8 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
         setCategoryDomainId(null);
         setCategoryRoleId(null);
         setCurrentLocationId(null);
+        setCurrentCtc(null);
+        setExpectedCtc(null);
       }
       currentUserId = newSession?.user.id ?? null;
       if (isMounted) {
@@ -267,6 +279,8 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
     setCategoryDomainId(profile.category_domain_id ?? null);
     setCategoryRoleId(profile.category_role_id ?? null);
     setCurrentLocationId(profile.current_location_id ?? null);
+    setCurrentCtc(profile.current_ctc ?? null);
+    setExpectedCtc(profile.expected_ctc ?? null);
   }
 
   async function signInWithGoogle(redirectTo = '/dashboard'): Promise<{ error: string | null }> {
@@ -329,6 +343,8 @@ export function AuthProvider({ children }: { children: ReactNode }): React.JSX.E
     categoryDomainId,
     categoryRoleId,
     currentLocationId,
+    currentCtc,
+    expectedCtc,
     loading,
     refreshProfile,
     signInWithGoogle,

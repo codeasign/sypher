@@ -18,6 +18,24 @@ export async function distinctCompanyNames(supabase) {
   return Array.from(names).sort((a, b) => a.localeCompare(b));
 }
 
+// Backs the company autocomplete on the Manage Access "Companies" tab. Scans
+// all of profiles + pending_invites, so it's worth caching for the session
+// even without an explicit invalidation hook -- new companies show up after
+// a reload, which is fine for an autocomplete suggestion list.
+let cachedNames = null;
+let namesPromise = null;
+
+export function fetchDistinctCompanyNames(supabase) {
+  if (cachedNames) return Promise.resolve(cachedNames);
+  if (namesPromise) return namesPromise;
+  namesPromise = distinctCompanyNames(supabase).then((names) => {
+    cachedNames = names;
+    namesPromise = null;
+    return names;
+  });
+  return namesPromise;
+}
+
 function normalizeEmail(email) {
   return (email ?? '').trim().toLowerCase();
 }

@@ -3,7 +3,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import DashboardLayout from '@/components/DashboardLayout';
 import { useAuth } from '@/contexts/AuthContext';
-import { createRazorpayOrder, verifyRazorpayPayment, loadRazorpayCheckout } from '@/data/payments';
+import { useUpgradeToPaid } from '@/hooks/useUpgradeToPaid';
 import { updateOwnBio } from '@/data/profiles';
 import { uploadToBunny } from '@/data/bunnyUpload';
 import PdfEmbed from '@/components/PdfEmbed';
@@ -16,10 +16,18 @@ import type { CurrentStatus, NoticePeriod } from '@/types/currentStatus';
 import { SOCIAL_PLATFORM_OPTIONS } from '@/types/socialLinks';
 import type { SocialLinks } from '@/types/socialLinks';
 import { fetchTaxonomy } from '@/data/taxonomy';
-import { getOwnSkills, setOwnSkills, setOwnDesignation } from '@/data/userTaxonomy';
+import { getOwnSkills, setOwnSkills, setOwnDesignation, setOwnCtc } from '@/data/userTaxonomy';
+import { SENIORITY_LEVEL_OPTIONS } from '@/types/seniority';
+import type { SeniorityLevel } from '@/types/seniority';
 import { fetchLocations } from '@/data/locations';
 import { getOwnOpenToLocations, setOwnOpenToLocations, setOwnLocationAndCategory } from '@/data/userLocations';
 import SkillsModal from '@/components/SkillsModal';
+import EmptySection from '@/components/EmptySection';
+import InsiderProfileSection from '@/components/InsiderProfileSection';
+import { FULL_DASHBOARD_ROLES } from '@/types/roles';
+import { ProfileIcon } from '@/components/NavIcons';
+import ExpandMoreRoundedIcon from '@mui/icons-material/ExpandMoreRounded';
+import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded';
 import styles from './profile.module.css';
 
 const BUNNY_CONFIG = {
@@ -52,22 +60,22 @@ type AboutSection =
   | 'resume'
   | 'status'
   | 'currentRole'
+  | 'compensation'
   | 'skills'
   | 'currentLocation'
   | 'openToLocation'
-  | 'socialLinks'
-  | 'billing';
+  | 'socialLinks';
 
 const ALL_SECTIONS_EXPANDED: Record<AboutSection, boolean> = {
   bio: true,
   resume: true,
   status: true,
   currentRole: true,
+  compensation: true,
   skills: true,
   currentLocation: true,
   openToLocation: true,
   socialLinks: true,
-  billing: true,
 };
 
 function SectionHeader({
@@ -75,20 +83,16 @@ function SectionHeader({
   expanded,
   onToggle,
   extra,
-  underline,
 }: {
   label: string;
   expanded: boolean;
   onToggle: () => void;
   extra?: React.ReactNode;
-  underline?: boolean;
 }): React.JSX.Element {
   return (
     <div className={styles.sectionHeaderRow}>
       <div className={styles.sectionHeaderLeft}>
-        <span className={underline ? `${styles.sectionLabel} ${styles.sectionLabelUnderline}` : styles.sectionLabel}>
-          {label}
-        </span>
+        <span className={styles.sectionLabel}>{label}</span>
         {extra}
       </div>
       <button
@@ -101,7 +105,7 @@ function SectionHeader({
         aria-label={expanded ? `Collapse ${label.toLowerCase()}` : `Expand ${label.toLowerCase()}`}
         title={expanded ? 'Collapse' : 'Expand'}
       >
-        <span className={styles.collapseToggleIcon}>⌄</span>
+        <ExpandMoreRoundedIcon className={styles.collapseToggleIcon} fontSize="small" />
       </button>
     </div>
   );
@@ -129,18 +133,18 @@ function isExpiringSoon(paidUntil: string): boolean {
   return daysLeft <= EXPIRING_SOON_DAYS;
 }
 
-export default function ProfilePage(): React.JSX.Element {
-  const razorpayKeyId = process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID;
+// Free/paid users and branders get the full candidate-profile editor below.
+// Everyone else (admin, HR roles, company_employees, external_job_poster)
+// gets EmptyProfileSection instead -- see FULL_DASHBOARD_ROLES.
+function LearnerProfileContent(): React.JSX.Element {
   const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL;
   const paidUpgradePriceInrPaise = process.env.NEXT_PUBLIC_PAID_UPGRADE_PRICE_INR_PAISE;
 
   const {
     supabase,
-    user,
     session,
     role,
     paidUntil,
-    companyName,
     bio,
     currentStatus,
     noticePeriod,
@@ -153,11 +157,13 @@ export default function ProfilePage(): React.JSX.Element {
     socialLinks,
     categoryDomainId,
     categoryRoleId,
+    designationSeniority,
     currentLocationId,
+    currentCtc,
+    expectedCtc,
     refreshProfile,
   } = useAuth();
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid();
 
   const [bioInput, setBioInput] = useState('');
   const [currentStatusInput, setCurrentStatusInput] = useState<CurrentStatus | null>(null);
@@ -190,6 +196,9 @@ export default function ProfilePage(): React.JSX.Element {
 
   const [categoryDomainInput, setCategoryDomainInput] = useState('');
   const [categoryRoleInput, setCategoryRoleInput] = useState('');
+  const [designationSeniorityInput, setDesignationSeniorityInput] = useState<SeniorityLevel | null>(null);
+  const [currentCtcInput, setCurrentCtcInput] = useState('');
+  const [expectedCtcInput, setExpectedCtcInput] = useState('');
   const [currentStateId, setCurrentStateId] = useState('');
   const [currentLocationInput, setCurrentLocationInput] = useState('');
   const [openToLocationPicks, setOpenToLocationPicks] = useState<string[]>([]);
@@ -276,6 +285,18 @@ export default function ProfilePage(): React.JSX.Element {
   }, [categoryDomainId, categoryRoleId]);
 
   useEffect(() => {
+    setDesignationSeniorityInput(designationSeniority ?? null);
+  }, [designationSeniority]);
+
+  useEffect(() => {
+    setCurrentCtcInput(currentCtc != null ? String(currentCtc) : '');
+  }, [currentCtc]);
+
+  useEffect(() => {
+    setExpectedCtcInput(expectedCtc != null ? String(expectedCtc) : '');
+  }, [expectedCtc]);
+
+  useEffect(() => {
     setCurrentLocationInput(currentLocationId ?? '');
     if (locationsCatalog && currentLocationId) {
       const location = locationsCatalog.locations.find((l) => l.id === currentLocationId);
@@ -322,6 +343,10 @@ export default function ProfilePage(): React.JSX.Element {
 
   function handleCategoryRoleChange(roleId: string): void {
     setCategoryRoleInput(roleId);
+  }
+
+  function handleDesignationSeniorityChange(value: string): void {
+    setDesignationSeniorityInput(value ? (value as SeniorityLevel) : null);
   }
 
   const skillsForCurrentDomain = selectedCategoryDomain
@@ -386,8 +411,13 @@ export default function ProfilePage(): React.JSX.Element {
         ),
         setOwnOpenToLocations(supabase, session.user.id, openToLocationPicks),
         categoryRoleInput
-          ? setOwnDesignation(supabase, categoryRoleInput, null)
+          ? setOwnDesignation(supabase, categoryRoleInput, designationSeniorityInput)
           : Promise.resolve({ error: null }),
+        setOwnCtc(
+          supabase,
+          currentCtcInput.trim() ? Number(currentCtcInput) : 0,
+          expectedCtcInput.trim() ? Number(expectedCtcInput) : 0
+        ),
         setOwnSkills(
           supabase,
           session.user.id,
@@ -472,58 +502,53 @@ export default function ProfilePage(): React.JSX.Element {
   // so a renewal 300 days out wouldn't do anything a user would notice.
   const showUpgradeButton = !isPaidAndActive || (!!paidUntil && isExpiringSoon(paidUntil));
 
-  async function handleUpgrade(): Promise<void> {
-    if (!session?.access_token) return;
-    setErrorMessage(null);
-    setIsProcessing(true);
-    try {
-      const Razorpay = await loadRazorpayCheckout();
-      const order = await createRazorpayOrder(session.access_token, apiBaseUrl);
-
-      const checkout = new Razorpay({
-        key: razorpayKeyId,
-        order_id: order.orderId,
-        amount: order.amount,
-        currency: order.currency,
-        name: 'Sypher',
-        description: 'Paid plan — 1 year',
-        prefill: { email: user?.email ?? '' },
-        handler: async (response: {
-          razorpay_order_id: string;
-          razorpay_payment_id: string;
-          razorpay_signature: string;
-        }) => {
-          try {
-            await verifyRazorpayPayment(session.access_token, response, apiBaseUrl);
-            await refreshProfile();
-          } catch (err) {
-            setErrorMessage(err instanceof Error ? err.message : 'Payment verification failed');
-          } finally {
-            setIsProcessing(false);
-          }
-        },
-        modal: {
-          ondismiss: () => setIsProcessing(false),
-        },
-      });
-
-      checkout.on('payment.failed', () => {
-        setErrorMessage('Payment failed — please try again.');
-        setIsProcessing(false);
-      });
-
-      checkout.open();
-    } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : 'Something went wrong');
-      setIsProcessing(false);
-    }
-  }
-
   return (
-    <DashboardLayout title="Profile" description="Your Sypher profile">
+    <>
       <div className={styles.container}>
         <div className={styles.header}>
-          <h1 className={styles.heading}>Profile</h1>
+          <div className={styles.headerTop}>
+            <div className={styles.headerLeft}>
+              <div className={styles.headerIcon}>
+                <ProfileIcon />
+              </div>
+              <div>
+                <h1 className={styles.heading}>Profile</h1>
+                <p className={styles.subtitle}>Manage your account details and preferences.</p>
+              </div>
+            </div>
+            {showUpgradeButton ? (
+              <button
+                type="button"
+                className={styles.upgradeBtn}
+                disabled={isProcessing}
+                onClick={handleUpgrade}
+              >
+                {isProcessing
+                  ? 'Processing…'
+                  : isPaidAndActive
+                    ? 'Renew'
+                    : priceLabel
+                      ? `Upgrade to Paid — ₹${priceLabel}/year`
+                      : 'Upgrade to Paid'}
+              </button>
+            ) : null}
+          </div>
+          <div className={styles.planRow}>
+            <span className={`${styles.statusBadge} ${isPaidAndActive ? styles.statusPaid : styles.statusFree}`}>
+              {isPaidAndActive ? 'Paid plan' : 'Free plan'}
+            </span>
+            {isPaidAndActive && paidUntil ? (
+              <p className={styles.expiry}>
+                Expires {formatDate(paidUntil)}
+                {isExpiringSoon(paidUntil) ? (
+                  <span className={`${styles.statusBadge} ${styles.statusFree}`} style={{ marginLeft: '0.5rem' }}>
+                    Expiring soon
+                  </span>
+                ) : null}
+              </p>
+            ) : null}
+          </div>
+          {errorMessage ? <p className={styles.errorMessage}>{errorMessage}</p> : null}
         </div>
 
         <div className={styles.mainPanel}>
@@ -735,7 +760,6 @@ export default function ProfilePage(): React.JSX.Element {
                 label="Current Role"
                 expanded={expandedSections.currentRole}
                 onToggle={() => toggleSection('currentRole')}
-                underline
               />
               {expandedSections.currentRole ? (
                 <>
@@ -765,6 +789,19 @@ export default function ProfilePage(): React.JSX.Element {
                         </option>
                       ))}
                     </select>
+                    <select
+                      className={styles.formSelect}
+                      value={designationSeniorityInput ?? ''}
+                      onChange={(e) => handleDesignationSeniorityChange(e.target.value)}
+                      disabled={!categoryRoleInput}
+                    >
+                      <option value="">Select seniority…</option>
+                      {SENIORITY_LEVEL_OPTIONS.map((level) => (
+                        <option key={level.value} value={level.value}>
+                          {level.label}
+                        </option>
+                      ))}
+                    </select>
                   </div>
                   {taxonomyError ? <p className={styles.errorMessage}>{taxonomyError}</p> : null}
                 </>
@@ -773,10 +810,51 @@ export default function ProfilePage(): React.JSX.Element {
 
             <div className={styles.sectionCard}>
               <SectionHeader
+                label="Compensation"
+                expanded={expandedSections.compensation}
+                onToggle={() => toggleSection('compensation')}
+              />
+              {expandedSections.compensation ? (
+                <div className={styles.cascadeRow}>
+                  <div className={styles.formField}>
+                    <label className={styles.formLabel} htmlFor="profile-current-ctc">
+                      Current CTC (lacs per annum)
+                    </label>
+                    <input
+                      id="profile-current-ctc"
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      className={styles.formInput}
+                      value={currentCtcInput}
+                      onChange={(e) => setCurrentCtcInput(e.target.value)}
+                      placeholder="30.02"
+                    />
+                  </div>
+                  <div className={styles.formField}>
+                    <label className={styles.formLabel} htmlFor="profile-expected-ctc">
+                      Expected CTC (lacs per annum)
+                    </label>
+                    <input
+                      id="profile-expected-ctc"
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      className={styles.formInput}
+                      value={expectedCtcInput}
+                      onChange={(e) => setExpectedCtcInput(e.target.value)}
+                      placeholder="35.00"
+                    />
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className={styles.sectionCard}>
+              <SectionHeader
                 label="Skills"
                 expanded={expandedSections.skills}
                 onToggle={() => toggleSection('skills')}
-                underline
               />
               {expandedSections.skills ? (
                 <div className={styles.formField}>
@@ -870,7 +948,7 @@ export default function ProfilePage(): React.JSX.Element {
                           onClick={() => removeOpenToLocationPick(index)}
                           aria-label={`Remove ${location?.name ?? 'location'}`}
                         >
-                          ✕
+                          <DeleteOutlineRoundedIcon fontSize="small" />
                         </button>
                       </div>
                     );
@@ -958,49 +1036,6 @@ export default function ProfilePage(): React.JSX.Element {
               ) : null}
             </div>
 
-            <div className={styles.sectionCard}>
-              <SectionHeader label="Billing" expanded={expandedSections.billing} onToggle={() => toggleSection('billing')} />
-              {expandedSections.billing ? (
-                <>
-                  <div className={styles.planRow}>
-                    <span className={`${styles.statusBadge} ${isPaidAndActive ? styles.statusPaid : styles.statusFree}`}>
-                      {isPaidAndActive ? 'Paid plan' : 'Free plan'}
-                    </span>
-                  </div>
-
-                  {isPaidAndActive && paidUntil ? (
-                    <p className={styles.expiry}>
-                      Expires {formatDate(paidUntil)}
-                      {isExpiringSoon(paidUntil) ? (
-                        <span className={`${styles.statusBadge} ${styles.statusFree}`} style={{ marginLeft: '0.5rem' }}>
-                          Expiring soon
-                        </span>
-                      ) : null}
-                    </p>
-                  ) : null}
-
-                  {showUpgradeButton ? (
-                    <button
-                      type="button"
-                      className={styles.upgradeBtn}
-                      disabled={isProcessing}
-                      onClick={handleUpgrade}
-                    >
-                      {isProcessing
-                        ? 'Processing…'
-                        : isPaidAndActive
-                          ? 'Renew'
-                          : priceLabel
-                            ? `Upgrade to Paid — ₹${priceLabel}/year`
-                            : 'Upgrade to Paid'}
-                    </button>
-                  ) : null}
-
-                  {errorMessage ? <p className={styles.errorMessage}>{errorMessage}</p> : null}
-                </>
-              ) : null}
-            </div>
-
             <div className={styles.saveRow}>
               <button
                 type="button"
@@ -1013,14 +1048,6 @@ export default function ProfilePage(): React.JSX.Element {
             </div>
 
             {saveError ? <p className={styles.errorMessage}>{saveError}</p> : null}
-            {saveSuccess && !saveError ? <p className={styles.savedMessage}>Saved.</p> : null}
-
-            {companyName && role !== 'free_users' && role !== 'paid_users' ? (
-              <div className={styles.aboutField}>
-                <span className={styles.aboutLabel}>Company</span>
-                <span className={styles.companyBadge}>{companyName}</span>
-              </div>
-            ) : null}
           </div>
         </div>
       </div>
@@ -1060,6 +1087,53 @@ export default function ProfilePage(): React.JSX.Element {
         selectedSkillIds={selectedSkillIds}
         onSave={setSelectedSkillIds}
       />
+    </>
+  );
+}
+
+function EmptyProfileSection(): React.JSX.Element {
+  return (
+    <div className={styles.container}>
+      <div className={styles.header}>
+        <div className={styles.headerTop}>
+          <div className={styles.headerLeft}>
+            <div className={styles.headerIcon}>
+              <ProfileIcon />
+            </div>
+            <div>
+              <h1 className={styles.heading}>Profile</h1>
+              <p className={styles.subtitle}>Manage your account details and preferences.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+      <EmptySection
+        icon={ProfileIcon}
+        title="Nothing here yet"
+        message="This role doesn't use the candidate profile editor. Use the sidebar to get to the tools for your role."
+      />
+    </div>
+  );
+}
+
+export default function ProfilePage(): React.JSX.Element {
+  const { role, loading } = useAuth();
+  const hasFullAccess = role !== null && FULL_DASHBOARD_ROLES.includes(role);
+  const isInsiderRole = role === 'admin' || role === 'internal_hr';
+
+  return (
+    <DashboardLayout title="Profile" description="Your Sypher profile">
+      {loading ? (
+        <p role="status">Loading…</p>
+      ) : hasFullAccess ? (
+        <LearnerProfileContent />
+      ) : isInsiderRole ? (
+        <div className={styles.container}>
+          <InsiderProfileSection />
+        </div>
+      ) : (
+        <EmptyProfileSection />
+      )}
     </DashboardLayout>
   );
 }

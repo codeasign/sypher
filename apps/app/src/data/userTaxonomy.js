@@ -91,3 +91,17 @@ export async function setOwnDesignation(supabase, designationId, seniority) {
   }
   return { error: null };
 }
+
+export async function setOwnCtc(supabase, currentCtc, expectedCtc) {
+  if (!supabase) return { error: 'Not authenticated' };
+  const { error } = await supabase.rpc('update_own_ctc', {
+    p_current_ctc: currentCtc,
+    p_expected_ctc: expectedCtc,
+  });
+  if (error) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to update CTC:', error.message);
+    return { error: error.message };
+  }
+  return { error: null };
+}

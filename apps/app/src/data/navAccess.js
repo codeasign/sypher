@@ -9,6 +9,31 @@ export async function listNavAccess(supabase) {
   return data;
 }
 
+// Same in-memory-cache-per-session pattern as fetchCourseAccessRows in
+// @sypher/course-catalog/src/courseAccess -- nav_access is read on every
+// dashboard navigation (DashboardSidebar's permission gate) and every visit
+// to the Manage Access "Sidebar Navigation" tab, so caching it avoids
+// re-querying Supabase for data that only changes via setNavItemRoles.
+let cachedRows = null;
+let rowsPromise = null;
+
+/** @returns {Promise<{ item_key: string, allowed_roles: string[] }[]>} */
+export function fetchNavAccessRows(supabase) {
+  if (cachedRows) return Promise.resolve(cachedRows);
+  if (rowsPromise) return rowsPromise;
+  rowsPromise = listNavAccess(supabase).then((rows) => {
+    cachedRows = rows;
+    rowsPromise = null;
+    return rows;
+  });
+  return rowsPromise;
+}
+
+export function invalidateNavAccessCache() {
+  cachedRows = null;
+  rowsPromise = null;
+}
+
 export async function getNavItemAllowedRoles(supabase, itemKey) {
   if (!supabase || !itemKey) return [];
   const { data, error } = await supabase
@@ -34,6 +59,7 @@ export async function setNavItemRoles(supabase, itemKey, roles) {
     console.error('Failed to update nav access:', error.message);
     return { error: error.message };
   }
+  invalidateNavAccessCache();
   return { error: null };
 }
 

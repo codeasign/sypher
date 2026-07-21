@@ -5,13 +5,13 @@ import DashboardLayout from '@/components/DashboardLayout';
 import RequireAdmin from '@/components/RequireAdmin';
 import { useAuth } from '@/contexts/AuthContext';
 import courses from '@sypher/course-catalog/src/courses';
-import { listCourseAccess, setCourseRoles } from '@/data/courseAccess';
-import { listNavAccess, setNavItemRoles } from '@/data/navAccess';
+import { fetchCourseAccessRows, setCourseRoles } from '@/data/courseAccess';
+import { fetchNavAccessRows, setNavItemRoles } from '@/data/navAccess';
 import { NAV_SECTIONS } from '@/data/navItems';
 import {
-  distinctCompanyNames,
-  listCompanyCourseAccess,
-  listCompanyNavAccess,
+  fetchDistinctCompanyNames,
+  fetchCompanyCourseAccessRows,
+  fetchCompanyNavAccessRows,
   setCompanyCourseAccess,
   setCompanyNavAccess,
 } from '@/data/companyAccess';
@@ -20,6 +20,7 @@ import type { Role } from '@/types/roles';
 import TaxonomyTab from '@/components/TaxonomyTab';
 import LocationsTab from '@/components/LocationsTab';
 import ResumeMockCreditsTab from '@/components/ResumeMockCreditsTab';
+import { ManageAccessIcon } from '@/components/NavIcons';
 import styles from './manage-access.module.css';
 
 /* ── Types ── */
@@ -252,7 +253,7 @@ function CoursesTab(): React.JSX.Element {
       setLoading(false);
       return;
     }
-    const accessRows = await listCourseAccess(supabase);
+    const accessRows = await fetchCourseAccessRows(supabase);
     const map: Record<string, Role[]> = {};
     for (const row of accessRows as { course_slug: string; allowed_roles: Role[] }[]) {
       map[row.course_slug] = row.allowed_roles ?? [];
@@ -369,7 +370,7 @@ function NavAccessTab(): React.JSX.Element {
       setLoading(false);
       return;
     }
-    const navRows = await listNavAccess(supabase);
+    const navRows = await fetchNavAccessRows(supabase);
     const map: Record<string, Role[]> = {};
     for (const row of navRows as { item_key: string; allowed_roles: Role[] }[]) {
       map[row.item_key] = row.allowed_roles ?? [];
@@ -473,7 +474,7 @@ function CompaniesTab(): React.JSX.Element {
   const [activeModal, setActiveModal] = useState<'courses' | 'nav' | null>(null);
 
   useEffect(() => {
-    distinctCompanyNames(supabase).then(setCompanyOptions);
+    fetchDistinctCompanyNames(supabase).then(setCompanyOptions);
   }, [supabase]);
 
   const fetchCompanyRows = useCallback(async (name: string) => {
@@ -484,12 +485,12 @@ function CompaniesTab(): React.JSX.Element {
       setLoading(false);
       return;
     }
-    const [courseRows, navRows] = await Promise.all([
-      listCompanyCourseAccess(supabase, name),
-      listCompanyNavAccess(supabase, name),
+    const [courseKeys, navKeys] = await Promise.all([
+      fetchCompanyCourseAccessRows(supabase, name),
+      fetchCompanyNavAccessRows(supabase, name),
     ]);
-    setCourseAllowedKeys(new Set((courseRows as { course_slug: string }[]).map((r) => r.course_slug)));
-    setNavAllowedKeys(new Set((navRows as { item_key: string }[]).map((r) => r.item_key)));
+    setCourseAllowedKeys(courseKeys as Set<string>);
+    setNavAllowedKeys(navKeys as Set<string>);
     setLoading(false);
   }, [supabase]);
 
@@ -626,10 +627,15 @@ function ManageAccessContent(): React.JSX.Element {
   return (
     <div className={styles.container}>
       <div className={styles.header}>
-        <h1 className={styles.heading}>Manage Course Access</h1>
-        <p className={styles.subtitle}>
-          Control which courses are free vs paid, and which dashboard sections each role can see.
-        </p>
+        <div className={styles.headerIcon}>
+          <ManageAccessIcon />
+        </div>
+        <div>
+          <h1 className={styles.heading}>Manage Course Access</h1>
+          <p className={styles.subtitle}>
+            Control which courses are free vs paid, and which dashboard sections each role can see.
+          </p>
+        </div>
       </div>
 
       <div className={styles.tabs}>

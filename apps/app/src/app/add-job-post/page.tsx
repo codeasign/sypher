@@ -6,9 +6,9 @@ import DashboardLayout from '@/components/DashboardLayout';
 import RequireNavAccess from '@/components/RequireNavAccess';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import JobPostEditor from '@/components/JobPostEditor';
-import JobApplicantsView from '@/components/JobApplicantsView';
 import { useAuth } from '@/contexts/AuthContext';
 import { listJobPosts, listJobPostsByCreator, getJobPostById, deleteJobPost } from '@/data/jobPosts';
+import { JobPostIcon } from '@/components/NavIcons';
 import styles from './add-job-post.module.css';
 
 interface JobPostSummary {
@@ -72,17 +72,6 @@ function EditIcon(): React.JSX.Element {
   );
 }
 
-function ApplicantsIcon(): React.JSX.Element {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-      <circle cx="9" cy="7" r="4" />
-      <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
-      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-    </svg>
-  );
-}
-
 function PlusIcon(): React.JSX.Element {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -96,9 +85,8 @@ function AddJobPostContent(): React.JSX.Element {
   const { supabase, user, companyName, role } = useAuth();
   const isExternalPoster = role === 'external_job_poster';
   const [pendingDelete, setPendingDelete] = useState<JobPostSummary | null>(null);
-  const [mode, setMode] = useState<'list' | 'new' | 'edit' | 'applicants'>('list');
+  const [mode, setMode] = useState<'list' | 'new' | 'edit'>('list');
   const [editingPost, setEditingPost] = useState<JobPostFull | null>(null);
-  const [viewingApplicantsFor, setViewingApplicantsFor] = useState<JobPostSummary | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const swrKey =
@@ -142,15 +130,9 @@ function AddJobPostContent(): React.JSX.Element {
     setMode('new');
   }
 
-  function openApplicants(summary: JobPostSummary): void {
-    setViewingApplicantsFor(summary);
-    setMode('applicants');
-  }
-
   function backToList(): void {
     setMode('list');
     setEditingPost(null);
-    setViewingApplicantsFor(null);
   }
 
   async function handleSaved(): Promise<void> {
@@ -169,14 +151,6 @@ function AddJobPostContent(): React.JSX.Element {
       return;
     }
     refetch(posts.filter((p) => p.id !== target.id), false);
-  }
-
-  if (mode === 'applicants' && viewingApplicantsFor) {
-    return (
-      <div className={styles.container}>
-        <JobApplicantsView jobId={viewingApplicantsFor.id} jobTitle={viewingApplicantsFor.title} onBack={backToList} />
-      </div>
-    );
   }
 
   if (mode !== 'list') {
@@ -219,13 +193,18 @@ function AddJobPostContent(): React.JSX.Element {
   return (
     <div className={styles.container}>
       <div className={styles.header}>
-        <div>
-          <h1 className={styles.heading}>Add Job Post</h1>
-          <p className={styles.subtitle}>
-            {isExternalPoster
-              ? 'Create, edit, publish, and close job postings you’ve created on behalf of any company.'
-              : `Create, edit, publish, and close job postings for ${companyName}.`}
-          </p>
+        <div className={styles.headerLeft}>
+          <div className={styles.headerIcon}>
+            <JobPostIcon />
+          </div>
+          <div>
+            <h1 className={styles.heading}>Add Job Post</h1>
+            <p className={styles.subtitle}>
+              {isExternalPoster
+                ? 'Create, edit, publish, and close job postings you’ve created on behalf of any company.'
+                : `Create, edit, publish, and close job postings for ${companyName}.`}
+            </p>
+          </div>
         </div>
         <button type="button" className={styles.newPostBtn} onClick={openNew}>
           <PlusIcon />
@@ -286,15 +265,6 @@ function AddJobPostContent(): React.JSX.Element {
                   onClick={() => openEdit(post)}
                 >
                   <EditIcon />
-                </button>
-                <button
-                  type="button"
-                  className={styles.actionBtn}
-                  title="View applicants"
-                  aria-label={`View applicants for ${post.title}`}
-                  onClick={() => openApplicants(post)}
-                >
-                  <ApplicantsIcon />
                 </button>
                 <button
                   type="button"

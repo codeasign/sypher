@@ -2,15 +2,12 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
-import { listProfiles } from '@/data/profiles';
 import {
-  fetchPlanFeatureDefaults,
+  fetchResumeMockAdminConfig,
   savePlanFeatureDefault,
   fetchUserFeatureOverride,
   saveUserFeatureOverride,
-  fetchConversionRates,
   saveConversionRate,
-  fetchCreditPacks,
   saveCreditPack,
 } from '@/data/featureCredits';
 import manageAccessStyles from '@/app/manage-access/manage-access.module.css';
@@ -74,7 +71,7 @@ export default function ResumeMockCreditsTab(): React.JSX.Element {
   const [overrideBonus, setOverrideBonus] = useState({ resume: 0, mock: 0 });
   const [overrideLoading, setOverrideLoading] = useState(false);
 
-  const fetchAll = useCallback(async () => {
+  const fetchAll = useCallback(async (forceRefresh = false) => {
     setLoading(true);
     setError(null);
     if (!supabase) {
@@ -82,12 +79,9 @@ export default function ResumeMockCreditsTab(): React.JSX.Element {
       setLoading(false);
       return;
     }
-    const [defaultRows, rateRows, packRows, profileRows] = await Promise.all([
-      fetchPlanFeatureDefaults(supabase),
-      fetchConversionRates(supabase),
-      fetchCreditPacks(supabase),
-      listProfiles(supabase),
-    ]);
+    const { defaultRows, rateRows, packRows, profileRows } = await fetchResumeMockAdminConfig(supabase, {
+      forceRefresh,
+    });
 
     const nextDefaults: Record<PlanRole, { resume: number; mock: number }> = {
       free_users: { resume: 0, mock: 0 },
@@ -213,7 +207,7 @@ export default function ResumeMockCreditsTab(): React.JSX.Element {
     return (
       <div className={manageAccessStyles.errorState}>
         <p className={manageAccessStyles.errorText}>{error}</p>
-        <button type="button" className={manageAccessStyles.retryBtn} onClick={fetchAll}>
+        <button type="button" className={manageAccessStyles.retryBtn} onClick={() => fetchAll(true)}>
           Retry
         </button>
       </div>

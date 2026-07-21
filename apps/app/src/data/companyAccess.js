@@ -1,4 +1,4 @@
-export { distinctCompanyNames } from './pendingInvites';
+export { distinctCompanyNames, fetchDistinctCompanyNames } from './pendingInvites';
 
 export async function listCompanyCourseAccess(supabase, companyName) {
   if (!supabase || !companyName) return [];

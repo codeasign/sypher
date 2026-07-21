@@ -8,6 +8,7 @@ import StatsBar from '@/components/StatsBar';
 import PillarsSection from '@/components/PillarsSection';
 import ApproachSection from '@/components/ApproachSection';
 import HomeCourseCatalog from '@/components/HomeCourseCatalog';
+import Footer from '@/components/Footer';
 
 export const metadata: Metadata = {
   title: 'Learn AI Engineering & System Design',
@@ -36,6 +37,7 @@ export default async function Home() {
         <HomeCourseCatalog freeCourses={freeCourses} premiumCourses={premiumCourses} />
       </div>
       <ApproachSection />
+      <Footer />
     </>
   );
 }

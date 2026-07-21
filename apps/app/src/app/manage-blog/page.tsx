@@ -8,6 +8,7 @@ import ConfirmDialog from '@/components/ConfirmDialog';
 import BlogPostEditor from '@/components/BlogPostEditor';
 import { useAuth } from '@/contexts/AuthContext';
 import { listBlogPosts, getBlogPostById, deleteBlogPost } from '@/data/blogPosts';
+import { ManageBlogIcon } from '@/components/NavIcons';
 import styles from './manage-blog.module.css';
 
 interface BlogPostSummary {
@@ -168,9 +169,14 @@ function ManageBlogContent(): React.JSX.Element {
   return (
     <div className={styles.container}>
       <div className={styles.header}>
-        <div>
-          <h1 className={styles.heading}>Manage Blog Posts</h1>
-          <p className={styles.subtitle}>Draft, edit, publish, and delete blog posts.</p>
+        <div className={styles.headerLeft}>
+          <div className={styles.headerIcon}>
+            <ManageBlogIcon />
+          </div>
+          <div>
+            <h1 className={styles.heading}>Manage Blog Posts</h1>
+            <p className={styles.subtitle}>Draft, edit, publish, and delete blog posts.</p>
+          </div>
         </div>
         <button type="button" className={styles.newPostBtn} onClick={openNew}>
           <PlusIcon />

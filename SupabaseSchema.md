@@ -1230,8 +1230,14 @@ as $$
 $$;
 
 -- ── core catalog tables ──
+-- Values below 'principal' (l1-l6/architect/manager) were added later —
+-- see "Seniority levels — adding L1-L6/Architect/Manager" for the
+-- ALTER TYPE migration that adds them to an already-existing enum.
 do $$ begin
-  create type public.seniority_level as enum ('base', 'senior', 'lead', 'staff', 'principal');
+  create type public.seniority_level as enum (
+    'base', 'senior', 'lead', 'staff', 'principal',
+    'l1', 'l2', 'l3', 'l4', 'l5', 'l6', 'architect', 'manager'
+  );
 exception when duplicate_object then null;
 end $$;
 
@@ -2736,6 +2742,144 @@ that applicants use to apply is a new page (`/jobs`) with its own
 
 ---
 
+## Applicants pipeline status & poster-wide Applicants view (`get_my_job_applicants`)
+
+The Applicants page (`/applicants`) shows a poster every applicant across
+*all* of their job posts at once, filterable by pipeline stage (Applied /
+Shortlisted), instead of one job at a time — so `get_job_applicants(p_job_id)`
+above is superseded by `get_my_job_applicants(p_status)`, scoped the same
+way (`job_posts.created_by = auth.uid()`) but across every job the poster
+owns, and returning the full profile snapshot the two-pane Applicants UI
+displays (not just the handful of columns the old per-job function
+returned). Nothing in the app still calls `get_job_applicants`/
+`listJobApplicants`, so it's dropped rather than kept alongside the new
+function.
+
+`job_applications` gets a `status` column (`applied`/`shortlisted`) so a
+poster can shortlist a candidate without a separate table — same inline
+check-constraint style as `job_posts.status`. The existing "posters view
+applications to own jobs" policy only covers `select`; shortlisting needs a
+new `update` policy scoped the same way (own jobs only — the `with check`
+re-validates job ownership on write, not just the row's pre-image, so a
+poster can't repoint an application at a job they don't own).
+
+```sql
+alter table public.job_applications
+  add column if not exists status text not null default 'applied' check (status in ('applied', 'shortlisted'));
+
+drop policy if exists "posters update applications to own jobs" on public.job_applications;
+create policy "posters update applications to own jobs" on public.job_applications
+  for update using (
+    exists (select 1 from public.job_posts jp where jp.id = job_id and jp.created_by = auth.uid())
+  )
+  with check (
+    exists (select 1 from public.job_posts jp where jp.id = job_id and jp.created_by = auth.uid())
+  );
+
+drop function if exists public.get_job_applicants(uuid);
+drop function if exists public.get_my_job_applicants(text);
+
+-- security-definer: every applicant across every job the caller posted,
+-- optionally filtered to one pipeline status. profiles/base_roles/domains/
+-- locations RLS would otherwise block a poster from reading another user's
+-- row at all, so (like get_job_applicants before it) this function does the
+-- real authorization itself via the job_posts.created_by check, then reads
+-- past profiles RLS as security definer. Two separate joins into
+-- base_roles (dr/cr) because designation_id (skills-profile designation)
+-- and category_role_id ("Current Role" on /profile) are deliberately
+-- independent columns -- see "Profile category & location" below.
+-- current_location_state_name and open_to_state_names both walk through
+-- locations -> states so the Applicants view can render "State - Location"
+-- for the current pick and a plain list of every state the candidate is
+-- open to relocating within (no location-level detail for open-to, just
+-- the distinct state names).
+create or replace function public.get_my_job_applicants(p_status text default null)
+returns table (
+  applicant_id uuid,
+  full_name text,
+  email text,
+  bio text,
+  current_status public.current_status_type,
+  notice_period public.notice_period_type,
+  looking_for public.looking_for_type[],
+  education_status public.education_status_type,
+  experience_years integer,
+  experience_months integer,
+  passing_year integer,
+  resume_url text,
+  social_links jsonb,
+  designation_id uuid,
+  designation_name text,
+  designation_seniority public.seniority_level,
+  category_domain_id uuid,
+  category_domain_name text,
+  category_role_id uuid,
+  category_role_name text,
+  current_location_id uuid,
+  current_location_name text,
+  current_location_state_name text,
+  open_to_state_names text[],
+  skills text[],
+  job_id uuid,
+  job_title text,
+  applied_at timestamptz,
+  status text
+)
+language sql
+security definer
+set search_path = public
+stable
+as $body$
+  select
+    p.id, p.full_name, p.email, p.bio, p.current_status, p.notice_period,
+    p.looking_for, p.education_status, p.experience_years, p.experience_months,
+    p.passing_year, p.resume_url, p.social_links,
+    p.designation_id, dr.name, p.designation_seniority,
+    p.category_domain_id, cd.name, p.category_role_id, cr.name,
+    p.current_location_id, loc.name, cur_state.name,
+    coalesce(array_agg(distinct ot_state.name) filter (where ot_state.name is not null), '{}'),
+    coalesce(array_agg(distinct s.name) filter (where s.name is not null), '{}'),
+    ja.job_id, jp.title, ja.created_at, ja.status
+  from public.job_applications ja
+  join public.job_posts jp on jp.id = ja.job_id
+  join public.profiles p on p.id = ja.applicant_id
+  left join public.base_roles dr on dr.id = p.designation_id
+  left join public.domains cd on cd.id = p.category_domain_id
+  left join public.base_roles cr on cr.id = p.category_role_id
+  left join public.locations loc on loc.id = p.current_location_id
+  left join public.states cur_state on cur_state.id = loc.state_id
+  left join public.user_open_to_locations uotl on uotl.user_id = p.id
+  left join public.locations otl on otl.id = uotl.location_id
+  left join public.states ot_state on ot_state.id = otl.state_id
+  left join public.user_skills us on us.user_id = p.id
+  left join public.skills s on s.id = us.skill_id
+  where jp.created_by = auth.uid()
+    and (p_status is null or ja.status = p_status)
+  group by
+    p.id, p.full_name, p.email, p.bio, p.current_status, p.notice_period,
+    p.looking_for, p.education_status, p.experience_years, p.experience_months,
+    p.passing_year, p.resume_url, p.social_links, p.designation_id, dr.name,
+    p.designation_seniority, p.category_domain_id, cd.name, p.category_role_id,
+    cr.name, p.current_location_id, loc.name, cur_state.name, ja.job_id, jp.title,
+    ja.created_at, ja.status
+  order by ja.created_at desc;
+$body$;
+
+revoke all on function public.get_my_job_applicants(text) from public, anon;
+grant execute on function public.get_my_job_applicants(text) to authenticated;
+
+notify pgrst, 'reload schema';
+```
+
+`email` is kept in the return set (posters need it for the mailto action
+on `/applicants`, same as the old `get_job_applicants`). `setApplicantStatus`
+in `src/data/jobApplicants.js` needs no change against this schema — its
+unconditional `update({ status })` is already covered by the new column and
+policy, and the check constraint doesn't encode a state machine (either
+direction, applied→shortlisted or back, is a valid transition).
+
+---
+
 ## Saved jobs (`saved_jobs`) — "Saved For Later" tab on `/jobs`
 
 Lets a signed-in candidate bookmark an open job post to revisit later,
@@ -3002,6 +3146,689 @@ direct `supabase.from('user_open_to_locations')...` calls under RLS — no RPC
 indirection needed. `update_own_location_and_category` is kept as its own
 function, mirroring `update_own_designation`, so `update_own_profile`'s
 argument list doesn't keep growing.
+
+---
+
+## Seniority levels — adding L1-L6/Architect/Manager, and folding seniority into Current Role
+
+Two changes, landed together:
+
+1. `public.seniority_level` gains eight new values (`l1`-`l6`, `architect`,
+   `manager`) alongside the original five (`base`/`senior`/`lead`/`staff`/
+   `principal`) — this repo's earlier `create type` block above already
+   lists all thirteen for a from-scratch run; an **existing** database
+   needs `ALTER TYPE ... ADD VALUE` instead, since Postgres enums can't be
+   redefined in place:
+   ```sql
+   alter type public.seniority_level add value if not exists 'l1' after 'principal';
+   alter type public.seniority_level add value if not exists 'l2' after 'l1';
+   alter type public.seniority_level add value if not exists 'l3' after 'l2';
+   alter type public.seniority_level add value if not exists 'l4' after 'l3';
+   alter type public.seniority_level add value if not exists 'l5' after 'l4';
+   alter type public.seniority_level add value if not exists 'l6' after 'l5';
+   alter type public.seniority_level add value if not exists 'architect' after 'l6';
+   alter type public.seniority_level add value if not exists 'manager' after 'architect';
+
+   notify pgrst, 'reload schema';
+   ```
+   `ALTER TYPE ... ADD VALUE` cannot run inside the same transaction as a
+   statement that uses the type, so run this block by itself, not pasted
+   into a larger migration. Nothing is renamed or removed — `base_roles.
+   seniority_levels` (admin taxonomy) and `profiles.designation_seniority`
+   keep every row they already had.
+
+2. On `/profile`, the standalone "Current Designation" card (role +
+   seniority pickers) is removed — "Current Role" (domain + role) becomes
+   the one place a user sets their role, now with a third dropdown for
+   seniority alongside it. On save, `designation_id` goes back to
+   mirroring `category_role_id` (the same value is written to both), and
+   `designation_seniority` is set from the new third dropdown via the
+   existing `update_own_designation(p_designation_id, p_seniority)` RPC —
+   no RPC signature changes needed, only the caller's arguments. This
+   reverses the brief period where `designation_id`/`category_role_id`
+   were independently settable; the "Profile category & location" section
+   above (and its "two pickers stay independent" note) predates this and
+   no longer reflects the UI, though the two columns remain structurally
+   separate in the schema and `get_my_job_applicants` still joins
+   `base_roles` twice (`dr`/`cr`) for them.
+
+---
+
+## Applicants view — drop Domain, add state names to Location
+
+On `/applicants`, the detail pane's "Location" section drops the Domain
+row (redundant with Current Role, which already implies a domain) and
+reshapes Current Location to `"<State> - <Location>"`, plus a new "Open
+to" row listing every distinct state the candidate is open to relocating
+within (states only, no location-level detail — a candidate can be open
+to several locations inside one state, so location detail would just be
+noisy here).
+
+`get_my_job_applicants`'s return shape changed (`current_location_name`
+now paired with a new `current_location_state_name`, plus a new
+`open_to_state_names text[]` column), so on an **existing** database the
+function must be dropped before being recreated — Postgres won't let
+`create or replace function` change a function's `returns table` column
+list in place (same class of error as the earlier `42P13` you hit):
+
+```sql
+drop function if exists public.get_my_job_applicants(text);
+```
+
+Then run the full `create or replace function public.get_my_job_applicants(...)`
+block from "Applicants pipeline status & poster-wide Applicants view"
+above (it already has the updated return columns and joins), followed by
+its `revoke`/`grant` lines and `notify pgrst, 'reload schema';`.
+
+---
+
+## Current CTC / Expected CTC
+
+Two new numeric fields on `/profile`, displayed as "30.02 lacs per annum"
+(the raw value is stored directly in lacs — `30.02` — not converted from a
+rupee figure, so display formatting is just `value.toFixed(2) + ' lacs per
+annum'` with no unit math anywhere in the app). Both are optional and
+free-text numeric inputs (unlike the dropdown-driven fields elsewhere on
+`/profile`), since "30.02"-style arbitrary decimals don't fit a fixed
+option list.
+
+Kept as its own self-scoped RPC (`update_own_ctc`), following the same
+reasoning as `update_own_designation`/`update_own_location_and_category`:
+`update_own_profile`'s argument list doesn't keep growing.
+
+```sql
+alter table public.profiles add column if not exists current_ctc numeric(6,2);
+alter table public.profiles add column if not exists expected_ctc numeric(6,2);
+
+create or replace function public.update_own_ctc(p_current_ctc numeric, p_expected_ctc numeric)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.profiles
+  set current_ctc = p_current_ctc, expected_ctc = p_expected_ctc
+  where id = auth.uid();
+end;
+$$;
+revoke all on function public.update_own_ctc(numeric, numeric) from public, anon;
+grant execute on function public.update_own_ctc(numeric, numeric) to authenticated;
+
+notify pgrst, 'reload schema';
+```
+
+`get_my_job_applicants` also needs both columns so the Applicants detail
+pane can show a candidate's CTC alongside Current Role and Total
+Experience in Candidate Overview. Return-shape change, so drop before
+recreate on an existing database:
+
+```sql
+drop function if exists public.get_my_job_applicants(text);
+
+create or replace function public.get_my_job_applicants(p_status text default null)
+returns table (
+  applicant_id uuid,
+  full_name text,
+  email text,
+  bio text,
+  current_status public.current_status_type,
+  notice_period public.notice_period_type,
+  looking_for public.looking_for_type[],
+  education_status public.education_status_type,
+  experience_years integer,
+  experience_months integer,
+  passing_year integer,
+  resume_url text,
+  social_links jsonb,
+  designation_id uuid,
+  designation_name text,
+  designation_seniority public.seniority_level,
+  category_domain_id uuid,
+  category_domain_name text,
+  category_role_id uuid,
+  category_role_name text,
+  current_location_id uuid,
+  current_location_name text,
+  current_location_state_name text,
+  open_to_state_names text[],
+  skills text[],
+  current_ctc numeric,
+  expected_ctc numeric,
+  job_id uuid,
+  job_title text,
+  applied_at timestamptz,
+  status text
+)
+language sql
+security definer
+set search_path = public
+stable
+as $body$
+  select
+    p.id, p.full_name, p.email, p.bio, p.current_status, p.notice_period,
+    p.looking_for, p.education_status, p.experience_years, p.experience_months,
+    p.passing_year, p.resume_url, p.social_links,
+    p.designation_id, dr.name, p.designation_seniority,
+    p.category_domain_id, cd.name, p.category_role_id, cr.name,
+    p.current_location_id, loc.name, cur_state.name,
+    coalesce(array_agg(distinct ot_state.name) filter (where ot_state.name is not null), '{}'),
+    coalesce(array_agg(distinct s.name) filter (where s.name is not null), '{}'),
+    p.current_ctc, p.expected_ctc,
+    ja.job_id, jp.title, ja.created_at, ja.status
+  from public.job_applications ja
+  join public.job_posts jp on jp.id = ja.job_id
+  join public.profiles p on p.id = ja.applicant_id
+  left join public.base_roles dr on dr.id = p.designation_id
+  left join public.domains cd on cd.id = p.category_domain_id
+  left join public.base_roles cr on cr.id = p.category_role_id
+  left join public.locations loc on loc.id = p.current_location_id
+  left join public.states cur_state on cur_state.id = loc.state_id
+  left join public.user_open_to_locations uotl on uotl.user_id = p.id
+  left join public.locations otl on otl.id = uotl.location_id
+  left join public.states ot_state on ot_state.id = otl.state_id
+  left join public.user_skills us on us.user_id = p.id
+  left join public.skills s on s.id = us.skill_id
+  where jp.created_by = auth.uid()
+    and (p_status is null or ja.status = p_status)
+  group by
+    p.id, p.full_name, p.email, p.bio, p.current_status, p.notice_period,
+    p.looking_for, p.education_status, p.experience_years, p.experience_months,
+    p.passing_year, p.resume_url, p.social_links, p.designation_id, dr.name,
+    p.designation_seniority, p.category_domain_id, cd.name, p.category_role_id,
+    cr.name, p.current_location_id, loc.name, cur_state.name, p.current_ctc,
+    p.expected_ctc, ja.job_id, jp.title, ja.created_at, ja.status
+  order by ja.created_at desc;
+$body$;
+
+revoke all on function public.get_my_job_applicants(text) from public, anon;
+grant execute on function public.get_my_job_applicants(text) to authenticated;
+
+notify pgrst, 'reload schema';
+```
+
+## Applicants pipeline — "Not fit" status
+
+A poster can mark an applicant "Not fit" from the Applicants detail pane,
+next to Shortlist. It's a third `job_applications.status` value stored
+against that applicant's row for that job (not a separate table) — the
+Applied tab calls `get_my_job_applicants('applied')`, so a `not_fit` row
+is already excluded from that view for free once the applicant's status
+moves off `'applied'`; no extra filtering needed in the RPC. The inline
+check constraint from the `status` column above needs widening to allow
+the new value:
+
+```sql
+alter table public.job_applications drop constraint if exists job_applications_status_check;
+alter table public.job_applications
+  add constraint job_applications_status_check check (status in ('applied', 'shortlisted', 'not_fit'));
+
+notify pgrst, 'reload schema';
+```
+
+## Applicants pipeline — "Next Action" on Shortlisted candidates
+
+Once a candidate is Shortlisted, the poster tracks where that candidate is
+in the hiring process via a "Next Action" dropdown in the Applicants
+detail pane. Stored as a free-standing text column on `job_applications`
+(not its own lookup table — a fixed, app-defined list of stages, same
+reasoning as `current_status`/`notice_period` being inline check
+constraints rather than tables) so `get_my_job_applicants` can keep
+returning it as a plain column alongside `status`.
+
+```sql
+alter table public.job_applications add column if not exists next_action text
+  check (next_action in (
+    'contact_candidate', 'follow_up_with_candidate', 'schedule_interview',
+    'reschedule_interview', 'complete_interview', 'collect_interview_feedback',
+    'schedule_next_interview_round', 'select_candidate', 'release_offer',
+    'follow_up_on_offer', 'confirm_offer_acceptance', 'confirm_joining_date',
+    'collect_documents', 'mark_joined', 'put_on_hold', 'resume_process', 'reject'
+  ));
+
+-- security-definer, mirrors setApplicantStatus's own-jobs-only update policy:
+-- callable by the applicant's job poster only.
+create or replace function public.update_applicant_next_action(p_job_id uuid, p_applicant_id uuid, p_next_action text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not exists (select 1 from public.job_posts jp where jp.id = p_job_id and jp.created_by = auth.uid()) then
+    raise exception 'Not authorized to update this application';
+  end if;
+
+  update public.job_applications
+  set next_action = p_next_action
+  where job_id = p_job_id and applicant_id = p_applicant_id;
+end;
+$$;
+revoke all on function public.update_applicant_next_action(uuid, uuid, text) from public, anon;
+grant execute on function public.update_applicant_next_action(uuid, uuid, text) to authenticated;
+
+notify pgrst, 'reload schema';
+```
+
+`get_my_job_applicants` needs `next_action` added to its return shape so
+the Shortlisted tab can render/select the current value. Return-shape
+change, so drop before recreate:
+
+```sql
+drop function if exists public.get_my_job_applicants(text);
+
+create or replace function public.get_my_job_applicants(p_status text default null)
+returns table (
+  applicant_id uuid,
+  full_name text,
+  email text,
+  bio text,
+  current_status public.current_status_type,
+  notice_period public.notice_period_type,
+  looking_for public.looking_for_type[],
+  education_status public.education_status_type,
+  experience_years integer,
+  experience_months integer,
+  passing_year integer,
+  resume_url text,
+  social_links jsonb,
+  designation_id uuid,
+  designation_name text,
+  designation_seniority public.seniority_level,
+  category_domain_id uuid,
+  category_domain_name text,
+  category_role_id uuid,
+  category_role_name text,
+  current_location_id uuid,
+  current_location_name text,
+  current_location_state_name text,
+  open_to_state_names text[],
+  skills text[],
+  current_ctc numeric,
+  expected_ctc numeric,
+  job_id uuid,
+  job_title text,
+  company_name text,
+  applied_at timestamptz,
+  status text,
+  next_action text
+)
+language sql
+security definer
+set search_path = public
+stable
+as $body$
+  select
+    p.id, p.full_name, p.email, p.bio, p.current_status, p.notice_period,
+    p.looking_for, p.education_status, p.experience_years, p.experience_months,
+    p.passing_year, p.resume_url, p.social_links,
+    p.designation_id, dr.name, p.designation_seniority,
+    p.category_domain_id, cd.name, p.category_role_id, cr.name,
+    p.current_location_id, loc.name, cur_state.name,
+    coalesce(array_agg(distinct ot_state.name) filter (where ot_state.name is not null), '{}'),
+    coalesce(array_agg(distinct s.name) filter (where s.name is not null), '{}'),
+    p.current_ctc, p.expected_ctc,
+    ja.job_id, jp.title, jp.company_name, ja.created_at, ja.status, ja.next_action
+  from public.job_applications ja
+  join public.job_posts jp on jp.id = ja.job_id
+  join public.profiles p on p.id = ja.applicant_id
+  left join public.base_roles dr on dr.id = p.designation_id
+  left join public.domains cd on cd.id = p.category_domain_id
+  left join public.base_roles cr on cr.id = p.category_role_id
+  left join public.locations loc on loc.id = p.current_location_id
+  left join public.states cur_state on cur_state.id = loc.state_id
+  left join public.user_open_to_locations uotl on uotl.user_id = p.id
+  left join public.locations otl on otl.id = uotl.location_id
+  left join public.states ot_state on ot_state.id = otl.state_id
+  left join public.user_skills us on us.user_id = p.id
+  left join public.skills s on s.id = us.skill_id
+  where jp.created_by = auth.uid()
+    and (p_status is null or ja.status = p_status)
+  group by
+    p.id, p.full_name, p.email, p.bio, p.current_status, p.notice_period,
+    p.looking_for, p.education_status, p.experience_years, p.experience_months,
+    p.passing_year, p.resume_url, p.social_links, p.designation_id, dr.name,
+    p.designation_seniority, p.category_domain_id, cd.name, p.category_role_id,
+    cr.name, p.current_location_id, loc.name, cur_state.name, p.current_ctc,
+    p.expected_ctc, ja.job_id, jp.title, jp.company_name, ja.created_at, ja.status,
+    ja.next_action
+  order by ja.created_at desc;
+$body$;
+
+revoke all on function public.get_my_job_applicants(text) from public, anon;
+grant execute on function public.get_my_job_applicants(text) to authenticated;
+
+notify pgrst, 'reload schema';
+```
+
+`get_my_job_applicants` also needs `job_posts.company_name` so the
+Applicants detail pane can show which company is hiring below the job
+title. Return-shape change, so drop before recreate:
+
+```sql
+drop function if exists public.get_my_job_applicants(text);
+
+create or replace function public.get_my_job_applicants(p_status text default null)
+returns table (
+  applicant_id uuid,
+  full_name text,
+  email text,
+  bio text,
+  current_status public.current_status_type,
+  notice_period public.notice_period_type,
+  looking_for public.looking_for_type[],
+  education_status public.education_status_type,
+  experience_years integer,
+  experience_months integer,
+  passing_year integer,
+  resume_url text,
+  social_links jsonb,
+  designation_id uuid,
+  designation_name text,
+  designation_seniority public.seniority_level,
+  category_domain_id uuid,
+  category_domain_name text,
+  category_role_id uuid,
+  category_role_name text,
+  current_location_id uuid,
+  current_location_name text,
+  current_location_state_name text,
+  open_to_state_names text[],
+  skills text[],
+  current_ctc numeric,
+  expected_ctc numeric,
+  job_id uuid,
+  job_title text,
+  company_name text,
+  applied_at timestamptz,
+  status text
+)
+language sql
+security definer
+set search_path = public
+stable
+as $body$
+  select
+    p.id, p.full_name, p.email, p.bio, p.current_status, p.notice_period,
+    p.looking_for, p.education_status, p.experience_years, p.experience_months,
+    p.passing_year, p.resume_url, p.social_links,
+    p.designation_id, dr.name, p.designation_seniority,
+    p.category_domain_id, cd.name, p.category_role_id, cr.name,
+    p.current_location_id, loc.name, cur_state.name,
+    coalesce(array_agg(distinct ot_state.name) filter (where ot_state.name is not null), '{}'),
+    coalesce(array_agg(distinct s.name) filter (where s.name is not null), '{}'),
+    p.current_ctc, p.expected_ctc,
+    ja.job_id, jp.title, jp.company_name, ja.created_at, ja.status
+  from public.job_applications ja
+  join public.job_posts jp on jp.id = ja.job_id
+  join public.profiles p on p.id = ja.applicant_id
+  left join public.base_roles dr on dr.id = p.designation_id
+  left join public.domains cd on cd.id = p.category_domain_id
+  left join public.base_roles cr on cr.id = p.category_role_id
+  left join public.locations loc on loc.id = p.current_location_id
+  left join public.states cur_state on cur_state.id = loc.state_id
+  left join public.user_open_to_locations uotl on uotl.user_id = p.id
+  left join public.locations otl on otl.id = uotl.location_id
+  left join public.states ot_state on ot_state.id = otl.state_id
+  left join public.user_skills us on us.user_id = p.id
+  left join public.skills s on s.id = us.skill_id
+  where jp.created_by = auth.uid()
+    and (p_status is null or ja.status = p_status)
+  group by
+    p.id, p.full_name, p.email, p.bio, p.current_status, p.notice_period,
+    p.looking_for, p.education_status, p.experience_years, p.experience_months,
+    p.passing_year, p.resume_url, p.social_links, p.designation_id, dr.name,
+    p.designation_seniority, p.category_domain_id, cd.name, p.category_role_id,
+    cr.name, p.current_location_id, loc.name, cur_state.name, p.current_ctc,
+    p.expected_ctc, ja.job_id, jp.title, jp.company_name, ja.created_at, ja.status
+  order by ja.created_at desc;
+$body$;
+
+revoke all on function public.get_my_job_applicants(text) from public, anon;
+grant execute on function public.get_my_job_applicants(text) to authenticated;
+
+notify pgrst, 'reload schema';
+```
+
+---
+
+## Applicants: server-side pagination + count (cost/bandwidth reduction)
+
+The `/applicants` page currently calls `get_my_job_applicants(p_status)` and
+pulls back **every** applicant that ever applied to any of the poster's job
+posts, every time the tab loads (client then slices/filters it in the
+browser). For a poster with a small applicant pool this is fine, but it
+doesn't scale: every uncached load ships the full joined result set (skills
+arrays, open-to-location arrays, social links jsonb, etc. for every row) over
+the wire, even though the UI only ever renders one page at a time. Egress
+bandwidth is one of Supabase's billed dimensions, so this scales with total
+applicants, not with what's actually shown.
+
+This revision adds `p_job_id`, `p_page`, and `p_page_size` parameters (all
+optional, defaulting to the old "return everything" behavior so existing
+callers that don't pass them keep working unchanged), moves the job-post
+filter into SQL instead of filtering client-side after the full fetch, and
+splits the total-row count into a separate lightweight function (mirrors the
+pattern already used for `job_posts` in `listSignedInJobs.js` —
+`count: 'exact', head: true` run as its own query rather than folded into the
+main one) so counting doesn't pay for the same joins/aggregation as the
+actual page fetch.
+
+This also restores `next_action` to the return shape — a later revision that
+added `company_name` (the "`get_my_job_applicants` also needs
+`job_posts.company_name`" section above) dropped it by accident when it
+copy-pasted an earlier `create or replace` instead of the version that
+already had `next_action` added. If your Shortlisted tab's "Next Action"
+picker has been silently forgetting your selection on reload, this is why —
+worth checking before/after you run this.
+
+Return-shape and signature change, so drop before recreate:
+
+```sql
+drop function if exists public.get_my_job_applicants(text);
+
+create or replace function public.get_my_job_applicants(
+  p_status text default null,
+  p_job_id uuid default null,
+  p_page int default null,
+  p_page_size int default null
+)
+returns table (
+  applicant_id uuid,
+  full_name text,
+  email text,
+  bio text,
+  current_status public.current_status_type,
+  notice_period public.notice_period_type,
+  looking_for public.looking_for_type[],
+  education_status public.education_status_type,
+  experience_years integer,
+  experience_months integer,
+  passing_year integer,
+  resume_url text,
+  social_links jsonb,
+  designation_id uuid,
+  designation_name text,
+  designation_seniority public.seniority_level,
+  category_domain_id uuid,
+  category_domain_name text,
+  category_role_id uuid,
+  category_role_name text,
+  current_location_id uuid,
+  current_location_name text,
+  current_location_state_name text,
+  open_to_state_names text[],
+  skills text[],
+  current_ctc numeric,
+  expected_ctc numeric,
+  job_id uuid,
+  job_title text,
+  company_name text,
+  applied_at timestamptz,
+  status text,
+  next_action text
+)
+language sql
+security definer
+set search_path = public
+stable
+as $body$
+  select
+    p.id, p.full_name, p.email, p.bio, p.current_status, p.notice_period,
+    p.looking_for, p.education_status, p.experience_years, p.experience_months,
+    p.passing_year, p.resume_url, p.social_links,
+    p.designation_id, dr.name, p.designation_seniority,
+    p.category_domain_id, cd.name, p.category_role_id, cr.name,
+    p.current_location_id, loc.name, cur_state.name,
+    coalesce(array_agg(distinct ot_state.name) filter (where ot_state.name is not null), '{}'),
+    coalesce(array_agg(distinct s.name) filter (where s.name is not null), '{}'),
+    p.current_ctc, p.expected_ctc,
+    ja.job_id, jp.title, jp.company_name, ja.created_at, ja.status, ja.next_action
+  from public.job_applications ja
+  join public.job_posts jp on jp.id = ja.job_id
+  join public.profiles p on p.id = ja.applicant_id
+  left join public.base_roles dr on dr.id = p.designation_id
+  left join public.domains cd on cd.id = p.category_domain_id
+  left join public.base_roles cr on cr.id = p.category_role_id
+  left join public.locations loc on loc.id = p.current_location_id
+  left join public.states cur_state on cur_state.id = loc.state_id
+  left join public.user_open_to_locations uotl on uotl.user_id = p.id
+  left join public.locations otl on otl.id = uotl.location_id
+  left join public.states ot_state on ot_state.id = otl.state_id
+  left join public.user_skills us on us.user_id = p.id
+  left join public.skills s on s.id = us.skill_id
+  where jp.created_by = auth.uid()
+    and (p_status is null or ja.status = p_status)
+    and (p_job_id is null or ja.job_id = p_job_id)
+  group by
+    p.id, p.full_name, p.email, p.bio, p.current_status, p.notice_period,
+    p.looking_for, p.education_status, p.experience_years, p.experience_months,
+    p.passing_year, p.resume_url, p.social_links, p.designation_id, dr.name,
+    p.designation_seniority, p.category_domain_id, cd.name, p.category_role_id,
+    cr.name, p.current_location_id, loc.name, cur_state.name, p.current_ctc,
+    p.expected_ctc, ja.job_id, jp.title, jp.company_name, ja.created_at, ja.status,
+    ja.next_action
+  order by ja.created_at desc
+  limit case when p_page_size is null then null else p_page_size end
+  offset case
+    when p_page is null or p_page_size is null then 0
+    else (greatest(p_page, 1) - 1) * p_page_size
+  end;
+$body$;
+
+revoke all on function public.get_my_job_applicants(text, uuid, int, int) from public, anon;
+grant execute on function public.get_my_job_applicants(text, uuid, int, int) to authenticated;
+
+-- Lightweight sibling for the total-row count the Applicants page needs to
+-- render "Page X of Y" -- no joins beyond job_posts (needed for the
+-- created_by ownership check), so it's cheap to run on every page change
+-- even though get_my_job_applicants itself only computes one page at a time.
+create or replace function public.count_my_job_applicants(
+  p_status text default null,
+  p_job_id uuid default null
+)
+returns bigint
+language sql
+security definer
+set search_path = public
+stable
+as $body$
+  select count(*)
+  from public.job_applications ja
+  join public.job_posts jp on jp.id = ja.job_id
+  where jp.created_by = auth.uid()
+    and (p_status is null or ja.status = p_status)
+    and (p_job_id is null or ja.job_id = p_job_id);
+$body$;
+
+revoke all on function public.count_my_job_applicants(text, uuid) from public, anon;
+grant execute on function public.count_my_job_applicants(text, uuid) to authenticated;
+
+notify pgrst, 'reload schema';
+```
+
+Old call sites (`get_my_job_applicants({ p_status })`) keep working exactly
+as before — the new params all default to "no filter / no limit" — so this
+is safe to run ahead of any frontend change. Once it's live, the frontend can
+be updated to pass `p_job_id`/`p_page`/`p_page_size` and call
+`count_my_job_applicants` for the total, which turns today's "fetch
+everything, cache and paginate in the browser" into true server-side
+pagination like the `/jobs` feed already has.
+
+---
+
+## Admin dashboard analytics (user counts by role, recently active users)
+
+The admin role now gets an analytics view on `/dashboard` instead of the
+learner course-browsing view: total courses (static, no query needed),
+user counts per role, and a list of recently active users. Two new
+functions back this:
+
+- `admin_user_counts_by_role()` — `group by role` over `profiles`, so it
+  returns one row per role instead of every profile row.
+- `admin_recent_active_users(p_limit)` — joins `profiles` to
+  `auth.users.last_sign_in_at`, which Supabase Auth updates on every sign-in.
+  `auth.users` isn't reachable directly from the client (no anon/authenticated
+  grant on that schema), so this has to go through a `security definer`
+  function the same way `handle_new_user`/`handle_user_confirmed` already do.
+
+Both are gated to admins only via the existing `public.is_admin()` helper
+(from the [fresh schema](#fresh-schema-all-tables) above) — the `where ...
+and public.is_admin()` clause means a non-admin caller gets an empty result
+set back rather than an error, consistent with how RLS-style checks read
+elsewhere in this file.
+
+```sql
+create or replace function public.admin_user_counts_by_role()
+returns table (role text, user_count bigint)
+language sql
+security definer
+set search_path = public
+stable
+as $body$
+  select role::text, count(*) as user_count
+  from public.profiles
+  where deleted_at is null and public.is_admin()
+  group by role
+  order by role;
+$body$;
+
+revoke all on function public.admin_user_counts_by_role() from public, anon;
+grant execute on function public.admin_user_counts_by_role() to authenticated;
+
+create or replace function public.admin_recent_active_users(p_limit int default 10)
+returns table (
+  id uuid,
+  email text,
+  full_name text,
+  role text,
+  last_sign_in_at timestamptz
+)
+language sql
+security definer
+set search_path = public
+stable
+as $body$
+  select p.id, p.email, p.full_name, p.role::text, u.last_sign_in_at
+  from public.profiles p
+  join auth.users u on u.id = p.id
+  where p.deleted_at is null
+    and u.last_sign_in_at is not null
+    and public.is_admin()
+  order by u.last_sign_in_at desc
+  limit greatest(1, least(p_limit, 50));
+$body$;
+
+revoke all on function public.admin_recent_active_users(int) from public, anon;
+grant execute on function public.admin_recent_active_users(int) to authenticated;
+
+notify pgrst, 'reload schema';
+```
+
+Both verified against a real Postgres 17 instance (with a mock `auth.users`
++ `profiles` + `is_admin()`) before being handed over — confirmed empty
+result set for a non-admin caller and correct grouped/ordered rows for an
+admin caller.
 
 ---
 

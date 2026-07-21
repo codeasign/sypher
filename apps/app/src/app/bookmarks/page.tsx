@@ -11,6 +11,7 @@ import { withCourseAccess } from '@sypher/course-catalog/src/homepageCourses';
 import { fetchCourseAccessRows, hasCourseAccess } from '@/data/courseAccess';
 import { fetchCompanyCourseAccessRows } from '@/data/companyAccess';
 import { useAuth } from '@/contexts/AuthContext';
+import { BookmarkIcon, CoursesIcon } from '@/components/NavIcons';
 import courses from '@sypher/course-catalog/src/courses';
 import styles from './bookmarks.module.css';
 
@@ -30,14 +31,6 @@ type PendingRemoval =
   | { type: 'doc'; docPath: string; title: string };
 
 const COURSE_BY_SLUG = new Map(courses.map((c) => [c.slug, c]));
-
-function BookmarkHeaderIcon() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
-      <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
-    </svg>
-  );
-}
 
 function CloseIcon() {
   return (
@@ -60,15 +53,6 @@ function FileDocIcon() {
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
       <path d="M14 2v6h6" />
-    </svg>
-  );
-}
-
-function CoursesIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
-      <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
     </svg>
   );
 }
@@ -224,12 +208,15 @@ function BookmarksContent(): React.JSX.Element {
   return (
     <>
       <div className={styles.header}>
-        <div className={styles.headerLeft}>
-          <span className={styles.headerIcon}><BookmarkHeaderIcon /></span>
-          <h1 className={styles.heading}>Bookmarks</h1>
-          {totalBookmarks > 0 && (
-            <span className={styles.headerCount}>{totalBookmarks}</span>
-          )}
+        <div className={styles.headerIcon}>
+          <BookmarkIcon />
+        </div>
+        <div>
+          <div className={styles.headingRow}>
+            <h1 className={styles.heading}>Bookmarks</h1>
+            {totalBookmarks > 0 && <span className={styles.headerCount}>{totalBookmarks}</span>}
+          </div>
+          <p className={styles.subtitle}>Courses and pages you&apos;ve saved for later.</p>
         </div>
       </div>
 

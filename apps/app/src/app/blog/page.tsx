@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import BlogList from '@/components/BlogList';
 import { getCachedPublishedBlogPosts } from '@/data/blogPostsCached';
+import Footer from '@/components/Footer';
 import styles from './styles.module.css';
 
 export const metadata: Metadata = {
@@ -12,14 +13,17 @@ export default async function BlogIndexPage() {
   const posts = await getCachedPublishedBlogPosts();
 
   return (
-    <div className={styles.page}>
-      <div className={styles.container}>
-        <div className={styles.pageHeader}>
-          <h1 className={styles.pageTitle}>Blog</h1>
-          <p className={styles.pageSubtitle}>Latest articles and updates from the Sypher team.</p>
+    <>
+      <div className={styles.page}>
+        <div className={styles.container}>
+          <div className={styles.pageHeader}>
+            <h1 className={styles.pageTitle}>Blog</h1>
+            <p className={styles.pageSubtitle}>Latest articles and updates from the Sypher team.</p>
+          </div>
+          <BlogList initialPosts={posts} />
         </div>
-        <BlogList initialPosts={posts} />
       </div>
-    </div>
+      <Footer />
+    </>
   );
 }

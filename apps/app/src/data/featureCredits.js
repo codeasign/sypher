@@ -1,3 +1,5 @@
+import { listProfiles } from './profiles';
+
 export async function fetchPlanFeatureDefaults(supabase) {
   if (!supabase) return [];
   const { data, error } = await supabase
@@ -25,6 +27,7 @@ export async function savePlanFeatureDefault(supabase, role, resumeReviewsInclud
     console.error('Failed to save plan feature default:', error.message);
     return { error: error.message };
   }
+  invalidateResumeMockAdminConfigCache();
   return { error: null };
 }
 
@@ -85,6 +88,7 @@ export async function saveConversionRate(supabase, feature, creditsPerUse) {
     console.error('Failed to save conversion rate:', error.message);
     return { error: error.message };
   }
+  invalidateResumeMockAdminConfigCache();
   return { error: null };
 }
 
@@ -118,6 +122,7 @@ export async function saveCreditPack(supabase, tier, fields) {
     console.error('Failed to save credit pack:', error.message);
     return { error: error.message };
   }
+  invalidateResumeMockAdminConfigCache();
   return { error: null };
 }
 
@@ -141,4 +146,33 @@ export async function consumeFeature(supabase, userId, feature) {
     return { error: error.message };
   }
   return { error: null, result: data };
+}
+
+// Bundles the 4 queries the Manage Access "Resume Reviews & Mock Interview"
+// tab needs into one cached fetch (same in-memory-per-session pattern as
+// fetchCourseAccessRows) -- switching tabs and back used to re-run all 4
+// (including a full profiles scan) every time.
+let cachedConfig = null;
+let configPromise = null;
+
+export function fetchResumeMockAdminConfig(supabase, { forceRefresh = false } = {}) {
+  if (!forceRefresh && cachedConfig) return Promise.resolve(cachedConfig);
+  if (!forceRefresh && configPromise) return configPromise;
+
+  configPromise = Promise.all([
+    fetchPlanFeatureDefaults(supabase),
+    fetchConversionRates(supabase),
+    fetchCreditPacks(supabase),
+    listProfiles(supabase),
+  ]).then(([defaultRows, rateRows, packRows, profileRows]) => {
+    cachedConfig = { defaultRows, rateRows, packRows, profileRows };
+    configPromise = null;
+    return cachedConfig;
+  });
+  return configPromise;
+}
+
+export function invalidateResumeMockAdminConfigCache() {
+  cachedConfig = null;
+  configPromise = null;
 }

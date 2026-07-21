@@ -11,6 +11,7 @@ import { ROLES } from '@/types/roles';
 import type { Role } from '@/types/roles';
 import { SIGNUP_SOURCES } from '@/types/signupSource';
 import type { SignupSource } from '@/types/signupSource';
+import { UsersIcon as UsersHeaderIcon } from '@/components/NavIcons';
 import styles from './manage-users.module.css';
 
 /* ── Types ── */
@@ -357,12 +358,17 @@ function ManageUsersContent(): React.JSX.Element {
   return (
     <div className={styles.container}>
       {/* ── Header ── */}
-      <div className={styles.header} style={{ flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between' }}>
-        <div>
-          <h1 className={styles.heading}>Manage Users</h1>
-          <p className={styles.subtitle}>
-            View and manage all registered users on the platform.
-          </p>
+      <div className={styles.header}>
+        <div className={styles.headerLeft}>
+          <div className={styles.headerIcon}>
+            <UsersHeaderIcon />
+          </div>
+          <div>
+            <h1 className={styles.heading}>Manage Users</h1>
+            <p className={styles.subtitle}>
+              View and manage all registered users on the platform.
+            </p>
+          </div>
         </div>
         <button type="button" className={styles.inviteBtn} onClick={() => setInviteModalOpen(true)}>
           Invite Employees

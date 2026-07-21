@@ -17,6 +17,7 @@ export const NAV_SECTIONS = [
     title: 'Job Management',
     items: [
       { key: 'add-job-post', href: '/add-job-post', label: 'Add Job Post' },
+      { key: 'applicants', href: '/applicants', label: 'Applicants' },
       { key: 'manage-users', href: '/manage-users', label: 'Manage Users' },
       { key: 'manage-access', href: '/manage-access', label: 'Manage Course Access' },
       { key: 'send-announcements', href: '#', label: 'Send Announcements', comingSoon: true },

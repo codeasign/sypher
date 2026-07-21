@@ -13,6 +13,7 @@ import {
   buildResumeReviewFormData,
   submitToWeb3Forms,
 } from '@sypher/career-tools';
+import { ResumeIcon } from '@/components/NavIcons';
 import styles from '@/styles/careerForm.module.css';
 
 interface FeatureStatus {
@@ -270,8 +271,13 @@ export default function ResumeReviewPage(): React.JSX.Element {
     <DashboardLayout title="Resume Review" description="Get expert feedback on your resume">
       <div className={styles.container}>
         <div className={styles.header}>
-          <h1 className={styles.heading}>Resume Review</h1>
-          <p className={styles.subtitle}>Submit your resume for detailed, personalized feedback from our team.</p>
+          <div className={styles.headerIcon}>
+            <ResumeIcon />
+          </div>
+          <div>
+            <h1 className={styles.heading}>Resume Review</h1>
+            <p className={styles.subtitle}>Submit your resume for detailed, personalized feedback from our team.</p>
+          </div>
         </div>
 
         {statusLoading ? (

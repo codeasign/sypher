@@ -1,16 +1,16 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React from 'react';
 import clsx from 'clsx';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import type { User } from '@supabase/supabase-js';
 import { useAuth } from '@/contexts/AuthContext';
-import { listNavAccess, canSeeNavItem } from '@/data/navAccess';
-import { fetchCompanyNavAccessRows } from '@/data/companyAccess';
-import { NAV_SECTIONS } from '@/data/navItems';
+import { useUpgradeToPaid } from '@/hooks/useUpgradeToPaid';
+import { useVisibleNavSections } from '@/hooks/useVisibleNavSections';
 import { ROLES } from '@/types/roles';
 import type { Role } from '@/types/roles';
+import { DashboardIcon, BookmarkIcon, LogoutIcon, ProfileIcon, NAV_ICONS_BY_KEY } from '@/components/NavIcons';
 import styles from './styles.module.css';
 
 function getRoleLabel(role: Role | null): string {
@@ -37,20 +37,6 @@ interface NavSection {
   items: NavItem[];
 }
 
-const ICONS_BY_KEY: Record<string, (props: { className?: string }) => React.JSX.Element> = {
-  'jobs': JobsIcon,
-  'careers': CareersIcon,
-  'resume-review': ResumeIcon,
-  'mock-interview': InterviewIcon,
-  'add-job-post': JobPostIcon,
-  'manage-users': UsersIcon,
-  'manage-access': ManageAccessIcon,
-  'send-announcements': AnnouncementIcon,
-  'create-blog-post': BlogIcon,
-  'manage-blog-post': ManageBlogIcon,
-  'add-company-branding': BrandingIcon,
-};
-
 const OVERVIEW_SECTION: NavSection = {
   title: 'Overview',
   items: [
@@ -58,17 +44,6 @@ const OVERVIEW_SECTION: NavSection = {
     { href: '/bookmarks', label: 'Bookmarks', icon: BookmarkIcon },
   ],
 };
-
-const SECTIONS: NavSection[] = NAV_SECTIONS.map((section) => ({
-  title: section.title,
-  items: section.items.map((item) => ({
-    key: item.key,
-    href: item.href,
-    label: item.label,
-    comingSoon: item.comingSoon,
-    icon: ICONS_BY_KEY[item.key] ?? DashboardIcon,
-  })),
-}));
 
 const PROFILE_ITEM: NavItem = { href: '/profile', label: 'Profile', icon: ProfileIcon };
 
@@ -78,7 +53,9 @@ export default function DashboardSidebar({
   onToggleCollapsed,
 }: DashboardSidebarProps): React.JSX.Element {
   const pathname = usePathname();
-  const { supabase, role, companyName, signOut } = useAuth();
+  const { role, paidUntil, signOut } = useAuth();
+  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid();
+  const { sections: accessGatedSections } = useVisibleNavSections();
   const email = user?.email ?? '';
   const metadata = (user?.user_metadata ?? {}) as {
     full_name?: string;
@@ -87,52 +64,23 @@ export default function DashboardSidebar({
   };
   const displayName = metadata.full_name || metadata.name || email.split('@')[0] || 'Guest';
   const avatarUrl = metadata.avatar_url;
+  // Client-side treats a past paid_until as expired regardless of `role`
+  // — the daily cron may not have caught up yet.
+  const isPaidAndActive = role === 'paid_users' && !!paidUntil && new Date(paidUntil) > new Date();
 
-  const [navAccessLoading, setNavAccessLoading] = useState(true);
-  const [allowedRolesByKey, setAllowedRolesByKey] = useState<Record<string, string[]>>({});
-  const [companyAllowedItemKeys, setCompanyAllowedItemKeys] = useState<Set<string>>(new Set());
-
-  useEffect(() => {
-    if (role === 'admin') {
-      setNavAccessLoading(false);
-      return;
-    }
-    let isMounted = true;
-    listNavAccess(supabase).then((rows) => {
-      if (!isMounted) return;
-      const map: Record<string, string[]> = {};
-      for (const row of rows) {
-        map[row.item_key] = row.allowed_roles ?? [];
-      }
-      setAllowedRolesByKey(map);
-      setNavAccessLoading(false);
-    });
-    return () => {
-      isMounted = false;
-    };
-  }, [supabase, role]);
-
-  useEffect(() => {
-    if (role !== 'company_employees' || !companyName) return;
-    fetchCompanyNavAccessRows(supabase, companyName).then(setCompanyAllowedItemKeys);
-  }, [supabase, role, companyName]);
-
-  const accessGatedSections: NavSection[] =
-    role === 'admin'
-      ? SECTIONS
-      : navAccessLoading
-      ? []
-      : SECTIONS.map((section) => ({
-          title: section.title,
-          items: section.items.filter((item) =>
-            canSeeNavItem(role, item.key ? allowedRolesByKey[item.key] : [], {
-              itemKey: item.key,
-              companyAllowedItemKeys,
-            }),
-          ),
-        })).filter((section) => section.items.length > 0);
-
-  const visibleSections: NavSection[] = [OVERVIEW_SECTION, ...accessGatedSections];
+  const visibleSections: NavSection[] = [
+    OVERVIEW_SECTION,
+    ...accessGatedSections.map((section) => ({
+      title: section.title,
+      items: section.items.map((item) => ({
+        key: item.key,
+        href: item.href,
+        label: item.label,
+        comingSoon: item.comingSoon,
+        icon: (item.key ? NAV_ICONS_BY_KEY[item.key] : undefined) ?? DashboardIcon,
+      })),
+    })),
+  ];
 
   function isActive(href: string): boolean {
     return pathname === href || pathname.startsWith(`${href}/`);
@@ -195,11 +143,27 @@ export default function DashboardSidebar({
           <div className={styles.userInfo}>
             <span className={styles.name}>{displayName}</span>
             <span className={styles.email}>{email}</span>
-            {role && (
-              <span className={clsx(styles.roleBadge, styles[`role-${role}`])}>
-                {getRoleLabel(role)}
+            <div className={styles.badgeRow}>
+              {role && (
+                <span className={clsx(styles.roleBadge, styles[`role-${role}`])}>
+                  {getRoleLabel(role)}
+                </span>
+              )}
+              <span className={clsx(styles.planBadge, isPaidAndActive ? styles.planPaid : styles.planFree)}>
+                {isPaidAndActive ? 'Paid plan' : 'Free plan'}
               </span>
+            </div>
+            {!isPaidAndActive && (
+              <button
+                type="button"
+                className={styles.goProBtn}
+                disabled={isProcessing}
+                onClick={handleUpgrade}
+              >
+                {isProcessing ? 'Processing…' : 'Go Pro'}
+              </button>
             )}
+            {errorMessage && <span className={styles.upgradeError}>{errorMessage}</span>}
           </div>
         )}
       </div>
@@ -223,323 +187,5 @@ export default function DashboardSidebar({
         </button>
       </div>
     </aside>
-  );
-}
-
-function DashboardIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <rect x="3" y="3" width="7" height="9" rx="1" />
-      <rect x="14" y="3" width="7" height="5" rx="1" />
-      <rect x="14" y="12" width="7" height="9" rx="1" />
-      <rect x="3" y="16" width="7" height="5" rx="1" />
-    </svg>
-  );
-}
-
-function BookmarkIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
-    </svg>
-  );
-}
-
-function JobsIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <rect x="2" y="7" width="20" height="14" rx="2" ry="2" />
-      <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16" />
-      <line x1="2" y1="13" x2="22" y2="13" />
-    </svg>
-  );
-}
-
-function CareersIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <rect x="2" y="7" width="20" height="14" rx="2" ry="2" />
-      <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16" />
-    </svg>
-  );
-}
-
-function LogoutIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
-      <polyline points="16 17 21 12 16 7" />
-      <line x1="21" y1="12" x2="9" y2="12" />
-    </svg>
-  );
-}
-
-function ProfileIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <circle cx="12" cy="8" r="4" />
-      <path d="M4 21c0-4 4-6 8-6s8 2 8 6" />
-    </svg>
-  );
-}
-
-function ResumeIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-      <polyline points="14 2 14 8 20 8" />
-      <line x1="16" y1="13" x2="8" y2="13" />
-      <line x1="16" y1="17" x2="8" y2="17" />
-      <polyline points="10 9 9 9 8 9" />
-    </svg>
-  );
-}
-
-function InterviewIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-      <circle cx="9" cy="7" r="4" />
-      <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
-      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-    </svg>
-  );
-}
-
-function JobPostIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-      <line x1="8" y1="21" x2="16" y2="21" />
-      <line x1="12" y1="17" x2="12" y2="21" />
-    </svg>
-  );
-}
-
-function UsersIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-      <circle cx="9" cy="7" r="4" />
-      <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
-      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-    </svg>
-  );
-}
-
-function ManageAccessIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-    </svg>
-  );
-}
-
-function AnnouncementIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M22 2L11 13" />
-      <path d="M22 2l-7 20-4-9-9-4 20-7z" />
-    </svg>
-  );
-}
-
-function BlogIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M12 20h9" />
-      <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
-    </svg>
-  );
-}
-
-function ManageBlogIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <circle cx="12" cy="12" r="3" />
-      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
-    </svg>
-  );
-}
-
-function BrandingIcon({ className }: { className?: string }): React.JSX.Element {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <circle cx="12" cy="12" r="3" />
-      <path d="M12 2v4" />
-      <path d="M12 18v4" />
-      <path d="M4.93 4.93l2.83 2.83" />
-      <path d="M16.24 16.24l2.83 2.83" />
-      <path d="M2 12h4" />
-      <path d="M18 12h4" />
-      <path d="M4.93 19.07l2.83-2.83" />
-      <path d="M16.24 7.76l2.83-2.83" />
-    </svg>
   );
 }

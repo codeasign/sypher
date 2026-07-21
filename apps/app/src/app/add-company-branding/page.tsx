@@ -7,6 +7,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { uploadToBunny } from '@/data/bunnyUpload';
 import { getCompanyBranding, upsertCompanyBranding, listCompanyBrandings } from '@/data/companyBranding';
 import { fetchLocations } from '@/data/locations';
+import { BrandingIcon } from '@/components/NavIcons';
 import styles from './add-company-branding.module.css';
 
 interface LocationsCatalog {
@@ -217,8 +218,13 @@ function AddCompanyBrandingContent(): React.JSX.Element {
     return (
       <div className={styles.container}>
         <div className={styles.header}>
-          <h1 className={styles.heading}>Add Company Branding</h1>
-          <p className={styles.subtitle}>Look up a company to create or edit its branding on their behalf.</p>
+          <div className={styles.headerIcon}>
+            <BrandingIcon />
+          </div>
+          <div>
+            <h1 className={styles.heading}>Add Company Branding</h1>
+            <p className={styles.subtitle}>Look up a company to create or edit its branding on their behalf.</p>
+          </div>
         </div>
         {error && <p className={styles.error}>{error}</p>}
         <div className={styles.card}>
@@ -282,17 +288,22 @@ function AddCompanyBrandingContent(): React.JSX.Element {
   return (
     <div className={styles.container}>
       <div className={styles.header}>
-        <h1 className={styles.heading}>Add Company Branding</h1>
-        <p className={styles.subtitle}>
-          {isExternalPoster
-            ? `Editing branding on behalf of ${activeCompanyName}.`
-            : `Set your company name, logo, brand colors, and profile details for ${companyName}.`}
-        </p>
-        {isExternalPoster && (
-          <button type="button" className={styles.switchCompanyBtn} onClick={switchCompany}>
-            Switch company
-          </button>
-        )}
+        <div className={styles.headerIcon}>
+          <BrandingIcon />
+        </div>
+        <div>
+          <h1 className={styles.heading}>Add Company Branding</h1>
+          <p className={styles.subtitle}>
+            {isExternalPoster
+              ? `Editing branding on behalf of ${activeCompanyName}.`
+              : `Set your company name, logo, brand colors, and profile details for ${companyName}.`}
+          </p>
+          {isExternalPoster && (
+            <button type="button" className={styles.switchCompanyBtn} onClick={switchCompany}>
+              Switch company
+            </button>
+          )}
+        </div>
       </div>
 
       {error && <p className={styles.error}>{error}</p>}

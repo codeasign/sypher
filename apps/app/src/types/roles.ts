@@ -24,3 +24,10 @@ export const ROLES: { value: Role; label: string }[] = [
 export const GLOBALLY_CONFIGURABLE_ROLES = ROLES.filter(
   (r) => r.value !== 'admin' && r.value !== 'company_employees'
 );
+
+// Dashboard and Profile show the full course-browsing / candidate-profile
+// experience only for these roles. Everyone else (admin, HR roles,
+// company_employees, external_job_poster) gets an empty placeholder instead
+// -- those roles operate through their own tools (Manage Access, Applicants,
+// Add Job Post, etc.), not the learner-facing dashboard/profile.
+export const FULL_DASHBOARD_ROLES: Role[] = ['free_users', 'paid_users', 'branders'];

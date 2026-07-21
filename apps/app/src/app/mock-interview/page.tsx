@@ -14,6 +14,7 @@ import {
   buildMockInterviewPayload,
   submitToWeb3Forms,
 } from '@sypher/career-tools';
+import { InterviewIcon } from '@/components/NavIcons';
 import styles from '@/styles/careerForm.module.css';
 
 interface FeatureStatus {
@@ -245,8 +246,13 @@ export default function MockInterviewPage(): React.JSX.Element {
     <DashboardLayout title="Mock Interview" description="Book a mock interview with our team">
       <div className={styles.container}>
         <div className={styles.header}>
-          <h1 className={styles.heading}>Mock Interview</h1>
-          <p className={styles.subtitle}>Book a practice interview and get personalized feedback from our team.</p>
+          <div className={styles.headerIcon}>
+            <InterviewIcon />
+          </div>
+          <div>
+            <h1 className={styles.heading}>Mock Interview</h1>
+            <p className={styles.subtitle}>Book a practice interview and get personalized feedback from our team.</p>
+          </div>
         </div>
 
         {statusLoading ? (
