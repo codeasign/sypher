@@ -1,5 +1,5 @@
 ---
-description: Generate a complete design pattern topic — one theory page with pseudocode and one domain example, plus complete single-file implementations in JavaScript, TypeScript, Python, Java, C#, and Rust.
+description: Generate a complete design pattern topic for the Design Patterns course — one theory page with pseudocode and one domain example, plus complete single-file implementations in JavaScript, TypeScript, Python, Java, C#, and Rust.
 ---
 
 # /add-design-pattern
@@ -92,7 +92,7 @@ The theory page may use pseudocode for explanation, but **every language impleme
 ## Files to generate
 
 ```
-docs/software-engineering/design-patterns/$SLUG/
+docs/design-patterns/$SLUG/
 ├── index.md
 ├── 01-theory.mdx
 ├── 02-javascript.mdx
@@ -581,45 +581,25 @@ Loan[Carol]: $50000.00 at 6.75% APR
 
 ## Sidebar entry
 
-Target file: `sidebars/software-engineering.json`
+Target file: `sidebars/design-patterns.json`, top-level key `designPatternsSidebar`.
+`"Creational"`, `"Structural"`, `"Behavioral"` are top-level categories in this array (no
+outer "Design Patterns" wrapper — the course itself is Design Patterns, so a same-named
+wrapper would be redundant). Locate the top-level `$CATEGORY` category directly.
 
-The sidebar already has a `"softwareEngineeringSidebar"` array. Locate the `"Design Patterns"` category (or the `"SOLID Principles"` category as anchor).
-
-**If the `"Design Patterns"` category with `"Creational"`, `"Structural"`, `"Behavioral"` subcategories does not exist yet, create it after `"SOLID Principles"`:**
+**If the file does not exist, create it with the three top-level categories:**
 
 ```json
 {
-  "type": "category",
-  "label": "Design Patterns",
-  "collapsible": true,
-  "collapsed": true,
-  "items": [
-    {
-      "type": "category",
-      "label": "Creational",
-      "collapsible": true,
-      "collapsed": true,
-      "items": []
-    },
-    {
-      "type": "category",
-      "label": "Structural",
-      "collapsible": true,
-      "collapsed": true,
-      "items": []
-    },
-    {
-      "type": "category",
-      "label": "Behavioral",
-      "collapsible": true,
-      "collapsed": true,
-      "items": []
-    }
+  "designPatternsSidebar": [
+    "design-patterns/index",
+    { "type": "category", "label": "Creational", "collapsible": true, "collapsed": false, "items": [] },
+    { "type": "category", "label": "Structural", "collapsible": true, "collapsed": true, "items": [] },
+    { "type": "category", "label": "Behavioral", "collapsible": true, "collapsed": true, "items": [] }
   ]
 }
 ```
 
-**Then append the new pattern to the matching `$CATEGORY` subcategory's `"items"`:**
+**Then append the new pattern to the matching top-level `$CATEGORY`'s `"items"`:**
 
 ```json
 {
@@ -628,22 +608,16 @@ The sidebar already has a `"softwareEngineeringSidebar"` array. Locate the `"Des
   "collapsible": true,
   "collapsed": true,
   "items": [
-    "software-engineering/design-patterns/$SLUG/$SLUG-theory",
-    "software-engineering/design-patterns/$SLUG/$SLUG-javascript",
-    "software-engineering/design-patterns/$SLUG/$SLUG-typescript",
-    "software-engineering/design-patterns/$SLUG/$SLUG-python",
-    "software-engineering/design-patterns/$SLUG/$SLUG-java",
-    "software-engineering/design-patterns/$SLUG/$SLUG-csharp",
-    "software-engineering/design-patterns/$SLUG/$SLUG-rust"
+    "design-patterns/$SLUG/$SLUG-theory",
+    "design-patterns/$SLUG/$SLUG-javascript",
+    "design-patterns/$SLUG/$SLUG-typescript",
+    "design-patterns/$SLUG/$SLUG-python",
+    "design-patterns/$SLUG/$SLUG-java",
+    "design-patterns/$SLUG/$SLUG-csharp",
+    "design-patterns/$SLUG/$SLUG-rust"
   ]
 }
 ```
-
----
-
-## docusaurus.config.js
-
-The navbar entry for `softwareEngineeringSidebar` already exists — no changes needed.
 
 ---
 
@@ -652,7 +626,7 @@ The navbar entry for `softwareEngineeringSidebar` already exists — no changes 
 After writing all 8 files, run this check to ensure all pages have AsciiDiagrams:
 
 ```bash
-for f in docs/software-engineering/design-patterns/$SLUG/*.mdx; do
+for f in docs/design-patterns/$SLUG/*.mdx; do
   count=$(grep -c '<AsciiDiagram' "$f")
   name=$(basename "$f")
   if [ "$count" -eq 0 ]; then echo "MISSING DIAGRAM: $name"; fi
@@ -665,7 +639,7 @@ If any file has 0 diagrams, add an AsciiDiagram between the intro paragraph and 
 
 ## Post-generation: run /fix-rendered-content
 
-After writing all files and verifying diagrams exist, run `/fix-rendered-content software-engineering/design-patterns/$SLUG` to catch any A5 (alt/caption ordering) or Defect E (children prop) issues.
+After writing all files and verifying diagrams exist, run `/fix-rendered-content design-patterns/$SLUG` to catch any A5 (alt/caption ordering) or Defect E (children prop) issues.
 
 ---
 
@@ -683,7 +657,7 @@ Do NOT run `npm start` or `npm run build`.
 When generating multiple design patterns, use parallel agents for efficiency. After all agents complete:
 
 1. Verify all files exist (N patterns × 8 files each)
-2. Update `sidebars/software-engineering.json` — add all patterns under their matching category subcategory
+2. Update `sidebars/design-patterns.json` — add all patterns under their matching top-level category (Creational/Structural/Behavioral)
 3. Verify every `.mdx` file has at least 1 AsciiDiagram (see verification step above)
 4. Run `/fix-rendered-content` on all generated directories
 5. Build fails are expected for sidebar context issues unrelated to new content — confirm no MDX syntax errors

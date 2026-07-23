@@ -1,5 +1,6 @@
 ---
 title: Sorting Algorithms
+sidebar_label: Course Home
 slug: /sorting-algorithms/
 ---
 

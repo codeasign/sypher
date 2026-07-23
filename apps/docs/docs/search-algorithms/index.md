@@ -1,5 +1,6 @@
 ---
 title: Search Algorithms
+sidebar_label: Course Home
 slug: /search-algorithms/
 ---
 

@@ -1,7 +1,7 @@
 ---
 id: system-design-fundamentals
 title: System Design Fundamentals
-sidebar_label: Overview
+sidebar_label: Course Home
 slug: /system-design-fundamentals
 ---
 

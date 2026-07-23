@@ -5,7 +5,9 @@ argument-hint: <module-number> <module-topic>
 
 # Add Search Algorithms Course Module
 
-Course: **Search Algorithms** — single page per module, algorithm reference + practice.
+Course: **Search Algorithms** — single page per module, algorithm reference with a
+multi-step worked example (programiz-style) plus an embedded Judge0 code editor and
+a practice/test-case section.
 
 ## Course Constants
 
@@ -67,22 +69,32 @@ below:
   tables of tradeoffs unless a single plain-language sentence can't say it — this is
   a first pass, not a reference manual.
 
-## Page Format — single page per module
+## Page Format — single page per module, IDE + practice included
+
+Baseline reference for the explanation sections' structure:
+[programiz.com/dsa/binary-search](https://www.programiz.com/dsa/binary-search) — a
+numbered sequence of step-by-step diagrams over one fixed example, followed by
+pseudocode, complexity, and applications. This course keeps its own plain-English
+"explain it to a first-timer" voice (see Audience above) but adopts that structural
+flow for the explanation, wrapped in the same embedded-IDE/practice format the course
+has always used.
 
 The entire page body is wrapped in a single `<DetailsPageWithIDE>` component with
 three regions, in this order:
 
-1. **Explanation** (children) — Sections 1-5: Summary, Pseudocode, ASCII Diagram,
-   How It Works, Practice (test case table). Rendered full-width, above the IDE.
+1. **Explanation** (children) — Sections 1-6 below: Summary, Pseudocode, Worked
+   Example, Complexity, Applications, Practice (test case table). Rendered full-width,
+   above the IDE.
 2. **IDE** — rendered by `DetailsPageWithIDE` itself from `starterCode`/`harness`/
    `testCases`, full-width, between explanation and solutions.
-3. **Solutions** (`solutions` prop) — Section 6: the same per-language reference
+3. **Solutions** (`solutions` prop) — Section 7: the same per-language reference
    implementation as `starterCode`, as tabbed code blocks, rendered full-width below
    the IDE.
 
-Frontmatter must include `hide_table_of_contents: true`.
+Frontmatter must include `hide_table_of_contents: true` (the two-pane IDE layout needs
+the extra width).
 
-Required imports (in addition to `AsciiDiagram`, `Tabs`, `TabItem`):
+Required imports (in addition to `AsciiDiagram`, `Tabs`, `TabItem`, `CodeBlock`):
 ```
 import DetailsPageWithIDE from '@site/src/components/DetailsPageWithIDE/Index';
 ```
@@ -91,7 +103,7 @@ Opening wrapper (immediately after imports, before Section 1):
 ```
 <DetailsPageWithIDE
   meta={{ id: 'search-algorithms/{slug}', timeLimitSeconds: 2, memoryLimitKb: 262144 }}
-  testCases={[ /* 5 entries, see Section 5 */ ]}
+  testCases={[ /* 5 entries, see Section 6 */ ]}
   starterCode={{ python311: `...`, c_gcc13: `...`, cpp_clang17: `...`, java21: `...`, csharp_dotnet8: `...`, javascript_node20: `...`, typescript516: `...`, rust179: `...`, go122: `...` }}
   harness={{ python311: `...`, c_gcc13: `...`, cpp_clang17: `...`, java21: `...`, csharp_dotnet8: `...`, javascript_node20: `...`, typescript516: `...`, rust179: `...`, go122: `...` }}
   defaultLanguage="python311"
@@ -110,7 +122,7 @@ Opening wrapper (immediately after imports, before Section 1):
   }
 >
 ```
-Closing tag `</DetailsPageWithIDE>` goes at the very end of the page, after Section 5
+Closing tag `</DetailsPageWithIDE>` goes at the very end of the page, after Section 6
 (the explanation/practice children) — the `solutions` prop is passed as JSX in the
 opening tag, not as page body content.
 
@@ -136,41 +148,57 @@ opening tag, not as page body content.
     encoding choice as a one-line comment near the harness definition (in this spec, not
     in the generated page).
 
-**Section 1 — Short Summary** (goes FIRST, immediately after the opening
-`<DetailsPageWithIDE>` tag)
+Page body (children), in this exact order:
+
+**Section 1 — Summary**
 - 2-3 short sentences in plain English: what the algorithm does and the one main
   idea behind it, told like you'd explain it to a friend with no CS background.
 - End with one line stating roughly how fast/slow it is in everyday terms (e.g. "it
   checks every item once, so it gets slower the more items you have" instead of
-  bare Big-O notation). Do not introduce a Big-O table here — that's covered
-  informally in Section 4.
+  bare Big-O notation). Do not introduce Big-O here — that's Section 4.
 
 **Section 2 — Pseudocode**
 - Language-agnostic step-by-step pseudocode, written as short numbered plain-English
   steps (not formal notation) — someone who has never coded should be able to follow
-  each line as an instruction, like a recipe.
+  each line as an instruction, like a recipe. This is the iterative formulation.
+- If the algorithm has a natural recursive formulation (binary search and its
+  variants, DFS, tree/trie search, A*, anything divide-and-conquer), add a second,
+  clearly labeled "Recursive Version" pseudocode block right after the iterative one.
+  Skip this for algorithms with no natural recursive shape (linear/jump/interpolation/
+  exponential search, two-pointer patterns) — don't force one in.
 
-**Section 3 — ASCII Diagram**
-- One `<AsciiDiagram>` visualizing the algorithm's core mechanic on a concrete small
-  input (per the drawing conventions in CLAUDE.md — Unicode box-drawing, no `+ - |`)
-- `id` = `search-algorithms/{module-slug}`, unique across the project
-- Keep the example tiny (4-7 elements) so a first-timer can trace it by eye
+**Section 3 — Worked Example** (the core section — this is what changed)
+- Pick ONE small concrete example (4-8 elements for arrays; a small graph/tree/trie
+  with 5-9 nodes for graph/tree/trie modules) and carry it through EVERY diagram in
+  this section — the reader traces one case start to finish, the same way programiz's
+  binary-search page reuses `[3, 4, 5, 6, 7, 8, 9]` searching for `4` across its whole
+  diagram sequence.
+- Render the example as a NUMBERED SEQUENCE of `<AsciiDiagram>` components — typically
+  3-7 diagrams, however many steps the algorithm naturally takes on the chosen
+  example. This replaces the old single "one diagram total" approach.
+- Immediately after each diagram, add 1-2 plain-English sentences saying what just
+  happened and why (which comparison was made, which pointer/pivot/element moved, why)
+  — a running narration interleaved with the diagrams, not one paragraph at the end.
+- Every diagram needs a unique `id`: `search-algorithms/{module-slug}/step-{N}` (IDs
+  must be unique across the whole project per CLAUDE.md).
+- Follow CLAUDE.md's ASCII diagram drawing conventions (Unicode box-drawing, no
+  `+ - |`, `content` prop not children, `alt`/`caption` before `content`, no blank
+  lines inside the template literal).
+- State any precondition simply where it first matters (e.g. "this only works if the
+  list is already sorted — like looking up a word in a dictionary") — skip if none.
 
-**Section 4 — How It Works**
-- What problem it solves and the core idea, in plain language — reuse the friend
-  analogy from Section 1 if useful, don't restate it word-for-word
-- Walk through how the diagram in Section 3 demonstrates the core idea, step by step
-- State any precondition simply (e.g. "this only works if the list is already sorted
-  — like looking up a word in a dictionary") — skip this bullet entirely if there's
-  no precondition
-- One plain-English line on how fast it is best case vs worst case (e.g. "if you're
-  lucky and find it on the first try, it's instant; if it's not there at all, it has
-  to check everything") — no complexity notation required, but include it in
-  parentheses for readers who do want it, e.g. "(this is called O(n) time)"
-- Skip formal correctness proofs, invariants, and alternative-algorithm comparisons
-  — those belong in more advanced material, not a first pass
+**Section 4 — Complexity**
+- Best, Average, Worst time, and Space — each as one plain-English phrase with the
+  Big-O in parentheses, e.g. "If you're lucky and the target is the very first thing
+  you check, this is instant (`O(1)`)." Keep this course's plain-English-first voice;
+  don't drop into a bare textbook table with no explanation.
 
-**Section 5 — Practice**
+**Section 5 — Applications**
+- 3-5 concrete, verifiable real-world uses — standard library implementations, named
+  systems/tools/protocols that actually use this algorithm. No generic filler like
+  "used in many applications."
+
+**Section 6 — Practice**
 - Exactly 5 test cases per module (shared across all 9 languages — same inputs/outputs)
 - Format per test case: input, expected output, one-line plain-English note on what
   it's testing (e.g. "what happens if the value isn't there", "an empty list",
@@ -184,7 +212,7 @@ opening tag, not as page body content.
   editor to verify your solution." This is the last line of the children content,
   immediately before the closing `</DetailsPageWithIDE>` tag.
 
-**Section 6 — Solutions** (goes in the `solutions` prop, not in page body children)
+**Section 7 — Solutions** (goes in the `solutions` prop, not in page body children)
 - Tabbed code block per language, all 9: Python 3.11, C (GCC 13), C++ (Clang 17),
   Java 21, C# / .NET 8, JavaScript (Node 20.10.0), TypeScript 5.1.6, Rust 1.79.0, Go 1.22
 - Each implementation complete and runnable — function signature, full body, no

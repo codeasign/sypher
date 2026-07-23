@@ -19,10 +19,12 @@ function collectDocIds(items) {
 }
 
 /**
- * Walk sidebar JSON and build a map: docId → sectionIndex (0-based).
+ * Walk sidebar JSON and build a map: docId → sectionIndex (0-based),
+ * plus the ordered list of top-level category labels (one per section).
  */
 function buildSectionMap(sidebarItems) {
   const map = {};
+  const labels = [];
   let sectionIndex = 0;
   for (const item of sidebarItems) {
     if (item.type === 'category' && Array.isArray(item.items)) {
@@ -30,10 +32,11 @@ function buildSectionMap(sidebarItems) {
       for (const id of ids) {
         map[id] = sectionIndex;
       }
+      labels.push(item.label || `Section ${sectionIndex + 1}`);
       sectionIndex++;
     }
   }
-  return map;
+  return { map, labels };
 }
 
 module.exports = function () {
@@ -44,6 +47,7 @@ module.exports = function () {
       const sidebarsDir = path.resolve(__dirname, '../../sidebars');
       const courseRegex = /^([\w-]+)\.json$/;
       const courseSectionMap = {};
+      const courseSectionLabels = {};
 
       if (fs.existsSync(sidebarsDir)) {
         const files = fs.readdirSync(sidebarsDir);
@@ -58,7 +62,9 @@ module.exports = function () {
             if (keys.length === 0) continue;
             const sidebarItems = content[keys[0]];
             if (Array.isArray(sidebarItems)) {
-              courseSectionMap[courseSlug] = buildSectionMap(sidebarItems);
+              const { map, labels } = buildSectionMap(sidebarItems);
+              courseSectionMap[courseSlug] = map;
+              courseSectionLabels[courseSlug] = labels;
             }
           } catch (err) {
             console.warn(`[course-sections] Could not parse ${file}:`, err.message);
@@ -66,7 +72,7 @@ module.exports = function () {
         }
       }
 
-      return { courseSectionMap };
+      return { courseSectionMap, courseSectionLabels };
     },
 
     contentLoaded({ content, actions }) {

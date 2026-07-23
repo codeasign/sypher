@@ -75,6 +75,29 @@ const config = {
     './plugins/course-sections',
     './plugins/blog-routes',
     './plugins/course-chunk-isolation',
+    [
+      '@docusaurus/plugin-client-redirects',
+      {
+        redirects: [
+          // The "Software Engineering" course was split into two courses —
+          // the old combined course-home and marketing-page URLs are now
+          // ambiguous, so send visitors to the catalog to pick one.
+          { to: '/courses', from: ['/docs/software-engineering', '/course/software-engineering'] },
+        ],
+        // Called once per built route with the NEW path; return the OLD
+        // path(s) that should redirect to it. Handles every moved lesson
+        // page via prefix rewrite instead of hand-listing ~196 pages.
+        createRedirects(existingPath) {
+          if (existingPath.startsWith('/docs/solid-principles/')) {
+            return [existingPath.replace('/docs/solid-principles/', '/docs/software-engineering/solid/')];
+          }
+          if (existingPath.startsWith('/docs/design-patterns/')) {
+            return [existingPath.replace('/docs/design-patterns/', '/docs/software-engineering/design-patterns/')];
+          }
+          return undefined;
+        },
+      },
+    ],
   ],
 
   future: {

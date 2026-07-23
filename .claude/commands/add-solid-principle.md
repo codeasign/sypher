@@ -1,5 +1,5 @@
 ---
-description: Generate a complete SOLID principle topic for the Software Engineering course — one overview page plus one complete single-file implementation per language (JavaScript, TypeScript, Python, Java, C#, Rust).
+description: Generate a complete SOLID principle topic for the SOLID Principles course — one overview page plus one complete single-file implementation per language (JavaScript, TypeScript, Python, Java, C#, Rust).
 ---
 
 # /add-solid-principle
@@ -34,7 +34,7 @@ Generate a complete SOLID principle with overview and all 6 language implementat
 ## Files to generate
 
 ```
-docs/software-engineering/solid/$SLUG/
+docs/solid-principles/$SLUG/
 ├── index.md
 ├── 01-overview.mdx
 ├── 02-javascript.mdx
@@ -178,42 +178,20 @@ One complete, runnable, single-file implementation. Structure:
 
 ## Sidebar entry
 
-Target file: `sidebars/software-engineering.json`
+Target file: `sidebars/solid-principles.json`, top-level key `solidPrinciplesSidebar`.
+Each principle is its own top-level category (no outer "SOLID Principles" wrapper — the
+course itself is SOLID Principles, so a same-named wrapper would be redundant).
 
 **If the file does not exist, create it:**
 ```json
 {
-  "softwareEngineeringSidebar": [
-    {
-      "type": "category",
-      "label": "SOLID Principles",
-      "collapsible": true,
-      "collapsed": false,
-      "items": []
-    },
-    {
-      "type": "category",
-      "label": "Design Patterns",
-      "collapsible": true,
-      "collapsed": true,
-      "items": [
-        { "type": "category", "label": "Creational", "collapsible": true, "collapsed": true, "items": [] },
-        { "type": "category", "label": "Structural", "collapsible": true, "collapsed": true, "items": [] },
-        { "type": "category", "label": "Behavioral", "collapsible": true, "collapsed": true, "items": [] }
-      ]
-    },
-    {
-      "type": "category",
-      "label": "Clean Code",
-      "collapsible": true,
-      "collapsed": true,
-      "items": []
-    }
+  "solidPrinciplesSidebar": [
+    "solid-principles/index"
   ]
 }
 ```
 
-**On every run:** locate `"SOLID Principles"` → append to its `"items"`:
+**On every run:** append a new top-level category for `$TOPIC` to the array:
 ```json
 {
   "type": "category",
@@ -221,24 +199,15 @@ Target file: `sidebars/software-engineering.json`
   "collapsible": true,
   "collapsed": true,
   "items": [
-    "software-engineering/solid/$SLUG/$SLUG-overview",
-    "software-engineering/solid/$SLUG/$SLUG-javascript",
-    "software-engineering/solid/$SLUG/$SLUG-typescript",
-    "software-engineering/solid/$SLUG/$SLUG-python",
-    "software-engineering/solid/$SLUG/$SLUG-java",
-    "software-engineering/solid/$SLUG/$SLUG-csharp",
-    "software-engineering/solid/$SLUG/$SLUG-rust"
+    "solid-principles/$SLUG/$SLUG-overview",
+    "solid-principles/$SLUG/$SLUG-javascript",
+    "solid-principles/$SLUG/$SLUG-typescript",
+    "solid-principles/$SLUG/$SLUG-python",
+    "solid-principles/$SLUG/$SLUG-java",
+    "solid-principles/$SLUG/$SLUG-csharp",
+    "solid-principles/$SLUG/$SLUG-rust"
   ]
 }
-```
-
----
-
-## docusaurus.config.js
-
-Add to navbar once if not present:
-```js
-{ to: '/docs/software-engineering/solid', label: 'Software Engineering', position: 'left' }
 ```
 
 ---
@@ -254,7 +223,7 @@ Do NOT run `npm start` or `npm run build`.
 After writing all files and fixing MDX errors, run this check to ensure all pages have AsciiDiagrams:
 
 ```bash
-for f in docs/software-engineering/solid/$SLUG/*.mdx; do
+for f in docs/solid-principles/$SLUG/*.mdx; do
   count=$(grep -c '<AsciiDiagram' "$f")
   name=$(basename "$f")
   if [ "$count" -eq 0 ]; then echo "MISSING DIAGRAM: $name"; fi
@@ -270,11 +239,10 @@ Also run `/fix-rendered-content` after generation to catch any A5 (alt/caption o
 When generating all 5 SOLID principles, use parallel agents for efficiency. After all agents complete:
 
 1. Verify all 40 files exist (5 principles × 8 files each)
-2. Update `sidebars/software-engineering.json` — add all 5 principles under "SOLID Principles" category
-3. Verify `docusaurus.config.js` has the "Software Engineering" navbar entry pointing to `softwareEngineeringSidebar`
-4. Verify every `.mdx` file has at least 1 AsciiDiagram (see verification step above)
-5. Run `/fix-rendered-content` on all generated directories
-6. Build fails are expected for sidebar context issues unrelated to new content — confirm no MDX syntax errors
+2. Update `sidebars/solid-principles.json` — add all 5 principles as top-level categories
+3. Verify every `.mdx` file has at least 1 AsciiDiagram (see verification step above)
+4. Run `/fix-rendered-content` on all generated directories
+5. Build fails are expected for sidebar context issues unrelated to new content — confirm no MDX syntax errors
 
 ---
 

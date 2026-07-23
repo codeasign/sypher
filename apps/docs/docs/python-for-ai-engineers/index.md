@@ -1,5 +1,6 @@
 ---
 title: Python for AI Engineers
+sidebar_label: Course Home
 slug: /python-for-ai-engineers/
 ---
 
