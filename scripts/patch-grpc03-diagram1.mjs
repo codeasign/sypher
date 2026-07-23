@@ -1,0 +1,67 @@
+import { readFileSync, writeFileSync } from 'node:fs';
+
+const FILE = 'docs/system-design-fundamentals/grpc/03-architecture.mdx';
+const content = readFileSync(FILE, 'utf8');
+const lines = content.split('\n');
+
+// Lines 65 (caption) through 117 ("} />") in 1-indexed terms -> 64..117 in 0-indexed slice bounds
+// Find the exact block by searching for the caption line and the closing "} />" after it.
+const startIdx = lines.findIndex(l => l.includes('caption="Production gRPC requires service discovery'));
+if (startIdx === -1) { console.error('start not found'); process.exit(1); }
+let endIdx = -1;
+for (let i = startIdx; i < lines.length; i++) {
+  if (lines[i].trim() === '} />') { endIdx = i; break; }
+}
+if (endIdx === -1) { console.error('end not found'); process.exit(1); }
+
+const newBlock = [
+  '  caption="Production gRPC requires service discovery, load balancing, health checking, and observability at every layer"',
+  '  mermaidSrc="/img/diagrams/573d46e35e70.svg"',
+  '  content={`',
+  '┌──────────────────────────────────────────────────────────────────────────────────┐',
+  '│                        Production gRPC Architecture                              │',
+  '├──────────────────────────────────────────────────────────────────────────────────┤',
+  '│                                                                                    │',
+  '│   ┌──────────────────┐              ┌──────────────────┐                        │',
+  '│   │   Internal LB      │              │   Internal LB      │                        │',
+  '│   │  (Envoy/NGINX)      │              │  (Envoy/NGINX)      │                        │',
+  '│   │    port 443        │              │    port 443        │                        │',
+  '│   └─────────┬──────────┘              └─────────┬──────────┘                        │',
+  '│              │                                    │                                 │',
+  '│   ┌──────────┼──────────┐              ┌──────────┼──────────┐                       │',
+  '│   ▼          ▼          ▼              ▼          ▼          ▼                       │',
+  '│ ┌──────┐  ┌──────┐  ┌──────┐        ┌──────┐  ┌──────┐  ┌──────┐                     │',
+  '│ │gRPC   │  │gRPC   │  │gRPC   │        │gRPC   │  │gRPC   │  │gRPC   │                     │',
+  '│ │Server │  │Server │  │Server │        │Server │  │Server │  │Server │                     │',
+  '│ │Inst 1 │  │Inst 2 │  │Inst N │        │Inst 4 │  │Inst 5 │  │Inst 6 │                     │',
+  '│ │(us-east)│(us-east)│(us-east)│      │(eu-west)│(eu-west)│(eu-west)│                    │',
+  '│ └───┬───┘  └───┬───┘  └───┬───┘        └───┬───┘  └───┬───┘  └───┬───┘                     │',
+  '│     │          │          │                │          │          │                       │',
+  '│     └──────────┴──────────┴───────┬────────┴──────────┴──────────┘                       │',
+  '│                                    ▼                                                      │',
+  '│                          ┌────────────────────┐                                           │',
+  '│                          │  Service Registry    │                                          │',
+  '│                          │    (etcd/Consul)      │◀── health check reports                 │',
+  '│                          └─────────┬────────────┘                                          │',
+  '│                                    │                                                       │',
+  '│                                    ▼                                                       │',
+  '│                    ┌─────────────────────────────┐                                         │',
+  '│                    │     Shared Infrastructure      │                                        │',
+  '│                    │  PostgreSQL   Redis   Kafka    │                                        │',
+  '│                    │ (user data)  (session)(events) │                                        │',
+  '│                    └─────────────────────────────┘                                         │',
+  '│                                                                                             │',
+  '│                    ┌─────────────────────────────┐                                         │',
+  '│                    │      Observability Stack       │                                        │',
+  '│                    │ Metrics  Tracing  Logging Alerting │                                    │',
+  '│                    │ (Prom)  (Jaeger)  (ELK)  (PagerDuty)│                                   │',
+  '│                    └─────────────────────────────┘                                         │',
+  '│                                                                                             │',
+  '└──────────────────────────────────────────────────────────────────────────────────────────┘',
+  '  `}',
+  '/>',
+];
+
+lines.splice(startIdx, endIdx - startIdx + 1, ...newBlock);
+writeFileSync(FILE, lines.join('\n'), 'utf8');
+console.log(`Replaced lines ${startIdx + 1}-${endIdx + 1} with ${newBlock.length} new lines.`);

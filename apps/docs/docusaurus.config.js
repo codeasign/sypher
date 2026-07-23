@@ -50,7 +50,7 @@ const GA_HEAD_TAGS = GA_MEASUREMENT_ID
       },
       {
         tagName: 'script',
-        attributes: { src: `https://www.googletagmanager.com/gtag/js?id=${GA_MEASUREMENT_ID}`, async: true },
+        attributes: { src: `https://www.googletagmanager.com/gtag/js?id=${GA_MEASUREMENT_ID}`, async: 'async' },
       },
       {
         tagName: 'script',
