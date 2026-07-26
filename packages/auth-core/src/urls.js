@@ -26,3 +26,7 @@ export function getAppSignupUrl(redirectTo) {
 export function getAppLogoutUrl() {
   return `${getAppOrigin()}/logout`;
 }
+
+export function getAppDashboardUrl() {
+  return `${getAppOrigin()}/dashboard`;
+}

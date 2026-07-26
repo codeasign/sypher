@@ -200,19 +200,13 @@ export default function JobPostEditor({ post, onSaved, onCancel, onBack }: JobPo
           companyName: isExternalPoster ? postCompanyName.trim() : companyName,
           ...currentFields(),
           createdBy: user?.id ?? null,
+          status: nextStatus ?? 'draft',
         });
         if (createError || !created) {
           setError(createError ?? 'Failed to create job post.');
           return null;
         }
-        if (nextStatus && nextStatus !== 'draft') {
-          const { error: statusError } = await setJobPostStatus(supabase, created.id, nextStatus);
-          if (statusError) {
-            setError(statusError);
-            return null;
-          }
-          if (nextStatus === 'open') trackEvent('jobpost_publish_click', { job_id: created.id });
-        }
+        if (nextStatus === 'open') trackEvent('jobpost_publish_click', { job_id: created.id });
         await setJobPostSkills(supabase, created.id, selectedSkillIds);
         return created.id;
       }

@@ -11,20 +11,34 @@ export function slugify(title) {
 // /add-job-post writes go straight to Supabase from the browser (anon key +
 // user session), which never touches Next's cache -- so without this, edits
 // made here would sit stale on /careers for up to the 1h revalidate TTL.
-// Best-effort: a failed revalidate shouldn't block the save.
+// Best-effort: a failed revalidate shouldn't block the save, but it must not
+// fail silently either -- a non-2xx response (e.g. a stale token) previously
+// looked identical to success since only network-level throws were caught.
+// Retries once, matching the retry convention used elsewhere in this repo
+// (see scripts/render-mermaid-manifest.mjs).
 async function revalidateCareersCache(supabase) {
-  try {
-    const { data } = await supabase.auth.getSession();
-    const token = data?.session?.access_token;
-    if (!token) return;
-    await fetch('/api/careers/revalidate', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    });
-  } catch (err) {
+  const { data } = await supabase.auth.getSession();
+  const token = data?.session?.access_token;
+  if (!token) {
     // eslint-disable-next-line no-console
-    console.error('Failed to revalidate careers cache:', err.message);
+    console.error('Failed to revalidate careers cache: no active session');
+    return false;
   }
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = await fetch('/api/careers/revalidate', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.ok) return true;
+      // eslint-disable-next-line no-console
+      console.error(`Failed to revalidate careers cache: ${response.status} ${response.statusText}`);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('Failed to revalidate careers cache:', err.message);
+    }
+  }
+  return false;
 }
 
 async function findAvailableSlug(supabase, baseSlug) {
@@ -101,7 +115,7 @@ export async function getJobPostById(supabase, id) {
   return data;
 }
 
-export async function createJobPost(supabase, { companyName, title, description, location, employmentType, workMode, salaryMin, salaryMax, applyUrl, applyEmail, includeBranding, createdBy, categoryDomainId, categoryRoleId, requiredExperienceYears, requiredExperienceMonths }) {
+export async function createJobPost(supabase, { companyName, title, description, location, employmentType, workMode, salaryMin, salaryMax, applyUrl, applyEmail, includeBranding, createdBy, categoryDomainId, categoryRoleId, requiredExperienceYears, requiredExperienceMonths, status = 'draft' }) {
   if (!supabase) return { error: 'Not authenticated', post: null };
   const slug = await findAvailableSlug(supabase, slugify(title));
   const { data, error } = await supabase
@@ -119,7 +133,7 @@ export async function createJobPost(supabase, { companyName, title, description,
       apply_url: applyUrl ?? null,
       apply_email: applyEmail ?? null,
       include_branding: includeBranding ?? false,
-      status: 'draft',
+      status,
       created_by: createdBy ?? null,
       category_domain_id: categoryDomainId ?? null,
       category_role_id: categoryRoleId ?? null,
@@ -132,6 +146,11 @@ export async function createJobPost(supabase, { companyName, title, description,
     // eslint-disable-next-line no-console
     console.error('Failed to create job post:', error.message);
     return { error: error.message, post: null };
+  }
+  // Draft posts never appear on /careers regardless of cache state, so
+  // there's nothing to revalidate for those.
+  if (status !== 'draft') {
+    await revalidateCareersCache(supabase);
   }
   return { error: null, post: data };
 }

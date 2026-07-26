@@ -153,41 +153,67 @@ export default function CourseDetail({ course, docUrl }) {
           </div>
         )}
 
-        {/* Curriculum */}
-        <div className={styles.curriculumSection}>
-          <div className={styles.curriculumHeader}>
-            <Heading as="h2" className={styles.curriculumTitle}>Course Curriculum</Heading>
-            <span className={styles.curriculumSub}>
-              {course.modules.reduce((s, m) => s + m.topics.length, 0)} topics across {course.modules.length} sections
-            </span>
-          </div>
+        {/* Curriculum — full breakdown only for signed-in users; anonymous
+            visitors get the outcome summary plus a sign-in prompt, so the
+            exact module/lesson list isn't public. */}
+        {user ? (
+          <div className={styles.curriculumSection}>
+            <div className={styles.curriculumHeader}>
+              <Heading as="h2" className={styles.curriculumTitle}>Course Curriculum</Heading>
+              <span className={styles.curriculumSub}>
+                {course.modules.reduce((s, m) => s + m.topics.length, 0)} topics across {course.modules.length} sections
+              </span>
+            </div>
 
-          <div className={styles.curriculumList}>
-            {course.modules.map((mod, i) => (
-              <div key={i} className={styles.module}>
-                <button
-                  className={styles.moduleSummary}
-                  onClick={() => toggleModule(i)}
-                  aria-expanded={openModules.has(i)}
-                >
-                  <span className={`${styles.moduleArrow} ${openModules.has(i) ? styles.moduleArrowOpen : ''}`}>▶</span>
-                  <span className={styles.moduleLabel}>{mod.label}</span>
-                  <span className={styles.moduleCount}>{mod.topics.length}</span>
-                </button>
-                {openModules.has(i) && (
-                  <div className={styles.moduleTopics}>
-                    {mod.topics.map((topic) => (
-                      <div key={topic} className={styles.topicItem}>
-                        <span className={styles.topicDot}>●</span>
-                        <span>{topic}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
+            <div className={styles.curriculumList}>
+              {course.modules.map((mod, i) => (
+                <div key={i} className={styles.module}>
+                  <button
+                    className={styles.moduleSummary}
+                    onClick={() => toggleModule(i)}
+                    aria-expanded={openModules.has(i)}
+                  >
+                    <span className={`${styles.moduleArrow} ${openModules.has(i) ? styles.moduleArrowOpen : ''}`}>▶</span>
+                    <span className={styles.moduleLabel}>{mod.label}</span>
+                    <span className={styles.moduleCount}>{mod.topics.length}</span>
+                  </button>
+                  {openModules.has(i) && (
+                    <div className={styles.moduleTopics}>
+                      {mod.topics.map((topic) => (
+                        <div key={topic} className={styles.topicItem}>
+                          <span className={styles.topicDot}>●</span>
+                          <span>{topic}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className={styles.curriculumSection}>
+            <div className={styles.curriculumHeader}>
+              <Heading as="h2" className={styles.curriculumTitle}>What You&apos;ll Learn</Heading>
+              <span className={styles.curriculumSub}>
+                {course.modules.length} sections · {course.modules.reduce((s, m) => s + m.topics.length, 0)} topics
+              </span>
+            </div>
+            <div className={styles.outcomeLocked}>
+              <ul className={styles.outcomeList}>
+                {course.outcomes.map((outcome) => (
+                  <li key={outcome} className={styles.outcomeItem}>
+                    <CheckGlyph />
+                    <span>{outcome}</span>
+                  </li>
+                ))}
+              </ul>
+              <Link to={startUrl} className={styles.unlockLink} onClick={handleStartLearning}>
+                Sign in to see the full lesson-by-lesson curriculum →
+              </Link>
+            </div>
+          </div>
+        )}
       </div>
 
       <ProUpgradeModal open={showProModal} onClose={() => setShowProModal(false)} />
@@ -205,6 +231,24 @@ function GitHubGlyph() {
       aria-hidden="true"
     >
       <path d="M12 .5C5.65.5.5 5.66.5 12.03c0 5.09 3.29 9.4 7.86 10.93.57.1.78-.25.78-.55 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.34-1.28-1.7-1.28-1.7-1.04-.72.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.76 2.69 1.25 3.34.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a10.9 10.9 0 0 1 5.8 0c2.2-1.5 3.18-1.18 3.18-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.69 5.4-5.25 5.69.41.36.78 1.06.78 2.14 0 1.55-.01 2.79-.01 3.17 0 .3.2.66.79.55A10.53 10.53 0 0 0 23.5 12.03C23.5 5.66 18.35.5 12 .5z" />
+    </svg>
+  );
+}
+
+function CheckGlyph() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="20 6 9 17 4 12" />
     </svg>
   );
 }

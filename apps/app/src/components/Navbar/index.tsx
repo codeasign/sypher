@@ -117,9 +117,9 @@ export default function Navbar() {
           that class is ignored and .links is always visible via media query.
         */}
         <nav className={mobileOpen ? `${styles.links} ${styles.linksOpen}` : styles.links}>
-          <Link href="/#courses" className={styles.link} onClick={() => setMobileOpen(false)}>
+          <a href={`${DOCS_ORIGIN}/courses`} className={styles.link}>
             Explore Courses
-          </Link>
+          </a>
           <Link
             href="/blog"
             className={pathname === '/blog' ? `${styles.link} ${styles.linkActive}` : styles.link}

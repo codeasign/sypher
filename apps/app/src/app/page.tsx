@@ -1,13 +1,11 @@
 import type { Metadata } from 'next';
 import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
-import { listCourseAccess, hasCourseAccess } from '@/data/courseAccess';
-import { withCourseAccess } from '@sypher/course-catalog/src/homepageCourses';
 import HeroSection from '@/components/HeroSection';
 import StatsBar from '@/components/StatsBar';
 import PillarsSection from '@/components/PillarsSection';
 import ApproachSection from '@/components/ApproachSection';
-import HomeCourseCatalog from '@/components/HomeCourseCatalog';
+import CoursesTeaser from '@/components/CoursesTeaser';
 import Footer from '@/components/Footer';
 
 export const metadata: Metadata = {
@@ -23,19 +21,12 @@ export default async function Home() {
     redirect('/dashboard');
   }
 
-  const accessRows = await listCourseAccess(supabase);
-  const courses = withCourseAccess(hasCourseAccess, null, accessRows, new Set());
-  const freeCourses = courses.filter((c: { isFree: boolean }) => c.isFree);
-  const premiumCourses = courses.filter((c: { isFree: boolean }) => !c.isFree);
-
   return (
     <>
       <HeroSection />
       <StatsBar />
       <PillarsSection />
-      <div id="courses">
-        <HomeCourseCatalog freeCourses={freeCourses} premiumCourses={premiumCourses} />
-      </div>
+      <CoursesTeaser />
       <ApproachSection />
       <Footer />
     </>

@@ -8,6 +8,8 @@ export default function AsciiDiagram({id, content = '', alt = 'Diagram', caption
   const mermaidImageUrl = useBaseUrl(mermaidSrc || '/img/diagrams/__unused__.svg');
   const [imageExists, setImageExists] = useState(false);
   const [checked, setChecked]         = useState(false);
+  const [mermaidExists, setMermaidExists] = useState(false);
+  const [mermaidChecked, setMermaidChecked] = useState(false);
   const showImages = features.diagramImages === true;
 
   useEffect(() => {
@@ -19,10 +21,20 @@ export default function AsciiDiagram({id, content = '', alt = 'Diagram', caption
   }, [imageUrl, showImages, mermaidSrc]);
 
   // A hand-authored Mermaid render takes priority over the generated-PNG
-  // pipeline below. The original ASCII is kept in a data attribute on the
-  // rendered image so it survives in the page's HTML even though it's no
-  // longer the visible content.
-  if (mermaidSrc) {
+  // pipeline below, but only once we've confirmed the SVG actually exists —
+  // rendered output can go missing (cache cleared, never committed) while
+  // the mermaidSrc prop stays in the page, and an unchecked <img> there
+  // would just show a broken image with no fallback. Until confirmed, and
+  // if the SVG 404s, we render the real ASCII content instead of nothing.
+  useEffect(() => {
+    if (!mermaidSrc) { setMermaidChecked(true); return; }
+    const img   = new Image();
+    img.onload  = () => { setMermaidExists(true);  setMermaidChecked(true); };
+    img.onerror = () => { setMermaidExists(false); setMermaidChecked(true); };
+    img.src = mermaidImageUrl;
+  }, [mermaidImageUrl, mermaidSrc]);
+
+  if (mermaidSrc && mermaidChecked && mermaidExists) {
     return (
       <figure className={styles.figure}>
         <div className={styles.imageWrap}>
@@ -33,6 +45,33 @@ export default function AsciiDiagram({id, content = '', alt = 'Diagram', caption
             loading="lazy"
             data-ascii-source={content.trim()}
           />
+        </div>
+        {caption && <figcaption className={styles.caption}>{caption}</figcaption>}
+      </figure>
+    );
+  }
+
+  if (mermaidSrc && mermaidChecked && !mermaidExists) {
+    return (
+      <figure className={styles.figure}>
+        <div className={styles.asciiWrap} role="img" aria-label={alt}>
+          <pre className={styles.ascii}>{content.trim()}</pre>
+        </div>
+        {caption && <figcaption className={styles.caption}>{caption}</figcaption>}
+        <p className={styles.pending}>
+          ⚠️ Mermaid image missing — run <code>node scripts/render-mermaid-manifest.mjs</code>
+        </p>
+      </figure>
+    );
+  }
+
+  if (mermaidSrc && !mermaidChecked) {
+    // SSR and the initial client render: show the real ASCII content so
+    // there's never a blank/broken state before the existence check lands.
+    return (
+      <figure className={styles.figure}>
+        <div className={styles.asciiWrap} role="img" aria-label={alt}>
+          <pre className={styles.ascii}>{content.trim()}</pre>
         </div>
         {caption && <figcaption className={styles.caption}>{caption}</figcaption>}
       </figure>

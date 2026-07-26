@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { getDocsOrigin } from '@sypher/auth-core/src/urls';
 import styles from './styles.module.css';
 
 const pillars = [
@@ -45,9 +46,9 @@ export default function HeroSection() {
               <Link className={styles.primaryBtn} href="/login">
                 Start Learning →
               </Link>
-              <Link className={styles.secondaryBtn} href="#courses">
+              <a className={styles.secondaryBtn} href={`${getDocsOrigin()}/courses`}>
                 Browse Courses
-              </Link>
+              </a>
             </div>
           </div>
           <div className={styles.heroVisual}>

@@ -14,6 +14,24 @@ const MANIFEST_PATH = path.join(REPO_ROOT, ".cache", "ascii-to-mermaid-images", 
 
 mkdirSync(OUT_DIR, { recursive: true });
 
+// mmdc always emits width="100%" with no height attribute on the SVG root,
+// intended for responsive inline embedding. When the SVG is instead used as
+// an <img src="..."> (as AsciiDiagram does), a percentage width doesn't
+// count as an intrinsic size to the browser, so a plain `width:auto` image
+// has no real natural size to fall back to — it stretches to fill the
+// content column's max-width instead of rendering at its actual small size.
+// Replacing width="100%" with the real pixel width/height read off the
+// viewBox gives the <img> a correct intrinsic size again.
+function fixIntrinsicSize(svgPath) {
+  let svg = readFileSync(svgPath, "utf8");
+  if (!svg.includes('width="100%"')) return;
+  const m = svg.match(/viewBox="[-0-9.]+ [-0-9.]+ ([0-9.]+) ([0-9.]+)"/);
+  if (!m) return;
+  const [, w, h] = m;
+  svg = svg.replace('width="100%"', `width="${w}" height="${h}"`);
+  writeFileSync(svgPath, svg);
+}
+
 const mmdFiles = readdirSync(MMD_DIR).filter((f) => f.endsWith(".mmd")).sort();
 const manifest = [];
 
@@ -32,6 +50,7 @@ for (const file of mmdFiles) {
         ["--no-install", "mmdc", "-i", mmdPath, "-o", svgPath, "-b", "transparent"],
         { cwd: path.join(REPO_ROOT, "apps", "docs"), stdio: ["ignore", "pipe", "pipe"], shell: true }
       );
+      fixIntrinsicSize(svgPath);
       ok = true;
       entry.attempts.push({ attempt, status: "success" });
     } catch (err) {
