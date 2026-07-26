@@ -168,6 +168,8 @@ const config = {
         { to: '/corporate-training', label: 'Corporate Training', position: 'left' },
         { to: '/resume-review', label: 'Resume Review', position: 'left' },
         { to: '/mock-interview', label: 'Mock Interview', position: 'left' },
+        { to: '/hire-with-us', label: 'Hire with Us', position: 'left' },
+        { to: '/team-access', label: 'Team Access', position: 'left' },
         { type: 'custom-login', position: 'right' },
       ],
     },

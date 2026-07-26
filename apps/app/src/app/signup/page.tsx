@@ -7,6 +7,8 @@ import OAuthButtons from '@/components/OAuthButtons';
 import RedirectIfAuthed from '@/components/RedirectIfAuthed';
 import { getSafeRedirect } from '@/utils/safeRedirect';
 import { trackEvent } from '@/lib/analytics';
+import { getDocsOrigin } from '@sypher/auth-core/src/urls';
+import Footer from '@/components/Footer';
 import styles from '../auth.module.css';
 
 function SignUpForm(): React.JSX.Element {
@@ -38,18 +40,31 @@ function SignUpForm(): React.JSX.Element {
       <p className={styles.altAction}>
         Already have an account? <Link href="/login">Log in</Link>
       </p>
+
+      <p className={styles.legalLinks}>
+        By continuing, you agree to our{' '}
+        <a href={`${getDocsOrigin()}/terms-and-conditions`}>Terms &amp; Conditions</a> and{' '}
+        <a href={`${getDocsOrigin()}/privacy-policy`}>Privacy Policy</a>.
+      </p>
     </div>
   );
 }
 
 export default function SignUpPage(): React.JSX.Element {
   return (
-    <main className={styles.wrapper}>
-      <Suspense fallback={<p role="status">Loading…</p>}>
-        <RedirectIfAuthed>
-          <SignUpForm />
-        </RedirectIfAuthed>
-      </Suspense>
-    </main>
+    <div className={styles.page}>
+      <main className={styles.wrapper}>
+        <div className={styles.wrapperBg} />
+        <div className={styles.wrapperInner}>
+          <Link href="/" className={styles.brand}>Sypher</Link>
+          <Suspense fallback={<p role="status">Loading…</p>}>
+            <RedirectIfAuthed>
+              <SignUpForm />
+            </RedirectIfAuthed>
+          </Suspense>
+        </div>
+      </main>
+      <Footer />
+    </div>
   );
 }

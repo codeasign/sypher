@@ -8,6 +8,8 @@ import WorkEmailSignIn from '@/components/WorkEmailSignIn';
 import RedirectIfAuthed from '@/components/RedirectIfAuthed';
 import { getSafeRedirect } from '@/utils/safeRedirect';
 import { trackEvent } from '@/lib/analytics';
+import { getDocsOrigin } from '@sypher/auth-core/src/urls';
+import Footer from '@/components/Footer';
 import styles from '../auth.module.css';
 
 function LoginForm(): React.JSX.Element {
@@ -27,7 +29,7 @@ function LoginForm(): React.JSX.Element {
 
   return (
     <div className={styles.card}>
-      <h1 className={styles.heading}>Log in</h1>
+      <h1 className={styles.heading}>Log in or sign up</h1>
 
       <div className={styles.tabs}>
         <button
@@ -66,18 +68,31 @@ function LoginForm(): React.JSX.Element {
       <p className={styles.altAction}>
         Need an account? <Link href="/signup">Sign up</Link>
       </p>
+
+      <p className={styles.legalLinks}>
+        By continuing, you agree to our{' '}
+        <a href={`${getDocsOrigin()}/terms-and-conditions`}>Terms &amp; Conditions</a> and{' '}
+        <a href={`${getDocsOrigin()}/privacy-policy`}>Privacy Policy</a>.
+      </p>
     </div>
   );
 }
 
 export default function LoginPage(): React.JSX.Element {
   return (
-    <main className={styles.wrapper}>
-      <Suspense fallback={<p role="status">Loading…</p>}>
-        <RedirectIfAuthed>
-          <LoginForm />
-        </RedirectIfAuthed>
-      </Suspense>
-    </main>
+    <div className={styles.page}>
+      <main className={styles.wrapper}>
+        <div className={styles.wrapperBg} />
+        <div className={styles.wrapperInner}>
+          <Link href="/" className={styles.brand}>Sypher</Link>
+          <Suspense fallback={<p role="status">Loading…</p>}>
+            <RedirectIfAuthed>
+              <LoginForm />
+            </RedirectIfAuthed>
+          </Suspense>
+        </div>
+      </main>
+      <Footer />
+    </div>
   );
 }

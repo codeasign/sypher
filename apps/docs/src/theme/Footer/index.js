@@ -20,7 +20,7 @@ const legalLinks = [
 // Only shown on these marketing-style pages (not on /docs/* lesson content)
 // and only to logged-out visitors -- once someone's signed in they're using
 // the product, not evaluating it, so the marketing footer no longer applies.
-const FOOTER_PATHS = ['/corporate-training', '/resume-review', '/mock-interview'];
+const FOOTER_PATHS = ['/corporate-training', '/resume-review', '/mock-interview', '/courses'];
 
 function isFooterPath(pathname) {
   return FOOTER_PATHS.some((path) => pathname === path || pathname === `${path}/`);

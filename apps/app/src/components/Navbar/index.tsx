@@ -81,6 +81,8 @@ const NAV_LINKS = [
   { key: 'corporate-training', href: `${DOCS_ORIGIN}/corporate-training`, label: 'Corporate Training' },
   { key: 'resume-review', href: `${DOCS_ORIGIN}/resume-review`, label: 'Resume Review' },
   { key: 'mock-interview', href: `${DOCS_ORIGIN}/mock-interview`, label: 'Mock Interview' },
+  { key: 'hire-with-us', href: `${DOCS_ORIGIN}/hire-with-us`, label: 'Hire with Us' },
+  { key: 'team-access', href: `${DOCS_ORIGIN}/team-access`, label: 'Team Access' },
 ];
 
 export default function Navbar() {
@@ -181,9 +183,14 @@ export default function Navbar() {
               </Link>
             </div>
           ) : (
-            <Link href="/login" className={styles.signInBtn}>
-              Sign In
-            </Link>
+            <div className={styles.authButtons}>
+              <Link href="/signup" className={styles.signUpBtn}>
+                Sign Up
+              </Link>
+              <Link href="/login" className={styles.signInBtn}>
+                Sign In
+              </Link>
+            </div>
           )}
         </div>
       </div>

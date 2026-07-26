@@ -1,7 +1,7 @@
 import React from 'react';
 import BrowserOnly from '@docusaurus/BrowserOnly';
 import { useAuth } from '@site/src/contexts/AuthContext';
-import { getAppOrigin, getAppLoginUrl, getAppLogoutUrl } from '@sypher/auth-core/src/urls';
+import { getAppOrigin, getAppLoginUrl, getAppLogoutUrl, getAppSignupUrl } from '@sypher/auth-core/src/urls';
 
 function DashboardIcon() {
   return (
@@ -69,9 +69,14 @@ function LoginButton() {
   }
 
   return (
-    <a href={getAppLoginUrl()} className="navbar__link login-link">
-      Log in
-    </a>
+    <span className="login-link-group">
+      <a href={getAppSignupUrl()} className="navbar__link login-link signup-link">
+        Sign Up
+      </a>
+      <a href={getAppLoginUrl()} className="navbar__link login-link">
+        Log in
+      </a>
+    </span>
   );
 }
 

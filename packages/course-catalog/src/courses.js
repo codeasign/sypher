@@ -1,6 +1,7 @@
 const courses = [
   {
     slug: 'python-for-ai-engineers',
+    category: 'AI Engineering',
     icon: '🐍',
     title: 'Python for AI Engineers',
     tag: 'Flagship',
@@ -33,6 +34,7 @@ const courses = [
   },
   {
     slug: 'agentic-ai-fundamentals',
+    category: 'AI Engineering',
     icon: '🤖',
     title: 'Agentic AI Fundamentals',
     tag: 'Trending',
@@ -63,6 +65,7 @@ const courses = [
   },
   {
     slug: 'system-design-fundamentals',
+    category: 'Software Engineering Fundamentals',
     icon: '🏗️',
     title: 'System Design Fundamentals',
     tag: 'Popular',
@@ -90,6 +93,7 @@ const courses = [
   },
   {
     slug: 'git-github-actions',
+    category: 'Software Engineering Fundamentals',
     icon: '🔀',
     title: 'Git & GitHub Actions',
     tag: 'Essential',
@@ -120,6 +124,7 @@ const courses = [
   {
     slug: 'ai-engineering-crash-course',
     docsSlug: 'ai-engineering-hands-on',
+    category: 'AI Engineering',
     icon: '⚡',
     title: 'AI Engineering Crash Course',
     tag: 'Hands-On',
@@ -149,6 +154,7 @@ const courses = [
   },
   {
     slug: 'build-with-ai',
+    category: 'AI Engineering',
     icon: '🛠️',
     title: 'Build with AI',
     tag: 'Project-Based',
@@ -175,6 +181,7 @@ const courses = [
   },
   {
     slug: 'solid-principles',
+    category: 'Software Engineering Fundamentals',
     icon: '📐',
     title: 'SOLID Principles',
     tag: 'Multi-Lang',
@@ -202,6 +209,7 @@ const courses = [
   },
   {
     slug: 'design-patterns',
+    category: 'Software Engineering Fundamentals',
     icon: '🧩',
     title: 'Design Patterns',
     tag: 'Multi-Lang',
@@ -227,6 +235,7 @@ const courses = [
   },
   {
     slug: 'coding-bootcamp',
+    category: 'Algorithms & Interview Prep',
     icon: '💻',
     title: 'Coding Bootcamp',
     tag: 'Interview Prep',
@@ -260,6 +269,7 @@ const courses = [
   },
   {
     slug: 'search-algorithms',
+    category: 'Algorithms & Interview Prep',
     icon: '🔍',
     title: 'Search Algorithms',
     tag: 'New',
@@ -283,6 +293,7 @@ const courses = [
   },
   {
     slug: 'sorting-algorithms',
+    category: 'Algorithms & Interview Prep',
     icon: '🔀',
     title: 'Sorting Algorithms',
     tag: 'New',
@@ -306,6 +317,7 @@ const courses = [
   },
   {
     slug: 'playwright-test-automation',
+    category: 'Test Automation',
     icon: '🎭',
     title: 'Playwright Test Automation',
     tag: 'New',
@@ -365,6 +377,7 @@ const courses = [
   },
   {
     slug: 'learn-typescript',
+    category: 'Programming Languages',
     icon: '🔷',
     title: 'Learn TypeScript',
     tag: 'New',
@@ -392,6 +405,7 @@ const courses = [
   },
   {
     slug: 'typescript-for-test-automation',
+    category: 'Test Automation',
     icon: '🧪',
     title: 'TypeScript for Test Automation',
     tag: 'New',
@@ -431,6 +445,7 @@ const courses = [
   },
   {
     slug: 'python-for-test-automation',
+    category: 'Test Automation',
     icon: '🧪',
     title: 'Python for Test Automation',
     tag: 'New',

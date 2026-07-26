@@ -1,12 +1,26 @@
 import React, { useEffect } from 'react';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
-import Link from '@docusaurus/Link';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import { useAuth } from '@site/src/contexts/AuthContext';
 import { getAppDashboardUrl } from '@sypher/auth-core/src/urls';
 import styles from './courses.module.css';
 import courses from '@sypher/course-catalog/src/courses';
+
+// Curated display order for the category sections below -- catalog order
+// within each category is preserved from courses.js.
+const CATEGORY_ORDER = [
+  'AI Engineering',
+  'Software Engineering Fundamentals',
+  'Algorithms & Interview Prep',
+  'Test Automation',
+  'Programming Languages',
+];
+
+const coursesByCategory = CATEGORY_ORDER.map((category) => ({
+  category,
+  courses: courses.filter((course) => course.category === category),
+})).filter((group) => group.courses.length > 0);
 
 function CheckGlyph() {
   return (
@@ -29,33 +43,28 @@ function CheckGlyph() {
 
 function CourseCard({ course, showDuration }) {
   return (
-    <Link to={course.url} className={styles.card} style={{ '--course-gradient': course.gradient }}>
-      <div className={styles.cardGlow} />
-      <div className={styles.cardTop}>
-        <span className={styles.cardIcon}>{course.icon}</span>
-        <span className={styles.cardTag}>{course.tag}</span>
-      </div>
-      <Heading as="h2" className={styles.cardTitle}>{course.title}</Heading>
-      <p className={styles.cardHook}>{course.hook}</p>
-      <div className={styles.cardMeta}>
-        <span>{course.difficulty}</span>
+    <article className={styles.card} style={{ '--course-gradient': course.gradient }}>
+      <div className={styles.cardAccent} />
+      <div className={styles.cardBody}>
+        <Heading as="h3" className={styles.cardTitle}>
+          {course.title}
+        </Heading>
+        <p className={styles.cardHook}>{course.hook}</p>
         {showDuration && (
-          <>
-            <span className={styles.metaDot}>·</span>
+          <div className={styles.cardMeta}>
             <span>{course.hours}</span>
-          </>
+          </div>
         )}
+        <ul className={styles.outcomeList}>
+          {course.outcomes.slice(0, 4).map((outcome) => (
+            <li key={outcome} className={styles.outcomeItem}>
+              <CheckGlyph />
+              <span>{outcome}</span>
+            </li>
+          ))}
+        </ul>
       </div>
-      <ul className={styles.outcomeList}>
-        {course.outcomes.slice(0, 4).map((outcome) => (
-          <li key={outcome} className={styles.outcomeItem}>
-            <CheckGlyph />
-            <span>{outcome}</span>
-          </li>
-        ))}
-      </ul>
-      <span className={styles.cardCta}>Explore course <span aria-hidden="true">→</span></span>
-    </Link>
+    </article>
   );
 }
 
@@ -77,21 +86,32 @@ export default function Courses() {
   return (
     <Layout
       title="All Courses"
-      description="Browse all Sypher courses — from Python for AI to system design, coding bootcamp, and production AI projects.">
+      description="Browse all Sypher courses — hands-on, text-first courses in Python, AI engineering, system design, algorithms, and more. Pick a track and start building today.">
       <div className={styles.page}>
         <div className={styles.container}>
           <div className={styles.pageHeader}>
-            <Heading as="h1" className={styles.pageTitle}>Learn by building. Ship real work.</Heading>
+            <span className={styles.pageEyebrow}>Sypher</span>
+            <Heading as="h1" className={styles.pageTitle}>
+              Learn by building. Ship real work.
+            </Heading>
             <p className={styles.pageSubtitle}>
-              Hands-on, text-first courses built for real engineering growth. Pick a track, see what you&apos;ll
-              walk away with, and start today.
+              Hands-on, text-first courses built for real engineering growth — {courses.length}{' '}
+              courses across {coursesByCategory.length} tracks.
             </p>
           </div>
-          <div className={styles.courseGrid}>
-            {courses.map((course) => (
-              <CourseCard key={course.slug} course={course} showDuration={showDurationOnLanding} />
-            ))}
-          </div>
+
+          {coursesByCategory.map((group) => (
+            <section key={group.category} className={styles.categorySection}>
+              <Heading as="h2" className={styles.categoryTitle}>
+                {group.category}
+              </Heading>
+              <div className={styles.courseGrid}>
+                {group.courses.map((course) => (
+                  <CourseCard key={course.slug} course={course} showDuration={showDurationOnLanding} />
+                ))}
+              </div>
+            </section>
+          ))}
         </div>
       </div>
     </Layout>
