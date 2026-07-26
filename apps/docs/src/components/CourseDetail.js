@@ -111,6 +111,48 @@ export default function CourseDetail({ course, docUrl }) {
           )}
         </div>
 
+        {/* System Under Test */}
+        {course.sut && (
+          <div className={styles.sutSection}>
+            <div className={styles.sutHeader}>
+              <Heading as="h2" className={styles.sutTitle}>{course.sut.label}</Heading>
+              <a
+                href={course.sut.repoUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={styles.sutRepoLink}
+              >
+                <GitHubGlyph />
+                {course.sut.repoName}
+              </a>
+            </div>
+            <p className={styles.sutDesc}>{course.sut.description}</p>
+            {course.sut.cloneCommand && (
+              <pre className={styles.sutClone}><code>{course.sut.cloneCommand}</code></pre>
+            )}
+            <ol className={styles.sutSteps}>
+              {course.sut.steps.map((step, i) => (
+                <li key={i} className={styles.sutStep}>{step}</li>
+              ))}
+            </ol>
+            {course.sut.screenshots && course.sut.screenshots.length > 0 && (
+              <div className={styles.sutScreenshots}>
+                {course.sut.screenshots.map((shot) => (
+                  <figure key={shot.src} className={styles.sutScreenshot}>
+                    <img src={shot.src} alt={shot.alt} loading="lazy" />
+                    <figcaption>{shot.caption}</figcaption>
+                  </figure>
+                ))}
+              </div>
+            )}
+            {course.sut.docsLink && (
+              <Link to={course.sut.docsLink} className={styles.sutDocsLink}>
+                Full walkthrough in Setup →
+              </Link>
+            )}
+          </div>
+        )}
+
         {/* Curriculum */}
         <div className={styles.curriculumSection}>
           <div className={styles.curriculumHeader}>
@@ -150,6 +192,20 @@ export default function CourseDetail({ course, docUrl }) {
 
       <ProUpgradeModal open={showProModal} onClose={() => setShowProModal(false)} />
     </div>
+  );
+}
+
+function GitHubGlyph() {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      aria-hidden="true"
+    >
+      <path d="M12 .5C5.65.5.5 5.66.5 12.03c0 5.09 3.29 9.4 7.86 10.93.57.1.78-.25.78-.55 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.34-1.28-1.7-1.28-1.7-1.04-.72.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.76 2.69 1.25 3.34.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a10.9 10.9 0 0 1 5.8 0c2.2-1.5 3.18-1.18 3.18-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.69 5.4-5.25 5.69.41.36.78 1.06.78 2.14 0 1.55-.01 2.79-.01 3.17 0 .3.2.66.79.55A10.53 10.53 0 0 0 23.5 12.03C23.5 5.66 18.35.5 12 .5z" />
+    </svg>
   );
 }
 

@@ -231,11 +231,11 @@ function FaqContactSection() {
   const [openIndex, setOpenIndex] = useState(null);
 
   return (
-    <section id="contact" className={styles.faqContact}>
+    <section className={styles.faqContact}>
       <div className={styles.container}>
         <div className={styles.faqContactGrid}>
           <div className={styles.faqColumn}>
-            <Heading as="h2" className={styles.sectionTitle}>Frequently Asked Questions</Heading>
+            <Heading as="h2" id="contact" className={styles.sectionTitle}>Frequently Asked Questions</Heading>
             <div className={styles.faqList}>
               {faqs.map((item, index) => {
                 const isOpen = openIndex === index;
