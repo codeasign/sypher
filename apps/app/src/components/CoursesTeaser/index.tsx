@@ -1,22 +1,38 @@
-import { getDocsOrigin } from '@sypher/auth-core/src/urls';
+import courses from '@sypher/course-catalog/src/courses';
 import styles from './styles.module.css';
 
-// Public homepage teaser -- links out to the canonical course catalog on
-// docs.sypher (docs.sypher.local/courses) instead of rendering an inline
-// listing here. Keeps course curriculum detail off the logged-out homepage
-// rather than duplicating it via DashboardCourseListing's slide panel.
+type Course = (typeof courses)[number];
+
+// Static grid, no links and no buttons -- purely a preview of the catalog.
+// "Browse All Courses" lived here before; the founder wants this section to
+// just be a plain, scannable list with nothing to click, so there is no
+// click-through target here at all (courses are browsed from docs.sypher.local
+// directly, not from this teaser).
+function CourseCard({ course }: { course: Course }) {
+  return (
+    <div className={styles.card}>
+      <span className={styles.cardIcon}>{course.icon}</span>
+      <h3 className={styles.cardTitle}>{course.title}</h3>
+      <p className={styles.cardHook}>{course.hook}</p>
+    </div>
+  );
+}
+
 export default function CoursesTeaser() {
   return (
     <section className={styles.teaser}>
-      <div className={styles.container}>
+      <div className={styles.header}>
         <h2 className={styles.title}>Explore Our Courses</h2>
         <p className={styles.subtitle}>
-          From Python fundamentals to production AI systems — hands-on, text-first courses built for
-          real engineering growth.
+          {courses.length} hands-on, text-first courses — from Python fundamentals to production
+          AI systems.
         </p>
-        <a href={`${getDocsOrigin()}/courses`} className={styles.cta}>
-          Browse All Courses →
-        </a>
+      </div>
+
+      <div className={styles.grid}>
+        {courses.map((course) => (
+          <CourseCard key={course.slug} course={course} />
+        ))}
       </div>
     </section>
   );

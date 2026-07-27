@@ -35,12 +35,13 @@ export default function HeroSection() {
           <div className={styles.heroContent}>
             <span className={styles.heroBadge}>Learn by Building</span>
             <h1 className={styles.heroTitle}>
-              Master AI Engineering<br />
-              <span className={styles.heroHighlight}>Through Real Projects</span>
+              Learn engineering<br />
+              <span className={styles.heroHighlight}>by actually building it.</span>
             </h1>
             <p className={styles.heroSubtitle}>
-              A complete, hands-on curriculum — from Python fundamentals to production AI systems.
-              Text-first lessons, real projects, and interview-ready skills. No fluff, no filler.
+              Sypher is a hands-on learning platform for AI engineering, system design, and
+              software fundamentals — deep, annotated, text-first lessons paired with real
+              projects, not another video course you&apos;ll never finish.
             </p>
             <div className={styles.heroButtons}>
               <Link className={styles.primaryBtn} href="/login">

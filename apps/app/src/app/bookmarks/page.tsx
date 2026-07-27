@@ -1,12 +1,12 @@
 'use client';
 
 import React, { useEffect, useMemo, useState } from 'react';
-import Link from 'next/link';
 import DashboardLayout from '@/components/DashboardLayout';
 import { CourseGrid } from '@/components/CourseCard';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import { useBookmarks } from '@/hooks/useBookmarks';
 import { useDocBookmarks } from '@/hooks/useDocBookmarks';
+import { getDocsOrigin } from '@sypher/auth-core/src/urls';
 import { withCourseAccess } from '@sypher/course-catalog/src/homepageCourses';
 import { fetchCourseAccessRows, hasCourseAccess } from '@/data/courseAccess';
 import { fetchCompanyCourseAccessRows } from '@/data/companyAccess';
@@ -134,10 +134,10 @@ function DocBookmarkExplorer({ docBookmarks, onRemove }: DocBookmarkExplorerProp
                 <div className={styles.fileList}>
                   {pages.map((p: DocBookmark) => (
                     <div key={p.doc_path} className={styles.fileRow}>
-                      <Link href={`/docs/${p.doc_path.replace(/\/index$/, '')}`} className={styles.fileLink}>
+                      <a href={`${getDocsOrigin()}/docs/${p.doc_path.replace(/\/index$/, '')}/`} className={styles.fileLink}>
                         <span className={styles.fileLinkIcon}><FileDocIcon /></span>
                         <span className={styles.fileName}>{p.title || p.doc_path}</span>
-                      </Link>
+                      </a>
                       <button
                         type="button"
                         className={styles.fileRemoveBtn}
