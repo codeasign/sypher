@@ -27,6 +27,7 @@ export const NAV_SECTIONS = [
     title: 'Content',
     items: [
       { key: 'manage-blog-post', href: '/manage-blog', label: 'Manage Blog Posts' },
+      { key: 'manage-course-authoring', href: '/manage-courses', label: 'Manage Courses' },
     ],
   },
   {

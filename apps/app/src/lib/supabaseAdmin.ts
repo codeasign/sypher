@@ -7,9 +7,11 @@ import ws from 'ws';
 // fix is to hand it the `ws` package explicitly (already a dependency).
 const REALTIME_OPTS = { realtime: { transport: ws as unknown as typeof WebSocket } };
 
-// The one place a service-role client is constructed. Bypasses RLS — only
-// used by app/api/razorpay/* and app/api/cron/* to verify payments and
-// upgrade profiles, a trusted write that the anon key can't perform.
+// The one place a service-role client is constructed. Bypasses RLS — used
+// by app/api/razorpay/* and app/api/cron/* for trusted writes the anon key
+// can't perform, and by data/coursesCached.ts to read gated course content
+// server-side (the per-request can_access_authored_course check, not RLS,
+// is what actually gates it — see coursesCached.ts).
 export function getSupabaseAdmin() {
   return createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
     auth: { persistSession: false },

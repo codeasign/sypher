@@ -357,6 +357,26 @@ export function ManageBlogIcon({ className }: IconProps): React.JSX.Element {
   );
 }
 
+export function ManageCoursesIcon({ className }: IconProps): React.JSX.Element {
+  return (
+    <svg
+      className={className}
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M22 10L12 5 2 10l10 5 10-5z" />
+      <path d="M6 12v5c0 1.66 2.69 3 6 3s6-1.34 6-3v-5" />
+    </svg>
+  );
+}
+
 export function BrandingIcon({ className }: IconProps): React.JSX.Element {
   return (
     <svg
@@ -384,6 +404,26 @@ export function BrandingIcon({ className }: IconProps): React.JSX.Element {
   );
 }
 
+export function GettingStartedIcon({ className }: IconProps): React.JSX.Element {
+  return (
+    <svg
+      className={className}
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="10" />
+      <polygon points="10 8 16 12 10 16 10 8" />
+    </svg>
+  );
+}
+
 // Maps NAV_SECTIONS item keys (@/data/navItems) to their icon, shared between
 // DashboardSidebar and anywhere else that renders nav items (e.g. the
 // dashboard's quick links) so the same item always gets the same icon.
@@ -399,5 +439,6 @@ export const NAV_ICONS_BY_KEY: Record<string, (props: IconProps) => React.JSX.El
   'send-announcements': AnnouncementIcon,
   'create-blog-post': BlogIcon,
   'manage-blog-post': ManageBlogIcon,
+  'manage-course-authoring': ManageCoursesIcon,
   'add-company-branding': BrandingIcon,
 };

@@ -3832,6 +3832,336 @@ admin caller.
 
 ---
 
+## Course authoring (`courses`, `course_modules`) — apps/app
+
+New DB-backed course system living in `apps/app` (Next.js), authored via
+MDXEditor, completely separate from the Docusaurus `course_access` /
+`company_course_access` tables above — different consumers
+(`@sypher/course-catalog`'s `buildCourseAccessMap` keys those by slug
+alone), different slug space, no FK between the two systems. Course
+hierarchy is flat: a `courses` row owns N `course_modules` rows, no
+sub-sections.
+
+Two authoring paths write into `course_modules.body_mdx`: an admin via
+`/manage-courses`'s MDXEditor UI (`authoring_mode = 'manual'`), and
+`apps/app/scripts/compose-authored-course.js` bulk-writing generated
+content with the service-role key (`authoring_mode = 'generated'`).
+
+`module_type` is schema headroom only — every module created through the
+UI or the compose script is `'content'`; `assignment`/`video`/`mcq` have no
+editor, renderer, or grading built yet. `is_certification` is only
+meaningful once `module_type = 'mcq'` is actually built.
+
+`show_in_getting_started` modules are visible **publicly, regardless of
+course access** — the second `select` branch on `course_modules` below —
+so a prospective user can see e.g. a course's Setup page before they have
+any grant. `getting_started_order` is a separate, cross-course sparse
+ordering column; `order_index` stays course-scoped. Both use the sparse
+step-1000 convention (`coalesce(max(...), 0) + 1000` within their own
+scope, assigned by the app/script — not by a DB default), so modules can be
+created out of order without a renumbering pass.
+
+`authored_course_access` / `authored_company_course_access` mirror
+`course_access` / `company_course_access` above but key on `course_id`
+(not slug) and gate writes on `can_manage_courses()` (not `is_admin()`) —
+any role granted `nav_access` for `manage-course-authoring` can manage
+courses, same convention as `can_manage_blog()`.
+
+```sql
+-- ============================================================
+-- COURSES
+-- ============================================================
+
+create table if not exists public.courses (
+  id uuid primary key default gen_random_uuid(),
+  slug text unique not null,
+  name text not null,
+  description text,
+  cover_image_url text,
+  status text not null default 'draft' check (status in ('draft', 'published')),
+  author_id uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  published_at timestamptz
+);
+
+alter table public.courses enable row level security;
+
+-- ============================================================
+-- COURSE_MODULES (flat -- no sub-sections)
+-- ============================================================
+
+create table if not exists public.course_modules (
+  id uuid primary key default gen_random_uuid(),
+  course_id uuid not null references public.courses(id) on delete cascade,
+  slug text not null,
+  title text not null,
+  module_type text not null default 'content'
+    check (module_type in ('content', 'assignment', 'video', 'mcq')),
+  is_certification boolean not null default false,
+  body_mdx text not null default '',
+  order_index integer not null default 0,
+  authoring_mode text not null default 'manual'
+    check (authoring_mode in ('manual', 'generated')),
+  show_in_getting_started boolean not null default false,
+  getting_started_order integer,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (course_id, slug)
+);
+
+alter table public.course_modules enable row level security;
+
+-- ============================================================
+-- AUTHORED_COURSE_ACCESS / AUTHORED_COMPANY_COURSE_ACCESS
+-- (kept separate from course_access / company_course_access --
+-- keyed by course_id, not slug; see design note above)
+-- ============================================================
+
+create table if not exists public.authored_course_access (
+  course_id uuid primary key references public.courses(id) on delete cascade,
+  allowed_roles public.user_role[] not null default '{}'::public.user_role[],
+  updated_at timestamptz not null default now()
+);
+
+alter table public.authored_course_access enable row level security;
+
+drop policy if exists "anyone can read authored course access" on public.authored_course_access;
+create policy "anyone can read authored course access" on public.authored_course_access
+  for select using (true);
+
+create table if not exists public.authored_company_course_access (
+  company_name text not null,
+  course_id uuid not null references public.courses(id) on delete cascade,
+  updated_at timestamptz not null default now(),
+  primary key (company_name, course_id)
+);
+
+alter table public.authored_company_course_access enable row level security;
+
+drop policy if exists "anyone can read authored company course access" on public.authored_company_course_access;
+create policy "anyone can read authored company course access" on public.authored_company_course_access
+  for select using (true);
+
+-- ============================================================
+-- can_manage_courses() -- mirrors can_manage_blog(): admin, or any role
+-- granted nav_access for 'manage-course-authoring'.
+-- ============================================================
+
+create or replace function public.can_manage_courses()
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (
+    select 1 from public.profiles p
+    where p.id = auth.uid()
+      and (
+        p.role = 'admin'
+        or p.role::text = any(
+          select unnest(allowed_roles)::text from public.nav_access
+          where item_key = 'manage-course-authoring'
+        )
+      )
+  );
+$$;
+
+drop policy if exists "authors manage courses" on public.courses;
+create policy "authors manage courses" on public.courses
+  for all using (public.can_manage_courses()) with check (public.can_manage_courses());
+
+drop policy if exists "authors manage course modules" on public.course_modules;
+create policy "authors manage course modules" on public.course_modules
+  for all using (public.can_manage_courses()) with check (public.can_manage_courses());
+
+drop policy if exists "authors manage authored course access" on public.authored_course_access;
+create policy "authors manage authored course access" on public.authored_course_access
+  for all using (public.can_manage_courses()) with check (public.can_manage_courses());
+
+drop policy if exists "authors manage authored company course access" on public.authored_company_course_access;
+create policy "authors manage authored company course access" on public.authored_company_course_access
+  for all using (public.can_manage_courses()) with check (public.can_manage_courses());
+
+-- ============================================================
+-- can_access_authored_course(p_course_id) -- mirrors check_course_access():
+-- admin bypass, then role grant, then company grant. Returns false for a
+-- signed-out caller (auth.uid() is null), same fail-closed default.
+-- ============================================================
+
+create or replace function public.can_access_authored_course(p_course_id uuid)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_role public.user_role;
+  v_company text;
+  v_allowed_roles public.user_role[];
+begin
+  if auth.uid() is null then
+    return false;
+  end if;
+
+  select role, company_name into v_role, v_company
+  from public.profiles where id = auth.uid();
+
+  if v_role = 'admin' then
+    return true;
+  end if;
+
+  select allowed_roles into v_allowed_roles
+  from public.authored_course_access where course_id = p_course_id;
+
+  if v_role is null then
+    return coalesce('free_users' = any(v_allowed_roles), false);
+  end if;
+
+  if coalesce(v_role = any(v_allowed_roles), false) then
+    return true;
+  end if;
+
+  if v_role = 'company_employees' and v_company is not null then
+    return exists (
+      select 1 from public.authored_company_course_access
+      where company_name = v_company and course_id = p_course_id
+    );
+  end if;
+
+  return false;
+end;
+$$;
+
+revoke execute on function public.can_access_authored_course(uuid) from public;
+grant execute on function public.can_access_authored_course(uuid) to anon, authenticated;
+
+-- ============================================================
+-- course_has_getting_started_module() -- security-definer helper so
+-- courses' select policy can check course_modules without a raw subquery.
+-- A raw `exists (select ... from course_modules)` inside courses' own
+-- policy would run as the calling role, re-triggering course_modules' RLS
+-- -- which itself subqueries courses -- causing Postgres to reject the
+-- whole thing with "infinite recursion detected in policy for relation
+-- courses" (42P17). Same fix pattern as is_admin() on profiles (see
+-- Troubleshooting below): a security-definer function bypasses RLS for
+-- its own internal query, breaking the cycle.
+-- ============================================================
+
+create or replace function public.course_has_getting_started_module(p_course_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (
+    select 1 from public.course_modules m
+    where m.course_id = p_course_id and m.show_in_getting_started = true
+  );
+$$;
+
+revoke execute on function public.course_has_getting_started_module(uuid) from public;
+grant execute on function public.course_has_getting_started_module(uuid) to anon, authenticated;
+
+-- ============================================================
+-- Public select policies -- course-level now carries the SAME
+-- getting-started branch as module-level, not none (see "Note" below).
+-- ============================================================
+
+drop policy if exists "anyone can read published accessible courses" on public.courses;
+create policy "anyone can read published accessible courses" on public.courses
+  for select using (
+    status = 'published'
+    and (
+      public.can_access_authored_course(id)
+      or (auth.uid() is not null and public.course_has_getting_started_module(id))
+    )
+  );
+
+drop policy if exists "anyone can read accessible or featured modules" on public.course_modules;
+create policy "anyone can read accessible or featured modules" on public.course_modules
+  for select using (
+    exists (
+      select 1 from public.courses c
+      where c.id = course_modules.course_id and c.status = 'published'
+    )
+    and (
+      public.can_access_authored_course(course_id)
+      or (auth.uid() is not null and show_in_getting_started = true)
+    )
+  );
+
+notify pgrst, 'reload schema';
+```
+
+Notes:
+
+- **Getting-Started rows require `auth.uid() is not null`, added in a
+  second Phase 9 revision.** Originally fully public (anon-readable, no
+  session needed) by design -- the point was to help a prospect with zero
+  session and zero course access. Changed after explicit confirmation that
+  a signed-out visitor should be redirected to `/login` instead. The
+  Next.js page-level checks (`isSignedIn()` in `src/lib/courseAccess.ts`)
+  enforce this for the app's own UI, but per this doc's own stated model
+  (RLS is the real security boundary, app checks are just UX) that alone
+  would leave the anon key able to read this data directly via Supabase's
+  REST API, bypassing the page entirely. `auth.uid() is not null` on both
+  OR-branches closes that gap. Consequence: `getCachedGettingStartedModules()`
+  (`apps/app/src/data/coursesCached.ts`) had to move off the anon client
+  onto the service-role client, matching the app's other three cached
+  course reads -- an anon-key client is by definition always
+  `auth.uid() is null`, so it would return zero rows forever once this
+  policy shipped, breaking the feature outright rather than protecting it.
+- **`courses`' select policy carries a getting-started branch, added after
+  Phase 9 verification found it missing.** The original policy was
+  `status = 'published' and can_access_authored_course(id)` with no OR
+  branch, on the theory that only individual modules needed to be public.
+  But `course_modules`' own policy checks
+  `exists (select 1 from public.courses c where c.id = ... and c.status =
+  'published')` as a plain subquery, not through a security-definer
+  function — so that subquery runs as the calling role and is itself
+  subject to `courses`' RLS. For an anonymous caller,
+  `can_access_authored_course` always returns `false`, so anon could never
+  see the `courses` row at all, which silently made that EXISTS check (and
+  therefore the entire `show_in_getting_started` branch) evaluate to
+  `false` for every signed-out visitor — `/getting-started` returned no
+  guides even for a correctly flagged, published module.
+- **First attempt at the fix above used a raw `exists (select ... from
+  course_modules)` inside courses' policy and hit `42P17: infinite
+  recursion detected in policy for relation "courses"`.** courses' policy
+  would subquery `course_modules`, whose own policy subqueries `courses`
+  right back — Postgres detects the cycle and refuses. Resolved with
+  `course_has_getting_started_module()`, a security-definer function: its
+  internal query bypasses RLS entirely, so it never re-triggers
+  `course_modules`' policy and the cycle never forms. Same root cause and
+  same fix shape as `is_admin()` on `profiles` (see Troubleshooting below)
+  — any raw cross-table subquery inside an RLS policy on two tables that
+  also reference each other needs to go through a security-definer
+  function, not a plain subquery.
+- `can_access_authored_course` is `security definer` `plpgsql` (not `sql`,
+  unlike `can_manage_courses`) because it needs the `if`/`declare` control
+  flow — same reason `check_course_access` above is `plpgsql` while
+  `can_manage_blog` is plain `sql`.
+- Not added to `supabase_realtime` — that publication exists only for the
+  now-disconnected Docusaurus static-rebake watchers, irrelevant here.
+- No seed rows needed in `nav_access` for `manage-course-authoring` — same
+  rule as every other item: a missing row means `allowed_roles = []`, so
+  only the hardcoded admin bypass can reach `/manage-courses` until an
+  admin grants the role via `/manage-access` (the nav item itself is
+  registered in a later phase).
+- Sanity-check directly in the SQL editor before building any UI on top:
+  ```sql
+  select public.can_manage_courses();
+  select public.can_access_authored_course('00000000-0000-0000-0000-000000000000');
+  ```
+  Run as different signed-in test users to confirm the admin bypass and the
+  fail-closed default for a course with no `authored_course_access` row;
+  unauthenticated (anon key, no session) should return `false`/`false`.
+
+---
+
 ## Troubleshooting
 
 ### `ERROR: 42710: type "user_role" already exists`

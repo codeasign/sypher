@@ -10,7 +10,14 @@ import { useUpgradeToPaid } from '@/hooks/useUpgradeToPaid';
 import { useVisibleNavSections } from '@/hooks/useVisibleNavSections';
 import { ROLES } from '@/types/roles';
 import type { Role } from '@/types/roles';
-import { DashboardIcon, BookmarkIcon, LogoutIcon, ProfileIcon, NAV_ICONS_BY_KEY } from '@/components/NavIcons';
+import {
+  DashboardIcon,
+  BookmarkIcon,
+  GettingStartedIcon,
+  LogoutIcon,
+  ProfileIcon,
+  NAV_ICONS_BY_KEY,
+} from '@/components/NavIcons';
 import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
@@ -38,10 +45,15 @@ interface NavSection {
   items: NavItem[];
 }
 
+// Getting Started is public (no course access required, see
+// SupabaseSchema.md "Course authoring" / the course-authoring plan's design
+// note 3), so it's pinned here rather than in the role-gated NAV_SECTIONS
+// list -- every signed-in user sees it regardless of role or grants.
 const OVERVIEW_SECTION: NavSection = {
   title: 'Overview',
   items: [
     { href: '/dashboard', label: 'Dashboard', icon: DashboardIcon },
+    { href: '/getting-started', label: 'Getting Started', icon: GettingStartedIcon },
     { href: '/bookmarks', label: 'Bookmarks', icon: BookmarkIcon },
   ],
 };
