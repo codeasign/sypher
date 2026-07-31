@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect } from 'react';
+import Link from 'next/link';
 import ReactMarkdown from 'react-markdown';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
@@ -20,6 +21,7 @@ interface BlogPostArticleProps {
   coverImageUrl: string | null;
   date: string | null;
   trackView?: boolean;
+  showBackLink?: boolean;
 }
 
 // Explicit locale, not `undefined` -- see BlogList/index.tsx for why.
@@ -27,13 +29,26 @@ function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString('en-IN', { month: 'long', day: 'numeric', year: 'numeric' });
 }
 
-export default function BlogPostArticle({ slug, title, content, coverImageUrl, date, trackView = true }: BlogPostArticleProps): React.JSX.Element {
+export default function BlogPostArticle({
+  slug,
+  title,
+  content,
+  coverImageUrl,
+  date,
+  trackView = true,
+  showBackLink = true,
+}: BlogPostArticleProps): React.JSX.Element {
   useEffect(() => {
     if (trackView) trackEvent('blog_post_view', { slug, title });
   }, [slug, title, trackView]);
 
   return (
     <article className={styles.article}>
+      {showBackLink && (
+        <Link href="/blog" className={styles.backLink}>
+          ← Back to Blog
+        </Link>
+      )}
       {coverImageUrl && <img src={coverImageUrl} alt={title} className={styles.coverImage} />}
       <h1 className={styles.title}>{title}</h1>
       {date && <p className={styles.date}>{formatDate(date)}</p>}

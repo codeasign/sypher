@@ -1,7 +1,9 @@
 'use client';
 
 import React, { useEffect } from 'react';
+import Link from 'next/link';
 import { WORK_MODE_LABEL } from '@/types/workMode';
+import CourseDescriptionMarkdown from '@/components/CourseDescriptionMarkdown';
 import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
@@ -57,20 +59,23 @@ export default function JobPostArticle({
 
   return (
     <article className={styles.article}>
+      <Link href="/careers" className={styles.backLink}>
+        ← Back to Careers
+      </Link>
       <h1 className={styles.title}>{title}</h1>
       <p className={styles.company}>{companyName}</p>
       <div className={styles.meta}>
-        {location && <span className={styles.metaBadge}>{location}</span>}
+        {location && <span className={styles.metaBadge}>Location: {location}</span>}
         {employmentType && (
-          <span className={styles.metaBadge}>{EMPLOYMENT_TYPE_LABEL[employmentType] ?? employmentType}</span>
+          <span className={styles.metaBadge}>Type: {EMPLOYMENT_TYPE_LABEL[employmentType] ?? employmentType}</span>
         )}
         {workMode && (
-          <span className={styles.metaBadge}>{WORK_MODE_LABEL[workMode] ?? workMode}</span>
+          <span className={styles.metaBadge}>Mode: {WORK_MODE_LABEL[workMode] ?? workMode}</span>
         )}
-        {experienceLevel && <span className={styles.metaBadge}>{experienceLevel}</span>}
-        {salary && <span className={styles.metaBadge}>{salary}</span>}
+        {experienceLevel && <span className={styles.metaBadge}>Experience: {experienceLevel}</span>}
+        {salary && <span className={styles.metaBadge}>Salary: {salary}</span>}
       </div>
-      <p className={styles.body}>{description}</p>
+      <CourseDescriptionMarkdown text={description} className={styles.body} />
       {(applyUrl || applyEmail) && (
         <div className={styles.applySection}>
           <a

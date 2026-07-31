@@ -1,14 +1,14 @@
 import type { Metadata } from 'next';
 import { redirect } from 'next/navigation';
-import Link from 'next/link';
 import Footer from '@/components/Footer';
+import GettingStartedModuleList from '@/components/GettingStartedModuleList';
 import { getCachedGettingStartedModules } from '@/data/coursesCached';
 import { isSignedIn } from '@/lib/courseAccess';
 import styles from './styles.module.css';
 
 export const metadata: Metadata = {
-  title: 'Getting Started',
-  description: 'Setup guides and getting-started material for signed-in users -- no course access required.',
+  title: 'Setup & Dependencies',
+  description: 'Find the guides for setting up the dependencies you need before starting your courses.',
 };
 
 interface GettingStartedModule {
@@ -32,31 +32,13 @@ export default async function GettingStartedPage() {
     <div className={styles.page}>
       <div className={styles.container}>
         <div className={styles.pageHeader}>
-          <h1 className={styles.pageTitle}>Getting Started</h1>
+          <h1 className={styles.pageTitle}>Setup & Dependencies</h1>
           <p className={styles.pageSubtitle}>
-            Setup guides and orientation material — no course access required, just a signed-in account.
+            Find the guides for setting up the dependencies you need before starting your courses.
           </p>
         </div>
 
-        {modules.length === 0 ? (
-          <p className={styles.empty}>No getting-started guides published yet.</p>
-        ) : (
-          <div className={styles.moduleGrid}>
-            {modules.map((m) => {
-              // Supabase's !inner embed types as an array in some client
-              // versions, a single object in others -- normalize both.
-              const course = Array.isArray(m.course) ? m.course[0] : m.course;
-              if (!course) return null;
-              return (
-                <Link key={m.id} href={`/courses/${course.slug}/${m.slug}`} className={styles.moduleCard}>
-                  <span className={styles.moduleCardIcon}>📘</span>
-                  <span className={styles.moduleCardTitle}>{m.title}</span>
-                  <span className={styles.moduleCardCourse}>{course.name}</span>
-                </Link>
-              );
-            })}
-          </div>
-        )}
+        <GettingStartedModuleList modules={modules} />
       </div>
       <Footer />
     </div>

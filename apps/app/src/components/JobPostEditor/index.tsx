@@ -10,6 +10,7 @@ import { fetchLocations } from '@/data/locations';
 import { EXPERIENCE_YEARS_OPTIONS, EXPERIENCE_MONTHS_OPTIONS } from '@/types/educationStatus';
 import { WORK_MODE_OPTIONS } from '@/types/workMode';
 import SkillsModal from '@/components/SkillsModal';
+import JobDescriptionEditor from '@/components/JobDescriptionEditor';
 import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
@@ -578,16 +579,13 @@ export default function JobPostEditor({ post, onSaved, onCancel, onBack }: JobPo
         </div>
 
         <div className={styles.formGroup}>
-          <label className={styles.fieldLabel} htmlFor="job-description">
+          <label className={styles.fieldLabel}>
             Description<span className={styles.requiredMark}>*</span>
           </label>
-          <textarea
-            id="job-description"
-            className={styles.textarea}
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
+          <JobDescriptionEditor
+            markdown={description}
+            onChange={setDescription}
             placeholder="Role responsibilities, requirements, and what the candidate will be doing"
-            rows={8}
             disabled={saving}
           />
         </div>

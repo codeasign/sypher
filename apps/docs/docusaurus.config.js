@@ -5,6 +5,10 @@ import { getAppOrigin } from '@sypher/auth-core/src/urls';
 
 const GA_MEASUREMENT_ID = process.env.GA_MEASUREMENT_ID ?? '';
 
+// Per-item navbar visibility toggles. Env var unset => item shows (default
+// behavior unchanged); set to the literal string "false" => item is hidden.
+const showNavItem = (envKey) => process.env[envKey] !== 'false';
+
 // Renders straight into the generated HTML <head>, ahead of Docusaurus's own
 // bundle, so consent defaults to 'denied' (unless the visitor already chose
 // on app.sypher.local -- same cookie, read here via a literal regex since
@@ -161,17 +165,17 @@ const config = {
       items: [
         // === TOPICS ===
         // Claude Code inserts new items here. Do not remove these markers.
-        { type: 'custom-exploreCourses', position: 'left' },
+        showNavItem('NAVBAR_SHOW_EXPLORE_COURSES') && { type: 'custom-exploreCourses', position: 'left' },
         // === /TOPICS ===
-        { to: '/blog', label: 'Blog', position: 'left' },
-        { href: `${getAppOrigin()}/careers`, label: 'Careers', position: 'left' },
-        { to: '/corporate-training', label: 'Corporate Training', position: 'left' },
-        { to: '/resume-review', label: 'Resume Review', position: 'left' },
-        { to: '/mock-interview', label: 'Mock Interview', position: 'left' },
-        { to: '/hire-with-us', label: 'Hire with Us', position: 'left' },
-        { to: '/team-access', label: 'Team Access', position: 'left' },
+        showNavItem('NAVBAR_SHOW_BLOG') && { to: '/blog', label: 'Blog', position: 'left' },
+        showNavItem('NAVBAR_SHOW_CAREERS') && { href: `${getAppOrigin()}/careers`, label: 'Careers', position: 'left' },
+        showNavItem('NAVBAR_SHOW_CORPORATE_TRAINING') && { to: '/corporate-training', label: 'Corporate Training', position: 'left' },
+        showNavItem('NAVBAR_SHOW_RESUME_REVIEW') && { to: '/resume-review', label: 'Resume Review', position: 'left' },
+        showNavItem('NAVBAR_SHOW_MOCK_INTERVIEW') && { to: '/mock-interview', label: 'Mock Interview', position: 'left' },
+        showNavItem('NAVBAR_SHOW_HIRE_WITH_US') && { to: '/hire-with-us', label: 'Hire with Us', position: 'left' },
+        showNavItem('NAVBAR_SHOW_TEAM_ACCESS') && { to: '/team-access', label: 'Team Access', position: 'left' },
         { type: 'custom-login', position: 'right' },
-      ],
+      ].filter(Boolean),
     },
     docs: {
       sidebar: {

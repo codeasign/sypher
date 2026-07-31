@@ -246,7 +246,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
       {error && <p className={styles.error}>{error}</p>}
 
       {previewMode ? (
-        <BlogPostArticle slug={post?.slug ?? 'preview'} title={title || 'Untitled post'} content={draftMarkdown} coverImageUrl={coverImageUrl} date={null} trackView={false} />
+        <BlogPostArticle slug={post?.slug ?? 'preview'} title={title || 'Untitled post'} content={draftMarkdown} coverImageUrl={coverImageUrl} date={null} trackView={false} showBackLink={false} />
       ) : (
         <>
           <div className={clsx(styles.card, styles.metaCard)}>

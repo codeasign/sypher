@@ -3,7 +3,8 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useAuth } from '@/contexts/AuthContext';
-import styles from './styles.module.css';
+import { useShowMore } from '@/hooks/useShowMore';
+import styles from '@/components/CardGrid/styles.module.css';
 
 interface PostSummary {
   slug: string;
@@ -48,25 +49,36 @@ export default function BlogList({ initialPosts }: { initialPosts: PostSummary[]
     };
   }, [supabase]);
 
+  const { visible, hasMore, showAll } = useShowMore(posts);
+
   if (posts.length === 0) {
     return <p className={styles.statusText}>No posts published yet. Check back soon.</p>;
   }
 
   return (
-    <div className={styles.grid}>
-      {posts.map((post) => (
-        <Link key={post.slug} href={`/blog/${post.slug}`} className={styles.card}>
-          {post.cover_image_url && (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={post.cover_image_url} alt={post.title} className={styles.cardImage} />
-          )}
-          <div className={styles.cardBody}>
-            <h3 className={styles.cardTitle}>{post.title}</h3>
-            <p className={styles.cardDescription}>{post.description}</p>
-            {post.published_at && <span className={styles.cardDate}>{formatDate(post.published_at)}</span>}
-          </div>
-        </Link>
-      ))}
-    </div>
+    <>
+      <div className={styles.grid}>
+        {visible.map((post) => (
+          <Link key={post.slug} href={`/blog/${post.slug}`} className={styles.card}>
+            {post.cover_image_url && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={post.cover_image_url} alt={post.title} className={styles.cardImage} />
+            )}
+            <div className={styles.cardBody}>
+              <h3 className={styles.cardTitle}>{post.title}</h3>
+              <p className={styles.cardDescription}>{post.description}</p>
+              {post.published_at && <span className={styles.cardDate}>{formatDate(post.published_at)}</span>}
+            </div>
+          </Link>
+        ))}
+      </div>
+      {hasMore && (
+        <div className={styles.showMoreWrap}>
+          <button type="button" className={styles.showMoreBtn} onClick={showAll}>
+            Show more
+          </button>
+        </div>
+      )}
+    </>
   );
 }

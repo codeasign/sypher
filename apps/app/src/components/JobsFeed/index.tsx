@@ -16,6 +16,7 @@ import {
 import { fetchTaxonomy } from '@/data/taxonomy';
 import { WORK_MODE_LABEL } from '@/types/workMode';
 import { JobsIcon } from '@/components/NavIcons';
+import CourseDescriptionMarkdown from '@/components/CourseDescriptionMarkdown';
 import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
@@ -517,7 +518,7 @@ export default function JobsFeed(): React.JSX.Element {
                           </div>
                         )}
                       </div>
-                      <p className={styles.detailDescription}>{selectedJob.description}</p>
+                      <CourseDescriptionMarkdown text={selectedJob.description} className={styles.detailDescription} />
                       {selectedJob.branding && (
                         <div className={styles.brandingStrip}>
                           <div className={styles.brandingHeader}>

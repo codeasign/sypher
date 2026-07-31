@@ -2,6 +2,7 @@
 
 import React from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkBreaks from 'remark-breaks';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 
@@ -21,7 +22,9 @@ export default function CourseDescriptionMarkdown({
 }: CourseDescriptionMarkdownProps): React.JSX.Element {
   return (
     <div className={className}>
-      <ReactMarkdown rehypePlugins={[rehypeRaw, [rehypeSanitize, schema]]}>{text}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={[remarkBreaks]} rehypePlugins={[rehypeRaw, [rehypeSanitize, schema]]}>
+        {text}
+      </ReactMarkdown>
     </div>
   );
 }
