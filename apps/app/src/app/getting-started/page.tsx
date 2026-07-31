@@ -16,7 +16,7 @@ interface GettingStartedModule {
   slug: string;
   title: string;
   getting_started_order: number | null;
-  course: { slug: string; status: string } | { slug: string; status: string }[];
+  course: { slug: string; status: string; name: string } | { slug: string; status: string; name: string }[];
 }
 
 export default async function GettingStartedPage() {
@@ -41,21 +41,21 @@ export default async function GettingStartedPage() {
         {modules.length === 0 ? (
           <p className={styles.empty}>No getting-started guides published yet.</p>
         ) : (
-          <ul className={styles.moduleList}>
+          <div className={styles.moduleGrid}>
             {modules.map((m) => {
               // Supabase's !inner embed types as an array in some client
               // versions, a single object in others -- normalize both.
               const course = Array.isArray(m.course) ? m.course[0] : m.course;
               if (!course) return null;
               return (
-                <li key={m.id} className={styles.moduleRow}>
-                  <Link href={`/courses/${course.slug}/${m.slug}`} className={styles.moduleLink}>
-                    {m.title}
-                  </Link>
-                </li>
+                <Link key={m.id} href={`/courses/${course.slug}/${m.slug}`} className={styles.moduleCard}>
+                  <span className={styles.moduleCardIcon}>📘</span>
+                  <span className={styles.moduleCardTitle}>{m.title}</span>
+                  <span className={styles.moduleCardCourse}>{course.name}</span>
+                </Link>
               );
             })}
-          </ul>
+          </div>
         )}
       </div>
       <Footer />

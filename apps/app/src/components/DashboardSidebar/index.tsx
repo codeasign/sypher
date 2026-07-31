@@ -28,8 +28,6 @@ function getRoleLabel(role: Role | null): string {
 
 interface DashboardSidebarProps {
   user?: User | null;
-  collapsed: boolean;
-  onToggleCollapsed: () => void;
 }
 
 interface NavItem {
@@ -62,8 +60,6 @@ const PROFILE_ITEM: NavItem = { href: '/profile', label: 'Profile', icon: Profil
 
 export default function DashboardSidebar({
   user,
-  collapsed,
-  onToggleCollapsed,
 }: DashboardSidebarProps): React.JSX.Element {
   const pathname = usePathname();
   const { role, paidUntil, signOut } = useAuth();
@@ -120,12 +116,8 @@ export default function DashboardSidebar({
         aria-disabled={comingSoon ? true : undefined}
       >
         <Icon className={styles.navIcon} />
-        {!collapsed && (
-          <>
-            <span className={styles.navLabel}>{label}</span>
-            {comingSoon && <span className={styles.comingSoonBadge}>Soon</span>}
-          </>
-        )}
+        <span className={styles.navLabel}>{label}</span>
+        {comingSoon && <span className={styles.comingSoonBadge}>Soon</span>}
       </Link>
     );
   }
@@ -133,26 +125,14 @@ export default function DashboardSidebar({
   function renderSection({ title, items }: NavSection): React.JSX.Element {
     return (
       <div key={title} className={styles.section}>
-        {!collapsed && <span className={styles.sectionHeader}>{title}</span>}
+        <span className={styles.sectionHeader}>{title}</span>
         {items.map((item) => renderNavItem(item, title))}
       </div>
     );
   }
 
   return (
-    <aside className={clsx(styles.sidebar, collapsed && styles.collapsed)}>
-      <button
-        type="button"
-        className={styles.toggle}
-        onClick={() => {
-          trackEvent('sidebar_collapse_toggle', { collapsed: !collapsed });
-          onToggleCollapsed();
-        }}
-        aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-      >
-        {collapsed ? '▶' : '◀'}
-      </button>
-
+    <aside className={styles.sidebar}>
       <div className={styles.userSection}>
         <span className={styles.avatar}>
           {avatarUrl ? (
@@ -161,33 +141,31 @@ export default function DashboardSidebar({
             displayName.slice(0, 1).toUpperCase()
           )}
         </span>
-        {!collapsed && (
-          <div className={styles.userInfo}>
-            <span className={styles.name}>{displayName}</span>
-            <span className={styles.email}>{email}</span>
-            <div className={styles.badgeRow}>
-              {role && (
-                <span className={clsx(styles.roleBadge, styles[`role-${role}`])}>
-                  {getRoleLabel(role)}
-                </span>
-              )}
-              <span className={clsx(styles.planBadge, isPaidAndActive ? styles.planPaid : styles.planFree)}>
-                {isPaidAndActive ? 'Paid plan' : 'Free plan'}
+        <div className={styles.userInfo}>
+          <span className={styles.name}>{displayName}</span>
+          <span className={styles.email}>{email}</span>
+          <div className={styles.badgeRow}>
+            {role && (
+              <span className={clsx(styles.roleBadge, styles[`role-${role}`])}>
+                {getRoleLabel(role)}
               </span>
-            </div>
-            {!isPaidAndActive && (
-              <button
-                type="button"
-                className={styles.goProBtn}
-                disabled={isProcessing}
-                onClick={handleUpgrade}
-              >
-                {isProcessing ? 'Processing…' : 'Go Pro'}
-              </button>
             )}
-            {errorMessage && <span className={styles.upgradeError}>{errorMessage}</span>}
+            <span className={clsx(styles.planBadge, isPaidAndActive ? styles.planPaid : styles.planFree)}>
+              {isPaidAndActive ? 'Paid plan' : 'Free plan'}
+            </span>
           </div>
-        )}
+          {!isPaidAndActive && (
+            <button
+              type="button"
+              className={styles.goProBtn}
+              disabled={isProcessing}
+              onClick={handleUpgrade}
+            >
+              {isProcessing ? 'Processing…' : 'Go Pro'}
+            </button>
+          )}
+          {errorMessage && <span className={styles.upgradeError}>{errorMessage}</span>}
+        </div>
       </div>
 
       <nav className={styles.nav}>
@@ -206,7 +184,7 @@ export default function DashboardSidebar({
           }}
         >
           <LogoutIcon className={styles.navIcon} />
-          {!collapsed && <span className={styles.navLabel}>Log out</span>}
+          <span className={styles.navLabel}>Log out</span>
         </button>
       </div>
     </aside>

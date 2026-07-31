@@ -53,7 +53,7 @@ export const getCachedGettingStartedModules = unstable_cache(
   async () => {
     const { data, error } = await getSupabaseAdmin()
       .from('course_modules')
-      .select('id, slug, title, getting_started_order, course:courses!inner(slug, status)')
+      .select('id, slug, title, getting_started_order, course:courses!inner(slug, status, name)')
       .eq('show_in_getting_started', true)
       .eq('module_type', 'content')
       .eq('courses.status', 'published')

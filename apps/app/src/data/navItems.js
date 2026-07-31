@@ -19,15 +19,15 @@ export const NAV_SECTIONS = [
       { key: 'add-job-post', href: '/add-job-post', label: 'Add Job Post' },
       { key: 'applicants', href: '/applicants', label: 'Applicants' },
       { key: 'manage-users', href: '/manage-users', label: 'Manage Users' },
-      { key: 'manage-access', href: '/manage-access', label: 'Manage Course Access' },
+      { key: 'manage-access', href: '/manage-access', label: 'Site Administration' },
       { key: 'send-announcements', href: '#', label: 'Send Announcements', comingSoon: true },
     ],
   },
   {
     title: 'Content',
     items: [
-      { key: 'manage-blog-post', href: '/manage-blog', label: 'Manage Blog Posts' },
-      { key: 'manage-course-authoring', href: '/manage-courses', label: 'Manage Courses' },
+      { key: 'manage-blog-post', href: '/manage-blog', label: 'Author Blog' },
+      { key: 'manage-course-authoring', href: '/manage-courses', label: 'Author Course' },
     ],
   },
   {

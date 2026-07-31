@@ -1,3 +1,5 @@
+import { hasCourseAccess } from '@sypher/course-catalog/src/courseAccess';
+
 export function slugify(title) {
   return title
     .toLowerCase()
@@ -91,6 +93,41 @@ export async function listCourses(supabase) {
   if (error) {
     // eslint-disable-next-line no-console
     console.error('Failed to load courses:', error.message);
+    return [];
+  }
+  return data;
+}
+
+// Bookmarked-course lookup for /bookmarks -- unlike getCourseBySlug, not
+// filtered to status='published' since RLS on authored_course_bookmarks
+// already scopes rows to this user's own bookmarks (a bookmark surviving a
+// course being unpublished should still show up, same as doc_bookmarks).
+export async function getCoursesByIds(supabase, ids) {
+  if (!supabase || !ids || ids.length === 0) return [];
+  const { data, error } = await supabase
+    .from('courses')
+    .select('id, slug, name, description, cover_image_url')
+    .in('id', ids);
+  if (error) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to load bookmarked courses:', error.message);
+    return [];
+  }
+  return data;
+}
+
+// Bookmarked-module lookup for /bookmarks -- joins the course's slug/name
+// live (module_id is a real FK, see SupabaseSchema.md's authored bookmarks
+// section) rather than needing a denormalized title.
+export async function getCourseModulesByIdsWithCourse(supabase, ids) {
+  if (!supabase || !ids || ids.length === 0) return [];
+  const { data, error } = await supabase
+    .from('course_modules')
+    .select('id, slug, title, course_id, courses(slug, name)')
+    .in('id', ids);
+  if (error) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to load bookmarked course modules:', error.message);
     return [];
   }
   return data;
@@ -337,6 +374,92 @@ export async function reorderCourseModules(supabase, courseId, moduleId, directi
   }
   await revalidateCoursesCache(supabase);
   return { error: null };
+}
+
+function getAuthoredCourseAllowedRoles(row) {
+  const accessRow = Array.isArray(row.authored_course_access)
+    ? row.authored_course_access[0]
+    : row.authored_course_access;
+  return accessRow?.allowed_roles ?? [];
+}
+
+// Reuses the exact gradient already assigned to a flagship docs course
+// (@sypher/course-catalog/src/courses.js) rather than inventing a new color
+// -- authored courses have no gradient field of their own yet (v1).
+const AUTHORED_COURSE_GRADIENT = 'linear-gradient(135deg, #1E4D8C 0%, #357ABD 100%)';
+
+// Maps an already-access-confirmed courses row into DashboardCourseListing's
+// CourseData shape (design note 5).
+export function normalizeAuthoredCourseForDashboard(row) {
+  return {
+    title: row.name,
+    description: row.description ?? '',
+    url: `/courses/${row.slug}`,
+    gradient: AUTHORED_COURSE_GRADIENT,
+    icon: '📘',
+    tag: 'Course',
+    isFree: getAuthoredCourseAllowedRoles(row).includes('free_users'),
+    slug: row.slug,
+    source: 'authored',
+  };
+}
+
+// Dashboard merge (design note 5) -- plain, uncached, client-agnostic read.
+// Called with the caller's own per-session client (never the service-role
+// cache). `courses`' RLS narrows the published rows to ones this user can
+// at least see -- but that alone isn't "can actually open this course":
+// `courses`' select policy has a second OR-branch (any signed-in user, if
+// the course has a show_in_getting_started module) that exists so
+// /getting-started can list a course before the user has real access to it.
+// A raw RLS-filtered row can't be trusted as "accessible" the way it can
+// for e.g. the SSR course routes, which always re-run the full grant check
+// themselves regardless of what RLS already let through -- a dashboard card
+// implying unlocked access is exactly the kind of thing that check exists
+// to prevent. So this re-derives the same true/false
+// can_access_authored_course() computes server-side (role match, or -- for
+// company_employees -- a row in authored_company_course_access for the
+// user's company) via one extra, single (not per-course) query, and only
+// returns courses that pass it -- full parity with what course-home itself
+// would allow, not just what RLS happened to let through this query.
+// Results are inherently per-user, so there's no unstable_cache tag here
+// (would either leak across users or need a per-user key, not worth it for
+// an already-dynamic page).
+export async function listAccessibleAuthoredCourses(supabase, role, companyName) {
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from('courses')
+    .select('id, slug, name, description, authored_course_access(allowed_roles)')
+    .eq('status', 'published');
+  if (error) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to load accessible authored courses:', error.message);
+    return [];
+  }
+
+  let companyGrantedIds = new Set();
+  if (role === 'company_employees' && companyName) {
+    const { data: grants, error: grantsError } = await supabase
+      .from('authored_company_course_access')
+      .select('course_id')
+      .eq('company_name', companyName);
+    if (grantsError) {
+      // eslint-disable-next-line no-console
+      console.error('Failed to load authored company course access:', grantsError.message);
+    } else {
+      companyGrantedIds = new Set((grants ?? []).map((g) => g.course_id));
+    }
+  }
+
+  return data
+    .filter((row) =>
+      // Reuses the shared docs-course access predicate as-is -- it's a
+      // generic role/company decision tree, not docs-specific. `slug` here
+      // is really the authored course's id, the key companyGrantedIds is
+      // keyed by; `ctx.companyAllowedSlugs` is just "the set of keys this
+      // user's company is granted," regardless of what the key represents.
+      hasCourseAccess(role, getAuthoredCourseAllowedRoles(row), { companyAllowedSlugs: companyGrantedIds, slug: row.id })
+    )
+    .map(normalizeAuthoredCourseForDashboard);
 }
 
 // Admin-UI-only -- never touched by compose-authored-course.js. Featuring a

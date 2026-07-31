@@ -1,8 +1,11 @@
 import type { Metadata } from 'next';
 import { notFound, redirect } from 'next/navigation';
 import CourseModuleArticle from '@/components/CourseModulePage/CourseModuleArticle';
-import { getCachedCourseBySlug, getCachedCourseModuleBySlug } from '@/data/coursesCached';
+import CourseShell from '@/components/CourseShell';
+import CourseTableOfContents from '@/components/CourseTableOfContents';
+import { getCachedCourseBySlug, getCachedCourseModuleBySlug, getCachedCourseModules } from '@/data/coursesCached';
 import { getCourseAccessStatus, isSignedIn } from '@/lib/courseAccess';
+import { extractHeadings } from '@/lib/extractHeadings';
 import styles from '@/components/CourseModulePage/styles.module.css';
 
 // Only module_type='content' renders yet (see SupabaseSchema.md "Course
@@ -68,14 +71,42 @@ export default async function CourseModulePage({
     if (access === 'forbidden') notFound();
   }
 
+  // Reuses the same cached, order_index-sorted module list for both the
+  // sidebar (CourseShell) and prev/next -- no new data-fetch shape, and
+  // this only runs after the access gate above has already passed, so the
+  // sidebar's module list is never fetched (let alone rendered) for a
+  // forbidden request.
+  const modules = await getCachedCourseModules(course.id);
+  const contentModules = (modules as { id: string; slug: string; title: string; module_type: string }[]).filter(
+    (m) => m.module_type === 'content'
+  );
+  const currentIndex = contentModules.findIndex((m) => m.id === mod.id);
+  const prevModule = currentIndex > 0 ? contentModules[currentIndex - 1] : null;
+  const nextModule =
+    currentIndex >= 0 && currentIndex < contentModules.length - 1 ? contentModules[currentIndex + 1] : null;
+
+  const headings = extractHeadings(mod.body_mdx);
+
   return (
-    <div className={styles.page}>
-      <CourseModuleArticle
-        courseSlug={course.slug}
-        moduleSlug={mod.slug}
-        title={mod.title}
-        content={mod.body_mdx}
-      />
-    </div>
+    <CourseShell courseSlug={course.slug} courseName={course.name} modules={contentModules}>
+      <div className={styles.page}>
+        <div className={styles.moduleLayout}>
+          <div className={styles.articleCol}>
+            <CourseModuleArticle
+              courseId={course.id}
+              moduleId={mod.id}
+              courseSlug={course.slug}
+              courseName={course.name}
+              moduleSlug={mod.slug}
+              title={mod.title}
+              content={mod.body_mdx}
+              prevModule={prevModule ? { slug: prevModule.slug, title: prevModule.title } : null}
+              nextModule={nextModule ? { slug: nextModule.slug, title: nextModule.title } : null}
+            />
+          </div>
+          <CourseTableOfContents headings={headings} />
+        </div>
+      </div>
+    </CourseShell>
   );
 }

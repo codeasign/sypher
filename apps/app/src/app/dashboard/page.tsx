@@ -10,10 +10,11 @@ import { useDocBookmarks } from '@/hooks/useDocBookmarks';
 import { useUpgradeToPaid } from '@/hooks/useUpgradeToPaid';
 import { useVisibleNavSections } from '@/hooks/useVisibleNavSections';
 import { fetchCourseAccessRows, hasCourseAccess } from '@/data/courseAccess';
+import { listAccessibleAuthoredCourses } from '@/data/courses';
 import { fetchUserCountsByRole, fetchRecentActiveUsers } from '@/data/adminAnalytics';
 import { withCourseAccess } from '@sypher/course-catalog/src/homepageCourses';
 import allCourses from '@sypher/course-catalog/src/courses';
-import DashboardCourseListing from '@/components/DashboardCourseListing';
+import DashboardCourseListing, { type CourseData } from '@/components/DashboardCourseListing';
 import EmptySection from '@/components/EmptySection';
 import { FULL_DASHBOARD_ROLES, ROLES } from '@/types/roles';
 import { DashboardIcon, BookmarkIcon, CoursesIcon, PlanIcon, UsersIcon, NAV_ICONS_BY_KEY } from '@/components/NavIcons';
@@ -53,18 +54,36 @@ function formatRelativeTime(iso: string): string {
 // gets EmptyDashboardSection instead -- they work through their own tools
 // (Manage Access, Applicants, Add Job Post, ...), not this learner view.
 function LearnerDashboardContent(): React.JSX.Element {
-  const { supabase, role, paidUntil, fullName } = useAuth();
+  const { supabase, role, companyName, paidUntil, fullName } = useAuth();
   const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid('dashboard');
   const { bookmarkedSlugs, loading: courseBookmarksLoading } = useBookmarks();
   const { bookmarks: docBookmarks, loading: docBookmarksLoading } = useDocBookmarks();
   const { sections: visibleNavSections } = useVisibleNavSections();
   const [accessRows, setAccessRows] = useState<{ course_slug: string; allowed_roles: string[] }[]>([]);
+  const [authoredCourses, setAuthoredCourses] = useState<CourseData[]>([]);
 
   useEffect(() => {
     fetchCourseAccessRows(supabase).then(setAccessRows);
   }, [supabase]);
 
-  const courses = withCourseAccess(hasCourseAccess, role, accessRows, new Set<string>());
+  // Uses the same per-session client as everything else on this page.
+  // listAccessibleAuthoredCourses re-derives real course access itself
+  // (role + company grant, matching can_access_authored_course exactly) --
+  // see its comment in data/courses.js for why raw RLS visibility alone
+  // isn't enough here. Uncached/per-request, deliberately: results are
+  // inherently per-user.
+  useEffect(() => {
+    if (!supabase) return;
+    listAccessibleAuthoredCourses(supabase, role, companyName).then((rows) => {
+      // Return type is inferred from a plain .js file, so TS widens
+      // `source` to `string` rather than the literal 'authored' -- the cast
+      // asserts what the function actually returns.
+      setAuthoredCourses(rows as CourseData[]);
+    });
+  }, [supabase, role, companyName]);
+
+  const docsCourses = withCourseAccess(hasCourseAccess, role, accessRows, new Set<string>());
+  const courses = [...docsCourses, ...authoredCourses];
   const freeCoursesList = courses.filter((c) => c.isFree);
   const premiumCoursesList = courses.filter((c) => !c.isFree);
 

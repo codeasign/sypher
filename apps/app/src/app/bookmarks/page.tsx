@@ -1,15 +1,20 @@
 'use client';
 
 import React, { useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
 import DashboardLayout from '@/components/DashboardLayout';
 import { CourseGrid } from '@/components/CourseCard';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import { useBookmarks } from '@/hooks/useBookmarks';
 import { useDocBookmarks } from '@/hooks/useDocBookmarks';
+import { useAuthoredCourseBookmarks } from '@/hooks/useAuthoredCourseBookmarks';
+import { useAuthoredModuleBookmarks } from '@/hooks/useAuthoredModuleBookmarks';
 import { getDocsOrigin } from '@sypher/auth-core/src/urls';
 import { withCourseAccess } from '@sypher/course-catalog/src/homepageCourses';
 import { fetchCourseAccessRows, hasCourseAccess } from '@/data/courseAccess';
 import { fetchCompanyCourseAccessRows } from '@/data/companyAccess';
+import { getCoursesByIds, getCourseModulesByIdsWithCourse } from '@/data/courses';
+import CourseDescriptionMarkdown from '@/components/CourseDescriptionMarkdown';
 import { useAuth } from '@/contexts/AuthContext';
 import { BookmarkIcon, CoursesIcon } from '@/components/NavIcons';
 import { trackEvent } from '@/lib/analytics';
@@ -27,9 +32,31 @@ interface CourseAccessRow {
   allowed_roles: string[];
 }
 
+interface AuthoredCourseBookmark {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+}
+
+interface AuthoredModuleBookmark {
+  id: string;
+  slug: string;
+  title: string;
+  course_id: string;
+  courses: { slug: string; name: string } | null;
+}
+
+interface AuthoredModuleBookmarkRow {
+  module_id: string;
+  course_id: string;
+}
+
 type PendingRemoval =
   | { type: 'course'; slug: string; title: string }
-  | { type: 'doc'; docPath: string; title: string };
+  | { type: 'doc'; docPath: string; title: string }
+  | { type: 'authoredCourse'; courseId: string; title: string }
+  | { type: 'authoredModule'; moduleId: string; title: string };
 
 const COURSE_BY_SLUG = new Map(courses.map((c) => [c.slug, c]));
 
@@ -158,13 +185,107 @@ function DocBookmarkExplorer({ docBookmarks, onRemove }: DocBookmarkExplorerProp
   );
 }
 
+interface AuthoredCourseGridProps {
+  authoredCourses: AuthoredCourseBookmark[];
+  onRemove: (courseId: string, title: string) => void;
+}
+
+function AuthoredCourseGrid({ authoredCourses, onRemove }: AuthoredCourseGridProps) {
+  return (
+    <div className={styles.authoredCourseGrid}>
+      {authoredCourses.map((course) => (
+        <div key={course.id} className={styles.authoredCourseCard}>
+          <Link href={`/courses/${course.slug}`} className={styles.authoredCourseLink}>
+            <span className={styles.authoredCourseIcon}><CoursesIcon /></span>
+            <div className={styles.authoredCourseBody}>
+              <div className={styles.authoredCourseTitle}>{course.name}</div>
+              {course.description && (
+                <CourseDescriptionMarkdown text={course.description} className={styles.authoredCourseDesc} />
+              )}
+            </div>
+          </Link>
+          <button
+            type="button"
+            className={styles.fileRemoveBtn}
+            aria-label="Remove bookmark"
+            onClick={() => onRemove(course.id, course.name)}
+          >
+            <CloseIcon />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+interface AuthoredModuleBookmarkListProps {
+  authoredModules: AuthoredModuleBookmark[];
+  onRemove: (moduleId: string, title: string) => void;
+}
+
+// Flat list grouped by course_id, no folder collapse -- modules are flat
+// (no category tree), unlike DocBookmarkExplorer's nested folders.
+function AuthoredModuleBookmarkList({ authoredModules, onRemove }: AuthoredModuleBookmarkListProps) {
+  const groups = useMemo(() => {
+    const byCourse = new Map<string, AuthoredModuleBookmark[]>();
+    authoredModules.forEach((m) => {
+      if (!byCourse.has(m.course_id)) byCourse.set(m.course_id, []);
+      byCourse.get(m.course_id)!.push(m);
+    });
+    return Array.from(byCourse.values());
+  }, [authoredModules]);
+
+  return (
+    <div className={styles.explorer}>
+      <div className={styles.explorerBody}>
+        {groups.map((group) => (
+          <div key={group[0].course_id} className={styles.folder}>
+            <div className={styles.authoredModuleGroupTitle}>{group[0].courses?.name ?? 'Course'}</div>
+            <div className={styles.fileList}>
+              {group.map((m) => (
+                <div key={m.id} className={styles.fileRow}>
+                  <Link href={`/courses/${m.courses?.slug}/${m.slug}`} className={styles.fileLink}>
+                    <span className={styles.fileLinkIcon}><FileDocIcon /></span>
+                    <span className={styles.fileName}>{m.title}</span>
+                  </Link>
+                  <button
+                    type="button"
+                    className={styles.fileRemoveBtn}
+                    aria-label="Remove bookmark"
+                    onClick={() => onRemove(m.id, m.title)}
+                  >
+                    <CloseIcon />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function BookmarksContent(): React.JSX.Element {
   const { supabase, role, companyName } = useAuth();
   const { bookmarkedSlugs, isBookmarked, toggleBookmark, loading } = useBookmarks();
   const { bookmarks: docBookmarks, toggleDocBookmark, loading: docLoading } = useDocBookmarks();
+  const {
+    bookmarkedCourseIds: authoredCourseBookmarkIds,
+    toggleCourseBookmark: toggleAuthoredCourseBookmark,
+    loading: authoredCourseLoading,
+  } = useAuthoredCourseBookmarks();
+  const {
+    bookmarks: authoredModuleBookmarkRowsRaw,
+    toggleModuleBookmark: toggleAuthoredModuleBookmark,
+    loading: authoredModuleLoading,
+  } = useAuthoredModuleBookmarks();
+  const authoredModuleBookmarkRows = authoredModuleBookmarkRowsRaw as AuthoredModuleBookmarkRow[];
   const [accessRows, setAccessRows] = useState<CourseAccessRow[]>([]);
   const [companyAllowedSlugs, setCompanyAllowedSlugs] = useState<Set<string>>(new Set());
   const [pendingRemoval, setPendingRemoval] = useState<PendingRemoval | null>(null);
+  const [authoredCourses, setAuthoredCourses] = useState<AuthoredCourseBookmark[]>([]);
+  const [authoredModules, setAuthoredModules] = useState<AuthoredModuleBookmark[]>([]);
 
   useEffect(() => {
     trackEvent('bookmarks_page_view');
@@ -179,13 +300,38 @@ function BookmarksContent(): React.JSX.Element {
     fetchCompanyCourseAccessRows(supabase, companyName).then(setCompanyAllowedSlugs);
   }, [supabase, role, companyName]);
 
+  const authoredCourseIdsKey = Array.from(authoredCourseBookmarkIds).sort().join(',');
+  useEffect(() => {
+    const ids = authoredCourseIdsKey ? authoredCourseIdsKey.split(',') : [];
+    if (ids.length === 0) {
+      setAuthoredCourses([]);
+      return;
+    }
+    getCoursesByIds(supabase, ids).then(setAuthoredCourses);
+  }, [supabase, authoredCourseIdsKey]);
+
+  const authoredModuleIdsKey = authoredModuleBookmarkRows
+    .map((b) => b.module_id)
+    .sort()
+    .join(',');
+  useEffect(() => {
+    const ids = authoredModuleIdsKey ? authoredModuleIdsKey.split(',') : [];
+    if (ids.length === 0) {
+      setAuthoredModules([]);
+      return;
+    }
+    getCourseModulesByIdsWithCourse(supabase, ids).then(setAuthoredModules);
+  }, [supabase, authoredModuleIdsKey]);
+
   const bookmarkedCourses = withCourseAccess(hasCourseAccess, role, accessRows, companyAllowedSlugs).filter((course) =>
     bookmarkedSlugs.has(course.slug)
   );
 
-  const isLoading = loading || docLoading;
-  const hasAnyBookmarks = bookmarkedCourses.length > 0 || docBookmarks.length > 0;
-  const totalBookmarks = bookmarkedCourses.length + docBookmarks.length;
+  const isLoading = loading || docLoading || authoredCourseLoading || authoredModuleLoading;
+  const hasAnyBookmarks =
+    bookmarkedCourses.length > 0 || docBookmarks.length > 0 || authoredCourses.length > 0 || authoredModules.length > 0;
+  const totalBookmarks =
+    bookmarkedCourses.length + docBookmarks.length + authoredCourses.length + authoredModules.length;
 
   function handleToggleCourseBookmark(slug: string) {
     if (isBookmarked(slug)) {
@@ -200,13 +346,26 @@ function BookmarksContent(): React.JSX.Element {
     setPendingRemoval({ type: 'doc', docPath, title: title || docPath });
   }
 
+  function handleRemoveAuthoredCourseBookmark(courseId: string, title: string) {
+    setPendingRemoval({ type: 'authoredCourse', courseId, title });
+  }
+
+  function handleRemoveAuthoredModuleBookmark(moduleId: string, title: string) {
+    setPendingRemoval({ type: 'authoredModule', moduleId, title });
+  }
+
   function confirmRemoval() {
     if (!pendingRemoval) return;
     trackEvent('bookmark_remove_confirm', { type: pendingRemoval.type });
     if (pendingRemoval.type === 'course') {
       toggleBookmark(pendingRemoval.slug);
-    } else {
+    } else if (pendingRemoval.type === 'doc') {
       toggleDocBookmark(pendingRemoval.docPath);
+    } else if (pendingRemoval.type === 'authoredCourse') {
+      toggleAuthoredCourseBookmark(pendingRemoval.courseId);
+    } else {
+      const bookmarkRow = authoredModuleBookmarkRows.find((b) => b.module_id === pendingRemoval.moduleId);
+      toggleAuthoredModuleBookmark(pendingRemoval.moduleId, bookmarkRow?.course_id);
     }
     setPendingRemoval(null);
   }
@@ -257,6 +416,28 @@ function BookmarksContent(): React.JSX.Element {
                 <span className={styles.sectionCount}>{docBookmarks.length}</span>
               </div>
               <DocBookmarkExplorer docBookmarks={docBookmarks} onRemove={handleRemoveDocBookmark} />
+            </div>
+          )}
+
+          {authoredCourses.length > 0 && (
+            <div className={styles.section}>
+              <div className={styles.sectionHeader}>
+                <span className={styles.sectionHeaderIcon}><CoursesIcon /></span>
+                <h2 className={styles.sectionTitle}>My Courses</h2>
+                <span className={styles.sectionCount}>{authoredCourses.length}</span>
+              </div>
+              <AuthoredCourseGrid authoredCourses={authoredCourses} onRemove={handleRemoveAuthoredCourseBookmark} />
+            </div>
+          )}
+
+          {authoredModules.length > 0 && (
+            <div className={styles.section}>
+              <div className={styles.sectionHeader}>
+                <span className={styles.sectionHeaderIcon}><PagesIcon /></span>
+                <h2 className={styles.sectionTitle}>My Course Modules</h2>
+                <span className={styles.sectionCount}>{authoredModules.length}</span>
+              </div>
+              <AuthoredModuleBookmarkList authoredModules={authoredModules} onRemove={handleRemoveAuthoredModuleBookmark} />
             </div>
           )}
         </>

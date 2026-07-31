@@ -1,12 +1,14 @@
 'use client';
 
 import React, { useState } from 'react';
+import Link from 'next/link';
 import CourseSlidePanel from '@/components/CourseSlidePanel';
+import CourseDescriptionMarkdown from '@/components/CourseDescriptionMarkdown';
 import { getDocsOrigin } from '@sypher/auth-core/src/urls';
 import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
-interface CourseData {
+export interface CourseData {
   title: string;
   description: string;
   url: string;
@@ -19,6 +21,13 @@ interface CourseData {
   videoId?: string;
   topics?: string[];
   modules?: Array<{ label: string; topics: string[] }>;
+  // 'docs' (default) = the existing Docusaurus-course card behavior below,
+  // unchanged. 'authored' = a DB-backed course living at /courses/[slug] in
+  // this same app -- no separate marketing/preview step, and every one
+  // reaching this list is already RLS-confirmed accessible to this user, so
+  // it always renders as a direct link and never opens CourseSlidePanel
+  // (design note 5 -- no locked/upsell tile for authored courses in v1).
+  source?: 'docs' | 'authored';
 }
 
 interface CourseCardProps extends CourseData {
@@ -38,9 +47,24 @@ function DashboardCourseCard({
   videoId,
   topics,
   modules,
+  source = 'docs',
   onOpenPanel,
 }: CourseCardProps) {
-  const course = { title, description, url, gradient, icon, tag, isFree, slug, docsSlug, videoId, topics, modules };
+  const course = {
+    title,
+    description,
+    url,
+    gradient,
+    icon,
+    tag,
+    isFree,
+    slug,
+    docsSlug,
+    videoId,
+    topics,
+    modules,
+    source,
+  };
 
   const cardContent = (
     <>
@@ -52,7 +76,7 @@ function DashboardCourseCard({
       </div>
       <h3 className={styles.cardTitle}>{title}</h3>
       <p className={styles.cardDesc}>{description}</p>
-      {isFree && (
+      {source !== 'authored' && isFree && (
         <div className={styles.cardActions}>
           <a
             href={`${getDocsOrigin()}/docs/${docsSlug ?? slug}/`}
@@ -75,6 +99,20 @@ function DashboardCourseCard({
       )}
     </>
   );
+
+  if (source === 'authored') {
+    return (
+      <Link
+        href={url}
+        className={styles.cardLink}
+        onClick={() => trackEvent('course_card_click', { slug, is_free: isFree, source: 'authored' })}
+      >
+        <article className={styles.card} style={{ '--card-gradient': gradient } as React.CSSProperties}>
+          {cardContent}
+        </article>
+      </Link>
+    );
+  }
 
   if (isFree) {
     return (
@@ -125,6 +163,11 @@ export default function DashboardCourseListing({
   const [panelOpen, setPanelOpen] = useState(false);
 
   function handleOpenPanel(course: CourseData) {
+    // Belt-and-suspenders: DashboardCourseCard's 'authored' branch never
+    // calls this (it always renders as a direct Link instead), but guard
+    // here too -- authored courses have no curriculum-preview data for
+    // CourseSlidePanel to show (design note 5), so this must never open.
+    if (course.source === 'authored') return;
     trackEvent(trackingContext === 'home' ? 'home_course_card_click' : 'course_card_click', {
       slug: course.slug,
       is_free: course.isFree,
@@ -158,7 +201,7 @@ export default function DashboardCourseListing({
         {selectedCourse && (
           <div className={styles.panelContent}>
             <div className={styles.panelFixed}>
-              <p className={styles.panelDesc}>{selectedCourse.description}</p>
+              <CourseDescriptionMarkdown text={selectedCourse.description} className={styles.panelDesc} />
               <br />
               {selectedCourse.videoId && (
                 <div className={styles.videoWrapper}>

@@ -4162,6 +4162,81 @@ Notes:
 
 ---
 
+## Course authoring bookmarks (`authored_course_bookmarks`, `authored_module_bookmarks`) — apps/app
+
+Phase 10 of the Course Authoring feature (see plan above). Mirrors
+`bookmarks` / `doc_bookmarks`'s RLS shape — a user manages only their own
+rows, `for all using (auth.uid() = user_id) with check (auth.uid() =
+user_id)` — but follows `authored_course_access`'s keying convention (by
+`course_id`/`module_id`, not slug), matching the same structural separation
+from the docs-based course system established there.
+
+No denormalized `title` column, unlike `doc_bookmarks.title`: `module_id`
+here is a real FK into `course_modules`, so the title/course can always be
+joined live at read time rather than captured at bookmark-time and risking
+staleness on a module rename. `course_id` is still denormalized onto
+`authored_module_bookmarks` (matching `doc_bookmarks.course_slug`) purely so
+`/bookmarks` can group a user's module bookmarks by course without an extra
+join per row.
+
+```sql
+-- ============================================================
+-- AUTHORED_COURSE_BOOKMARKS / AUTHORED_MODULE_BOOKMARKS
+-- (Phase 10 -- mirrors bookmarks/doc_bookmarks' owner-only RLS, keyed by
+-- course_id/module_id per authored_course_access's convention)
+-- ============================================================
+
+create table if not exists public.authored_course_bookmarks (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  course_id uuid not null references public.courses(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  unique (user_id, course_id)
+);
+
+alter table public.authored_course_bookmarks enable row level security;
+
+drop policy if exists "manage own authored course bookmarks" on public.authored_course_bookmarks;
+create policy "manage own authored course bookmarks" on public.authored_course_bookmarks
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+create table if not exists public.authored_module_bookmarks (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  module_id uuid not null references public.course_modules(id) on delete cascade,
+  course_id uuid not null references public.courses(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  unique (user_id, module_id)
+);
+
+alter table public.authored_module_bookmarks enable row level security;
+
+drop policy if exists "manage own authored module bookmarks" on public.authored_module_bookmarks;
+create policy "manage own authored module bookmarks" on public.authored_module_bookmarks
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+notify pgrst, 'reload schema';
+```
+
+Notes:
+
+- `course_id` on `authored_module_bookmarks` is a plain denormalized column,
+  not derived via a join or trigger — the app is responsible for passing
+  the correct `course_id` alongside `module_id` on insert (same trust model
+  as `doc_bookmarks.course_slug`, which also has nothing enforcing
+  consistency with `doc_path`).
+- Not added to `supabase_realtime` — same as every table in the Course
+  Authoring section above.
+- Sanity-check owner-only RLS directly in the SQL editor before building any
+  UI on top, as two different signed-in test users:
+  ```sql
+  insert into public.authored_course_bookmarks (user_id, course_id)
+    values (auth.uid(), '<a real course id>');
+  select * from public.authored_course_bookmarks; -- only this user's own row
+  ```
+
+---
+
 ## Troubleshooting
 
 ### `ERROR: 42710: type "user_role" already exists`

@@ -2,6 +2,10 @@ import type { Metadata } from 'next';
 import { notFound, redirect } from 'next/navigation';
 import Link from 'next/link';
 import Footer from '@/components/Footer';
+import KeyboardDoubleArrowRightIcon from '@mui/icons-material/KeyboardDoubleArrowRight';
+import { CourseBookmarkButton } from '@/components/AuthoredBookmarkButton';
+import CourseDescriptionMarkdown from '@/components/CourseDescriptionMarkdown';
+import CourseShell from '@/components/CourseShell';
 import {
   getCachedPublishedCourseSlugs,
   getCachedCourseBySlug,
@@ -65,27 +69,48 @@ export default async function CourseHomePage({
   );
 
   return (
-    <div className={styles.page}>
-      <div className={styles.container}>
-        <div className={styles.header}>
-          <h1 className={styles.title}>{course.name}</h1>
-          {course.description && <p className={styles.description}>{course.description}</p>}
-        </div>
-        {contentModules.length === 0 ? (
-          <p className={styles.empty}>No modules published yet.</p>
-        ) : (
-          <ul className={styles.moduleList}>
-            {contentModules.map((m) => (
-              <li key={m.id} className={styles.moduleRow}>
-                <Link href={`/courses/${course.slug}/${m.slug}`} className={styles.moduleLink}>
-                  {m.title}
+    <CourseShell courseSlug={course.slug} courseName={course.name} modules={contentModules}>
+      <div className={styles.page}>
+        <div className={styles.container}>
+          <div className={styles.header}>
+            <div className={styles.titleRow}>
+              <h1 className={styles.title}>{course.name}</h1>
+              <CourseBookmarkButton courseId={course.id} />
+            </div>
+            {course.description && (
+              <CourseDescriptionMarkdown text={course.description} className={styles.description} />
+            )}
+          </div>
+          {contentModules.length === 0 ? (
+            <p className={styles.empty}>No modules published yet.</p>
+          ) : (
+            <>
+              <ul className={styles.moduleList}>
+                {contentModules.map((m) => (
+                  <li key={m.id} className={styles.moduleRow}>
+                    <Link href={`/courses/${course.slug}/${m.slug}`} className={styles.moduleLink}>
+                      {m.title}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+              <nav className={styles.pagination} aria-label="Course pagination">
+                <Link
+                  href={`/courses/${course.slug}/${contentModules[0].slug}`}
+                  className={styles.pageLink}
+                >
+                  <span className={styles.pageLabel}>
+                    Next
+                    <KeyboardDoubleArrowRightIcon className={styles.pageArrowIcon} />
+                  </span>
+                  <span className={styles.pageTitle}>{contentModules[0].title}</span>
                 </Link>
-              </li>
-            ))}
-          </ul>
-        )}
+              </nav>
+            </>
+          )}
+        </div>
+        <Footer />
       </div>
-      <Footer />
-    </div>
+    </CourseShell>
   );
 }
