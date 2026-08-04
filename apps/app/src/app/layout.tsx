@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Script from "next/script";
 import { Geist, Geist_Mono } from "next/font/google";
 import { AuthProvider } from "@/contexts/AuthContext";
 import Navbar from "@/components/Navbar";
@@ -49,13 +50,16 @@ export default function RootLayout({
       className={`${geistSans.variable} ${geistMono.variable}`}
       suppressHydrationWarning
     >
-      <head>
-        <script dangerouslySetInnerHTML={{ __html: SET_THEME_SCRIPT }} />
-      </head>
       <body>
         {/* next/script hoists beforeInteractive scripts into <head> itself
             regardless of where in the tree they're declared -- body is the
-            documented placement, not <head> directly. */}
+            documented placement, not <head> directly. A raw <script> tag
+            (previously used here) isn't guaranteed to execute outside the
+            initial SSR document, which is what the "script tag while
+            rendering" console warning was about. */}
+        <Script id="set-theme" strategy="beforeInteractive">
+          {SET_THEME_SCRIPT}
+        </Script>
         <AnalyticsBootstrap />
         <AuthProvider>
           <AnalyticsSession />

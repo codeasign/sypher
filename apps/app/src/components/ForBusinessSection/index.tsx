@@ -54,6 +54,7 @@ const links = [
     cta: 'Hire with Us',
     href: `${DOCS_ORIGIN}/hire-with-us`,
     icon: <BriefcaseIcon />,
+    shown: process.env.NAVBAR_SHOW_HIRE_WITH_US !== 'false',
   },
   {
     title: 'Running a team?',
@@ -61,13 +62,16 @@ const links = [
     cta: 'Team Access',
     href: `${DOCS_ORIGIN}/team-access`,
     icon: <UsersIcon />,
+    shown: process.env.NAVBAR_SHOW_TEAM_ACCESS !== 'false',
   },
-];
+].filter((link) => link.shown);
 
 // Slim B2B band for a different audience (hiring managers, company/team
 // admins) than the rest of the homepage's individual-learner funnel --
 // placed just above the footer so it doesn't interrupt that flow.
 export default function ForBusinessSection() {
+  if (links.length === 0) return null;
+
   return (
     <section className={styles.section}>
       <div className={styles.container}>

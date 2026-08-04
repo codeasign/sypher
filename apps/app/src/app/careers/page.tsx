@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import { redirect } from 'next/navigation';
 import JobList from '@/components/JobList';
 import { getCachedOpenJobPosts } from '@/data/jobPostsCached';
 import Footer from '@/components/Footer';
@@ -10,6 +11,12 @@ export const metadata: Metadata = {
 };
 
 export default async function CareersIndexPage() {
+  // Hiding the navbar link isn't enough -- a direct URL guess would still
+  // reach this page, so gate it on the same toggle.
+  if (process.env.NAVBAR_SHOW_CAREERS === 'false') {
+    redirect('/');
+  }
+
   const posts = await getCachedOpenJobPosts();
 
   return (

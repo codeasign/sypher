@@ -77,13 +77,48 @@ const DASHBOARD_ROUTE_PREFIXES = [
 // app.sypher) rather than next/link. Blog moved to this app in Phase 7, so
 // it's a same-origin next/link alongside Courses instead of living here.
 const DOCS_ORIGIN = getDocsOrigin();
+
+// Mirrors apps/docs' NAVBAR_SHOW_* toggles -- single source of truth is
+// apps/docs/.env, loaded into this app's build by next.config.ts's `env`
+// key (see comment there), so set the matching var to "false" in that one
+// file to hide an item here too. Inlined at build time, so this can't be a
+// runtime function reading process.env dynamically like docs' navbarShown().
+const NAVBAR_SHOW_EXPLORE_COURSES = process.env.NAVBAR_SHOW_EXPLORE_COURSES !== 'false';
+const NAVBAR_SHOW_BLOG = process.env.NAVBAR_SHOW_BLOG !== 'false';
+const NAVBAR_SHOW_CAREERS = process.env.NAVBAR_SHOW_CAREERS !== 'false';
+
 const NAV_LINKS = [
-  { key: 'corporate-training', href: `${DOCS_ORIGIN}/corporate-training`, label: 'Corporate Training' },
-  { key: 'resume-review', href: `${DOCS_ORIGIN}/resume-review`, label: 'Resume Review' },
-  { key: 'mock-interview', href: `${DOCS_ORIGIN}/mock-interview`, label: 'Mock Interview' },
-  { key: 'hire-with-us', href: `${DOCS_ORIGIN}/hire-with-us`, label: 'Hire with Us' },
-  { key: 'team-access', href: `${DOCS_ORIGIN}/team-access`, label: 'Team Access' },
-];
+  {
+    key: 'corporate-training',
+    href: `${DOCS_ORIGIN}/corporate-training`,
+    label: 'Corporate Training',
+    shown: process.env.NAVBAR_SHOW_CORPORATE_TRAINING !== 'false',
+  },
+  {
+    key: 'resume-review',
+    href: `${DOCS_ORIGIN}/resume-review`,
+    label: 'Resume Review',
+    shown: process.env.NAVBAR_SHOW_RESUME_REVIEW !== 'false',
+  },
+  {
+    key: 'mock-interview',
+    href: `${DOCS_ORIGIN}/mock-interview`,
+    label: 'Mock Interview',
+    shown: process.env.NAVBAR_SHOW_MOCK_INTERVIEW !== 'false',
+  },
+  {
+    key: 'hire-with-us',
+    href: `${DOCS_ORIGIN}/hire-with-us`,
+    label: 'Hire with Us',
+    shown: process.env.NAVBAR_SHOW_HIRE_WITH_US !== 'false',
+  },
+  {
+    key: 'team-access',
+    href: `${DOCS_ORIGIN}/team-access`,
+    label: 'Team Access',
+    shown: process.env.NAVBAR_SHOW_TEAM_ACCESS !== 'false',
+  },
+].filter((item) => item.shown);
 
 export default function Navbar() {
   const pathname = usePathname();
@@ -119,23 +154,29 @@ export default function Navbar() {
           that class is ignored and .links is always visible via media query.
         */}
         <nav className={mobileOpen ? `${styles.links} ${styles.linksOpen}` : styles.links}>
-          <a href={`${DOCS_ORIGIN}/courses`} className={styles.link}>
-            Explore Courses
-          </a>
-          <Link
-            href="/blog"
-            className={pathname === '/blog' ? `${styles.link} ${styles.linkActive}` : styles.link}
-            onClick={() => setMobileOpen(false)}
-          >
-            Blog
-          </Link>
-          <Link
-            href="/careers"
-            className={pathname === '/careers' ? `${styles.link} ${styles.linkActive}` : styles.link}
-            onClick={() => setMobileOpen(false)}
-          >
-            Careers
-          </Link>
+          {NAVBAR_SHOW_EXPLORE_COURSES && (
+            <a href={`${DOCS_ORIGIN}/courses`} className={styles.link}>
+              Explore Courses
+            </a>
+          )}
+          {NAVBAR_SHOW_BLOG && (
+            <Link
+              href="/blog"
+              className={pathname === '/blog' ? `${styles.link} ${styles.linkActive}` : styles.link}
+              onClick={() => setMobileOpen(false)}
+            >
+              Blog
+            </Link>
+          )}
+          {NAVBAR_SHOW_CAREERS && (
+            <Link
+              href="/careers"
+              className={pathname === '/careers' ? `${styles.link} ${styles.linkActive}` : styles.link}
+              onClick={() => setMobileOpen(false)}
+            >
+              Careers
+            </Link>
+          )}
           {NAV_LINKS.map((item) => (
             <a key={item.key} href={item.href} className={styles.link}>
               {item.label}

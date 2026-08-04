@@ -14,9 +14,13 @@ import ApproachSection from '@/components/ApproachSection';
 import ForBusinessSection from '@/components/ForBusinessSection';
 import Footer from '@/components/Footer';
 
+const SHOW_CAREER_SERVICES =
+  process.env.NAVBAR_SHOW_RESUME_REVIEW !== 'false' || process.env.NAVBAR_SHOW_MOCK_INTERVIEW !== 'false';
+
 const SITE_TITLE = 'Learn AI Engineering & System Design';
-const SITE_DESCRIPTION =
-  'Sypher is a hands-on learning platform for AI engineering, system design, Python, and software engineering. Text-first lessons with real projects, plus Resume Review and Mock Interview for Pro members.';
+const SITE_DESCRIPTION = SHOW_CAREER_SERVICES
+  ? 'Sypher is a hands-on learning platform for AI engineering, system design, Python, and software engineering. Text-first lessons with real projects, plus Resume Review and Mock Interview for Pro members.'
+  : 'Sypher is a hands-on learning platform for AI engineering, system design, Python, and software engineering. Text-first lessons with real projects.';
 
 export const metadata: Metadata = {
   title: SITE_TITLE,

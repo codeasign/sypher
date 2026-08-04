@@ -5,9 +5,9 @@ import { getAppOrigin } from '@sypher/auth-core/src/urls';
 
 const GA_MEASUREMENT_ID = process.env.GA_MEASUREMENT_ID ?? '';
 
-// Per-item navbar visibility toggles. Env var unset => item shows (default
-// behavior unchanged); set to the literal string "false" => item is hidden.
-const showNavItem = (envKey) => process.env[envKey] !== 'false';
+// Navbar items default to visible; set the matching NAVBAR_SHOW_* var to
+// the literal string "false" in .env to hide one.
+const navbarShown = (envVar) => process.env[envVar] !== 'false';
 
 // Renders straight into the generated HTML <head>, ahead of Docusaurus's own
 // bundle, so consent defaults to 'denied' (unless the visitor already chose
@@ -140,6 +140,14 @@ const config = {
     apiBaseUrl: process.env.API_BASE_URL ?? '',
     paidUpgradePriceInrPaise: process.env.PAID_UPGRADE_PRICE_INR_PAISE ?? '',
     paidUpgradeDurationDays: process.env.PAID_UPGRADE_DURATION_DAYS ?? '365',
+    // Standalone pages (src/pages/*.js) gate themselves on these -- a
+    // hidden navbar item still leaves its page reachable by direct URL
+    // otherwise.
+    navbarShowCorporateTraining: navbarShown('NAVBAR_SHOW_CORPORATE_TRAINING'),
+    navbarShowResumeReview: navbarShown('NAVBAR_SHOW_RESUME_REVIEW'),
+    navbarShowMockInterview: navbarShown('NAVBAR_SHOW_MOCK_INTERVIEW'),
+    navbarShowHireWithUs: navbarShown('NAVBAR_SHOW_HIRE_WITH_US'),
+    navbarShowTeamAccess: navbarShown('NAVBAR_SHOW_TEAM_ACCESS'),
   },
 
   presets: [
@@ -165,15 +173,15 @@ const config = {
       items: [
         // === TOPICS ===
         // Claude Code inserts new items here. Do not remove these markers.
-        showNavItem('NAVBAR_SHOW_EXPLORE_COURSES') && { type: 'custom-exploreCourses', position: 'left' },
+        navbarShown('NAVBAR_SHOW_EXPLORE_COURSES') && { type: 'custom-exploreCourses', position: 'left' },
         // === /TOPICS ===
-        showNavItem('NAVBAR_SHOW_BLOG') && { to: '/blog', label: 'Blog', position: 'left' },
-        showNavItem('NAVBAR_SHOW_CAREERS') && { href: `${getAppOrigin()}/careers`, label: 'Careers', position: 'left' },
-        showNavItem('NAVBAR_SHOW_CORPORATE_TRAINING') && { to: '/corporate-training', label: 'Corporate Training', position: 'left' },
-        showNavItem('NAVBAR_SHOW_RESUME_REVIEW') && { to: '/resume-review', label: 'Resume Review', position: 'left' },
-        showNavItem('NAVBAR_SHOW_MOCK_INTERVIEW') && { to: '/mock-interview', label: 'Mock Interview', position: 'left' },
-        showNavItem('NAVBAR_SHOW_HIRE_WITH_US') && { to: '/hire-with-us', label: 'Hire with Us', position: 'left' },
-        showNavItem('NAVBAR_SHOW_TEAM_ACCESS') && { to: '/team-access', label: 'Team Access', position: 'left' },
+        navbarShown('NAVBAR_SHOW_BLOG') && { to: '/blog', label: 'Blog', position: 'left' },
+        navbarShown('NAVBAR_SHOW_CAREERS') && { href: `${getAppOrigin()}/careers`, label: 'Careers', position: 'left' },
+        navbarShown('NAVBAR_SHOW_CORPORATE_TRAINING') && { to: '/corporate-training', label: 'Corporate Training', position: 'left' },
+        navbarShown('NAVBAR_SHOW_RESUME_REVIEW') && { to: '/resume-review', label: 'Resume Review', position: 'left' },
+        navbarShown('NAVBAR_SHOW_MOCK_INTERVIEW') && { to: '/mock-interview', label: 'Mock Interview', position: 'left' },
+        navbarShown('NAVBAR_SHOW_HIRE_WITH_US') && { to: '/hire-with-us', label: 'Hire with Us', position: 'left' },
+        navbarShown('NAVBAR_SHOW_TEAM_ACCESS') && { to: '/team-access', label: 'Team Access', position: 'left' },
         { type: 'custom-login', position: 'right' },
       ].filter(Boolean),
     },

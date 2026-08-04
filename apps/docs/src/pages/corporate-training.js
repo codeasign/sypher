@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import Link from '@docusaurus/Link';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
+import { Redirect } from '@docusaurus/router';
+import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import TrainingContactForm from '@site/src/components/TrainingContactForm';
 import styles from './corporate-training.module.css';
 
@@ -293,6 +295,12 @@ function ClosingBanner() {
 }
 
 export default function CorporateTraining() {
+  const { siteConfig } = useDocusaurusContext();
+  // Hiding the navbar link isn't enough -- a direct URL guess would still
+  // reach this page, so gate it on the same toggle.
+  if (!siteConfig.customFields.navbarShowCorporateTraining) {
+    return <Redirect to="/" />;
+  }
   return (
     <Layout
       title="Corporate Training"

@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import Link from '@docusaurus/Link';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
+import { Redirect } from '@docusaurus/router';
+import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import ResumeReviewContactForm from '@site/src/components/ResumeReviewContactForm';
 import FeatureGate from '@site/src/components/FeatureGate';
 import styles from './corporate-training.module.css';
@@ -299,6 +301,10 @@ function FaqContactSection() {
 }
 
 export default function ResumeReview() {
+  const { siteConfig } = useDocusaurusContext();
+  if (!siteConfig.customFields.navbarShowResumeReview) {
+    return <Redirect to="/" />;
+  }
   return (
     <Layout
       title="Resume Review"

@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import Link from '@docusaurus/Link';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
+import { Redirect } from '@docusaurus/router';
+import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import TeamAccessContactForm from '@site/src/components/TeamAccessContactForm';
 import styles from './corporate-training.module.css';
 
@@ -250,6 +252,10 @@ function FaqContactSection() {
 }
 
 export default function TeamAccess() {
+  const { siteConfig } = useDocusaurusContext();
+  if (!siteConfig.customFields.navbarShowTeamAccess) {
+    return <Redirect to="/" />;
+  }
   return (
     <Layout
       title="Team Access"

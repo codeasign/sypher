@@ -7,9 +7,9 @@ import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 const corporateLinks = [
-  { label: 'Corporate Training', href: '/corporate-training' },
-  { label: 'Resume Review', href: '/resume-review' },
-];
+  { label: 'Corporate Training', href: '/corporate-training', shown: process.env.NAVBAR_SHOW_CORPORATE_TRAINING !== 'false' },
+  { label: 'Resume Review', href: '/resume-review', shown: process.env.NAVBAR_SHOW_RESUME_REVIEW !== 'false' },
+].filter((link) => link.shown);
 
 const legalLinks = [
   { label: 'Privacy Policy', href: '/privacy-policy' },
@@ -36,22 +36,24 @@ export default function Footer(): React.JSX.Element | null {
             <p className={styles.brandTagline}>Learn by building</p>
           </div>
 
-          <nav className={styles.linkColumn} aria-label="Corporate">
-            <span className={styles.columnTitle}>Corporate</span>
-            <ul className={styles.linkList}>
-              {corporateLinks.map((link) => (
-                <li key={link.href}>
-                  <a
-                    href={`${getDocsOrigin()}${link.href}`}
-                    className={styles.link}
-                    onClick={() => trackEvent('footer_link_click', { label: link.label, destination: link.href })}
-                  >
-                    {link.label}
-                  </a>
-                </li>
-              ))}
-            </ul>
-          </nav>
+          {corporateLinks.length > 0 && (
+            <nav className={styles.linkColumn} aria-label="Corporate">
+              <span className={styles.columnTitle}>Corporate</span>
+              <ul className={styles.linkList}>
+                {corporateLinks.map((link) => (
+                  <li key={link.href}>
+                    <a
+                      href={`${getDocsOrigin()}${link.href}`}
+                      className={styles.link}
+                      onClick={() => trackEvent('footer_link_click', { label: link.label, destination: link.href })}
+                    >
+                      {link.label}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </nav>
+          )}
 
           <nav className={styles.linkColumn} aria-label="Legal">
             <span className={styles.columnTitle}>Legal</span>

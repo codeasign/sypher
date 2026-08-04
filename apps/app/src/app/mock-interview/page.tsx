@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useCallback, useEffect, useState } from 'react';
+import { redirect } from 'next/navigation';
 import DashboardLayout from '@/components/DashboardLayout';
 import { useAuth } from '@/contexts/AuthContext';
 import { useUpgradeToPaid } from '@/hooks/useUpgradeToPaid';
@@ -64,6 +65,14 @@ const TIER_ICON: Record<string, string> = {
 };
 
 export default function MockInterviewPage(): React.JSX.Element {
+  // Hiding the navbar link isn't enough -- a direct URL guess would still
+  // reach this page, so gate it on the same toggle. Value is a fixed
+  // build-time constant, so which branch runs never changes across
+  // renders and the hooks below stay in a consistent order.
+  if (process.env.NAVBAR_SHOW_MOCK_INTERVIEW === 'false') {
+    redirect('/');
+  }
+
   const paidUpgradePriceInrPaise = process.env.NEXT_PUBLIC_PAID_UPGRADE_PRICE_INR_PAISE;
 
   const { supabase, user, role } = useAuth();

@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import Link from '@docusaurus/Link';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
+import { Redirect } from '@docusaurus/router';
+import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import HireWithUsContactForm from '@site/src/components/HireWithUsContactForm';
 import styles from './corporate-training.module.css';
 
@@ -250,6 +252,10 @@ function FaqContactSection() {
 }
 
 export default function HireWithUs() {
+  const { siteConfig } = useDocusaurusContext();
+  if (!siteConfig.customFields.navbarShowHireWithUs) {
+    return <Redirect to="/" />;
+  }
   return (
     <Layout
       title="Hire with Us"

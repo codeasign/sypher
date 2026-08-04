@@ -9,6 +9,7 @@ const services = [
       "Get detailed, actionable feedback on your resume from people who've reviewed thousands of them — not a generic template checker.",
     href: `${getDocsOrigin()}/resume-review`,
     icon: 'resume',
+    shown: process.env.NAVBAR_SHOW_RESUME_REVIEW !== 'false',
   },
   {
     title: 'Mock Interview',
@@ -16,8 +17,9 @@ const services = [
       'Practice real technical interviews with experienced interviewers and walk away with a written report on what to fix before the real thing.',
     href: `${getDocsOrigin()}/mock-interview`,
     icon: 'interview',
+    shown: process.env.NAVBAR_SHOW_MOCK_INTERVIEW !== 'false',
   },
-];
+].filter((service) => service.shown);
 
 function ServiceIcon({ name }: { name: string }) {
   const icons: Record<string, ReactNode> = {
@@ -43,6 +45,8 @@ function ServiceIcon({ name }: { name: string }) {
 }
 
 export default function CareerServicesSection() {
+  if (services.length === 0) return null;
+
   return (
     <section className={styles.services}>
       <div className={styles.container}>
