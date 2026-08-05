@@ -25,9 +25,14 @@ const navbarEnv = Object.fromEntries(
   NAVBAR_SHOW_KEYS.map((key) => [key, docsEnv[key] ?? "true"])
 );
 
+// Same single-source-of-truth pattern as the navbar toggles above, but
+// defaults to "false" (opt-in) rather than "true" (opt-out).
+const SHOW_PLAN_ROLE = docsEnv.SHOW_PLAN_ROLE ?? "false";
+const SHOW_PERSONAL_DETAILS = docsEnv.SHOW_PERSONAL_DETAILS ?? "false";
+
 const nextConfig: NextConfig = {
   allowedDevOrigins: ['app.sypher.local'],
-  env: navbarEnv,
+  env: { ...navbarEnv, SHOW_PLAN_ROLE, SHOW_PERSONAL_DETAILS },
 };
 
 export default nextConfig;

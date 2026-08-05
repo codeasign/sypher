@@ -175,8 +175,13 @@ const config = {
         // Claude Code inserts new items here. Do not remove these markers.
         navbarShown('NAVBAR_SHOW_EXPLORE_COURSES') && { type: 'custom-exploreCourses', position: 'left' },
         // === /TOPICS ===
-        navbarShown('NAVBAR_SHOW_BLOG') && { to: '/blog', label: 'Blog', position: 'left' },
-        navbarShown('NAVBAR_SHOW_CAREERS') && { href: `${getAppOrigin()}/careers`, label: 'Careers', position: 'left' },
+        // `to` (not `href`) on purpose -- Docusaurus's NavbarNavLink only
+        // renders the external-link icon when `href` is set, but the
+        // underlying <Link> resolves external absolute URLs identically
+        // either way, so this keeps cross-app navigation working while
+        // matching the plain, icon-less look of every other navbar item.
+        navbarShown('NAVBAR_SHOW_BLOG') && { to: `${getAppOrigin()}/blog`, label: 'Blog', position: 'left' },
+        navbarShown('NAVBAR_SHOW_CAREERS') && { to: `${getAppOrigin()}/careers`, label: 'Careers', position: 'left' },
         navbarShown('NAVBAR_SHOW_CORPORATE_TRAINING') && { to: '/corporate-training', label: 'Corporate Training', position: 'left' },
         navbarShown('NAVBAR_SHOW_RESUME_REVIEW') && { to: '/resume-review', label: 'Resume Review', position: 'left' },
         navbarShown('NAVBAR_SHOW_MOCK_INTERVIEW') && { to: '/mock-interview', label: 'Mock Interview', position: 'left' },

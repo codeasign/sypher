@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { useAuth } from '@/contexts/AuthContext';
 import { WORK_MODE_LABEL } from '@/types/workMode';
 import { useShowMore } from '@/hooks/useShowMore';
-import styles from '@/components/CardGrid/styles.module.css';
+import styles from './styles.module.css';
 
 interface JobSummary {
   slug: string;
@@ -29,6 +29,17 @@ const EMPLOYMENT_TYPE_LABEL: Record<string, string> = {
 // a server/client hydration mismatch in this Client Component.
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// Deterministic per-company avatar color so the same company always gets the
+// same tint across renders/tabs, without needing a stored color field.
+function companyColor(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i += 1) {
+    hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  }
+  const hue = hash % 360;
+  return `hsl(${hue}, 58%, 42%)`;
 }
 
 // Seeds from the server-rendered `initialPosts`. On any job_posts change,
@@ -65,27 +76,45 @@ export default function JobList({ initialPosts }: { initialPosts: JobSummary[] }
 
   return (
     <>
-      <div className={styles.grid}>
+      <span className={styles.countLabel}>
+        {posts.length} open {posts.length === 1 ? 'role' : 'roles'}
+      </span>
+      <div className={styles.list}>
         {visible.map((post) => (
-          <Link key={post.slug} href={`/careers/${post.slug}`} className={styles.card}>
-            <div className={styles.cardBody}>
-              <h3 className={styles.cardTitle}>{post.title}</h3>
-              <p className={styles.cardSubtitle}>{post.company_name}</p>
-              <div className={styles.cardMeta}>
-                {post.location && <span className={styles.metaBadge}>{post.location}</span>}
+          <Link key={post.slug} href={`/careers/${post.slug}`} className={styles.row}>
+            <div className={styles.avatar} style={{ background: companyColor(post.company_name) }}>
+              {post.company_name.charAt(0).toUpperCase()}
+            </div>
+            <div className={styles.rowBody}>
+              <div className={styles.rowTop}>
+                <h3 className={styles.title}>{post.title}</h3>
+                <span className={styles.postedDate}>{formatDate(post.created_at)}</span>
+              </div>
+              <p className={styles.company}>
+                {post.company_name}
+                {post.location && (
+                  <>
+                    <span className={styles.companyDot}>&middot;</span>
+                    <span className={styles.location}>{post.location}</span>
+                  </>
+                )}
+              </p>
+              <div className={styles.badges}>
                 {post.employment_type && (
-                  <span className={styles.metaBadge}>
+                  <span className={styles.badge}>
                     {EMPLOYMENT_TYPE_LABEL[post.employment_type] ?? post.employment_type}
                   </span>
                 )}
                 {post.work_mode && (
-                  <span className={styles.metaBadge}>
+                  <span className={styles.badge}>
                     {WORK_MODE_LABEL[post.work_mode] ?? post.work_mode}
                   </span>
                 )}
               </div>
-              <span className={styles.cardDate}>{formatDate(post.created_at)}</span>
             </div>
+            <span className={styles.chevron} aria-hidden="true">
+              &rsaquo;
+            </span>
           </Link>
         ))}
       </div>

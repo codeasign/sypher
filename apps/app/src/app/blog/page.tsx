@@ -17,7 +17,8 @@ export default async function BlogIndexPage() {
       <div className={styles.page}>
         <div className={styles.container}>
           <div className={styles.pageHeader}>
-            <h1 className={styles.pageTitle}>Blog</h1>
+            <span className={styles.pageEyebrow}>The Blog</span>
+            <h1 className={styles.pageTitle}>Latest articles and updates</h1>
             <p className={styles.pageSubtitle}>Latest articles and updates from the Sypher team.</p>
           </div>
           <BlogList initialPosts={posts} />

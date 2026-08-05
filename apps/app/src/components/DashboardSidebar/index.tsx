@@ -58,6 +58,12 @@ const OVERVIEW_SECTION: NavSection = {
 
 const PROFILE_ITEM: NavItem = { href: '/profile', label: 'Profile', icon: ProfileIcon };
 
+// See apps/docs/.env's SHOW_PLAN_ROLE comment -- single source of truth is
+// that file, loaded into this app's build by next.config.ts's `env` key,
+// same mechanism as the NAVBAR_SHOW_* toggles. Opt-in (defaults to hidden),
+// unlike those toggles which default to shown.
+const SHOW_PLAN_ROLE = process.env.SHOW_PLAN_ROLE === 'true';
+
 export default function DashboardSidebar({
   user,
 }: DashboardSidebarProps): React.JSX.Element {
@@ -145,16 +151,18 @@ export default function DashboardSidebar({
           <div className={styles.userInfo}>
             <span className={styles.name}>{displayName}</span>
             <span className={styles.email}>{email}</span>
-            <div className={styles.badgeRow}>
-              {role && (
-                <span className={clsx(styles.roleBadge, styles[`role-${role}`])}>
-                  {getRoleLabel(role)}
+            {SHOW_PLAN_ROLE && (
+              <div className={styles.badgeRow}>
+                {role && (
+                  <span className={clsx(styles.roleBadge, styles[`role-${role}`])}>
+                    {getRoleLabel(role)}
+                  </span>
+                )}
+                <span className={clsx(styles.planBadge, isPaidAndActive ? styles.planPaid : styles.planFree)}>
+                  {isPaidAndActive ? 'Paid plan' : 'Free plan'}
                 </span>
-              )}
-              <span className={clsx(styles.planBadge, isPaidAndActive ? styles.planPaid : styles.planFree)}>
-                {isPaidAndActive ? 'Paid plan' : 'Free plan'}
-              </span>
-            </div>
+              </div>
+            )}
             {!isPaidAndActive && (
               <button
                 type="button"

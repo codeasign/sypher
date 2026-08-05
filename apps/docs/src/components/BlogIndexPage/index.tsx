@@ -12,18 +12,15 @@ interface PostSummary {
   coverImageUrl: string | null;
 }
 
-function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
-}
-
 export default function BlogIndexPage({ posts }: { posts: PostSummary[] }): JSX.Element {
   return (
     <Layout title="Blog" description="Latest articles from Sypher.">
       <div className={styles.page}>
         <div className={styles.container}>
           <div className={styles.pageHeader}>
+            <span className={styles.pageEyebrow}>The Blog</span>
             <Heading as="h1" className={styles.pageTitle}>
-              Blog
+              Latest articles and updates
             </Heading>
             <p className={styles.pageSubtitle}>Latest articles and updates from the Sypher team.</p>
           </div>
@@ -33,14 +30,7 @@ export default function BlogIndexPage({ posts }: { posts: PostSummary[] }): JSX.
             <div className={styles.grid}>
               {posts.map((post) => (
                 <Link key={post.slug} to={`/blog/${post.slug}`} className={styles.card}>
-                  {post.coverImageUrl && (
-                    <img src={post.coverImageUrl} alt={post.title} className={styles.cardImage} />
-                  )}
-                  <div className={styles.cardBody}>
-                    <h3 className={styles.cardTitle}>{post.title}</h3>
-                    <p className={styles.cardDescription}>{post.description}</p>
-                    {post.date && <span className={styles.cardDate}>{formatDate(post.date)}</span>}
-                  </div>
+                  <h3 className={styles.cardTitle}>{post.title}</h3>
                 </Link>
               ))}
             </div>

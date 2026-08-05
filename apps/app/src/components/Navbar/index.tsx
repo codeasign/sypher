@@ -54,7 +54,7 @@ function ColorModeToggle() {
 // logout links). Showing this public navbar on top of it would double up
 // on "Dashboard" links and the user avatar, so it's hidden there. Derived
 // from NAV_SECTIONS (the same source DashboardSidebar renders from) plus
-// the three top-level dashboard routes that aren't part of any section --
+// the top-level dashboard routes that aren't part of any section --
 // a hardcoded list here previously went stale every time a new sidebar
 // item (e.g. add-job-post, add-company-branding) was added. '/careers' is
 // excluded even though it's a NAV_SECTIONS entry: unlike every other item
@@ -65,6 +65,7 @@ const DASHBOARD_ROUTE_PREFIXES = [
   '/dashboard',
   '/profile',
   '/bookmarks',
+  '/getting-started',
   ...NAV_SECTIONS.flatMap((section) => section.items.map((item) => item.href)),
 ].filter((href) => !DASHBOARD_EXCLUDED_HREFS.has(href));
 

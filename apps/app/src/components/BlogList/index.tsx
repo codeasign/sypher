@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useAuth } from '@/contexts/AuthContext';
 import { useShowMore } from '@/hooks/useShowMore';
-import styles from '@/components/CardGrid/styles.module.css';
+import styles from './styles.module.css';
 
 interface PostSummary {
   slug: string;
@@ -14,13 +14,21 @@ interface PostSummary {
   cover_image_url: string | null;
 }
 
-// Explicit locale ('en-IN', matching profile/page.tsx's date formatting) --
-// `undefined` resolves to the runtime's default locale, which differs
-// between the server (Node's ICU default) and the browser (navigator
-// language), producing different text on each render and a hydration
-// mismatch in this Client Component.
+// Explicit locale -- undefined would let the runtime's default locale decide,
+// which differs between the server (build/render) and a visitor's browser
+// and would cause a hydration mismatch on first paint.
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// Deterministic per-post avatar color so the same title always gets the same
+// tint across renders/tabs, without needing a stored color field.
+function titleColor(title: string): string {
+  let hash = 0;
+  for (let i = 0; i < title.length; i += 1) {
+    hash = (hash * 31 + title.charCodeAt(i)) >>> 0;
+  }
+  return `hsl(${hash % 360}, 58%, 42%)`;
 }
 
 // Seeds from the server-rendered `initialPosts` (real SEO/link-preview
@@ -34,7 +42,6 @@ export default function BlogList({ initialPosts }: { initialPosts: PostSummary[]
 
   useEffect(() => {
     if (!supabase) return undefined;
-
     const channel = supabase
       .channel('blog_posts_public')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'blog_posts' }, () => {
@@ -43,10 +50,7 @@ export default function BlogList({ initialPosts }: { initialPosts: PostSummary[]
           .then((data) => setPosts(data));
       })
       .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    return () => { supabase.removeChannel(channel); };
   }, [supabase]);
 
   const { visible, hasMore, showAll } = useShowMore(posts);
@@ -57,18 +61,27 @@ export default function BlogList({ initialPosts }: { initialPosts: PostSummary[]
 
   return (
     <>
-      <div className={styles.grid}>
+      <span className={styles.countLabel}>
+        {posts.length} {posts.length === 1 ? 'post' : 'posts'}
+      </span>
+      <div className={styles.list}>
         {visible.map((post) => (
-          <Link key={post.slug} href={`/blog/${post.slug}`} className={styles.card}>
-            {post.cover_image_url && (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={post.cover_image_url} alt={post.title} className={styles.cardImage} />
-            )}
-            <div className={styles.cardBody}>
-              <h3 className={styles.cardTitle}>{post.title}</h3>
-              <p className={styles.cardDescription}>{post.description}</p>
-              {post.published_at && <span className={styles.cardDate}>{formatDate(post.published_at)}</span>}
+          <Link key={post.slug} href={`/blog/${post.slug}`} className={styles.row}>
+            <div className={styles.avatar} style={{ background: titleColor(post.title) }}>
+              {post.title.charAt(0).toUpperCase()}
             </div>
+            <div className={styles.rowBody}>
+              <div className={styles.rowTop}>
+                <h3 className={styles.title}>{post.title}</h3>
+                {post.published_at && (
+                  <span className={styles.postedDate}>{formatDate(post.published_at)}</span>
+                )}
+              </div>
+              {post.description && <p className={styles.description}>{post.description}</p>}
+            </div>
+            <span className={styles.chevron} aria-hidden="true">
+              &rsaquo;
+            </span>
           </Link>
         ))}
       </div>

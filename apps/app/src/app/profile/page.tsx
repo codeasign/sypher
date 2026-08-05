@@ -166,6 +166,10 @@ function LearnerProfileContent(): React.JSX.Element {
   } = useAuth();
   const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid('profile');
 
+  // Default false -- only the "About me" section shows unless the
+  // deployment opts in via apps/docs/.env's SHOW_PERSONAL_DETAILS.
+  const showPersonalDetails = process.env.SHOW_PERSONAL_DETAILS === 'true';
+
   useEffect(() => {
     trackEvent('profile_view');
   }, []);
@@ -588,6 +592,8 @@ function LearnerProfileContent(): React.JSX.Element {
               ) : null}
             </div>
 
+            {showPersonalDetails ? (
+              <>
             <div className={styles.sectionCard}>
               <SectionHeader label="Resume" expanded={expandedSections.resume} onToggle={() => toggleSection('resume')} />
               {expandedSections.resume ? (
@@ -1053,6 +1059,8 @@ function LearnerProfileContent(): React.JSX.Element {
                 </div>
               ) : null}
             </div>
+              </>
+            ) : null}
 
             <div className={styles.saveRow}>
               <button

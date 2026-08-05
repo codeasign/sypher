@@ -5,10 +5,7 @@ import Link from '@docusaurus/Link';
 // app.sypher); point this at the in-docs /courses page instead.
 export default function ExploreCoursesNavbarItem() {
   return (
-    <Link
-      to="/courses"
-      className="navbar__link explore-courses-link"
-    >
+    <Link to="/courses" className="navbar__link">
       Explore Courses
     </Link>
   );

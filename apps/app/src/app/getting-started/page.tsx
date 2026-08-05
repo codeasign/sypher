@@ -1,6 +1,6 @@
 import type { Metadata } from 'next';
 import { redirect } from 'next/navigation';
-import Footer from '@/components/Footer';
+import DashboardLayout from '@/components/DashboardLayout';
 import GettingStartedModuleList from '@/components/GettingStartedModuleList';
 import { getCachedGettingStartedModules } from '@/data/coursesCached';
 import { isSignedIn } from '@/lib/courseAccess';
@@ -29,7 +29,10 @@ export default async function GettingStartedPage() {
   const modules = (await getCachedGettingStartedModules()) as GettingStartedModule[];
 
   return (
-    <div className={styles.page}>
+    <DashboardLayout
+      title="Setup & Dependencies"
+      description="Find the guides for setting up the dependencies you need before starting your courses."
+    >
       <div className={styles.container}>
         <div className={styles.pageHeader}>
           <h1 className={styles.pageTitle}>Setup & Dependencies</h1>
@@ -40,7 +43,6 @@ export default async function GettingStartedPage() {
 
         <GettingStartedModuleList modules={modules} />
       </div>
-      <Footer />
-    </div>
+    </DashboardLayout>
   );
 }
