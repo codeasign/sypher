@@ -20,6 +20,8 @@ interface BlogPostArticleProps {
   content: string;
   coverImageUrl: string | null;
   date: string | null;
+  authorName?: string | null;
+  authorBio?: string | null;
   trackView?: boolean;
   showBackLink?: boolean;
 }
@@ -35,6 +37,8 @@ export default function BlogPostArticle({
   content,
   coverImageUrl,
   date,
+  authorName,
+  authorBio,
   trackView = true,
   showBackLink = true,
 }: BlogPostArticleProps): React.JSX.Element {
@@ -51,7 +55,11 @@ export default function BlogPostArticle({
       )}
       {coverImageUrl && <img src={coverImageUrl} alt={title} className={styles.coverImage} />}
       <h1 className={styles.title}>{title}</h1>
-      {date && <p className={styles.date}>{formatDate(date)}</p>}
+      {date && (
+        <p className={styles.date}>
+          <span className={styles.dateLabel}>Posted On:</span> {formatDate(date)}
+        </p>
+      )}
       <div className={styles.body}>
         <ReactMarkdown
           rehypePlugins={[rehypeRaw, [rehypeSanitize, schema]]}
@@ -60,6 +68,18 @@ export default function BlogPostArticle({
           {content}
         </ReactMarkdown>
       </div>
+      {authorBio && (
+        <div className={styles.authorCard}>
+          <div className={styles.authorMeta}>
+            <p className={styles.authorLabel}>Written by</p>
+            {authorName && <p className={styles.authorName}>{authorName}</p>}
+          </div>
+          <div className={styles.authorAbout}>
+            <p className={styles.authorLabel}>About author</p>
+            <p className={styles.authorBio}>{authorBio}</p>
+          </div>
+        </div>
+      )}
     </article>
   );
 }

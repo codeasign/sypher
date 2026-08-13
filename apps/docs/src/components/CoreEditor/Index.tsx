@@ -1,12 +1,15 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import Editor from '@monaco-editor/react';
-import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import { useColorMode } from '@docusaurus/theme-common';
 import { trackEvent } from '@site/src/lib/analytics';
+import { useAuth } from '@site/src/contexts/AuthContext';
+import { getAppOrigin } from '@sypher/auth-core/src/urls';
+import type { SupabaseClient } from '@supabase/supabase-js';
 
 interface TestCase {
   stdin: string;
   expectedOutput: string;
+  isSample?: boolean;
 }
 
 interface ProblemMeta {
@@ -34,79 +37,332 @@ interface CodeEditorProps {
   defaultLanguage?: string;
 }
 
+// Verified against RapidAPI's hosted Judge0 CE GET /languages (2026-08-06) --
+// every id below is confirmed to exist there. Six legacy keys that exercise
+// .mdx files still author (csharp_mono52, csharp_mono54, java8, python35,
+// python36, rust120) map to ids that don't exist on RapidAPI's instance
+// (they were only valid against the old self-hosted Docker image) and are
+// deliberately omitted here rather than left pointing at a dead id --
+// selecting one of those still-authored keys now fails cleanly with
+// "Missing languageId" (400) instead of a confusing upstream 502.
+// python311/c_gcc13/cpp_clang17/java21/csharp_dotnet8/javascript_node20/
+// typescript516/rust179/go122 were also removed: no exercise anywhere in the
+// codebase uses ProblemEditor/CodeEditor with those keys (search-algorithms/
+// sorting-algorithms, the courses they were provisioned for, don't use this
+// component), so they were dead entries.
 const LANGUAGE_IDS: Record<string, number> = {
-  python: 71, python27: 70, python36: 34, python35: 35,
-  javascript: 63, java: 62, java8: 27,
+  python: 71, python27: 70,
+  javascript: 63, java: 62,
   cpp: 54, cpp14: 52, cpp83: 53,
   c: 50, c_gcc8: 49, c_gcc7: 48,
-  csharp: 51, csharp_mono54: 16, csharp_mono52: 17,
-  go: 60, rust: 73, rust120: 42, typescript: 74,
-  // Search/Sorting Algorithms 9-language set. IDs are best-known placeholders
-  // against the public Judge0 CE demo instance — verify/update once the user's
-  // custom Judge0 docker image (exact versions: Python 3.11, GCC 13, Clang 17,
-  // Java 21, .NET 8, Node 20.10.0, TypeScript 5.1.6, Rust 1.79.0, Go 1.22) is live.
-  python311: 92, c_gcc13: 103, cpp_clang17: 76, java21: 91, csharp_dotnet8: 51,
-  javascript_node20: 97, typescript516: 94, rust179: 108, go122: 106,
+  csharp: 51,
+  go: 60, rust: 73, typescript: 74,
+  kotlin: 78,
 };
 
 const LANGUAGE_LABELS: Record<string, string> = {
   python: 'Python 3.8', python27: 'Python 2.7',
-  python36: 'Python 3.6', python35: 'Python 3.5',
   javascript: 'JavaScript (ECMA)',
-  java: 'Java (OpenJDK 13)', java8: 'Java 8 (OpenJDK 8)',
+  java: 'Java (OpenJDK 13)',
   cpp: 'C++ 17 (GCC 9.2)', cpp14: 'C++ 14 (GCC 7.4)', cpp83: 'C++ (GCC 8.3)',
   c: 'C (GCC 9.2)', c_gcc8: 'C (GCC 8.3)', c_gcc7: 'C (GCC 7.4)',
-  csharp: 'C# (Mono 6.6)', csharp_mono54: 'C# (Mono 5.4)',
-  csharp_mono52: 'C# (Mono 5.2)',
-  go: 'Go 1.13', rust: 'Rust 1.40', rust120: 'Rust 1.20',
+  csharp: 'C# (Mono 6.6)',
+  go: 'Go 1.13', rust: 'Rust 1.40',
   typescript: 'TypeScript 3.7',
-  python311: 'Python 3.11', c_gcc13: 'C (GCC 13)', cpp_clang17: 'C++ (Clang 17)',
-  java21: 'Java 21', csharp_dotnet8: 'C# / .NET 8',
-  javascript_node20: 'JavaScript (Node 20.10.0)', typescript516: 'TypeScript 5.1.6',
-  rust179: 'Rust 1.79.0', go122: 'Go 1.22',
+  kotlin: 'Kotlin 1.3',
 };
 
 const MONACO_LANGUAGES: Record<string, string> = {
-  python27: 'python', python36: 'python', python35: 'python',
-  java8: 'java',
+  python27: 'python',
   cpp14: 'cpp', cpp83: 'cpp',
   c: 'c', c_gcc8: 'c', c_gcc7: 'c',
-  csharp: 'csharp', csharp_mono54: 'csharp', csharp_mono52: 'csharp',
-  rust120: 'rust',
-  python311: 'python', c_gcc13: 'c', cpp_clang17: 'cpp', java21: 'java',
-  csharp_dotnet8: 'csharp', javascript_node20: 'javascript',
-  typescript516: 'typescript', rust179: 'rust', go122: 'go',
+  csharp: 'csharp',
 };
 
 const BASE_LANGUAGE: Record<string, string> = {
-  python27: 'python27', python36: 'python', python35: 'python',
-  java8: 'java', cpp14: 'cpp', cpp83: 'cpp',
+  python27: 'python27', cpp14: 'cpp', cpp83: 'cpp',
   c_gcc8: 'c', c_gcc7: 'c',
-  csharp_mono54: 'csharp', csharp_mono52: 'csharp',
-  rust120: 'rust',
 };
 
+// -1 is not a real Judge0 status id -- it's synthesized server-side by
+// judge0Client.ts's timedOut() for submissions that never finish polling
+// within the allotted attempts (see runBatchToCompletion). Mapped to the
+// same 'tle' bucket as Judge0's own native TLE (id 5) so both render with
+// the same yellow badge instead of this case falling through to the red
+// 'error' badge.
 const STATUS_MAP: Record<number, TestResult['status']> = {
-  3: 'accepted', 4: 'wrong_answer', 5: 'tle',
+  3: 'accepted', 4: 'wrong_answer', 5: 'tle', [-1]: 'tle',
 };
 
-async function pollSubmission(
-  token: string, baseUrl: string, authToken: string,
-  maxAttempts = 20, intervalMs = 800,
-): Promise<Record<string, unknown>> {
-  const headers: Record<string, string> = {};
-  if (authToken) headers['X-Auth-Token'] = authToken;
-  for (let i = 0; i < maxAttempts; i++) {
-    await new Promise((r) => setTimeout(r, intervalMs));
-    const res = await fetch(
-      `${baseUrl}/submissions/${token}?fields=status,stdout,stderr,compile_output,time,memory`,
-      { headers },
-    );
-    if (!res.ok) throw new Error(`Poll error: ${res.status}`);
-    const data = await res.json() as Record<string, unknown>;
-    if ((data.status as Record<string, number>)?.id > 2) return data;
+// Judge0 credentials never reach the browser -- CoreEditor calls apps/app's
+// /api/judge0/* proxy instead of Judge0/RapidAPI directly, authenticated
+// with this Supabase access token rather than a Judge0 auth header.
+async function getAuthToken(supabase: SupabaseClient | null): Promise<string | null> {
+  if (!supabase) return null;
+  const { data: { session } } = await supabase.auth.getSession();
+  return session?.access_token ?? null;
+}
+
+interface ProxyResult {
+  index: number;
+  statusId: number | undefined;
+  statusDescription: string;
+  stdout: string | null;
+  stderr: string | null;
+  compileOutput: string | null;
+  time: string | null;
+  memory: number | null;
+}
+
+interface ProxyCustomResult {
+  statusId: number | undefined;
+  statusDescription: string;
+  stdout: string | null;
+  stderr: string | null;
+  compileOutput: string | null;
+  time: string | null;
+  memory: number | null;
+}
+
+interface ProxyErrorBody {
+  error: string;
+  code?: string;
+  resetsAt?: string;
+}
+
+async function proxyErrorBody(res: Response): Promise<ProxyErrorBody> {
+  const body = await res.json().catch(() => null) as ProxyErrorBody | null;
+  return body ?? { error: `Request failed: ${res.status}` };
+}
+
+// The monthly-limit rejection carries a machine-readable code + resetsAt so
+// this can show a friendly message with the server's own reset date, rather
+// than the raw error string used for every other failure (compile errors,
+// the 10-min rate limit, etc).
+function friendlyErrorMessage(body: ProxyErrorBody): string {
+  if (body.code === 'monthly_limit_reached' && body.resetsAt) {
+    const resetDate = new Date(body.resetsAt).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+    return `Monthly limit reached, resets on ${resetDate}.`;
   }
-  throw new Error('Execution timed out');
+  return body.error;
+}
+
+interface MonthlyUsage {
+  isPaid: boolean;
+  limit: number | null;
+  remaining: number | null;
+  resetsAt: string | null;
+}
+
+interface SplitSource {
+  preamble: string;
+  body: string;
+}
+
+function consumeGoImportBlock(lines: string[], startIdx: number, preambleLines: string[]): number {
+  let i = startIdx;
+  while (i < lines.length) {
+    preambleLines.push(lines[i]);
+    // endsWith, not `=== ')'` -- a single-line grouped import like
+    // `import ("fmt")` has its closing paren on the SAME line as the
+    // opening one, so it would never match a lone-`)`-line check and this
+    // loop would run away, swallowing the rest of the source (including
+    // the harness's own main()) into the "preamble". endsWith still
+    // correctly matches the standard multi-line `import (\n "fmt"\n)`
+    // style too, since its closing line is just `)`, which also ends with
+    // `)`. Confirmed empirically via a real audit run, 2026-08.
+    const isEnd = lines[i].trim().endsWith(')');
+    i++;
+    if (isEnd) break;
+  }
+  return i;
+}
+
+// Pulls out whatever must stay at the literal top of the file: Go's
+// `package` line (+ its immediately-following import block/line, which is
+// the only truly positional requirement Go has), or generic leading
+// import/using/#include lines for every other language. No semicolon
+// requirement on the generic branch -- Kotlin's `import` has none.
+function extractPreamble(source: string): SplitSource {
+  const lines = source.split('\n');
+  let i = 0;
+
+  if (/^package\s+\w+\s*$/.test(lines[0] ?? '')) {
+    const preambleLines = [lines[0]];
+    i = 1;
+    while (i < lines.length && lines[i].trim() === '') i++;
+    if (/^import\s*\(/.test(lines[i] ?? '')) {
+      i = consumeGoImportBlock(lines, i, preambleLines);
+    } else if (/^import\s+"/.test(lines[i] ?? '')) {
+      preambleLines.push(lines[i]);
+      i++;
+    }
+    return { preamble: preambleLines.join('\n'), body: lines.slice(i).join('\n') };
+  }
+
+  // Student Go code has no `package` line of its own (only the harness
+  // carries one) but may still open directly with a parenthesized
+  // `import (...)` block -- Go-specific syntax no other supported language
+  // uses `import (` for, so it's safe to special-case ahead of the generic
+  // single-line-per-import branch below.
+  if (/^import\s*\(/.test(lines[0] ?? '')) {
+    const preambleLines: string[] = [];
+    i = consumeGoImportBlock(lines, 0, preambleLines);
+    return { preamble: preambleLines.join('\n'), body: lines.slice(i).join('\n') };
+  }
+
+  const isDirective = (line: string) => /^\s*(import\s|using\s|#include\b)/.test(line);
+  const preambleLines: string[] = [];
+  while (i < lines.length && (isDirective(lines[i]) || lines[i].trim() === '')) {
+    if (isDirective(lines[i])) preambleLines.push(lines[i]);
+    i++;
+  }
+  return { preamble: preambleLines.join('\n'), body: lines.slice(i).join('\n') };
+}
+
+// Go raises a hard compile error on two separate `import` declarations of
+// the same package ("fmt redeclared as imported package name"), unlike
+// Java/C#/Kotlin which tolerate duplicate imports harmlessly. Since the
+// harness's import block and the student's own imports are hoisted
+// independently in composeSourceCode, a student solution that imports a
+// package the harness already imports would hit this compile error --
+// confirmed empirically during the RapidAPI migration, 2026-08. Parse out
+// the package line + import paths so they can be merged with dedup instead
+// of concatenated.
+function parseGoPreamble(preamble: string): { packageLine: string; imports: string[] } {
+  const lines = preamble.split('\n');
+  const packageLine = lines.find((line) => /^package\s+\w+/.test(line)) ?? '';
+  const imports: string[] = [];
+  for (const line of lines) {
+    const single = line.match(/^import\s+"([^"]+)"/);
+    if (single) { imports.push(single[1]); continue; }
+    // Single-line grouped form: `import ("fmt")` (or, in principle,
+    // multiple packages on one line) -- distinct from both the bare
+    // `import "fmt"` case above and the multi-line block's own per-line
+    // `"fmt"` entries below. Missing this meant the import was silently
+    // dropped even after consumeGoImportBlock correctly bounded the
+    // preamble/body split, since this function never saw it as an import
+    // at all. Confirmed empirically via a real audit run, 2026-08.
+    const grouped = line.match(/^import\s*\(([^)]*)\)/);
+    if (grouped) {
+      const quoted = grouped[1].match(/"([^"]+)"/g) ?? [];
+      for (const q of quoted) imports.push(q.slice(1, -1));
+      continue;
+    }
+    const blockEntry = line.match(/^\s*"([^"]+)"\s*$/);
+    if (blockEntry) imports.push(blockEntry[1]);
+  }
+  return { packageLine, imports };
+}
+
+function composeGoPreamble(hPreamble: string, cPreamble: string): string {
+  const h = parseGoPreamble(hPreamble);
+  const c = parseGoPreamble(cPreamble);
+  const packageLine = h.packageLine || c.packageLine;
+  const imports = Array.from(new Set([...h.imports, ...c.imports]));
+  const importBlock = imports.length === 0
+    ? ''
+    : imports.length === 1
+      ? `import "${imports[0]}"`
+      : `import (\n${imports.map((p) => `    "${p}"`).join('\n')}\n)`;
+  return [packageLine, importBlock].filter((p) => p !== '').join('\n');
+}
+
+// Some harnesses (C/C++ linked-list/tree-node style problems) declare a
+// plain data type -- `struct ListNode { ... };` or `typedef struct {...}
+// Name;` -- that the STUDENT's own code references (e.g. `hasCycle(ListNode*
+// head)`), not one the student redeclares. Since composeSourceCode always
+// places the student's body before the harness's body (see below), that
+// type would be an incomplete/undeclared type from the student body's point
+// of view -- a real compile error in C/C++, confirmed empirically
+// (linked-list-cycle.mdx, 2026-08). Only a single leading struct/typedef-
+// struct block right at the top of the harness body is hoisted -- never a
+// `class`, since a C++ `class` is exactly the shape that would risk
+// reintroducing a harness/student duplicate-implementation shadow if hoisted
+// blindly, and this repo's harness-shadow fixes deliberately keep the
+// harness's own logic after the student's.
+function extractLeadingDataStruct(harnessBody: string, studentBody: string): SplitSource | null {
+  const lines = harnessBody.split('\n');
+  let i = 0;
+  while (i < lines.length && lines[i].trim() === '') i++;
+
+  const typedefMatch = /^typedef\s+struct\s*\{?\s*$/.test(lines[i] ?? '') || /^typedef\s+struct\s*\{/.test(lines[i] ?? '');
+  const namedMatch = /^struct\s+(\w+)\s*\{/.test(lines[i] ?? '');
+  if (!typedefMatch && !namedMatch) return null;
+
+  const startLine = i;
+  let depth = 0;
+  let sawOpenBrace = false;
+  for (; i < lines.length; i++) {
+    for (const ch of lines[i]) {
+      if (ch === '{') { depth++; sawOpenBrace = true; }
+      else if (ch === '}') depth--;
+    }
+    if (sawOpenBrace && depth === 0) break;
+  }
+  if (!sawOpenBrace || depth !== 0) return null;
+
+  // typedef form ends with `} Name;` on the same closing-brace line (or the next).
+  let endLine = i;
+  const structText = lines.slice(startLine, endLine + 1).join('\n');
+  if (typedefMatch && !/\}\s*\w+\s*;\s*$/.test(lines[endLine])) {
+    if (endLine + 1 < lines.length && /^\s*\w+\s*;\s*$/.test(lines[endLine + 1])) endLine++;
+  }
+  const fullStructText = lines.slice(startLine, endLine + 1).join('\n');
+
+  // Refuse to hoist a struct with access specifiers -- that's a C++ class
+  // wearing a struct keyword, exactly the shape the shadow fixes guard against.
+  if (/\b(public|private|protected)\s*:/.test(fullStructText)) return null;
+
+  const nameMatch = fullStructText.match(/^struct\s+(\w+)/) ?? fullStructText.match(/\}\s*(\w+)\s*;\s*$/);
+  const typeName = nameMatch?.[1];
+  // Require a `{` right after the name -- a genuine declaration, not just a
+  // reference like `struct ListNode* head` (which also matches `struct\s+Name`
+  // but isn't the student declaring the type themselves).
+  if (typeName && new RegExp(`\\b(class|struct)\\s+${typeName}\\s*\\{`).test(studentBody)) {
+    return null; // student already declares this type themselves -- not ours to hoist.
+  }
+
+  const rest = lines.slice(endLine + 1).join('\n');
+  return { preamble: fullStructText, body: rest };
+}
+
+// Composes the final Judge0 source. Harness must run AFTER the student's
+// code -- otherwise the harness's own top-level driver code (which calls
+// into the student's function/class) executes before that function/class
+// is defined, breaking any language without hoisting (Python: NameError;
+// confirmed empirically during the RapidAPI migration, 2026-08). But some
+// languages also require specific lines to stay at the literal file start
+// (Go's `package`; Java/C#/Kotlin's `import`/`using`; C/C++'s `#include`
+// and point-of-declaration `using namespace`) regardless of which side --
+// harness or student code -- they originated from. So: extract each side's
+// leading preamble first, hoist both to the true top, then place the
+// student's body before the harness's body.
+function composeSourceCode(harness: string, code: string, language?: string): string {
+  const h = extractPreamble(harness);
+  const c = extractPreamble(code);
+  const isGo = /^package\s+\w+/.test(h.preamble) || /^package\s+\w+/.test(c.preamble);
+  const preamble = isGo ? composeGoPreamble(h.preamble, c.preamble) : [h.preamble, c.preamble].filter((p) => p.trim() !== '').join('\n\n');
+
+  const hoisted = extractLeadingDataStruct(h.body, c.body);
+  const dataStructPreamble = hoisted?.preamble ?? '';
+  const harnessBody = hoisted?.body ?? h.body;
+
+  const composed = [preamble, dataStructPreamble, c.body, harnessBody].filter((p) => p.trim() !== '').join('\n\n');
+
+  // Judge0's `python` id runs 3.8.1, but starterCode across the course uses
+  // PEP 585 subscripted generics (`list[int]`, `dict[str, int]`, ...), only
+  // valid at runtime from 3.9 -- eagerly evaluating those annotations on 3.8
+  // raises `TypeError: 'type' object is not subscriptable` before any
+  // student logic runs, confirmed empirically 2026-08. `from __future__
+  // import annotations` (PEP 563, supported since 3.7) defers annotation
+  // evaluation to strings, sidestepping the crash. Must be the literal first
+  // line -- future imports are only legal before every other statement.
+  if (language === 'python') {
+    return `from __future__ import annotations\n${composed}`;
+  }
+
+  return composed;
 }
 
 function StatusBadge({ status, description }: { status: TestResult['status']; description: string }) {
@@ -149,6 +405,8 @@ const preStyle: React.CSSProperties = {
   fontSize: '0.78rem', lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
 };
 
+const HELP_DISMISSED_KEY = 'sypher-ide-help-dismissed';
+
 const textareaStyle: React.CSSProperties = {
   width: '100%', boxSizing: 'border-box', background: vars.bg, color: vars.text,
   border: `1px solid ${vars.border}`, borderRadius: 4, padding: '8px 10px',
@@ -157,16 +415,14 @@ const textareaStyle: React.CSSProperties = {
 };
 
 export default function CodeEditor({ meta, testCases, starterCode, harness, defaultLanguage = 'python' }: CodeEditorProps): JSX.Element {
-  const { siteConfig } = useDocusaurusContext();
-  const baseUrl = siteConfig.customFields.judge0BaseUrl as string;
-  const authToken = siteConfig.customFields.judge0AuthToken as string;
+  const { supabase, role } = useAuth();
 
   const { colorMode } = useColorMode();
   const monacoTheme = colorMode === 'dark' ? 'vs-dark' : 'vs-light';
 
   const [language, setLanguage] = useState(defaultLanguage);
   const [code, setCode] = useState(starterCode[defaultLanguage] ?? '');
-  const [running, setRunning] = useState(false);
+  const [runningKind, setRunningKind] = useState<'run' | 'submit' | null>(null);
   const [results, setResults] = useState<TestResult[]>([]);
   const [compileError, setCompileError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState(0);
@@ -178,6 +434,48 @@ export default function CodeEditor({ meta, testCases, starterCode, harness, defa
   const [customResult, setCustomResult] = useState<TestResult | null>(null);
   const [customRunning, setCustomRunning] = useState(false);
 
+  // Monthly Judge0 call quota (paid users only) -- always re-fetched from
+  // the server after Run/Submit/Run Custom, never decremented optimistically.
+  const [monthlyUsage, setMonthlyUsage] = useState<MonthlyUsage | null>(null);
+  const fetchMonthlyUsage = useCallback(async () => {
+    // Cheap client-side skip for the common free-user case -- not the
+    // authority. The server's own isPaid (which also checks paid_until)
+    // decides what actually renders.
+    if (role !== 'paid_users') {
+      setMonthlyUsage(null);
+      return;
+    }
+    const token = await getAuthToken(supabase);
+    if (!token) {
+      setMonthlyUsage(null);
+      return;
+    }
+    const res = await fetch(`${getAppOrigin()}/api/judge0/usage`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      setMonthlyUsage(null);
+      return;
+    }
+    setMonthlyUsage(await res.json() as MonthlyUsage);
+  }, [supabase, role]);
+  useEffect(() => {
+    fetchMonthlyUsage();
+  }, [fetchMonthlyUsage]);
+
+  // Starts hidden (matches SSR output, avoiding a hydration mismatch) and is
+  // revealed from an effect after mount, once localStorage is available --
+  // dismissal is global across every problem, not per-problem like the
+  // split-pane width in ProblemEditor.
+  const [showHelp, setShowHelp] = useState(false);
+  useEffect(() => {
+    if (!localStorage.getItem(HELP_DISMISSED_KEY)) setShowHelp(true);
+  }, []);
+  const dismissHelp = useCallback(() => {
+    setShowHelp(false);
+    localStorage.setItem(HELP_DISMISSED_KEY, '1');
+  }, []);
+
   const handleLanguageChange = useCallback((lang: string) => {
     trackEvent('coding_problem_language_change', { problem_id: meta.id, language: lang });
     setLanguage(lang);
@@ -187,44 +485,47 @@ export default function CodeEditor({ meta, testCases, starterCode, harness, defa
     setCustomResult(null);
   }, [starterCode, meta.id]);
 
-  const runAll = useCallback(async () => {
-    trackEvent('coding_problem_run_click', { problem_id: meta.id, language });
-    setRunning(true);
-    setResults(testCases.map((_, i) => ({ index: i, status: 'pending' as const, statusDescription: 'Running…', stdout: null, stderr: null, compileOutput: null, time: null, memory: null })));
+  const runTests = useCallback(async (kind: 'run' | 'submit') => {
+    trackEvent(kind === 'run' ? 'coding_problem_run_click' : 'coding_problem_submit_click', { problem_id: meta.id, language });
+
+    // Run sends only the isSample-tagged cases (always the problem's first
+    // N, but selected here by the flag rather than assumed position);
+    // Submit sends everything. originalIndex is kept so results map back
+    // onto the right entry in the full testCases array regardless of which
+    // subset was actually submitted.
+    const indexed = testCases.map((tc, i) => ({ tc, originalIndex: i }));
+    const selected = kind === 'run' ? indexed.filter((x) => x.tc.isSample) : indexed;
+
+    setRunningKind(kind);
+    setResults(selected.map((x) => ({ index: x.originalIndex, status: 'pending' as const, statusDescription: 'Running…', stdout: null, stderr: null, compileOutput: null, time: null, memory: null })));
     setCompileError(null);
     try {
+      const token = await getAuthToken(supabase);
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (authToken) headers['X-Auth-Token'] = authToken;
-      const res = await fetch(`${baseUrl}/submissions/batch?base64_encoded=false`, {
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const sourceCode = composeSourceCode(harness?.[BASE_LANGUAGE[language] ?? language] ?? '', code, language);
+      const res = await fetch(`${getAppOrigin()}/api/judge0/batch`, {
         method: 'POST', headers,
         body: JSON.stringify({
-          submissions: testCases.map((tc) => ({
-            source_code: (() => {
-              const h = harness?.[BASE_LANGUAGE[language] ?? language] ?? '';
-              return h ? h + '\n' + code : code;
-            })(), language_id: LANGUAGE_IDS[language],
-            stdin: tc.stdin, expected_output: tc.expectedOutput,
-            cpu_time_limit: meta.timeLimitSeconds, memory_limit: meta.memoryLimitKb,
-          })),
+          kind,
+          languageId: LANGUAGE_IDS[language],
+          sourceCode,
+          testCases: selected.map((x) => ({ stdin: x.tc.stdin, expectedOutput: x.tc.expectedOutput })),
+          cpuTimeLimit: meta.timeLimitSeconds,
+          memoryLimit: meta.memoryLimitKb,
         }),
       });
-      if (!res.ok) throw new Error(`Submit failed: ${res.status}`);
-      const tokens = await res.json() as Array<{ token: string }>;
-      const settled = await Promise.all(tokens.map(async ({ token }, i) => {
-        try {
-          const data = await pollSubmission(token, baseUrl, authToken);
-          const statusId = (data.status as Record<string, number>)?.id;
-          const compileOut = data.compile_output as string | null;
-          if (compileOut) return { index: i, status: 'error' as const, statusDescription: 'Compilation Error', stdout: null, stderr: null, compileOutput: compileOut, time: null, memory: null };
-          return { index: i, status: STATUS_MAP[statusId] ?? 'error', statusDescription: (data.status as Record<string, string>)?.description ?? 'Unknown', stdout: data.stdout as string | null, stderr: data.stderr as string | null, compileOutput: null, time: data.time as string | null, memory: data.memory as number | null };
-        } catch (err) {
-          return { index: i, status: 'error' as const, statusDescription: err instanceof Error ? err.message : 'Error', stdout: null, stderr: null, compileOutput: null, time: null, memory: null };
-        }
-      }));
+      if (!res.ok) throw new Error(friendlyErrorMessage(await proxyErrorBody(res)));
+      const { results: proxyResults } = await res.json() as { results: ProxyResult[]; cached: boolean };
+      const settled: TestResult[] = proxyResults.map((r, k) => {
+        const originalIndex = selected[k].originalIndex;
+        if (r.compileOutput) return { index: originalIndex, status: 'error' as const, statusDescription: 'Compilation Error', stdout: null, stderr: null, compileOutput: r.compileOutput, time: null, memory: null };
+        return { index: originalIndex, status: STATUS_MAP[r.statusId ?? -1] ?? 'error', statusDescription: r.statusDescription, stdout: r.stdout, stderr: r.stderr, compileOutput: null, time: r.time, memory: r.memory };
+      });
       const firstCompile = settled.find((r) => r.compileOutput);
       if (firstCompile) setCompileError(firstCompile.compileOutput ?? null);
       setResults(settled);
-      trackEvent('coding_problem_run_result', {
+      trackEvent(kind === 'run' ? 'coding_problem_run_result' : 'coding_problem_submit_result', {
         problem_id: meta.id,
         language,
         passed: settled.filter((r) => r.status === 'accepted').length,
@@ -234,78 +535,108 @@ export default function CodeEditor({ meta, testCases, starterCode, harness, defa
       setCompileError(err instanceof Error ? err.message : 'Unknown error');
       setResults([]);
     } finally {
-      setRunning(false);
+      setRunningKind(null);
+      fetchMonthlyUsage();
     }
-  }, [code, language, testCases, meta, baseUrl, authToken]);
+  }, [code, language, testCases, meta, supabase, fetchMonthlyUsage]);
 
   const runCustom = useCallback(async () => {
     trackEvent('coding_problem_run_custom_click', { problem_id: meta.id, language });
     setCustomRunning(true);
     setCustomResult(null);
     try {
+      const token = await getAuthToken(supabase);
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (authToken) headers['X-Auth-Token'] = authToken;
-      const sourceCode = (() => {
-        const h = harness?.[BASE_LANGUAGE[language] ?? language] ?? '';
-        return h ? h + '\n' + code : code;
-      })();
-      const res = await fetch(`${baseUrl}/submissions?base64_encoded=false`, {
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const sourceCode = composeSourceCode(harness?.[BASE_LANGUAGE[language] ?? language] ?? '', code, language);
+      const res = await fetch(`${getAppOrigin()}/api/judge0/custom`, {
         method: 'POST', headers,
         body: JSON.stringify({
-          source_code: sourceCode,
-          language_id: LANGUAGE_IDS[language],
+          languageId: LANGUAGE_IDS[language],
+          sourceCode,
           stdin: customInput,
-          expected_output: customExpected || undefined,
-          cpu_time_limit: meta.timeLimitSeconds,
-          memory_limit: meta.memoryLimitKb,
+          expectedOutput: customExpected || undefined,
+          cpuTimeLimit: meta.timeLimitSeconds,
+          memoryLimit: meta.memoryLimitKb,
         }),
       });
-      if (!res.ok) throw new Error(`Submit failed: ${res.status}`);
-      const { token } = await res.json() as { token: string };
-      const data = await pollSubmission(token, baseUrl, authToken);
-      const statusId = (data.status as Record<string, number>)?.id;
-      const compileOut = data.compile_output as string | null;
-      if (compileOut) {
-        setCustomResult({ index: -1, status: 'error', statusDescription: 'Compilation Error', stdout: null, stderr: null, compileOutput: compileOut, time: null, memory: null });
+      if (!res.ok) throw new Error(friendlyErrorMessage(await proxyErrorBody(res)));
+      const r = await res.json() as ProxyCustomResult;
+      if (r.compileOutput) {
+        setCustomResult({ index: -1, status: 'error', statusDescription: 'Compilation Error', stdout: null, stderr: null, compileOutput: r.compileOutput, time: null, memory: null });
         return;
       }
       setCustomResult({
         index: -1,
-        status: STATUS_MAP[statusId] ?? 'error',
-        statusDescription: (data.status as Record<string, string>)?.description ?? 'Unknown',
-        stdout: data.stdout as string | null,
-        stderr: data.stderr as string | null,
+        status: STATUS_MAP[r.statusId ?? -1] ?? 'error',
+        statusDescription: r.statusDescription,
+        stdout: r.stdout,
+        stderr: r.stderr,
         compileOutput: null,
-        time: data.time as string | null,
-        memory: data.memory as number | null,
+        time: r.time,
+        memory: r.memory,
       });
     } catch (err) {
       setCustomResult({ index: -1, status: 'error', statusDescription: err instanceof Error ? err.message : 'Error', stdout: null, stderr: null, compileOutput: null, time: null, memory: null });
     } finally {
       setCustomRunning(false);
+      fetchMonthlyUsage();
     }
-  }, [code, language, meta, baseUrl, authToken, customInput, customExpected]);
+  }, [code, language, meta, supabase, customInput, customExpected, fetchMonthlyUsage]);
 
+  const sampleCount = testCases.filter((tc) => tc.isSample).length;
   const passed = results.filter((r) => r.status === 'accepted').length;
-  const total = testCases.length;
+  const total = results.length;
   const allPassed = results.length > 0 && passed === total;
+  const running = runningKind !== null;
 
   return (
     <div style={{ border: `1px solid ${vars.border}`, borderRadius: 8, overflow: 'hidden', marginBottom: 24, display: 'flex', flexDirection: 'column', height: '100%' }}>
+      {/* Dismissable "how to use this IDE" banner */}
+      {showHelp && (
+        <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '10px 12px', background: 'var(--ifm-color-primary-contrast-background)', borderBottom: `1px solid ${vars.border}`, flexShrink: 0 }}>
+          <span style={{ fontSize: '1rem', lineHeight: 1.4 }}>💡</span>
+          <div style={{ flex: 1, fontSize: '0.78rem', lineHeight: 1.5, color: vars.text }}>
+            <strong>How to use this IDE:</strong> Write your solution in the editor below.{' '}
+            <strong>▶ Run</strong> checks it against a couple of sample cases, and{' '}
+            <strong>⬆ Submit</strong> grades it against the full test suite. Switch languages from the
+            dropdown, and try your own input under the <strong>Console</strong> tab.
+          </div>
+          <button onClick={dismissHelp} aria-label="Dismiss"
+            style={{ background: 'transparent', border: 'none', color: vars.textMuted, fontSize: '1rem', lineHeight: 1, cursor: 'pointer', padding: 2, flexShrink: 0 }}>
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* Toolbar */}
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '8px 12px', background: vars.surface, borderBottom: `1px solid ${vars.border}`, flexShrink: 0 }}>
         <select value={language} onChange={(e) => handleLanguageChange(e.target.value)}
           style={{ background: vars.bg, color: vars.text, border: `1px solid ${vars.border}`, borderRadius: 4, padding: '4px 8px', fontSize: '0.82rem', cursor: 'pointer' }}>
           {Object.keys(starterCode).map((lang) => <option key={lang} value={lang}>{LANGUAGE_LABELS[lang] ?? lang}</option>)}
         </select>
-        {results.length > 0 && (
+        {running && (
+          <span style={{ fontSize: '0.8rem', fontWeight: 700, color: vars.textMuted }}>
+            ⏳ Running…
+          </span>
+        )}
+        {!running && results.length > 0 && (
           <span style={{ fontSize: '0.8rem', fontWeight: 700, color: allPassed ? vars.green : vars.red }}>
             {passed}/{total} passed
           </span>
         )}
-        <button onClick={runAll} disabled={running}
-          style={{ marginLeft: 'auto', background: running ? vars.borderStrong : vars.accent, color: '#fff', border: 'none', borderRadius: 4, padding: '6px 16px', fontSize: '0.82rem', fontWeight: 700, cursor: running ? 'not-allowed' : 'pointer' }}>
-          {running ? 'Running…' : `▶ Run (${total} tests)`}
+        {monthlyUsage?.isPaid && monthlyUsage.remaining !== null && (
+          <span style={{ fontSize: '0.75rem', color: vars.textMuted }}>
+            {monthlyUsage.remaining} call{monthlyUsage.remaining === 1 ? '' : 's'} left this month
+          </span>
+        )}
+        <button onClick={() => runTests('run')} disabled={running}
+          style={{ marginLeft: 'auto', background: runningKind === 'run' ? vars.borderStrong : vars.accent, color: '#fff', border: 'none', borderRadius: 4, padding: '6px 16px', fontSize: '0.82rem', fontWeight: 700, cursor: running ? 'not-allowed' : 'pointer' }}>
+          {runningKind === 'run' ? 'Running…' : `▶ Run (${sampleCount} samples)`}
+        </button>
+        <button onClick={() => runTests('submit')} disabled={running}
+          style={{ background: runningKind === 'submit' ? vars.borderStrong : vars.accent, color: '#fff', border: 'none', borderRadius: 4, padding: '6px 16px', fontSize: '0.82rem', fontWeight: 700, cursor: running ? 'not-allowed' : 'pointer' }}>
+          {runningKind === 'submit' ? 'Running…' : `⬆ Submit (${testCases.length} tests)`}
         </button>
       </div>
 
@@ -416,7 +747,7 @@ export default function CodeEditor({ meta, testCases, starterCode, harness, defa
               )}
               {results.length === 0 && !compileError && (
                 <div style={{ color: vars.textMuted, fontSize: '0.75rem', padding: '12px 0', textAlign: 'center' }}>
-                  Click <strong>▶ Run</strong> to test your code against the predefined test cases
+                  Click <strong>▶ Run</strong> or <strong>⬆ Submit</strong> to test your code against the test cases
                 </div>
               )}
               {results.length > 0 && !compileError && (
@@ -438,8 +769,11 @@ export default function CodeEditor({ meta, testCases, starterCode, harness, defa
                         {results[activeTab].memory && <span style={{ color: vars.textLabel, marginLeft: 8 }}>{((results[activeTab].memory ?? 0) / 1024).toFixed(1)} MB</span>}
                       </div>
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-                        <div><div style={{ color: vars.textLabel, marginBottom: 2, fontSize: '0.7rem' }}>Input</div><pre style={{ ...preStyle, fontSize: '0.72rem', maxHeight: 60, overflow: 'auto' }}>{testCases[activeTab]?.stdin ?? ''}</pre></div>
-                        <div><div style={{ color: vars.textLabel, marginBottom: 2, fontSize: '0.7rem' }}>Expected</div><pre style={{ ...preStyle, fontSize: '0.72rem', maxHeight: 60, overflow: 'auto' }}>{testCases[activeTab]?.expectedOutput ?? ''}</pre></div>
+                        {/* Looked up by the result's original testCases index, not
+                            tab position -- Run only submits the isSample subset,
+                            so those two don't always coincide. */}
+                        <div><div style={{ color: vars.textLabel, marginBottom: 2, fontSize: '0.7rem' }}>Input</div><pre style={{ ...preStyle, fontSize: '0.72rem', maxHeight: 60, overflow: 'auto' }}>{testCases[results[activeTab].index]?.stdin ?? ''}</pre></div>
+                        <div><div style={{ color: vars.textLabel, marginBottom: 2, fontSize: '0.7rem' }}>Expected</div><pre style={{ ...preStyle, fontSize: '0.72rem', maxHeight: 60, overflow: 'auto' }}>{testCases[results[activeTab].index]?.expectedOutput ?? ''}</pre></div>
                       </div>
                       {results[activeTab].stdout !== null && (
                         <div style={{ marginTop: 6 }}>

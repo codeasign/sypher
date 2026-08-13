@@ -72,20 +72,22 @@ function PlusIcon(): React.JSX.Element {
 const MANAGE_BLOG_POSTS_KEY = 'manageBlogPosts';
 
 function ManageBlogContent(): React.JSX.Element {
-  const { supabase } = useAuth();
+  const { supabase, user, role } = useAuth();
   const { mutate } = useSWRConfig();
   const [pendingDelete, setPendingDelete] = useState<BlogPostSummary | null>(null);
   const [mode, setMode] = useState<'list' | 'new' | 'edit'>('list');
   const [editingPost, setEditingPost] = useState<BlogPostFull | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // Admins manage the whole blog; everyone else only sees what they authored.
+  const authorId = role === 'admin' ? undefined : user?.id;
   const swrKey = supabase ? MANAGE_BLOG_POSTS_KEY : null;
   const {
     data: posts = [],
     isLoading: loading,
     error: swrError,
     mutate: refetch,
-  } = useSWR<BlogPostSummary[]>(swrKey, () => listBlogPosts(supabase));
+  } = useSWR<BlogPostSummary[]>(swrKey, () => listBlogPosts(supabase, authorId));
   const error =
     actionError ??
     (!supabase

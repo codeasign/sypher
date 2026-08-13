@@ -87,6 +87,7 @@ const DOCS_ORIGIN = getDocsOrigin();
 const NAVBAR_SHOW_EXPLORE_COURSES = process.env.NAVBAR_SHOW_EXPLORE_COURSES !== 'false';
 const NAVBAR_SHOW_BLOG = process.env.NAVBAR_SHOW_BLOG !== 'false';
 const NAVBAR_SHOW_CAREERS = process.env.NAVBAR_SHOW_CAREERS !== 'false';
+const NAVBAR_SHOW_COHORTS = process.env.NAVBAR_SHOW_COHORTS !== 'false';
 
 const NAV_LINKS = [
   {
@@ -176,6 +177,15 @@ export default function Navbar() {
               onClick={() => setMobileOpen(false)}
             >
               Careers
+            </Link>
+          )}
+          {NAVBAR_SHOW_COHORTS && (
+            <Link
+              href="/cohorts"
+              className={pathname === '/cohorts' ? `${styles.link} ${styles.linkActive}` : styles.link}
+              onClick={() => setMobileOpen(false)}
+            >
+              Cohorts
             </Link>
           )}
           {NAV_LINKS.map((item) => (

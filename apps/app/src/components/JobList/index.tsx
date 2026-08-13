@@ -88,7 +88,7 @@ export default function JobList({ initialPosts }: { initialPosts: JobSummary[] }
             <div className={styles.rowBody}>
               <div className={styles.rowTop}>
                 <h3 className={styles.title}>{post.title}</h3>
-                <span className={styles.postedDate}>{formatDate(post.created_at)}</span>
+                <span className={styles.postedDate}>Posted on: {formatDate(post.created_at)}</span>
               </div>
               <p className={styles.company}>
                 {post.company_name}

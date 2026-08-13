@@ -425,8 +425,13 @@ $$;
 create policy "anyone can read published posts" on public.blog_posts
   for select using (status = 'published');
 
-create policy "authorized roles manage blog posts" on public.blog_posts
-  for all using (public.can_manage_blog()) with check (public.can_manage_blog());
+-- Admins manage every post; non-admin editors granted manage-blog-post
+-- access only see/manage what they personally authored (see "Blog posts —
+-- restrict /manage-blog to own posts" below for the standalone migration).
+create policy "authorized roles manage own blog posts" on public.blog_posts
+  for all
+  using (public.can_manage_blog() and (public.is_admin() or author_id = auth.uid()))
+  with check (public.can_manage_blog() and (public.is_admin() or author_id = auth.uid()));
 
 -- lets scripts/watch-blog-posts.mjs (npm run dev / npm run start) receive
 -- live postgres_changes events and re-bake blog-content/ without a
@@ -1184,6 +1189,76 @@ begin
     alter publication supabase_realtime add table public.blog_posts;
   end if;
 end $$;
+
+notify pgrst, 'reload schema';
+```
+
+---
+
+## Blog posts — restrict `/manage-blog` to own posts (non-admins)
+
+`/manage-blog` used to show every post to anyone with `manage-blog-post`
+access, regardless of who wrote it. Now: admins still see and manage every
+post; everyone else only sees and can manage posts where `author_id` is
+their own `auth.uid()`. Published posts remain publicly readable via the
+separate `anyone can read published posts` policy — this only tightens the
+`for all` (select/insert/update/delete) policy non-admin editors use to
+manage posts, so a non-admin can no longer see or touch another author's
+drafts, or delete/edit another author's published post, through this page.
+Idempotent, safe to re-run.
+
+```sql
+drop policy if exists "authorized roles manage blog posts" on public.blog_posts;
+create policy "authorized roles manage own blog posts" on public.blog_posts
+  for all
+  using (public.can_manage_blog() and (public.is_admin() or author_id = auth.uid()))
+  with check (public.can_manage_blog() and (public.is_admin() or author_id = auth.uid()));
+
+notify pgrst, 'reload schema';
+```
+
+---
+
+## Blog posts — author "About me" on the public post page
+
+Shows the post author's name and `bio` ("About Me", from
+[Editable profile fields](#editable-profile-fields-name--bio--current-status--notice-period--looking-for--education-status--resume--social-links))
+under the article on `/blog/:slug`. The public blog page reads with an
+**anon** client (see `blogPostsCached.ts`), and `profiles` RLS only allows
+reading your own row or, if you're an admin, everyone's — an anon client
+can't read any profile row directly. Rather than loosening that (which
+would expose every column, including email), this adds a `security definer`
+function that returns only `full_name` and `bio` for a post's author, and
+only for a post that's actually published. Idempotent, safe to re-run.
+
+```sql
+create or replace function public.get_published_blog_post_with_author(p_slug text)
+returns table (
+  id uuid,
+  slug text,
+  title text,
+  description text,
+  content text,
+  cover_image_url text,
+  published_at timestamptz,
+  author_full_name text,
+  author_bio text
+)
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select
+    bp.id, bp.slug, bp.title, bp.description, bp.content, bp.cover_image_url, bp.published_at,
+    p.full_name as author_full_name,
+    p.bio as author_bio
+  from public.blog_posts bp
+  left join public.profiles p on p.id = bp.author_id
+  where bp.slug = p_slug and bp.status = 'published';
+$$;
+
+grant execute on function public.get_published_blog_post_with_author(text) to anon, authenticated;
 
 notify pgrst, 'reload schema';
 ```
@@ -4234,6 +4309,485 @@ Notes:
     values (auth.uid(), '<a real course id>');
   select * from public.authored_course_bookmarks; -- only this user's own row
   ```
+
+---
+
+## Judge0 submission result cache
+
+Backs the code-execution proxy in `apps/app/src/app/api/judge0/` (RapidAPI
+Judge0 CE migration, replacing the old self-hosted Hetzner box that
+`apps/docs`'s `CoreEditor` used to call directly from the browser). Only
+`/api/judge0/batch` reads/writes this table — `/api/judge0/custom` (ad-hoc
+custom-input runs) is never cached, since user-typed input is one-off by
+definition.
+
+```sql
+create table if not exists public.judge0_submission_cache (
+  cache_key text primary key,
+  result jsonb not null,
+  created_at timestamptz not null default now()
+);
+
+alter table public.judge0_submission_cache enable row level security;
+-- deliberately no select/insert/update policy for anon/authenticated --
+-- only the service-role client (judge0Cache.ts) touches this table,
+-- bypassing RLS. Mirrors public.cron_runs.
+
+notify pgrst, 'reload schema';
+```
+
+`cache_key` is `sha256(languageId + harness-composed sourceCode + JSON({stdin,
+expectedOutput}[]))` — computed in `apps/app/src/lib/judge0Cache.ts`. Including
+`expectedOutput` (not just `stdin`) means editing a problem's expected output
+correctly invalidates any previously-cached verdict for that problem. Results
+that include a timeout entry are never cached, so an infra hiccup doesn't get
+memorized as a deterministic verdict. No TTL/expiry in v1 (see the SQL file's
+header comment).
+
+---
+
+## Judge0 monthly call limit (paid users)
+
+A separate, independent cap from both the per-10-minute rolling rate limits
+(`apps/app/src/lib/rateLimit.ts`) and the result cache above — this one
+tracks a paid user's total Judge0 calls across a calendar month, covering
+Run, Submit, and the ad-hoc Custom-Input run alike, since all three cost
+RapidAPI money regardless of which button triggered them. Backs
+`apps/app/src/lib/judge0MonthlyLimit.ts`, used by `/api/judge0/batch`
+(regardless of `kind`), `/api/judge0/custom`, and the read-only
+`/api/judge0/usage` (sourced by `apps/docs`'s `CoreEditor` to display "N
+calls left this month").
+
+```sql
+create table if not exists public.judge0_monthly_submissions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists judge0_monthly_submissions_user_month_idx
+  on public.judge0_monthly_submissions (user_id, created_at);
+
+alter table public.judge0_monthly_submissions enable row level security;
+-- deliberately no select/insert/update policy for anon/authenticated --
+-- only the service-role client (judge0MonthlyLimit.ts) touches this table,
+-- bypassing RLS. Mirrors judge0_submission_cache / cron_runs.
+
+create or replace function public.judge0_month_start()
+returns timestamptz
+language sql
+stable
+as $$
+  select date_trunc('month', now());
+$$;
+
+create or replace function public.judge0_monthly_status(p_user_id uuid, p_limit integer)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+stable
+as $$
+declare
+  v_month_start timestamptz := public.judge0_month_start();
+  v_used integer;
+begin
+  select count(*) into v_used
+    from public.judge0_monthly_submissions
+    where user_id = p_user_id and created_at >= v_month_start;
+
+  return jsonb_build_object(
+    'limit', p_limit,
+    'used', v_used,
+    'remaining', greatest(p_limit - v_used, 0),
+    'resetsAt', v_month_start + interval '1 month'
+  );
+end;
+$$;
+
+revoke execute on function public.judge0_monthly_status(uuid, integer) from public;
+revoke execute on function public.judge0_monthly_status(uuid, integer) from anon;
+revoke execute on function public.judge0_monthly_status(uuid, integer) from authenticated;
+grant execute on function public.judge0_monthly_status(uuid, integer) to service_role;
+
+notify pgrst, 'reload schema';
+```
+
+**Derivation, not decrement:** "remaining" is always computed as
+`p_limit - count(rows where created_at >= judge0_month_start())`, so the
+limit resets automatically at each calendar-month boundary with zero cron
+job or manual reset — a new month simply has zero rows yet. `p_limit` comes
+from `apps/app`'s `JUDGE0_MONTHLY_LIMIT_PAID` env var on every call, never
+stored or hardcoded in Postgres, matching `rate_limit_check`'s shape
+(`p_key, p_limit, p_window_ms`) rather than `get_feature_status`'s
+DB-configured-default shape.
+
+**One row per call, not per test case** — a Submit against 40 test cases
+still only inserts one row, same unit-of-work the 10-minute rate limiter
+already uses (`judge0:${kind}:${user.id}` is incremented once per POST,
+not once per test case).
+
+**Only a real verdict counts.** A row is inserted only after Judge0 returns
+a genuine result — never for a `Judge0UpstreamError` (RapidAPI 5xx/timeout)
+and never when `judge0Client.ts`'s own polling-timeout sentinel
+(`status.id === -1`, `timedOut()`) fires instead of a real status. This is
+a deliberate, product-confirmed choice: a request that never reached Judge0
+shouldn't cost the user their quota. The pre-flight check (before calling
+Judge0) and the post-verdict insert are consequently two separate steps
+rather than one atomic operation — a user racing two tabs/buttons could in
+theory squeeze one extra call past the cap in a tight window. Accepted
+tradeoff in exchange for not needing a reserve/refund RPC; the existing
+10-minute rate limits already bound the practical damage.
+
+**Fails open** on a missing/invalid `JUDGE0_MONTHLY_LIMIT_PAID` — logs via
+`console.error` and lets the call through ungated, same philosophy as
+`rateLimit.ts`.
+
+---
+
+## Manage Employees (company_hr self-service — `/manage-employees`)
+
+Adds a self-service page for the `company_hr` role: she can invite new employees by
+email (same magic-link mechanism the admin CSV flow already uses), deactivate/reactivate
+existing ones, and control course access **per employee email** rather than company-wide.
+Reuses `can_manage_company_content(company_name, item_key)` (already used for
+`job_posts`/`company_branding`, see [Company HR — job posts &
+branding](#company-hr--job-posts--branding)) with a new `item_key`: `'manage-employees'`
+— no seed row is needed in `nav_access`, same rule as every other item: an admin grants
+`company_hr` access to it from `/manage-access`'s Nav Access tab after this ships.
+
+**Behavior change:** `company_course_access` previously granted a course to *every*
+`company_employees` user at that company automatically. From this migration onward, it's
+a **pool** — the set of courses HR is allowed to assign — and actual access is granted
+only via the new per-employee `employee_course_access` table. The backfill below
+grandfathers every company's *current* blanket access into explicit per-employee rows so
+nobody active loses access the moment this ships; going forward, a newly-granted
+company-wide course needs HR (or admin) to explicitly assign it per employee. This is
+called out directly in the `/manage-access` Companies tab UI (both the tab-level note and
+the Course Access modal's description) so it isn't a silent surprise.
+
+Deactivating an employee (`hr_set_employee_active(email, false)`) also revokes her
+`employee_course_access` rows — a deactivated employee shouldn't retain course access.
+Reactivating does **not** restore them; HR must re-grant access explicitly, which is the
+safer default (mirrors requiring a fresh decision rather than assuming yesterday's grant
+still applies).
+
+`profiles` deliberately gets **no** new RLS policy here (see `update_own_profile`'s own
+reasoning: a broad `for update` policy would let HR set `role` on a target row, not just
+the intended field) — employee lifecycle goes through the narrow `hr_list_employees` /
+`hr_set_employee_active` RPCs instead, each independently re-checking
+`can_manage_company_content` and scoping every write to `role = 'company_employees'` rows
+in the caller's own company. `pending_invites` (new-employee invite) and
+`employee_course_access` (course grants) get plain declarative RLS instead, since neither
+can be used to mutate an existing account the way a `profiles` update could.
+
+```sql
+-- 1. pending_invites: let any role granted 'manage-employees' nav access invite NEW
+--    company_employees under her own company. Existing "admins manage pending invites"
+--    (for all using is_admin()) is untouched and still co-exists.
+drop policy if exists "authorized roles invite own company employees" on public.pending_invites;
+create policy "authorized roles invite own company employees" on public.pending_invites
+  for insert
+  with check (
+    role = 'company_employees'
+    and public.can_manage_company_content(company_name, 'manage-employees')
+  );
+
+drop policy if exists "authorized roles view own company pending invites" on public.pending_invites;
+create policy "authorized roles view own company pending invites" on public.pending_invites
+  for select
+  using (public.can_manage_company_content(company_name, 'manage-employees'));
+
+drop policy if exists "authorized roles revoke own company pending invites" on public.pending_invites;
+create policy "authorized roles revoke own company pending invites" on public.pending_invites
+  for delete
+  using (public.can_manage_company_content(company_name, 'manage-employees'));
+
+-- 2. employee_course_access: per-employee (by email) course grants. Presence = allowed,
+--    same convention as company_course_access. Bounded to (a) a course already in the
+--    company's admin-granted pool and (b) an actual active company_employees profile --
+--    admin bypasses both bounds via is_admin(), same escape hatch used elsewhere.
+create table if not exists public.employee_course_access (
+  company_name text not null,
+  employee_email text not null,
+  course_slug text not null,
+  updated_at timestamptz not null default now(),
+  primary key (company_name, employee_email, course_slug)
+);
+
+alter table public.employee_course_access enable row level security;
+
+drop policy if exists "anyone can read employee course access" on public.employee_course_access;
+create policy "anyone can read employee course access" on public.employee_course_access
+  for select using (true);
+
+-- security-definer helper, same reasoning as is_admin()/can_manage_company_content():
+-- a raw `exists (select 1 from public.profiles ...)` INSIDE the employee_course_access
+-- policy below would be evaluated under the CALLER's own restricted view of profiles
+-- (HR can only SELECT her own row -- see "read own profile" policy -- there is no
+-- broad profiles-read grant for company_hr, by design), so it would silently find
+-- zero rows for any employee who isn't the caller herself and reject every real
+-- grant. security definer bypasses that, exactly like is_admin() bypasses it for the
+-- "is this caller an admin" check. Confirmed empirically: without this fix, granting
+-- course access to an actual employee was unconditionally rejected by RLS.
+create or replace function public.is_active_company_employee(p_email text, p_company_name text)
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (
+    select 1 from public.profiles p
+    where p.company_name = p_company_name
+      and lower(p.email) = lower(p_email)
+      and p.role = 'company_employees'
+      and p.deleted_at is null
+  );
+$$;
+
+drop policy if exists "authorized roles manage own company employee course access" on public.employee_course_access;
+create policy "authorized roles manage own company employee course access" on public.employee_course_access
+  for all
+  using (public.can_manage_company_content(company_name, 'manage-employees'))
+  with check (
+    public.can_manage_company_content(company_name, 'manage-employees')
+    and (
+      public.is_admin()
+      or (
+        exists (
+          select 1 from public.company_course_access cca
+          where cca.company_name = employee_course_access.company_name
+            and cca.course_slug = employee_course_access.course_slug
+        )
+        and public.is_active_company_employee(employee_course_access.employee_email, employee_course_access.company_name)
+      )
+    )
+  );
+
+-- 3. Narrow RPCs for employee lifecycle (no direct profiles RLS grant -- see rationale above)
+
+create or replace function public.hr_list_employees()
+returns table (email text, full_name text, confirmed_at timestamptz, created_at timestamptz, deleted_at timestamptz)
+language plpgsql
+security definer
+set search_path = public
+as $hr_list_employees$
+declare
+  v_company text;
+begin
+  select company_name into v_company from public.profiles where id = auth.uid();
+  -- No "v_company is null" short-circuit: can_manage_company_content already
+  -- returns true for an admin caller regardless of the p_company_name argument
+  -- (its first branch checks the caller's own role, not p_company_name) -- an
+  -- early null-check here would incorrectly block admin, whose own profile
+  -- typically has no company_name at all.
+  if not public.can_manage_company_content(v_company, 'manage-employees') then
+    raise exception 'Not authorized';
+  end if;
+  return query
+    select p.email, p.full_name, p.confirmed_at, p.created_at, p.deleted_at
+    from public.profiles p
+    where p.company_name = v_company and p.role = 'company_employees'
+    order by p.created_at desc;
+end;
+$hr_list_employees$;
+revoke execute on function public.hr_list_employees() from public;
+grant execute on function public.hr_list_employees() to authenticated;
+
+-- Deactivating also revokes her employee_course_access rows -- a deactivated employee
+-- shouldn't retain course access. Reactivating does NOT restore them (safer default --
+-- HR must make a fresh decision, not silently inherit a stale grant).
+create or replace function public.hr_set_employee_active(p_email text, p_active boolean)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $hr_set_employee_active$
+declare
+  v_company text;
+  v_updated int;
+begin
+  select company_name into v_company from public.profiles where id = auth.uid();
+  -- No "v_company is null" short-circuit: can_manage_company_content already
+  -- returns true for an admin caller regardless of the p_company_name argument
+  -- (its first branch checks the caller's own role, not p_company_name) -- an
+  -- early null-check here would incorrectly block admin, whose own profile
+  -- typically has no company_name at all.
+  if not public.can_manage_company_content(v_company, 'manage-employees') then
+    raise exception 'Not authorized';
+  end if;
+  update public.profiles
+    set deleted_at = case when p_active then null else now() end
+    where lower(email) = lower(p_email)
+      and company_name = v_company
+      and role = 'company_employees';
+  get diagnostics v_updated = row_count;
+  if v_updated = 0 then
+    raise exception 'Employee not found in your company';
+  end if;
+  if not p_active then
+    delete from public.employee_course_access
+      where company_name = v_company and lower(employee_email) = lower(p_email);
+  end if;
+end;
+$hr_set_employee_active$;
+revoke execute on function public.hr_set_employee_active(text, boolean) from public;
+grant execute on function public.hr_set_employee_active(text, boolean) to authenticated;
+
+-- 4. check_course_access: company_employees branch now checks employee_course_access
+--    (per-employee) instead of company_course_access (blanket). company_course_access
+--    is still read elsewhere (the pool HR assigns from) but no longer directly grants.
+create or replace function public.check_course_access(p_course_slug text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $check_course_access$
+declare
+  v_role public.user_role;
+  v_company text;
+  v_email text;
+  v_allowed_roles public.user_role[];
+begin
+  if auth.uid() is null then
+    return false;
+  end if;
+
+  select role, company_name, email into v_role, v_company, v_email
+  from public.profiles where id = auth.uid();
+
+  if v_role = 'admin' then
+    return true;
+  end if;
+
+  select allowed_roles into v_allowed_roles
+  from public.course_access where course_slug = p_course_slug;
+
+  if v_role is null then
+    return coalesce('free_users' = any(v_allowed_roles), false);
+  end if;
+
+  if coalesce(v_role = any(v_allowed_roles), false) then
+    return true;
+  end if;
+
+  if v_role = 'company_employees' and v_company is not null and v_email is not null then
+    return exists (
+      select 1 from public.employee_course_access
+      where company_name = v_company and lower(employee_email) = lower(v_email) and course_slug = p_course_slug
+    );
+  end if;
+
+  return false;
+end;
+$check_course_access$;
+
+-- 5. Backfill: grandfather existing blanket company access into explicit per-employee
+--    rows so nobody currently active loses access the moment this ships.
+insert into public.employee_course_access (company_name, employee_email, course_slug)
+select cca.company_name, lower(p.email), cca.course_slug
+from public.company_course_access cca
+join public.profiles p
+  on p.company_name = cca.company_name and p.role = 'company_employees' and p.deleted_at is null
+on conflict (company_name, employee_email, course_slug) do nothing;
+
+notify pgrst, 'reload schema';
+```
+
+---
+
+## Cohorts (`cohorts`, admin-only — sidebar "Launch Cohort", public `/cohorts`)
+
+Adds scheduled/live-run cohorts: admin creates and manages them from `/launch-cohort`
+(sidebar), the public site lists live ones as cards at `/cohorts` with a detail page at
+`/cohorts/[slug]`, cached the same way `/blog` and `/careers` already are
+(`unstable_cache` + tag + `revalidate: 3600` TTL safety net, plus an auth-gated
+revalidate route the admin's own save/publish calls directly, plus a public
+rate-limited live-refresh route a Realtime subscription calls on any table change).
+
+Admin-only (no per-company scoping, unlike `job_posts`/`company_branding`), so
+`can_manage_cohorts()` mirrors `can_manage_blog()`'s shape, not
+`can_manage_company_content()`'s. It's `security definer`, so its entire body — both the
+`profiles` lookup (`p.id = auth.uid()`) and the `nav_access` lookup — runs under the
+function owner's privileges, bypassing RLS on both tables regardless of the caller's own
+visibility. This is *not* the same shape as the bug that hit
+`is_active_company_employee` (see [Manage Employees](#manage-employees-company_hr-self-service--manage-employees)) —
+that was a raw `exists (...)` written directly inside a table's `WITH CHECK` clause
+(runs as the calling user), not a call to its own `security definer` function.
+Independently, `nav_access`'s own RLS is already `for select to authenticated using
+(true)` (see section 5 above) — unrestricted for any authenticated caller, not row-scoped
+like `profiles` — so even a hypothetical non-`security definer` read of `nav_access`
+would still resolve correctly regardless of caller.
+
+`seats_total` is stored and displayed but intentionally **not enforced** in this pass —
+there's no `cohort_signups` table counting confirmed interest-form submissions against
+it, so nothing blocks a signup once a cohort is "full." Known future gap, not an
+oversight: enforcing capacity would need a signups table and a check in the interest-form
+submit path.
+
+No `nav_access` seed row needed — same rule as every other item.
+
+```sql
+create table if not exists public.cohorts (
+  id uuid primary key default gen_random_uuid(),
+  slug text unique not null,
+  title text not null check (char_length(title) <= 80),
+  description text not null check (char_length(description) <= 120),
+  content text not null default '',
+  cover_image_url text,
+  start_date date,
+  duration_weeks integer,
+  seats_total integer,
+  price_label text,
+  status text not null default 'draft' check (status in ('draft', 'live', 'closed')),
+  created_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.cohorts enable row level security;
+
+create or replace function public.can_manage_cohorts()
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $cmc$
+  select exists (
+    select 1 from public.profiles p
+    where p.id = auth.uid()
+      and (
+        p.role = 'admin'
+        or p.role::text = any(
+          select unnest(allowed_roles)::text from public.nav_access
+          where item_key = 'launch-cohort'
+        )
+      )
+  );
+$cmc$;
+
+drop policy if exists "anyone can read live cohorts" on public.cohorts;
+create policy "anyone can read live cohorts" on public.cohorts
+  for select using (status = 'live');
+
+drop policy if exists "authorized roles manage cohorts" on public.cohorts;
+create policy "authorized roles manage cohorts" on public.cohorts
+  for all using (public.can_manage_cohorts()) with check (public.can_manage_cohorts());
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'cohorts'
+  ) then
+    alter publication supabase_realtime add table public.cohorts;
+  end if;
+end $$;
+
+notify pgrst, 'reload schema';
+```
 
 ---
 

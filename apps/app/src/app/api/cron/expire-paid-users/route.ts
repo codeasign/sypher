@@ -10,7 +10,7 @@ export async function OPTIONS() {
 export async function GET(req: Request) {
   const corsHeaders = getCorsHeaders() ?? undefined;
 
-  if (req.headers.get('authorization') !== `Bearer ${process.env.CRON_SECRET}`) {
+  if (!process.env.CRON_SECRET || req.headers.get('authorization') !== `Bearer ${process.env.CRON_SECRET}`) {
     return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
   }
 

@@ -53,6 +53,8 @@ export default async function BlogPostPage({
         content={post.content}
         coverImageUrl={post.cover_image_url}
         date={post.published_at}
+        authorName={post.author_full_name}
+        authorBio={post.author_bio}
       />
     </div>
   );

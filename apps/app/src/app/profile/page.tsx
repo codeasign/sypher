@@ -1065,14 +1065,14 @@ function LearnerProfileContent(): React.JSX.Element {
             <div className={styles.saveRow}>
               <button
                 type="button"
-                className={styles.upgradeBtn}
+                className={`${styles.upgradeBtn} ${styles.saveBtn}`}
                 disabled={isSaving || isBioOverLimit}
                 onClick={() => {
                   trackEvent('profile_save_click');
                   handleSaveProfile();
                 }}
               >
-                {isSaving ? 'Saving…' : 'Save'}
+                {isSaving ? 'Saving…' : 'Save Profile'}
               </button>
             </div>
 

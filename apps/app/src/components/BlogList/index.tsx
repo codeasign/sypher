@@ -14,13 +14,6 @@ interface PostSummary {
   cover_image_url: string | null;
 }
 
-// Explicit locale -- undefined would let the runtime's default locale decide,
-// which differs between the server (build/render) and a visitor's browser
-// and would cause a hydration mismatch on first paint.
-function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
-}
-
 // Deterministic per-post avatar color so the same title always gets the same
 // tint across renders/tabs, without needing a stored color field.
 function titleColor(title: string): string {
@@ -73,15 +66,9 @@ export default function BlogList({ initialPosts }: { initialPosts: PostSummary[]
             <div className={styles.rowBody}>
               <div className={styles.rowTop}>
                 <h3 className={styles.title}>{post.title}</h3>
-                {post.published_at && (
-                  <span className={styles.postedDate}>{formatDate(post.published_at)}</span>
-                )}
               </div>
               {post.description && <p className={styles.description}>{post.description}</p>}
             </div>
-            <span className={styles.chevron} aria-hidden="true">
-              &rsaquo;
-            </span>
           </Link>
         ))}
       </div>

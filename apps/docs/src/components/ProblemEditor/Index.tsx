@@ -5,6 +5,7 @@ import styles from './styles.module.css';
 interface TestCase {
   stdin: string;
   expectedOutput: string;
+  isSample?: boolean;
 }
 
 interface ProblemMeta {

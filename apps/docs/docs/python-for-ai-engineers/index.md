@@ -74,6 +74,4 @@ After completing this course, you will be able to:
 | Python official docs | [docs.python.org](https://docs.python.org/3/) |
 | NumPy docs | [numpy.org/doc](https://numpy.org/doc/stable/) |
 | pandas docs | [pandas.pydata.org](https://pandas.pydata.org/docs/) |
-| OpenAI API docs | TODO |
-| Anthropic API docs | TODO |
 | Pytest docs | [docs.pytest.org](https://docs.pytest.org/en/stable/) |

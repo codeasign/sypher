@@ -45,12 +45,19 @@ async function findAvailableSlug(supabase, baseSlug) {
   }
 }
 
-export async function listBlogPosts(supabase) {
+// `/manage-blog` scopes the list to the signed-in user's own posts unless
+// they're an admin (see page.tsx) -- authorId is omitted entirely for
+// admins so the query (and the RLS policy behind it) returns every post.
+export async function listBlogPosts(supabase, authorId) {
   if (!supabase) return [];
-  const { data, error } = await supabase
+  let query = supabase
     .from('blog_posts')
     .select('id, slug, title, description, cover_image_url, status, updated_at, published_at, created_at')
     .order('updated_at', { ascending: false });
+  if (authorId) {
+    query = query.eq('author_id', authorId);
+  }
+  const { data, error } = await query;
   if (error) {
     // eslint-disable-next-line no-console
     console.error('Failed to load blog posts:', error.message);
@@ -74,13 +81,15 @@ export async function listPublishedBlogPosts(supabase) {
   return data;
 }
 
+// Uses the get_published_blog_post_with_author RPC rather than a plain
+// table select -- profiles RLS doesn't allow the anon client this page
+// reads with to join in the author's name/bio directly, and the RPC (a
+// security-definer function scoped to published-only, name+bio-only)
+// is the safe way to expose just those two fields publicly.
 export async function getBlogPostBySlug(supabase, slug) {
   if (!supabase || !slug) return null;
   const { data, error } = await supabase
-    .from('blog_posts')
-    .select('id, slug, title, description, content, cover_image_url, published_at')
-    .eq('slug', slug)
-    .eq('status', 'published')
+    .rpc('get_published_blog_post_with_author', { p_slug: slug })
     .maybeSingle();
   if (error) {
     // eslint-disable-next-line no-console

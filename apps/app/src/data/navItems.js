@@ -17,6 +17,7 @@ export const NAV_SECTIONS = [
     title: 'Job Management',
     items: [
       { key: 'add-job-post', href: '/add-job-post', label: 'Add Job Post' },
+      { key: 'manage-employees', href: '/manage-employees', label: 'Manage Employees' },
       { key: 'applicants', href: '/applicants', label: 'Applicants' },
       { key: 'manage-users', href: '/manage-users', label: 'Manage Users' },
       { key: 'manage-access', href: '/manage-access', label: 'Site Administration' },
@@ -28,6 +29,7 @@ export const NAV_SECTIONS = [
     items: [
       { key: 'manage-blog-post', href: '/manage-blog', label: 'Author Blog' },
       { key: 'manage-course-authoring', href: '/manage-courses', label: 'Author Course' },
+      { key: 'launch-cohort', href: '/launch-cohort', label: 'Launch Cohort' },
     ],
   },
   {

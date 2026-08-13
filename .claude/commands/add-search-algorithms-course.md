@@ -13,24 +13,38 @@ a practice/test-case section.
 
 - Languages (fixed order, every module implements all 9):
 
-  | Key | Label |
-  |---|---|
-  | `python311` | Python 3.11 |
-  | `c_gcc13` | C (GCC 13) |
-  | `cpp_clang17` | C++ (Clang 17) |
-  | `java21` | Java 21 |
-  | `csharp_dotnet8` | C# / .NET 8 |
-  | `javascript_node20` | JavaScript (Node 20.10.0) |
-  | `typescript516` | TypeScript 5.1.6 |
-  | `rust179` | Rust 1.79.0 |
-  | `go122` | Go 1.22 |
+  | Key | Label | Judge0 id |
+  |---|---|---|
+  | `python311` | Python 3.11 | 92 |
+  | `c_gcc13` | C (GCC 14.1) | 103 |
+  | `cpp_clang17` | C++ (Clang 7.0.1) | 76 |
+  | `java21` | Java (JDK 17) | 91 |
+  | `csharp_dotnet8` | C# (Mono 6.6) | 51 |
+  | `javascript_node20` | JavaScript (Node 20.17.0) | 97 |
+  | `typescript516` | TypeScript 5.0.3 | 94 |
+  | `rust179` | Rust 1.85.0 | 108 |
+  | `go122` | Go 1.22 | 106 |
 
-- These keys must match `LANGUAGE_IDS`/`LANGUAGE_LABELS`/`MONACO_LANGUAGES` entries in
-  `src/components/CoreEditor/Index.tsx`. The Judge0 `language_id` values behind these
-  keys are best-known placeholders against the public Judge0 CE demo — the user is
-  deploying a custom Judge0 docker image with the exact versions above; IDs may need
-  updating once that instance is live. Do not add new language keys without also
-  adding matching entries in `CoreEditor/Index.tsx`.
+- **These keys do not exist in `LANGUAGE_IDS`/`LANGUAGE_LABELS`/`MONACO_LANGUAGES` in
+  `src/components/CoreEditor/Index.tsx` right now** — they were removed as dead entries
+  during the Judge0 → RapidAPI migration (2026-08), since no course used them at the
+  time. Before running this command, re-add all 9 keys to those maps using the ids
+  above. There is no more self-hosted/custom Judge0 docker image — Judge0 execution now
+  runs entirely through RapidAPI's hosted Judge0 CE, and the ids above were verified
+  directly against its `GET /languages` response (2026-08-06), not guessed.
+  Labels reflect the actual runtime version behind each id, not the aspirational
+  version some key names imply — several drifted from what they're named after:
+  `c_gcc13` actually runs GCC 14.1, `cpp_clang17` actually runs Clang 7.0.1 (RapidAPI
+  has no newer Clang C++ build), `java21` actually runs JDK 17, `rust179` actually runs
+  1.85.0. `csharp_dotnet8` is the most misleading of the nine: RapidAPI has no modern
+  .NET Core/C# option at all, so its id (51) is the exact same Mono 6.6.0.161 runtime
+  the plain `csharp` key elsewhere in CoreEditor already uses — there is no real .NET 8
+  execution available; the label says Mono, not .NET 8, specifically so this isn't
+  silently misleading. Do not add new language keys without also adding matching
+  entries in `CoreEditor/Index.tsx`, and re-verify ids against `GET /languages` again
+  before trusting this table if much time has passed — RapidAPI's hosted versions
+  change (that's exactly why `c_gcc13`'s id now serves GCC 14.1 instead of the 13 its
+  own key name claims).
 
 ## Module List (18 modules — pass `<module-number>` 1-18)
 
@@ -110,13 +124,13 @@ Opening wrapper (immediately after imports, before Section 1):
   solutions={
     <Tabs>
       <TabItem value="python311" label="Python 3.11">...</TabItem>
-      <TabItem value="c_gcc13" label="C (GCC 13)">...</TabItem>
-      <TabItem value="cpp_clang17" label="C++ (Clang 17)">...</TabItem>
-      <TabItem value="java21" label="Java 21">...</TabItem>
-      <TabItem value="csharp_dotnet8" label="C# / .NET 8">...</TabItem>
-      <TabItem value="javascript_node20" label="JavaScript (Node 20.10.0)">...</TabItem>
-      <TabItem value="typescript516" label="TypeScript 5.1.6">...</TabItem>
-      <TabItem value="rust179" label="Rust 1.79.0">...</TabItem>
+      <TabItem value="c_gcc13" label="C (GCC 14.1)">...</TabItem>
+      <TabItem value="cpp_clang17" label="C++ (Clang 7.0.1)">...</TabItem>
+      <TabItem value="java21" label="Java (JDK 17)">...</TabItem>
+      <TabItem value="csharp_dotnet8" label="C# (Mono 6.6)">...</TabItem>
+      <TabItem value="javascript_node20" label="JavaScript (Node 20.17.0)">...</TabItem>
+      <TabItem value="typescript516" label="TypeScript 5.0.3">...</TabItem>
+      <TabItem value="rust179" label="Rust 1.85.0">...</TabItem>
       <TabItem value="go122" label="Go 1.22">...</TabItem>
     </Tabs>
   }
@@ -213,8 +227,9 @@ Page body (children), in this exact order:
   immediately before the closing `</DetailsPageWithIDE>` tag.
 
 **Section 7 — Solutions** (goes in the `solutions` prop, not in page body children)
-- Tabbed code block per language, all 9: Python 3.11, C (GCC 13), C++ (Clang 17),
-  Java 21, C# / .NET 8, JavaScript (Node 20.10.0), TypeScript 5.1.6, Rust 1.79.0, Go 1.22
+- Tabbed code block per language, all 9: Python 3.11, C (GCC 14.1), C++ (Clang 7.0.1),
+  Java (JDK 17), C# (Mono 6.6), JavaScript (Node 20.17.0), TypeScript 5.0.3,
+  Rust 1.85.0, Go 1.22
 - Each implementation complete and runnable — function signature, full body, no
   pseudocode
 - Consistent function signature across languages for the same module (e.g. all take

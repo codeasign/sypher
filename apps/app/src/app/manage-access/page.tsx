@@ -154,6 +154,7 @@ function RoleAccessModal({
 function CompanyAccessModal({
   companyName,
   title,
+  description,
   items,
   allowedKeys,
   rowErrors,
@@ -162,6 +163,7 @@ function CompanyAccessModal({
 }: {
   companyName: string;
   title: string;
+  description?: string;
   items: AccessModalItem[];
   allowedKeys: Set<string>;
   rowErrors: Record<string, string>;
@@ -195,6 +197,7 @@ function CompanyAccessModal({
             ×
           </button>
         </div>
+        {description && <div className={styles.adminNote}>{description}</div>}
         <div className={styles.modalBody}>
           {items.map((item) => {
             const showSectionHeader = Boolean(item.sectionTitle) && item.sectionTitle !== lastSection;
@@ -546,6 +549,10 @@ function CompaniesTab(): React.JSX.Element {
     <>
       <div className={styles.adminNote}>
         Configure which courses and sidebar items Company Employees can see, per company.
+        Course access here is a <strong>pool</strong>, not a blanket grant: checking a
+        course makes it available for that company's HR to assign to specific employees
+        from <strong>Manage Employees</strong> — it no longer gives every employee at the
+        company automatic access on its own. Sidebar items still apply company-wide as before.
       </div>
 
       <label className={styles.fieldLabel} htmlFor="companies-tab-name">
@@ -600,6 +607,7 @@ function CompaniesTab(): React.JSX.Element {
         <CompanyAccessModal
           companyName={trimmedName}
           title="Course Access"
+          description="Checking a course here adds it to this company's pool — their HR still needs to assign it to individual employees from Manage Employees before anyone can actually access it."
           items={COURSE_ITEMS}
           allowedKeys={courseAllowedKeys}
           rowErrors={rowErrors}

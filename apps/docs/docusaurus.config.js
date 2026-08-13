@@ -125,8 +125,6 @@ const config = {
 
   customFields: {
     gaMeasurementId: GA_MEASUREMENT_ID,
-    judge0BaseUrl: process.env.JUDGE0_BASE_URL ?? 'http://localhost:2358',
-    judge0AuthToken: process.env.JUDGE0_AUTH_TOKEN ?? '',
     showDurationOnLanding: process.env.SHOW_DURATION_ON_LANDING === 'true',
     showDurationOnContent: process.env.SHOW_DURATION_ON_CONTENT === 'true',
     supabaseUrl: process.env.SUPABASE_URL,
