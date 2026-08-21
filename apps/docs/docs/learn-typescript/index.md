@@ -6,37 +6,38 @@ slug: /learn-typescript/
 
 # Learn TypeScript
 
-Estimated completion: 15-20 hours - Difficulty: Beginner to Advanced
+*Estimated completion time: 15–20 hours*
 
-## What This Is
+**Difficulty:** Beginner to Advanced
+
+## What This Course Covers
 
 Learn TypeScript teaches the whole language, taught simply — starting from zero TypeScript experience and going all the way through generics, mapped types, and decorators. Nothing is skipped for being "too advanced." Every module, including the advanced ones, stays plain-English and code-first: a short explanation, a small runnable example, and a short explanation of what it does.
 
 One consistent example runs through the entire course: BookHaven, a small online bookstore. Reusing the same domain means an advanced concept like a mapped type gets explained against something you already understand, instead of a brand-new example you have to learn on top of the concept itself.
 
-## Modules
+## Why This Matters
 
-0. Setup
-1. Why TypeScript
-2. Basic Types
-3. Objects and Interfaces
-4. Type Aliases
-5. Functions
-6. Arrays and Lists
-7. Union Types
-8. Type Narrowing
-9. Classes
-10. Working with Async Code
-11. Generics
-12. Utility Types
-13. Enums vs. Union Literals
-14. Working with Untyped Code
-15. Advanced Generics
-16. Conditional and Mapped Types
-17. Decorators
-18. Modules and Project Structure
-19. Reading and Understanding Type Errors
-20. Putting It All Together
+TypeScript is the default choice for any JavaScript codebase that expects to grow — it catches whole categories of bugs before they run, and it turns an editor into a much better collaborator through autocomplete and inline type errors. Most teams don't hire for "knows TypeScript" as a separate skill anymore; they assume it. This course gets you from zero to genuinely fluent, including the parts of the language — generics, mapped types, decorators — that most tutorials wave past.
+
+## Skills You Will Gain
+
+- Write and read TypeScript's core type system: basic types, objects, interfaces, and type aliases
+- Model real-world data with unions, literal types, and type narrowing
+- Use classes, generics, and utility types to write reusable, type-safe code
+- Handle async code and untyped third-party libraries safely
+- Read advanced generics, conditional types, and mapped types with confidence
+- Use decorators and understand TypeScript's module and project structure
+- Diagnose and fix TypeScript compiler errors instead of suppressing them
+
+## Prerequisites
+
+- Basic JavaScript — variables, functions, arrays, and objects
+- No prior TypeScript experience required
+
+## Course Roadmap
+
+<CourseCurriculum />
 
 ## How to Use This Course
 

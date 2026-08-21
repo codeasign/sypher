@@ -6,9 +6,11 @@ slug: /typescript-for-test-automation/
 
 # TypeScript for Test Automation
 
-Estimated completion: 4-6 hours - Difficulty: Beginner, no programming background assumed
+*Estimated completion time: 4–6 hours*
 
-## What This Is
+**Difficulty:** Beginner, no programming background assumed
+
+## What This Course Covers
 
 TypeScript for Test Automation is a short, fast on-ramp for manual testers moving into test automation for the first time. It assumes no JavaScript or TypeScript experience at all, and teaches only what's needed to confidently read and write a basic typed test — not the language in depth.
 
@@ -16,18 +18,27 @@ Every example in this course runs against the same real system used across this 
 
 This course is deliberately not a substitute for learning the full language — it closes by pointing you toward Learn TypeScript for depth, and toward Playwright Test Automation for what actual test automation work looks like once you're past this on-ramp.
 
-## Modules
+## Why This Matters
 
-0. Setup
-1. Just Enough TypeScript to Read a Test
-2. Functions and Imports
-3. Setting Up Jest
-4. Typing Test Data and Fixtures
-5. Typing API Responses
-6. Understanding Async Test Code
-7. Classes, Briefly
-8. Structuring a Simple Typed Test Project
-9. Capstone: Modeling the RBAC Permission Matrix
+Most modern test automation frameworks — Playwright chief among them — are TypeScript-first. Manual testers who can read and write basic typed code move into automation roles faster than those who wait to "learn programming" as a separate project. Most of what blocks that move isn't the language — it's not knowing which small slice of it actually matters for reading a test. This course teaches exactly that slice, against a real app, so you're productive in hours instead of weeks.
+
+## Skills You Will Gain
+
+- Read and write basic TypeScript: variables, functions, imports, and just enough syntax to follow a test
+- Type test data and fixtures so mistakes get caught before a test even runs
+- Set up and run tests with Jest
+- Type API responses and reason about async test code
+- Structure a simple, readable typed test project
+- Model a real-world permission matrix as typed data and test against it
+
+## Prerequisites
+
+- No programming experience required — this course starts from zero
+- Comfortable using a terminal to run commands
+
+## Course Roadmap
+
+<CourseCurriculum />
 
 ## How to Use This Course
 

@@ -30,6 +30,7 @@ export const NAV_SECTIONS = [
       { key: 'manage-blog-post', href: '/manage-blog', label: 'Author Blog' },
       { key: 'manage-course-authoring', href: '/manage-courses', label: 'Author Course' },
       { key: 'launch-cohort', href: '/launch-cohort', label: 'Launch Cohort' },
+      { key: 'manage-cohort-users', href: '/manage-cohort-users', label: 'Manage Cohort Users' },
     ],
   },
   {

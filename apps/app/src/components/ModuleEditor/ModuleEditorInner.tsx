@@ -10,6 +10,7 @@ import {
   listsPlugin,
   quotePlugin,
   linkPlugin,
+  linkDialogPlugin,
   imagePlugin,
   codeBlockPlugin,
   codeMirrorPlugin,
@@ -26,6 +27,7 @@ import {
   ChangeCodeMirrorLanguage,
 } from '@mdxeditor/editor';
 import type { MDXEditorMethods } from '@mdxeditor/editor';
+import { hardLineBreakPlugin } from '@/lib/mdxeditor/hardLineBreakPlugin';
 import { useAuth } from '@/contexts/AuthContext';
 import { createCourseModule, updateCourseModule, setModuleGettingStarted } from '@/data/courses';
 import { uploadToBunny } from '@/data/bunnyUpload';
@@ -258,6 +260,7 @@ export default function ModuleEditorInner({
                   listsPlugin(),
                   quotePlugin(),
                   linkPlugin(),
+                  linkDialogPlugin(),
                   imagePlugin({ imageUploadHandler: handleImageUpload }),
                   codeBlockPlugin({ defaultCodeBlockLanguage: 'text' }),
                   codeMirrorPlugin({
@@ -277,6 +280,7 @@ export default function ModuleEditorInner({
                     },
                   }),
                   markdownShortcutPlugin(),
+                  hardLineBreakPlugin(),
                   toolbarPlugin({
                     toolbarContents: () => (
                       <ConditionalContents

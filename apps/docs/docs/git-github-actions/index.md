@@ -33,7 +33,7 @@ Git is the universal version control system in software engineering. GitHub Acti
 - A GitHub account (free tier is sufficient)
 - No prior Git experience required
 
-## Course Sections
+## Course Roadmap
 
 <CourseCurriculum />
 

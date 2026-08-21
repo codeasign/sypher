@@ -26,6 +26,8 @@ interface BlogPostSummary {
 
 interface BlogPostFull extends BlogPostSummary {
   content: string;
+  featured_media_type: 'pdf' | 'youtube' | null;
+  featured_media_value: string | null;
 }
 
 // Explicit locale, not `undefined` -- see BlogList/index.tsx for why.

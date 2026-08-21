@@ -36,7 +36,7 @@ AI engineering is the most in-demand skill in software development. Companies ne
 - An API key from [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/) (the course covers both)
 - No prior LLM or AI experience required
 
-## Course Sections
+## Course Roadmap
 
 <CourseCurriculum />
 

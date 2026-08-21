@@ -28,6 +28,16 @@ The best way to learn AI engineering is by building. Theory gives you the map, b
 - Work with LangGraph for workflow orchestration
 - Deploy AI SaaS applications with real-world infrastructure
 
+## Prerequisites
+
+- Python programming — functions, classes, and basic async/await
+- Familiarity with LLM APIs (calling Anthropic or OpenAI at least once)
+- Basic understanding of REST APIs and JSON
+
+## Course Roadmap
+
+<CourseCurriculum />
+
 ## Project Tracks
 
 ### Mini Projects
@@ -52,12 +62,6 @@ Capstone projects that showcase end-to-end AI engineering:
 - Multi-agent research platform, AI testing framework
 - AI observability platform, enterprise knowledge assistant
 
-## Prerequisites
-
-- Python programming — functions, classes, and basic async/await
-- Familiarity with LLM APIs (calling Anthropic or OpenAI at least once)
-- Basic understanding of REST APIs and JSON
-
 ## How to Use This Course
 
 Each project follows a structured format:
@@ -67,5 +71,3 @@ Each project follows a structured format:
 - **Deploy** — deployment, testing, and production considerations
 
 You can follow the projects in order or jump to a specific track. Mini projects are recommended first if you are new to building with AI.
-
-<CourseCurriculum />

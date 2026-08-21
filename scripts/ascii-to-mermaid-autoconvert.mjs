@@ -492,6 +492,14 @@ async function processCourse(slug) {
     writeFileSync(reportPath, lines.join('\n'), 'utf8');
     console.log(`Needs-LLM list: ${reportPath}`);
   }
+
+  if (!DRY_RUN) {
+    try {
+      execFileSync('node', [path.resolve('scripts/update-diagram-manifest.mjs'), slug], { stdio: 'inherit' });
+    } catch (err) {
+      console.error(`Failed to update diagram manifest for "${slug}": ${err.message}`);
+    }
+  }
 }
 
 async function main() {

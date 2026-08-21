@@ -3,6 +3,7 @@
 import React, { useEffect } from 'react';
 import Link from 'next/link';
 import ReactMarkdown from 'react-markdown';
+import remarkBreaks from 'remark-breaks';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import rehypeSlug from 'rehype-slug';
@@ -86,6 +87,7 @@ export default function CourseModuleArticle({
       </div>
       <div className={styles.body}>
         <ReactMarkdown
+          remarkPlugins={[remarkBreaks]}
           rehypePlugins={[rehypeRaw, rehypeSlug, [rehypeSanitize, schema]]}
           components={{ pre: CodeBlock }}
         >

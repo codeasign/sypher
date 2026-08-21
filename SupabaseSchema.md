@@ -1265,6 +1265,40 @@ notify pgrst, 'reload schema';
 
 ---
 
+## Blog post featured media (PDF / YouTube)
+
+Lets an author attach one piece of "featured media" to a blog post — an
+uploaded PDF or a YouTube video — rendered above the article body, written
+content below it. PPT/PowerPoint was considered and dropped from scope.
+
+```sql
+alter table public.blog_posts
+  add column if not exists featured_media_type text check (featured_media_type in ('pdf', 'youtube'));
+
+alter table public.blog_posts
+  add column if not exists featured_media_value text;
+```
+
+**One slot, one type.** `featured_media_type` is `null` when the author
+hasn't picked anything; otherwise `'pdf'` or `'youtube'`, and
+`featured_media_value` holds the corresponding payload:
+- `pdf` — the Bunny CDN URL (`uploadToBunny`, same pattern and
+  `blog/featured-media/` prefix convention as `cover_image_url`'s
+  `blog/covers/`).
+- `youtube` — just the extracted 11-character video ID (see
+  `apps/app/src/lib/youtube.ts`'s `extractYouTubeId`, which accepts a pasted
+  watch/share/embed/shorts URL or a bare ID), not the raw pasted URL — so the
+  render side (`apps/app/src/components/YouTube`) never needs to re-parse it.
+
+**`get_published_blog_post_with_author` is re-created, not just altered** —
+Postgres can't change a `returns table (...)` column list via `create or
+replace` alone; the migration `drop function`s it first. Same
+`security definer`, published-only, anon+authenticated grant as the original
+version documented under "Blog posts — author 'About me' on the public post
+page" above — just two more columns in the whitelist.
+
+---
+
 ## Taxonomy (career domains, roles, skills, technologies)
 
 Adds a shared reference catalog — career **domains** (e.g. "MLOps"), **base
@@ -4445,6 +4479,119 @@ tradeoff in exchange for not needing a reserve/refund RPC; the existing
 
 ---
 
+## Email rotation quota (Brevo + Resend)
+
+A standalone multi-vendor transactional-email system — **not** wired into
+Supabase Auth's Send Email Hook (a separate, later migration step); Auth's
+own mailer/SMTP config is untouched by this. Backs
+`apps/app/src/lib/email/emailQuota.ts`, used by
+`apps/app/src/lib/email/rotation.ts` (pre-send quota check + priority
+selection: Brevo first, then Resend) and the admin-only
+`app/api/email/test` route (usage display + manual test sends, including a
+`simulateFailureFor` hook to verify fallback without touching a live vendor
+account).
+
+```sql
+create table if not exists public.email_sends (
+  id uuid primary key default gen_random_uuid(),
+  provider text not null,
+  to_email text,
+  subject text,
+  sent_at timestamptz not null default now()
+);
+
+create index if not exists email_sends_provider_sent_at_idx
+  on public.email_sends (provider, sent_at);
+
+alter table public.email_sends enable row level security;
+-- deliberately no select/insert/update policy for anon/authenticated --
+-- only the service-role client (emailQuota.ts) touches this table,
+-- bypassing RLS. Mirrors judge0_monthly_submissions.
+
+create or replace function public.email_day_start()
+returns timestamptz language sql stable as $$
+  select date_trunc('day', now());
+$$;
+
+create or replace function public.email_month_start()
+returns timestamptz language sql stable as $$
+  select date_trunc('month', now());
+$$;
+
+create or replace function public.email_daily_status(p_provider text, p_limit integer)
+returns jsonb
+language plpgsql security definer set search_path = public stable
+as $$
+declare
+  v_period_start timestamptz := public.email_day_start();
+  v_used integer;
+begin
+  select count(*) into v_used from public.email_sends
+    where provider = p_provider and sent_at >= v_period_start;
+  return jsonb_build_object(
+    'limit', p_limit, 'used', v_used, 'remaining', greatest(p_limit - v_used, 0),
+    'resetsAt', v_period_start + interval '1 day'
+  );
+end;
+$$;
+
+create or replace function public.email_monthly_status(p_provider text, p_limit integer)
+returns jsonb
+language plpgsql security definer set search_path = public stable
+as $$
+declare
+  v_period_start timestamptz := public.email_month_start();
+  v_used integer;
+begin
+  select count(*) into v_used from public.email_sends
+    where provider = p_provider and sent_at >= v_period_start;
+  return jsonb_build_object(
+    'limit', p_limit, 'used', v_used, 'remaining', greatest(p_limit - v_used, 0),
+    'resetsAt', v_period_start + interval '1 month'
+  );
+end;
+$$;
+
+revoke execute on function public.email_daily_status(text, integer) from public, anon, authenticated;
+grant execute on function public.email_daily_status(text, integer) to service_role;
+revoke execute on function public.email_monthly_status(text, integer) from public, anon, authenticated;
+grant execute on function public.email_monthly_status(text, integer) to service_role;
+
+notify pgrst, 'reload schema';
+```
+
+**Derivation, not decrement** — same shape as `judge0_monthly_status`:
+"remaining" is always `p_limit - count(rows where sent_at >= <period
+start>)`, so a day/month boundary resets the cap automatically with zero
+cron job. `p_provider` is a free-text tag (`'brevo'`, `'resend'`, ...)
+rather than a foreign key, since providers aren't a DB-managed entity here —
+`EmailProviderName` in `emailQuota.ts` is the source of truth for valid
+values. `p_limit` comes from env on every call (`BREVO_DAILY_LIMIT`,
+`RESEND_DAILY_LIMIT`, `RESEND_MONTHLY_LIMIT`), never stored in Postgres.
+
+**Two status functions, not one, because the two vendors' free tiers reset
+on different windows** — verified current numbers (Aug 2026): Brevo caps at
+300/day only; Resend caps at 100/day *and* 3,000/month simultaneously, so
+Resend is checked against both `email_daily_status` and
+`email_monthly_status` and is only "under quota" when both have headroom. A
+provider is skipped in favor of the next one in priority order if it's over
+any cap it's configured for; an unconfigured cap (missing/invalid env var)
+is treated as no ceiling, not as blocking — same fail-open philosophy as
+`JUDGE0_MONTHLY_LIMIT_PAID`.
+
+**Only a confirmed successful send counts** — `recordEmailSend` is called
+from `rotation.ts` strictly after a provider's API call returns success,
+never optimistically before it and never for a failed attempt. A non-quota
+failure (network error, vendor 5xx, timeout) falls through to the next
+provider in the list rather than failing the whole send.
+
+**Exhausting the entire provider pool** (all providers either over quota or
+failing) is a known, deliberately unhandled gap — throws/logs loudly rather
+than queueing or alerting, since it isn't a near-term concern at current
+send volume. Revisit if volume grows enough to make it plausible.
+
+---
+
 ## Manage Employees (company_hr self-service — `/manage-employees`)
 
 Adds a self-service page for the `company_hr` role: she can invite new employees by
@@ -4788,6 +4935,459 @@ end $$;
 
 notify pgrst, 'reload schema';
 ```
+
+---
+
+## Cohort Users (`cohort_users` role, per-cohort roster & access — `/launch-cohort` roster panel)
+
+Adds a new role, `cohort_users`, for people enrolled in one or more cohorts, plus a
+roster/access model scoped to a real `cohort_id` foreign key (`cohorts.id`, already a
+`uuid primary key` — see [Cohorts](#cohorts-cohorts-admin-only--sidebar-launch-cohort-public-cohorts)
+above) rather than the free-text `company_name` matching `company_employees` uses. This
+is deliberately the same shape as [Manage Employees](#manage-employees-company_hr-self-service--manage-employees)
+— `cohort_members`/`cohort_managers`/`cohort_course_access`/`cohort_member_course_access`
+mirror `profiles.company_name` scoping/`company_hr`/`company_course_access`/
+`employee_course_access` respectively — with two differences:
+
+- **Many-to-many, not one-to-one.** A person can belong to several cohorts at once or
+  over time, so membership is a join table (`cohort_members`) rather than a single column
+  on `profiles`.
+- **Delegated management is per-cohort, not per-company.** `company_hr` manages every
+  employee at her own company because `profiles.company_name` already ties her to it. A
+  cohort has no equivalent owner column, so `cohort_managers` is an explicit join table an
+  admin populates — being manager of Cohort A says nothing about Cohort B. Only an admin
+  can write to `cohort_managers` (a delegated manager can't grant herself or anyone else
+  manager status), and a manager also still needs the `manage-cohort-users` `nav_access`
+  item granted to her role before `can_manage_cohort_roster()` returns true — same
+  two-part gate (`nav_access` + resource-scoped table) every other delegated capability in
+  this schema uses.
+
+**Cleanup on removal/role-change follows the existing `hr_set_employee_active` convention,
+not a trigger.** No RLS table in this schema cascades on a `profiles.role` UPDATE or a
+soft-delete (`deleted_at`) — `employee_course_access` doesn't either. Instead: (a)
+`is_active_cohort_member()` and `check_course_access()` re-check `role = 'cohort_users'
+and deleted_at is null` **live**, so a role change or soft-delete makes a stale
+`cohort_member_course_access` row grant nothing even though the row still physically
+exists; (b) `set_cohort_member_status(cohort_id, user_id, false)` below mirrors
+`hr_set_employee_active`'s explicit behavior — removing someone from a cohort deletes
+their `cohort_member_course_access` rows for it, and re-adding them does **not** restore
+those grants, the same "reactivation requires a fresh decision" rule.
+
+All four new tables use `on delete cascade` on their `cohort_id` FK, so deleting a cohort
+(`/launch-cohort`'s existing delete action) cleans up its entire roster/pool/manager/grant
+rows automatically instead of leaving orphans or blocking the delete. `user_id` FKs to
+`auth.users(id) on delete cascade` too, matching `profiles`/`bookmarks` — dormant in
+practice since this app only ever soft-deletes (`profiles.deleted_at`), never a real
+`auth.users` row, but correct if that ever changes.
+
+```sql
+-- ============================================================
+-- 1. New role
+-- ============================================================
+alter type public.user_role add value if not exists 'cohort_users';
+```
+
+Run the statement above **on its own**, separately from everything below — a newly added
+enum value can't be referenced in the same transaction that creates it (same reason the
+`seniority_level` L1-L6/Architect/Manager migration keeps its `alter type ... add value`
+isolated). Once it's committed, run the rest:
+
+```sql
+-- ============================================================
+-- 2. cohort_members (roster -- many-to-many, mirrors profiles.company_name scoping)
+-- ============================================================
+create table if not exists public.cohort_members (
+  cohort_id uuid not null references public.cohorts(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  status text not null default 'active' check (status in ('active', 'removed')),
+  enrolled_at timestamptz not null default now(),
+  enrolled_by uuid references auth.users(id) on delete set null,
+  primary key (cohort_id, user_id)
+);
+
+alter table public.cohort_members enable row level security;
+
+-- ============================================================
+-- 3. cohort_managers (admin-delegated: who may manage THIS cohort's roster)
+-- ============================================================
+create table if not exists public.cohort_managers (
+  cohort_id uuid not null references public.cohorts(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  assigned_at timestamptz not null default now(),
+  primary key (cohort_id, user_id)
+);
+
+alter table public.cohort_managers enable row level security;
+
+-- Both tables above must exist before the two helper functions below (their bodies
+-- reference cohort_members/cohort_managers directly), and both functions must exist
+-- before ANY policy on either table (CREATE POLICY resolves function names
+-- immediately, at creation time, not lazily at query time).
+
+-- security-definer helper: true if caller is admin, or caller's role holds
+-- `manage-cohort-users` nav access AND caller is listed in cohort_managers for this
+-- specific p_cohort_id. security definer so the internal cohort_managers/profiles/
+-- nav_access lookups bypass RLS on those tables regardless of the caller's own
+-- visibility -- same reasoning as can_manage_company_content()/is_admin().
+create or replace function public.can_manage_cohort_roster(p_cohort_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select
+    public.is_admin()
+    or exists (
+      select 1
+      from public.cohort_managers cm
+      join public.profiles p on p.id = auth.uid()
+      where cm.cohort_id = p_cohort_id
+        and cm.user_id = auth.uid()
+        and p.deleted_at is null
+        and p.role::text = any(
+          select unnest(allowed_roles)::text from public.nav_access
+          where item_key = 'manage-cohort-users'
+        )
+    );
+$$;
+
+-- security-definer helper: true only if p_user_id is an ACTIVE cohort_users member of
+-- p_cohort_id right now -- re-checked live (role + deleted_at), not cached, so a role
+-- change or soft-delete makes any grant bounded by this instantly inert. Mirrors
+-- is_active_company_employee().
+create or replace function public.is_active_cohort_member(p_user_id uuid, p_cohort_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (
+    select 1
+    from public.cohort_members cme
+    join public.profiles p on p.id = cme.user_id
+    where cme.cohort_id = p_cohort_id
+      and cme.user_id = p_user_id
+      and cme.status = 'active'
+      and p.role = 'cohort_users'
+      and p.deleted_at is null
+  );
+$$;
+
+-- Now that both functions exist, add policies for both tables.
+
+drop policy if exists "cohort managers manage roster" on public.cohort_members;
+create policy "cohort managers manage roster" on public.cohort_members
+  for all
+  using (public.can_manage_cohort_roster(cohort_id))
+  with check (public.can_manage_cohort_roster(cohort_id));
+
+drop policy if exists "members read own membership" on public.cohort_members;
+create policy "members read own membership" on public.cohort_members
+  for select using (auth.uid() = user_id);
+
+-- Admin-only write: a delegated manager cannot grant herself or a co-manager access to
+-- her own cohort -- there's no ceiling on that otherwise, same reasoning as why
+-- `manage-employees` nav access itself is admin-granted, not HR-granted.
+drop policy if exists "admins manage cohort managers" on public.cohort_managers;
+create policy "admins manage cohort managers" on public.cohort_managers
+  for all using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists "cohort managers read own assignments" on public.cohort_managers;
+create policy "cohort managers read own assignments" on public.cohort_managers
+  for select using (auth.uid() = user_id or public.can_manage_cohort_roster(cohort_id));
+
+-- ============================================================
+-- 4. cohort_course_access (admin-set POOL of courses assignable within a cohort --
+--    mirrors company_course_access; presence = eligible to be granted, not granted)
+-- ============================================================
+create table if not exists public.cohort_course_access (
+  cohort_id uuid not null references public.cohorts(id) on delete cascade,
+  course_slug text not null,
+  updated_at timestamptz not null default now(),
+  primary key (cohort_id, course_slug)
+);
+
+alter table public.cohort_course_access enable row level security;
+
+drop policy if exists "anyone can read cohort course access" on public.cohort_course_access;
+create policy "anyone can read cohort course access" on public.cohort_course_access
+  for select using (true);
+
+drop policy if exists "admins manage cohort course access" on public.cohort_course_access;
+create policy "admins manage cohort course access" on public.cohort_course_access
+  for all using (public.is_admin()) with check (public.is_admin());
+
+-- ============================================================
+-- 5. cohort_member_course_access (actual per-member grant -- mirrors
+--    employee_course_access; bounded to (a) a course already in the cohort's pool and
+--    (b) an active cohort_users member, admin bypasses both via is_admin())
+-- ============================================================
+create table if not exists public.cohort_member_course_access (
+  cohort_id uuid not null references public.cohorts(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  course_slug text not null,
+  updated_at timestamptz not null default now(),
+  primary key (cohort_id, user_id, course_slug)
+);
+
+alter table public.cohort_member_course_access enable row level security;
+
+drop policy if exists "anyone can read cohort member course access" on public.cohort_member_course_access;
+create policy "anyone can read cohort member course access" on public.cohort_member_course_access
+  for select using (true);
+
+drop policy if exists "cohort managers manage member course access" on public.cohort_member_course_access;
+create policy "cohort managers manage member course access" on public.cohort_member_course_access
+  for all
+  using (public.can_manage_cohort_roster(cohort_id))
+  with check (
+    public.can_manage_cohort_roster(cohort_id)
+    and (
+      public.is_admin()
+      or (
+        exists (
+          select 1 from public.cohort_course_access cca
+          where cca.cohort_id = cohort_member_course_access.cohort_id
+            and cca.course_slug = cohort_member_course_access.course_slug
+        )
+        and public.is_active_cohort_member(cohort_member_course_access.user_id, cohort_member_course_access.cohort_id)
+      )
+    )
+  );
+
+-- ============================================================
+-- 6. pending_invites: extend to support cohort_users invites alongside the existing
+--    company_hr/company_employees ones. company_name becomes conditionally required --
+--    a cohort invite has no company, a company invite has no cohort.
+-- ============================================================
+alter table public.pending_invites
+  add column if not exists cohort_id uuid references public.cohorts(id) on delete cascade;
+
+alter table public.pending_invites alter column company_name drop not null;
+
+alter table public.pending_invites drop constraint if exists pending_invites_role_check;
+alter table public.pending_invites add constraint pending_invites_role_check
+  check (role in ('company_hr', 'company_employees', 'cohort_users'));
+
+alter table public.pending_invites drop constraint if exists pending_invites_scope_check;
+alter table public.pending_invites add constraint pending_invites_scope_check
+  check (
+    (role in ('company_hr', 'company_employees') and company_name is not null and cohort_id is null)
+    or (role = 'cohort_users' and cohort_id is not null and company_name is null)
+  );
+
+-- Let a cohort roster manager invite a NEW cohort_users signup targeted at a cohort she
+-- manages. Existing "admins manage pending invites" (for all using is_admin()) is
+-- untouched and still co-exists, same pattern as the company_hr policies below it.
+drop policy if exists "authorized roles invite own cohort members" on public.pending_invites;
+create policy "authorized roles invite own cohort members" on public.pending_invites
+  for insert
+  with check (
+    role = 'cohort_users'
+    and cohort_id is not null
+    and public.can_manage_cohort_roster(cohort_id)
+  );
+
+drop policy if exists "authorized roles view own cohort pending invites" on public.pending_invites;
+create policy "authorized roles view own cohort pending invites" on public.pending_invites
+  for select
+  using (role = 'cohort_users' and cohort_id is not null and public.can_manage_cohort_roster(cohort_id));
+
+drop policy if exists "authorized roles revoke own cohort pending invites" on public.pending_invites;
+create policy "authorized roles revoke own cohort pending invites" on public.pending_invites
+  for delete
+  using (role = 'cohort_users' and cohort_id is not null and public.can_manage_cohort_roster(cohort_id));
+
+-- handle_new_user: also enrolls into cohort_members when the consumed invite is a
+-- cohort_users invite. Fixes a latent bug this migration would otherwise introduce --
+-- the old `coalesce(invite.company_name, ... 'Independent' ...)` fell back to
+-- 'Independent' for ANY invited role with a null company_name, which was harmless while
+-- only company_hr/company_employees (both company_name NOT NULL) could be invited, but
+-- would have wrongly stamped 'Independent' onto a Google-signup cohort_users profile.
+-- Now the 'Independent' fallback only applies when there was NO invite at all.
+create or replace function public.handle_new_user()
+returns trigger as $$
+declare
+  provider text := new.raw_app_meta_data->>'provider';
+  invite public.pending_invites;
+begin
+  select * into invite from public.pending_invites where email = lower(new.email);
+
+  insert into public.profiles (id, email, full_name, role, signup_source, company_name)
+  values (
+    new.id,
+    new.email,
+    new.raw_user_meta_data->>'full_name',
+    coalesce(invite.role, 'free_users'),
+    case when provider = 'google' then 'google' else 'email' end::public.signup_source,
+    case
+      when invite.email is not null then invite.company_name
+      when provider = 'google' then 'Independent'
+      else null
+    end
+  );
+
+  if invite.email is not null and invite.role = 'cohort_users' and invite.cohort_id is not null then
+    insert into public.cohort_members (cohort_id, user_id, status, enrolled_by)
+    values (invite.cohort_id, new.id, 'active', invite.invited_by)
+    on conflict (cohort_id, user_id) do nothing;
+  end if;
+
+  if invite.email is not null then
+    delete from public.pending_invites where email = lower(new.email);
+  end if;
+
+  return new;
+end;
+$$ language plpgsql security definer;
+
+-- ============================================================
+-- 7. check_course_access: adds a cohort_users branch, unioned across ALL of the
+--    caller's cohorts (not just one) since membership is many-to-many.
+-- ============================================================
+create or replace function public.check_course_access(p_course_slug text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_role public.user_role;
+  v_company text;
+  v_email text;
+  v_allowed_roles public.user_role[];
+begin
+  if auth.uid() is null then
+    return false;
+  end if;
+
+  select role, company_name, email into v_role, v_company, v_email
+  from public.profiles where id = auth.uid();
+
+  if v_role = 'admin' then
+    return true;
+  end if;
+
+  select allowed_roles into v_allowed_roles
+  from public.course_access where course_slug = p_course_slug;
+
+  if v_role is null then
+    return coalesce('free_users' = any(v_allowed_roles), false);
+  end if;
+
+  if coalesce(v_role = any(v_allowed_roles), false) then
+    return true;
+  end if;
+
+  if v_role = 'company_employees' and v_company is not null and v_email is not null then
+    return exists (
+      select 1 from public.employee_course_access
+      where company_name = v_company and lower(employee_email) = lower(v_email) and course_slug = p_course_slug
+    );
+  end if;
+
+  if v_role = 'cohort_users' then
+    return exists (
+      select 1 from public.cohort_member_course_access cmca
+      join public.cohort_members cme
+        on cme.cohort_id = cmca.cohort_id and cme.user_id = cmca.user_id
+      where cmca.user_id = auth.uid()
+        and cmca.course_slug = p_course_slug
+        and cme.status = 'active'
+    );
+  end if;
+
+  return false;
+end;
+$$;
+
+-- ============================================================
+-- 8. Narrow RPCs for roster management (mirror hr_list_employees /
+--    hr_set_employee_active -- no broad profiles-read grant exists for a non-admin
+--    cohort manager, so a plain join against profiles from the client would silently
+--    return zero rows under RLS; these run security definer instead).
+-- ============================================================
+create or replace function public.list_cohort_roster(p_cohort_id uuid)
+returns table (
+  user_id uuid,
+  email text,
+  full_name text,
+  status text,
+  enrolled_at timestamptz,
+  confirmed_at timestamptz,
+  deleted_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.can_manage_cohort_roster(p_cohort_id) then
+    raise exception 'Not authorized';
+  end if;
+  return query
+    select p.id, p.email, p.full_name, cme.status, cme.enrolled_at, p.confirmed_at, p.deleted_at
+    from public.cohort_members cme
+    join public.profiles p on p.id = cme.user_id
+    where cme.cohort_id = p_cohort_id
+    order by cme.enrolled_at desc;
+end;
+$$;
+revoke execute on function public.list_cohort_roster(uuid) from public;
+grant execute on function public.list_cohort_roster(uuid) to authenticated;
+
+-- Removing a member revokes her cohort_member_course_access rows for THIS cohort --
+-- a removed member shouldn't retain course access. Reactivating does NOT restore them
+-- (same safer default as hr_set_employee_active): a fresh decision, not a silent
+-- inherited grant. Also doubles as "add existing profile to roster" via upsert.
+create or replace function public.set_cohort_member_status(p_cohort_id uuid, p_user_id uuid, p_active boolean)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.can_manage_cohort_roster(p_cohort_id) then
+    raise exception 'Not authorized';
+  end if;
+
+  insert into public.cohort_members (cohort_id, user_id, status, enrolled_by)
+  values (p_cohort_id, p_user_id, case when p_active then 'active' else 'removed' end, auth.uid())
+  on conflict (cohort_id, user_id)
+  do update set status = excluded.status;
+
+  if not p_active then
+    delete from public.cohort_member_course_access
+      where cohort_id = p_cohort_id and user_id = p_user_id;
+  end if;
+end;
+$$;
+revoke execute on function public.set_cohort_member_status(uuid, uuid, boolean) from public;
+grant execute on function public.set_cohort_member_status(uuid, uuid, boolean) to authenticated;
+
+-- ============================================================
+-- 9. cohorts: let a delegated (non-admin) manager READ a cohort she's been assigned to
+--    manage, regardless of its status. Without this, a manager who only holds
+--    'manage-cohort-users' nav access (not 'launch-cohort') couldn't see so much as the
+--    title of a 'draft' cohort she's managing -- the existing "anyone can read live
+--    cohorts" policy only exposes status = 'live' rows. Purely additive (SELECT
+--    policies are OR'd together) -- does not grant write access, that's still gated by
+--    the existing "authorized roles manage cohorts" policy tied to can_manage_cohorts()
+--    (checks 'launch-cohort' nav access, a different, content-editing capability).
+-- ============================================================
+drop policy if exists "cohort managers can read their assigned cohorts" on public.cohorts;
+create policy "cohort managers can read their assigned cohorts" on public.cohorts
+  for select using (public.can_manage_cohort_roster(id));
+
+notify pgrst, 'reload schema';
+```
+
+No `nav_access` seed row needed for `manage-cohort-users` — same rule as every other item:
+an admin grants it to whichever role(s) should see the roster-management capability from
+`/manage-access`'s Sidebar Navigation tab, after this ships. No backfill needed either —
+`cohort_users` is a brand-new role with zero existing rows to migrate.
 
 ---
 

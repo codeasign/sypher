@@ -1,0 +1,214 @@
+---
+id: testing-llm-applications
+title: "Testing LLM Applications"
+sidebar_label: "6. Testing LLM Applications"
+sidebar_position: 6
+hide_table_of_contents: true
+---
+
+## Page purpose
+
+Every module up to this point has used AI to help you do QE work faster — generating scenarios, generating automation, diagnosing failures, formalizing review. Module 1 named the two halves of this course; this is the page where the course actually crosses that line. Starting here, **AI is no longer the tool you're using — it's the system under test.** The habits you built reviewing AI-generated test code in Modules 2 through 5 still matter, but the object of that scrutiny flips: instead of reviewing a draft test that a model wrote, you're testing a feature that runs a model in production, on real (if you're not careful) customer data, with real consequences if it gets something wrong. This page introduces Vespera's first AI-powered product feature — the Ticket Summarizer — and the four things you need to test about any LLM feature: does it reliably return the shape your application code expects, is its output actually trustworthy, does it stay trustworthy over time, and does it fail safely when the input is weird or hostile.
+
+## Learning objectives
+
+By the end of this page, you should be able to:
+
+- Explain why "AI as a system under test" needs a different testing discipline than "AI as a QE tool," even though both halves of this course share the same "AI generates, QE validates" principle.
+- Write a prompt test that asserts an LLM feature reliably returns a constrained JSON shape, not just "some" output.
+- Define and write a concrete test for each of the five output-validation dimensions: hallucination, factuality, consistency, regression, and negative testing.
+- Build a small golden evaluation dataset and use it to catch a prompt change that silently degrades quality.
+
+## Concepts
+
+A few ideas underpin everything else on this page:
+
+**LLM output is non-deterministic by default.** The same prompt sent twice can come back with different wording, and sometimes a different judgment call. That rules out the assertion style you're used to from Module 3's UI automation (`expect(locator).toHaveText("Urgent")`) for anything that touches the model's free-text output. You still assert exactly on things that *should* be exact — the JSON shape, the allowed values of an enum field — and you assert more loosely (keyword presence, absence of forbidden content, semantic overlap between runs) on the parts that are inherently generative.
+
+**Prompt testing is not the same thing as output validation.** Prompt testing asks a narrower, mechanical question: given this input, does the feature reliably return the shape the rest of the application depends on? Output validation asks a harder question: given a shape that parses correctly, is the *content* trustworthy? A response can pass every prompt test and still be dangerously wrong — it returned valid JSON with a summary that invents facts.
+
+**Output validation breaks down into five distinct dimensions**, and conflating them is how testing gaps happen:
+
+- **Hallucination** — did the model state something as fact that isn't anywhere in its input?
+- **Factuality** — does the output contradict a fact that *is* in the input?
+- **Consistency** — does re-running the same input produce a materially similar result, not a contradictory one?
+- **Regression** — did a prompt or model change quietly make outputs worse against cases that used to pass?
+- **Negative testing** — does the feature degrade safely on inputs it wasn't designed around (empty input, one-line input, input in an unsupported language)?
+
+**Evaluation datasets are how you scale output validation beyond one-off examples.** A single hand-picked test case tells you the feature worked once, on one input. A small, curated golden set — inputs paired with the properties a correct output must have — is what lets you re-run the same check every time the prompt or model changes, and catch a regression instead of just hoping you'd notice.
+
+## Practical example
+
+Vespera Helpdesk's first AI feature is the **Ticket Summarizer**: given a ticket thread (the customer's messages interleaved with agent replies), it returns a small JSON object a support agent sees at the top of the ticket view before they read the full thread.
+
+The contract, and the exact field names every later module in this course reuses, is:
+
+```json
+{
+  "summary": "2-3 sentence factual summary of what's happened in the thread so far",
+  "sentiment": "frustrated | neutral | satisfied",
+  "suggested_next_action": "a short, human-readable suggestion for what the agent should do next"
+}
+```
+
+The feature's system prompt is deliberately narrow about what the model is and isn't allowed to do:
+
+```python
+SYSTEM_PROMPT = """\
+You are Vespera Helpdesk's ticket summarizer. You will be given a support \
+ticket thread containing customer messages and agent replies.
+
+Rules:
+- Summarize only what is explicitly present in the thread. Never invent \
+details that are not there — no order numbers, dates, product names, or \
+promises that were not actually made.
+- If the customer's tone in the thread sounds frustrated, set "sentiment" \
+to "frustrated". Otherwise use "neutral" or "satisfied", whichever fits \
+better.
+- Never recommend a refund or any account action yourself (e.g. "issue a \
+refund," "close the account," "waive the fee"). That decision always \
+stays with the human agent — at most, suggest that the agent review the \
+account.
+- Respond with JSON only, using exactly these fields: "summary", \
+"sentiment", "suggested_next_action". No extra fields, no prose outside \
+the JSON.
+"""
+```
+
+Application code never calls a vendor SDK directly — it goes through a small `LLMProvider` abstraction, so the summarizer (and every AI feature from here through the capstone) can swap providers or models without touching the code that calls it:
+
+```python
+import json
+import os
+from typing import Protocol
+
+
+class LLMProvider(Protocol):
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        """Return the raw text completion for a system/user prompt pair."""
+        ...
+
+
+class AnthropicProvider:
+    """Real provider — used in production and in live smoke tests."""
+
+    def __init__(self, model: str = "claude-sonnet-4-5") -> None:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is not set")
+        # Import kept local so the rest of this module has no hard
+        # dependency on a specific SDK being installed.
+        import anthropic
+
+        self._client = anthropic.Anthropic(api_key=api_key)
+        self._model = model
+
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        response = self._client.messages.create(
+            model=self._model,
+            max_tokens=512,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return response.content[0].text
+
+
+class RecordedProvider:
+    """Test double — replays a fixed response instead of calling a model.
+
+    Used for prompt-shape tests where the point is to check how the
+    calling code handles a response, not to re-verify the model itself.
+    """
+
+    def __init__(self, response_text: str) -> None:
+        self._response_text = response_text
+
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        return self._response_text
+
+
+def summarize_ticket(thread: str, provider: LLMProvider) -> dict:
+    raw = provider.complete(SYSTEM_PROMPT, thread)
+    return json.loads(raw)
+```
+
+## AI/QE workflow
+
+The generate-then-validate shape from every earlier module still applies here — it just runs continuously instead of once per pull request. A typical change to the Ticket Summarizer moves through:
+
+1. An engineer edits the system prompt or swaps the model.
+2. **Prompt tests** run first and fast — do responses still parse as JSON, with exactly the three required fields, and does `sentiment` stay inside its three allowed values? This is a cheap gate that catches a broken prompt before spending time on anything deeper.
+3. **Output validation tests** run next — hallucination, factuality, consistency, and negative-testing checks against a handful of realistic fixture threads.
+4. **The golden evaluation set** runs against the full set of curated cases, comparing this run's outputs against the properties each case is expected to have. A failure here doesn't necessarily mean broken JSON — it can mean the JSON is well-formed but *worse* than before.
+5. A QE reviews any failures. Some are real regressions that block the change; some are the golden set itself needing an update because the underlying ticket data or product behavior changed. That judgment call — same as Module 4's "needs updating" versus "reveals a real bug" — doesn't go away just because the thing under test is a model instead of a UI.
+
+## Code requirements
+
+Examples on this page are Python, matching the rest of this course's AI-systems-under-test modules (6 through 10 and the capstone). All model access goes through the `LLMProvider` abstraction defined above — no test or application code calls a vendor SDK inline. `AnthropicProvider` reads its key from `os.getenv("ANTHROPIC_API_KEY")`; it is never hardcoded, and no example on this page uses real ticket data — every thread shown is fabricated for this page. Tests use `pytest`, and any test that needs a live model response uses `RecordedProvider` with a fixed, checked-in response rather than calling a real model on every test run — fast, deterministic tests for the deterministic parts of the contract, with live-model runs reserved for the golden-set regression suite described below.
+
+## Vespera Systems scenario
+
+The Ticket Summarizer sits at the top of the ticket detail view inside Vespera Helpdesk — the same product surface whose SLA auto-escalation logic you tested in Modules 2 through 5. A Support Agent opens a ticket, sees the three-field summary before reading the full thread, and uses `suggested_next_action` as a starting point, not an instruction — the summarizer never gets to decide anything on its own, which is exactly what its system prompt's refund/account-action rule enforces. As the QE owning this feature, your job isn't just "does it work on a happy-path thread" — it's making sure the feature stays trustworthy as the prompt, the model version, and the shape of real ticket threads all keep changing under it. This same feature is exactly what Module 7 extends into a retrieval-backed Knowledge Assistant, and what Module 8 attacks adversarially — so the contract you lock down here (the three field names, the refund/account-action boundary) is what those modules build directly on top of.
+
+## Diagram
+
+<AsciiDiagram
+  id="ai-for-quality-engineering/testing-llm-applications"
+  mermaidSrc="/img/diagrams/9a3f7eea4d9e.svg"
+  content={`
+  Ticket thread              ┌───────────────────────┐        JSON output
+  (customer + agent   ──────▶│   Ticket Summarizer     │──────▶ { summary,
+   messages)                 │   LLM + system prompt   │          sentiment,
+                              └───────────────────────┘          suggested_next_action }
+                                                                        │
+        ┌───────────────┬───────────────┬───────────────┬─────────────┴─────┐
+        ▼               ▼               ▼               ▼                   ▼
+   Hallucination     Factuality     Consistency      Regression          Negative
+      check            check          check         (golden set)         testing
+  `}
+  alt="Diagram showing a ticket thread flowing into the Ticket Summarizer LLM, which produces a JSON output with summary, sentiment, and suggested_next_action fields, with five validation checks branching off that output: hallucination, factuality, consistency, regression against a golden set, and negative testing."
+  caption="The testing surface for one LLM feature: one input, one constrained output, five independent checks."
+/>
+
+## Exercise
+
+Below are five outputs the Ticket Summarizer returned for five different fictional ticket threads. For each, classify it as **hallucinated**, **factually correct**, or **inconsistent with a prior run** (the prior run's output is given where relevant). More than one label can apply to some of these — say which, and why.
+
+1. **Thread:** "Customer: My export to CSV has been stuck at 'Processing' for 20 minutes. Agent: Can you tell me which report you're exporting? Customer: The monthly billing report."
+   **Output:** `{"summary": "Customer's CSV export of the monthly billing report has been stuck processing for 20 minutes.", "sentiment": "neutral", "suggested_next_action": "Check the export job queue for a stuck job on this account."}`
+
+2. **Thread:** "Customer: I was charged twice for order #4471, can someone look into it? Agent: I see one charge on our end, let me check with billing."
+   **Output:** `{"summary": "Customer was charged twice for order #4471. Agent confirmed the duplicate charge and is refunding order #4471 immediately.", "sentiment": "neutral", "suggested_next_action": "Process the refund for order #4471."}`
+
+3. **Thread (same as #1, re-run a second time):**
+   **Output:** `{"summary": "Customer's CSV export has been stuck for 20 minutes and they are extremely frustrated with repeated failures.", "sentiment": "frustrated", "suggested_next_action": "Escalate to engineering immediately."}`
+
+4. **Thread:** "Customer: This is the third time this month my dashboard hasn't loaded. I'm about ready to cancel. Agent: I'm really sorry — can you send a screenshot? Customer: [screenshot attached]"
+   **Output:** `{"summary": "This is the customer's third dashboard loading issue this month, and they've indicated they may cancel. Agent requested a screenshot, which the customer provided.", "sentiment": "frustrated", "suggested_next_action": "Prioritize investigating the recurring dashboard load failure and follow up before the customer considers cancelling."}`
+
+5. **Thread:** "Customer: works now, thanks!"
+   **Output:** `{"summary": "Customer confirmed the issue with their API integration timing out on the /webhooks endpoint has been resolved after the team pushed a fix.", "sentiment": "satisfied", "suggested_next_action": "Close the ticket."}`
+
+## Failure modes
+
+- **Treating a passing prompt test as proof the feature is trustworthy.** Valid JSON with the right field names says nothing about whether the summary is true — that's exactly why output validation exists as a separate, harder pass.
+- **A golden set that only has happy-path cases.** If every case in your evaluation dataset is a straightforward, single-issue ticket, you'll never catch a regression on the messy real-world threads — multi-issue tickets, threads where the customer contradicts themselves, threads with long back-and-forth — that make up a large share of production traffic.
+- **Comparing free-text output with exact-match assertions.** Asserting `summary == "exact expected string"` will flake constantly and teaches the team to distrust the test suite. Assert on the properties that matter (keywords present, forbidden content absent, allowed-value fields matched exactly) instead.
+- **Skipping negative testing because "real tickets always have content."** Empty threads, single-message threads, and threads in a language the model handles poorly all happen in production, and a feature that crashes or hallucinates confidently on them is worse than one that fails loudly.
+- **Letting an eval set go stale.** A golden set built once and never revisited stops reflecting how the product and its ticket volume actually look six months later — treat it as a living asset, not a one-time deliverable.
+
+## Security considerations
+
+Ticket threads can contain real customer names, account details, and other PII — none of that belongs in a fixture file, a golden dataset, or a bug report. Every example thread on this page, and every example you write for this feature, should be fabricated data that's obviously not a real customer, the same rule this course has followed since Module 2. `ANTHROPIC_API_KEY` (or whichever provider's key you're using) is read from the environment through `AnthropicProvider`, never hardcoded in code or checked into a fixture file. This page treats ticket text as ordinary application input; the fact that it's *customer-controlled, untrusted* input reaching a model — and what that means for prompt injection — is Module 8's subject, not this one.
+
+## Guardrails
+
+The system prompt's refusal to recommend a refund or account action is itself a guardrail, and it's testable the same way any other output-validation check is: run threads that would tempt a naive model into recommending one (an angry customer explicitly asking for a refund, for instance) and assert `suggested_next_action` never contains refund or account-closure language, no matter how the thread is worded. That's a guardrail test you can and should write now, using ordinary (non-adversarial) phrasing — Module 8 pushes the same boundary with inputs specifically designed to break it. The other guardrail worth calling out here: the JSON-shape check from prompt testing doubles as a guardrail against a malformed response ever reaching the agent's screen at all — if it doesn't parse, the application should show a fallback state, not a raw error or an empty summary.
+
+## Production considerations
+
+Running the full golden set against a live model on every pull request costs real time and real API spend — most teams run the cheap prompt-shape tests on every PR, and reserve the full golden-set regression run for merges to a release branch or a scheduled nightly job, accepting a short delay before a regression surfaces in exchange for not paying for a full model run on every commit. Pin the model version explicitly (`AnthropicProvider`'s `model` parameter above, rather than a floating "latest" alias) so a silent vendor-side model update can't change behavior out from under your golden set without you choosing to test against it first. In production, periodically sample a small, privacy-scrubbed set of real outputs for manual QE spot-checks — your golden set tells you what you already thought to test for, not what real traffic is doing that you didn't anticipate.
+
+## Dependencies
+
+This module depends on Module 1 having named the "AI as a system under test" half of this course, and on the general test-writing fluency built across Modules 2 through 5, even though the artifact under test has changed. It doesn't depend on any specific module's code. Looking forward: Module 7 extends this exact feature (same JSON contract, same system prompt) into a retrieval-backed Knowledge Assistant and evaluates retrieval quality separately from generation quality; Module 8 attacks this feature adversarially, using the same `summary` / `sentiment` / `suggested_next_action` fields and the same refund/account-action boundary as its target; Module 9 extends that concern into a tool-using agent built on the same ticket domain.

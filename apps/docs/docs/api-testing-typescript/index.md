@@ -6,9 +6,11 @@ slug: /api-testing-typescript/
 
 # API Testing using TypeScript
 
-Estimated completion: 25-35 hours - Difficulty: Beginner to Advanced
+*Estimated completion time: 25–35 hours*
 
-## What This Is
+**Difficulty:** Beginner to Advanced
+
+## What This Course Covers
 
 API Testing using TypeScript is the complete reference for testing REST APIs with TypeScript, Jest, and Supertest. It starts from the basics — what API testing even covers, and how it's different from clicking through a UI — then moves quickly into writing real requests, real assertions, and real test suites, all the way through schema validation, RBAC-aware permission testing, security testing, and a CI pipeline that actually gates on the results.
 
@@ -16,35 +18,31 @@ Every example in this course runs against the same real system used across this 
 
 You test the same app from a growing number of angles as the course progresses — CRUD, schema, the full permission matrix across all 4 roles, negative cases, security — the way you would on a real project, instead of a different disposable example every lesson.
 
-## Modules
+## Why This Matters
 
-0. Setup
-1. API Testing Foundations
-2. In-Process vs Black-Box Testing
-3. TypeScript + Jest + Supertest Setup
-4. Writing Supertest Requests
-5. Async/Await + Jest
-6. Authentication + JWT
-7. CRUD API Testing
-8. Assertions + Response Validation
-9. Schema + Contract Validation
-10. OpenAPI Testing
-11. RBAC + Permission Matrix
-12. Negative + Edge-Case Testing
-13. API Security Testing
-14. Test Data + Fixtures
-15. Database Testing
-16. Mocking + Isolation
-17. Flaky Test Prevention
-18. Parameterized Testing
-19. Test Framework Architecture
-20. API Test Coverage
-21. Reporting + Diagnostics
-22. CI/CD + GitHub Actions
-23. Parallel Test Execution
-24. Smoke + Performance Testing
-25. Requirements → Test Design
-26. Capstone: API Automation
+Most production API test suites live in the same language as the rest of the team's codebase, and for a huge share of teams today that's TypeScript. Being able to write fast, in-process API tests — not just slower black-box HTTP calls — is what lets a suite run in seconds instead of minutes and gate every pull request instead of running once a night. This course builds that skill against a real Express backend, covering the same ground a real team's API test suite has to cover: auth, CRUD, schema, permissions, security, and CI.
+
+## Skills You Will Gain
+
+- Write REST API tests in TypeScript with Jest and Supertest
+- Distinguish in-process testing from black-box HTTP testing, and know when to use each
+- Implement JWT authentication once and reuse it across a suite through helpers
+- Validate responses against a schema and against an OpenAPI spec
+- Test role-based access control (RBAC) across a multi-role permission matrix
+- Write negative, edge-case, and security-focused tests
+- Structure fixtures, test data, and database state for a maintainable suite
+- Mock and isolate dependencies, and prevent flaky tests before they start
+- Parameterize tests, measure coverage, and wire a suite into CI/CD with GitHub Actions
+
+## Prerequisites
+
+- Basic JavaScript/TypeScript — variables, functions, `async`/`await`
+- No prior API testing or automation experience required
+- Comfortable running a backend service locally (covered in Module 0: Setup)
+
+## Course Roadmap
+
+<CourseCurriculum />
 
 ## How to Use This Course
 

@@ -34,6 +34,8 @@ interface BlogPost {
   description: string;
   content: string;
   cover_image_url: string | null;
+  featured_media_type: 'pdf' | 'youtube' | null;
+  featured_media_value: string | null;
   status: 'draft' | 'published';
 }
 

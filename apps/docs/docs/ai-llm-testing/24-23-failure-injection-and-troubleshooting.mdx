@@ -1,0 +1,139 @@
+---
+id: failure-injection-and-troubleshooting-deep-dive
+title: "Failure Injection & Troubleshooting Deep Dive"
+sidebar_label: "23. Failure Injection & Troubleshooting Deep Dive"
+sidebar_position: 24
+hide_table_of_contents: true
+---
+
+## Page purpose
+
+Every earlier module's failure came with the diagnosis attached, close by, in the same page. This page doesn't. It walks through three realistic Vespera failures — none of them fully diagnosed anywhere earlier in the course — using the complete Symptom → Hypothesis → Investigation → Evidence → Root Cause → Fix → Prevention pattern, and it uses the finished framework's own components (`eval_log.jsonl`, baseline comparison, the reporting layer) as the actual diagnostic tools, the way you'd really use them on the job.
+
+## Learning objectives
+
+By the end of this page, you should be able to:
+
+- Diagnose fluctuating evaluation scores using `eval_log.jsonl` instead of guessing.
+- Distinguish a real regression from a stale baseline blocking a release for the wrong reason.
+- Diagnose a coverage gap — a real user-facing failure that a 100%-passing suite never caught.
+
+## Failure one: evaluation scores fluctuating between nightly runs
+
+**Symptom.** Module 19's nightly full-evaluation job has been passing, but a QE reviewing Module 18's reports notices the pass rate isn't stable — 100% one night, 92% the next, back to 100% the night after, with no prompt or code changes in between.
+
+**Hypothesis.** Something that should be pinned for reproducibility isn't — Module 2 and Module 13 both flagged this exact risk category.
+
+**Investigation.** Pull the last several nights' log entries for the specific test cases that flipped, and compare their `config` fields side by side:
+
+```python
+from llmqe.observability.logger import read_log
+
+entries = [e for e in read_log() if e["test_case_id"] == "Does the Pro plan support SSO?"]
+for e in entries[-6:]:
+    print(e["timestamp"], e["config"], e["passed"], e["reason"])
+```
+
+**Evidence.** Every entry's `config` shows `{"temperature": 0, "seed": 42}` — the client-level settings are pinned correctly. But `evaluator_version` is `"v1"` for the passing nights and missing entirely (logged as `None`) for the failing ones — a strong signal the *evaluator*, not the client, is the unpinned piece.
+
+**Root cause.** Checking `llmqe/eval/judge.py`, Module 21's `OllamaClient(provider=fake_provider)` refactor was applied to `client.py`, but `judge_answer()` still constructs its own `OllamaClient(temperature=0)` directly — and a recent edit (made while testing Module 20's refactor) temporarily changed that line to `OllamaClient(temperature=0.7)` for an unrelated experiment, and never got changed back. The judge itself has been running at a non-zero temperature on some nights depending on which code checkout the nightly job happened to pick up.
+
+**Fix.** Pin `judge_answer()`'s temperature explicitly, and bump `evaluator_version` in `config.py` so every future log entry can be told apart from runs made under the old, accidentally-unpinned judge:
+
+```python
+def judge_answer(question: str, reference_answer: str, candidate_answer: str) -> dict:
+    client = OllamaClient(temperature=0, seed=CONFIG.seed)  # explicit, not left to a stray edit
+    ...
+```
+
+**Prevention.** This is exactly the scattered-configuration problem Module 20 fixed for `prompt_version`/`dataset_version` — and the fix here is the same principle, applied to a spot the earlier refactor missed: every place that constructs an `OllamaClient` for evaluation purposes should pull its settings from `CONFIG`, not a locally hardcoded literal, so a stray experimental edit can't silently drift back into "production" evaluation behavior unnoticed.
+
+## Failure two: a CI gate blocks a release that isn't actually regressed
+
+**Symptom.** Module 19's nightly job reports `should_block_release: True` the morning of a planned release. A QE, remembering Module 19's real safety-regression incident, expects to find another safety failure — but `blocking_failures` is empty, and `total_diffs` shows one entry: a brand-new test case with `"change": "new test case, no prior baseline"`.
+
+**Hypothesis.** This isn't a regression at all — it's a baseline that was never updated after Module 15's `qa_dataset.jsonl` gained a new case, and `run_regression_suite()`'s `should_block_release` logic is treating "no prior baseline" the same as "an actual failure."
+
+**Investigation.** Check `run_regression_suite()`'s definition from Module 14 against this exact situation:
+
+```python
+def run_regression_suite(baseline_name, current_records, max_new_failures=0, block_categories=CONFIG.block_categories):
+    diffs = compare_to_baseline(baseline_name, current_records)
+    new_failures = [d for d in diffs if "True -> False" in d.get("change", "")]
+    blocking = [d for d in new_failures if d.get("current_reason") in block_categories]
+    over_threshold = len(new_failures) > max_new_failures
+    return {..., "should_block_release": bool(blocking) or over_threshold}
+```
+
+**Evidence.** `new_failures` only matches `"change"` strings containing `"True -> False"` — a "new test case, no prior baseline" diff doesn't match that pattern, so `new_failures` is actually empty, and `over_threshold` is `False`. Re-reading the actual returned dictionary rather than assuming from the summary shows `blocking_failures` is genuinely empty and `should_block_release` is in fact `False` — the release was never blocked at all. The "block" a QE thought they saw was a misreading of the report, not a real gate failure.
+
+**Root cause.** This one isn't a code bug — it's a **reporting clarity gap**: Module 18's `render_report()` doesn't currently distinguish "a new case with no baseline yet" from "everything's fine," so a QE skimming the summary section saw `total_diffs: 1` and assumed the worst without reading the detail.
+
+**Fix.** Improve the report, not the gate logic — the gate was correct the whole time:
+
+```python
+# llmqe/reporting/report.py (addition)
+def render_report(summary: dict) -> str:
+    lines = [...]  # as in Module 18
+    new_cases = [d for d in summary.get("diffs", []) if "no prior baseline" in d.get("change", "")]
+    if new_cases:
+        lines += ["", "## New test cases (no baseline yet — not a regression)", ""]
+        for d in new_cases:
+            lines.append(f"- `{d['test_case']}`")
+    return "\n".join(lines)
+```
+
+**Prevention.** This is worth sitting with: not every alarming-looking report line is a real problem, and not every real problem announces itself clearly. Both failures in this module cost real investigation time — the first because a config value drifted silently, the second because a report didn't distinguish two genuinely different situations clearly enough. Good observability (Module 17) and good reporting (Module 18) are what make the difference between a five-minute check and a stressful morning before a release.
+
+## Failure three: a 100%-passing suite, and a real complaint anyway
+
+**Symptom.** Module 19's nightly suite has passed at 100% for two straight weeks. A support agent still reports the assistant gave a wrong answer about whether Vespera offers a free trial — a question the framework has never actually tested.
+
+**Hypothesis.** This isn't an evaluator problem (Module 8) or a regression (Module 14) — it's a **coverage gap**: the golden dataset (Module 7) simply never included a free-trial question, so nothing about this failure mode was ever exercised, pass or fail.
+
+**Investigation.** Check `qa_dataset.jsonl` and `retrieval_dataset.jsonl` directly for any case resembling the agent's report.
+
+**Evidence.** Neither file contains a free-trial-related question, and `llmqe/rag/documents.py`'s knowledge base has no document about trial terms at all — this is simultaneously a missing-document problem (Module 10's category) *and* a dataset coverage gap (nobody wrote a test for it, so the missing document was never caught by anything automated).
+
+**Root cause.** A 100% pass rate only ever means "every case someone thought to write passed" — Module 6 said this explicitly the first time a validation layer was introduced, and it's easy to forget nine modules later when a report has been green for two weeks straight. No amount of evaluator sophistication (Module 7), regression discipline (Module 14), or CI automation (Module 19) compensates for a dataset that never asked the right question in the first place.
+
+**Fix.** Two additions, not one: a new document (`llmqe/rag/documents.py`) with real free-trial information, and a new case in both `qa_dataset.jsonl` and `retrieval_dataset.jsonl` covering it — closing the gap in both the knowledge base and the test coverage, since fixing only one would leave the other silently incomplete again.
+
+**Prevention.** Treat every real production complaint — not just Vespera's fictional ones — as a mandatory new test case, added before the underlying issue is even fixed if possible, exactly the discipline Module 5's rate-limit hallucination test modeled back at the start of the course. A framework only ever tests what someone remembered to ask it to.
+
+## Diagram
+
+<AsciiDiagram
+  id="ai-llm-testing/failure-injection-and-troubleshooting-deep-dive"
+  mermaidSrc="/img/diagrams/97338d8602fe.svg"
+  content={`
+  Observed symptom
+        │
+        ▼
+  ┌───────────────────────────────────────────┐
+  │  Is it in the LOG?         (eval_log.jsonl)  │  Module 17
+  │  Is it in the BASELINE?    (compare_to_      │  Module 13-14
+  │                              baseline)         │
+  │  Is it in the REPORT?      (render_report)    │  Module 18
+  │  Is it in the DATASET at all?                  │  Module 7, this module
+  └───────────────────────────────────────────┘
+        │                 │                 │
+        ▼                 ▼                 ▼
+  Config drift       Misread report      Coverage gap
+  (failure one)       (failure two)       (failure three)
+  `}
+  alt="Diagram showing a troubleshooting flow starting from an observed symptom, checking the log, the baseline, the report, and the dataset in turn, leading to three distinct root causes covered in this module: config drift, a misread report, and a coverage gap."
+  caption="The finished framework is the diagnostic tool — three different root causes, found three different ways."
+/>
+
+## Learning checkpoint
+
+Before continuing to Module 24, you should now be able to:
+
+- Diagnose all three failures in this module from their symptoms alone, without re-reading the investigation steps.
+- Explain why failure two wasn't actually a gate bug, and what it revealed about report clarity instead.
+- State, in your own words, why a 100% pass rate never proves the absence of coverage gaps.
+
+## What's next
+
+Module 24 turns the finished framework and everything you've diagnosed across this course into a portfolio piece — README, architecture summary, and the reflection questions you'll need answers to in a real interview.

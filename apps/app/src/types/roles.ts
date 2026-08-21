@@ -6,7 +6,8 @@ export type Role =
   | 'company_hr'
   | 'company_employees'
   | 'branders'
-  | 'external_job_poster';
+  | 'external_job_poster'
+  | 'cohort_users';
 
 export const ROLES: { value: Role; label: string }[] = [
   { value: 'admin', label: 'Admin' },
@@ -17,12 +18,14 @@ export const ROLES: { value: Role; label: string }[] = [
   { value: 'company_employees', label: 'Company Employees' },
   { value: 'branders', label: 'Branders' },
   { value: 'external_job_poster', label: 'External Job Poster' },
+  { value: 'cohort_users', label: 'Cohort Users' },
 ];
 
-// company_employees access is configured per-company on the Companies tab,
-// not globally — so it's excluded from the global Courses/Sidebar grids.
+// company_employees access is configured per-company (Companies tab) and
+// cohort_users access is configured per-cohort (Launch Cohort's roster panel),
+// not globally — both are excluded from the global Courses/Sidebar grids.
 export const GLOBALLY_CONFIGURABLE_ROLES = ROLES.filter(
-  (r) => r.value !== 'admin' && r.value !== 'company_employees'
+  (r) => r.value !== 'admin' && r.value !== 'company_employees' && r.value !== 'cohort_users'
 );
 
 // Dashboard and Profile show the full course-browsing / candidate-profile

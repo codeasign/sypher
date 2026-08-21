@@ -110,7 +110,10 @@ export async function getBlogPostById(supabase, id) {
   return data;
 }
 
-export async function createBlogPost(supabase, { title, description, content, coverImageUrl, authorId }) {
+export async function createBlogPost(
+  supabase,
+  { title, description, content, coverImageUrl, featuredMediaType, featuredMediaValue, authorId }
+) {
   if (!supabase) return { error: 'Not authenticated', post: null };
   const slug = await findAvailableSlug(supabase, slugify(title));
   const { data, error } = await supabase
@@ -121,6 +124,8 @@ export async function createBlogPost(supabase, { title, description, content, co
       description,
       content: content ?? '',
       cover_image_url: coverImageUrl ?? null,
+      featured_media_type: featuredMediaType ?? null,
+      featured_media_value: featuredMediaValue ?? null,
       status: 'draft',
       author_id: authorId ?? null,
     })

@@ -1,10 +1,34 @@
 'use client';
 
-import React, { useState } from 'react';
-import { useAuth } from '@/contexts/AuthContext';
-import { createCohort, updateCohort, setCohortStatus, slugify } from '@/data/cohorts';
-import { uploadToBunny } from '@/data/bunnyUpload';
-import styles from './styles.module.css';
+import React, { useEffect, useState } from 'react';
+import type { ComponentType } from 'react';
+
+// @mdxeditor/editor -> @lexical/code statically imports a fixed set of
+// prism-*.js language files, some of which extend a base language that must
+// already be registered (e.g. objectivec/cpp extend c, which extends
+// clike). Under Rspack, that whole import chain gets bundled into a
+// dynamically-loaded vendor chunk whose *internal* module execution order
+// isn't guaranteed to match source order, so a dependent language's module
+// can run before its base language's module and Prism.languages.extend()
+// throws "Cannot set properties of undefined" on the missing base -- which
+// aborts the entire chunk's evaluation and leaves this loader's dynamic
+// import() promise permanently unresolved.
+//
+// Rather than fight Rspack's chunk ordering, make Prism.languages.extend()
+// tolerate a not-yet-registered base language (falling back to an empty
+// object, same as Prism.util.clone(undefined) would if it didn't throw).
+// This runs in the eagerly-loaded bundle, before the dynamic import() can
+// fire, so the patch is guaranteed to be in place first. Duplicated from
+// BlogPostEditor/CourseEditor/ModuleEditor/JobDescriptionEditor -- same
+// @mdxeditor/editor bundling issue, applies per-entrypoint.
+const Prism = require('prismjs');
+const originalExtend = Prism.languages.extend;
+Prism.languages.extend = function patchedExtend(id: string, redef: object) {
+  if (!Prism.languages[id]) {
+    Prism.languages[id] = {};
+  }
+  return originalExtend.call(Prism.languages, id, redef);
+};
 
 interface Cohort {
   id: string;
@@ -24,181 +48,23 @@ interface CohortEditorProps {
   cohort?: Cohort | null;
   onSaved: () => void;
   onCancel: () => void;
+  onBack?: () => void;
 }
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
+function CohortEditorLoader(props: CohortEditorProps): React.JSX.Element {
+  const [Inner, setInner] = useState<ComponentType<CohortEditorProps> | null>(null);
 
-export default function CohortEditor({ cohort, onSaved, onCancel }: CohortEditorProps): React.JSX.Element {
-  const { supabase, user } = useAuth();
-  const isEditing = Boolean(cohort);
+  useEffect(() => {
+    import('./CohortEditorInner').then((mod) => setInner(() => mod.default));
+  }, []);
 
-  const [title, setTitle] = useState(cohort?.title ?? '');
-  const [description, setDescription] = useState(cohort?.description ?? '');
-  const [content, setContent] = useState(cohort?.content ?? '');
-  const [coverImageUrl, setCoverImageUrl] = useState(cohort?.cover_image_url ?? '');
-  const [startDate, setStartDate] = useState(cohort?.start_date ?? '');
-  const [durationWeeks, setDurationWeeks] = useState(cohort?.duration_weeks?.toString() ?? '');
-  const [seatsTotal, setSeatsTotal] = useState(cohort?.seats_total?.toString() ?? '');
-  const [priceLabel, setPriceLabel] = useState(cohort?.price_label ?? '');
-  const [coverUploading, setCoverUploading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function handleCoverUpload(file: File): Promise<void> {
-    setCoverUploading(true);
-    setError(null);
-    try {
-      const url = await uploadToBunny(file, 'cohorts/covers', BUNNY_CONFIG);
-      setCoverImageUrl(url);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to upload cover image.');
-    } finally {
-      setCoverUploading(false);
-    }
+  if (!Inner) {
+    return <p role="status">Loading editor…</p>;
   }
 
-  function currentFields() {
-    return {
-      title,
-      description,
-      content,
-      coverImageUrl: coverImageUrl || null,
-      startDate: startDate || null,
-      durationWeeks: durationWeeks ? Number(durationWeeks) : null,
-      seatsTotal: seatsTotal ? Number(seatsTotal) : null,
-      priceLabel: priceLabel || null,
-    };
-  }
+  return <Inner {...props} />;
+}
 
-  async function persist(nextStatus?: 'draft' | 'live' | 'closed'): Promise<void> {
-    if (!title.trim() || !description.trim()) {
-      setError('Title and description are required.');
-      return;
-    }
-    setSaving(true);
-    setError(null);
-
-    try {
-      if (!isEditing) {
-        const { error: createError, cohort: created } = await createCohort(supabase, {
-          ...currentFields(),
-          createdBy: user?.id,
-        });
-        if (createError || !created) {
-          setError(createError ?? 'Failed to create cohort.');
-          return;
-        }
-        if (nextStatus) {
-          const { error: statusError } = await setCohortStatus(supabase, created.id, nextStatus);
-          if (statusError) {
-            setError(statusError);
-            return;
-          }
-        }
-      } else {
-        const fields = currentFields();
-        const { error: updateError } = await updateCohort(supabase, cohort!.id, {
-          title: fields.title,
-          description: fields.description,
-          content: fields.content,
-          cover_image_url: fields.coverImageUrl,
-          start_date: fields.startDate,
-          duration_weeks: fields.durationWeeks,
-          seats_total: fields.seatsTotal,
-          price_label: fields.priceLabel,
-        });
-        if (updateError) {
-          setError(updateError);
-          return;
-        }
-        if (nextStatus && nextStatus !== cohort!.status) {
-          const { error: statusError } = await setCohortStatus(supabase, cohort!.id, nextStatus);
-          if (statusError) {
-            setError(statusError);
-            return;
-          }
-        }
-      }
-      onSaved();
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className={styles.editor}>
-      <button type="button" className={styles.backBtn} onClick={onCancel}>← Back</button>
-
-      <div className={styles.formGroup}>
-        <label className={styles.fieldLabel} htmlFor="cohort-title">Title</label>
-        <input id="cohort-title" type="text" className={styles.textInput} value={title} onChange={(e) => setTitle(e.target.value)} />
-        {title && <p className={styles.slugPreview}>Slug: {isEditing ? cohort!.slug : slugify(title)}</p>}
-      </div>
-
-      <div className={styles.formGroup}>
-        <label className={styles.fieldLabel} htmlFor="cohort-description">Short description (card + SEO, max 120 chars)</label>
-        <input id="cohort-description" type="text" maxLength={120} className={styles.textInput} value={description} onChange={(e) => setDescription(e.target.value)} />
-      </div>
-
-      <div className={styles.formRow}>
-        <div className={styles.formGroup}>
-          <label className={styles.fieldLabel} htmlFor="cohort-start-date">Start date</label>
-          <input id="cohort-start-date" type="date" className={styles.textInput} value={startDate} onChange={(e) => setStartDate(e.target.value)} />
-        </div>
-        <div className={styles.formGroup}>
-          <label className={styles.fieldLabel} htmlFor="cohort-duration">Duration (weeks)</label>
-          <input id="cohort-duration" type="number" min={1} className={styles.textInput} value={durationWeeks} onChange={(e) => setDurationWeeks(e.target.value)} />
-        </div>
-      </div>
-
-      <div className={styles.formRow}>
-        <div className={styles.formGroup}>
-          <label className={styles.fieldLabel} htmlFor="cohort-seats">Seats (informational only — not enforced)</label>
-          <input id="cohort-seats" type="number" min={1} className={styles.textInput} value={seatsTotal} onChange={(e) => setSeatsTotal(e.target.value)} />
-        </div>
-        <div className={styles.formGroup}>
-          <label className={styles.fieldLabel} htmlFor="cohort-price">Price label</label>
-          <input id="cohort-price" type="text" placeholder="e.g. $499 or Free" className={styles.textInput} value={priceLabel} onChange={(e) => setPriceLabel(e.target.value)} />
-        </div>
-      </div>
-
-      <div className={styles.formGroup}>
-        <label className={styles.fieldLabel}>Cover image</label>
-        {coverImageUrl && <img src={coverImageUrl} alt="Cover preview" className={styles.coverPreview} />}
-        <input
-          type="file"
-          accept="image/*"
-          disabled={coverUploading}
-          onChange={(e) => { const file = e.target.files?.[0]; if (file) handleCoverUpload(file); }}
-        />
-        {coverUploading && <p className={styles.uploadStatus}>Uploading…</p>}
-      </div>
-
-      <div className={styles.formGroup}>
-        <label className={styles.fieldLabel} htmlFor="cohort-content">Details (markdown)</label>
-        <textarea id="cohort-content" className={styles.contentTextarea} rows={14} value={content} onChange={(e) => setContent(e.target.value)} />
-      </div>
-
-      {error && <p className={styles.formError}>{error}</p>}
-
-      <div className={styles.actions}>
-        <button type="button" className={styles.secondaryBtn} disabled={saving} onClick={() => persist('draft')}>
-          {saving ? 'Saving…' : 'Save Draft'}
-        </button>
-        <button type="button" className={styles.primaryBtn} disabled={saving} onClick={() => persist('live')}>
-          {saving ? 'Saving…' : isEditing && cohort!.status === 'live' ? 'Republish' : 'Publish (Live)'}
-        </button>
-        {isEditing && cohort!.status === 'live' && (
-          <button type="button" className={styles.dangerBtn} disabled={saving} onClick={() => persist('closed')}>
-            Close
-          </button>
-        )}
-      </div>
-    </div>
-  );
+export default function CohortEditor(props: CohortEditorProps): React.JSX.Element {
+  return <CohortEditorLoader {...props} />;
 }

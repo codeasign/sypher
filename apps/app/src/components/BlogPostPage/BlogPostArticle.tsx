@@ -3,9 +3,12 @@
 import React, { useEffect } from 'react';
 import Link from 'next/link';
 import ReactMarkdown from 'react-markdown';
+import remarkBreaks from 'remark-breaks';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import CodeBlock from './CodeBlock';
+import PdfEmbed from '@/components/PdfEmbed';
+import YouTube from '@/components/YouTube';
 import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
@@ -19,6 +22,8 @@ interface BlogPostArticleProps {
   title: string;
   content: string;
   coverImageUrl: string | null;
+  featuredMediaType?: 'pdf' | 'youtube' | null;
+  featuredMediaValue?: string | null;
   date: string | null;
   authorName?: string | null;
   authorBio?: string | null;
@@ -36,6 +41,8 @@ export default function BlogPostArticle({
   title,
   content,
   coverImageUrl,
+  featuredMediaType,
+  featuredMediaValue,
   date,
   authorName,
   authorBio,
@@ -60,8 +67,15 @@ export default function BlogPostArticle({
           <span className={styles.dateLabel}>Posted On:</span> {formatDate(date)}
         </p>
       )}
+      {featuredMediaType === 'pdf' && featuredMediaValue && (
+        <PdfEmbed src={featuredMediaValue} title={title} />
+      )}
+      {featuredMediaType === 'youtube' && featuredMediaValue && (
+        <YouTube id={featuredMediaValue} title={title} />
+      )}
       <div className={styles.body}>
         <ReactMarkdown
+          remarkPlugins={[remarkBreaks]}
           rehypePlugins={[rehypeRaw, [rehypeSanitize, schema]]}
           components={{ pre: CodeBlock }}
         >

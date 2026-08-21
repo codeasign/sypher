@@ -6,9 +6,11 @@ slug: /python-for-test-automation/
 
 # Python for Test Automation
 
-Estimated completion: 4-6 hours - Difficulty: Beginner, no programming background assumed
+*Estimated completion time: 4–6 hours*
 
-## What This Is
+**Difficulty:** Beginner, no programming background assumed
+
+## What This Course Covers
 
 Python for Test Automation is a short, fast on-ramp for manual testers moving into test automation for the first time. It assumes no programming experience at all, and teaches only what's needed to confidently read and write a basic Python test — not the language in depth.
 
@@ -16,19 +18,27 @@ Every example in this course runs against the same real system used across this 
 
 This course is deliberately not a substitute for learning the full language — it closes by pointing you toward Python for AI Engineers for depth, and naming realistic next steps (Selenium, Playwright's Python bindings, API testing with `requests`) once you're past this on-ramp.
 
-## Modules
+## Why This Matters
 
-0. Setup
-1. Just Enough Python to Read a Test
-2. Functions and Imports
-3. Setting Up pytest
-4. Lists, Dicts, and Sets — Working with Test Data
-5. Type Hints for Test Data
-6. Calling APIs and Understanding Responses
-7. Classes, Briefly
-8. Fixtures and pytest Conventions
-9. Structuring a Simple Test Project
-10. Capstone: Modeling the RBAC Permission Matrix
+Manual testers who can read and write basic automation code move into automation roles faster than those who wait to "learn programming" as a separate project first. Most of what blocks that move isn't the language — it's not knowing which small slice of it actually matters for reading a test. This course teaches exactly that slice, against a real app, so you're productive in hours instead of weeks.
+
+## Skills You Will Gain
+
+- Read and write basic Python: variables, functions, imports, and just enough syntax to follow a test
+- Work with lists, dicts, and sets to model real test data
+- Set up and run tests with pytest, including fixtures and basic conventions
+- Call a real API and reason about its response
+- Structure a simple, readable test project
+- Model a real-world permission matrix as data and test against it
+
+## Prerequisites
+
+- No programming experience required — this course starts from zero
+- Comfortable using a terminal to run commands
+
+## Course Roadmap
+
+<CourseCurriculum />
 
 ## How to Use This Course
 

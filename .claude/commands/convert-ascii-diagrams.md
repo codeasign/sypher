@@ -77,12 +77,57 @@ file, or only a render) is not converted.
 
 1. Read the diagram's `content` (the original ASCII/Unicode-box-drawing) and
    the prose immediately around it for context.
-2. Write a faithful Mermaid equivalent — `flowchart`/`graph` for
-   architecture/relationship diagrams, `sequenceDiagram` for
-   request/response or step-by-step interactions, `erDiagram` if it's
-   entity-relationship. Preserve box contents, labels, and arrow
-   directions/meaning exactly. Don't invent connections or drop labels.
-3. Save it as its own file:
+2. **Get the type recommendation from the classifier before making your own
+   judgment call — this is a real script, not a suggestion to eyeball:**
+
+   ```bash
+   node scripts/classify-diagram-type.mjs <course-slug> --id <the-diagram's-id>
+   ```
+
+   (Or classify the whole course/file in one call and look up each `id` in
+   the output — cheaper than one process per diagram when converting many
+   at once: `node scripts/classify-diagram-type.mjs <course-slug>`.)
+
+   - **`confidence: "clear-match"`** — use the `recommendedType` directly.
+     Don't second-guess a clear-match with your own read of the content;
+     the script's pattern-matching was tuned specifically to avoid false
+     positives (validated against known classDiagram- and flowchart-shaped
+     content in this repo — see the script's own header comments for what
+     each signal requires and why weak signals alone don't qualify).
+   - **`confidence: "ambiguous"`** — *now* apply your own judgment, using
+     the `scores`/`signals` in the output plus the type-selection guidance
+     below as a starting point. This is the only case that should spend a
+     judgment call on type selection at all.
+3. Write a faithful Mermaid equivalent of the type the previous step
+   settled on:
+   - `flowchart`/`graph` for architecture/relationship diagrams (boxes and
+     arrows showing components, data flow, or a decision tree).
+   - `sequenceDiagram` for request/response or step-by-step
+     time-ordered interactions between actors.
+   - `erDiagram` for entity-relationship / database schema content.
+   - `classDiagram` for UML-shaped structure: class/interface boxes with
+     attribute or method compartments, visibility markers (`+`/`-`/`#`),
+     `<<interface>>`/`<<abstract>>` stereotypes, or `extends`/`implements`
+     relationship arrows. This is common in pattern- and OOP-principle-style
+     content — a box with a divider line separating a name from a list of
+     method signatures underneath is the tell. See the classDiagram syntax
+     notes below before writing one.
+   - `stateDiagram-v2` for a state machine / lifecycle diagram — named
+     states with labeled transitions between them, not a linear pipeline.
+     See the stateDiagram-v2 syntax notes below.
+
+   A single diagram can be legitimately ambiguous — e.g. a "before/after"
+   panel comparison that *contains* class-shaped boxes is still better
+   served by `flowchart` (with subgraphs for each panel) than by
+   `classDiagram`, because `classDiagram` has no concept of an arbitrary
+   panel/annotation framing. Judge by what the diagram is actually doing,
+   not just whether individual boxes look class-shaped. (This is exactly
+   the kind of case the classifier reports as `ambiguous` rather than
+   guessing — trust that signal instead of overriding a `clear-match`.)
+
+   Preserve box contents, labels, and arrow directions/meaning exactly.
+   Don't invent connections or drop labels.
+4. Save it as its own file:
    `.cache/ascii-to-mermaid/<course-page-slug>-N.mmd` (N = 1-based index of
    that diagram within its file, in source order). Plain Mermaid source
    only, no markdown fences in the `.mmd` file.
@@ -163,6 +208,87 @@ don't guess):**
   the whole batch. Don't trust "I matched the existing convention" as
   proof of correctness.
 
+**`classDiagram` syntax notes — no prior examples exist in this repo (997
+cached `.mmd` files as of this writing: 946 `flowchart`, 51
+`sequenceDiagram`, 0 `classDiagram`), so treat everything below as
+needing empirical verification on the first real batch, not settled fact:**
+
+```
+classDiagram
+  direction LR
+
+  class BankFactory {
+    <<interface>>
+    +createSavingsAccount(holder, amount) Account
+    +createCheckingAccount(holder, amount) Account
+  }
+
+  class PersonalBankingFactory {
+    +createSavingsAccount(holder, amount) Account
+  }
+
+  BankFactory <|.. PersonalBankingFactory
+  PersonalBankingFactory --> Account : creates
+```
+
+- `direction LR` / `direction TB` as the first line inside the diagram
+  works the same way as flowchart's direction hint, and the same
+  landscape-band rules below apply — a tall chain of classes needs `LR`
+  just like a flowchart would.
+- Compartments: `+public`, `-private`, `#protected`, `~package` prefix a
+  field or method to show visibility — carry these over from the ASCII if
+  the original used similar markers (many of this repo's source diagrams
+  already write `+methodName(...)` by convention), otherwise omit the
+  prefix rather than guessing a visibility that isn't in the original.
+- Stereotypes (`<<interface>>`, `<<abstract>>`, `<<enumeration>>`) go as
+  their own line, first inside the `class { }` block.
+- Relationship arrows carry real semantic meaning — pick the one that
+  matches the original ASCII's arrow label, don't default to a plain line:
+  `<|--` inheritance/extends, `<|..` realization/implements, `*--`
+  composition, `o--` aggregation, `-->` plain association, `..>`
+  dependency. An ASCII diagram labeled "implements" or drawn with a
+  hollow-arrow-to-interface convention maps to `<|..`; "extends" maps to
+  `<|--`.
+- **Generics use `~T~`, not `<T>`.** `List<String>` in a method signature
+  must be written `List~String~` — Mermaid's classDiagram grammar reserves
+  `<` and `>` for stereotypes and relationship arrows, so a literal angle
+  bracket in a label breaks parsing. This is the single most likely
+  silent-corruption trap when porting method signatures verbatim from
+  ASCII source that used `<T>`-style generics. Confirm this renders
+  correctly on the very first pilot diagram before trusting it across a
+  whole batch.
+- Method signatures otherwise render as plain text — the `&amp;`/`&quot;`/
+  `&lt;`/`&gt;` entity rules from the flowchart section above apply the
+  same way inside class member lines.
+
+**`stateDiagram-v2` syntax notes — also zero prior examples in this repo:**
+
+```
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Processing : request received
+  Processing --> Idle : success
+  Processing --> Failed : error
+  Failed --> Idle : retry
+  Idle --> [*]
+
+  state Processing {
+    [*] --> Validating
+    Validating --> Executing
+  }
+```
+
+- `[*]` is the start/end pseudostate — every state diagram needs at least
+  one `[*] --> FirstState` to show the entry point.
+- `StateA --> StateB : label` — the label is the triggering event or
+  condition; carry it over from whatever the ASCII arrow was annotated
+  with instead of dropping it.
+- Nested/composite states use `state Name { ... }` with the same `[*] -->`
+  entry-point convention inside the block, for a state that itself
+  contains sub-states in the original diagram.
+- `note right of StateName : text` / `note left of StateName : text` for
+  any annotation that doesn't fit as a transition label.
+
 **Keep the diagram in a landscape band — this is not optional, and it's not
 just about avoiding "too wide."** The component CSS renders the image at
 `width: 100%` with the aspect ratio locked (`apps/docs/src/components/AsciiDiagram/styles.module.css`).
@@ -208,32 +334,13 @@ but not extremely wide. Concretely:
   stacks vertically inside the node) rather than letting one long line
   push the node — and the whole diagram — wider.
 
-After Phase 2b's render step, check every new SVG's actual dimensions
-before wiring anything in — this checks the landscape band, not just a
-width ceiling:
-
-```bash
-node -e "
-const fs = require('fs');
-for (const f of fs.readdirSync('apps/docs/static/img/diagrams')) {
-  if (!f.endsWith('.svg')) continue;
-  const svg = fs.readFileSync('apps/docs/static/img/diagrams/' + f, 'utf8');
-  const m = svg.match(/viewBox=\"([^\"]*)\"/);
-  if (!m) continue;
-  const [, , w, h] = m[1].split(/\s+/).map(Number);
-  const ratio = w / h;
-  if (w > 1400 || ratio > 3.5 || ratio < 1.3) console.log(f, 'w=' + Math.round(w), 'h=' + Math.round(h), 'ratio=' + ratio.toFixed(2));
-}
-"
-```
-
-Any diagram flagged here — too wide (ratio over ~3.5, or absolute width
-over ~1400px) *or* too narrow/portrait (ratio under ~1.3) — needs
-restructuring (switch direction between `LR`/`TD`, split a wide row into
-two via subgraphs, or shorten labels) and re-rendering before moving on.
-Don't wire in a diagram that fails this check just because it rendered
-without an error — rendering successfully and looking right at page width
-are different things.
+**This check is enforced by a real script, not a manual step** —
+`scripts/check-landscape-band.mjs`, run as part of Phase 2b below. It
+renders, checks the band, and automatically retries once with a flipped
+direction where that's mechanically possible, before you ever see the
+result. Use the guidance above to write a good first draft (fewer retry
+cycles), but the actual pass/fail gate happens in 2b, not by eyeballing
+output here.
 
 **Corrupted content**: if a diagram's `content` is unreadable garbage (a
 historical encoding-corruption incident affected some diagrams in this
@@ -254,30 +361,42 @@ numbers) rather than touching the source `.mdx` yet. Do 2b and 2c centrally
 yourself once every agent's `.mmd` files exist, so hash naming and the
 background flag stay consistent.
 
-### 2b. Render every diagram (background color MUST stay consistent)
+### 2b. Render + landscape-band gate (enforced by script, not eyeballed)
 
-Render every new `.mmd` file with `mmdc`, **always** with a transparent
-background — never vary this flag between diagrams, courses, or runs. A
-mix of transparent and white/colored backgrounds is a visible inconsistency
-across the site.
-
-If `scripts/render-mermaid-manifest.mjs` exists in the repo, reuse it as-is
-— it already does this correctly (hashes each `.mmd` by content, renders to
-`apps/docs/static/img/diagrams/<hash>.svg` via
-`mmdc -i <file> -o <out> -b transparent`, retries once on failure, writes a
-manifest). Run it from `apps/docs`:
+Render and check every new `.mmd` file with the checked-in gate script:
 
 ```bash
-node ../../scripts/render-mermaid-manifest.mjs docs
+node scripts/check-landscape-band.mjs .cache/ascii-to-mermaid/<file-1>.mmd .cache/ascii-to-mermaid/<file-2>.mmd ...
 ```
 
-If it doesn't exist, write it (or an equivalent) rather than inlining a
-one-off `mmdc` call per diagram. Confirm `@mermaid-js/mermaid-cli` is a
-devDependency of `apps/docs` first (`npm install --save-dev
-@mermaid-js/mermaid-cli` if missing).
+It always renders with `mmdc -b transparent` (never vary this flag between
+diagrams, courses, or runs — a mix of transparent and white/colored
+backgrounds is a visible inconsistency across the site), then checks the
+band (`w<=1400`, `ratio 1.3-3.5`). For any diagram type with a direction
+hint it can flip (`flowchart <DIR>`/`graph <DIR>` as the declaration line,
+or a standalone `direction <DIR>` line — covers flowchart, classDiagram,
+stateDiagram-v2), it automatically flips and retries **once** if the first
+render fails. Diagrams with no direction hint (sequenceDiagram, erDiagram)
+get one render+check, no retry — there's nothing to mechanically flip.
 
-Any renders that fail: retry once, then log the diagram and error and move
-on — never leave the whole course conversion blocked by one bad diagram.
+Exit code is `0` only if every input passed. Read the output:
+- `PASS <file> ... -> <svgPath>` — use that `svgPath`'s hash in 2c.
+- `FAIL <file> <reason>` — needs manual restructuring (shorten labels,
+  split rows/subgraphs, reconsider diagram type per the guidance in 2a).
+  Fix the `.mmd`, re-run the script on just that file, don't proceed to 2c
+  for it until it reports `PASS`.
+
+**A diagram that isn't reported `PASS` by this script must never be wired
+in.** This replaced an earlier version of this step that was a manual
+`node -e` snippet + judgment call — validation found ~21% of already-wired
+diagrams repo-wide fell outside the band because that manual step wasn't
+consistently followed. This script is the actual enforcement now, not a
+suggestion.
+
+(`scripts/render-mermaid-manifest.mjs` still exists for *bulk* re-rendering
+of already-`.mmd`'d content — e.g. after a global style change — but it
+doesn't band-check. It is not the tool for wiring in new diagrams; use
+`check-landscape-band.mjs` for that.)
 
 **Spot-check the render output before wiring anything in** — this is not
 optional, it's how the numeric-entity bug above was caught:
@@ -288,15 +407,17 @@ grep -lE '&amp;\{|&amp;\}|&amp;#[0-9]' apps/docs/static/img/diagrams/*.svg
 
 Any match is a real bug in that diagram's source label — fix the `.mmd`
 (usually: strip the numeric entity down to the bare character) and
-re-render before moving to 2c.
+re-run `check-landscape-band.mjs` on that file before moving to 2c.
 
 ### 2c. Wire every diagram in
 
-For every converted diagram, add `mermaidSrc="/img/diagrams/<hash>.svg"` as
-a new prop on its `<AsciiDiagram>` tag, using the hash from the manifest.
-Nothing else about the tag changes — `id`, `content`, `alt`, `caption` all
-stay exactly as they were (or, for the corrupted-content case, `content`
-becomes the regenerated clean ASCII).
+**Only diagrams `check-landscape-band.mjs` reported `PASS` for may be wired
+in — no exceptions, no "it's close enough."** For every one, add
+`mermaidSrc="/img/diagrams/<hash>.svg"` as a new prop on its
+`<AsciiDiagram>` tag, using the hash the script reported. Nothing else
+about the tag changes — `id`, `content`, `alt`, `caption` all stay exactly
+as they were (or, for the corrupted-content case, `content` becomes the
+regenerated clean ASCII).
 
 If a diagram isn't already wrapped in `<AsciiDiagram>` (rare — a plain
 ` ``` ` fence instead), convert it into one: give it a new unique `id`
@@ -334,7 +455,21 @@ Only after every diagram from Phase 1 has gone through 2a/2b/2c:
    to ignore. Any new MDX compile error means a wiring mistake — find and
    fix it, don't leave the course in a broken state.
 
-Only when both checks pass does the course count as done.
+3. **Refresh the diagram manifest** — update the git-tracked conversion
+   record so it reflects what this run just wired in, without a separate
+   manual step:
+
+   ```bash
+   node scripts/update-diagram-manifest.mjs <course-slug>
+   ```
+
+   This rebuilds `apps/docs/diagram-manifests/<course-slug>.json` from the
+   current source + disk state and regenerates the aggregate
+   `apps/docs/diagram-manifests/summary.json`. Safe to run any time —
+   idempotent, and it never removes an entry unless the corresponding
+   `<AsciiDiagram>` no longer exists in the source.
+
+Only when all three checks pass does the course count as done.
 
 ## Phase 4 — REPORT
 

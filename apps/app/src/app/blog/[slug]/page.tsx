@@ -47,15 +47,27 @@ export default async function BlogPostPage({
 
   return (
     <div className={styles.page}>
-      <BlogPostArticle
-        slug={slug}
-        title={post.title}
-        content={post.content}
-        coverImageUrl={post.cover_image_url}
-        date={post.published_at}
-        authorName={post.author_full_name}
-        authorBio={post.author_bio}
-      />
+      <div className={styles.layout}>
+        <BlogPostArticle
+          slug={slug}
+          title={post.title}
+          content={post.content}
+          coverImageUrl={post.cover_image_url}
+          featuredMediaType={post.featured_media_type}
+          featuredMediaValue={post.featured_media_value}
+          date={post.published_at}
+          authorName={post.author_full_name}
+          authorBio={post.author_bio}
+        />
+        {/* Reserved for future Google ad units (300x250 / 300x600) -- no
+            ad network wired in yet. Hidden below 1100px (see .adSlot). Both
+            units scroll/stick together as one group (see .adSlot's own
+            comment on why they aren't each independently sticky). */}
+        <aside className={styles.adSlot} aria-hidden="true">
+          <div className={styles.adUnit}>Ad space</div>
+          <div className={styles.adUnit}>Ad space</div>
+        </aside>
+      </div>
     </div>
   );
 }

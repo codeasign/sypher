@@ -2,6 +2,8 @@
 
 import React, { useRef, useState, isValidElement } from 'react';
 import { Highlight, themes } from 'prism-react-renderer';
+import ContentCopyRoundedIcon from '@mui/icons-material/ContentCopyRounded';
+import CheckRoundedIcon from '@mui/icons-material/CheckRounded';
 import { useColorMode } from '@/hooks/useColorMode';
 import clsx from 'clsx';
 import styles from './styles.module.css';
@@ -35,6 +37,11 @@ export default function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>): 
   return (
     <div className={styles.codeBlockWrapper}>
       <button type="button" className={styles.copyButton} onClick={handleCopy}>
+        {copied ? (
+          <CheckRoundedIcon className={styles.copyButtonIcon} />
+        ) : (
+          <ContentCopyRoundedIcon className={styles.copyButtonIcon} />
+        )}
         {copied ? 'Copied' : 'Copy'}
       </button>
       <Highlight theme={theme} code={code} language={language ?? 'text'}>

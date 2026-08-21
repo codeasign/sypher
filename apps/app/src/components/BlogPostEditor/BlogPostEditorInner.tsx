@@ -10,6 +10,7 @@ import {
   listsPlugin,
   quotePlugin,
   linkPlugin,
+  linkDialogPlugin,
   imagePlugin,
   codeBlockPlugin,
   codeMirrorPlugin,
@@ -26,6 +27,8 @@ import {
   ChangeCodeMirrorLanguage,
 } from '@mdxeditor/editor';
 import type { MDXEditorMethods } from '@mdxeditor/editor';
+import { hardLineBreakPlugin } from '@/lib/mdxeditor/hardLineBreakPlugin';
+import { extractYouTubeId } from '@/lib/youtube';
 import { useAuth } from '@/contexts/AuthContext';
 import { createBlogPost, updateBlogPost, setBlogPostStatus } from '@/data/blogPosts';
 import { uploadToBunny } from '@/data/bunnyUpload';
@@ -54,6 +57,8 @@ function EyeOffIcon(): React.JSX.Element {
   );
 }
 
+type FeaturedMediaType = 'pdf' | 'youtube';
+
 interface BlogPost {
   id: string;
   slug: string;
@@ -61,6 +66,8 @@ interface BlogPost {
   description: string;
   content: string;
   cover_image_url: string | null;
+  featured_media_type: FeaturedMediaType | null;
+  featured_media_value: string | null;
   status: 'draft' | 'published';
 }
 
@@ -85,6 +92,13 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
   const [description, setDescription] = useState(post?.description ?? '');
   const [coverImageUrl, setCoverImageUrl] = useState<string | null>(post?.cover_image_url ?? null);
   const [coverUploading, setCoverUploading] = useState(false);
+  const [featuredMediaType, setFeaturedMediaType] = useState<FeaturedMediaType | null>(post?.featured_media_type ?? null);
+  const [featuredMediaValue, setFeaturedMediaValue] = useState<string | null>(post?.featured_media_value ?? null);
+  const [featuredMediaUploading, setFeaturedMediaUploading] = useState(false);
+  const [youtubeInput, setYoutubeInput] = useState(
+    post?.featured_media_type === 'youtube' ? (post.featured_media_value ?? '') : ''
+  );
+  const [youtubeError, setYoutubeError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [previewMode, setPreviewMode] = useState(false);
@@ -129,10 +143,57 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
     return uploadToBunny(file, 'blog/content', BUNNY_CONFIG);
   }
 
+  function selectFeaturedMediaType(type: FeaturedMediaType | null): void {
+    setFeaturedMediaType(type);
+    setFeaturedMediaValue(null);
+    setYoutubeInput('');
+    setYoutubeError(null);
+  }
+
+  async function handleFeaturedMediaPdfChange(event: React.ChangeEvent<HTMLInputElement>): Promise<void> {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (file.type !== 'application/pdf') {
+      setError('Featured PDF must be a PDF file.');
+      return;
+    }
+    setFeaturedMediaUploading(true);
+    setError(null);
+    try {
+      const url = await uploadToBunny(file, 'blog/featured-media', BUNNY_CONFIG);
+      setFeaturedMediaValue(url);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to upload PDF.');
+    } finally {
+      setFeaturedMediaUploading(false);
+    }
+  }
+
+  function handleYoutubeInputChange(event: React.ChangeEvent<HTMLInputElement>): void {
+    const value = event.target.value;
+    setYoutubeInput(value);
+    if (!value.trim()) {
+      setFeaturedMediaValue(null);
+      setYoutubeError(null);
+      return;
+    }
+    const id = extractYouTubeId(value);
+    if (id) {
+      setFeaturedMediaValue(id);
+      setYoutubeError(null);
+    } else {
+      setFeaturedMediaValue(null);
+      setYoutubeError('Doesn’t look like a YouTube URL or video ID.');
+    }
+  }
+
   async function persist(nextStatus?: 'draft' | 'published'): Promise<string | null> {
     setSaving(true);
     setError(null);
     const content = editorRef.current?.getMarkdown() ?? contentMarkdown;
+    // Never store a type with no matching value (e.g. YouTube selected but
+    // the URL field left empty/invalid) -- would render nothing anyway.
+    const effectiveFeaturedMediaType = featuredMediaValue ? featuredMediaType : null;
 
     try {
       if (!isEditing) {
@@ -141,6 +202,8 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
           description: description.trim(),
           content,
           coverImageUrl,
+          featuredMediaType: effectiveFeaturedMediaType,
+          featuredMediaValue,
           authorId: user?.id ?? null,
         });
         if (createError || !created) {
@@ -162,6 +225,8 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
         description: description.trim(),
         content,
         cover_image_url: coverImageUrl,
+        featured_media_type: effectiveFeaturedMediaType,
+        featured_media_value: featuredMediaValue,
       });
       if (updateError) {
         setError(updateError);
@@ -246,7 +311,17 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
       {error && <p className={styles.error}>{error}</p>}
 
       {previewMode ? (
-        <BlogPostArticle slug={post?.slug ?? 'preview'} title={title || 'Untitled post'} content={draftMarkdown} coverImageUrl={coverImageUrl} date={null} trackView={false} showBackLink={false} />
+        <BlogPostArticle
+          slug={post?.slug ?? 'preview'}
+          title={title || 'Untitled post'}
+          content={draftMarkdown}
+          coverImageUrl={coverImageUrl}
+          featuredMediaType={featuredMediaValue ? featuredMediaType : null}
+          featuredMediaValue={featuredMediaValue}
+          date={null}
+          trackView={false}
+          showBackLink={false}
+        />
       ) : (
         <>
           <div className={clsx(styles.card, styles.metaCard)}>
@@ -315,6 +390,72 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
                 {coverUploading && <span className={styles.uploadingNote}>Uploading…</span>}
               </div>
             </div>
+
+            <div className={styles.formGroup}>
+              <label className={styles.fieldLabel}>Featured media</label>
+              <div className={styles.mediaTypeRow}>
+                <button
+                  type="button"
+                  className={clsx(styles.toolbarBtn, featuredMediaType === null && styles.toolbarBtnActive)}
+                  onClick={() => selectFeaturedMediaType(null)}
+                  disabled={saving}
+                >
+                  None
+                </button>
+                <button
+                  type="button"
+                  className={clsx(styles.toolbarBtn, featuredMediaType === 'pdf' && styles.toolbarBtnActive)}
+                  onClick={() => selectFeaturedMediaType('pdf')}
+                  disabled={saving}
+                >
+                  PDF
+                </button>
+                <button
+                  type="button"
+                  className={clsx(styles.toolbarBtn, featuredMediaType === 'youtube' && styles.toolbarBtnActive)}
+                  onClick={() => selectFeaturedMediaType('youtube')}
+                  disabled={saving}
+                >
+                  YouTube
+                </button>
+              </div>
+
+              {featuredMediaType === 'pdf' && (
+                <div className={styles.coverField}>
+                  {featuredMediaValue && (
+                    <a href={featuredMediaValue} target="_blank" rel="noopener noreferrer" className={styles.fieldHint}>
+                      {featuredMediaValue.split('/').pop()}
+                    </a>
+                  )}
+                  <label htmlFor="blog-post-featured-pdf" className={styles.coverUploadLabel}>
+                    {featuredMediaValue ? 'Replace PDF' : 'Upload PDF'}
+                  </label>
+                  <input
+                    id="blog-post-featured-pdf"
+                    type="file"
+                    accept="application/pdf"
+                    className={styles.fileInput}
+                    onChange={handleFeaturedMediaPdfChange}
+                    disabled={saving || featuredMediaUploading}
+                  />
+                  {featuredMediaUploading && <span className={styles.uploadingNote}>Uploading…</span>}
+                </div>
+              )}
+
+              {featuredMediaType === 'youtube' && (
+                <div className={styles.coverField}>
+                  <input
+                    type="text"
+                    className={styles.titleInput}
+                    value={youtubeInput}
+                    onChange={handleYoutubeInputChange}
+                    placeholder="Paste a YouTube URL"
+                    disabled={saving}
+                  />
+                  {youtubeError && <span className={styles.inlineError}>{youtubeError}</span>}
+                </div>
+              )}
+            </div>
           </div>
 
           <div className={clsx(styles.card, styles.contentCard)}>
@@ -335,6 +476,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
                   listsPlugin(),
                   quotePlugin(),
                   linkPlugin(),
+                  linkDialogPlugin(),
                   imagePlugin({ imageUploadHandler: handleImageUpload }),
                   codeBlockPlugin({ defaultCodeBlockLanguage: 'text' }),
                   codeMirrorPlugin({
@@ -354,6 +496,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
                     },
                   }),
                   markdownShortcutPlugin(),
+                  hardLineBreakPlugin(),
                   toolbarPlugin({
                     toolbarContents: () => (
                       <ConditionalContents

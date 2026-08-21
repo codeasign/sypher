@@ -7,6 +7,7 @@ import {
   listsPlugin,
   quotePlugin,
   linkPlugin,
+  linkDialogPlugin,
   toolbarPlugin,
   markdownShortcutPlugin,
   UndoRedo,
@@ -15,6 +16,7 @@ import {
   CreateLink,
 } from '@mdxeditor/editor';
 import type { MDXEditorMethods } from '@mdxeditor/editor';
+import { hardLineBreakPlugin } from '@/lib/mdxeditor/hardLineBreakPlugin';
 import { useAuth } from '@/contexts/AuthContext';
 import { createCourse, updateCourse, setCourseStatus } from '@/data/courses';
 import { uploadToBunny } from '@/data/bunnyUpload';
@@ -222,7 +224,9 @@ export default function CourseEditorInner({ course, onSaved, onCancel, onBack }:
                 listsPlugin(),
                 quotePlugin(),
                 linkPlugin(),
+                linkDialogPlugin(),
                 markdownShortcutPlugin(),
+                hardLineBreakPlugin(),
                 toolbarPlugin({
                   toolbarContents: () => (
                     <>

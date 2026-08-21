@@ -15,6 +15,7 @@ import {
   BlockTypeSelect,
   ListsToggle,
 } from '@mdxeditor/editor';
+import { hardLineBreakPlugin } from '@/lib/mdxeditor/hardLineBreakPlugin';
 import '@mdxeditor/editor/style.css';
 import styles from './styles.module.css';
 
@@ -51,6 +52,7 @@ export default function JobDescriptionEditorInner({
           // still parses/renders instead of erroring the editor.
           linkPlugin(),
           markdownShortcutPlugin(),
+          hardLineBreakPlugin(),
           toolbarPlugin({
             // Image and link insertion are intentionally left out of this
             // toolbar -- job descriptions don't need either.

@@ -12,12 +12,14 @@ const ACRONYMS = new Set([
   'https', 'rest', 'cli', 'sdk', 'jwt', 'ci', 'cd', 'rag', 'ui', 'ux', 'qa',
 ]);
 
-// docId is always "<courseSlug>/<topic>/<page>", except a few flat
-// "<courseSlug>/<page>" entries (e.g. capstone index docs) — the topic is
-// always the second-to-last segment when there is one.
+// docId is usually "<courseSlug>/<topic>/<page>", but some courses nest an
+// extra tier/category level ("<courseSlug>/<tier>/<topic>/<page>") — the
+// topic is always the second-to-last segment. A few flat "<courseSlug>/<page>"
+// entries (e.g. capstone index docs, or whole courses with one page per
+// module) have no separate topic segment, so the page is its own topic.
 function topicSlug(docId) {
   const parts = docId.split('/');
-  return parts.length > 2 ? parts[1] : parts[0];
+  return parts.length > 2 ? parts[parts.length - 2] : parts[parts.length - 1];
 }
 
 function humanize(slug) {
@@ -29,14 +31,30 @@ function humanize(slug) {
 
 // The last docId segment is either an exact tag (overview/build-it/
 // avoid-mistakes/review) or a topic-prefixed one
-// (what-llm-and-api-are-overview, ...-practice, ...-general-practice).
-// Classify by suffix so both styles resolve to the same tag.
-function pageType(lastSegment) {
+// (what-llm-and-api-are-overview, ...-practice, ...-general-practice,
+// what-is-system-design-concepts, ...-deep-dive, ...-tradeoffs,
+// multi-agent-research-platform-build-core, factory-method-javascript, etc.).
+// Strip a leading "<topic>-" prefix first — most courses repeat the topic
+// slug in every page's doc id — then classify what's left by suffix so
+// every course's page-naming style resolves to a short tag instead of
+// falling back to the full topic-prefixed segment.
+function pageType(lastSegment, topic) {
   if (lastSegment === 'index') return 'overview';
-  if (/(^|-)general-practice$/.test(lastSegment)) return 'general-practice';
-  if (/(^|-)overview$/.test(lastSegment)) return 'overview';
-  if (/(^|-)practice$/.test(lastSegment)) return 'practice';
-  return lastSegment;
+  let seg = lastSegment;
+  if (topic && seg.startsWith(`${topic}-`) && seg.length > topic.length + 1) {
+    seg = seg.slice(topic.length + 1);
+  }
+  if (/(^|-)general-practice$/.test(seg)) return 'general-practice';
+  if (/(^|-)overview$/.test(seg)) return 'overview';
+  if (/(^|-)practice$/.test(seg)) return 'practice';
+  if (seg === 'concepts') return 'concepts';
+  if (seg === 'deep-dive') return 'deep-dive';
+  if (seg === 'architecture') return 'architecture';
+  if (seg === 'tradeoffs') return 'tradeoffs';
+  if (seg === 'real-world') return 'real-world';
+  if (seg === 'interview') return 'interview';
+  if (seg === 'challenge') return 'challenge';
+  return seg;
 }
 
 function pageLabel(type) {
@@ -47,6 +65,20 @@ function pageLabel(type) {
     review: 'Review',
     practice: 'Practice',
     'general-practice': 'General Practice',
+    concepts: 'Mental Model',
+    'deep-dive': 'Deep Dive',
+    architecture: 'Architecture',
+    tradeoffs: 'Trade-offs',
+    'real-world': 'Real World',
+    interview: 'Interview',
+    challenge: 'Challenges',
+    theory: 'Theory',
+    javascript: 'JavaScript',
+    typescript: 'TypeScript',
+    python: 'Python',
+    java: 'Java',
+    csharp: 'C#',
+    rust: 'Rust',
   };
   return labels[type] || humanize(type);
 }
@@ -110,7 +142,7 @@ export default function CourseCurriculum() {
             <div className={styles.ccLessons}>
               {topicOrder.map((topic) => {
                 const pages = topics[topic];
-                const overviewPage = pages.find((p) => pageType(p.split('/').pop()) === 'overview');
+                const overviewPage = pages.find((p) => pageType(p.split('/').pop(), topic) === 'overview');
                 const linkTarget = `/docs/${overviewPage || pages[0]}`;
                 const lessonName = humanize(topic);
 
@@ -125,24 +157,26 @@ export default function CourseCurriculum() {
                         {lessonName}
                       </span>
                     )}
-                    <div className={styles.ccPages}>
-                      {pages.map((page) => {
-                        const type = pageType(page.split('/').pop());
-                        const pagePath = `/docs/${page}`;
-                        const label = pageLabel(type);
-                        return (
-                          <span key={page} className={styles.ccPageTag}>
-                            {isFree ? (
-                              <Link to={pagePath} className={styles.ccPageLink}>
-                                {label}
-                              </Link>
-                            ) : (
-                              <span className={styles.ccPageLocked}>{label}</span>
-                            )}
-                          </span>
-                        );
-                      })}
-                    </div>
+                    {pages.length > 1 && (
+                      <div className={styles.ccPages}>
+                        {pages.map((page) => {
+                          const type = pageType(page.split('/').pop(), topic);
+                          const pagePath = `/docs/${page}`;
+                          const label = pageLabel(type);
+                          return (
+                            <span key={page} className={styles.ccPageTag}>
+                              {isFree ? (
+                                <Link to={pagePath} className={styles.ccPageLink}>
+                                  {label}
+                                </Link>
+                              ) : (
+                                <span className={styles.ccPageLocked}>{label}</span>
+                              )}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 );
               })}

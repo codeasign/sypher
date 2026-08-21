@@ -16,6 +16,9 @@ interface CohortArticleProps {
   durationWeeks: number | null;
   seatsTotal: number | null;
   priceLabel: string | null;
+  trackView?: boolean;
+  showBackLink?: boolean;
+  showInterestForm?: boolean;
 }
 
 // Explicit locale -- see BlogList/index.tsx for why `undefined` would cause
@@ -33,16 +36,21 @@ export default function CohortArticle({
   durationWeeks,
   seatsTotal,
   priceLabel,
+  trackView = true,
+  showBackLink = true,
+  showInterestForm = true,
 }: CohortArticleProps): React.JSX.Element {
   useEffect(() => {
-    trackEvent('cohort_view', { slug, title });
-  }, [slug, title]);
+    if (trackView) trackEvent('cohort_view', { slug, title });
+  }, [slug, title, trackView]);
 
   return (
     <article className={styles.article}>
-      <Link href="/cohorts" className={styles.backLink}>
-        ← Back to Cohorts
-      </Link>
+      {showBackLink && (
+        <Link href="/cohorts" className={styles.backLink}>
+          ← Back to Cohorts
+        </Link>
+      )}
       {coverImageUrl && <img src={coverImageUrl} alt={title} className={styles.coverImage} />}
       <h1 className={styles.title}>{title}</h1>
       <div className={styles.meta}>
@@ -52,10 +60,12 @@ export default function CohortArticle({
         {priceLabel && <span className={styles.metaBadge}>{priceLabel}</span>}
       </div>
       {content && <CourseDescriptionMarkdown text={content} className={styles.body} />}
-      <div className={styles.interestSection}>
-        <h2 className={styles.interestHeading}>Interested in this cohort?</h2>
-        <CohortInterestForm cohortTitle={title} />
-      </div>
+      {showInterestForm && (
+        <div className={styles.interestSection}>
+          <h2 className={styles.interestHeading}>Interested in this cohort?</h2>
+          <CohortInterestForm cohortTitle={title} />
+        </div>
+      )}
     </article>
   );
 }
