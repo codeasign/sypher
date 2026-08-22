@@ -1,0 +1,71 @@
+import Link from 'next/link';
+import { getDocsOrigin } from '@sypher/auth-core/src/urls';
+import styles from './styles.module.css';
+
+const pillars = [
+  {
+    icon: '📖',
+    title: 'Text-First, Deep Learning',
+    description: 'No passive videos. Every concept is explained in clear, annotated text with real code — the way engineers actually learn best. You read, you code, you build.',
+  },
+  {
+    icon: '🧠',
+    title: 'Built for Modern AI Engineering',
+    description: 'Deep dives into LLMs, agents, MCP, and RAG — the tools and patterns shaping how AI systems are actually built today, not a decade-old curriculum.',
+  },
+  {
+    icon: '🎯',
+    title: 'Interview-Ready Projects',
+    description: 'Real-world system design, coding challenges, and production-grade portfolio projects that build the skills employers actually look for.',
+  },
+];
+
+const accentClasses = ['accent1', 'accent2', 'accent3'] as const;
+
+function accentFor(index: number) {
+  return accentClasses[index % accentClasses.length];
+}
+
+export default function HeroSection() {
+  return (
+    <header className={styles.hero}>
+      <div className={styles.heroBg} />
+      <div className={styles.container}>
+        <div className={styles.heroGrid}>
+          <div className={styles.heroContent}>
+            <span className={styles.heroBadge}>Learn by Building</span>
+            <h1 className={styles.heroTitle}>
+              Learn engineering<br />
+              <span className={styles.heroHighlight}>by actually building it.</span>
+            </h1>
+            <p className={styles.heroSubtitle}>
+              Sypher is a hands-on learning platform for AI engineering, system design, and
+              software fundamentals — deep, annotated, text-first lessons paired with real
+              projects, not another video course you&apos;ll never finish.
+            </p>
+            <div className={styles.heroButtons}>
+              <Link className={styles.primaryBtn} href="/login">
+                Start Learning →
+              </Link>
+              <a className={styles.secondaryBtn} href={`${getDocsOrigin()}/courses`}>
+                Browse Courses
+              </a>
+            </div>
+          </div>
+          <div className={styles.heroVisual}>
+            {pillars.map((pillar, index) => (
+              <div
+                key={pillar.title}
+                className={`${styles.heroTile} ${styles[accentFor(index)]}`}
+              >
+                <span className={styles.heroTileIcon}>{pillar.icon}</span>
+                <span className={styles.heroTileTitle}>{pillar.title}</span>
+                <p className={styles.heroTileDesc}>{pillar.description}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </header>
+  );
+}

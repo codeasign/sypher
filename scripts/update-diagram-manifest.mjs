@@ -20,6 +20,8 @@
 //   node scripts/update-diagram-manifest.mjs --all
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
@@ -28,6 +30,41 @@ const STATIC_ROOT = path.join(REPO_ROOT, 'apps', 'docs', 'static');
 const MMD_CACHE_DIR = path.join(REPO_ROOT, '.cache', 'ascii-to-mermaid');
 const MANIFEST_DIR = path.join(REPO_ROOT, 'apps', 'docs', 'diagram-manifests');
 const SUMMARY_PATH = path.join(MANIFEST_DIR, 'summary.json');
+
+// ---------- hash cross-verification ----------
+// Immutable CDN caching only stays safe if a content-hash change and its
+// mermaidSrc reference update always ship together. Nothing in the wiring
+// scripts enforces that atomically (they're separate manual/LLM steps), so
+// this check catches drift after the fact: a stale reference (old SVG
+// still exists on disk, hash no longer matches current .mmd source) and a
+// dangling reference (mermaidSrc updated but the SVG was never committed).
+
+let trackedSvgSetCache = null;
+function getTrackedSvgSet() {
+  if (trackedSvgSetCache) return trackedSvgSetCache;
+  try {
+    const out = execFileSync('git', ['ls-files', 'apps/docs/static/img/diagrams'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+    });
+    trackedSvgSetCache = new Set(out.split('\n').filter(Boolean));
+  } catch (err) {
+    console.warn(`Could not read git-tracked SVGs (${err.message}); svgGitTracked will read as unknown.`);
+    trackedSvgSetCache = null;
+  }
+  return trackedSvgSetCache;
+}
+
+// Same two-line hash as render-mermaid-manifest.mjs — the hash embedded in
+// every mermaidSrc filename is this exact computation over the .mmd source.
+function hashMmdContent(content) {
+  return createHash('sha256').update(content).digest('hex').slice(0, 12);
+}
+
+function extractHashFromMermaidSrc(mermaidSrc) {
+  const m = mermaidSrc && mermaidSrc.match(/([a-f0-9]{12})\.svg$/);
+  return m ? m[1] : null;
+}
 
 // ---------- JSX <AsciiDiagram> extraction (brace/backtick-aware) ----------
 // Same scanner used by ascii-to-mermaid-autoconvert.mjs / wire-mermaid-src*.mjs,
@@ -126,7 +163,37 @@ function buildCourseManifest(slug) {
       // older, already-converted diagram is expected, not a problem.
       // mermaidSrcWiredIn (below) is the flag that actually matters.
       const mmdFileName = `${slugForFile}-${n}.mmd`;
-      const mmdExists = existsSync(path.join(MMD_CACHE_DIR, mmdFileName));
+      const mmdPath = path.join(MMD_CACHE_DIR, mmdFileName);
+      const mmdExists = existsSync(mmdPath);
+
+      // svgGitTracked: null when not converted (n/a); false flags a
+      // dangling reference — mermaidSrc points at a file that only exists
+      // in the working tree, never committed, so a CDN build off a clean
+      // checkout of HEAD wouldn't have it.
+      let svgGitTracked = null;
+      if (converted && svgExists) {
+        const trackedSet = getTrackedSvgSet();
+        const svgRelPath = path.join('apps/docs/static', mermaidSrc.replace(/^\//, '')).replace(/\\/g, '/');
+        svgGitTracked = trackedSet ? trackedSet.has(svgRelPath) : null;
+      }
+
+      // hashVerified: recomputes the hash from the current .mmd source and
+      // compares it to the hash embedded in the mermaidSrc filename. This
+      // is what catches a *stale* reference — content changed (new .mmd),
+      // a new hash was rendered, but mermaidSrc was never updated to match,
+      // so the old file (still present on disk; nothing deletes old
+      // hash-named SVGs) keeps passing the plain existsSync check above.
+      let hashVerified = null;
+      if (converted && svgExists) {
+        if (mmdExists) {
+          const mmdContent = readFileSync(mmdPath, 'utf8');
+          const currentHash = hashMmdContent(mmdContent);
+          const wiredHash = extractHashFromMermaidSrc(mermaidSrc);
+          hashVerified = wiredHash !== null && wiredHash === currentHash;
+        } else {
+          hashVerified = 'unknown-no-mmd-source';
+        }
+      }
 
       diagrams.push({
         id,
@@ -138,18 +205,26 @@ function buildCourseManifest(slug) {
         mermaidSrcWiredIn: converted && svgExists,
         mmdFile: `.cache/ascii-to-mermaid/${mmdFileName}`,
         mmdExists,
+        svgGitTracked,
+        hashVerified,
       });
     });
   }
 
   diagrams.sort((a, b) => a.file.localeCompare(b.file) || a.diagramIndex - b.diagramIndex);
   const converted = diagrams.filter((d) => d.mermaidSrcWiredIn).length;
+  const hashMismatches = diagrams.filter((d) => d.hashVerified === false).length;
+  const untrackedSvg = diagrams.filter((d) => d.svgGitTracked === false).length;
+  const unverifiableHash = diagrams.filter((d) => d.hashVerified === 'unknown-no-mmd-source').length;
 
   return {
     course: slug,
     totalDiagrams: diagrams.length,
     converted,
     pending: diagrams.length - converted,
+    hashMismatches,
+    untrackedSvg,
+    unverifiableHash,
     diagrams,
   };
 }
@@ -170,15 +245,35 @@ function regenerateSummary() {
 
   const courses = [];
   let totalDiagrams = 0, totalConverted = 0, totalPending = 0;
+  let totalHashMismatches = 0, totalUntrackedSvg = 0, totalUnverifiableHash = 0;
   for (const f of courseFiles) {
     const m = JSON.parse(readFileSync(path.join(MANIFEST_DIR, f), 'utf8'));
-    courses.push({ course: m.course, totalDiagrams: m.totalDiagrams, converted: m.converted, pending: m.pending });
+    courses.push({
+      course: m.course,
+      totalDiagrams: m.totalDiagrams,
+      converted: m.converted,
+      pending: m.pending,
+      hashMismatches: m.hashMismatches ?? 0,
+      untrackedSvg: m.untrackedSvg ?? 0,
+      unverifiableHash: m.unverifiableHash ?? 0,
+    });
     totalDiagrams += m.totalDiagrams;
     totalConverted += m.converted;
     totalPending += m.pending;
+    totalHashMismatches += m.hashMismatches ?? 0;
+    totalUntrackedSvg += m.untrackedSvg ?? 0;
+    totalUnverifiableHash += m.unverifiableHash ?? 0;
   }
 
-  const summary = { courses, totalDiagrams, totalConverted, totalPending };
+  const summary = {
+    courses,
+    totalDiagrams,
+    totalConverted,
+    totalPending,
+    totalHashMismatches,
+    totalUntrackedSvg,
+    totalUnverifiableHash,
+  };
   const changed = writeJsonIfChanged(SUMMARY_PATH, summary);
   return { summary, changed };
 }
@@ -203,13 +298,21 @@ function main() {
     const filePath = path.join(MANIFEST_DIR, `${slug}.json`);
     const changed = writeJsonIfChanged(filePath, manifest);
     console.log(
-      `${changed ? 'UPDATED ' : 'unchanged'} ${slug}: total=${manifest.totalDiagrams} converted=${manifest.converted} pending=${manifest.pending}`
+      `${changed ? 'UPDATED ' : 'unchanged'} ${slug}: total=${manifest.totalDiagrams} converted=${manifest.converted} pending=${manifest.pending} ` +
+      `hashMismatches=${manifest.hashMismatches} untrackedSvg=${manifest.untrackedSvg} unverifiableHash=${manifest.unverifiableHash}`
     );
   }
 
   const { summary, changed: summaryChanged } = regenerateSummary();
   console.log(
     `${summaryChanged ? 'UPDATED ' : 'unchanged'} summary.json: total=${summary.totalDiagrams} converted=${summary.totalConverted} pending=${summary.totalPending}`
+  );
+  const unverifiableOrMismatched = summary.totalHashMismatches + summary.totalUnverifiableHash;
+  console.log(
+    `\n${unverifiableOrMismatched} diagrams have unverifiable or mismatched hashes ` +
+    `(${summary.totalHashMismatches} confirmed mismatches — stale reference, ` +
+    `${summary.totalUnverifiableHash} unverifiable — no .mmd source to check against). ` +
+    `${summary.totalUntrackedSvg} referenced SVGs are untracked in git (dangling reference).`
   );
 }
 

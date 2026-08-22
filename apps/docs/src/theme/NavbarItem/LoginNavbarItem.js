@@ -1,7 +1,7 @@
 import React from 'react';
 import BrowserOnly from '@docusaurus/BrowserOnly';
 import { useAuth } from '@site/src/contexts/AuthContext';
-import { getAppOrigin, getAppLoginUrl, getAppLogoutUrl, getAppSignupUrl } from '@sypher/auth-core/src/urls';
+import { getAppOrigin, getAppLogoutUrl, getAppSignupUrl } from '@sypher/auth-core/src/urls';
 
 // Docs never initiates login/logout itself -- app.sypher is the only place
 // those Supabase calls happen (see apps/app/src/contexts/AuthContext.tsx).
@@ -23,13 +23,13 @@ function LoginButton() {
     );
   }
 
+  // One CTA, not two — same merge applied to Sypher Next's and app.sypher's
+  // navbars. apps/app's /signup already has "Already have an account? Log
+  // in", so a returning user reaches sign-in in one click from there.
   return (
     <span className="login-link-group">
       <a href={getAppSignupUrl()} className="navbar__link login-link signup-link">
-        Sign Up
-      </a>
-      <a href={getAppLoginUrl()} className="navbar__link login-link">
-        Log in
+        Start Learning Free
       </a>
     </span>
   );
@@ -37,7 +37,7 @@ function LoginButton() {
 
 export default function LoginNavbarItem() {
   return (
-    <BrowserOnly fallback={<button type="button" className="navbar__link login-link">Log in</button>}>
+    <BrowserOnly fallback={<button type="button" className="navbar__link login-link">Start Learning Free</button>}>
       {() => <LoginButton />}
     </BrowserOnly>
   );

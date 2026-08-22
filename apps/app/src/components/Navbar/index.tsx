@@ -236,11 +236,14 @@ export default function Navbar() {
             </div>
           ) : (
             <div className={styles.authButtons}>
+              {/* One CTA, not two — matches the same merge applied to Sypher
+                  Next's navbar: a single benefit-specific CTA converts
+                  better than making a visitor pick Sign Up vs Sign In before
+                  they've decided anything. /signup already has "Already have
+                  an account? Log in", so returning users reach sign-in in
+                  one click from there. */}
               <Link href="/signup" className={styles.signUpBtn}>
-                Sign Up
-              </Link>
-              <Link href="/login" className={styles.signInBtn}>
-                Sign In
+                Start Learning Free
               </Link>
             </div>
           )}

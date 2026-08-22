@@ -16,6 +16,10 @@ import {
   codeMirrorPlugin,
   toolbarPlugin,
   markdownShortcutPlugin,
+  jsxPlugin,
+  frontmatterPlugin,
+  thematicBreakPlugin,
+  GenericJsxEditor,
   UndoRedo,
   BoldItalicUnderlineToggles,
   BlockTypeSelect,
@@ -281,6 +285,21 @@ export default function ModuleEditorInner({
                   }),
                   markdownShortcutPlugin(),
                   hardLineBreakPlugin(),
+                  // Round-tripping real docs content (AsciiDiagram, YouTube,
+                  // PdfEmbed, Slideshow tags; frontmatter delimiters; `---`
+                  // dividers) previously threw UnrecognizedMarkdownConstructError
+                  // on load — none of those constructs had a registered import
+                  // visitor. The wildcard descriptor preserves any unrecognized
+                  // JSX tag as-is (editable as raw props, not a custom UI) rather
+                  // than crashing; content-specific visual editors can replace it
+                  // per-tag later if that's ever needed.
+                  jsxPlugin({
+                    jsxComponentDescriptors: [
+                      { name: '*', kind: 'flow', props: [], hasChildren: true, Editor: GenericJsxEditor },
+                    ],
+                  }),
+                  frontmatterPlugin(),
+                  thematicBreakPlugin(),
                   toolbarPlugin({
                     toolbarContents: () => (
                       <ConditionalContents

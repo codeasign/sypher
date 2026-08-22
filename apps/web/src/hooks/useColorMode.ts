@@ -1,0 +1,49 @@
+'use client';
+
+import { useCallback, useEffect, useState } from 'react';
+
+export type ColorMode = 'light' | 'dark';
+
+const STORAGE_KEY = 'sypher-color-mode';
+
+// Ported from apps/app/src/hooks/useColorMode.ts. Every call site mounts
+// its own independent useState — there's no shared context — so this event
+// is what keeps multiple already-mounted instances (e.g. Navbar's toggle
+// plus any other component that reads colorMode) in sync when the mode
+// changes from one of them.
+const COLOR_MODE_EVENT = 'sypher-color-mode-change';
+
+function readStoredColorMode(): ColorMode {
+  return document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+}
+
+// Mirrors Docusaurus's @docusaurus/theme-common useColorMode (2-state, no
+// OS-preference/system-mode layer). data-theme is applied synchronously
+// pre-paint by the inline script in layout.tsx, but the SSR-rendered HTML
+// always assumes 'light' (the server can't see localStorage) — so the
+// initial state here must also be 'light' to match the server render
+// exactly, or React logs a hydration mismatch on the toggle's icon/
+// aria-label. useEffect runs post-hydration, so correcting the state there
+// is safe.
+export function useColorMode(): { colorMode: ColorMode; setColorMode: (mode: ColorMode) => void } {
+  const [colorMode, setColorModeState] = useState<ColorMode>('light');
+
+  useEffect(() => {
+    setColorModeState(readStoredColorMode());
+
+    function handleColorModeChange(): void {
+      setColorModeState(readStoredColorMode());
+    }
+    window.addEventListener(COLOR_MODE_EVENT, handleColorModeChange);
+    return () => window.removeEventListener(COLOR_MODE_EVENT, handleColorModeChange);
+  }, []);
+
+  const setColorMode = useCallback((mode: ColorMode) => {
+    document.documentElement.setAttribute('data-theme', mode);
+    localStorage.setItem(STORAGE_KEY, mode);
+    setColorModeState(mode);
+    window.dispatchEvent(new Event(COLOR_MODE_EVENT));
+  }, []);
+
+  return { colorMode, setColorMode };
+}
