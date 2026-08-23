@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import { RestoreIcon, RemoveIcon } from '@/components/icons/ActionIcons';
+import Tooltip from '@/components/Tooltip';
 import {
   listManageableCohorts,
   listCohortRoster,
@@ -317,7 +318,11 @@ export default function ManageCohortUsersContent(): React.JSX.Element {
                   {member.fullName && <span className={styles.userEmail}>{member.email}</span>}
                 </div>
                 <span className={styles.tableCell}>
-                  <span className={styles.statusBadge}>{removed ? 'Removed' : 'Active'}</span>
+                  {/* Status-badge rule: modifier class carries the semantic fill —
+                      without it .statusBadge renders transparent. */}
+                  <span className={`${styles.statusBadge} ${removed ? styles.statusRemoved : styles.statusActive}`}>
+                    {removed ? 'Removed' : 'Active'}
+                  </span>
                 </span>
                 <span className={styles.tableCell}>
                   <button type="button" className={styles.courseAccessBtn} disabled={removed} onClick={() => setCourseModalFor(member)}>
@@ -327,13 +332,17 @@ export default function ManageCohortUsersContent(): React.JSX.Element {
                 </span>
                 <div className={styles.actions}>
                   {removed ? (
-                    <button type="button" className={styles.textActionBtn} onClick={() => handleSetActive(member, true)}>
-                      <RestoreIcon /> Re-add
-                    </button>
+                    <Tooltip label="Re-add member">
+                      <button type="button" className={`${styles.actionBtn} ${styles.actionBtnSuccess}`} aria-label="Re-add member" onClick={() => handleSetActive(member, true)}>
+                        <RestoreIcon />
+                      </button>
+                    </Tooltip>
                   ) : (
-                    <button type="button" className={`${styles.textActionBtn} ${styles.textActionBtnDanger}`} onClick={() => setPendingRemove(member)}>
-                      <RemoveIcon /> Remove
-                    </button>
+                    <Tooltip label="Remove member">
+                      <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} aria-label="Remove member" onClick={() => setPendingRemove(member)}>
+                        <RemoveIcon />
+                      </button>
+                    </Tooltip>
                   )}
                 </div>
               </div>

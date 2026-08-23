@@ -8,6 +8,7 @@ import CourseModuleArticle from '@/components/CourseModulePage/CourseModuleArtic
 import ModuleCompletionTracker from '@/components/CourseModulePage/ModuleCompletionTracker';
 import LockedModuleNotice from '@/components/CourseModulePage/LockedModuleNotice';
 import { ModuleBookmarkButton } from '@/components/AuthoredBookmarkButton';
+import Tooltip from '@/components/Tooltip';
 import styles from '@/components/CourseModulePage/styles.module.css';
 
 interface AuthUser {
@@ -29,6 +30,26 @@ async function fetchModule(slug: string, moduleSlug: string): Promise<{ module: 
 async function fetchCourseModules(slug: string): Promise<CourseModule[]> {
   const res = await serverApiFetch(`/courses/${encodeURIComponent(slug)}/modules`);
   return res.ok ? res.json() : [];
+}
+
+// Big edge-pager chevrons — simple stroked geometry drawn locally (same
+// inline-stroke convention as BlogPostPage/CodeBlock's copy icons). Not
+// added to ActionIcons because those use filled Material Symbols path
+// data, and guessing that path data from memory is banned.
+function ChevronLeftIcon({ className }: { className?: string }): React.JSX.Element {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="15 18 9 12 15 6" />
+    </svg>
+  );
+}
+
+function ChevronRightIcon({ className }: { className?: string }): React.JSX.Element {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="9 18 15 12 9 6" />
+    </svg>
+  );
 }
 
 export async function generateMetadata({
@@ -73,14 +94,26 @@ export default async function CourseModulePage({
 
   return (
     <div className={styles.page}>
+      {/* Outside the paper sheet, pinned under the navbar — Back to Course
+          on the left, Bookmark on the right, visible for the entire scroll
+          (user request 2026-08-23). The x/N counter between them shows the
+          current topic's position in the course. */}
+      <div className={styles.moduleTopRow}>
+        <Link href={`/learn/${slug}`} className={styles.backLink}>
+          ← Back to course
+        </Link>
+        {currentIndex >= 0 && (
+          <span
+            className={styles.modulePosition}
+            aria-label={`Topic ${currentIndex + 1} of ${allModules.length}`}
+          >
+            {currentIndex + 1} / {allModules.length}
+          </span>
+        )}
+        <ModuleBookmarkButton moduleId={mod.id} courseId={mod.courseId} initialBookmarked={isBookmarked} />
+      </div>
       <div className={styles.container}>
         {!mod.locked && <ModuleCompletionTracker courseSlug={slug} moduleSlug={moduleSlug} />}
-        <div className={styles.moduleTopRow}>
-          <Link href={`/learn/${slug}`} className={styles.backLink}>
-            ← Back to course
-          </Link>
-          <ModuleBookmarkButton moduleId={mod.id} courseId={mod.courseId} initialBookmarked={isBookmarked} />
-        </div>
         {mod.locked ? (
           <>
             <h1 className={styles.title}>{mod.title}</h1>
@@ -90,27 +123,34 @@ export default async function CourseModulePage({
           <CourseModuleArticle title={mod.title} content={mod.bodyMdx} />
         )}
 
-        {!mod.locked && (previous || next) && (
-          <nav className={styles.pagination} aria-label="Module pages">
-            {previous ? (
-              <Link href={`/learn/${slug}/${previous.slug}`} className={`${styles.paginationLink} ${styles.paginationPrev}`}>
-                <span className={styles.paginationSubLabel}>← Previous</span>
-                <span className={styles.paginationTitle}>{previous.title}</span>
-              </Link>
-            ) : (
-              <span />
-            )}
-            {next ? (
-              <Link href={`/learn/${slug}/${next.slug}`} className={`${styles.paginationLink} ${styles.paginationNext}`}>
-                <span className={styles.paginationSubLabel}>Next →</span>
-                <span className={styles.paginationTitle}>{next.title}</span>
-              </Link>
-            ) : (
-              <span />
-            )}
-          </nav>
-        )}
       </div>
+
+      {/* Edge pager OUTSIDE the paper sheet — big chevrons on the left and
+          right screen edges, vertically centered, always visible while
+          reading (user refinement 2026-08-23). Destination titles live in
+          the shared Tooltip; aria-labels carry them for screen readers. */}
+      {!mod.locked && (previous || next) && (
+        <nav className={styles.pagination} aria-label="Module pages">
+          {previous ? (
+            <Tooltip label={`Previous: ${previous.title}`}>
+              <Link href={`/learn/${slug}/${previous.slug}`} className={styles.paginationLink} aria-label={`Previous topic: ${previous.title}`}>
+                <ChevronLeftIcon className={styles.pagerIcon} />
+              </Link>
+            </Tooltip>
+          ) : (
+            <span />
+          )}
+          {next ? (
+            <Tooltip label={`Next: ${next.title}`}>
+              <Link href={`/learn/${slug}/${next.slug}`} className={styles.paginationLink} aria-label={`Next topic: ${next.title}`}>
+                <ChevronRightIcon className={styles.pagerIcon} />
+              </Link>
+            </Tooltip>
+          ) : (
+            <span />
+          )}
+        </nav>
+      )}
     </div>
   );
 }

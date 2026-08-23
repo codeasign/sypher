@@ -7,6 +7,7 @@ import CourseEditor from './CourseEditor';
 import CourseWorkspace from './CourseWorkspace';
 import { ManageCoursesIcon } from '@/components/icons/SidebarIcons';
 import { EditIcon, DeleteIcon } from '@/components/icons/ActionIcons';
+import Tooltip from '@/components/Tooltip';
 import styles from './manage-courses.module.css';
 
 function formatDate(iso: string): string {
@@ -119,12 +120,16 @@ export default function ManageCoursesContent({ initialCourses }: { initialCourse
               </span>
               <span className={styles.tableCell}>{formatDate(course.updatedAt)}</span>
               <div className={styles.actions}>
-                <button type="button" className={styles.actionBtn} title="Manage course" onClick={() => openWorkspace(course)}>
-                  <EditIcon />
-                </button>
-                <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} title="Delete course" onClick={() => handleDelete(course)}>
-                  <DeleteIcon />
-                </button>
+                <Tooltip label="Manage course">
+                  <button type="button" className={`${styles.actionBtn} ${styles.actionBtnEdit}`} aria-label="Manage course" onClick={() => openWorkspace(course)}>
+                    <EditIcon />
+                  </button>
+                </Tooltip>
+                <Tooltip label="Delete course">
+                  <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} aria-label="Delete course" onClick={() => handleDelete(course)}>
+                    <DeleteIcon />
+                  </button>
+                </Tooltip>
               </div>
             </div>
           ))}

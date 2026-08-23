@@ -5,6 +5,7 @@ import clsx from 'clsx';
 import { listCourseModules, deleteCourseModule, reorderCourseModule, type CourseModule } from '@/data/courses';
 import ModuleEditor from './ModuleEditor';
 import { EditIcon, DeleteIcon } from '@/components/icons/ActionIcons';
+import Tooltip from '@/components/Tooltip';
 import styles from './manage-courses.module.css';
 
 function UpIcon(): React.JSX.Element {
@@ -128,24 +129,32 @@ export default function ModulesTab({ courseId }: ModulesTabProps): React.JSX.Ele
                 </div>
               </div>
               <div className={styles.actions}>
-                <button type="button" className={styles.actionBtn} title="Move up" onClick={() => handleReorder(mod, 'up')} disabled={index === 0}>
-                  <UpIcon />
-                </button>
-                <button
-                  type="button"
-                  className={styles.actionBtn}
-                  title="Move down"
-                  onClick={() => handleReorder(mod, 'down')}
-                  disabled={index === modules.length - 1}
-                >
-                  <DownIcon />
-                </button>
-                <button type="button" className={styles.actionBtn} title="Edit module" onClick={() => openEdit(mod)}>
-                  <EditIcon />
-                </button>
-                <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} title="Delete module" onClick={() => handleDelete(mod)}>
-                  <DeleteIcon />
-                </button>
+                <Tooltip label="Move up">
+                  <button type="button" className={`${styles.actionBtn} ${styles.actionBtnNeutral}`} aria-label="Move up" onClick={() => handleReorder(mod, 'up')} disabled={index === 0}>
+                    <UpIcon />
+                  </button>
+                </Tooltip>
+                <Tooltip label="Move down">
+                  <button
+                    type="button"
+                    className={`${styles.actionBtn} ${styles.actionBtnNeutral}`}
+                    aria-label="Move down"
+                    onClick={() => handleReorder(mod, 'down')}
+                    disabled={index === modules.length - 1}
+                  >
+                    <DownIcon />
+                  </button>
+                </Tooltip>
+                <Tooltip label="Edit module">
+                  <button type="button" className={`${styles.actionBtn} ${styles.actionBtnEdit}`} aria-label="Edit module" onClick={() => openEdit(mod)}>
+                    <EditIcon />
+                  </button>
+                </Tooltip>
+                <Tooltip label="Delete module">
+                  <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} aria-label="Delete module" onClick={() => handleDelete(mod)}>
+                    <DeleteIcon />
+                  </button>
+                </Tooltip>
               </div>
             </div>
           ))}

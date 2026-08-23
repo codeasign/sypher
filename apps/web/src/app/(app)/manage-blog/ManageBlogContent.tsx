@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { apiFetch } from '@/lib/api';
 import BlogPostEditor from '@/components/BlogPostEditor';
 import { ViewIcon, EditIcon, DeleteIcon } from '@/components/icons/ActionIcons';
+import Tooltip from '@/components/Tooltip';
 import styles from './manage-blog.module.css';
 
 interface BlogPostSummary {
@@ -117,16 +118,22 @@ export default function ManageBlogContent({ initialPosts }: { initialPosts: Blog
               <span className={styles.tableCell}>{formatDate(post.updatedAt)}</span>
               <div className={styles.actions}>
                 {post.status === 'published' && (
-                  <a className={styles.actionBtn} title="View post" href={`/blog/${post.slug}`} target="_blank" rel="noopener noreferrer">
-                    <ViewIcon />
-                  </a>
+                  <Tooltip label="View post">
+                    <a className={styles.actionBtn} aria-label="View post" href={`/blog/${post.slug}`} target="_blank" rel="noopener noreferrer">
+                      <ViewIcon />
+                    </a>
+                  </Tooltip>
                 )}
-                <button type="button" className={styles.actionBtn} title="Edit post" onClick={() => openEdit(post)}>
-                  <EditIcon />
-                </button>
-                <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} title="Delete post" onClick={() => handleDelete(post)}>
-                  <DeleteIcon />
-                </button>
+                <Tooltip label="Edit post">
+                  <button type="button" className={`${styles.actionBtn} ${styles.actionBtnEdit}`} aria-label="Edit post" onClick={() => openEdit(post)}>
+                    <EditIcon />
+                  </button>
+                </Tooltip>
+                <Tooltip label="Delete post">
+                  <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} aria-label="Delete post" onClick={() => handleDelete(post)}>
+                    <DeleteIcon />
+                  </button>
+                </Tooltip>
               </div>
             </div>
           ))}

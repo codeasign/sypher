@@ -4,6 +4,7 @@ import React, { useEffect, useState } from 'react';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import CohortEditor from '@/components/CohortEditor';
 import { ViewIcon, SettingsIcon, EditIcon, DeleteIcon } from '@/components/icons/ActionIcons';
+import Tooltip from '@/components/Tooltip';
 import {
   listCohorts,
   deleteCohort,
@@ -36,6 +37,14 @@ function formatDate(iso: string): string {
 }
 
 const STATUS_LABEL: Record<string, string> = { draft: 'Draft', live: 'Live', closed: 'Closed' };
+
+// Status-badge rule: the modifier class carries the semantic fill
+// (warning/success/neutral) — without it .statusBadge renders transparent.
+const STATUS_CLASS: Record<string, string> = {
+  draft: styles.statusDraft,
+  live: styles.statusLive,
+  closed: styles.statusClosed,
+};
 
 /* Course Pool & Managers modal — admin-only (matches the server's
    admin-only enforcement on both course-pool writes and manager
@@ -323,27 +332,35 @@ export default function LaunchCohortContent({ isAdmin }: { isAdmin: boolean }): 
                 <span>{cohort.title}</span>
               </div>
               <span className={styles.tableCell}>
-                <span className={styles.statusBadge}>{STATUS_LABEL[cohort.status]}</span>
+                <span className={`${styles.statusBadge} ${STATUS_CLASS[cohort.status] ?? ''}`}>{STATUS_LABEL[cohort.status]}</span>
               </span>
               <span className={styles.tableCell}>{cohort.startDate ? formatDate(cohort.startDate) : '—'}</span>
               <span className={styles.tableCell}>{formatDate(cohort.updatedAt)}</span>
               <div className={styles.actions}>
                 {cohort.status === 'live' && (
-                  <a className={styles.actionBtn} title="View cohort" href={`/cohorts/${cohort.slug}`} target="_blank" rel="noopener noreferrer">
-                    <ViewIcon />
-                  </a>
+                  <Tooltip label="View cohort">
+                    <a className={styles.actionBtn} aria-label="View cohort" href={`/cohorts/${cohort.slug}`} target="_blank" rel="noopener noreferrer">
+                      <ViewIcon />
+                    </a>
+                  </Tooltip>
                 )}
                 {isAdmin && (
-                  <button type="button" className={styles.actionBtn} title="Course pool & managers" onClick={() => setAccessModalFor(cohort)}>
-                    <SettingsIcon />
-                  </button>
+                  <Tooltip label="Course pool & managers">
+                    <button type="button" className={`${styles.actionBtn} ${styles.actionBtnNeutral}`} aria-label="Course pool & managers" onClick={() => setAccessModalFor(cohort)}>
+                      <SettingsIcon />
+                    </button>
+                  </Tooltip>
                 )}
-                <button type="button" className={styles.actionBtn} title="Edit cohort" onClick={() => openEdit(cohort)}>
-                  <EditIcon />
-                </button>
-                <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} title="Delete cohort" onClick={() => setPendingDelete(cohort)}>
-                  <DeleteIcon />
-                </button>
+                <Tooltip label="Edit cohort">
+                  <button type="button" className={`${styles.actionBtn} ${styles.actionBtnEdit}`} aria-label="Edit cohort" onClick={() => openEdit(cohort)}>
+                    <EditIcon />
+                  </button>
+                </Tooltip>
+                <Tooltip label="Delete cohort">
+                  <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} aria-label="Delete cohort" onClick={() => setPendingDelete(cohort)}>
+                    <DeleteIcon />
+                  </button>
+                </Tooltip>
               </div>
             </div>
           ))}

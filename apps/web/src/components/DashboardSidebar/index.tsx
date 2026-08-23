@@ -52,6 +52,11 @@ export default function DashboardSidebar({ role, email, fullName, visibleKeys, i
   const displayName = fullName || email.split('@')[0] || 'User';
   const { handleUpgrade, isProcessing } = useUpgradeToPaid(email, () => router.refresh());
 
+  // Pin the rail only on /dashboard (user request 2026-08-23): there it
+  // stays fixed under the navbar while content scrolls; everywhere else
+  // it scrolls with the page like normal flow content.
+  const isDashboard = pathname === '/dashboard' || pathname.startsWith('/dashboard/');
+
   function isActive(href: string): boolean {
     return pathname === href || pathname.startsWith(`${href}/`);
   }
@@ -63,7 +68,7 @@ export default function DashboardSidebar({ role, email, fullName, visibleKeys, i
   }
 
   return (
-    <aside className={styles.sidebar}>
+    <aside className={isDashboard ? `${styles.sidebar} ${styles.sidebarPinned}` : styles.sidebar}>
       <div className={styles.userSection}>
         <span className={styles.avatar}>{displayName.slice(0, 1).toUpperCase()}</span>
         <div className={styles.userInfo}>

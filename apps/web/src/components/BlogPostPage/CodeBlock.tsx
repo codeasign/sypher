@@ -54,7 +54,11 @@ export default function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>): 
 
   return (
     <div className={styles.codeBlockWrapper}>
-      <button type="button" className={styles.copyButton} onClick={handleCopy}>
+      <button
+        type="button"
+        className={copied ? `${styles.copyButton} ${styles.copyButtonCopied}` : styles.copyButton}
+        onClick={handleCopy}
+      >
         {copied ? <CheckIcon /> : <CopyIcon />}
         {copied ? 'Copied' : 'Copy'}
       </button>
