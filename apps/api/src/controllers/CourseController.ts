@@ -62,6 +62,13 @@ interface CourseModuleWithProgress extends CourseModule {
   locked: boolean;
 }
 
+// One earned course completion as listed on /mock-tests — the course is
+// embedded so the page renders name/link without a second round-trip.
+interface MockTestEntry {
+  course: Course;
+  completedAt: Date;
+}
+
 interface CourseAccessInfo {
   hasFullAccess: boolean;
   visible: boolean;
@@ -174,6 +181,26 @@ export class CourseController extends Controller {
   @Security('session')
   public async gettingStarted(): Promise<GettingStartedModuleEntry[]> {
     return getOrSet('courses:getting-started', GETTING_STARTED_CACHE_TTL_MS, () => courseModuleRepository.listGettingStarted());
+  }
+
+  // Data for the /mock-tests page: every course the calling user has fully
+  // completed, newest first. Published courses only — a draft/unpublished
+  // course would leak draft metadata into the response and link to a dead
+  // /learn/[slug] page. Deliberately NOT access-gated beyond that (unlike
+  // listVisible): a completion is an earned personal record, same rule as
+  // the bookmarks by-ids lookup above — it doesn't vanish when access is
+  // revoked later.
+  @Get('mock-tests')
+  @Security('session')
+  public async listMockTests(@Request() request: ExpressRequest): Promise<MockTestEntry[]> {
+    const user = request.user as User;
+    const completions = await courseCompletionRepository.listForUser(user.id);
+    const courses = await courseRepository.findByIds(completions.map((c) => c.courseId));
+    const publishedById = new Map(courses.filter((c) => c.status === 'published').map((c) => [c.id, c]));
+    return completions.flatMap((completion) => {
+      const course = publishedById.get(completion.courseId);
+      return course ? [{ course, completedAt: completion.completedAt }] : [];
+    });
   }
 
   // Returns EVERY module, not just accessible ones — confirmed 2026-08-22

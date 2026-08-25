@@ -15,6 +15,17 @@
 // with no code enforcing it for anything except the auto-convert script's
 // own flowchart-only path. This script is that enforcement, generalized.
 //
+// Exception: classDiagram sources may render portrait (ratio < 1.3) —
+// only the w<=1400 width cap still applies to them, not the aspect-ratio
+// band. classDiagram's layout stacks sibling classes (interface
+// implementers) perpendicular to `direction`, which naturally goes tall
+// once there are 3+ implementers; forcing that into landscape previously
+// drove real content compromises (downgrading to flowchart, or trimming
+// class fields/methods just to shave width) — user decision 2026-08-24.
+// If a classDiagram still can't fit under the width cap in either
+// direction, split it into two connected classDiagram blocks rather than
+// cutting content. All other diagram types keep the full landscape band.
+//
 // Direction retry: works for any diagram type with an explicit direction
 // hint — `flowchart LR`/`graph TD`/etc. as the type declaration line, or
 // a standalone `direction LR`/`direction TB` line (used by classDiagram,
@@ -48,6 +59,15 @@ import os from 'node:os';
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
 const IMG_OUT_DIR = path.join(REPO_ROOT, 'apps', 'docs', 'static', 'img', 'diagrams');
 
+// Blackboard technical theme — ONE canonical look baked into every SVG so
+// the same file reads correctly on dark AND light pages (user decision
+// 2026-08-23; supersedes the old always-transparent-background rule — the
+// board color below IS the background, no consumer-side card needed).
+// Consumed identically by the bulk re-render path (render-mermaid-manifest*)
+// so restyled re-renders overwrite existing hash-named SVGs in place.
+const THEME_CONFIG = path.join(REPO_ROOT, 'scripts', 'mermaid-blackboard.config.json');
+const BOARD_BG = '#0B0F14';
+
 const MIN_RATIO = 1.3;
 const MAX_RATIO = 3.5;
 const MAX_WIDTH = 1400;
@@ -76,18 +96,50 @@ function renderMermaid(mermaidCode, hash) {
   if (!existsSync(puppeteerConfig)) {
     writeFileSync(puppeteerConfig, JSON.stringify({ args: ['--no-sandbox'] }), 'utf8');
   }
-  const args = ['--no-install', 'mmdc', '-i', tmpFile, '-o', outFile, '-e', 'svg', '-b', 'transparent', '-p', puppeteerConfig];
+  const args = ['--no-install', 'mmdc', '-i', tmpFile, '-o', outFile, '-e', 'svg', '-b', BOARD_BG, '-c', THEME_CONFIG, '-p', puppeteerConfig];
   execFileSync('npx', args, { stdio: 'ignore', shell: true });
+  fixIntrinsicSize(outFile);
   return outFile;
 }
 
-function checkLandscapeBand(svgPath) {
+// mmdc emits width="100%" with no height on the SVG root — fine for inline
+// embedding, but these SVGs are consumed as <img src> (AsciiDiagram), where
+// a percentage width gives the browser no intrinsic size, so width:auto
+// stretches the image to the full content column. Replace it with the real
+// pixel dimensions from the viewBox (same fix as render-mermaid-manifest.mjs).
+function fixIntrinsicSize(svgPath) {
+  let svg = readFileSync(svgPath, 'utf8');
+  if (!svg.includes('width="100%"')) return;
+  const m = svg.match(/viewBox="[-0-9.]+ [-0-9.]+ ([0-9.]+) ([0-9.]+)"/);
+  if (!m) return;
+  const [, w, h] = m;
+  svg = svg.replace('width="100%"', `width="${w}" height="${h}"`);
+  writeFileSync(svgPath, svg, 'utf8');
+}
+
+// classDiagram's layout stacks sibling classes (interface implementers) on
+// the axis perpendicular to `direction`, which naturally produces tall/
+// narrow shapes once there are 3+ implementers. Forcing that into the
+// landscape band is what drove real production compromises (downgrading
+// to flowchart to dodge the sibling-stacking, or trimming class fields/
+// methods just to shave width) — user decision 2026-08-24. So for
+// classDiagram sources specifically, portrait is accepted outright: only
+// the width cap applies, not the aspect-ratio band. Every other diagram
+// type (flowchart, sequenceDiagram, stateDiagram-v2, erDiagram, ...)
+// keeps the full landscape-band requirement.
+function isClassDiagram(mermaidCode) {
+  return /^\s*classDiagram\b/.test(mermaidCode);
+}
+
+function checkLandscapeBand(svgPath, portraitAllowed) {
   const svg = readFileSync(svgPath, 'utf8');
   const m = svg.match(/viewBox="([^"]*)"/);
   if (!m) return { ok: false, reason: 'no viewBox found in rendered SVG' };
   const [, , w, h] = m[1].split(/\s+/).map(Number);
   const ratio = w / h;
-  const ok = w <= MAX_WIDTH && ratio >= MIN_RATIO && ratio <= MAX_RATIO;
+  const ok = portraitAllowed
+    ? w <= MAX_WIDTH
+    : w <= MAX_WIDTH && ratio >= MIN_RATIO && ratio <= MAX_RATIO;
   return { ok, w, h, ratio };
 }
 
@@ -121,6 +173,7 @@ function flipDirection(mermaidCode) {
 function checkOne(mmdPath) {
   const original = readFileSync(mmdPath, 'utf8');
   const attempts = [];
+  const portraitAllowed = isClassDiagram(original);
 
   if (!checkMmdc()) {
     return { mmdFile: mmdPath, status: 'fail', reason: '@mermaid-js/mermaid-cli (mmdc) not available', attempts };
@@ -131,21 +184,23 @@ function checkOne(mmdPath) {
   let svgPath, band;
   try {
     svgPath = renderMermaid(code, hash);
-    band = checkLandscapeBand(svgPath);
+    band = checkLandscapeBand(svgPath, portraitAllowed);
   } catch (err) {
     return { mmdFile: mmdPath, status: 'fail', reason: `render failed: ${err.message}`, attempts };
   }
   attempts.push({ attempt: 1, direction: 'original', hash, w: band.w, h: band.h, ratio: band.ratio, ok: band.ok });
 
   if (band.ok) {
-    return { mmdFile: mmdPath, status: 'pass', hash, svgPath: path.relative(REPO_ROOT, svgPath).replace(/\\/g, '/'), w: band.w, h: band.h, ratio: band.ratio, attempts };
+    return { mmdFile: mmdPath, status: 'pass', hash, svgPath: path.relative(REPO_ROOT, svgPath).replace(/\\/g, '/'), w: band.w, h: band.h, ratio: band.ratio, attempts, ...(portraitAllowed ? { portraitAllowed: true } : {}) };
   }
 
   const flipped = flipDirection(code);
   if (flipped === null) {
     return {
       mmdFile: mmdPath, status: 'fail',
-      reason: `outside landscape band (w=${Math.round(band.w)}, ratio=${band.ratio?.toFixed(2)}) and no direction hint to retry with — needs manual restructuring (shorten labels, split rows/subgraphs)`,
+      reason: portraitAllowed
+        ? `classDiagram exceeds the ${MAX_WIDTH}px width cap (w=${Math.round(band.w)}) and no direction hint to retry with — split into two connected classDiagram blocks rather than trimming content`
+        : `outside landscape band (w=${Math.round(band.w)}, ratio=${band.ratio?.toFixed(2)}) and no direction hint to retry with — needs manual restructuring (shorten labels, split rows/subgraphs)`,
       attempts,
     };
   }
@@ -153,7 +208,7 @@ function checkOne(mmdPath) {
   hash = hashContent(flipped);
   try {
     svgPath = renderMermaid(flipped, hash);
-    band = checkLandscapeBand(svgPath);
+    band = checkLandscapeBand(svgPath, portraitAllowed);
   } catch (err) {
     return { mmdFile: mmdPath, status: 'fail', reason: `retry render failed: ${err.message}`, attempts };
   }
@@ -164,12 +219,14 @@ function checkOne(mmdPath) {
     // to the .mmd cache file so the source of truth matches what was
     // actually rendered and wired in.
     writeFileSync(mmdPath, flipped, 'utf8');
-    return { mmdFile: mmdPath, status: 'pass', hash, svgPath: path.relative(REPO_ROOT, svgPath).replace(/\\/g, '/'), w: band.w, h: band.h, ratio: band.ratio, attempts, directionFlipped: true };
+    return { mmdFile: mmdPath, status: 'pass', hash, svgPath: path.relative(REPO_ROOT, svgPath).replace(/\\/g, '/'), w: band.w, h: band.h, ratio: band.ratio, attempts, directionFlipped: true, ...(portraitAllowed ? { portraitAllowed: true } : {}) };
   }
 
   return {
     mmdFile: mmdPath, status: 'fail',
-    reason: `outside landscape band after direction-flip retry (w=${Math.round(band.w)}, ratio=${band.ratio?.toFixed(2)}) — needs manual restructuring (shorten labels, split rows/subgraphs, reconsider diagram type)`,
+    reason: portraitAllowed
+      ? `classDiagram exceeds the ${MAX_WIDTH}px width cap in both directions (best w=${Math.round(band.w)}) — split into two connected classDiagram blocks rather than trimming content`
+      : `outside landscape band after direction-flip retry (w=${Math.round(band.w)}, ratio=${band.ratio?.toFixed(2)}) — needs manual restructuring (shorten labels, split rows/subgraphs, reconsider diagram type)`,
     attempts,
   };
 }

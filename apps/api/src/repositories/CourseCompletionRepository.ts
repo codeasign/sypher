@@ -43,6 +43,15 @@ export class CourseCompletionRepository {
     return new Set(rows.map((r) => r.courseId));
   }
 
+  // Newest-first — the mock tests page lists most-recently-earned first.
+  async listForUser(userId: string): Promise<{ courseId: string; completedAt: Date }[]> {
+    return prisma.courseCompletion.findMany({
+      where: { userId },
+      select: { courseId: true, completedAt: true },
+      orderBy: { completedAt: 'desc' },
+    });
+  }
+
   async listCompletionsForCourse(courseId: string): Promise<{ userId: string; completedAt: Date }[]> {
     return prisma.courseCompletion.findMany({
       where: { courseId },

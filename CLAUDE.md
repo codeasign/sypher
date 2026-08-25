@@ -46,6 +46,51 @@ Feature toggle in features.json:
 - "diagramImages": false  → renders ASCII (default)
 - "diagramImages": true   → renders PNG if it exists, falls back to ASCII
 
+## Mermaid diagram sources (.mmd)
+
+Applies to ALL diagram work in apps/docs AND apps/web:
+
+- English-only text inside diagrams — translate non-English labels, never copy them
+- Choose diagram type from source structure: actor message exchanges → sequenceDiagram,
+  fielded structures/implementers → classDiagram, state machines → stateDiagram-v2,
+  entity relations → erDiagram, otherwise flowchart;
+  `node scripts/classify-diagram-type.mjs` classifies automatically (~99% accuracy)
+- Every .mmd must pass `node scripts/check-landscape-band.mjs <file>` with exit 0:
+  width ≤1400px, aspect ratio 1.3–3.5 (this IS the landscape-mode rule);
+  classDiagrams may render portrait (width cap only);
+  EXCEPTION: after 7+ failed restructure attempts on one diagram, gate may be
+  relaxed for that case — ship best variant and note it
+- Render with the blackboard theme (`scripts/mermaid-blackboard.config.json`);
+  gate PASS writes hash-named SVGs to apps/docs/static/img/diagrams/;
+  never bulk-rerun render-mermaid-manifest.mjs (no skip-if-exists) — render single
+  fixed files directly with mmdc + patch the manifest
+- Never trim nodes/labels/content to fit layout — restructure instead;
+  never downgrade a classDiagram to a flowchart
+- Probe geometry (cheap render + viewBox check) before gating; iterate until in-band
+- Blackboard-theme layout levers: wrap long labels with `<br/>` (labels hard-cap ~260px),
+  ≤3 top-level clusters, inter-cluster edges attach at cluster level only
+  (edges from internal nodes collapse the subgraph's `direction`),
+  fans stay inside one cluster, connect isolated subgraph nodes or they ignore `direction`,
+  declare explicit `direction` per top-level subgraph,
+  NO quoted edge labels (`-->|"..."|`) on cross-subgraph edges — they flatten the
+  whole layout; use unquoted `-- text -->` there (quoting is fine inside a cluster)
+- Known syntax traps: `--> A["x"] & B["y"]` chaining after a label is invalid;
+  `end` must sit on its own line; never put `->` inside a mermaid Note (decodes
+  pre-lex and parses as an arrow — recast as flowchart). Near-miss rescues:
+  `wrappingWidth`, `nodeSpacing`, `rankSpacing`, `sequence.actorMargin/messageMargin`
+  init tuning
+- sequenceDiagram messages/notes: UNWRAP labels to single lines so text widens the
+  actor span (opposite of flowchart wrapping)
+- A chain wider than 1400px even fully unwrapped: split into two disconnected LR
+  chains stacked vertically, order carried by numbered step titles
+- Batch/agent runs: write only to manifest-given exact mmdFile paths,
+  skip-if-exists (files on disk are the checkpoint), workers never edit manifests/MDX
+- Wiring chain once a course's sources are gate-green:
+  make-rehash-map.mjs → wire-mermaid-rehash.mjs → update-diagram-manifest.mjs <slug>
+  (fresh unwired tags need wire-mermaid-from-map.mjs instead of the rehash variant)
+- apps/docs/diagram-manifests/ is the git-tracked source of truth;
+  .cache/ascii-to-mermaid/*.mmd is disposable build output
+
 Generating images:
   node scripts/generate-diagrams.js --dry-run
   node scripts/generate-diagrams.js

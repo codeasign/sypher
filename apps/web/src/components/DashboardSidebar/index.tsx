@@ -18,6 +18,7 @@ import {
   ManageCoursesIcon,
   SetupGuidesIcon,
   BookmarksIcon,
+  MockTestIcon,
   ProfileIcon,
 } from '@/components/icons/SidebarIcons';
 import styles from './styles.module.css';
@@ -100,6 +101,10 @@ export default function DashboardSidebar({ role, email, fullName, visibleKeys, i
           <Link href="/learn" className={isActive('/learn') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}>
             <ManageCoursesIcon className={styles.navIcon} />
             <span className={styles.navLabel}>My Courses</span>
+          </Link>
+          <Link href="/mock-tests" className={isActive('/mock-tests') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}>
+            <MockTestIcon className={styles.navIcon} />
+            <span className={styles.navLabel}>Mock Test</span>
           </Link>
           <Link
             href="/getting-started"

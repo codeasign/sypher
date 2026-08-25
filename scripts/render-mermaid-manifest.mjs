@@ -12,6 +12,14 @@ const MMD_DIR = path.join(REPO_ROOT, ".cache", "ascii-to-mermaid");
 const OUT_DIR = path.join(REPO_ROOT, "apps", "docs", "static", "img", "diagrams");
 const MANIFEST_PATH = path.join(REPO_ROOT, ".cache", "ascii-to-mermaid-images", "manifest.json");
 
+// Blackboard technical theme — must stay in lockstep with
+// check-landscape-band.mjs (same config file, same board background) so a
+// bulk re-render reproduces byte-identical styling for the same .mmd source.
+// User decision 2026-08-23: one baked-in theme for dark AND light pages,
+// superseding this script's original -b transparent.
+const THEME_CONFIG = path.join(REPO_ROOT, "scripts", "mermaid-blackboard.config.json");
+const BOARD_BG = "#0B0F14";
+
 mkdirSync(OUT_DIR, { recursive: true });
 
 // mmdc always emits width="100%" with no height attribute on the SVG root,
@@ -47,7 +55,7 @@ for (const file of mmdFiles) {
     try {
       execFileSync(
         "npx",
-        ["--no-install", "mmdc", "-i", mmdPath, "-o", svgPath, "-b", "transparent"],
+        ["--no-install", "mmdc", "-i", mmdPath, "-o", svgPath, "-b", BOARD_BG, "-c", THEME_CONFIG],
         { cwd: path.join(REPO_ROOT, "apps", "docs"), stdio: ["ignore", "pipe", "pipe"], shell: true }
       );
       fixIntrinsicSize(svgPath);
