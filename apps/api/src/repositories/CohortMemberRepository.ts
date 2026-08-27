@@ -28,6 +28,47 @@ export class CohortMemberRepository {
     }));
   }
 
+  // Paginated twin for /manage-cohort-users' table (10/page default). id
+  // as tiebreaker — enrolledAt alone isn't unique enough to page on
+  // reliably (same lesson as BlogPostRepository.listPublishedPage).
+  // Optional search matches the member's email or full name, case-insensitive.
+  async listRosterPage(cohortId: string, limit: number, offset: number, search?: string): Promise<{ members: RosterEntry[]; total: number }> {
+    const where = {
+      cohortId,
+      ...(search
+        ? {
+            user: {
+              is: {
+                OR: [
+                  { email: { contains: search, mode: 'insensitive' as const } },
+                  { fullName: { contains: search, mode: 'insensitive' as const } },
+                ],
+              },
+            },
+          }
+        : {}),
+    };
+    const [rows, total] = await Promise.all([
+      prisma.cohortMember.findMany({
+        where,
+        include: { user: true },
+        orderBy: [{ enrolledAt: 'desc' }, { userId: 'desc' }],
+        take: limit,
+        skip: offset,
+      }),
+      prisma.cohortMember.count({ where }),
+    ]);
+    const members = rows.map((row) => ({
+      userId: row.userId,
+      email: row.user.email,
+      fullName: row.user.fullName,
+      status: row.status,
+      enrolledAt: row.enrolledAt,
+      deletedAt: row.user.deletedAt,
+    }));
+    return { members, total };
+  }
+
   async isActiveMember(cohortId: string, userId: string): Promise<boolean> {
     const row = await prisma.cohortMember.findUnique({ where: { cohortId_userId: { cohortId, userId } } });
     return row?.status === 'active';

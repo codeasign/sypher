@@ -6,6 +6,9 @@ export interface Course {
   name: string;
   description: string | null;
   coverImageUrl: string | null;
+  category?: string | null; // "tech" | "life-skills"
+  relatedCourses?: string | null; // CSV of related course slugs
+  audienceRole?: string | null; // target-audience role, e.g. "developer"
   status: 'draft' | 'published';
   authorId: string | null;
   createdAt: string;
@@ -15,6 +18,36 @@ export interface Course {
 
 export interface CourseWithAccess extends Course {
   hasFullAccess: boolean;
+  // Has the user completed at least one module (ever) — Enroll vs Resume
+  // on the course card. Stays true for a fully completed course too.
+  started: boolean;
+}
+
+export interface CoursePage {
+  courses: CourseWithAccess[];
+  total: number;
+}
+
+// GET /courses — paginated, full-access-only (My Courses).
+export async function fetchMyCoursesPage(limit: number, offset: number, role?: string): Promise<CoursePage> {
+  const roleQs = role ? `&role=${encodeURIComponent(role)}` : '';
+  const res = await apiFetch(`/courses?limit=${limit}&offset=${offset}${roleQs}`);
+  if (!res.ok) throw new Error(`request failed (${res.status})`);
+  return res.json();
+}
+
+// GET /courses/browse — paginated, every published course (Browse Courses).
+export async function fetchBrowseCoursesPage(limit: number, offset: number, role?: string): Promise<CoursePage> {
+  const roleQs = role ? `&role=${encodeURIComponent(role)}` : '';
+  const res = await apiFetch(`/courses/browse?limit=${limit}&offset=${offset}${roleQs}`);
+  if (!res.ok) throw new Error(`request failed (${res.status})`);
+  return res.json();
+}
+
+/** Enroll (full access, never started) / Resume (full access, started or completed) / Preview (no full access). */
+export function courseActionLabel(course: Pick<CourseWithAccess, 'hasFullAccess' | 'started'>): 'Enroll' | 'Resume' | 'Preview' {
+  if (!course.hasFullAccess) return 'Preview';
+  return course.started ? 'Resume' : 'Enroll';
 }
 
 export interface CourseModule {
@@ -52,9 +85,29 @@ export interface GettingStartedModuleEntry {
 
 interface CourseFields {
   name: string;
+  slug?: string; // optional explicit URL slug; omitted = derived from name
   description?: string | null;
   coverImageUrl?: string | null;
+  category?: string | null; // "tech" | "life-skills"
+  relatedCourses?: string | null; // CSV of related course slugs
+  audienceRole?: string | null;
 }
+
+// Target-audience roles for catalog grouping (/learn chips). Distinct from
+// the access/billing roles (FREE_USER etc.) — this describes who the course
+// TEACHES, not who may open it. The DB column is free-form like category;
+// this list standardizes what the authoring flow writes and the UI offers.
+export const AUDIENCE_ROLES: { value: string; label: string }[] = [
+  { value: 'developer', label: 'Developer' },
+  { value: 'qa', label: 'QA / QE' },
+  { value: 'engineering-manager', label: 'Engineering Manager' },
+  { value: 'engineering-leader', label: 'Engineering Leader' },
+  { value: 'product-manager', label: 'Product Manager' },
+  { value: 'devops-sre', label: 'DevOps / SRE' },
+  { value: 'agile-delivery', label: 'Agile / Delivery' },
+  { value: 'project-management', label: 'Project Management' },
+  { value: 'foundation', label: 'Foundation / Cross-role' },
+];
 
 interface CourseModuleFields {
   title: string;

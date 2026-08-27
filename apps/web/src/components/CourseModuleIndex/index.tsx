@@ -60,7 +60,7 @@ export default function CourseModuleIndex({ courseSlug, courseName, courses, mod
       </div>
 
       {showModuleOutline ? (
-        <ol className={styles.list}>
+        <ol className={`${styles.list} ${styles.scrollable}`}>
           {groupBySection(modules).map((group, groupIdx) => (
             <li key={group.label ?? `ungrouped-${groupIdx}`}>
               {group.label && <div className={styles.sectionLabel}>{group.label}</div>}

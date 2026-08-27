@@ -53,11 +53,6 @@ export default function DashboardSidebar({ role, email, fullName, visibleKeys, i
   const displayName = fullName || email.split('@')[0] || 'User';
   const { handleUpgrade, isProcessing } = useUpgradeToPaid(email, () => router.refresh());
 
-  // Pin the rail only on /dashboard (user request 2026-08-23): there it
-  // stays fixed under the navbar while content scrolls; everywhere else
-  // it scrolls with the page like normal flow content.
-  const isDashboard = pathname === '/dashboard' || pathname.startsWith('/dashboard/');
-
   function isActive(href: string): boolean {
     return pathname === href || pathname.startsWith(`${href}/`);
   }
@@ -68,8 +63,12 @@ export default function DashboardSidebar({ role, email, fullName, visibleKeys, i
     router.refresh();
   }
 
+  // Pinned everywhere in the (app) group now — was /dashboard-only
+  // (2026-08-23 request), reversed 2026-08-27: user reported the rail
+  // drifting up while scrolling a long list on /browse-courses and asked
+  // for it to stay put consistently instead of page-by-page.
   return (
-    <aside className={isDashboard ? `${styles.sidebar} ${styles.sidebarPinned}` : styles.sidebar}>
+    <aside className={`${styles.sidebar} ${styles.sidebarPinned}`}>
       <div className={styles.userSection}>
         <span className={styles.avatar}>{displayName.slice(0, 1).toUpperCase()}</span>
         <div className={styles.userInfo}>
@@ -94,7 +93,10 @@ export default function DashboardSidebar({ role, email, fullName, visibleKeys, i
             <DashboardIcon className={styles.navIcon} />
             <span className={styles.navLabel}>Dashboard</span>
           </Link>
-          <Link href="/courses" className={isActive('/courses') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}>
+          <Link
+            href="/browse-courses"
+            className={isActive('/browse-courses') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
+          >
             <CoursesIcon className={styles.navIcon} />
             <span className={styles.navLabel}>Browse Courses</span>
           </Link>

@@ -122,7 +122,6 @@ export default async function CourseModulePage({
         ) : (
           <CourseModuleArticle title={mod.title} content={mod.bodyMdx} />
         )}
-
       </div>
 
       {/* Edge pager OUTSIDE the paper sheet — big chevrons on the left and

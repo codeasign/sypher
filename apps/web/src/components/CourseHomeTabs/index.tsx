@@ -6,11 +6,12 @@ import styles from './styles.module.css';
 interface CourseHomeTabsProps {
   about: ReactNode;
   topics: ReactNode;
+  discussion: ReactNode;
 }
 
-type Tab = 'about' | 'topics';
+type Tab = 'about' | 'topics' | 'discussion';
 
-export default function CourseHomeTabs({ about, topics }: CourseHomeTabsProps): React.JSX.Element {
+export default function CourseHomeTabs({ about, topics, discussion }: CourseHomeTabsProps): React.JSX.Element {
   const [active, setActive] = useState<Tab>('about');
 
   return (
@@ -34,9 +35,20 @@ export default function CourseHomeTabs({ about, topics }: CourseHomeTabsProps): 
         >
           Topics
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={active === 'discussion'}
+          className={active === 'discussion' ? `${styles.tab} ${styles.tabActive}` : styles.tab}
+          onClick={() => setActive('discussion')}
+        >
+          Discussion
+        </button>
       </div>
       <div className={styles.tabPanel} role="tabpanel">
-        {active === 'about' ? about : topics}
+        {active === 'about' && about}
+        {active === 'topics' && topics}
+        {active === 'discussion' && discussion}
       </div>
     </div>
   );

@@ -4,15 +4,28 @@
 // role-gated and company-scoped endpoints against locally.
 import { PrismaClient } from '@prisma/client';
 import { hashPassword } from '../src/lib/password';
+import { buildUsernameBase } from '../src/repositories/UserRepository';
 
 const prisma = new PrismaClient();
 
 async function upsertUser(email: string, password: string, fullName: string, role: 'ADMIN' | 'COMPANY_HR' | 'COMPANY_EMPLOYEE', companyId?: string) {
   const passwordHash = await hashPassword(password);
+  // username lives in create-data only: re-seeding must never clobber a
+  // handle (user-editable now). Fresh databases get the same deterministic
+  // base the runtime generator and the migration backfill produce
+  // (buildUsernameBase's rules), keeping dev fixtures consistent.
   return prisma.user.upsert({
     where: { email },
     update: {},
-    create: { email, passwordHash, fullName, role, provider: 'EMAIL', companyId },
+    create: {
+      email,
+      passwordHash,
+      fullName,
+      role,
+      provider: 'EMAIL',
+      companyId,
+      username: buildUsernameBase(email),
+    },
   });
 }
 

@@ -1,10 +1,12 @@
 import { redirect } from 'next/navigation';
 import { serverApiFetch } from '@/lib/serverApi';
 import { roleLabel } from '@/lib/roleLabels';
+import ProfileUsernameEditor from '@/components/ProfileUsernameEditor';
 
 interface AuthUser {
   id: string;
   email: string;
+  username: string;
   fullName: string | null;
   role: string;
   companyId: string | null;
@@ -26,6 +28,7 @@ export default async function ProfilePage(): Promise<React.JSX.Element> {
       <p>
         <strong>Name:</strong> {user.fullName || '—'}
       </p>
+      <ProfileUsernameEditor initial={user} />
       <p>
         <strong>Email:</strong> {user.email}
       </p>

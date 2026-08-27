@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Path, Post, Put, Request, Res, Route, Security, Tags, type TsoaResponse } from 'tsoa';
+import { Body, Controller, Delete, Get, Path, Post, Put, Query, Request, Res, Route, Security, Tags, type TsoaResponse } from 'tsoa';
 import type { Request as ExpressRequest } from 'express';
 import type { Course, CourseModule, Role, User } from '@prisma/client';
 import { CourseRepository } from '../repositories/CourseRepository';
@@ -11,6 +11,7 @@ import { requireCanManageCourses } from '../lib/contentAuthz';
 import { hasCourseAccess } from '../lib/accessControl';
 import { isModuleFreelyVisible } from '../lib/coursePreview';
 import { getOrSet, purge } from '../lib/cache';
+import { assertNoReplacementChar } from '../lib/textSanitize';
 
 const courseRepository = new CourseRepository();
 const courseModuleRepository = new CourseModuleRepository();
@@ -23,8 +24,23 @@ const GETTING_STARTED_CACHE_TTL_MS = 60_000;
 
 interface CourseCreateRequest {
   name: string;
+  // Optional explicit URL slug. When absent the slug derives from `name`
+  // (previous behavior, unchanged). Authored-course imports pass this so a
+  // requested course slug can differ from the display name.
+  slug?: string;
   description?: string | null;
   coverImageUrl?: string | null;
+  // "tech" | "life-skills" (free-form string so new categories don't need
+  // schema changes).
+  category?: string | null;
+  // Comma-separated slugs of related courses (CSV), e.g.
+  // "api-testing-python,api-testing-typescript".
+  relatedCourses?: string | null;
+  // Target audience role for catalog grouping, e.g. "developer" | "qa" |
+  // "engineering-manager". Free-form like category; distinct from the
+  // billing/access roles (FREE_USER etc.) — this describes WHO THE COURSE
+  // TEACHES, not who may open it.
+  audienceRole?: string | null;
 }
 
 interface CourseSetStatusRequest {
@@ -51,6 +67,11 @@ interface CourseSetCompanyGrantRequest {
 
 interface CourseWithAccess extends Course {
   hasFullAccess: boolean;
+  // Has the user completed at least one module of this course (ever) —
+  // Enroll (false) vs Resume (true) on the course card. A fully completed
+  // course still reads true here (ModuleProgress rows persist forever),
+  // so revisiting it never resets or re-tracks anything.
+  started: boolean;
 }
 
 interface CourseByIdsRequest {
@@ -101,6 +122,45 @@ async function courseAccessInfo(user: User, course: Course): Promise<CourseAcces
   return { hasFullAccess: false, visible: moduleCount > 0 };
 }
 
+const DEFAULT_PAGE_SIZE = 20;
+const MAX_PAGE_SIZE = 50;
+// Higher cap for the admin manage-list endpoint only — the frontend fetches
+// the full course set once and does search/pagination client-side (user's
+// explicit call 2026-08-27: avoid a network round trip per keystroke/page),
+// so this needs to comfortably exceed any realistic course count, unlike
+// the public-facing MAX_PAGE_SIZE above which bounds real per-request cost.
+const MAX_MANAGE_PAGE_SIZE = 1000;
+
+export interface CoursePage {
+  courses: CourseWithAccess[];
+  total: number;
+}
+
+// Shared by listVisible/listBrowse below — computes access+started for
+// every published course once, so both endpoints paginate the SAME
+// already-filtered-or-not array rather than re-deriving it. Course counts
+// are still small enough (dozens, not hundreds) that computing access for
+// all of them up front and paginating in memory is simpler and fast
+// enough; revisit with real DB-level pagination if that stops being true.
+async function computeAllWithAccess(user: User): Promise<CourseWithAccess[]> {
+  const courses = await courseRepository.listPublished();
+  const startedIds = await moduleProgressRepository.listStartedCourseIds(user.id);
+  const results: CourseWithAccess[] = [];
+  for (const course of courses) {
+    const info = await courseAccessInfo(user, course);
+    results.push({ ...course, hasFullAccess: info.hasFullAccess, started: startedIds.has(course.id) });
+  }
+  return results;
+}
+
+function paginate<T>(items: T[], limit?: string, offset?: string): { items: T[]; total: number } {
+  const parsedLimit = limit === undefined ? DEFAULT_PAGE_SIZE : Number.parseInt(limit, 10);
+  const parsedOffset = offset === undefined ? 0 : Number.parseInt(offset, 10);
+  const pageSize = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, MAX_PAGE_SIZE) : DEFAULT_PAGE_SIZE;
+  const pageOffset = Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
+  return { items: items.slice(pageOffset, pageOffset + pageSize), total: items.length };
+}
+
 @Route('courses')
 @Tags('Courses')
 export class CourseController extends Controller {
@@ -108,38 +168,59 @@ export class CourseController extends Controller {
   // truly anonymous path, matching the old system's auth.uid() is not null
   // requirement on every access branch, getting-started included) ----
 
+  // "My Courses" (apps/web's /learn page): only courses the user has FULL
+  // access to — not the broader "visible" set (which also includes
+  // locked-but-freely-previewable courses; those now live on the Browse
+  // Courses catalog instead, via listBrowse below, with a Preview button).
+  // Narrowed 2026-08-27 at the user's request: My Courses should read as
+  // "what you're enrolled in / can fully take", not a mixed list.
+  // Paginated (20/page default) — same shape as GET /blog and
+  // GET /mock-exams/page.
   @Get()
   @Security('session')
-  public async listVisible(@Request() request: ExpressRequest): Promise<CourseWithAccess[]> {
+  public async listVisible(
+    @Request() request: ExpressRequest,
+    @Query() limit?: string,
+    @Query() offset?: string,
+    @Query() role?: string,
+  ): Promise<CoursePage> {
     const user = request.user as User;
-    const courses = await courseRepository.listPublished();
-    const results: CourseWithAccess[] = [];
-    for (const course of courses) {
-      const info = await courseAccessInfo(user, course);
-      if (info.visible) results.push({ ...course, hasFullAccess: info.hasFullAccess });
-    }
-    return results;
+    const all = await computeAllWithAccess(user);
+    const filtered = all.filter((c) => c.hasFullAccess && (role === undefined || c.audienceRole === role));
+    const { items, total } = paginate(filtered, limit, offset);
+    return { courses: items, total };
   }
 
-  // Deliberately unfiltered by visible — every published course appears,
-  // regardless of access. Confirmed with the user 2026-08-22: the /learn
-  // sidebar course-switcher needs locked courses to be discoverable (shown
-  // with a lock icon) rather than hidden, since free users will eventually
-  // get a partial preview of every course — that deeper per-course
-  // partial-access model is separate, bigger, scoped-later work; this
-  // endpoint only fixes the sidebar's own visibility gate. listVisible
-  // above is untouched, still used by /learn's own course grid and
-  // anywhere else "hide what I can't see at all" is still the right rule.
+  // Every published course, access-aware — the Browse Courses catalog
+  // (apps/web's /courses page, 2026-08-27): Enroll/Resume/Preview per
+  // card depending on hasFullAccess/started. Paginated like listVisible.
+  @Get('browse')
+  @Security('session')
+  public async listBrowse(
+    @Request() request: ExpressRequest,
+    @Query() limit?: string,
+    @Query() offset?: string,
+    @Query() role?: string,
+  ): Promise<CoursePage> {
+    const user = request.user as User;
+    const all = await computeAllWithAccess(user);
+    const filtered = role === undefined ? all : all.filter((c) => c.audienceRole === role);
+    const { items, total } = paginate(filtered, limit, offset);
+    return { courses: items, total };
+  }
+
+  // Deliberately unfiltered by visible AND unpaginated — every published
+  // course appears, regardless of access, in one shot. Confirmed with the
+  // user 2026-08-22: the /learn sidebar course-switcher needs locked
+  // courses to be discoverable (shown with a lock icon) rather than
+  // hidden. Kept separate from listBrowse above (which paginates) because
+  // the switcher is a small in-page dropdown, not a browse-everything view
+  // — it needs the full list in one request every time, not pages of it.
   @Get('sidebar-list')
   @Security('session')
   public async listForSidebar(@Request() request: ExpressRequest): Promise<CourseWithAccess[]> {
     const user = request.user as User;
-    const courses = await courseRepository.listPublished();
-    const results: CourseWithAccess[] = [];
-    for (const course of courses) {
-      const info = await courseAccessInfo(user, course);
-      results.push({ ...course, hasFullAccess: info.hasFullAccess });
-    }
+    const results = await computeAllWithAccess(user);
     return results;
   }
 
@@ -161,11 +242,23 @@ export class CourseController extends Controller {
     return courseModuleRepository.findByIdsWithCourse(body.ids);
   }
 
+  // Paginated (10/page default per the user's /manage-courses request),
+  // optional ?search= over the course name — same shape convention as
+  // CoursePage.
   @Get('manage/list')
   @Security('session')
-  public async listManage(@Request() request: ExpressRequest): Promise<Course[]> {
+  public async listManage(
+    @Request() request: ExpressRequest,
+    @Query() limit?: string,
+    @Query() offset?: string,
+    @Query() search?: string,
+  ): Promise<{ courses: Course[]; total: number }> {
     await requireCanManageCourses(request.user as User);
-    return courseRepository.listAll();
+    const parsedLimit = limit === undefined ? 10 : Number.parseInt(limit, 10);
+    const parsedOffset = offset === undefined ? 0 : Number.parseInt(offset, 10);
+    const pageSize = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, MAX_MANAGE_PAGE_SIZE) : 10;
+    const pageOffset = Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
+    return courseRepository.listAllPage(pageSize, pageOffset, search);
   }
 
   @Get('manage/{id}')
@@ -304,6 +397,8 @@ export class CourseController extends Controller {
   public async create(@Body() body: CourseCreateRequest, @Request() request: ExpressRequest): Promise<Course> {
     const user = request.user as User;
     await requireCanManageCourses(user);
+    assertNoReplacementChar(body.name, 'Name');
+    assertNoReplacementChar(body.description, 'Description');
     return courseRepository.create({ ...body, authorId: user.id });
   }
 
@@ -311,6 +406,8 @@ export class CourseController extends Controller {
   @Security('session')
   public async update(@Path() id: string, @Body() body: Partial<CourseCreateRequest>, @Request() request: ExpressRequest): Promise<void> {
     await requireCanManageCourses(request.user as User);
+    assertNoReplacementChar(body.name, 'Name');
+    assertNoReplacementChar(body.description, 'Description');
     await courseRepository.update(id, body);
     purge('courses');
   }
@@ -348,6 +445,7 @@ export class CourseController extends Controller {
     @Request() request: ExpressRequest,
   ): Promise<CourseModule> {
     await requireCanManageCourses(request.user as User);
+    assertNoReplacementChar(body.title, 'Title');
     const mod = await courseModuleRepository.create(courseId, body);
     purge('courses');
     return mod;
@@ -362,6 +460,7 @@ export class CourseController extends Controller {
     @Request() request: ExpressRequest,
   ): Promise<void> {
     await requireCanManageCourses(request.user as User);
+    assertNoReplacementChar(body.title, 'Title');
     await courseModuleRepository.update(moduleId, body);
     purge('courses');
   }
@@ -441,6 +540,7 @@ export class CourseController extends Controller {
     if (!course) return notFound(404);
     const info = await courseAccessInfo(user, course);
     if (!info.visible) return notFound(404);
-    return { ...course, hasFullAccess: info.hasFullAccess };
+    const startedIds = await moduleProgressRepository.listStartedCourseIds(user.id);
+    return { ...course, hasFullAccess: info.hasFullAccess, started: startedIds.has(course.id) };
   }
 }

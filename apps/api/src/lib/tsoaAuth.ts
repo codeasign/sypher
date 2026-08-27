@@ -27,3 +27,22 @@ export async function expressAuthentication(request: Request, securityName: stri
   await sessionRepository.touch(session.id);
   return session.user;
 }
+
+/**
+ * Same session-cookie lookup as expressAuthentication, but for routes that
+ * are readable by anonymous visitors and only need to know WHO is asking
+ * when someone happens to be logged in (personalizing viewerVote/
+ * viewerHelpful, etc.) — never throws; resolves to null instead of
+ * rejecting when there's no cookie or the session is invalid/expired.
+ * Routes using this do NOT carry @Security('session') (tsoa's decorator
+ * always enforces expressAuthentication's throw-on-missing behavior), so
+ * they call this directly instead.
+ */
+export async function resolveOptionalUser(request: Request): Promise<User | null> {
+  const token = request.cookies?.[env.sessionCookieName];
+  if (!token) return null;
+  const session = await sessionRepository.findByTokenWithUser(token);
+  if (!session || session.expiresAt < new Date()) return null;
+  await sessionRepository.touch(session.id);
+  return session.user;
+}

@@ -9,7 +9,9 @@ export default async function ManageBlogPage(): Promise<React.JSX.Element> {
     redirect('/login');
   }
 
-  const postsRes = await serverApiFetch('/blog/manage/list');
+  // Full set in one request — ManageBlogContent does search + pagination
+  // client-side (see its own comment for why).
+  const postsRes = await serverApiFetch('/blog/manage/list?limit=1000&offset=0');
   if (!postsRes.ok) {
     return (
       <div className={styles.container}>
@@ -18,6 +20,6 @@ export default async function ManageBlogPage(): Promise<React.JSX.Element> {
     );
   }
 
-  const initialPosts = await postsRes.json();
-  return <ManageBlogContent initialPosts={initialPosts} />;
+  const page = await postsRes.json();
+  return <ManageBlogContent initialPosts={page.posts} />;
 }

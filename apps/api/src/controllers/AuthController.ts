@@ -51,6 +51,7 @@ interface AuthResetPasswordRequest {
 interface AuthUser {
   id: string;
   email: string;
+  username: string;
   fullName: string | null;
   role: string;
   companyId: string | null;
@@ -65,6 +66,7 @@ function toAuthUser(user: User): AuthUser {
   return {
     id: user.id,
     email: user.email,
+    username: user.username,
     fullName: user.fullName,
     role: user.role,
     companyId: user.companyId,

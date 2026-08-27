@@ -16,7 +16,7 @@ TypeScript for Test Automation is a short, fast on-ramp for manual testers movin
 
 Every example in this course runs against the same real system used across this site's other automation courses: [`rbac-healthcare-system`](https://github.com/codedbyabhishekc/rbac-healthcare-system), a 4-role (admin/doctor/nurse/patient) healthcare app with an Express + SQLite backend at `http://localhost:5000` (Swagger docs at `/api-docs`) and a frontend at `http://localhost:3002`. You model real data from a real app from the very first module, not toy examples.
 
-This course is deliberately not a substitute for learning the full language — it closes by pointing you toward Learn TypeScript for depth, and toward Playwright Test Automation for what actual test automation work looks like once you're past this on-ramp.
+This course is deliberately not a substitute for learning the full language — it closes by pointing you toward [Learn TypeScript](/docs/learn-typescript/) for depth, and toward [Playwright Test Automation](/docs/playwright-test-automation/) for what actual test automation work looks like once you're past this on-ramp.
 
 ## Why This Matters
 

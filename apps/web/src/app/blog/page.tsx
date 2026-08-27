@@ -9,7 +9,7 @@ export const metadata: Metadata = {
   description: 'Latest articles and updates from the Sypher team.',
 };
 
-interface PostSummary {
+export interface PostSummary {
   slug: string;
   title: string;
   description: string;
@@ -17,9 +17,19 @@ interface PostSummary {
   coverImageUrl: string | null;
 }
 
+interface PublishedPostSummaryPage {
+  posts: PostSummary[];
+  total: number;
+}
+
+const PAGE_SIZE = 20;
+
 export default async function BlogIndexPage(): Promise<React.JSX.Element> {
-  const res = await serverApiFetch('/blog');
-  const posts: PostSummary[] = res.ok ? await res.json() : [];
+  // First page only (20 posts, summary fields) — BlogList fetches
+  // subsequent pages itself on "Show more" rather than the server sending
+  // every published post (and its full markdown body) on every load.
+  const res = await serverApiFetch(`/blog?limit=${PAGE_SIZE}&offset=0`);
+  const page: PublishedPostSummaryPage = res.ok ? await res.json() : { posts: [], total: 0 };
 
   return (
     <>
@@ -30,7 +40,7 @@ export default async function BlogIndexPage(): Promise<React.JSX.Element> {
             <h1 className={styles.pageTitle}>Latest articles and updates</h1>
             <p className={styles.pageSubtitle}>Latest articles and updates from the Sypher team.</p>
           </div>
-          <BlogList initialPosts={posts} />
+          <BlogList initialPosts={page.posts} total={page.total} pageSize={PAGE_SIZE} />
         </div>
       </div>
       <Footer />

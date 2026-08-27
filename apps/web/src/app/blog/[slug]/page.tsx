@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import BlogPostArticle from '@/components/BlogPostPage/BlogPostArticle';
+import DiscussionSection from '@/components/DiscussionSection';
 import { serverApiFetch } from '@/lib/serverApi';
 import styles from '@/components/BlogPostPage/styles.module.css';
 
@@ -57,17 +58,28 @@ export default async function BlogPostPage({ params }: { params: Promise<{ slug:
   return (
     <div className={styles.page}>
       <div className={styles.layout}>
-        <BlogPostArticle
-          slug={slug}
-          title={post.title}
-          content={post.content}
-          coverImageUrl={post.coverImageUrl}
-          featuredMediaType={post.featuredMediaType}
-          featuredMediaValue={post.featuredMediaValue}
-          date={post.publishedAt}
-          authorName={post.authorFullName}
-          authorBio={post.authorBio}
-        />
+        <div className={styles.mainColumn}>
+          <BlogPostArticle
+            slug={slug}
+            title={post.title}
+            content={post.content}
+            coverImageUrl={post.coverImageUrl}
+            featuredMediaType={post.featuredMediaType}
+            featuredMediaValue={post.featuredMediaValue}
+            date={post.publishedAt}
+            authorName={post.authorFullName}
+            authorBio={post.authorBio}
+          />
+
+          {/* Public discussion under every published post (no lock/preview
+              model — visibility follows the post's published/draft status,
+              see resolveBlogPostTargetOr404). Best-Answer UI intentionally
+              omitted for blog comments; the backend stays uniform so it can
+              be turned on later with a single prop. Lives in the same
+              column as the article (not a .layout sibling) so width AND
+              height both track the article — see .mainColumn. */}
+          <DiscussionSection targetType="blogPost" targetId={post.id} badgeLabel="Author" />
+        </div>
         <aside className={styles.adSlot} aria-hidden="true">
           <div className={styles.adUnit}>Ad space</div>
           <div className={styles.adUnit}>Ad space</div>

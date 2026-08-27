@@ -11,6 +11,7 @@ import { requireAdmin } from '../lib/authz';
 import { canManageCohorts, requireCanManageCohorts, requireCanManageCohortRoster, rosterPickerScope } from '../lib/contentAuthz';
 import { ForbiddenError } from '../lib/authz';
 import { getOrSet, purge } from '../lib/cache';
+import { assertNoReplacementChar } from '../lib/textSanitize';
 
 const cohortRepository = new CohortRepository();
 const cohortMemberRepository = new CohortMemberRepository();
@@ -85,6 +86,8 @@ export class CohortController extends Controller {
   public async create(@Body() body: CreateCohortRequest, @Request() request: ExpressRequest): Promise<Cohort> {
     const user = request.user as User;
     await requireCanManageCohorts(user);
+    assertNoReplacementChar(body.title, 'Title');
+    assertNoReplacementChar(body.description, 'Description');
     const cohort = await cohortRepository.create({
       ...body,
       startDate: body.startDate ? new Date(body.startDate) : null,
@@ -98,6 +101,8 @@ export class CohortController extends Controller {
   @Security('session')
   public async update(@Path() id: string, @Body() body: Partial<CreateCohortRequest>, @Request() request: ExpressRequest): Promise<void> {
     await requireCanManageCohorts(request.user as User);
+    assertNoReplacementChar(body.title, 'Title');
+    assertNoReplacementChar(body.description, 'Description');
     await cohortRepository.update(id, { ...body, startDate: body.startDate ? new Date(body.startDate) : undefined });
     purge('cohorts');
   }

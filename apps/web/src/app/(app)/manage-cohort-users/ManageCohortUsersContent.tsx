@@ -4,6 +4,8 @@ import React, { useEffect, useMemo, useState } from 'react';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import { RestoreIcon, RemoveIcon } from '@/components/icons/ActionIcons';
 import Tooltip from '@/components/Tooltip';
+import Pagination from '@/components/Pagination';
+import TableSearchBar from '@/components/TableSearchBar';
 import {
   listManageableCohorts,
   listCohortRoster,
@@ -167,6 +169,9 @@ export default function ManageCohortUsersContent(): React.JSX.Element {
   const [courseModalFor, setCourseModalFor] = useState<RosterEntry | null>(null);
   const [pendingRemove, setPendingRemove] = useState<RosterEntry | null>(null);
   const [courseErrorByUserId, setCourseErrorByUserId] = useState<Record<string, string>>({});
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 10;
 
   useEffect(() => {
     listManageableCohorts().then((rows) => {
@@ -196,6 +201,8 @@ export default function ManageCohortUsersContent(): React.JSX.Element {
 
   useEffect(() => {
     refetchRoster();
+    setSearch('');
+    setPage(1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedCohortId]);
 
@@ -206,6 +213,22 @@ export default function ManageCohortUsersContent(): React.JSX.Element {
     }
     return map;
   }, [memberCourses]);
+
+  // Client-side search + pagination over the already-fetched full roster
+  // — no network round trip per keystroke or page change (user's explicit
+  // call 2026-08-27).
+  const filteredMembers = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return members;
+    return members.filter((m) => m.email.toLowerCase().includes(q) || (m.fullName ?? '').toLowerCase().includes(q));
+  }, [members, search]);
+  const totalPages = Math.max(1, Math.ceil(filteredMembers.length / PAGE_SIZE));
+  const visibleMembers = filteredMembers.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  function handleSearchChange(value: string): void {
+    setSearch(value);
+    setPage(1);
+  }
 
   async function handleSetActive(member: RosterEntry, active: boolean): Promise<void> {
     if (!selectedCohortId) return;
@@ -301,6 +324,13 @@ export default function ManageCohortUsersContent(): React.JSX.Element {
           <p>No members yet. Add your first one.</p>
         </div>
       ) : (
+        <>
+        <TableSearchBar value={search} onChange={handleSearchChange} placeholder="Search members by name or email…" />
+        {visibleMembers.length === 0 ? (
+          <div className={styles.emptyState}>
+            <p>No members match &quot;{search}&quot;.</p>
+          </div>
+        ) : (
         <div className={styles.tableWrapper}>
           <div className={styles.tableHeader}>
             <span>Member</span>
@@ -308,7 +338,7 @@ export default function ManageCohortUsersContent(): React.JSX.Element {
             <span>Course Access</span>
             <span>Actions</span>
           </div>
-          {members.map((member) => {
+          {visibleMembers.map((member) => {
             const grantedSlugs = memberCoursesSets.get(member.userId) ?? new Set<string>();
             const removed = member.status === 'removed';
             return (
@@ -349,6 +379,9 @@ export default function ManageCohortUsersContent(): React.JSX.Element {
             );
           })}
         </div>
+        )}
+        <Pagination page={page} totalPages={totalPages} onPageChange={setPage} />
+        </>
       )}
 
       {addOpen && selectedCohortId && (

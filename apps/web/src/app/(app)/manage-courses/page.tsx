@@ -9,7 +9,9 @@ export default async function ManageCoursesPage(): Promise<React.JSX.Element> {
     redirect('/login');
   }
 
-  const coursesRes = await serverApiFetch('/courses/manage/list');
+  // Full set in one request — ManageCoursesContent does search + pagination
+  // client-side (see its own comment for why).
+  const coursesRes = await serverApiFetch('/courses/manage/list?limit=1000&offset=0');
   if (!coursesRes.ok) {
     return (
       <div className={styles.container}>
@@ -18,6 +20,6 @@ export default async function ManageCoursesPage(): Promise<React.JSX.Element> {
     );
   }
 
-  const initialCourses = await coursesRes.json();
-  return <ManageCoursesContent initialCourses={initialCourses} />;
+  const page = await coursesRes.json();
+  return <ManageCoursesContent initialCourses={page.courses} />;
 }

@@ -4,8 +4,12 @@ import { slugify, findAvailableSlug } from '../lib/slug';
 
 export interface CreateCourseInput {
   name: string;
+  slug?: string;
   description?: string | null;
   coverImageUrl?: string | null;
+  category?: string | null; // "tech" | "life-skills" (free-form)
+  relatedCourses?: string | null; // CSV of related course slugs
+  audienceRole?: string | null; // target audience role, e.g. "developer" (free-form)
   authorId?: string | null;
 }
 
@@ -13,11 +17,33 @@ export interface UpdateCourseInput {
   name?: string;
   description?: string | null;
   coverImageUrl?: string | null;
+  category?: string | null;
+  relatedCourses?: string | null;
+  audienceRole?: string | null;
 }
 
 export class CourseRepository {
   async listAll(): Promise<Course[]> {
     return prisma.course.findMany({ orderBy: { updatedAt: 'desc' } });
+  }
+
+  // Paginated twin for /manage-courses' table — id as tiebreaker since
+  // updatedAt alone isn't unique enough to page on reliably (same lesson
+  // as BlogPostRepository.listPublishedPage). Optional search matches the
+  // course name, case-insensitive — server-side since the table is
+  // paginated (a client-side filter would only ever see the current page).
+  async listAllPage(limit: number, offset: number, search?: string): Promise<{ courses: Course[]; total: number }> {
+    const where = search ? { name: { contains: search, mode: 'insensitive' as const } } : undefined;
+    const [courses, total] = await Promise.all([
+      prisma.course.findMany({
+        where,
+        orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+        take: limit,
+        skip: offset,
+      }),
+      prisma.course.count({ where }),
+    ]);
+    return { courses, total };
   }
 
   async listPublished(): Promise<Course[]> {
@@ -41,7 +67,7 @@ export class CourseRepository {
   }
 
   async create(input: CreateCourseInput): Promise<Course> {
-    const slug = await findAvailableSlug(slugify(input.name), async (s) => {
+    const slug = await findAvailableSlug(slugify(input.slug || input.name), async (s) => {
       const existing = await prisma.course.findUnique({ where: { slug: s } });
       return existing !== null;
     });
@@ -51,6 +77,11 @@ export class CourseRepository {
         name: input.name,
         description: input.description ?? null,
         coverImageUrl: input.coverImageUrl ?? null,
+        // Same ""-means-clear convention as update(): clients avoid explicit
+        // JSON nulls because tsoa's validators reject them.
+        category: input.category || null,
+        relatedCourses: input.relatedCourses || null,
+        audienceRole: input.audienceRole || null,
         status: 'draft',
         authorId: input.authorId ?? null,
       },
@@ -71,7 +102,18 @@ export class CourseRepository {
   }
 
   async update(id: string, fields: UpdateCourseInput): Promise<void> {
-    await prisma.course.update({ where: { id }, data: fields });
+    // Empty string means "clear" for the nullable text columns — tsoa's
+    // Partial<> validators reject explicit JSON nulls, so clients clear by
+    // sending "" instead.
+    const data = {
+      ...fields,
+      description: fields.description === '' ? null : fields.description,
+      coverImageUrl: fields.coverImageUrl === '' ? null : fields.coverImageUrl,
+      category: fields.category === '' ? null : fields.category,
+      relatedCourses: fields.relatedCourses === '' ? null : fields.relatedCourses,
+      audienceRole: fields.audienceRole === '' ? null : fields.audienceRole,
+    };
+    await prisma.course.update({ where: { id }, data });
   }
 
   async setStatus(id: string, status: 'draft' | 'published'): Promise<void> {

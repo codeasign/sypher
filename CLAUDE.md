@@ -1,9 +1,48 @@
 # Sypher — Project Guide for Claude Code
 
-Docusaurus learning site. Each topic is a self-contained section with its own
-sidebar JSON and navbar link. Static site — no server-side code.
+Monorepo with two course platforms:
 
-## Project structure
+- **apps/web + apps/api ("Sypher Next")** — DB-backed courses (PostgreSQL via
+  Prisma), react-markdown rendered. **All NEW authored/life-skill courses go
+  here.** See "Sypher Next course authoring" below.
+- **apps/docs** — legacy Docusaurus site (structure below), being phased out;
+  no new UI/UX work here.
+
+## Sypher Next course authoring (apps/web)
+
+Canonical reference: `Course-Creation-Guide.md` at repo root.
+Life-skill courses: `.claude/commands/next-life-skill.md`.
+
+- Courses/modules/access are **DB rows only** — no files on disk, no sidebar
+  JSON, no route files (`/learn/[slug]` catch-alls serve any course).
+- Never write course/module/access rows with the Supabase JS client or a
+  service-role key. All writes go through apps/api management endpoints,
+  authenticated as the seeded dev admin (`admin@sypher.local`, from
+  `apps/api/prisma/seed.ts`) via `POST /auth/login` session cookie:
+  POST /courses → POST /courses/{id}/modules (strictly in teaching order) →
+  PUT /courses/{id}/access/roles → PUT /courses/{id}/status.
+- Bulk driver (run from apps/web):
+  `node scripts/import-authored-course.mjs --api http://localhost:4000
+  --course <slug> --name "<Name>" --input scratch/<dir>
+  [--roles FREE_USER,PAID_USER] [--publish]`
+  Idempotent (updates existing modules by slug); order of creation = free
+  preview window (first ceil(n*0.2) by orderIndex).
+- `POST /courses` accepts an optional explicit `slug`; module slugs derive
+  from titles (slugify). Draft is the default; publish only after verifying.
+- Course has `category` ("tech" | "life-skills") and `relatedCourses`
+  (CSV of slugs); driver flags: --category / --related.
+- Module body rules: plain markdown rendered by react-markdown — NO JSX
+  components, NO import statements, NO Docusaurus admonitions, NO leading
+  `# H1` (the reader page renders `<h1>{module.title}</h1>` itself).
+- TRY IT format (all courses): every dialogue line in quotes; 2-3 exercises
+  per TRY IT; visible `**Suggested answer:**` directly below each exercise —
+  never `<details>` collapses.
+- Local dev: Docker Postgres on :5433 first (`cd apps/api && docker compose
+  up -d postgres`), then API (:4000) and web (:3002); verify at
+  `https://next.sypher.local` (Caddy HTTPS — plain localhost breaks secure
+  session cookies).
+
+## apps/docs project structure (legacy Docusaurus)
 
 docs/<slug>/          one folder per topic
   index.md            topic landing page

@@ -4,6 +4,7 @@ import React from 'react';
 import Link from 'next/link';
 import ReactMarkdown from 'react-markdown';
 import remarkBreaks from 'remark-breaks';
+import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import CodeBlock from './CodeBlock';
@@ -46,7 +47,7 @@ export default function BlogPostArticle({
   showBackLink = true,
 }: BlogPostArticleProps): React.JSX.Element {
   return (
-    <article className={styles.article}>
+    <article>
       {showBackLink && (
         <Link href="/blog" className={styles.backLink}>
           ← Back to Blog
@@ -63,7 +64,7 @@ export default function BlogPostArticle({
       {featuredMediaType === 'youtube' && featuredMediaValue && <YouTube id={featuredMediaValue} title={title} />}
       <div className={styles.body}>
         <ReactMarkdown
-          remarkPlugins={[remarkBreaks]}
+          remarkPlugins={[remarkGfm, remarkBreaks]}
           rehypePlugins={[rehypeRaw, [rehypeSanitize, schema]]}
           components={{ pre: CodeBlock }}
         >

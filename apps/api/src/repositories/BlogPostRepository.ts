@@ -13,6 +13,19 @@ export interface CreateBlogPostInput {
   authorId?: string | null;
 }
 
+export interface PublishedPostSummary {
+  slug: string;
+  title: string;
+  description: string;
+  publishedAt: Date | null;
+  coverImageUrl: string | null;
+}
+
+export interface PublishedPostSummaryPage {
+  posts: PublishedPostSummary[];
+  total: number;
+}
+
 export interface PublishedPostWithAuthor {
   id: string;
   slug: string;
@@ -36,8 +49,56 @@ export class BlogPostRepository {
     });
   }
 
+  // Paginated twin for /manage-blog's table (10/page default). Unlike the
+  // public listPublishedPage, this keeps `content` — the manage table
+  // doesn't render it, but the editor reuses these rows without a second
+  // fetch, same as the unpaginated list() above always did. Optional
+  // search matches the title, case-insensitive.
+  async listPage(limit: number, offset: number, authorId?: string, search?: string): Promise<{ posts: BlogPost[]; total: number }> {
+    const where = {
+      ...(authorId ? { authorId } : {}),
+      ...(search ? { title: { contains: search, mode: 'insensitive' as const } } : {}),
+    };
+    const [posts, total] = await Promise.all([
+      prisma.blogPost.findMany({
+        where,
+        orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+        take: limit,
+        skip: offset,
+      }),
+      prisma.blogPost.count({ where }),
+    ]);
+    return { posts, total };
+  }
+
   async listPublished(): Promise<BlogPost[]> {
     return prisma.blogPost.findMany({ where: { status: 'published' }, orderBy: { publishedAt: 'desc' } });
+  }
+
+  /**
+   * Paginated listing summary — deliberately omits `content` (the full
+   * markdown body). The listing page never renders post bodies, so with
+   * hundreds of posts, selecting the full row on every page load is pure
+   * waste; this is the query the /blog catalog actually needs.
+   */
+  async listPublishedPage(limit: number, offset: number): Promise<PublishedPostSummaryPage> {
+    const [posts, total] = await Promise.all([
+      prisma.blogPost.findMany({
+        where: { status: 'published' },
+        // id as a tiebreaker: publishedAt alone isn't unique enough to
+        // paginate on — many rows can share the exact same timestamp (a
+        // single batched INSERT's `now()` is identical for every row in
+        // it), and ORDER BY with ties unresolved is not guaranteed stable
+        // across separate queries, so offset pagination would return
+        // duplicates/gaps between pages without this.
+        orderBy: [{ publishedAt: 'desc' }, { id: 'desc' }],
+        select: { slug: true, title: true, description: true, publishedAt: true, coverImageUrl: true },
+        take: limit,
+        skip: offset,
+      }),
+      prisma.blogPost.count({ where: { status: 'published' } }),
+    ]);
+    return { posts, total };
   }
 
   /** Reimplements get_published_blog_post_with_author(). */

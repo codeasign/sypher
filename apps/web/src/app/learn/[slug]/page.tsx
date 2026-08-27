@@ -6,6 +6,7 @@ import type { CourseWithAccess, CourseModule } from '@/data/courses';
 import { CourseBookmarkButton } from '@/components/AuthoredBookmarkButton';
 import { LockIcon } from '@/components/icons/SidebarIcons';
 import CourseHomeTabs from '@/components/CourseHomeTabs';
+import DiscussionSection from '@/components/DiscussionSection';
 import styles from './styles.module.css';
 
 async function fetchCourse(slug: string): Promise<{ course: CourseWithAccess | null; unauthenticated: boolean }> {
@@ -34,6 +35,25 @@ export default async function CourseHomePage({ params }: { params: Promise<{ slu
   const bookmarksRes = await serverApiFetch('/bookmarks/authored-courses');
   const bookmarkedIds: string[] = bookmarksRes.ok ? await bookmarksRes.json() : [];
 
+  // relatedCourses is a CSV of slugs; resolve each to its published course
+  // so the About tab can link by name. Missing/unpublished slugs are skipped.
+  const relatedSlugs = (course.relatedCourses ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const relatedCourses = (
+    await Promise.all(
+      relatedSlugs.map(async (relatedSlug) => {
+        const res = await serverApiFetch(`/courses/${encodeURIComponent(relatedSlug)}`);
+        if (!res.ok) return null;
+        const related = await res.json();
+        return related?.status === 'published' && related.slug !== course.slug
+          ? { slug: related.slug as string, name: related.name as string }
+          : null;
+      }),
+    )
+  ).filter((c): c is { slug: string; name: string } => c !== null);
+
   return (
     <div className={styles.page}>
       <div className={styles.container}>
@@ -41,6 +61,7 @@ export default async function CourseHomePage({ params }: { params: Promise<{ slu
           ← My Courses
         </Link>
 
+        {course.category && <span className={styles.categoryBadge}>{course.category}</span>}
         {course.coverImageUrl && <img src={course.coverImageUrl} alt={course.name} className={styles.coverImage} />}
         <div className={styles.titleRow}>
           <h1 className={styles.title}>{course.name}</h1>
@@ -48,11 +69,27 @@ export default async function CourseHomePage({ params }: { params: Promise<{ slu
         </div>
         <CourseHomeTabs
           about={
-            course.description ? (
-              <p className={styles.description}>{course.description}</p>
-            ) : (
-              <p className={styles.emptyText}>No description yet.</p>
-            )
+            <>
+              {course.description ? (
+                <p className={styles.description}>{course.description}</p>
+              ) : (
+                <p className={styles.emptyText}>No description yet.</p>
+              )}
+              {relatedCourses.length > 0 && (
+                <>
+                  <h2 className={styles.relatedHeading}>Related courses</h2>
+                  <ul className={styles.relatedList}>
+                    {relatedCourses.map((related) => (
+                      <li key={related.slug}>
+                        <Link href={`/learn/${related.slug}`} className={styles.relatedLink}>
+                          {related.name}
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </>
           }
           topics={
             <>
@@ -86,6 +123,7 @@ export default async function CourseHomePage({ params }: { params: Promise<{ slu
               )}
             </>
           }
+          discussion={<DiscussionSection targetType="course" targetId={course.id} badgeLabel="Instructor" />}
         />
       </div>
     </div>

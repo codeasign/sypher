@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useRef, useState } from 'react';
-import { createCourse, updateCourse, setCourseStatus, type Course } from '@/data/courses';
+import { createCourse, updateCourse, setCourseStatus, AUDIENCE_ROLES, type Course } from '@/data/courses';
 import { uploadToBunny } from '@/data/bunnyUpload';
 import styles from './manage-courses.module.css';
 
@@ -21,9 +21,31 @@ interface CourseEditorProps {
   onBack?: () => void;
 }
 
+const CATEGORY_OPTIONS = ['tech', 'life-skills'] as const;
+
+// Audience-role select options: canonical list first, then any free-form
+// value already stored on other courses (so nothing saved outside this
+// list becomes uneditable).
+function audienceRoleOptions(existing: string[]): { value: string; label: string }[] {
+  const known = new Set(AUDIENCE_ROLES.map((r) => r.value));
+  const extra = [...new Set(existing.filter((r) => !known.has(r)))].sort();
+  return [...AUDIENCE_ROLES, ...extra.map((value) => ({ value, label: value }))];
+}
+
+function normalizeCsv(raw: string): string {
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join(',');
+}
+
 export default function CourseEditor({ course, onSaved, onCancel, onBack }: CourseEditorProps): React.JSX.Element {
   const [name, setName] = useState(course?.name ?? '');
   const [description, setDescription] = useState(course?.description ?? '');
+  const [category, setCategory] = useState(course?.category ?? '');
+  const [relatedCourses, setRelatedCourses] = useState(course?.relatedCourses ?? '');
+  const [audienceRole, setAudienceRole] = useState(course?.audienceRole ?? '');
   const [coverImageUrl, setCoverImageUrl] = useState<string | null>(course?.coverImageUrl ?? null);
   const [coverUploading, setCoverUploading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -57,6 +79,9 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
           name: name.trim(),
           description: description.trim() || null,
           coverImageUrl,
+          category: category || '',
+          relatedCourses: normalizeCsv(relatedCourses),
+          audienceRole: audienceRole || '',
         });
         if (createError || !created) {
           setError(createError ?? 'Failed to create course.');
@@ -76,6 +101,11 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
         name: name.trim(),
         description: description.trim() || null,
         coverImageUrl,
+        // "" clears the value server-side; explicit nulls are rejected by
+        // the API's tsoa validators.
+        category: category || '',
+        relatedCourses: normalizeCsv(relatedCourses),
+        audienceRole: audienceRole || '',
       });
       if (updateError) {
         setError(updateError);
@@ -168,6 +198,61 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           placeholder="Shown to learners on the course home page"
+          disabled={saving}
+        />
+      </div>
+
+      <div className={styles.formGroup}>
+        <label className={styles.fieldLabel} htmlFor="course-category">
+          Category
+        </label>
+        <select
+          id="course-category"
+          className={styles.textInput}
+          value={category}
+          onChange={(e) => setCategory(e.target.value)}
+          disabled={saving}
+        >
+          <option value="">None</option>
+          {CATEGORY_OPTIONS.map((opt) => (
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div className={styles.formGroup}>
+        <label className={styles.fieldLabel} htmlFor="course-audience-role">
+          Audience role
+        </label>
+        <select
+          id="course-audience-role"
+          className={styles.textInput}
+          value={audienceRole}
+          onChange={(e) => setAudienceRole(e.target.value)}
+          disabled={saving}
+        >
+          <option value="">None</option>
+          {audienceRoleOptions(course?.audienceRole ? [course.audienceRole] : []).map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div className={styles.formGroup}>
+        <label className={styles.fieldLabel} htmlFor="course-related">
+          Related courses
+        </label>
+        <input
+          id="course-related"
+          type="text"
+          className={styles.textInput}
+          value={relatedCourses}
+          onChange={(e) => setRelatedCourses(e.target.value)}
+          placeholder="Comma-separated course slugs, e.g. learn-typescript,agentic-ai-fundamentals"
           disabled={saving}
         />
       </div>
