@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 import {
   addAuthoredCourseBookmark,
   removeAuthoredCourseBookmark,
@@ -24,6 +25,7 @@ interface CourseBookmarkButtonProps {
 }
 
 export function CourseBookmarkButton({ courseId, initialBookmarked, onChange }: CourseBookmarkButtonProps): React.JSX.Element {
+  const router = useRouter();
   const [bookmarked, setBookmarked] = useState(initialBookmarked);
   const [pending, setPending] = useState(false);
 
@@ -37,6 +39,11 @@ export function CourseBookmarkButton({ courseId, initialBookmarked, onChange }: 
     try {
       await (next ? addAuthoredCourseBookmark(courseId) : removeAuthoredCourseBookmark(courseId));
       onChange?.(next);
+      // Keep server-rendered bookmark state in sync (the /bookmarks page,
+      // and this button's own initialBookmarked prop when the route is
+      // revisited via cached client navigation) — the write already
+      // succeeded, this just refetches the RSC tree so nothing shows stale.
+      router.refresh();
     } catch {
       setBookmarked(!next);
     } finally {
@@ -66,6 +73,7 @@ interface ModuleBookmarkButtonProps {
 }
 
 export function ModuleBookmarkButton({ moduleId, courseId, initialBookmarked, onChange }: ModuleBookmarkButtonProps): React.JSX.Element {
+  const router = useRouter();
   const [bookmarked, setBookmarked] = useState(initialBookmarked);
   const [pending, setPending] = useState(false);
 
@@ -77,6 +85,7 @@ export function ModuleBookmarkButton({ moduleId, courseId, initialBookmarked, on
     try {
       await (next ? addAuthoredModuleBookmark(moduleId, courseId) : removeAuthoredModuleBookmark(moduleId));
       onChange?.(next);
+      router.refresh();
     } catch {
       setBookmarked(!next);
     } finally {

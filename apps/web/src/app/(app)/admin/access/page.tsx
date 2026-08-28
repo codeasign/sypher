@@ -17,7 +17,9 @@ export default async function AdminAccessPage(): Promise<React.JSX.Element> {
   }
   const user: AuthUser = await res.json();
 
-  if (user.role !== 'ADMIN' && user.role !== 'COMPANY_HR') {
+  // Company Grants (and everything on this page) is admin-only now —
+  // Company HR included.
+  if (user.role !== 'ADMIN') {
     return (
       <main>
         <h1>Manage access</h1>
@@ -29,7 +31,7 @@ export default async function AdminAccessPage(): Promise<React.JSX.Element> {
   return (
     <main>
       <h1>Manage access</h1>
-      <AccessManager role={user.role} companyId={user.companyId} />
+      <AccessManager role={user.role} userId={user.id} />
     </main>
   );
 }

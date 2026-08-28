@@ -92,7 +92,13 @@ export class MockExamAttemptController extends Controller {
       submitted.set(answer.questionId, Array.isArray(answer.selectedAnswer) ? answer.selectedAnswer : []);
     }
 
-    const outcome = await mockExamAttemptRepository.submit(attempt.id, user.id, drawnQuestions, submitted);
+    const outcome = await mockExamAttemptRepository.submit(
+      attempt.id,
+      user.id,
+      drawnQuestions,
+      submitted,
+      attempt.totalQuestions,
+    );
     if (!outcome) return conflict(409, { message: 'This attempt has already been submitted.' });
 
     // The attempt's exam must exist (Cascade would have removed the attempt

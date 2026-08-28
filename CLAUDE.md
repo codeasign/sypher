@@ -42,6 +42,74 @@ Life-skill courses: `.claude/commands/next-life-skill.md`.
   `https://next.sypher.local` (Caddy HTTPS — plain localhost breaks secure
   session cookies).
 
+## Corporate portal (apps/web + apps/api)
+
+Full guide: `Corporate-User-Guide.md` at repo root. Test accounts +
+fixture: `Corporate-Test-Accounts.md` (`apps/api/scripts/seed-corporate-test.ts`).
+
+- **`corporate.sypher.local`** is the SAME apps/web app as
+  `next.sypher.local` — `apps/web/src/middleware.ts` keys off the
+  `corporate.` host prefix and redirects it into the `/corporate/*` route
+  tree. Add `127.0.0.1 corporate.sypher.local` to hosts + `caddy reload`
+  (`Caddyfile` has the block).
+- Flow: `/corporate` (enter company code → `POST /companies/resolve`) →
+  `/corporate/login` (company-branded → `POST /auth/login/company`, which
+  re-checks the code, credentials, `user.companyId` membership AND
+  `Company.accessUntil` before setting a session) → COMPANY_HR lands on
+  `/corporate/admin`, everyone else on the main app.
+- **Company admin = `Company.adminEmail`** — setting it in the main
+  `/admin/access` Company Grants form auto-provisions a `COMPANY_HR`
+  account + set-password email (fire-and-forget). No mail server? use
+  `POST /access/companies/{id}/admin-invite-link`.
+- **Email + first login**: all transactional mail goes through
+  `apps/api/src/lib/email.ts` → `emailTemplates.ts` → the Brevo/Resend
+  rotation; templates: welcome / set-password / password-reset /
+  cohort-welcome. Full map + how to enable delivery: `Email-Hookup.md`.
+  Provisioned accounts carry `User.mustResetPassword` — passwordless ones
+  can't log in until they use their set-password link; ones with an
+  admin-set temp password are routed to `/set-password` on first login.
+- **First-login onboarding** (`components/FirstLoginOnboarding`, mounted in
+  root `app/layout.tsx`): an app-wide blocking modal — EVERY role, BOTH
+  hosts — for `User.onboardedAt IS NULL`: choose handle, pick one of 10
+  preset avatars (`public/avatars/`, `scripts/gen-avatars.mjs`) or upload,
+  accept Terms/Privacy/Refund. `POST /auth/onboard`. Runs AFTER the
+  `mustResetPassword` step. Skipped only on the pre-auth screens. See
+  memory `sypher-next-first-login-onboarding`.
+- **Local email**: `EMAIL_TRANSPORT=smtp` in `apps/api/.env` routes every
+  transactional email to an SMTP server (the docker-compose `greenmail`
+  service, or an external GreenMail) instead of Brevo/Resend — read it via
+  `docker logs -f api-greenmail-1` or IMAP on `:3143`. `SMTP_*` env vars
+  configure host/port/auth. Unset `EMAIL_TRANSPORT` for real delivery
+  (production never sets it). Standalone: `greenmail.compose.yml`.
+- **Combined testing reference**: `Testing-Accounts-and-Emailers.md` at
+  repo root — all test accounts (main + corporate), re-running the
+  first-login flows, and reading emails via GreenMail. Deep dives:
+  `Test-Accounts.md`, `Corporate-Test-Accounts.md`, `Email-Hookup.md`.
+- **`/corporate/admin/*`** (COMPANY_HR only): Groups (create + per-group
+  course/sidebar grants), Employees (CSV import: `Full Name, Email Id,
+  Department, Role, Manager Name` — Department→group, Role/Manager are
+  labels only). Every `/company-admin/*` endpoint scopes to
+  `requireCompanyAdmin(user)` → the caller's own `companyId`; no company id
+  is ever taken from a path/body.
+- **Access model change**: a COMPANY_EMPLOYEE now gets a company course/nav
+  item ONLY via a group grant. The Sypher-set company-wide grants
+  (`AuthoredCompanyCourseAccess` / `CompanyNavAccess`) are just the
+  *ceiling* the portal admin picks subsets from. Resolution
+  (`courseAccessInfo`, comment gates, `MockExamController`,
+  `AccessController.myNav`) goes through
+  `CompanyDirectoryRepository.listCourseIdsForUserGroups` /
+  `listNavKeysForUserGroups` (union across the employee's groups,
+  `isCompanyAccessActive`-gated).
+- **Split-ready**: all new company tables (`CompanyGroup`,
+  `CompanyEmployee`, `CompanyGroupMember`, `CompanyGroup{Course,Nav}Access`)
+  are **FK-free** with `companyId` on every row, and every read/write goes
+  through `CompanyDirectoryRepository` — the single swap point if a
+  company's data later moves to a per-company database (this server staying
+  the auth/authz + catalog source of truth).
+- A "force COMPANY_* accounts through the portal" enforcement point is
+  marked-but-not-built in `AuthController.login`, `AuthController.googleCallback`,
+  and `middleware.ts`.
+
 ## apps/docs project structure (legacy Docusaurus)
 
 docs/<slug>/          one folder per topic

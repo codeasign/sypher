@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import Tooltip from '@/components/Tooltip';
-import { EditIcon, DeleteIcon } from '@/components/icons/ActionIcons';
+import { DeleteIcon, EditIcon, ReplyIcon, ThumbUpIcon } from '@/components/icons/ActionIcons';
 import {
   deleteComment,
   editComment,
@@ -11,6 +11,7 @@ import {
   toggleCommentHelpful,
   voteComment,
   type CommentView,
+  type MentionCandidateData,
 } from '@/data/comments';
 import Composer, { initialsOf } from './Composer';
 import styles from './styles.module.css';
@@ -18,8 +19,17 @@ import styles from './styles.module.css';
 interface CommentItemProps {
   comment: CommentView;
   isReply: boolean;
+  /**
+   * Top-level comment id for this whole thread. For a top-level comment it
+   * equals comment.id; for a reply it's the parent. Every reply — including
+   * a reply written from under another reply — posts against THIS id, so the
+   * thread stays a flat two-level list with no per-parent reply cap.
+   */
+  threadRootId: string;
   /** Thread-root author id — Best-Answer rights anchor (spec §7). */
   rootAuthorId: string;
+  /** Comment author + everyone who has replied — bare-"@" mention shortlist. */
+  participants: MentionCandidateData[];
   me: { id: string; role: string } | null;
   viewerCanModerate: boolean;
   badgeLabel: string;
@@ -32,6 +42,10 @@ interface CommentItemProps {
   submitReply: (parentId: string, body: string, mentionedUserIds: string[]) => Promise<{ error: string | null; reply: CommentView | null }>;
   /** A Best Answer was set anywhere — parent refreshes the thread (previous holder may sit anywhere). */
   onBestAnswerChanged: () => void;
+  /** Thread-collapse affordance — only passed for top-level comments that have replies. */
+  replyCount?: number;
+  repliesCollapsed?: boolean;
+  onToggleReplies?: () => void;
 }
 
 function formatTimestamp(iso: string): string {
@@ -80,7 +94,9 @@ function renderBody(body: string, mentions: CommentView['mentions']): React.JSX.
 export default function CommentItem({
   comment,
   isReply,
+  threadRootId,
   rootAuthorId,
+  participants,
   me,
   viewerCanModerate,
   badgeLabel,
@@ -91,6 +107,9 @@ export default function CommentItem({
   onDeleted,
   submitReply,
   onBestAnswerChanged,
+  replyCount,
+  repliesCollapsed,
+  onToggleReplies,
 }: CommentItemProps): React.JSX.Element {
   const [votePending, setVotePending] = useState(false);
   const [helpfulPending, setHelpfulPending] = useState(false);
@@ -138,6 +157,17 @@ export default function CommentItem({
     if (!result.error) onDeleted(comment.id);
   }
 
+  /**
+   * Merged reply affordance (Reddit-style): on a top-level comment the
+   * button carries the reply count in brackets and clicking it expands the
+   * collapsed thread, then opens the composer — one button, both jobs.
+   * On replies (or threads with no replies) it just opens the composer.
+   */
+  function handleReplyClick(): void {
+    if (!isReply && repliesCollapsed && onToggleReplies) onToggleReplies();
+    setReplyOpen((open) => !open);
+  }
+
   const showBadge = comment.isContentAuthor || comment.author.role === 'ADMIN';
   const badgeText = comment.author.role === 'ADMIN' && !comment.isContentAuthor ? 'Admin' : badgeLabel;
 
@@ -146,96 +176,140 @@ export default function CommentItem({
       {comment.isBestAnswer && (
         <div className={styles.bestAnswerBanner}>✔ Best Answer</div>
       )}
-      <div className={styles.commentHeaderRow}>
-        <span className={`${styles.avatar} ${isReply ? styles.avatarSmall : ''}`} aria-hidden="true">
-          {initialsOf(comment.author.fullName, comment.author.username)}
-        </span>
-        <div className={styles.commentIdentity}>
-          <span className={styles.commentName}>{comment.author.fullName || comment.author.username}</span>
-          <span className={styles.commentHandle}>@{comment.author.username}</span>
-          {showBadge && <span className={styles.badge}>{badgeText}</span>}
-          <span className={styles.commentTimestamp} title={new Date(comment.createdAt).toLocaleString()}>
-            {formatTimestamp(comment.createdAt)}
-            {comment.isEdited && ' (edited)'}
-          </span>
+      {/* Reddit-style card: a left rail holds ONLY the (bigger) vote arrows
+          with the score between them; avatar + identity sit right-aligned
+          at the top of the content column. */}
+      <div className={styles.commentLayout}>
+        <div className={styles.voteRail}>
+          <button
+            type="button"
+            className={`${styles.voteButton} ${comment.viewerVote === 'UP' ? styles.voteButtonActiveUp : ''}`}
+            disabled={!me || votePending}
+            onClick={() => void handleVote('UP')}
+            aria-pressed={comment.viewerVote === 'UP'}
+            aria-label="Upvote"
+            title={me ? 'Upvote' : 'Sign in to vote'}
+          >
+            ▲
+          </button>
+          <span className={styles.score}>{comment.score}</span>
+          <button
+            type="button"
+            className={`${styles.voteButton} ${comment.viewerVote === 'DOWN' ? styles.voteButtonActiveDown : ''}`}
+            disabled={!me || votePending}
+            onClick={() => void handleVote('DOWN')}
+            aria-pressed={comment.viewerVote === 'DOWN'}
+            aria-label="Downvote"
+            title={me ? 'Downvote' : 'Sign in to vote'}
+          >
+            ▼
+          </button>
         </div>
-      </div>
 
-      {editing ? (
-        <Composer
-          placeholder="Edit your comment"
-          submitLabel="Save"
-          initialBody={comment.body}
-          initialMentionUsernames={comment.mentions.map((m) => m.username)}
-          autoFocus
-          onSubmit={async (body, mentionedUserIds) => {
-            const result = await editComment(comment.id, { body, mentionedUserIds });
-            if (!result.error && result.comment) {
-              onEdited(result.comment);
-              setEditing(false);
-            }
-            return { error: result.error };
-          }}
-          onCancel={() => setEditing(false)}
-        />
-      ) : (
-        <p className={styles.commentBody}>{renderBody(comment.body, comment.mentions)}</p>
-      )}
-
-      {!editing && (
-        <div className={`${styles.actionRow} ${isOwner ? styles.actionRowOwner : ''}`}>
-          {isOwner ? (
-            <span className={styles.ownerActions}>
-              <Tooltip label="Edit comment">
-                <button type="button" className={`${styles.actionBtn} ${styles.actionBtnEdit}`} aria-label="Edit comment" onClick={() => setEditing(true)}>
-                  <EditIcon />
-                </button>
-              </Tooltip>
-              <Tooltip label="Delete comment">
-                <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} aria-label="Delete comment" onClick={() => setConfirmDelete(true)}>
-                  <DeleteIcon />
-                </button>
-              </Tooltip>
+        <div className={styles.commentMain}>
+          <div className={styles.commentHeaderRow}>
+            <span className={`${styles.avatar} ${isReply ? styles.avatarSmall : ''}`} aria-hidden="true">
+              {initialsOf(comment.author.fullName, comment.author.username)}
             </span>
-          ) : (
-            <>
-              <span className={styles.voteGroup}>
-                <button
-                  type="button"
-                  className={`${styles.voteButton} ${comment.viewerVote === 'UP' ? styles.voteButtonActiveUp : ''}`}
-                  disabled={!me || votePending}
-                  onClick={() => void handleVote('UP')}
-                  aria-pressed={comment.viewerVote === 'UP'}
-                  aria-label="Upvote"
-                  title={me ? 'Upvote' : 'Sign in to vote'}
-                >
-                  ▲
-                </button>
-                <span className={styles.score}>{comment.score}</span>
-                <button
-                  type="button"
-                  className={`${styles.voteButton} ${comment.viewerVote === 'DOWN' ? styles.voteButtonActiveDown : ''}`}
-                  disabled={!me || votePending}
-                  onClick={() => void handleVote('DOWN')}
-                  aria-pressed={comment.viewerVote === 'DOWN'}
-                  aria-label="Downvote"
-                  title={me ? 'Downvote' : 'Sign in to vote'}
-                >
-                  ▼
-                </button>
+            <div className={styles.commentIdentity}>
+              <span className={styles.commentName}>{comment.author.fullName || comment.author.username}</span>
+              <span className={styles.commentHandle}>@{comment.author.username}</span>
+              {showBadge && <span className={styles.badge}>{badgeText}</span>}
+              <span className={styles.commentTimestamp} title={new Date(comment.createdAt).toLocaleString()}>
+                {formatTimestamp(comment.createdAt)}
+                {comment.isEdited && ' (edited)'}
               </span>
+            </div>
+          </div>
 
-              <button
-                type="button"
-                className={`${styles.helpfulButton} ${comment.viewerHelpful ? styles.helpfulButtonActive : ''}`}
-                disabled={!me || helpfulPending}
-                onClick={() => void handleHelpful()}
-                aria-pressed={comment.viewerHelpful}
-              >
-                Helpful{comment.helpfulCount > 0 ? ` (${comment.helpfulCount})` : ''}
-              </button>
+          {editing ? (
+            <Composer
+              placeholder="Edit your comment"
+              submitLabel="Save"
+              initialBody={comment.body}
+              initialMentionUsernames={comment.mentions.map((m) => m.username)}
+              autoFocus
+              onSubmit={async (body, mentionedUserIds) => {
+                const result = await editComment(comment.id, { body, mentionedUserIds });
+                if (!result.error && result.comment) {
+                  onEdited(result.comment);
+                  setEditing(false);
+                }
+                return { error: result.error };
+              }}
+              onCancel={() => setEditing(false)}
+            />
+          ) : (
+            <p className={styles.commentBody}>{renderBody(comment.body, comment.mentions)}</p>
+          )}
 
-              {showBestAnswerUI &&
+          {!editing && (
+            <div className={`${styles.actionRow} ${isOwner ? styles.actionRowOwner : ''}`}>
+              {/* All comments use the same icon-only affordances (bare
+                  Material glyph, hover Tooltip, verb tint, no background) —
+                  matches the owner's Edit/Delete treatment. Counts ride
+                  alongside the icon as a small tabular number, never inside
+                  the button. */}
+              {isOwner && (
+                <>
+                  <Tooltip label="Edit comment">
+                    <button type="button" className={`${styles.actionBtn} ${styles.actionBtnEdit}`} aria-label="Edit comment" onClick={() => setEditing(true)}>
+                      <EditIcon />
+                    </button>
+                  </Tooltip>
+                  <Tooltip label="Delete comment">
+                    <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} aria-label="Delete comment" onClick={() => setConfirmDelete(true)}>
+                      <DeleteIcon />
+                    </button>
+                  </Tooltip>
+                </>
+              )}
+
+              {!isOwner && (
+                <span className={styles.actionGroup}>
+                  <Tooltip label={comment.viewerHelpful ? 'Remove helpful mark' : 'Mark as helpful'}>
+                    <button
+                      type="button"
+                      className={`${styles.actionBtn} ${comment.viewerHelpful ? styles.actionBtnActive : ''}`}
+                      disabled={!me || helpfulPending}
+                      onClick={() => void handleHelpful()}
+                      aria-pressed={comment.viewerHelpful}
+                      aria-label={comment.viewerHelpful ? 'Remove helpful mark' : 'Mark as helpful'}
+                    >
+                      <ThumbUpIcon />
+                    </button>
+                  </Tooltip>
+                  {comment.helpfulCount > 0 && <span className={styles.actionCount}>{comment.helpfulCount}</span>}
+                </span>
+              )}
+
+              {me && (
+                <span className={styles.actionGroup}>
+                  <Tooltip label="Reply">
+                    <button
+                      type="button"
+                      className={styles.actionBtn}
+                      onClick={handleReplyClick}
+                      aria-expanded={!isReply && replyCount != null ? !repliesCollapsed : undefined}
+                      aria-label="Reply"
+                    >
+                      <ReplyIcon />
+                    </button>
+                  </Tooltip>
+                  {!isReply && replyCount ? <span className={styles.actionCount}>{replyCount}</span> : null}
+                </span>
+              )}
+
+              {!isOwner && canDelete && (
+                <Tooltip label="Delete comment">
+                  <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} aria-label="Delete comment" onClick={() => setConfirmDelete(true)}>
+                    <DeleteIcon />
+                  </button>
+                </Tooltip>
+              )}
+
+              {!isOwner &&
+                showBestAnswerUI &&
                 (comment.isBestAnswer ? (
                   <span className={styles.bestAnswerChip}>✔ Best Answer</span>
                 ) : (
@@ -245,37 +319,36 @@ export default function CommentItem({
                     </button>
                   )
                 ))}
+            </div>
+          )}
 
-              {!isReply && me && (
-                <button type="button" className={styles.replyButton} onClick={() => setReplyOpen((open) => !open)}>
-                  Reply
-                </button>
-              )}
-
-              {canDelete && (
-                <button type="button" className={`${styles.textActionButton} ${styles.deleteAction}`} onClick={() => setConfirmDelete(true)}>
-                  Delete
-                </button>
-              )}
-            </>
+          {replyOpen && me && (
+            <Composer
+              compact
+              autoFocus
+              placeholder={`Reply to ${comment.author.fullName || comment.author.username}… — type @ to tag someone in this thread`}
+              submitLabel="Reply"
+              participants={participants}
+              // Replying to a reply: pre-address it so the flat thread still
+              // shows who's being answered, and seed that as a tracked
+              // mention. Replying to a top-level comment needs no prefill —
+              // the reply already nests directly under it.
+              initialBody={isReply ? `@${comment.author.username} ` : ''}
+              seededMentions={
+                isReply
+                  ? [{ id: comment.author.id, username: comment.author.username, fullName: comment.author.fullName }]
+                  : []
+              }
+              onSubmit={async (body, mentionedUserIds) => {
+                const result = await submitReply(threadRootId, body, mentionedUserIds);
+                if (!result.error && result.reply) setReplyOpen(false);
+                return { error: result.error };
+              }}
+              onCancel={() => setReplyOpen(false)}
+            />
           )}
         </div>
-      )}
-
-      {replyOpen && me && (
-        <Composer
-          compact
-          autoFocus
-          placeholder={`Reply to ${comment.author.fullName || comment.author.username}… — @mention with the dropdown`}
-          submitLabel="Reply"
-          onSubmit={async (body, mentionedUserIds) => {
-            const result = await submitReply(comment.id, body, mentionedUserIds);
-            if (!result.error && result.reply) setReplyOpen(false);
-            return { error: result.error };
-          }}
-          onCancel={() => setReplyOpen(false)}
-        />
-      )}
+      </div>
 
       <ConfirmDialog
         open={confirmDelete}

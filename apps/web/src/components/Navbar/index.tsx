@@ -76,7 +76,7 @@ function ColorModeToggle(): React.JSX.Element {
 // on mount) rather than a shared AuthContext/provider — this is the only
 // consumer of "am I logged in" so far; worth promoting to a real context if
 // a second client component ever needs the same state.
-export default function Navbar(): React.JSX.Element {
+export default function Navbar(): React.JSX.Element | null {
   const pathname = usePathname();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [user, setUser] = useState<AuthUser | null>(null);
@@ -103,6 +103,11 @@ export default function Navbar(): React.JSX.Element {
     // instead of a full page load. `pathname` is a reliable proxy for
     // "something navigation-worthy just happened."
   }, [pathname]);
+
+  // The corporate portal (corporate.sypher.local -> /corporate/*) is a
+  // standalone gated entrance — no main-site nav. Middleware redirects
+  // that host into /corporate, so this prefix check is reliable.
+  if (pathname?.startsWith('/corporate')) return null;
 
   return (
     <header className={styles.navbar}>

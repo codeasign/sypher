@@ -113,7 +113,7 @@ export default async function CourseModulePage({
         <ModuleBookmarkButton moduleId={mod.id} courseId={mod.courseId} initialBookmarked={isBookmarked} />
       </div>
       <div className={styles.container}>
-        {!mod.locked && <ModuleCompletionTracker courseSlug={slug} moduleSlug={moduleSlug} />}
+        {!mod.locked && <ModuleCompletionTracker courseSlug={slug} moduleSlug={moduleSlug} alreadyComplete={mod.completed ?? false} />}
         {mod.locked ? (
           <>
             <h1 className={styles.title}>{mod.title}</h1>

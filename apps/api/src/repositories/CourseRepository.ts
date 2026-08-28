@@ -1,4 +1,5 @@
 import { prisma } from '../lib/prisma';
+import { Prisma } from '@prisma/client';
 import type { Course } from '@prisma/client';
 import { slugify, findAvailableSlug } from '../lib/slug';
 
@@ -102,11 +103,14 @@ export class CourseRepository {
   }
 
   async update(id: string, fields: UpdateCourseInput): Promise<void> {
-    // Empty string means "clear" for the nullable text columns — tsoa's
-    // Partial<> validators reject explicit JSON nulls, so clients clear by
-    // sending "" instead.
-    const data = {
-      ...fields,
+    // Whitelist the updatable columns explicitly — the controller's body
+    // type is Partial<CourseCreateRequest>, which also carries `slug`; a
+    // blanket `...fields` spread would let a PUT silently rename the course
+    // (breaking every /learn/[slug] URL). `undefined` values are skipped by
+    // Prisma; "" means "clear" for the nullable text columns (tsoa's
+    // validators reject explicit JSON nulls, so clients send "" instead).
+    const data: Prisma.CourseUpdateInput = {
+      name: fields.name,
       description: fields.description === '' ? null : fields.description,
       coverImageUrl: fields.coverImageUrl === '' ? null : fields.coverImageUrl,
       category: fields.category === '' ? null : fields.category,

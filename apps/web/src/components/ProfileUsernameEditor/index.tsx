@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { apiFetch } from '@/lib/api';
 import styles from './styles.module.css';
 
@@ -23,6 +23,15 @@ export default function ProfileUsernameEditor({ initial }: { initial: MeUser }):
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
+  // Auto-clear the success note after 3s — as an effect so the timer is
+  // cancelled on unmount / re-save (a bare setTimeout in save() leaks and
+  // fires setState on an unmounted component).
+  useEffect(() => {
+    if (!success) return;
+    const t = setTimeout(() => setSuccess(null), 3000);
+    return () => clearTimeout(t);
+  }, [success]);
+
   async function save(): Promise<void> {
     setPending(true);
     setError(null);
@@ -42,7 +51,6 @@ export default function ProfileUsernameEditor({ initial }: { initial: MeUser }):
       setMe(updated);
       setEditing(false);
       setSuccess('Username updated');
-      setTimeout(() => setSuccess(null), 3000);
     }
   }
 

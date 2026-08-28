@@ -63,7 +63,10 @@ function AuthForm(): React.JSX.Element {
       setError(responseBody.message ?? 'Something went wrong');
       return;
     }
-    router.push('/dashboard');
+    const authUser = await res.json().catch(() => ({}));
+    // Provisioned account with a temporary/admin-set password — force a
+    // password change before anything else.
+    router.push(authUser?.mustResetPassword ? '/set-password' : '/dashboard');
   }
 
   return (

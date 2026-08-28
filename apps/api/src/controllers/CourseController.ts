@@ -5,6 +5,7 @@ import { CourseRepository } from '../repositories/CourseRepository';
 import { CourseModuleRepository, type GettingStartedModuleEntry, type ModuleWithCourseEntry } from '../repositories/CourseModuleRepository';
 import { AuthoredCourseAccessRepository } from '../repositories/AuthoredCourseAccessRepository';
 import { AuthoredCompanyCourseAccessRepository } from '../repositories/AuthoredCompanyCourseAccessRepository';
+import { CompanyDirectoryRepository } from '../repositories/CompanyDirectoryRepository';
 import { ModuleProgressRepository } from '../repositories/ModuleProgressRepository';
 import { CourseCompletionRepository } from '../repositories/CourseCompletionRepository';
 import { requireCanManageCourses } from '../lib/contentAuthz';
@@ -17,6 +18,7 @@ const courseRepository = new CourseRepository();
 const courseModuleRepository = new CourseModuleRepository();
 const authoredCourseAccessRepository = new AuthoredCourseAccessRepository();
 const authoredCompanyCourseAccessRepository = new AuthoredCompanyCourseAccessRepository();
+const companyDirectoryRepository = new CompanyDirectoryRepository();
 const moduleProgressRepository = new ModuleProgressRepository();
 const courseCompletionRepository = new CourseCompletionRepository();
 
@@ -105,7 +107,11 @@ async function courseAccessInfo(user: User, course: Course): Promise<CourseAcces
   const allowedRoles = await authoredCourseAccessRepository.getAllowedRoles(course.id);
   let companyAllowedIds: Set<string> | undefined;
   if (user.companyId) {
-    companyAllowedIds = new Set(await authoredCompanyCourseAccessRepository.listCourseIdsForCompany(user.companyId));
+    // Company employees get courses via their GROUPS (managed on the
+    // corporate portal), not straight from the company-wide grant — that
+    // grant is now only the ceiling the portal admin picks from. Union
+    // across the employee's groups; lapsed accessUntil ⇒ empty.
+    companyAllowedIds = new Set(await companyDirectoryRepository.listCourseIdsForUserGroups(user.companyId, user.id));
   }
   const hasFullAccess = hasCourseAccess(user.role, allowedRoles, { companyAllowedSlugs: companyAllowedIds, slug: course.id });
   if (hasFullAccess) return { hasFullAccess: true, visible: true };

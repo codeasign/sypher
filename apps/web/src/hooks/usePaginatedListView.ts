@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 export type ListViewMode = 'card' | 'list';
 
@@ -56,6 +56,22 @@ export function usePaginatedListView<T>({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [viewMode, setViewModeState] = useState<ListViewMode>(defaultView);
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  // Re-seed from the server props when they genuinely change reference —
+  // i.e. the host Server Component re-rendered (a router.refresh(), a
+  // filter change). Without this the hook would keep showing the stale
+  // first-mount page-1 data after such a refresh. `initialItems` is a
+  // fresh array only when the RSC actually re-ran, so a reference check is
+  // the right trigger; it resets to page 1, which is the sensible landing
+  // for a refresh.
+  const seededRef = useRef({ items: initialItems, total: initialTotal });
+  useEffect(() => {
+    if (seededRef.current.items === initialItems && seededRef.current.total === initialTotal) return;
+    seededRef.current = { items: initialItems, total: initialTotal };
+    setItems(initialItems);
+    setTotal(initialTotal);
+    setPage(1);
+  }, [initialItems, initialTotal]);
 
   useEffect(() => {
     try {

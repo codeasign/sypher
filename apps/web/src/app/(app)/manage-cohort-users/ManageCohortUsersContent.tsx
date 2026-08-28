@@ -10,10 +10,10 @@ import {
   listManageableCohorts,
   listCohortRoster,
   setCohortMemberStatus,
+  addCohortMemberByEmail,
   listCohortCoursePool,
   listCohortMemberCourseAccess,
   setCohortMemberCourseAccess,
-  lookupUserByEmail,
   type Cohort,
   type RosterEntry,
 } from '@/data/cohorts';
@@ -25,18 +25,15 @@ const COURSE_TITLE_BY_SLUG: Record<string, string> = Object.fromEntries(
 );
 
 /**
- * Replaces the old email-invite modal (inviteCohortMember/pending_invites +
- * Supabase magic-link signInWithOtp) — that flow depends on the deferred
- * Brevo/Resend rotation wiring and a magic-link auth concept that doesn't
- * exist in the new password/Google auth system, so it's explicitly out of
- * scope for this port. This adds an EXISTING, already-registered account to
- * the roster by email (mirrors the Launch Cohort "add manager by email"
- * flow) rather than sending a new invite to someone who doesn't have an
- * account yet. Inviting brand-new cohort members is a follow-up once the
- * general invite-consumption flow gets built.
+ * Add someone to the roster by email. If the email has no Sypher account,
+ * one is provisioned server-side (passwordless, mustResetPassword) and the
+ * person is emailed a welcome + set-password link — then a cohort welcome
+ * email. Same onboarding as the admin User Role tab and the corporate
+ * portal. `Full name` is optional and only used when a new account is made.
  */
 function AddMemberModal({ cohortId, onClose, onAdded }: { cohortId: string; onClose: () => void; onAdded: () => void }): React.JSX.Element {
   const [email, setEmail] = useState('');
+  const [fullName, setFullName] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -53,16 +50,10 @@ function AddMemberModal({ cohortId, onClose, onAdded }: { cohortId: string; onCl
     if (sending) return;
     setSending(true);
     setError(null);
-    const profile = await lookupUserByEmail(email.trim());
-    if (!profile) {
-      setError('No account found with that email — they need to register first.');
-      setSending(false);
-      return;
-    }
-    const { error: statusError } = await setCohortMemberStatus(cohortId, profile.id, true);
+    const { error: addError } = await addCohortMemberByEmail(cohortId, email.trim(), fullName.trim() || undefined);
     setSending(false);
-    if (statusError) {
-      setError(statusError);
+    if (addError) {
+      setError(addError);
       return;
     }
     onAdded();
@@ -78,7 +69,7 @@ function AddMemberModal({ cohortId, onClose, onAdded }: { cohortId: string; onCl
         </div>
         <form onSubmit={handleSubmit}>
           <div className={styles.modalBody}>
-            <label className={styles.fieldLabel} htmlFor="add-member-email">Email (must already have an account)</label>
+            <label className={styles.fieldLabel} htmlFor="add-member-email">Email</label>
             <input
               id="add-member-email"
               type="email"
@@ -88,6 +79,20 @@ function AddMemberModal({ cohortId, onClose, onAdded }: { cohortId: string; onCl
               onChange={(e) => setEmail(e.target.value)}
               placeholder="jane@example.com"
             />
+            <label className={styles.fieldLabel} htmlFor="add-member-name" style={{ marginTop: '0.75rem' }}>
+              Full name <span style={{ fontWeight: 400, opacity: 0.7 }}>(only used if they&rsquo;re new to Sypher)</span>
+            </label>
+            <input
+              id="add-member-name"
+              type="text"
+              className={styles.textInput}
+              value={fullName}
+              onChange={(e) => setFullName(e.target.value)}
+              placeholder="Jane Doe"
+            />
+            <p className={styles.fieldLabel} style={{ fontWeight: 400, opacity: 0.75, marginTop: '0.5rem' }}>
+              No account yet? We&rsquo;ll create one and email them a link to set their password.
+            </p>
             {error && <p className={styles.formError}>{error}</p>}
           </div>
           <div className={styles.modalFooter}>

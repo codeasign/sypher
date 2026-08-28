@@ -15,6 +15,16 @@ async function asJson<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// Write helpers below MUST surface a non-2xx response — the bookmark
+// buttons apply their state optimistically and only roll back inside a
+// `catch`, so a silently-swallowed 401/403/500 was leaving the UI showing
+// "Bookmarked" while nothing persisted (reverting on the next reload).
+async function assertOk(res: Response, action: string): Promise<void> {
+  if (!res.ok) {
+    throw new Error(`${action} failed: ${res.status} ${res.statusText}`);
+  }
+}
+
 // ---- Whole-course bookmarks (docs course catalog, slug-keyed) ----
 // No UI wires into these yet — see AuthoredCourseBookmarkButton's sibling
 // note. Kept here so /bookmarks and any future docs-catalog page can read
@@ -26,11 +36,11 @@ export async function listCourseBookmarks(): Promise<string[]> {
 }
 
 export async function addCourseBookmark(slug: string): Promise<void> {
-  await apiFetch(`/bookmarks/courses/${encodeURIComponent(slug)}`, { method: 'POST' });
+  await assertOk(await apiFetch(`/bookmarks/courses/${encodeURIComponent(slug)}`, { method: 'POST' }), 'Add course bookmark');
 }
 
 export async function removeCourseBookmark(slug: string): Promise<void> {
-  await apiFetch(`/bookmarks/courses/${encodeURIComponent(slug)}`, { method: 'DELETE' });
+  await assertOk(await apiFetch(`/bookmarks/courses/${encodeURIComponent(slug)}`, { method: 'DELETE' }), 'Remove course bookmark');
 }
 
 // ---- Individual docs-page bookmarks ----
@@ -41,11 +51,14 @@ export async function listDocBookmarks(): Promise<DocBookmarkEntry[]> {
 }
 
 export async function addDocBookmark(docPath: string, courseSlug: string, title?: string | null): Promise<void> {
-  await apiFetch('/bookmarks/docs', { method: 'POST', body: JSON.stringify({ docPath, courseSlug, title }) });
+  await assertOk(
+    await apiFetch('/bookmarks/docs', { method: 'POST', body: JSON.stringify({ docPath, courseSlug, title }) }),
+    'Add doc bookmark',
+  );
 }
 
 export async function removeDocBookmark(docPath: string): Promise<void> {
-  await apiFetch(`/bookmarks/docs?docPath=${encodeURIComponent(docPath)}`, { method: 'DELETE' });
+  await assertOk(await apiFetch(`/bookmarks/docs?docPath=${encodeURIComponent(docPath)}`, { method: 'DELETE' }), 'Remove doc bookmark');
 }
 
 // ---- Authored course bookmarks (DB-backed course system, id-keyed) ----
@@ -56,11 +69,11 @@ export async function listAuthoredCourseBookmarks(): Promise<string[]> {
 }
 
 export async function addAuthoredCourseBookmark(courseId: string): Promise<void> {
-  await apiFetch(`/bookmarks/authored-courses/${courseId}`, { method: 'POST' });
+  await assertOk(await apiFetch(`/bookmarks/authored-courses/${courseId}`, { method: 'POST' }), 'Add course bookmark');
 }
 
 export async function removeAuthoredCourseBookmark(courseId: string): Promise<void> {
-  await apiFetch(`/bookmarks/authored-courses/${courseId}`, { method: 'DELETE' });
+  await assertOk(await apiFetch(`/bookmarks/authored-courses/${courseId}`, { method: 'DELETE' }), 'Remove course bookmark');
 }
 
 // ---- Authored module bookmarks ----
@@ -71,9 +84,12 @@ export async function listAuthoredModuleBookmarks(): Promise<AuthoredModuleBookm
 }
 
 export async function addAuthoredModuleBookmark(moduleId: string, courseId: string): Promise<void> {
-  await apiFetch(`/bookmarks/authored-modules/${moduleId}`, { method: 'POST', body: JSON.stringify({ courseId }) });
+  await assertOk(
+    await apiFetch(`/bookmarks/authored-modules/${moduleId}`, { method: 'POST', body: JSON.stringify({ courseId }) }),
+    'Add module bookmark',
+  );
 }
 
 export async function removeAuthoredModuleBookmark(moduleId: string): Promise<void> {
-  await apiFetch(`/bookmarks/authored-modules/${moduleId}`, { method: 'DELETE' });
+  await assertOk(await apiFetch(`/bookmarks/authored-modules/${moduleId}`, { method: 'DELETE' }), 'Remove module bookmark');
 }

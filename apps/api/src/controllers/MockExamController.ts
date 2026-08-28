@@ -5,7 +5,7 @@ import { MockExamRepository, type DrawSplit } from '../repositories/MockExamRepo
 import { MockExamAttemptRepository } from '../repositories/MockExamAttemptRepository';
 import { CourseRepository } from '../repositories/CourseRepository';
 import { AuthoredCourseAccessRepository } from '../repositories/AuthoredCourseAccessRepository';
-import { AuthoredCompanyCourseAccessRepository } from '../repositories/AuthoredCompanyCourseAccessRepository';
+import { CompanyDirectoryRepository } from '../repositories/CompanyDirectoryRepository';
 import { hasCourseAccess } from '../lib/accessControl';
 
 const mockExamRepository = new MockExamRepository();
@@ -14,7 +14,7 @@ const MAX_PAGE_SIZE = 50;
 const mockExamAttemptRepository = new MockExamAttemptRepository();
 const courseRepository = new CourseRepository();
 const authoredCourseAccessRepository = new AuthoredCourseAccessRepository();
-const authoredCompanyCourseAccessRepository = new AuthoredCompanyCourseAccessRepository();
+const companyDirectoryRepository = new CompanyDirectoryRepository();
 
 // One exam on the /mock-tests list page — explicit field projection, the
 // list page never needs anything beyond what it renders.
@@ -69,7 +69,9 @@ async function hasFullCourseAccess(user: User, courseId: string): Promise<boolea
   const allowedRoles = await authoredCourseAccessRepository.getAllowedRoles(course.id);
   let companyAllowedIds: Set<string> | undefined;
   if (user.companyId) {
-    companyAllowedIds = new Set(await authoredCompanyCourseAccessRepository.listCourseIdsForCompany(user.companyId));
+    // Company access flows through the employee's groups now — see
+    // CompanyDirectoryRepository / the corporate portal.
+    companyAllowedIds = new Set(await companyDirectoryRepository.listCourseIdsForUserGroups(user.companyId, user.id));
   }
   return hasCourseAccess(user.role, allowedRoles, { companyAllowedSlugs: companyAllowedIds, slug: course.id });
 }

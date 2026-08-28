@@ -4,7 +4,7 @@ import { isModuleFreelyVisible } from './coursePreview';
 import { CourseModuleRepository } from '../repositories/CourseModuleRepository';
 import { CourseRepository } from '../repositories/CourseRepository';
 import { AuthoredCourseAccessRepository } from '../repositories/AuthoredCourseAccessRepository';
-import { AuthoredCompanyCourseAccessRepository } from '../repositories/AuthoredCompanyCourseAccessRepository';
+import { CompanyDirectoryRepository } from '../repositories/CompanyDirectoryRepository';
 import { BlogPostRepository } from '../repositories/BlogPostRepository';
 import type { BlogPost, Course, CourseModule, User } from '@prisma/client';
 
@@ -29,7 +29,7 @@ const COMMENT_BODY_MAX_LENGTH = 5000;
 const courseModuleRepository = new CourseModuleRepository();
 const courseRepository = new CourseRepository();
 const authoredCourseAccessRepository = new AuthoredCourseAccessRepository();
-const authoredCompanyCourseAccessRepository = new AuthoredCompanyCourseAccessRepository();
+const companyDirectoryRepository = new CompanyDirectoryRepository();
 const blogPostRepository = new BlogPostRepository();
 
 function notFound(): HttpError {
@@ -59,7 +59,7 @@ export async function resolveModuleTargetOr404(user: User | null, moduleId: stri
   let companyAllowedIds: Set<string> | undefined;
   if (user.companyId) {
     companyAllowedIds = new Set(
-      await authoredCompanyCourseAccessRepository.listCourseIdsForCompany(user.companyId),
+      await companyDirectoryRepository.listCourseIdsForUserGroups(user.companyId, user.id),
     );
   }
   const hasFullAccess = hasCourseAccess(user.role, allowedRoles, {
@@ -109,7 +109,7 @@ export async function resolveCourseTargetOr404(user: User | null, courseId: stri
   let companyAllowedIds: Set<string> | undefined;
   if (user.companyId) {
     companyAllowedIds = new Set(
-      await authoredCompanyCourseAccessRepository.listCourseIdsForCompany(user.companyId),
+      await companyDirectoryRepository.listCourseIdsForUserGroups(user.companyId, user.id),
     );
   }
   const hasFullAccess = hasCourseAccess(user.role, allowedRoles, {

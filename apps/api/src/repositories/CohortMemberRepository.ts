@@ -83,8 +83,17 @@ export class CohortMemberRepository {
    * cohort — reactivating later does NOT restore them (same "reactivation
    * requires a fresh decision" rule as the original).
    */
-  async setStatus(cohortId: string, userId: string, active: boolean, actingUserId: string): Promise<void> {
-    await prisma.$transaction(async (tx) => {
+  async setStatus(
+    cohortId: string,
+    userId: string,
+    active: boolean,
+    actingUserId: string,
+  ): Promise<{ activated: boolean }> {
+    return prisma.$transaction(async (tx) => {
+      const before = await tx.cohortMember.findUnique({
+        where: { cohortId_userId: { cohortId, userId } },
+        select: { status: true },
+      });
       await tx.cohortMember.upsert({
         where: { cohortId_userId: { cohortId, userId } },
         create: { cohortId, userId, status: active ? 'active' : 'removed', enrolledById: actingUserId },
@@ -93,6 +102,10 @@ export class CohortMemberRepository {
       if (!active) {
         await tx.cohortMemberCourseAccess.deleteMany({ where: { cohortId, userId } });
       }
+      // "activated" = the member is now active AND wasn't already — a fresh
+      // enrolment or a reactivation. Drives the cohort-welcome email; a
+      // no-op re-set of an already-active member sends nothing.
+      return { activated: active && before?.status !== 'active' };
     });
   }
 }

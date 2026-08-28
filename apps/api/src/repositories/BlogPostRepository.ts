@@ -19,11 +19,27 @@ export interface PublishedPostSummary {
   description: string;
   publishedAt: Date | null;
   coverImageUrl: string | null;
+  /** First image found in the post's markdown/HTML content — card/list
+      thumbnails fall back to this when no cover was uploaded. */
+  contentImage: string | null;
+  /** Live (non-deleted) comment count including replies. */
+  commentCount: number;
 }
 
 export interface PublishedPostSummaryPage {
   posts: PublishedPostSummary[];
   total: number;
+}
+
+// First image in a post body — markdown `![alt](url)` or HTML `<img src>`.
+const MARKDOWN_IMAGE = /!\[[^\]]*\]\(([^)\s]+)/;
+const HTML_IMAGE = /<img[^>]*\ssrc=["']([^"']+)["']/i;
+
+function firstImageInContent(content: string): string | null {
+  if (!content) return null;
+  const md = content.match(MARKDOWN_IMAGE);
+  if (md?.[1]) return md[1].replace(/^</, '').replace(/>$/, '');
+  return content.match(HTML_IMAGE)?.[1] ?? null;
 }
 
 export interface PublishedPostWithAuthor {
@@ -82,7 +98,7 @@ export class BlogPostRepository {
    * waste; this is the query the /blog catalog actually needs.
    */
   async listPublishedPage(limit: number, offset: number): Promise<PublishedPostSummaryPage> {
-    const [posts, total] = await Promise.all([
+    const [rows, total] = await Promise.all([
       prisma.blogPost.findMany({
         where: { status: 'published' },
         // id as a tiebreaker: publishedAt alone isn't unique enough to
@@ -92,13 +108,37 @@ export class BlogPostRepository {
         // across separate queries, so offset pagination would return
         // duplicates/gaps between pages without this.
         orderBy: [{ publishedAt: 'desc' }, { id: 'desc' }],
-        select: { slug: true, title: true, description: true, publishedAt: true, coverImageUrl: true },
+        // content IS selected — but only the first image URL is extracted
+        // from it and returned (contentImage below), so the payload stays
+        // summary-sized while the catalog can still show a real thumbnail
+        // for posts without a cover. _count gives the live comment total
+        // (deleted comments excluded) without a second query.
+        select: {
+          slug: true,
+          title: true,
+          description: true,
+          publishedAt: true,
+          coverImageUrl: true,
+          content: true,
+          _count: { select: { comments: { where: { isDeleted: false } } } },
+        },
         take: limit,
         skip: offset,
       }),
       prisma.blogPost.count({ where: { status: 'published' } }),
     ]);
-    return { posts, total };
+    return {
+      posts: rows.map((row) => ({
+        slug: row.slug,
+        title: row.title,
+        description: row.description,
+        publishedAt: row.publishedAt,
+        coverImageUrl: row.coverImageUrl,
+        contentImage: firstImageInContent(row.content),
+        commentCount: row._count.comments,
+      })),
+      total,
+    };
   }
 
   /** Reimplements get_published_blog_post_with_author(). */

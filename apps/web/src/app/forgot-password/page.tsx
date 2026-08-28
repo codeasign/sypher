@@ -1,7 +1,9 @@
 'use client';
 
 import { useState, type FormEvent } from 'react';
+import Link from 'next/link';
 import { apiFetch } from '@/lib/api';
+import styles from '../reset-password/styles.module.css';
 
 export default function ForgotPasswordPage(): React.JSX.Element {
   const [email, setEmail] = useState('');
@@ -18,18 +20,46 @@ export default function ForgotPasswordPage(): React.JSX.Element {
   }
 
   return (
-    <main>
-      <h1>Forgot password</h1>
-      <form onSubmit={handleSubmit}>
-        <div>
-          <label htmlFor="email">Email</label>
-          <input id="email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
+    <div className={styles.page}>
+      <div className={styles.card}>
+        <div className={styles.brand}>
+          <span className={styles.brandDot} />
+          Sypher
         </div>
-        <button type="submit" disabled={submitting}>
-          {submitting ? 'Sending…' : 'Send reset link'}
-        </button>
-      </form>
-      {message && <p role="status">{message}</p>}
-    </main>
+        <h1 className={styles.title}>Forgot password</h1>
+        <p className={styles.subtitle}>
+          Enter your email and we&rsquo;ll send a link to set a new password.
+        </p>
+
+        {message ? (
+          <p role="status" className={styles.note}>
+            {message}
+          </p>
+        ) : (
+          <form onSubmit={handleSubmit}>
+            <div className={styles.field}>
+              <label htmlFor="email">Email</label>
+              <input
+                id="email"
+                type="email"
+                required
+                autoFocus
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+            </div>
+            <button type="submit" className={styles.submitBtn} disabled={submitting}>
+              {submitting ? 'Sending…' : 'Send reset link'}
+            </button>
+          </form>
+        )}
+
+        <p className={styles.linkRow}>
+          <Link href="/login" className={styles.link}>
+            Back to sign in
+          </Link>
+        </p>
+      </div>
+    </div>
   );
 }

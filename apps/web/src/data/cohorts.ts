@@ -110,6 +110,23 @@ export async function setCohortMemberStatus(cohortId: string, userId: string, ac
   return res.ok ? { error: null } : { error: await asError(res) };
 }
 
+/**
+ * Add someone to the roster by email. If they have no Sypher account, one
+ * is provisioned and they're emailed a welcome + set-password link.
+ * `fullName` is only used when a new account is created.
+ */
+export async function addCohortMemberByEmail(
+  cohortId: string,
+  email: string,
+  fullName?: string,
+): Promise<{ error: string | null }> {
+  const res = await apiFetch(`/cohorts/${cohortId}/roster/by-email`, {
+    method: 'POST',
+    body: JSON.stringify({ email, fullName }),
+  });
+  return res.ok ? { error: null } : { error: await asError(res) };
+}
+
 // ---- Course pool (admin-only write) ----
 
 export async function listCohortCoursePool(cohortId: string): Promise<string[]> {
@@ -154,6 +171,19 @@ export async function listCohortManagers(cohortId: string): Promise<ManagerEntry
 
 export async function addCohortManager(cohortId: string, userId: string): Promise<{ error: string | null }> {
   const res = await apiFetch(`/cohorts/${cohortId}/managers`, { method: 'POST', body: JSON.stringify({ userId }) });
+  return res.ok ? { error: null } : { error: await asError(res) };
+}
+
+/** Add a manager by email — provisions + emails a set-password link if new. */
+export async function addCohortManagerByEmail(
+  cohortId: string,
+  email: string,
+  fullName?: string,
+): Promise<{ error: string | null }> {
+  const res = await apiFetch(`/cohorts/${cohortId}/managers/by-email`, {
+    method: 'POST',
+    body: JSON.stringify({ email, fullName }),
+  });
   return res.ok ? { error: null } : { error: await asError(res) };
 }
 

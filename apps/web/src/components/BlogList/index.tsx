@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { apiFetch } from '@/lib/api';
 import { usePaginatedListView } from '@/hooks/usePaginatedListView';
 import { ListViewToolbar } from '@/components/ListViewToolbar';
+import { CommentIcon } from '@/components/icons/ActionIcons';
 import Pagination from '@/components/Pagination';
 import styles from './styles.module.css';
 
@@ -13,14 +14,20 @@ interface PostSummary {
   description: string;
   publishedAt: string | null;
   coverImageUrl: string | null;
+  contentImage?: string | null;
+  commentCount?: number;
 }
 
-function titleColor(title: string): string {
-  let hash = 0;
-  for (let i = 0; i < title.length; i += 1) {
-    hash = (hash * 31 + title.charCodeAt(i)) >>> 0;
-  }
-  return `hsl(${hash % 360}, 58%, 42%)`;
+// Centralized placeholder for image-less posts (cover and content both empty).
+const PLACEHOLDER_IMAGE = '/blog-placeholder.svg';
+
+function postImage(post: PostSummary): string {
+  return post.coverImageUrl ?? post.contentImage ?? PLACEHOLDER_IMAGE;
+}
+
+function formatDate(iso: string | null): string | null {
+  if (!iso) return null;
+  return new Date(iso).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
 }
 
 // Seeded from the server-rendered `initialPosts` (page 1, summary fields
@@ -74,16 +81,19 @@ export default function BlogList({
         <div className={styles.grid}>
           {posts.map((post) => (
             <Link key={post.slug} href={`/blog/${post.slug}`} className={styles.card}>
-              {post.coverImageUrl ? (
-                <img src={post.coverImageUrl} alt={post.title} className={styles.cardImage} />
-              ) : (
-                <div className={styles.cardImagePlaceholder} style={{ background: titleColor(post.title) }}>
-                  {post.title.charAt(0).toUpperCase()}
-                </div>
-              )}
+              <img src={postImage(post)} alt={post.title} className={styles.cardImage} loading="lazy" />
               <div className={styles.cardBody}>
                 <h3 className={styles.cardTitle}>{post.title}</h3>
                 {post.description && <p className={styles.cardDescription}>{post.description}</p>}
+                <div className={styles.cardMeta}>
+                  {post.publishedAt && <span>{formatDate(post.publishedAt)}</span>}
+                  {post.commentCount != null && (
+                    <span className={styles.metaItem}>
+                      <CommentIcon />
+                      {post.commentCount}
+                    </span>
+                  )}
+                </div>
               </div>
             </Link>
           ))}
@@ -92,12 +102,19 @@ export default function BlogList({
         <div className={styles.list}>
           {posts.map((post) => (
             <Link key={post.slug} href={`/blog/${post.slug}`} className={styles.row}>
-              <div className={styles.avatar} style={{ background: titleColor(post.title) }}>
-                {post.title.charAt(0).toUpperCase()}
-              </div>
+              <img src={postImage(post)} alt={post.title} className={styles.rowThumb} loading="lazy" />
               <div className={styles.rowBody}>
                 <div className={styles.rowTop}>
                   <h3 className={styles.title}>{post.title}</h3>
+                  <span className={styles.rowMeta}>
+                    {post.publishedAt && <span>{formatDate(post.publishedAt)}</span>}
+                    {post.commentCount != null && (
+                      <span className={styles.metaItem}>
+                        <CommentIcon />
+                        {post.commentCount}
+                      </span>
+                    )}
+                  </span>
                 </div>
                 {post.description && <p className={styles.description}>{post.description}</p>}
               </div>

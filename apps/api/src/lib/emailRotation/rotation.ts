@@ -1,12 +1,16 @@
 import type { EmailProvider, SendEmailParams, SendEmailResult } from './types';
 import { brevoProvider } from './providers/brevo';
 import { resendProvider } from './providers/resend';
+import { smtpProvider } from './providers/smtp';
 import { isUnderQuota, recordEmailSend, type EmailProviderName } from './quota';
+import { env } from '../env';
 
-// Priority order: Brevo first, then Resend. Adding a third provider means
-// adding one entry here plus one new providers/*.ts file — nothing else in
-// this function changes.
-const PROVIDERS: EmailProvider[] = [brevoProvider, resendProvider];
+// EMAIL_TRANSPORT=smtp → send everything through the local SMTP provider
+// only (a GreenMail/Mailpit container for local email testing); the real
+// providers are never contacted. Default / production: Brevo first, then
+// Resend. Adding another real provider = one entry here + one providers/*.ts.
+const PROVIDERS: EmailProvider[] =
+  env.email.transport === 'smtp' ? [smtpProvider] : [brevoProvider, resendProvider];
 
 // Checks quota, picks the first under-quota provider in priority order,
 // sends, and records the send only after a confirmed success. A non-quota

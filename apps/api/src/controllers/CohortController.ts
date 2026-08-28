@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Path, Post, Put, Query, Request, Route, Security, Tags } from 'tsoa';
+import { Body, Controller, Delete, Get, Path, Post, Put, Query, Request, Res, Route, Security, Tags, type TsoaResponse } from 'tsoa';
 import type { Request as ExpressRequest } from 'express';
 import type { Cohort, User } from '@prisma/client';
 import { CohortRepository } from '../repositories/CohortRepository';
@@ -12,6 +12,8 @@ import { canManageCohorts, requireCanManageCohorts, requireCanManageCohortRoster
 import { ForbiddenError } from '../lib/authz';
 import { getOrSet, purge } from '../lib/cache';
 import { assertNoReplacementChar } from '../lib/textSanitize';
+import { sendCohortWelcomeEmail } from '../lib/email';
+import { ensureUserByEmail } from '../lib/userProvisioning';
 
 const cohortRepository = new CohortRepository();
 const cohortMemberRepository = new CohortMemberRepository();
@@ -21,6 +23,23 @@ const cohortMemberCourseAccessRepository = new CohortMemberCourseAccessRepositor
 const userRepository = new UserRepository();
 
 const PUBLIC_CACHE_TTL_MS = 60_000;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Fire-and-forget cohort-welcome email on a fresh enrolment / reactivation
+// (never on a no-op re-set). A send failure never fails the roster change —
+// the membership is already committed by the time this runs.
+function maybeSendCohortWelcome(cohortId: string, userId: string, activated: boolean): void {
+  if (!activated) return;
+  void (async () => {
+    const [member, cohort] = await Promise.all([
+      userRepository.findById(userId),
+      cohortRepository.findById(cohortId),
+    ]);
+    if (member && cohort) {
+      await sendCohortWelcomeEmail(member.email, member.fullName, cohort.title, cohort.slug);
+    }
+  })();
+}
 
 interface CreateCohortRequest {
   title: string;
@@ -47,6 +66,16 @@ interface CohortSetAllowedRequest {
 
 interface CohortAddManagerRequest {
   userId: string;
+}
+
+interface CohortAddByEmailRequest {
+  email: string;
+  /** Used only when the email has no account yet and one is provisioned. */
+  fullName?: string;
+}
+
+interface CohortMessageResponse {
+  message: string;
 }
 
 interface CohortLookupUser {
@@ -150,7 +179,34 @@ export class CohortController extends Controller {
   ): Promise<void> {
     const user = request.user as User;
     await requireCanManageCohortRoster(user, id);
-    await cohortMemberRepository.setStatus(id, userId, body.active, user.id);
+    const { activated } = await cohortMemberRepository.setStatus(id, userId, body.active, user.id);
+    maybeSendCohortWelcome(id, userId, activated);
+  }
+
+  /**
+   * Add someone to a cohort roster BY EMAIL. If they don't have a Sypher
+   * account yet, one is provisioned (passwordless, mustResetPassword) and
+   * they're emailed a welcome + set-password link — same as the corporate
+   * and admin add-a-user flows. Then they're set active on the roster and
+   * (via maybeSendCohortWelcome) get the cohort welcome email too.
+   */
+  @Post('{id}/roster/by-email')
+  @Security('session')
+  public async addRosterMemberByEmail(
+    @Path() id: string,
+    @Body() body: CohortAddByEmailRequest,
+    @Request() request: ExpressRequest,
+    @Res() badRequest: TsoaResponse<400, CohortMessageResponse>,
+  ): Promise<CohortLookupUser | void> {
+    const actor = request.user as User;
+    await requireCanManageCohortRoster(actor, id);
+    const email = (body.email ?? '').trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) return badRequest(400, { message: 'Enter a valid email address.' });
+
+    const { user } = await ensureUserByEmail(email, { fullName: body.fullName?.trim() || null });
+    const { activated } = await cohortMemberRepository.setStatus(id, user.id, true, actor.id);
+    maybeSendCohortWelcome(id, user.id, activated);
+    return { id: user.id, email: user.email, fullName: user.fullName };
   }
 
   // ---- Course pool (admin-only write, matching the original RLS exactly —
@@ -231,6 +287,28 @@ export class CohortController extends Controller {
   public async addManager(@Path() id: string, @Body() body: CohortAddManagerRequest, @Request() request: ExpressRequest): Promise<void> {
     requireAdmin(request.user as User);
     await cohortManagerRepository.add(id, body.userId);
+  }
+
+  /**
+   * Add a cohort manager BY EMAIL — provisions a passwordless account +
+   * welcome/set-password email if the person isn't on Sypher yet, then
+   * grants the manager role. Same onboarding as every other add-a-user
+   * surface.
+   */
+  @Post('{id}/managers/by-email')
+  @Security('session')
+  public async addManagerByEmail(
+    @Path() id: string,
+    @Body() body: CohortAddByEmailRequest,
+    @Request() request: ExpressRequest,
+    @Res() badRequest: TsoaResponse<400, CohortMessageResponse>,
+  ): Promise<CohortLookupUser | void> {
+    requireAdmin(request.user as User);
+    const email = (body.email ?? '').trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) return badRequest(400, { message: 'Enter a valid email address.' });
+    const { user } = await ensureUserByEmail(email, { fullName: body.fullName?.trim() || null });
+    await cohortManagerRepository.add(id, user.id);
+    return { id: user.id, email: user.email, fullName: user.fullName };
   }
 
   @Delete('{id}/managers/{userId}')

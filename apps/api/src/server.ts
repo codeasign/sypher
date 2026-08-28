@@ -10,6 +10,7 @@ import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import helmet from 'helmet';
 import swaggerUi from 'swagger-ui-express';
+import { ValidateError } from 'tsoa';
 import type { ErrorRequestHandler } from 'express';
 import { env } from './lib/env';
 import { createLogger } from './lib/logger';
@@ -48,6 +49,12 @@ app.use((req, res) => {
 
 const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
   if (res.headersSent) return next(err);
+  // tsoa's runtime schema validation throws this for request bodies that
+  // fail the generated OpenAPI schema — a client mistake, not a crash,
+  // so it must map to 400 with the field details, not the generic 500.
+  if (err instanceof ValidateError) {
+    return res.status(400).json({ message: 'Validation failed', fields: err.fields });
+  }
   const status = err instanceof HttpError ? err.status : 500;
   if (status >= 500) logger.error('Unhandled error', err);
   res.status(status).json({ message: err instanceof Error ? err.message : 'Internal server error' });

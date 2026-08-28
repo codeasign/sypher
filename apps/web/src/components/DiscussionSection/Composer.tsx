@@ -8,13 +8,26 @@ interface ComposerProps {
   placeholder: string;
   submitLabel: string;
   cancelLabel?: string;
-  /** Prefill for edit-in-place. */
+  /** Prefill for edit-in-place, or a reply pre-addressed to "@someone ". */
   initialBody?: string;
   /**
    * Tracked mention usernames already present in initialBody (edit case) —
    * they stay "selected" so resubmitting keeps their CommentMention rows.
    */
   initialMentionUsernames?: string[];
+  /**
+   * Fully-resolved mentions to seed as already-selected (reply-prefill
+   * case) — same effect as initialMentionUsernames but skips the lookup
+   * round-trip since the caller already holds id + username.
+   */
+  seededMentions?: MentionCandidateData[];
+  /**
+   * Thread participants (comment author + everyone who has replied) —
+   * offered as suggestions the moment the user types a bare "@", before
+   * any handle characters, so tagging someone already in the conversation
+   * takes no typing.
+   */
+  participants?: MentionCandidateData[];
   autoFocus?: boolean;
   compact?: boolean;
   onSubmit: (body: string, mentionedUserIds: string[]) => Promise<{ error: string | null }>;
@@ -38,6 +51,8 @@ export default function Composer({
   cancelLabel = 'Cancel',
   initialBody = '',
   initialMentionUsernames = [],
+  seededMentions = [],
+  participants = [],
   autoFocus = false,
   compact = false,
   onSubmit,
@@ -52,8 +67,9 @@ export default function Composer({
 
   // username -> userId for every dropdown selection made in this session
   // of the composer; pre-seeded from initialMentionUsernames' handles via a
-  // lookup done once on mount (edit case).
-  const selectedMentions = useRef(new Map<string, string>());
+  // lookup done once on mount (edit case), or directly from seededMentions
+  // (reply-prefill case, no lookup needed).
+  const selectedMentions = useRef(new Map<string, string>(seededMentions.map((m) => [m.username, m.id])));
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -91,7 +107,9 @@ export default function Composer({
   function caretToken(text: string, caret: number): { matchStart: number; query: string } | null {
     const before = text.slice(0, caret);
     const match = MENTION_TRIGGER_RE.exec(before);
-    if (!match || match[2].length === 0) return null;
+    // A bare "@" (no handle chars yet) is a valid token now — it opens the
+    // thread-participant shortlist rather than a server search.
+    if (!match) return null;
     return { matchStart: caret - match[2].length - 1, query: match[2].toLowerCase() };
   }
 
@@ -104,6 +122,13 @@ export default function Composer({
     if (!token) {
       setDropdownOpen(false);
       setCandidates([]);
+      return;
+    }
+    // Bare "@": no round-trip — suggest the people already in this thread.
+    if (token.query.length === 0) {
+      setCandidates(participants.slice(0, 6));
+      setMentionActive(0);
+      setDropdownOpen(participants.length > 0);
       return;
     }
     debounceRef.current = setTimeout(async () => {

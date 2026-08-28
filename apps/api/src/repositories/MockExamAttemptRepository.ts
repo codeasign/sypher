@@ -54,6 +54,11 @@ export class MockExamAttemptRepository {
     userId: string,
     questions: MockExamQuestion[],
     submitted: Map<string, string[]>,
+    // The frozen draw size, from the attempt row — the score denominator.
+    // `questions` may be shorter if a bank question was deleted after the
+    // draw; those count as unanswered/incorrect, keeping `score` consistent
+    // with the immutable `totalQuestions` stored at create time.
+    frozenTotal: number,
   ): Promise<SubmitOutcome | null> {
     const submittedAt = new Date();
     let correctCount = 0;
@@ -64,7 +69,7 @@ export class MockExamAttemptRepository {
       if (isCorrect) correctCount += 1;
       return { questionId: question.id, selectedAnswer: hasSelection ? selected : null, isCorrect };
     });
-    const totalQuestions = questions.length;
+    const totalQuestions = frozenTotal;
     const score = totalQuestions > 0 ? Math.round((correctCount / totalQuestions) * 100) : 0;
 
     const committed = await prisma.$transaction(async (tx) => {

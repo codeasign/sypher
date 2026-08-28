@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import Script from 'next/script';
 import Navbar from '@/components/Navbar';
+import FirstLoginOnboarding from '@/components/FirstLoginOnboarding';
 import './globals.css';
 
 export const metadata = {
@@ -31,6 +32,7 @@ export default function RootLayout({ children }: { children: ReactNode }): React
         </Script>
         <Navbar />
         {children}
+        <FirstLoginOnboarding />
       </body>
     </html>
   );

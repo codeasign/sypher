@@ -11,9 +11,8 @@ import {
   listCohortCoursePool,
   setCohortCourseAccess,
   listCohortManagers,
-  addCohortManager,
+  addCohortManagerByEmail,
   removeCohortManager,
-  lookupUserByEmail,
   type Cohort,
   type ManagerEntry,
 } from '@/data/cohorts';
@@ -103,13 +102,9 @@ function CohortAccessModal({ cohort, onClose }: { cohort: Cohort; onClose: () =>
     if (addingManager || !managerEmail.trim()) return;
     setAddingManager(true);
     setManagerError(null);
-    const profile = await lookupUserByEmail(managerEmail.trim());
-    if (!profile) {
-      setManagerError('No account found with that email.');
-      setAddingManager(false);
-      return;
-    }
-    const { error: addError } = await addCohortManager(cohort.id, profile.id);
+    // Provisions a passwordless account + set-password email if this email
+    // isn't on Sypher yet, then grants the manager role.
+    const { error: addError } = await addCohortManagerByEmail(cohort.id, managerEmail.trim());
     setAddingManager(false);
     if (addError) {
       setManagerError(addError);

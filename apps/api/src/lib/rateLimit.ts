@@ -31,15 +31,33 @@ function sweepExpired(now: number): void {
  * 429's Retry-After header).
  */
 export function consumeCommentAllowance(userId: string): number {
+  return consumeAllowance(`comment:${userId}`, COMMENT_CREATE_LIMIT);
+}
+
+// Unauthenticated company-code lookups on the corporate portal — keyed by
+// client IP, not user id (there's no session yet at that point). Codes
+// aren't secret (ACME-style), so this only blunts brute-force enumeration.
+export const COMPANY_RESOLVE_LIMIT = 12;
+
+export function consumeCompanyResolveAllowance(clientKey: string): number {
+  return consumeAllowance(`company-resolve:${clientKey}`, COMPANY_RESOLVE_LIMIT);
+}
+
+/**
+ * Shared fixed-window bucket. `key` is caller-namespaced so unrelated
+ * limiters can't collide. Returns 0 when allowed, else seconds until the
+ * window resets (for a 429's Retry-After header).
+ */
+function consumeAllowance(key: string, limit: number): number {
   const now = Date.now();
   if (buckets.size > SWEEP_THRESHOLD) sweepExpired(now);
 
-  const bucket = buckets.get(userId);
+  const bucket = buckets.get(key);
   if (!bucket || now - bucket.windowStart >= WINDOW_MS) {
-    buckets.set(userId, { windowStart: now, count: 1 });
+    buckets.set(key, { windowStart: now, count: 1 });
     return 0;
   }
-  if (bucket.count >= COMMENT_CREATE_LIMIT) {
+  if (bucket.count >= limit) {
     return Math.ceil((WINDOW_MS - (now - bucket.windowStart)) / 1000);
   }
   bucket.count += 1;

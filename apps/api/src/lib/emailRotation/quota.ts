@@ -5,7 +5,7 @@ import { createLogger } from '../logger';
 const logger = createLogger('emailQuota');
 const emailSendRepository = new EmailSendRepository();
 
-export type EmailProviderName = 'brevo' | 'resend';
+export type EmailProviderName = 'brevo' | 'resend' | 'smtp';
 
 interface CapConfig {
   limit: string;
@@ -35,6 +35,8 @@ const PROVIDER_CAPS: Record<EmailProviderName, CapConfig[]> = {
     { limit: env.email.resend.dailyLimit, periodStart: dayStart },
     { limit: env.email.resend.monthlyLimit, periodStart: monthStart },
   ],
+  // Local SMTP sink (GreenMail/Mailpit) — no caps.
+  smtp: [],
 };
 
 function parseLimit(raw: string): number | null {

@@ -464,21 +464,28 @@ export class CommentRepository {
    * the controller via getActionContext before calling this.
    */
   async setBestAnswer(commentId: string, viewerId: string): Promise<CommentViewData | null> {
-    const target = await prisma.comment.findFirst({
-      where: { id: commentId, isDeleted: false },
-      select: { id: true, parentId: true },
-    });
-    if (!target) return null;
-    const rootId = target.parentId ?? target.id;
+    const set = await prisma.$transaction(async (tx) => {
+      // Re-read the target INSIDE the transaction — a soft-delete between a
+      // pre-check and here must resolve to a clean null (→ 404), not a
+      // P2025 from `update`.
+      const target = await tx.comment.findFirst({
+        where: { id: commentId, isDeleted: false },
+        select: { id: true, parentId: true },
+      });
+      if (!target) return false;
+      const rootId = target.parentId ?? target.id;
 
-    await prisma.$transaction([
-      prisma.comment.updateMany({
+      await tx.comment.updateMany({
         where: { OR: [{ id: rootId }, { parentId: rootId }], isDeleted: false, isBestAnswer: true },
         data: { isBestAnswer: false },
-      }),
-      prisma.comment.update({ where: { id: target.id }, data: { isBestAnswer: true } }),
-    ]);
-    return this.findView(commentId, viewerId);
+      });
+      await tx.comment.updateMany({
+        where: { id: target.id, isDeleted: false },
+        data: { isBestAnswer: true },
+      });
+      return true;
+    });
+    return set ? this.findView(commentId, viewerId) : null;
   }
 
   /** Content-author check for the VIEWER against the attached target (badge/moderation input). */

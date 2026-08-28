@@ -15,6 +15,7 @@ import {
   type CommentListPageData,
   type CommentSortMode,
   type CommentView,
+  type MentionCandidateData,
 } from '@/data/comments';
 import Composer from './Composer';
 import CommentItem from './CommentItem';
@@ -69,6 +70,20 @@ interface MeUser {
 
 type RepliesMap = Record<string, CommentView[]>;
 
+/**
+ * Unique commenters across a set of comments, as mention candidates —
+ * offered the moment someone types a bare "@" so tagging a person already
+ * in the thread takes no typing. The viewer is dropped (you don't @yourself).
+ */
+function participantsOf(comments: CommentView[], excludeUserId: string | null): MentionCandidateData[] {
+  const byId = new Map<string, MentionCandidateData>();
+  for (const c of comments) {
+    if (c.author.id === excludeUserId || byId.has(c.author.id)) continue;
+    byId.set(c.author.id, { id: c.author.id, username: c.author.username, fullName: c.author.fullName });
+  }
+  return [...byId.values()];
+}
+
 function sortForClient(comments: CommentView[], mode: CommentSortMode): CommentView[] {
   const sorted = [...comments];
   if (mode === 'chrono') {
@@ -107,6 +122,9 @@ export default function DiscussionSection({
   const [initialLoading, setInitialLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [composerError, setComposerError] = useState<string | null>(null);
+  // Threads start collapsed (replies hidden behind the parent's toggle);
+  // this map only records what the viewer has explicitly expanded.
+  const [expandedTops, setExpandedTops] = useState<Record<string, boolean>>({});
 
   const canModerate = viewerIsContentAuthor || me?.role === 'ADMIN';
 
@@ -249,6 +267,8 @@ export default function DiscussionSection({
       ...prev,
       [parentId]: sortForClient([...(prev[parentId] ?? []), reply], sort),
     }));
+    // The replier obviously wants to see their reply — expand the thread.
+    setExpandedTops((prev) => ({ ...prev, [parentId]: true }));
     setTops((prev) => prev.map((t) => (t.id === parentId ? { ...t, replyCount: (t.replyCount ?? 0) + 1 } : t)));
     return { error: null, reply };
   }
@@ -285,7 +305,12 @@ export default function DiscussionSection({
 
       {meLoaded && me && (
         <div className={styles.composerSlot}>
-          <Composer placeholder="Add to the discussion… — @mention classmates with the dropdown" submitLabel="Post Comment" onSubmit={handleSubmitTopLevel} />
+          <Composer
+            placeholder="Add to the discussion… — type @ to tag someone"
+            submitLabel="Post Comment"
+            participants={participantsOf([...tops, ...Object.values(replies).flat()], me.id)}
+            onSubmit={handleSubmitTopLevel}
+          />
         </div>
       )}
       {meLoaded && !me && (
@@ -301,47 +326,58 @@ export default function DiscussionSection({
       )}
 
       <div className={styles.threadList}>
-        {tops.map((top) => (
-          <div key={top.id} className={styles.thread}>
-            <CommentItem
-              comment={top}
-              isReply={false}
-              rootAuthorId={top.author.id}
-              me={me}
-              viewerCanModerate={canModerate}
-              badgeLabel={badgeLabel}
-              showBestAnswerUI={showBestAnswerUI}
-              onVoted={handleVoted}
-              onHelpful={handleHelpful}
-              onEdited={updateCommentEverywhere}
-              onDeleted={handleDeleted}
-              submitReply={handleSubmitReply}
-              onBestAnswerChanged={() => void load(sort)}
-            />
-            {(replies[top.id]?.length ?? 0) > 0 && (
-              <div className={styles.replyList}>
-                {(replies[top.id] ?? []).map((reply) => (
-                  <CommentItem
-                    key={reply.id}
-                    comment={reply}
-                    isReply
-                    rootAuthorId={top.author.id}
-                    me={me}
-                    viewerCanModerate={canModerate}
-                    badgeLabel={badgeLabel}
-                    showBestAnswerUI={showBestAnswerUI}
-                    onVoted={handleVoted}
-                    onHelpful={handleHelpful}
-                    onEdited={updateCommentEverywhere}
-                    onDeleted={handleDeleted}
-                    submitReply={handleSubmitReply}
-                    onBestAnswerChanged={() => void load(sort)}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
-        ))}
+        {tops.map((top) => {
+          const threadReplies = replies[top.id] ?? [];
+          const threadParticipants = participantsOf([top, ...threadReplies], me?.id ?? null);
+          return (
+            <div key={top.id} className={styles.thread}>
+              <CommentItem
+                comment={top}
+                isReply={false}
+                threadRootId={top.id}
+                rootAuthorId={top.author.id}
+                participants={threadParticipants}
+                me={me}
+                viewerCanModerate={canModerate}
+                badgeLabel={badgeLabel}
+                showBestAnswerUI={showBestAnswerUI}
+                onVoted={handleVoted}
+                onHelpful={handleHelpful}
+                onEdited={updateCommentEverywhere}
+                onDeleted={handleDeleted}
+                submitReply={handleSubmitReply}
+                onBestAnswerChanged={() => void load(sort)}
+                replyCount={Math.max(top.replyCount ?? 0, threadReplies.length)}
+                repliesCollapsed={!expandedTops[top.id]}
+                onToggleReplies={() => setExpandedTops((prev) => ({ ...prev, [top.id]: !prev[top.id] }))}
+              />
+              {expandedTops[top.id] && threadReplies.length > 0 && (
+                <div className={styles.replyList}>
+                  {threadReplies.map((reply) => (
+                    <CommentItem
+                      key={reply.id}
+                      comment={reply}
+                      isReply
+                      threadRootId={top.id}
+                      rootAuthorId={top.author.id}
+                      participants={threadParticipants}
+                      me={me}
+                      viewerCanModerate={canModerate}
+                      badgeLabel={badgeLabel}
+                      showBestAnswerUI={showBestAnswerUI}
+                      onVoted={handleVoted}
+                      onHelpful={handleHelpful}
+                      onEdited={updateCommentEverywhere}
+                      onDeleted={handleDeleted}
+                      submitReply={handleSubmitReply}
+                      onBestAnswerChanged={() => void load(sort)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
 
       {nextCursor !== null && !initialLoading && (

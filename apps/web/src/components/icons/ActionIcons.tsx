@@ -54,3 +54,39 @@ export const InfoIcon = base(
   // Material Symbols "info" glyph that was already rendering there.
   'M440-280h80v-240h-80v240Zm40-320q17 0 28.5-11.5T520-640q0-17-11.5-28.5T480-680q-17 0-28.5 11.5T440-640q0 17 11.5 28.5T480-600Zm0 520q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z',
 );
+
+export const ImageIcon = base(
+  // Material Symbols "image" — empty-state placeholder for logo/avatar
+  // uploaders (e.g. the company form's logo upload row).
+  'M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h560q33 0 56.5 23.5T840-760v560q0 33-23.5 56.5T760-120H200Zm0-80h560v-560H200v560Zm40-80h480L570-480 450-320l-90-120-120 220Zm100-240q25 0 42.5-17.5T400-580q0-25-17.5-42.5T340-640q-25 0-42.5 17.5T280-580q0 25 17.5 42.5T340-520ZM200-200v-560 560Z',
+);
+
+export const UploadIcon = base(
+  // Material Symbols "upload" — file-upload actions (e.g. company logo).
+  'M440-320h80v-326l116 116 56-58-192-192-192 192 56 58 116-116v326ZM240-160q-33 0-56.5-23.5T160-240v-80h80v80h480v-80h80v80q0 33-23.5 56.5T800-160H240Z',
+);
+
+export const ChevronDownIcon = base(
+  // Material Symbols "expand_more"
+  'M480-345 240-585l56-56 184 184 184-184 56 56-240 240Z',
+);
+
+export const ChevronRightIcon = base(
+  // Material Symbols "chevron_right"
+  'M504-480 320-664l56-56 240 240-240 240-56-56 184-184Z',
+);
+
+export const ReplyIcon = base(
+  // Material Symbols "reply"
+  'M760-200v-160q0-50-35-85t-85-35H280l144 144-56 56-240-240 240-240 56 56-144 144h360q83 0 141.5 58.5T860-360v160h-100Z',
+);
+
+export const ThumbUpIcon = base(
+  // Material Symbols "thumb_up"
+  'M720-560h120v320H720v-320Zm-440 480q-34 0-58-22t-30-54l-72-380q-4-21 10-38t35-17h195l97-204q7-15 21-24t30-9q19 0 33 13t14 33v10l-38 181h214q30 0 51 21t21 51v57q0 14-4 27t-11 25L880-249q-8 19-25 29t-37 10H280Zm0-80h120v-360H280v360Z',
+);
+
+export const CommentIcon = base(
+  // Material Symbols "comment" — speech bubble for reply-count toggles.
+  'M180-120q-24.75 0-42.375-17.625T120-180v-600q0-24.75 17.625-42.375T180-840h600q24.75 0 42.375 17.625T840-780v600q0 24.75-17.625 42.375T780-120H180Zm60-240h480v-60H240v60Zm0-110h480v-60H240v60Zm0-110h480v-60H240v60Z',
+);

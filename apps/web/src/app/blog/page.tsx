@@ -15,6 +15,8 @@ export interface PostSummary {
   description: string;
   publishedAt: string | null;
   coverImageUrl: string | null;
+  contentImage?: string | null;
+  commentCount?: number;
 }
 
 interface PublishedPostSummaryPage {
