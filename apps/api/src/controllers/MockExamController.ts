@@ -129,11 +129,8 @@ export class MockExamController extends Controller {
   // access-gated beyond that: seeing that an exam exists costs nothing;
   // the gate bites at start-attempt time for course-linked exams.
   //
-  // Unpaginated on purpose — the exam detail page ([slug]/page.tsx)
-  // resolves its exam by scanning this same full list rather than a
-  // separate by-id lookup, so this route's contract (bare array, every
-  // published exam) must stay stable. The /mock-tests list page uses the
-  // separate paginated `page` route below instead.
+  // Retain the unpaginated catalog contract for existing consumers. The
+  // detail page uses the single-slug route; the list page uses `page`.
   @Get()
   @Security('session')
   public async listPublished(): Promise<MockExamSummaryEntry[]> {
@@ -152,6 +149,19 @@ export class MockExamController extends Controller {
     const pageOffset = Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
     const { exams, total } = await mockExamRepository.listPublishedPage(pageSize, pageOffset);
     return { exams: exams.map(toSummaryEntry), total };
+  }
+
+  // Same summary visibility as the catalog: session + publication only.
+  // Course/preview/company restrictions still apply when starting an attempt.
+  @Get('{slug}')
+  @Security('session')
+  public async getPublishedBySlug(
+    @Path() slug: string,
+    @Res() notFound: TsoaResponse<404, void>,
+  ): Promise<MockExamSummaryEntry | void> {
+    const exam = await mockExamRepository.findPublishedBySlug(slug);
+    if (!exam) return notFound(404);
+    return toSummaryEntry(exam);
   }
 
   // Starts an attempt: freezes the random draw (easy -> medium -> hard) into

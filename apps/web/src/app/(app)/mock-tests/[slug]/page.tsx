@@ -6,15 +6,12 @@ import type { MockExamSummary } from '@/data/mockTests';
 import MockTestRunner from './MockTestRunner';
 import styles from '../styles.module.css';
 
-// The exam is resolved from the same GET /mock-exams list response the
-// index page uses (no separate by-id endpoint needed at this scale) — an
-// absent or unpublished slug simply notFounds.
+// Fetch only this exam's public summary; missing/unpublished slugs 404.
 async function fetchExam(slug: string): Promise<{ exam: MockExamSummary | null; unauthenticated: boolean }> {
-  const res = await serverApiFetch('/mock-exams');
+  const res = await serverApiFetch(`/mock-exams/${encodeURIComponent(slug)}`);
   if (res.status === 401) return { exam: null, unauthenticated: true };
   if (!res.ok) return { exam: null, unauthenticated: false };
-  const exams: MockExamSummary[] = await res.json();
-  return { exam: exams.find((exam) => exam.slug === slug) ?? null, unauthenticated: false };
+  return { exam: await res.json(), unauthenticated: false };
 }
 
 export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }): Promise<Metadata> {

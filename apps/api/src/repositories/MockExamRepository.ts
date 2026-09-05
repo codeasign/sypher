@@ -43,6 +43,10 @@ export class MockExamRepository {
     return prisma.mockExam.findFirst({ where: { id, isPublished: true } });
   }
 
+  async findPublishedBySlug(slug: string): Promise<MockExam | null> {
+    return prisma.mockExam.findFirst({ where: { slug, isPublished: true } });
+  }
+
   // Attempts on an already-started exam must keep working even if the exam
   // is since unpublished — same earned-record reasoning as bookmarks'
   // by-ids lookup. Only *starting* new attempts requires published state.
