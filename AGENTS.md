@@ -244,6 +244,13 @@ When debugging/verifying anything in a browser (Puppeteer or otherwise):
 4. If the server's node process gets killed during cleanup, restart it
    again with `npm run start` afterward — don't leave the site down.
 
+You are permitted to restart local dev servers yourself when needed (e.g.
+after a code change requires a restart to take effect, or a server hangs/
+crashes) — follow the existing port-check/kill/restart sequence already
+documented here. This does not require asking first, since it's a routine,
+reversible action, not an architectural decision under the Agent Autonomy
+Boundary section.
+
 ## Hard rules
 
 - Never hardcode API keys or secrets in any file
