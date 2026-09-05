@@ -5,7 +5,7 @@ Add Google reCAPTCHA v2 checkbox bot protection to Sign In, Sign Up, and Contact
 on https://next.sypher.local.
 
 ## Status
-Implementation complete and ready for review. No commit made.
+Complete and verified by the user. Committed as `1b159734`.
 
 ## Completed
 - Confirmed Sign In and Sign Up share apps/web/src/app/login/page.tsx;
@@ -22,6 +22,7 @@ Implementation complete and ready for review. No commit made.
   and a server secret are configured.
 - Added API and web environment examples without secrets.
 - Google OAuth and corporate login remain outside this requested scope.
+- User checked the Sign In, Sign Up, and Contact flows after deployment.
 
 ## Decisions
 - Use v2 checkbox as selected by user.
@@ -30,10 +31,6 @@ Implementation complete and ready for review. No commit made.
 - No schema, RLS, or database changes.
 
 ## Known Issues
-- No site key or secret is configured in the current local env, so the checkbox
-  is not rendered locally until NEXT_PUBLIC_RECAPTCHA_SITE_KEY is supplied.
-- Real Google token success/failure cannot be exercised without matching Google
-  keys and a registered domain.
 - Previous tasks: ESLint 9 flat config missing; Next build worker spawn EPERM.
 
 ## Tests/Validation
@@ -41,29 +38,19 @@ Implementation complete and ready for review. No commit made.
 - npx tsc --noEmit -p apps/web/tsconfig.json: passed.
 - Direct verifier test with RECAPTCHA_REQUIRED=true and no secret returned false
   for both missing and supplied test tokens (fail-closed).
+- User verified the rendered checkbox and protected submissions on all three
+  flows after configuring the Google site key and API secret.
 - git diff --check passed before this handoff update.
 - No credentials, database rows, schema, RLS, or authorization policy files
   changed.
 
 ## Files Modified
-- apps/api/.env.example
-- apps/api/src/controllers/AuthController.ts
-- apps/api/src/controllers/ContactController.ts
-- apps/api/src/lib/env.ts
-- apps/api/src/lib/recaptcha.ts
-- apps/web/.env.example
-- apps/web/src/app/login/page.tsx
-- apps/web/src/app/login/styles.module.css
-- apps/web/src/app/contact/ContactForm.tsx
-- apps/web/src/components/RecaptchaV2.tsx
-- apps/web/src/components/RecaptchaV2.module.css
-- memory-bank/current-task.md
+- None; implementation files are committed in `1b159734`.
+- memory-bank/current-task.md is updated by this handoff checkpoint.
 
 ## Next Action
-User configures NEXT_PUBLIC_RECAPTCHA_SITE_KEY in the web environment and
-RECAPTCHA_SECRET_KEY plus RECAPTCHA_REQUIRED=true in the API environment for
-the Google reCAPTCHA site/domain, restarts API/web servers, and reviews the
-uncommitted diff. Do not commit automatically.
+Await the next task. Do not change the completed reCAPTCHA integration unless a
+new issue is reported.
 
 ## Last Updated
 2026-09-05
