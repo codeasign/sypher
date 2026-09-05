@@ -104,9 +104,16 @@ export default function DashboardSidebar({ role, email, fullName, visibleKeys, i
             <ManageCoursesIcon className={styles.navIcon} />
             <span className={styles.navLabel}>My Courses</span>
           </Link>
-          <Link href="/mock-tests" className={isActive('/mock-tests') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}>
-            <MockTestIcon className={styles.navIcon} />
-            <span className={styles.navLabel}>Mock Test</span>
+          <Link
+            href="/mock-tests"
+            className={
+              isActive('/mock-tests')
+                ? `${styles.navItem} ${styles.navItemActive} ${styles.navItemWrap}`
+                : `${styles.navItem} ${styles.navItemWrap}`
+            }
+          >
+            <MockTestIcon className={`${styles.navIcon} ${styles.navIconWrap}`} />
+            <span className={`${styles.navLabel} ${styles.navLabelWrap}`}>Certification Practice Exam</span>
           </Link>
           <Link
             href="/getting-started"

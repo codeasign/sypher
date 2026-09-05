@@ -2,9 +2,21 @@
 // Course/CourseModule Postgres model. Scope and design decisions confirmed
 // with the user 2026-08-21/22 (see memory: sypher-next-docusaurus-importer):
 //
-// - Only the 14 courses whose diagram-manifests/summary.json entry has
-//   pending: 0 (excluding coding-bootcamp, which is also pending:0 but was
-//   explicitly held back), listed in TARGET_COURSES below.
+// - Only courses whose diagram-manifests/summary.json entry has pending: 0
+//   and hashMismatches: 0, listed in TARGET_COURSES below.
+// - 2026-09-05: extended to 6 more courses (sorting-algorithms,
+//   search-algorithms, solid-principles, design-patterns,
+//   git-github-actions, coding-bootcamp), all confirmed pending:0/
+//   hashMismatches:0 in summary.json. coding-bootcamp was previously held
+//   back deliberately (it depends on apps/docs's separate Judge0/Supabase
+//   auth stack for its interactive code-execution exercises, which this
+//   importer does not carry over — plain content only) — added to the
+//   allowlist per this session's request, but not yet actually imported;
+//   flag the Judge0 gap again before running it for real.
+//   solid-principles/design-patterns structurally spot-checked (per-language
+//   leaf docs under a DocCardList-stub category index, course-level index
+//   with <CourseCurriculum/>) — both match patterns this script already
+//   handles, no code changes needed for them.
 // - Every <AsciiDiagram> becomes a plain <img src="{bunnyUrl}" /> — the
 //   public reader (react-markdown + rehype-raw + rehype-sanitize) cannot
 //   render JSX component invocations at all, only raw HTML passed through
@@ -38,7 +50,7 @@
 //
 // Usage (from apps/api):
 //   npx tsx scripts/import-docusaurus-course.ts [slug ...]
-//   (no args = all 14 target courses)
+//   (no args = all 20 target courses)
 
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
@@ -65,6 +77,13 @@ const TARGET_COURSES = [
   'python-for-ai-engineers',
   'python-for-test-automation',
   'typescript-for-test-automation',
+  // Added 2026-09-05 (see header comment above):
+  'sorting-algorithms',
+  'search-algorithms',
+  'solid-principles',
+  'design-patterns',
+  'git-github-actions',
+  'coding-bootcamp',
 ];
 
 // The one diagram confirmed 2026-08-21 as local-.mmd-cache drift, not a
@@ -236,6 +255,7 @@ async function convertAsciiDiagrams(
     const id = extractAttr(tag.text, 'id');
     const mermaidSrc = extractAttr(tag.text, 'mermaidSrc');
     const alt = extractAttr(tag.text, 'alt') ?? '';
+    const caption = extractAttr(tag.text, 'caption');
 
     if (!id) throw new CourseImportError(`${docId}: <AsciiDiagram> tag has no id attribute`);
     if (!mermaidSrc) throw new CourseImportError(`${docId}: AsciiDiagram "${id}" has no mermaidSrc — not actually converted despite course being marked fully converted`);
@@ -263,7 +283,12 @@ async function convertAsciiDiagrams(
     const filename = path.basename(svgAbsPath);
     const pathPrefix = `svgs/${courseSlug}/${renderedModuleSlug(courseSlug, docId)}`;
     const bunnyUrl = await uploadBufferToBunny(svgBuffer, filename, pathPrefix, 'image/svg+xml');
-    replacements.push({ start: tag.start, end: tag.end, replacement: `<img src="${bunnyUrl}" alt="${escapeHtmlAttr(alt)}" />` });
+    // <figure>/<figcaption> aren't in the reader's rehype-sanitize allowlist
+    // (CourseModuleArticle.tsx extends defaultSchema with only 'u') — a
+    // plain italic paragraph is the closest allowed equivalent, so a
+    // caption survives instead of being silently dropped like before.
+    const captionHtml = caption ? `\n\n<p><em>${escapeHtmlAttr(caption)}</em></p>` : '';
+    replacements.push({ start: tag.start, end: tag.end, replacement: `<img src="${bunnyUrl}" alt="${escapeHtmlAttr(alt)}" />${captionHtml}` });
   }
 
   let out = '';
@@ -280,6 +305,18 @@ function stripKnownImports(body: string): string {
   return body.replace(/^import\s+.*from\s+['"]@(?:site|theme)\/.*['"];?\s*$/gm, '').replace(/^<CourseCurriculum\s*\/>\s*$/gm, '');
 }
 
+// The reader renders <h1>{module.title}</h1> itself (Course-Creation-
+// Guide.md's "no leading # H1" rule) — but that's a hand-authoring
+// convention, not something Docusaurus source respects. A doc whose body
+// leads with its own "# <title>" (common Docusaurus authoring habit,
+// usually restating the frontmatter title verbatim) would otherwise render
+// that heading twice. Only strips a genuine leading H1 (the very first
+// line of the trimmed body), never a "# " that happens to appear inside a
+// code fence further down.
+function stripLeadingH1(body: string): string {
+  return body.replace(/^#\s+.+(?:\r?\n)*/, '');
+}
+
 async function loadCourseOverview(
   courseSlug: string,
   docIdIndex: Map<string, string>,
@@ -291,7 +328,7 @@ async function loadCourseOverview(
   const { data, content } = matter(raw);
   const title = (data.title as string | undefined) ?? courseSlug;
 
-  let body = stripKnownImports(content).trim();
+  let body = stripLeadingH1(stripKnownImports(content).trim()).trim();
   body = await convertAsciiDiagrams(body, courseSlug, `${courseSlug}/index`, manifest, log);
 
   const firstParagraph = body.split(/\n\s*\n/).find((block) => block.trim() && !block.trim().startsWith('#')) ?? '';
@@ -379,7 +416,7 @@ async function importCourse(courseSlug: string): Promise<void> {
     }
 
     const title = (data.title as string | undefined) ?? path.basename(leaf.docId);
-    let body = stripKnownImports(content).trim();
+    let body = stripLeadingH1(stripKnownImports(content).trim()).trim();
     body = await convertAsciiDiagrams(body, courseSlug, leaf.docId, manifest, log);
 
     const slugSegment = leaf.docId

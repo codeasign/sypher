@@ -31,7 +31,7 @@ export default async function MockTestDetailPage({ params }: { params: Promise<{
     <div className={styles.page}>
       <div className={styles.container}>
         <Link href="/mock-tests" className={styles.backLink}>
-          ← Mock Test
+          ← Certification Practice Exams
         </Link>
         <MockTestRunner exam={{ ...exam }} />
       </div>

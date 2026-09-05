@@ -4,6 +4,7 @@ import React, { useRef, useState, isValidElement } from 'react';
 import { Highlight, themes } from 'prism-react-renderer';
 import clsx from 'clsx';
 import { useColorMode } from '@/hooks/useColorMode';
+import '@/lib/prismLanguages';
 import styles from './styles.module.css';
 
 // apps/web has no MUI (apps/app does) — plain inline SVGs instead of
@@ -48,9 +49,28 @@ export default function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>): 
     setTimeout(() => setCopied(false), 2000);
   }
 
-  // Matches apps/app's CodeBlock exactly — same theme pair, same mapping.
+  // Switched from the github/dracula pair (originally matching apps/app's
+  // CodeBlock) to vsLight/vsDark -- github's light theme is subtle enough
+  // to read as "unstyled" at a glance; VS Code's colors are unambiguous
+  // and recognizable in both modes. apps/app is being retired, so cross-app
+  // parity there no longer outweighs this app's own readability.
   const { colorMode } = useColorMode();
-  const theme = colorMode === 'dark' ? themes.dracula : themes.github;
+  const baseTheme = colorMode === 'dark' ? themes.vsDark : themes.vsLight;
+  // vsLight's own background is #ffffff -- identical to the course-reader
+  // card's --ifm-background-surface-color, so the block had zero visual
+  // separation from the page around it (user report 2026-09-06: "add
+  // background color to differentiate the codeblocks in light and dark
+  // theme" -- vsDark's #1E1E1E vs the card's dark surface #17171b was
+  // barely better). --ifm-color-emphasis-50 is this app's existing
+  // "sunken surface" token (already used for table zebra-striping etc.) --
+  // reusing it here keeps the block visibly inset from the card in BOTH
+  // themes without inventing a new hardcoded color, and it stays
+  // theme-aware automatically. Only `plain.backgroundColor` is overridden;
+  // every syntax-token color from the base theme is untouched.
+  const theme = {
+    ...baseTheme,
+    plain: { ...baseTheme.plain, backgroundColor: 'var(--ifm-color-emphasis-50)' },
+  };
 
   return (
     <div className={styles.codeBlockWrapper}>

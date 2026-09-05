@@ -6,7 +6,7 @@ import type { UserDashboard } from '@/data/dashboard';
 
 export const metadata: Metadata = {
   title: 'Dashboard',
-  description: 'Your learning progress, streaks, mock-exam scores, and what to pick up next.',
+  description: 'Your learning progress, streaks, certification practice exam scores, and what to pick up next.',
 };
 
 interface AuthUser {

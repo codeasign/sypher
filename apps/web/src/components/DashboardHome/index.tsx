@@ -67,7 +67,7 @@ export default function DashboardHome({ data, userEmail, fullName, completions }
     { value: fmtNum(learning.coursesInProgress), label: 'Courses in progress' },
     { value: fmtNum(learning.coursesCompleted), label: 'Courses completed' },
     { value: `${learning.currentStreakDays}`, label: 'Day streak', hint: `Best ${learning.longestStreakDays}` },
-    { value: exams.bestScore === null ? '—' : `${exams.bestScore}%`, label: 'Best mock score', hint: exams.completedAttempts ? `${exams.completedAttempts} taken` : undefined },
+    { value: exams.bestScore === null ? '—' : `${exams.bestScore}%`, label: 'Best exam score', hint: exams.completedAttempts ? `${exams.completedAttempts} taken` : undefined },
     { value: fmtNum(community.upvotesReceived), label: 'Upvotes received' },
   ].map((t, i) => ({ ...t, accent: TILE_ACCENTS[i % TILE_ACCENTS.length] }));
 
@@ -97,7 +97,7 @@ export default function DashboardHome({ data, userEmail, fullName, completions }
             </h2>
             <p className={styles.bandText}>
               You can fully take {access.accessibleCourses} of {access.totalCourses} courses today. Pro opens everything —
-              every course, every mock exam, and your completion certificates.
+              every course, every certification practice exam, and your completion certificates.
             </p>
             {upgrade.highlightedLockedCourses.length > 0 && (
               <div className={styles.bandChips}>
@@ -114,7 +114,7 @@ export default function DashboardHome({ data, userEmail, fullName, completions }
               </button>
               <span className={styles.bandProof}>
                 Join {fmtNum(platform.learners)} learners · {platform.courses} courses · {fmtNum(platform.modules)} lessons ·{' '}
-                {platform.mockExams} mock exams
+                {platform.mockExams} certification practice exams
               </span>
             </div>
             {errorMessage && <p className={styles.bandError}>{errorMessage}</p>}
@@ -147,7 +147,7 @@ export default function DashboardHome({ data, userEmail, fullName, completions }
                 Browse courses
               </Link>
               <span className={styles.bandProof}>
-                {platform.courses} courses · {fmtNum(platform.modules)} lessons · {platform.mockExams} mock exams
+                {platform.courses} courses · {fmtNum(platform.modules)} lessons · {platform.mockExams} certification practice exams
               </span>
             </div>
           </div>
@@ -189,20 +189,20 @@ export default function DashboardHome({ data, userEmail, fullName, completions }
 
         <article className={styles.card}>
           <div className={styles.cardHead}>
-            <h3 className={styles.cardTitle}>Mock exam scores</h3>
+            <h3 className={styles.cardTitle}>Certification practice exam scores</h3>
             <span className={styles.cardSub}>{exams.averageScore !== null ? `Avg ${exams.averageScore}% · pass ${exams.passRate}%` : 'No attempts yet'}</span>
           </div>
           {exams.trend.length >= 2 ? (
             <TrendArea
               points={exams.trend.map((p) => ({ label: p.label, value: p.score }))}
-              ariaLabel="Mock exam score trend"
+              ariaLabel="Certification practice exam score trend"
               accent={EXAM_ACCENT}
             />
           ) : (
             <div className={styles.chartEmpty}>
-              <p>Take a timed mock exam to start tracking your scores.</p>
+              <p>Take a timed certification practice exam to start tracking your scores.</p>
               <Link href="/mock-tests" className={styles.chartEmptyLink}>
-                Go to Mock Tests
+                Go to Certification Practice Exams
               </Link>
             </div>
           )}

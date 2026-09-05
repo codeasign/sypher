@@ -2,12 +2,37 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import Link from 'next/link';
+import Image from 'next/image';
 import { startMockAttempt, submitMockAttempt, type MockExamSummary, type MockTestQuestionView, type MockTestResultResponse } from '@/data/mockTests';
 import { LogoutMenuIcon, TimerIcon } from '@/components/icons/ActionIcons';
+import MiniBars from '@/components/charts/MiniBars';
+import RankedBars from '@/components/charts/RankedBars';
+import SegmentedRing from '@/components/charts/SegmentedRing';
 import styles from './styles.module.css';
 
+// Fixed-order categorical hues (identity, never status) -- see the chart
+// tokens in globals.css and the dataviz skill's palette check. Row/bar order
+// picks the slot; never reassigned when the underlying list is filtered.
+const CHART_SERIES = [
+  'var(--chart-series-1)',
+  'var(--chart-series-2)',
+  'var(--chart-series-3)',
+  'var(--chart-series-4)',
+  'var(--chart-series-5)',
+  'var(--chart-series-6)',
+  'var(--chart-series-7)',
+  'var(--chart-series-8)',
+];
+function seriesColor(index: number): string {
+  return CHART_SERIES[index % CHART_SERIES.length];
+}
+
+function capitalize(word: string): string {
+  return word.length > 0 ? word.charAt(0).toUpperCase() + word.slice(1) : word;
+}
+
 type Phase = 'idle' | 'active' | 'results';
+type ReviewFilter = 'correct' | 'incorrect' | 'unanswered';
 
 interface ActiveState {
   attemptId: string;
@@ -88,16 +113,6 @@ function aggregateResults(result: MockTestResultResponse): {
   return { correct, wrong, unanswered, byDifficulty, byDomain };
 }
 
-// One stacked segment list shared by the composition and difficulty bars —
-// zero-count series drop out so the 2px surface gaps stay meaningful.
-function stackedSegments(row: { correct: number; wrong: number; unanswered: number }): { key: string; count: number }[] {
-  return [
-    { key: 'correct', count: row.correct },
-    { key: 'wrong', count: row.wrong },
-    { key: 'unanswered', count: row.unanswered },
-  ].filter((segment) => segment.count > 0);
-}
-
 export default function MockTestRunner({ exam }: { exam: MockExamSummary }): React.JSX.Element {
   const [phase, setPhase] = useState<Phase>('idle');
   const [active, setActive] = useState<ActiveState | null>(null);
@@ -110,6 +125,7 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
   const [confirmingSubmit, setConfirmingSubmit] = useState(false);
   const [confirmingExit, setConfirmingExit] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [reviewFilter, setReviewFilter] = useState<ReviewFilter>('correct');
 
   const autoSubmittedRef = useRef(false);
 
@@ -178,13 +194,14 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
       clearCachedResult();
       const { error: startError, start } = await startMockAttempt(exam.id);
       if (startError || !start) {
-        setError(startError ?? 'Could not start the mock test.');
+        setError(startError ?? 'Could not start the certification practice exam.');
         return;
       }
       autoSubmittedRef.current = false;
       setSelections({});
       setCurrentIndex(0);
       setConfirmingExit(false);
+      setReviewFilter('correct');
       setActive({
         attemptId: start.attemptId,
         startedAtMs: new Date(start.startedAt).getTime(),
@@ -231,186 +248,187 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
   if (phase === 'results' && result) {
     const passed = result.score >= 60;
     const agg = aggregateResults(result);
-    const timeTakenMin = (() => {
-      const ms = new Date(result.submittedAt).getTime() - new Date(result.startedAt).getTime();
-      return Number.isFinite(ms) && ms > 0 ? Math.max(1, Math.round(ms / 60000)) : null;
-    })();
-    const orderedQuestions = [...result.questions].sort(
-      (a, b) => (DIFFICULTY_ORDER[a.difficulty] ?? 9) - (DIFFICULTY_ORDER[b.difficulty] ?? 9),
-    );
+    const orderedQuestions = [...result.questions]
+      .sort((a, b) => (DIFFICULTY_ORDER[a.difficulty] ?? 9) - (DIFFICULTY_ORDER[b.difficulty] ?? 9))
+      .map((q, i) => ({ ...q, displayNumber: i + 1 })); // stable numbering, independent of the active filter
+    const filteredQuestions = orderedQuestions.filter((q) => {
+      if (reviewFilter === 'correct') return q.isCorrect;
+      if (reviewFilter === 'incorrect') return !q.isCorrect && q.selectedAnswer !== null;
+      return q.selectedAnswer === null; // 'unanswered'
+    });
     return (
       <div className={styles.runner}>
-        <div className={styles.scoreCard}>
-          <p className={styles.scoreLabel}>Your score</p>
-          <p className={`${styles.scoreValue} ${passed ? styles.scoreGood : styles.scoreLow}`}>
-            {result.score}%
-          </p>
-          <p className={styles.scoreDetail}>
-            {result.correctCount} of {result.totalQuestions} correct · {result.examTitle}
-          </p>
-        </div>
-
-        <div className={styles.tileRow}>
-          <div className={styles.statTile}>
-            <span className={styles.tileValue}>{agg.correct}</span>
-            <span className={styles.tileLabel}>
-              <span className={`${styles.swatch} ${styles.swatchCorrect}`} /> Correct
-            </span>
-          </div>
-          <div className={styles.statTile}>
-            <span className={styles.tileValue}>{agg.wrong}</span>
-            <span className={styles.tileLabel}>
-              <span className={`${styles.swatch} ${styles.swatchWrong}`} /> Wrong
-            </span>
-          </div>
-          <div className={styles.statTile}>
-            <span className={styles.tileValue}>{agg.unanswered}</span>
-            <span className={styles.tileLabel}>
-              <span className={`${styles.swatch} ${styles.swatchUnanswered}`} /> Unanswered
-            </span>
-          </div>
-          <div className={styles.statTile}>
-            <span className={styles.tileValue}>{timeTakenMin !== null ? `${timeTakenMin} min` : '—'}</span>
-            <span className={styles.tileLabelPlain}>Time taken</span>
-          </div>
-        </div>
-
-        <div className={styles.chartCard}>
-          <h2 className={styles.sectionHeading}>Score composition</h2>
-          <div
-            className={styles.stackBar}
-            role="img"
-            aria-label={`Correct ${agg.correct}, wrong ${agg.wrong}, unanswered ${agg.unanswered} of ${result.totalQuestions}`}
-          >
-            {stackedSegments(agg).map((segment, index, all) => (
-              <div
-                key={segment.key}
-                className={`${styles.segment} ${styles[`seg${segment.key.charAt(0).toUpperCase()}${segment.key.slice(1)}`]}`}
-                style={{
-                  width: `${(segment.count / result.totalQuestions) * 100}%`,
-                  ...(index === all.length - 1 ? { borderRadius: '0 4px 4px 0' } : {}),
-                }}
-                title={`${segment.key}: ${segment.count}`}
-              />
-            ))}
-          </div>
-          <div className={styles.legendRow}>
-            <span className={styles.legendItem}>
-              <span className={`${styles.swatch} ${styles.swatchCorrect}`} /> Correct ({agg.correct})
-            </span>
-            <span className={styles.legendItem}>
-              <span className={`${styles.swatch} ${styles.swatchWrong}`} /> Wrong ({agg.wrong})
-            </span>
-            <span className={styles.legendItem}>
-              <span className={`${styles.swatch} ${styles.swatchUnanswered}`} /> Unanswered ({agg.unanswered})
-            </span>
-          </div>
-        </div>
-
-        <div className={styles.chartCard}>
-          <h2 className={styles.sectionHeading}>Performance by difficulty</h2>
-          <div className={styles.rowChartList}>
-            {agg.byDifficulty.map((row) => {
-              const segments = stackedSegments(row);
-              return (
-                <div key={row.difficulty} className={styles.rowChart}>
-                  <span className={styles.rowLabel}>{row.difficulty}</span>
-                  <div
-                    className={styles.stackBar}
-                    role="img"
-                    aria-label={`${row.difficulty}: ${row.correct} correct, ${row.wrong} wrong, ${row.unanswered} unanswered`}
-                  >
-                    {segments.map((segment, index, all) => (
-                      <div
-                        key={segment.key}
-                        className={`${styles.segment} ${styles[`seg${segment.key.charAt(0).toUpperCase()}${segment.key.slice(1)}`]}`}
-                        style={{
-                          width: `${(segment.count / row.total) * 100}%`,
-                          ...(index === all.length - 1 ? { borderRadius: '0 4px 4px 0' } : {}),
-                        }}
-                        title={`${segment.key}: ${segment.count}`}
-                      />
-                    ))}
-                  </div>
-                  <span className={styles.rowValue}>
-                    {Math.round((row.correct / row.total) * 100)}% · {row.total} Qs
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {agg.byDomain.length > 0 && (
-          <div className={styles.chartCard}>
-            <h2 className={styles.sectionHeading}>Performance by domain</h2>
-            <div className={styles.rowChartList}>
-              {agg.byDomain.map((row) => (
-                <div key={row.domain} className={styles.rowChart} title={`${row.domain}: ${row.correct}/${row.total}`}>
-                  <span className={styles.rowLabel} title={row.domain}>
-                    {row.domain}
-                  </span>
-                  <div className={styles.trackBar} role="img" aria-label={`${row.domain}: ${row.percent}% correct`}>
-                    <div className={styles.fillBar} style={{ width: `${row.percent}%` }} />
-                  </div>
-                  <span className={styles.rowValue}>{row.percent}%</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        <h2 className={styles.sectionHeading}>Review</h2>
-        <ol className={styles.reviewList}>
-          {orderedQuestions.map((question, index) => (
-            <li key={question.id} className={styles.reviewCard}>
-              <div className={styles.questionMeta}>
-                <span className={styles.domainTag}>{question.domain}</span>
-                <span className={styles.difficultyTag}>{question.difficulty}</span>
-                <span className={question.isCorrect ? styles.verdictRight : styles.verdictWrong}>
-                  {question.isCorrect ? 'Correct' : 'Incorrect'}
-                </span>
-              </div>
-              <p className={styles.questionText}>
-                {index + 1}. {question.question}
-              </p>
-              <ul className={styles.optionList}>
-                {Object.entries(question.options).map(([key, text]) => {
-                  const isSelected = question.selectedAnswer?.includes(key) ?? false;
-                  const isCorrectKey = question.correctAnswer.includes(key);
-                  const cls = isCorrectKey
-                    ? `${styles.optionRow} ${styles.optionCorrect}`
-                    : isSelected
-                      ? `${styles.optionRow} ${styles.optionWrong}`
-                      : styles.optionRow;
-                  return (
-                    <li key={key} className={cls}>
-                      <span className={styles.optionKey}>{key}.</span> {text}
-                    </li>
-                  );
-                })}
-              </ul>
-              {question.explanation && <p className={styles.explanation}>{question.explanation}</p>}
-            </li>
-          ))}
-        </ol>
-
         <div className={styles.resultsActions}>
+          <p className={styles.resultsNote}>These results reflect your most recent attempt. You may retake the exam at any time.</p>
           <button
             type="button"
-            className={styles.primaryButton}
+            className={`${styles.primaryButton} ${styles.retakeButton}`}
             onClick={() => {
               clearCachedResult();
               setResult(null);
               setPhase('idle');
             }}
           >
-            Retake this test
+            Retake this exam
           </button>
-          <Link href="/mock-tests" className={styles.secondaryLink} onClick={clearCachedResult}>
-            Back to all mock tests
-          </Link>
         </div>
+
+        <div className={styles.chartsSection}>
+          <h2 className={styles.sectionHeading}>Results view</h2>
+          <div className={styles.chartsRow}>
+            <div className={styles.chartCard}>
+              <div className={styles.examHeaderRow}>
+                {exam.logoUrl ? (
+                  <span className={styles.examLogo}>
+                    <Image src={exam.logoUrl} alt="" width={32} height={32} unoptimized />
+                  </span>
+                ) : (
+                  <span className={styles.examLogoFallback} aria-hidden="true">
+                    {exam.examCode.slice(0, 2).toUpperCase()}
+                  </span>
+                )}
+                <span className={styles.examName}>{exam.title}</span>
+              </div>
+              <div className={styles.compositionRow}>
+                <div className={styles.ringGroup}>
+                  <SegmentedRing
+                    variant="donut"
+                    labelPosition="inside"
+                    segments={[
+                      { key: 'correct', value: agg.correct, color: 'var(--status-success-bg)' },
+                      { key: 'wrong', value: agg.wrong, color: 'var(--status-danger-bg)' },
+                      { key: 'unanswered', value: agg.unanswered, color: 'var(--status-info-bg)' },
+                    ]}
+                    total={result.totalQuestions}
+                    ariaLabel={`Correct ${agg.correct}, wrong ${agg.wrong}, unanswered ${agg.unanswered} of ${result.totalQuestions}`}
+                  />
+                  <p className={styles.ringHint}>Breakdown of your answers</p>
+                </div>
+                <div className={styles.legendRow}>
+                  <span className={styles.legendItem}>
+                    <span className={`${styles.swatch} ${styles.swatchCorrect}`} /> Correct
+                  </span>
+                  <span className={styles.legendItem}>
+                    <span className={`${styles.swatch} ${styles.swatchWrong}`} /> Wrong
+                  </span>
+                  <span className={styles.legendItem}>
+                    <span className={`${styles.swatch} ${styles.swatchUnanswered}`} /> Unanswered
+                  </span>
+                </div>
+                <div className={`${styles.marksBlock} ${passed ? styles.marksBlockPass : styles.marksBlockFail}`}>
+                  <span className={styles.marksLabel}>Marks</span>
+                  <span className={styles.marksFraction}>
+                    <span className={styles.marksNumerator}>{result.correctCount}</span>
+                    <span className={styles.marksSlash}>/</span>
+                    <span className={styles.marksDenominator}>{result.totalQuestions}</span>
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className={styles.chartCard}>
+              <h2 className={styles.sectionHeading}>Performance by difficulty</h2>
+              <MiniBars
+                data={agg.byDifficulty.map((row, index) => ({
+                  label: capitalize(row.difficulty),
+                  value: Math.round((row.correct / row.total) * 100),
+                  color: seriesColor(index),
+                }))}
+                labelEvery={1}
+                tickColor="var(--chart-strong-text)"
+                ariaLabel="Percent correct by question difficulty"
+              />
+              <div className={styles.legendRow}>
+                {agg.byDifficulty.map((row, index) => (
+                  <span key={row.difficulty} className={styles.legendItem}>
+                    <span className={styles.swatch} style={{ background: seriesColor(index) }} /> {capitalize(row.difficulty)} ({row.total} Qs)
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {agg.byDomain.length > 0 && (
+              <div className={styles.chartCard}>
+                <h2 className={styles.sectionHeading}>Performance by domain</h2>
+                <RankedBars
+                  data={agg.byDomain.map((row, index) => ({
+                    label: row.domain,
+                    value: row.percent,
+                    color: seriesColor(index),
+                  }))}
+                  ariaLabel="Percent correct by exam domain"
+                />
+              </div>
+            )}
+          </div>
+        </div>
+
+        <h2 className={styles.sectionHeading}>Review</h2>
+        <div className={styles.tabs} role="tablist" aria-label="Filter review by answer">
+          {(
+            [
+              ['correct', 'Correct', agg.correct],
+              ['incorrect', 'Incorrect', agg.wrong],
+              ['unanswered', 'Unattempted', agg.unanswered],
+            ] as [ReviewFilter, string, number][]
+          ).map(([key, label, count]) => (
+            <button
+              key={key}
+              type="button"
+              role="tab"
+              aria-selected={reviewFilter === key}
+              className={`${styles.tab} ${reviewFilter === key ? `${styles.tabActive} ${styles[`tabActive${capitalize(key)}`] ?? ''}` : ''}`}
+              onClick={() => setReviewFilter(key)}
+            >
+              {label} <span className={styles.tabCount}>{count}</span>
+            </button>
+          ))}
+        </div>
+        {filteredQuestions.length === 0 ? (
+          <p className={styles.reviewEmpty}>No questions in this category.</p>
+        ) : (
+          <ol className={styles.reviewList}>
+            {filteredQuestions.map((question) => (
+              <li key={question.id} className={styles.reviewCard}>
+                <div className={styles.questionMeta}>
+                  <span className={styles.domainTag}>{question.domain}</span>
+                  <span className={styles.difficultyTag}>{question.difficulty}</span>
+                  <span
+                    className={
+                      question.selectedAnswer === null
+                        ? styles.verdictNeutral
+                        : question.isCorrect
+                          ? styles.verdictRight
+                          : styles.verdictWrong
+                    }
+                  >
+                    {question.selectedAnswer === null ? 'Unattempted' : question.isCorrect ? 'Correct' : 'Incorrect'}
+                  </span>
+                </div>
+                <p className={styles.questionText}>
+                  {question.displayNumber}. {question.question}
+                </p>
+                <ul className={styles.optionList}>
+                  {Object.entries(question.options).map(([key, text]) => {
+                    const isSelected = question.selectedAnswer?.includes(key) ?? false;
+                    const isCorrectKey = question.correctAnswer.includes(key);
+                    const cls = isCorrectKey
+                      ? `${styles.optionRow} ${styles.optionCorrect}`
+                      : isSelected
+                        ? `${styles.optionRow} ${styles.optionWrong}`
+                        : styles.optionRow;
+                    return (
+                      <li key={key} className={cls}>
+                        <span className={styles.optionKey}>{key}.</span> {text}
+                      </li>
+                    );
+                  })}
+                </ul>
+                {question.explanation && <p className={styles.explanation}>{question.explanation}</p>}
+              </li>
+            ))}
+          </ol>
+        )}
       </div>
     );
   }
@@ -459,7 +477,7 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
             ) : (
               <button type="button" className={styles.exitButton} onClick={() => setConfirmingExit(true)} disabled={submitting}>
                 <LogoutMenuIcon className={styles.controlIcon} />
-                <span>Exit test</span>
+                <span>Exit exam</span>
               </button>
             )}
           </div>
@@ -550,7 +568,7 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
             </span>
           ) : (
             <button type="button" className={styles.dangerButton} onClick={() => setConfirmingSubmit(true)} disabled={submitting}>
-              Submit test
+              Submit exam
             </button>
           )}
         </div>
@@ -566,7 +584,18 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
   // idle
   return (
     <div className={styles.runner}>
-      <h1 className={styles.examTitle}>{exam.title}</h1>
+      <div className={styles.examHeaderRow}>
+        {exam.logoUrl ? (
+          <span className={styles.examLogo}>
+            <Image src={exam.logoUrl} alt="" width={32} height={32} unoptimized />
+          </span>
+        ) : (
+          <span className={styles.examLogoFallback} aria-hidden="true">
+            {exam.examCode.slice(0, 2).toUpperCase()}
+          </span>
+        )}
+        <h1 className={styles.examTitle}>{exam.title}</h1>
+      </div>
       <div className={styles.rulesCard}>
         <h2 className={styles.sectionHeading}>How this works</h2>
         <ul className={styles.ruleList}>
@@ -579,13 +608,13 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
             questions are available.
           </li>
           <li>The timer starts as soon as you press Start and cannot be paused.</li>
-          <li>Refreshing or closing the tab abandons the attempt — tests never resume mid-way.</li>
+          <li>Refreshing or closing the tab abandons the attempt — exams never resume mid-way.</li>
           <li>Your score and full answer review appear only after you submit.</li>
           <li>Retake it as many times as you like — every attempt draws a fresh random question set.</li>
         </ul>
         <div className={styles.startRow}>
           <button type="button" className={styles.primaryButton} onClick={() => void startExam()} disabled={starting}>
-            {starting ? 'Preparing your test…' : 'Start test'}
+            {starting ? 'Preparing your exam…' : 'Start exam'}
           </button>
         </div>
         {error && <p className={styles.errorText}>{error}</p>}

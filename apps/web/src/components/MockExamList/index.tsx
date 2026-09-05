@@ -92,7 +92,7 @@ export default function MockExamList({
   });
 
   if (liveTotal === 0) {
-    return <p className={styles.emptyText}>No mock tests available yet — check back soon.</p>;
+    return <p className={styles.emptyText}>No certification practice exams available yet — check back soon.</p>;
   }
 
   const groups = groupByRole(exams);
@@ -102,11 +102,11 @@ export default function MockExamList({
       <ListViewToolbar
         shown={exams.length}
         total={liveTotal}
-        itemLabelSingular="mock test"
-        itemLabelPlural="mock tests"
+        itemLabelSingular="certification practice exam"
+        itemLabelPlural="certification practice exams"
         viewMode={viewMode}
         onChangeView={setViewMode}
-        ariaLabel="Mock test display"
+        ariaLabel="Certification practice exam display"
         showCount={false}
       />
 

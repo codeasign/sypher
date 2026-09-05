@@ -6,8 +6,8 @@ import MockExamList from '@/components/MockExamList';
 import styles from './styles.module.css';
 
 export const metadata: Metadata = {
-  title: 'Mock Test',
-  description: 'Timed mock exams that mirror the real certification experience.',
+  title: 'Certification Practice Exam',
+  description: 'Timed certification practice exams that mirror the real certification experience.',
 };
 
 interface MockExamSummaryPage {

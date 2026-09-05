@@ -841,6 +841,7 @@ apps/app/
 | Verify with a FREE_USER account | Only verify with admin |
 | Create Course + Overview + Setup first | Skip the prerequisite creation step |
 | Set access control before publishing | Publish before setting access grants |
+| Wrap identifiers in backticks in prose (`` `calculateTotal` ``, `` `taxRate` `` — [GitHub basic formatting syntax](https://docs.github.com/en/get-started/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax)) | Write function/variable/class names as plain prose text (`calculateTotal`, `taxRate`) |
 
 ### Claude Code Commands
 

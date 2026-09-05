@@ -1,7 +1,9 @@
 import styles from './charts.module.css';
 
 interface MiniBarsProps {
-  data: { label: string; value: number }[];
+  /** Per-bar `color` overrides the shared accent -- for categorical series
+      (distinct identity per bar) rather than one accent for all bars. */
+  data: { label: string; value: number; color?: string }[];
   /** SVG height in px (width is fluid via viewBox). */
   height?: number;
   ariaLabel: string;
@@ -9,6 +11,8 @@ interface MiniBarsProps {
   labelEvery?: number;
   /** Bar colour (any CSS colour). Defaults to the theme primary. */
   accent?: string;
+  /** Axis label text colour. Defaults to the shared muted tick color. */
+  tickColor?: string;
 }
 
 /**
@@ -17,7 +21,7 @@ interface MiniBarsProps {
  * `--chart-accent` CSS var (set via the `accent` prop) so it follows the
  * theme by default.
  */
-export default function MiniBars({ data, height = 140, ariaLabel, labelEvery, accent }: MiniBarsProps): React.JSX.Element {
+export default function MiniBars({ data, height = 140, ariaLabel, labelEvery, accent, tickColor }: MiniBarsProps): React.JSX.Element {
   const width = 320;
   const pad = { top: 8, right: 4, bottom: 18, left: 4 };
   const innerW = width - pad.left - pad.right;
@@ -42,11 +46,25 @@ export default function MiniBars({ data, height = 140, ariaLabel, labelEvery, ac
         const showLabel = labelEvery ? i % labelEvery === 0 : i === 0 || i === data.length - 1;
         return (
           <g key={i}>
-            <rect x={x} y={y} width={barW} height={h} rx={2} className={styles.bar}>
+            <rect
+              x={x}
+              y={y}
+              width={barW}
+              height={h}
+              rx={2}
+              className={styles.bar}
+              style={d.color ? { fill: d.color } : undefined}
+            >
               <title>{`${d.label}: ${d.value}`}</title>
             </rect>
             {showLabel && (
-              <text x={pad.left + i * slot + slot / 2} y={height - 4} className={styles.tick} textAnchor="middle">
+              <text
+                x={pad.left + i * slot + slot / 2}
+                y={height - 4}
+                className={styles.tick}
+                textAnchor="middle"
+                style={tickColor ? { fill: tickColor } : undefined}
+              >
                 {d.label}
               </text>
             )}
