@@ -2,6 +2,8 @@ import { prisma } from '../lib/prisma';
 import type { CourseModule } from '@prisma/client';
 import { slugify, findAvailableSlug } from '../lib/slug';
 
+export type CourseModuleSummary = Omit<CourseModule, 'bodyMdx'>;
+
 export interface CreateCourseModuleInput {
   title: string;
   bodyMdx?: string;
@@ -61,6 +63,14 @@ async function nextSparseGettingStartedOrder(): Promise<number> {
 }
 
 export class CourseModuleRepository {
+  async listMetadataForCourse(courseId: string): Promise<CourseModuleSummary[]> {
+    return prisma.courseModule.findMany({
+      where: { courseId },
+      orderBy: { orderIndex: 'asc' },
+      omit: { bodyMdx: true },
+    });
+  }
+
   async listForCourse(courseId: string): Promise<CourseModule[]> {
     return prisma.courseModule.findMany({ where: { courseId }, orderBy: { orderIndex: 'asc' } });
   }

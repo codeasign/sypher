@@ -1,92 +1,98 @@
 # Current Task Handoff
 
 ## Objective
-Set up reliable handoff between Claude Code and OpenAI Codex working
-interchangeably on this repo, including automatic handoff-state updates
-when context usage gets high (compaction) or a usage limit is hit.
+Fix course-card navigation performance by removing lesson bodies from module
+lists, fetching one lesson body at a time, parallelizing independent reads,
+and adding loading/error feedback. Certifications are a separate investigation
+and remain on hold.
 
 ## Status
-Closed. All handoff scaffolding is committed:
-- `dc80bf69` — AGENTS.md, restructured CLAUDE.md, this file, PreCompact
-  hook script.
-- `77613402` — registered the PreCompact hook in `.claude/settings.json`.
-One small cleanup is staged in the working tree, not yet committed by the
-user: removing the now-dead `.gitignore` entries for `.claude/settings.json`
-/ `.claude/settings.local.json` (see Context and Files Modified).
-
-## Context
-- Repo has two parallel instruction files: `AGENTS.md` (provider-neutral,
-  read by any agent, primary source of truth) and `CLAUDE.md` (Claude Code
-  only — a thin pointer to AGENTS.md plus the reactive usage-limit
-  instruction).
-- `memory-bank/current-task.md` (this file) is git-tracked by decision —
-  travels with the repo across machines/clones and is visible in diffs.
-- `.claude/settings.json` and `.claude/settings.local.json` are both
-  actually **tracked** in git (confirmed via `git ls-files` and
-  `git check-ignore -v`) — the `.gitignore` lines for them were dead
-  (gitignore doesn't retroactively untrack already-tracked files). Those
-  two lines have been removed from `.gitignore` in the working tree;
-  awaiting the user's commit.
-- A separate MCP-based memory bank (`@allpepper/memory-bank-mcp`) also
-  exists outside this repo for cross-project durable facts — do not
-  conflate it with this file. See "Memory systems" section in AGENTS.md.
+Course fix complete and ready for user diff review. No commit made.
 
 ## Completed
-- AGENTS.md created and populated (moved full prior CLAUDE.md content +
-  new Git Safety Rules, Agent Handoff Protocol, Memory Systems sections).
-- CLAUDE.md restructured to a minimal pointer, no duplicated content.
-- memory-bank/current-task.md scaffolded and kept current throughout.
-- PreCompact hook script written and dry-run verified (piped fake stdin
-  JSON against a throwaway copy of this file — appended a correct
-  `## Handoff Events` line, exit 0, no corruption).
-- PreCompact hook registered in `.claude/settings.json`, committed.
-- Confirmed `.claude/settings.json` / `.claude/settings.local.json` are
-  tracked, not gitignored; removed the dead `.gitignore` lines (diff
-  reviewed by user, commit pending on their side).
-
-## Remaining
-- Real end-to-end confirmation that the PreCompact hook fires during an
-  actual auto-compaction event in a live session (only dry-run tested so
-  far) — low priority, not blocking, no action needed unless it misfires.
-- Exit-code-2 PreCompact blocking mechanism remains explicitly
-  unexplored/unimplemented — deferred by decision, pick up only if a
-  stronger-than-marker-only handoff is wanted later.
+- Added `CourseModuleRepository.listMetadataForCourse`, which omits `bodyMdx`
+  at the Prisma query rather than stripping it after transfer from PostgreSQL.
+- Wired the public course module-list endpoint to metadata-only results. Module
+  metadata and completion progress now load concurrently.
+- Kept `GET /courses/{slug}/modules/{moduleSlug}` as the individual lesson-body
+  endpoint. Its lesson, module-navigation metadata, and completion reads now
+  run concurrently after access is confirmed.
+- Added a frontend `CourseModuleSummary` type so course and lesson navigation
+  cannot depend on `bodyMdx`.
+- Parallelized course-page module, bookmark, and related-course reads. Related
+  course lookups fan out concurrently.
+- Parallelized lesson-page module-navigation, bookmark, and conditional account
+  reads.
+- Added route-level loading and retryable error feedback for both course and
+  lesson pages; non-404 API failures now reach the error boundaries instead of
+  silently rendering empty data.
+- Confirmed the narrowed `Pick<...>` inputs in `coursePreview.ts` compile in the
+  API and web TypeScript projects.
+- Removed `scratch/course-perf-chrome/` and the temporary curl cookie file.
+- Added the separately requested local dev server restart permission note to
+  `AGENTS.md`; it remains uncommitted for review.
 
 ## Decisions
-- memory-bank/ is git-tracked, not gitignored (explicit decision: commit
-  noise traded for cross-machine portability + PR visibility).
-- PreCompact hook ships as marker-only (append a timestamped note); the
-  exit-code-2 blocking mechanism was explicitly NOT implemented or tested.
-- No content duplicated between CLAUDE.md and AGENTS.md — single source
-  of truth is AGENTS.md.
-- Dead `.gitignore` entries for `.claude/settings.json` /
-  `.claude/settings.local.json` removed rather than left in place, since
-  both files are tracked and the lines had no effect.
+- Browser/Puppeteer verification is explicitly dropped for this task. API-level
+  curl benchmarks are the accepted proof because oversized API payloads are the
+  confirmed root cause.
+- Public module lists contain no lesson body for either locked or unlocked
+  modules. The single-module endpoint remains responsible for body delivery and
+  locked-body stripping.
+- Certifications remain separate and untouched.
+- The old pending `.gitignore` note was stale; that work was already committed.
 
-## Known Issues
-- PreCompact hook's exact stdin field names (e.g. `trigger` vs
-  `compaction_reason`) came from an unverified research pass, not a live
-  hook invocation. The script is defensive (falls back to `"unknown"`
-  rather than erroring) so this is a robustness note, not a live bug.
-- A crash, forced kill, or a usage-limit cutoff with no warning message
-  bypasses both handoff triggers (PreCompact hook and reactive
-  usage-limit instruction) entirely — no fully automatic catch-all exists
-  for those cases.
+## Curl Benchmark
+Target: `agentic-ai-fundamentals` (234 modules), authenticated local API,
+five sequential curl runs per endpoint. Times are min / median.
+
+| Endpoint | Before payload | After payload | Before time | After time |
+| --- | ---: | ---: | ---: | ---: |
+| Course detail | 473 B | 473 B | 23.049 / 28.698 ms | 17.364 / 26.266 ms |
+| Module list | 1,530,623 B | 118,675 B | 72.107 / 81.738 ms | 24.555 / 33.068 ms |
+
+The module-list payload fell 92.25%; median response time fell 59.54%.
+All 234 list entries were checked: zero contained `bodyMdx`. A separate curl
+request for the first lesson (`overview`) contained `bodyMdx` with a 4,150-byte
+body, confirming bodies are still delivered individually.
 
 ## Tests/Validation
-- Hook script dry-run tested against a throwaway copy — confirmed correct
-  append behavior, exit 0. Real auto-compaction firing not yet observed
-  in a live session.
+- `npm run build --workspace apps/api` — passed (tsoa generation + TypeScript).
+- `npx tsc --noEmit -p apps/web/tsconfig.json` — passed.
+- `npm run build --workspace apps/web` — application bundle compiled
+  successfully; the later Next.js TypeScript worker launch failed with the
+  environment-level `spawn EPERM`.
+- API and web lint scripts could not run: ESLint 9 reports that the repo has no
+  `eslint.config.js`, `.mjs`, or `.cjs`.
+- `git diff --check` — passed before the final handoff update.
+- Ports 3002 and 4000 remain listening after validation.
+
+## Known Issues
+- Full Next production build cannot finish in this environment because its
+  post-compilation worker launch returns `spawn EPERM`.
+- Both workspace lint scripts are blocked by the repository's missing ESLint 9
+  flat configuration.
 
 ## Files Modified
-- `AGENTS.md` (new, committed `dc80bf69`)
-- `CLAUDE.md` (restructured, committed `dc80bf69`)
-- `memory-bank/current-task.md` (this file, committed, updated repeatedly)
-- `.claude/hooks/pre-compact-handoff.mjs` (new, committed `dc80bf69`)
-- `.claude/settings.json` (added `hooks.PreCompact`, committed `77613402`)
+- `AGENTS.md`
+- `apps/api/src/controllers/CourseController.ts`
+- `apps/api/src/lib/coursePreview.ts`
+- `apps/api/src/repositories/CourseModuleRepository.ts`
+- `apps/web/src/app/(app)/learn/[slug]/page.tsx`
+- `apps/web/src/app/(app)/learn/[slug]/loading.tsx`
+- `apps/web/src/app/(app)/learn/[slug]/error.tsx`
+- `apps/web/src/app/(app)/learn/[slug]/styles.module.css`
+- `apps/web/src/app/(app)/learn/[slug]/[moduleSlug]/page.tsx`
+- `apps/web/src/app/(app)/learn/[slug]/[moduleSlug]/loading.tsx`
+- `apps/web/src/app/(app)/learn/[slug]/[moduleSlug]/error.tsx`
+- `apps/web/src/components/CourseModulePage/styles.module.css`
+- `apps/web/src/data/courses.ts`
+- `memory-bank/current-task.md`
 
 ## Next Action
-Await the next task from the user.
+User reviews the uncommitted diff. After the course fix is accepted, investigate
+the certification inefficiency separately, starting with a single-exam lookup
+by slug; do not mix certification changes into this course diff.
 
 ## Last Updated
-2026-09-05 (session: handoff-system setup — closed)
+2026-09-05

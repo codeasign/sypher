@@ -2,7 +2,12 @@ import { Body, Controller, Delete, Get, Path, Post, Put, Query, Request, Res, Ro
 import type { Request as ExpressRequest } from 'express';
 import type { Course, CourseModule, Role, User } from '@prisma/client';
 import { CourseRepository } from '../repositories/CourseRepository';
-import { CourseModuleRepository, type GettingStartedModuleEntry, type ModuleWithCourseEntry } from '../repositories/CourseModuleRepository';
+import {
+  CourseModuleRepository,
+  type CourseModuleSummary,
+  type GettingStartedModuleEntry,
+  type ModuleWithCourseEntry,
+} from '../repositories/CourseModuleRepository';
 import { AuthoredCourseAccessRepository } from '../repositories/AuthoredCourseAccessRepository';
 import { AuthoredCompanyCourseAccessRepository } from '../repositories/AuthoredCompanyCourseAccessRepository';
 import { CompanyDirectoryRepository } from '../repositories/CompanyDirectoryRepository';
@@ -102,6 +107,11 @@ interface CourseByIdsRequest {
 }
 
 interface CourseModuleWithProgress extends CourseModule {
+  completed: boolean;
+  locked: boolean;
+}
+
+interface CourseModuleSummaryWithProgress extends CourseModuleSummary {
   completed: boolean;
   locked: boolean;
 }
@@ -341,26 +351,28 @@ export class CourseController extends Controller {
   // does NOT extend to courses themselves — a course you have zero access
   // to (fails courseAccessInfo's visible check entirely: draft, company-
   // gated with no grant, etc.) still 404s exactly as before, unchanged.
-  // bodyMdx is stripped from locked entries so the list response itself
-  // never leaks paid content — a locked module's title/metadata are fine
-  // to show, its content is not.
+  // The list is metadata-only for every entry. Lesson bodies are fetched
+  // individually from getModule, which keeps this navigation response small
+  // even for courses with hundreds of long lessons.
   @Get('{slug}/modules')
   @Security('session')
   public async listModules(
     @Path() slug: string,
     @Request() request: ExpressRequest,
     @Res() notFound: TsoaResponse<404, void>,
-  ): Promise<CourseModuleWithProgress[] | void> {
+  ): Promise<CourseModuleSummaryWithProgress[] | void> {
     const user = request.user as User;
     const course = await courseRepository.findPublishedBySlug(slug);
     if (!course) return notFound(404);
     const info = await courseAccessInfo(user, course);
     if (!info.visible) return notFound(404);
-    const modules = await courseModuleRepository.listForCourse(course.id);
-    const completedIds = await moduleProgressRepository.listCompletedModuleIds(user.id, course.id);
+    const [modules, completedIds] = await Promise.all([
+      courseModuleRepository.listMetadataForCourse(course.id),
+      moduleProgressRepository.listCompletedModuleIds(user.id, course.id),
+    ]);
     return modules.map((m) => {
       const locked = !info.hasFullAccess && !isModuleFreelyVisible(m, modules);
-      return { ...m, bodyMdx: locked ? '' : m.bodyMdx, completed: completedIds.has(m.id), locked };
+      return { ...m, completed: completedIds.has(m.id), locked };
     });
   }
 
@@ -381,11 +393,13 @@ export class CourseController extends Controller {
     if (!course) return notFound(404);
     const info = await courseAccessInfo(user, course);
     if (!info.visible) return notFound(404);
-    const mod = await courseModuleRepository.findBySlug(course.id, moduleSlug);
+    const [mod, modules, completedIds] = await Promise.all([
+      courseModuleRepository.findBySlug(course.id, moduleSlug),
+      courseModuleRepository.listMetadataForCourse(course.id),
+      moduleProgressRepository.listCompletedModuleIds(user.id, course.id),
+    ]);
     if (!mod) return notFound(404);
-    const modules = await courseModuleRepository.listForCourse(course.id);
     const locked = !info.hasFullAccess && !isModuleFreelyVisible(mod, modules);
-    const completedIds = await moduleProgressRepository.listCompletedModuleIds(user.id, course.id);
     return { ...mod, bodyMdx: locked ? '' : mod.bodyMdx, completed: completedIds.has(mod.id), locked };
   }
 

@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { serverApiFetch } from '@/lib/serverApi';
-import type { CourseModule } from '@/data/courses';
+import type { CourseModule, CourseModuleSummary } from '@/data/courses';
 import type { AuthoredModuleBookmarkEntry } from '@/data/bookmarks';
 import CourseModuleArticle from '@/components/CourseModulePage/CourseModuleArticle';
 import ModuleCompletionTracker from '@/components/CourseModulePage/ModuleCompletionTracker';
@@ -18,18 +18,30 @@ interface AuthUser {
 async function fetchModule(slug: string, moduleSlug: string): Promise<{ module: CourseModule | null; unauthenticated: boolean }> {
   const res = await serverApiFetch(`/courses/${encodeURIComponent(slug)}/modules/${encodeURIComponent(moduleSlug)}`);
   if (res.status === 401) return { module: null, unauthenticated: true };
-  if (!res.ok) return { module: null, unauthenticated: false };
+  if (res.status === 404) return { module: null, unauthenticated: false };
+  if (!res.ok) throw new Error(`Could not load lesson (${res.status})`);
   return { module: await res.json(), unauthenticated: false };
 }
 
-// Already ordered by orderIndex and access-filtered server-side (full list
-// for hasFullAccess, getting-started-only otherwise), and now also carries
-// each module's per-user completed flag — reused for both the top-of-page
-// index and previous/next, so a module this user isn't allowed to open can
-// never appear in either.
-async function fetchCourseModules(slug: string): Promise<CourseModule[]> {
+// Metadata-only, ordered by orderIndex, with per-user access/progress flags.
+// Reused for the position counter and previous/next navigation without
+// downloading every lesson body.
+async function fetchCourseModules(slug: string): Promise<CourseModuleSummary[]> {
   const res = await serverApiFetch(`/courses/${encodeURIComponent(slug)}/modules`);
-  return res.ok ? res.json() : [];
+  if (!res.ok) throw new Error(`Could not load course topics (${res.status})`);
+  return res.json();
+}
+
+async function fetchModuleBookmarks(): Promise<AuthoredModuleBookmarkEntry[]> {
+  const res = await serverApiFetch('/bookmarks/authored-modules');
+  if (!res.ok) throw new Error(`Could not load lesson bookmarks (${res.status})`);
+  return res.json();
+}
+
+async function fetchAuthUser(): Promise<AuthUser> {
+  const res = await serverApiFetch('/auth/me');
+  if (!res.ok) throw new Error(`Could not load account details (${res.status})`);
+  return res.json();
 }
 
 // Big edge-pager chevrons — simple stroked geometry drawn locally (same
@@ -73,11 +85,13 @@ export default async function CourseModulePage({
   if (unauthenticated) redirect('/login');
   if (!mod) notFound();
 
-  const bookmarksRes = await serverApiFetch('/bookmarks/authored-modules');
-  const bookmarks: AuthoredModuleBookmarkEntry[] = bookmarksRes.ok ? await bookmarksRes.json() : [];
+  const [bookmarks, allModules, me] = await Promise.all([
+    fetchModuleBookmarks(),
+    fetchCourseModules(slug),
+    mod.locked ? fetchAuthUser() : Promise.resolve(null),
+  ]);
   const isBookmarked = bookmarks.some((b) => b.moduleId === mod.id);
 
-  const allModules = await fetchCourseModules(slug);
   const currentIndex = allModules.findIndex((m) => m.id === mod.id);
   const previous = currentIndex > 0 ? allModules[currentIndex - 1] : null;
   const next = currentIndex >= 0 && currentIndex < allModules.length - 1 ? allModules[currentIndex + 1] : null;
@@ -85,12 +99,7 @@ export default async function CourseModulePage({
   // Only fetched when actually needed — the locked-notice CTA is the only
   // consumer, and it's the uncommon path (most module views are
   // unlocked).
-  let userEmail = '';
-  if (mod.locked) {
-    const meRes = await serverApiFetch('/auth/me');
-    const me: AuthUser | null = meRes.ok ? await meRes.json() : null;
-    userEmail = me?.email ?? '';
-  }
+  const userEmail = me?.email ?? '';
 
   return (
     <div className={styles.page}>

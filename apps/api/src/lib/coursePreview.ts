@@ -20,7 +20,7 @@ export function computeFreePreviewCount(totalModules: number): number {
 // CourseModuleRepository.listForCourse) -- this does not sort, it trusts
 // the caller's order, same convention as everywhere else that consumes
 // this list.
-export function isModuleInFreePreview(module: CourseModule, orderedModules: CourseModule[]): boolean {
+export function isModuleInFreePreview(module: Pick<CourseModule, 'id'>, orderedModules: ReadonlyArray<Pick<CourseModule, 'id'>>): boolean {
   const freeCount = computeFreePreviewCount(orderedModules.length);
   const rank = orderedModules.findIndex((m) => m.id === module.id);
   return rank !== -1 && rank < freeCount;
@@ -31,6 +31,6 @@ export function isModuleInFreePreview(module: CourseModule, orderedModules: Cour
 // this can push the effective free percentage above 15% once
 // getting-started flags are used on a course that also has this
 // mechanism. Not a bug, confirmed and accepted.
-export function isModuleFreelyVisible(module: CourseModule, orderedModules: CourseModule[]): boolean {
+export function isModuleFreelyVisible(module: Pick<CourseModule, 'id' | 'showInGettingStarted'>, orderedModules: ReadonlyArray<Pick<CourseModule, 'id'>>): boolean {
   return module.showInGettingStarted || isModuleInFreePreview(module, orderedModules);
 }

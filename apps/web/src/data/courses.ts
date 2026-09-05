@@ -92,6 +92,12 @@ export interface CourseModule {
   locked?: boolean;
 }
 
+/** Public course navigation data. Lesson bodies only come from the single-module endpoint. */
+export interface CourseModuleSummary extends Omit<CourseModule, 'bodyMdx'> {
+  completed: boolean;
+  locked: boolean;
+}
+
 export interface GettingStartedModuleEntry {
   id: string;
   slug: string;
