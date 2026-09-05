@@ -283,6 +283,14 @@ context):
    (not memory), write a concrete Next Action.
 2. Do not commit as part of this step unless explicitly asked.
 
+## Agent Autonomy Boundary
+
+Even when approval_policy is set to never (auto-accept), stop and ask the
+user before: making architectural decisions, choosing between multiple
+valid implementation approaches, or taking any action that would be hard
+to reverse. Only proceed without asking for routine, unambiguous
+implementation work.
+
 ## Memory systems (two distinct, do not conflate)
 
 - **MCP memory bank** (`@allpepper/memory-bank-mcp`, root outside this repo) —
