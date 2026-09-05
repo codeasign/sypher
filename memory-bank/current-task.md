@@ -7,7 +7,10 @@ and adding loading/error feedback. Certifications are a separate investigation
 and remain on hold.
 
 ## Status
-Course fix complete and ready for user diff review. No commit made.
+Course fix complete and committed by the user in `d6589c46`.
+The AGENTS.md restart clarification is committed in `1964d5c3`.
+Working tree was clean when these commits were verified; only this handoff
+update is now uncommitted.
 
 ## Completed
 - Added `CourseModuleRepository.listMetadataForCourse`, which omits `bodyMdx`
@@ -30,7 +33,7 @@ Course fix complete and ready for user diff review. No commit made.
   API and web TypeScript projects.
 - Removed `scratch/course-perf-chrome/` and the temporary curl cookie file.
 - Added the separately requested local dev server restart permission note to
-  `AGENTS.md`; it remains uncommitted for review.
+  `AGENTS.md`; committed by the user in `1964d5c3`.
 
 ## Decisions
 - Browser/Puppeteer verification is explicitly dropped for this task. API-level
@@ -74,25 +77,12 @@ body, confirming bodies are still delivered individually.
   flat configuration.
 
 ## Files Modified
-- `AGENTS.md`
-- `apps/api/src/controllers/CourseController.ts`
-- `apps/api/src/lib/coursePreview.ts`
-- `apps/api/src/repositories/CourseModuleRepository.ts`
-- `apps/web/src/app/(app)/learn/[slug]/page.tsx`
-- `apps/web/src/app/(app)/learn/[slug]/loading.tsx`
-- `apps/web/src/app/(app)/learn/[slug]/error.tsx`
-- `apps/web/src/app/(app)/learn/[slug]/styles.module.css`
-- `apps/web/src/app/(app)/learn/[slug]/[moduleSlug]/page.tsx`
-- `apps/web/src/app/(app)/learn/[slug]/[moduleSlug]/loading.tsx`
-- `apps/web/src/app/(app)/learn/[slug]/[moduleSlug]/error.tsx`
-- `apps/web/src/components/CourseModulePage/styles.module.css`
-- `apps/web/src/data/courses.ts`
-- `memory-bank/current-task.md`
+- `memory-bank/current-task.md` — records the user's commits and current hold.
 
 ## Next Action
-User reviews the uncommitted diff. After the course fix is accepted, investigate
-the certification inefficiency separately, starting with a single-exam lookup
-by slug; do not mix certification changes into this course diff.
+Await the user's instruction to resume certifications; they remain on hold.
+When resumed, investigate the single-exam lookup by slug separately from the
+completed course fix. Do not launch Chrome/Puppeteer for this task.
 
 ## Last Updated
 2026-09-05
