@@ -1,6 +1,8 @@
-import { Body, Controller, Post, Res, Route, Tags, type TsoaResponse } from 'tsoa';
+import { Body, Controller, Post, Request, Res, Route, Tags, type TsoaResponse } from 'tsoa';
+import type { Request as ExpressRequest } from 'express';
 import { ContactSubmissionRepository } from '../repositories/ContactSubmissionRepository';
 import { sendContactNotification } from '../lib/email';
+import { verifyRecaptchaToken } from '../lib/recaptcha';
 
 const contactSubmissionRepository = new ContactSubmissionRepository();
 
@@ -12,6 +14,7 @@ interface ContactRequest {
   message: string;
   /** Honeypot — real users never fill this in; bots that do get a fake success. */
   botcheck?: string;
+  recaptchaToken?: string;
 }
 
 interface ContactMessageResponse {
@@ -24,10 +27,15 @@ export class ContactController extends Controller {
   @Post()
   public async submit(
     @Body() body: ContactRequest,
+    @Request() request: ExpressRequest,
     @Res() badRequest: TsoaResponse<400, ContactMessageResponse>,
   ): Promise<ContactMessageResponse> {
     if (body.botcheck) {
       return { message: 'Thanks for reaching out — we will get back to you soon.' };
+    }
+
+    if (!(await verifyRecaptchaToken(body.recaptchaToken, request.ip))) {
+      return badRequest(400, { message: 'Please complete the bot verification and try again.' });
     }
 
     const name = body.name.trim();

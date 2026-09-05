@@ -1,79 +1,69 @@
 # Current Task Handoff
 
 ## Objective
-Certification detail efficiency cleanup: replace the full-list scan with a
-single published exam lookup by slug. No freeze is attributed to certifications.
-No schema, RLS, authorization changes, or browser launches. No commit.
+Add Google reCAPTCHA v2 checkbox bot protection to Sign In, Sign Up, and Contact
+on https://next.sypher.local.
 
 ## Status
-Complete and ready for user review; no commit made. Working tree was clean at start; previous
-handoff pending-commit and hold notes were stale and reconciled with Git.
+Implementation complete and ready for review. No commit made.
 
 ## Completed
-- Inspected summary visibility and attempt access checks.
-- Captured five baseline curl runs: nine exams, 3,830 bytes.
-- Added repository lookup and session-protected GET /mock-exams/{slug}.
-- Reused summary projection and filtered publication in the query.
-- Updated detail page to request its encoded slug.
-- API build/tsoa generation and web TypeScript checks passed.
-- Verified all nine single-exam summaries exactly match catalog entries.
+- Confirmed Sign In and Sign Up share apps/web/src/app/login/page.tsx;
+  /register redirects to signup mode.
+- Added reusable apps/web/src/components/RecaptchaV2.tsx with explicit checkbox
+  rendering, token expiry, load-error, and reset handling.
+- Added the widget to the shared login/signup form and to /contact.
+- Added recaptchaToken to email login, register, and contact requests.
+- Added API-side verification through Google's siteverify endpoint before
+  authentication, account creation, or contact persistence/notification.
+- Preserved the contact honeypot's fake-success behavior for filled botcheck.
+- Production requires verification by default, even if RECAPTCHA_REQUIRED=false;
+  local development remains backward-compatible until RECAPTCHA_REQUIRED=true
+  and a server secret are configured.
+- Added API and web environment examples without secrets.
+- Google OAuth and corporate login remain outside this requested scope.
 
 ## Decisions
-- Summary visibility remains session + publication, as with the old list.
-- Attempt creation retains published-course/full-course-access checks.
-  Preview does not grant attempt access; company group grants remain gated by
-  active company access. These authorization implementations are unchanged.
-- Existing catalog/page routes retained; course fix d6589c46 stays separate.
-
-## Benchmark
-Authenticated curl, http://localhost:4000, five sequential runs, time_total,
-no compression requested; login excluded. All baseline responses HTTP 200.
-Before GET /mock-exams: 3,830 bytes.
-Times (ms): 24.705, 17.934, 17.412, 23.196, 17.144.
-Min / median: 17.144 / 17.934 ms. Already fast.
-After GET /mock-exams/istqb-ctal-tae: HTTP 200, 469 bytes on every run.
-Times (ms): 27.763, 19.098, 18.255, 14.435, 19.228.
-Min / median: 14.435 / 19.098 ms.
-
-| Request used by detail page | Payload | Min time | Median time |
-| --- | ---: | ---: | ---: |
-| Before: full catalog | 3,830 B | 17.144 ms | 17.934 ms |
-| After: one exam | 469 B | 14.435 ms | 19.098 ms |
-
-Payload saves 3,361 bytes (87.75%), but the absolute saving is only about
-3.36 KB with nine exams. Median is 1.164 ms slower; this small sample shows
-no meaningful latency improvement. This is an efficiency cleanup, not a
-freeze fix. These are local API timings, not end-to-end navigation timings.
-
-## Tests/Validation
-- npm run build --workspace apps/api: passed, including tsoa generation.
-- npx tsc --noEmit -p apps/web/tsconfig.json: passed.
-- All nine published slugs return exactly the existing catalog summary fields.
-- No session: 401; nonexistent slug: 404; /mock-exams/page: 200 (no route clash).
-- FREE_USER summary request: 200, preserving metadata discoverability.
-- Source review confirms new lookup filters isPublished:true; attempt creation
-  and hasFullCourseAccess are unchanged. Company grants still resolve through
-  listCourseIdsForUserGroups and isCompanyAccessActive. No preview bypass added.
-- Read-only fixture inspection found zero unpublished or course-linked exams,
-  so unpublished/company-linked attempt cases were verified by source review,
-  not live fixture tests. No exam/course/access rows were changed.
-- git diff --check passed; diff limited to controller, repository, detail page,
-  and this handoff. No schema, RLS, or authorization implementation changes.
+- Use v2 checkbox as selected by user.
+- Keep the reCAPTCHA secret server-side in apps/api environment configuration.
+- Do not hardcode site keys, secrets, or bypass tokens.
+- No schema, RLS, or database changes.
 
 ## Known Issues
-Previous task: lint lacks ESLint 9 config; full Next build worker spawn EPERM.
-Direct TypeScript checks will be used.
+- No site key or secret is configured in the current local env, so the checkbox
+  is not rendered locally until NEXT_PUBLIC_RECAPTCHA_SITE_KEY is supplied.
+- Real Google token success/failure cannot be exercised without matching Google
+  keys and a registered domain.
+- Previous tasks: ESLint 9 flat config missing; Next build worker spawn EPERM.
+
+## Tests/Validation
+- npm run build --workspace apps/api: passed (including tsoa generation).
+- npx tsc --noEmit -p apps/web/tsconfig.json: passed.
+- Direct verifier test with RECAPTCHA_REQUIRED=true and no secret returned false
+  for both missing and supplied test tokens (fail-closed).
+- git diff --check passed before this handoff update.
+- No credentials, database rows, schema, RLS, or authorization policy files
+  changed.
 
 ## Files Modified
-- apps/api/src/controllers/MockExamController.ts
-- apps/api/src/repositories/MockExamRepository.ts
-- apps/web/src/app/(app)/mock-tests/[slug]/page.tsx
+- apps/api/.env.example
+- apps/api/src/controllers/AuthController.ts
+- apps/api/src/controllers/ContactController.ts
+- apps/api/src/lib/env.ts
+- apps/api/src/lib/recaptcha.ts
+- apps/web/.env.example
+- apps/web/src/app/login/page.tsx
+- apps/web/src/app/login/styles.module.css
+- apps/web/src/app/contact/ContactForm.tsx
+- apps/web/src/components/RecaptchaV2.tsx
+- apps/web/src/components/RecaptchaV2.module.css
 - memory-bank/current-task.md
 
 ## Next Action
-User reviews the four-file diff and decides whether to commit. No remaining
-implementation work for this cleanup. Do not expand into certification latency
-or rendering work: no freeze or meaningful latency improvement was established.
+User configures NEXT_PUBLIC_RECAPTCHA_SITE_KEY in the web environment and
+RECAPTCHA_SECRET_KEY plus RECAPTCHA_REQUIRED=true in the API environment for
+the Google reCAPTCHA site/domain, restarts API/web servers, and reviews the
+uncommitted diff. Do not commit automatically.
 
 ## Last Updated
 2026-09-05

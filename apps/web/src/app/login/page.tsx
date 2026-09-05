@@ -3,6 +3,7 @@
 import { Suspense, useState, type FormEvent } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { apiFetch } from '@/lib/api';
+import RecaptchaV2, { recaptchaConfigured } from '@/components/RecaptchaV2';
 import styles from './styles.module.css';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'https://api-next.sypher.local';
@@ -47,20 +48,27 @@ function AuthForm(): React.JSX.Element {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [captchaToken, setCaptchaToken] = useState<string | null>(null);
+  const [captchaResetSignal, setCaptchaResetSignal] = useState(0);
 
   async function handleSubmit(e: FormEvent): Promise<void> {
     e.preventDefault();
+    if (recaptchaConfigured && !captchaToken) {
+      setError('Please complete the bot verification and try again.');
+      return;
+    }
     setSubmitting(true);
     setError(null);
     const endpoint = isSignUp ? '/auth/register' : '/auth/login';
     const body = isSignUp
-      ? { email, password, fullName: `${firstName} ${lastName}`.trim() }
-      : { email, password };
+      ? { email, password, fullName: `${firstName} ${lastName}`.trim(), recaptchaToken: captchaToken }
+      : { email, password, recaptchaToken: captchaToken };
     const res = await apiFetch(endpoint, { method: 'POST', body: JSON.stringify(body) });
     setSubmitting(false);
     if (!res.ok) {
       const responseBody = await res.json().catch(() => ({}));
       setError(responseBody.message ?? 'Something went wrong');
+      setCaptchaResetSignal((signal) => signal + 1);
       return;
     }
     const authUser = await res.json().catch(() => ({}));
@@ -148,6 +156,8 @@ function AuthForm(): React.JSX.Element {
                 {error}
               </p>
             )}
+
+            <RecaptchaV2 resetSignal={captchaResetSignal} onTokenChange={setCaptchaToken} />
 
             <button type="submit" className={styles.submitBtn} disabled={submitting}>
               {submitting ? 'Please wait…' : isSignUp ? 'Sign up' : 'Log in'}

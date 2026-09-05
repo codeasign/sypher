@@ -2,6 +2,7 @@
 
 import { useState, type FormEvent } from 'react';
 import { apiFetch } from '@/lib/api';
+import RecaptchaV2, { recaptchaConfigured } from '@/components/RecaptchaV2';
 import styles from './styles.module.css';
 
 type Status = 'idle' | 'loading' | 'success' | 'error';
@@ -13,21 +14,28 @@ export default function ContactForm(): React.JSX.Element {
   const [botcheck, setBotcheck] = useState('');
   const [status, setStatus] = useState<Status>('idle');
   const [error, setError] = useState<string | null>(null);
+  const [captchaToken, setCaptchaToken] = useState<string | null>(null);
+  const [captchaResetSignal, setCaptchaResetSignal] = useState(0);
 
   async function handleSubmit(e: FormEvent): Promise<void> {
     e.preventDefault();
+    if (recaptchaConfigured && !captchaToken) {
+      setError('Please complete the bot verification and try again.');
+      return;
+    }
     setStatus('loading');
     setError(null);
 
     const res = await apiFetch('/contact', {
       method: 'POST',
-      body: JSON.stringify({ name, email, message, botcheck }),
+      body: JSON.stringify({ name, email, message, botcheck, recaptchaToken: captchaToken }),
     });
 
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       setError(body.message ?? 'Something went wrong — please try again.');
       setStatus('error');
+      setCaptchaResetSignal((signal) => signal + 1);
       return;
     }
 
@@ -73,6 +81,8 @@ export default function ContactForm(): React.JSX.Element {
         <label htmlFor="message">Message</label>
         <textarea id="message" required rows={6} value={message} onChange={(e) => setMessage(e.target.value)} />
       </div>
+
+      <RecaptchaV2 resetSignal={captchaResetSignal} onTokenChange={setCaptchaToken} />
 
       {error && (
         <p role="alert" className={styles.error}>

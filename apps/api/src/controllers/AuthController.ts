@@ -21,6 +21,7 @@ import { sendPasswordResetEmail, sendWelcomeEmail } from '../lib/email';
 import { buildGoogleAuthUrl, exchangeGoogleCode } from '../lib/googleOAuth';
 import { env } from '../lib/env';
 import { createLogger } from '../lib/logger';
+import { verifyRecaptchaToken } from '../lib/recaptcha';
 
 const logger = createLogger('AuthController');
 const userRepository = new UserRepository();
@@ -55,11 +56,13 @@ interface AuthRegisterRequest {
   email: string;
   password: string;
   fullName?: string;
+  recaptchaToken?: string;
 }
 
 interface AuthLoginRequest {
   email: string;
   password: string;
+  recaptchaToken?: string;
 }
 
 interface AuthCompanyLoginRequest {
@@ -151,6 +154,9 @@ export class AuthController extends Controller {
     @Res() badRequest: TsoaResponse<400, AuthMessageResponse>,
     @Res() created: TsoaResponse<201, AuthUser, { 'Set-Cookie': string }>,
   ): Promise<void> {
+    if (!(await verifyRecaptchaToken(body.recaptchaToken, request.ip))) {
+      return badRequest(400, { message: 'Please complete the bot verification and try again.' });
+    }
     const email = body.email.trim().toLowerCase();
     if (!EMAIL_RE.test(email)) return badRequest(400, { message: 'Invalid email address' });
     if (body.password.length < 8) return badRequest(400, { message: 'Password must be at least 8 characters' });
@@ -180,8 +186,12 @@ export class AuthController extends Controller {
     @Body() body: AuthLoginRequest,
     @Request() request: ExpressRequest,
     @Res() unauthorized: TsoaResponse<401, AuthMessageResponse>,
+    @Res() badRequest: TsoaResponse<400, AuthMessageResponse>,
     @Res() ok: TsoaResponse<200, AuthUser, { 'Set-Cookie': string }>,
   ): Promise<void> {
+    if (!(await verifyRecaptchaToken(body.recaptchaToken, request.ip))) {
+      return badRequest(400, { message: 'Please complete the bot verification and try again.' });
+    }
     const user = await authenticate(body.email, body.password);
     if (!user) return unauthorized(401, { message: 'Invalid email or password' });
 

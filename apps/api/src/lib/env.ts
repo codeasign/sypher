@@ -22,6 +22,10 @@ export const env = {
   sessionTtlDays: Number(process.env.SESSION_TTL_DAYS ?? 30),
   frontendUrl: process.env.FRONTEND_URL ?? 'https://next.sypher.local',
   apiBaseUrl: process.env.API_BASE_URL ?? 'https://api-next.sypher.local',
+  recaptcha: {
+    secretKey: process.env.RECAPTCHA_SECRET_KEY ?? '',
+    required: process.env.RECAPTCHA_REQUIRED === 'true' || (process.env.RECAPTCHA_REQUIRED !== 'false' && (process.env.NODE_ENV ?? 'development') === 'production'),
+  },
   google: {
     clientId: process.env.GOOGLE_CLIENT_ID ?? '',
     clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? '',
