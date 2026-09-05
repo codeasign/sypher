@@ -45,7 +45,6 @@ user: removing the now-dead `.gitignore` entries for `.claude/settings.json`
   reviewed by user, commit pending on their side).
 
 ## Remaining
-- User to commit the `.gitignore` cleanup (diff already reviewed).
 - Real end-to-end confirmation that the PreCompact hook fires during an
   actual auto-compaction event in a live session (only dry-run tested so
   far) — low priority, not blocking, no action needed unless it misfires.
@@ -85,12 +84,9 @@ user: removing the now-dead `.gitignore` entries for `.claude/settings.json`
 - `memory-bank/current-task.md` (this file, committed, updated repeatedly)
 - `.claude/hooks/pre-compact-handoff.mjs` (new, committed `dc80bf69`)
 - `.claude/settings.json` (added `hooks.PreCompact`, committed `77613402`)
-- `.gitignore` (removed dead settings.json/settings.local.json entries —
-  **uncommitted**, awaiting user commit)
 
 ## Next Action
-No task queued yet. Handoff-setup work is done; next entry here should be
-whatever normal work is picked up next.
+Await the next task from the user.
 
 ## Last Updated
 2026-09-05 (session: handoff-system setup — closed)
