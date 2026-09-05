@@ -7,8 +7,8 @@ Exit Test matching filled controls with icons and white text. Add modest color
 to the active exam surface and question navigation.
 
 ## Status
-Implementation complete and validated. The mock-test UI and profile-width
-updates are complete; changes are ready for the user's commit.
+Complete. All requested implementation and validation work is finished; no
+task is pending. Changes are ready for the user's commit.
 
 ## Completed
 - Lowered the active exam overlay below the sticky global navbar and reserved
@@ -63,8 +63,8 @@ file has an existing staged version plus additional unstaged handoff updates
 (`MM`). No files were staged or committed by the agent.
 
 ## Next Action
-Review the diff and commit the intended changes. No commit was created by the
-agent.
+No pending task. The user may review and commit the changes when ready; no
+commit was created by the agent.
 
 ## Last Updated
 2026-09-05
