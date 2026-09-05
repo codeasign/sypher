@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { startMockAttempt, submitMockAttempt, type MockExamSummary, type MockTestQuestionView, type MockTestResultResponse } from '@/data/mockTests';
+import { LogoutMenuIcon, TimerIcon } from '@/components/icons/ActionIcons';
 import styles from './styles.module.css';
 
 type Phase = 'idle' | 'active' | 'results';
@@ -432,10 +433,11 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
               Question {currentIndex + 1} of {active.questions.length} · {answeredCount} answered
             </p>
           </div>
-          <div className={styles.headerControls}>
-            <div className={`${styles.timerBox} ${lowTime ? styles.timerLow : ''}`} aria-live="polite">
-              {formatClock(remainingSeconds)}
-            </div>
+            <div className={styles.headerControls}>
+              <div className={`${styles.timerBox} ${lowTime ? styles.timerLow : ''}`} aria-live="polite">
+                <TimerIcon className={styles.controlIcon} />
+                <span>{formatClock(remainingSeconds)}</span>
+              </div>
             {confirmingExit ? (
               <span className={styles.confirmCluster}>
                 <span className={styles.confirmText}>Abandon this attempt?</span>
@@ -450,19 +452,20 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
                 >
                   Yes, exit
                 </button>
-                <button type="button" className={styles.secondaryButton} onClick={() => setConfirmingExit(false)} disabled={submitting}>
+                <button type="button" className={`${styles.secondaryButton} ${styles.keepWorkingButton}`} onClick={() => setConfirmingExit(false)} disabled={submitting}>
                   Keep working
                 </button>
               </span>
             ) : (
-              <button type="button" className={styles.secondaryButton} onClick={() => setConfirmingExit(true)} disabled={submitting}>
-                Exit test
+              <button type="button" className={styles.exitButton} onClick={() => setConfirmingExit(true)} disabled={submitting}>
+                <LogoutMenuIcon className={styles.controlIcon} />
+                <span>Exit test</span>
               </button>
             )}
           </div>
         </div>
 
-        <div className={styles.paletteGrid}>
+        <nav className={styles.paletteGrid} aria-label="Exam questions">
           {active.questions.map((q, index) => {
             const answered = (selections[q.id]?.length ?? 0) > 0;
             // Current wins the fill color (CSS cascade), answered still rides
@@ -480,7 +483,7 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
               </button>
             );
           })}
-        </div>
+        </nav>
 
         {question && (
           <div className={styles.questionCard}>

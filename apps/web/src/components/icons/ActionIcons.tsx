@@ -48,6 +48,16 @@ export const LogoutMenuIcon = base(
   'M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h280v80H200v560h280v80H200Zm440-160-56-57 103-103H360v-80h327L584-623l56-57 200 200-200 200Z',
 );
 
+// Material UI's Timer glyph, kept inline with the shared icon helpers so the
+// web app does not need a separate icon-font runtime dependency.
+export function TimerIcon({ className }: IconProps): React.JSX.Element {
+  return (
+    <svg className={className} width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M9 1h6v2H9zm10.03 6.39 1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42C16.07 4.74 14.12 4 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9 9-4.03 9-9c0-2.12-.74-4.07-1.97-5.61M13 14h-2V8h2z" />
+    </svg>
+  );
+}
+
 export const InfoIcon = base(
   // Moved here from a local copy in AccessManager.tsx (2026-08-23) so every
   // info/tooltip hint uses the shared library. Path is the same verified
