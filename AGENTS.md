@@ -290,6 +290,21 @@ context):
    (not memory), write a concrete Next Action.
 2. Do not commit as part of this step unless explicitly asked.
 
+## Handoff Update Cadence
+
+Update memory-bank/current-task.md at these points, not only at session end:
+- A meaningful milestone (sub-step finishes, root cause established,
+  implementation ready for validation).
+- A material change in direction (scope, decisions, blockers, or next action
+  changes).
+- Before a risky or lengthy operation (record state and recovery step first).
+- After validation (record results, failures, remaining work).
+- Before ending or handing off (reconcile modified-file list with git status).
+- At signs of context pressure or a usage limit (immediate checkpoint).
+
+Do not update after every file edit, search, or tiny sub-step — the file is a
+continuation point, not a running transcript.
+
 ## Agent Autonomy Boundary
 
 Even when approval_policy is set to never (auto-accept), stop and ask the

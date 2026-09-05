@@ -9,10 +9,12 @@ and remain on hold.
 ## Status
 Course fix complete and committed by the user in `d6589c46`.
 The AGENTS.md restart clarification is committed in `1964d5c3`.
-Working tree was clean when these commits were verified; only this handoff
-update is now uncommitted.
+Working tree was clean at the start of the cadence-policy update. The new
+AGENTS.md cadence policy and this handoff update are uncommitted for user review.
 
 ## Completed
+- Added the requested Handoff Update Cadence section immediately after Agent
+  Handoff Protocol in AGENTS.md, covering milestone and interruption checkpoints.
 - Added `CourseModuleRepository.listMetadataForCourse`, which omits `bodyMdx`
   at the Prisma query rather than stripping it after transfer from PostgreSQL.
 - Wired the public course module-list endpoint to metadata-only results. Module
@@ -77,9 +79,11 @@ body, confirming bodies are still delivered individually.
   flat configuration.
 
 ## Files Modified
-- `memory-bank/current-task.md` — records the user's commits and current hold.
+- `AGENTS.md` — adds Handoff Update Cadence.
+- `memory-bank/current-task.md` — records the documentation change and current hold.
 
 ## Next Action
+User reviews and commits the cadence-policy diff. No commit made by the agent.
 Await the user's instruction to resume certifications; they remain on hold.
 When resumed, investigate the single-exam lookup by slug separately from the
 completed course fix. Do not launch Chrome/Puppeteer for this task.
