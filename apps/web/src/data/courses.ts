@@ -21,6 +21,11 @@ export interface CourseWithAccess extends Course {
   // Has the user completed at least one module (ever) — Enroll vs Resume
   // on the course card. Stays true for a fully completed course too.
   started: boolean;
+  // Progress bar on the course card: modules completed vs the course's
+  // current module count. completedModules is clamped to totalModules
+  // server-side; totalModules 0 ⇒ render no bar.
+  completedModules: number;
+  totalModules: number;
 }
 
 export interface CoursePage {
@@ -28,26 +33,38 @@ export interface CoursePage {
   total: number;
 }
 
-// GET /courses — paginated, full-access-only (My Courses).
-export async function fetchMyCoursesPage(limit: number, offset: number, role?: string): Promise<CoursePage> {
-  const roleQs = role ? `&role=${encodeURIComponent(role)}` : '';
-  const res = await apiFetch(`/courses?limit=${limit}&offset=${offset}${roleQs}`);
-  if (!res.ok) throw new Error(`request failed (${res.status})`);
-  return res.json();
+/**
+ * The exact set of fields <CourseCard> renders. Both the catalog pages
+ * (CourseWithAccess satisfies this) and the Dashboard course strips
+ * (DashboardCourseRef) feed the SAME card, so Start / Resume / Preview and
+ * the progress bar look identical everywhere.
+ */
+export interface CourseCardData {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  coverImageUrl: string | null;
+  hasFullAccess: boolean;
+  started: boolean;
+  completedModules: number;
+  totalModules: number;
 }
 
-// GET /courses/browse — paginated, every published course (Browse Courses).
-export async function fetchBrowseCoursesPage(limit: number, offset: number, role?: string): Promise<CoursePage> {
-  const roleQs = role ? `&role=${encodeURIComponent(role)}` : '';
-  const res = await apiFetch(`/courses/browse?limit=${limit}&offset=${offset}${roleQs}`);
-  if (!res.ok) throw new Error(`request failed (${res.status})`);
-  return res.json();
-}
-
-/** Enroll (full access, never started) / Resume (full access, started or completed) / Preview (no full access). */
-export function courseActionLabel(course: Pick<CourseWithAccess, 'hasFullAccess' | 'started'>): 'Enroll' | 'Resume' | 'Preview' {
+/** Start (full access, never started) / Resume (full access, started or completed) / Preview (no full access). */
+export function courseActionLabel(course: Pick<CourseWithAccess, 'hasFullAccess' | 'started'>): 'Start' | 'Resume' | 'Preview' {
   if (!course.hasFullAccess) return 'Preview';
-  return course.started ? 'Resume' : 'Enroll';
+  return course.started ? 'Resume' : 'Start';
+}
+
+/**
+ * The colour tone for the action button — Start is green, Resume is cyan,
+ * Preview is neutral. Kept next to courseActionLabel so the two never
+ * drift; each consumer maps the tone to its own CSS-module class.
+ */
+export function courseActionTone(course: Pick<CourseWithAccess, 'hasFullAccess' | 'started'>): 'start' | 'resume' | 'preview' {
+  if (!course.hasFullAccess) return 'preview';
+  return course.started ? 'resume' : 'start';
 }
 
 export interface CourseModule {

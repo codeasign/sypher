@@ -42,13 +42,6 @@ interface CourseEditorProps {
   onBack?: () => void;
 }
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
-
 export default function CourseEditorInner({ course, onSaved, onCancel, onBack }: CourseEditorProps): React.JSX.Element {
   const { supabase, user } = useAuth();
   const [name, setName] = useState(course?.name ?? '');
@@ -69,7 +62,7 @@ export default function CourseEditorInner({ course, onSaved, onCancel, onBack }:
     setCoverUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, `courses/${course?.slug ?? 'new'}/covers`, BUNNY_CONFIG);
+      const url = await uploadToBunny(file, `courses/${course?.slug ?? 'new'}/covers`);
       setCoverImageUrl(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload cover image.');

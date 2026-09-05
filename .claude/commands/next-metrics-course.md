@@ -46,7 +46,7 @@ Content renders through `react-markdown` + `rehype-raw` + `rehype-sanitize` insi
 
 - **Driver script**: `apps/web/scripts/import-authored-course.mjs` — reads staging `.mdx` files, logs in against the API, drives the management endpoints in order
 
-- **Chart image pipeline**: Bunny CDN via `apps/web/src/data/bunnyUpload.ts` — config comes from `NEXT_PUBLIC_BUNNY_*` env vars in `apps/web/.env`. Imported diagram SVGs already live under the storage path convention `svgs/<course>/<module>/<hash>.svg`; metric chart images follow the same pattern
+- **Chart image pipeline**: Bunny CDN via `apps/web/src/data/bunnyUpload.ts` — config comes from `BUNNY_*` env vars in `apps/web/.env`. Imported diagram SVGs already live under the storage path convention `svgs/<course>/<module>/<hash>.svg`; metric chart images follow the same pattern
 
 - **Routes** (dynamic catch-alls, already exist, no new files needed): `/learn` catalog, `/learn/[slug]` course home, `/learn/[slug]/[moduleSlug]` reader, `(app)/manage-courses` admin UI
 
@@ -265,7 +265,7 @@ There is **no charting library in apps/web** (no Recharts, nothing interactive) 
 
 2. **English-only text inside charts** — translate any non-English labels before upload.
 
-3. Upload to a **dedicated per-course subfolder** on Bunny CDN: `svgs/<course-slug>/`. Every course owns exactly one folder there — never mix two courses' charts in one folder, never dump SVGs at the `svgs/` root. Bunny creates intermediate folders automatically on first PUT. Use the `NEXT_PUBLIC_BUNNY_*` env vars from `apps/web/.env` (same PUT-to-storage contract as `uploadToBunny`: `PUT https://<hostname>/<zone>/svgs/<course-slug>/<name>.svg` with the `AccessKey` header).
+3. Upload to a **dedicated per-course subfolder** on Bunny CDN: `svgs/<course-slug>/`. Every course owns exactly one folder there — never mix two courses' charts in one folder, never dump SVGs at the `svgs/` root. Bunny creates intermediate folders automatically on first PUT. Use the `BUNNY_*` env vars from `apps/web/.env` (same PUT-to-storage contract as `uploadToBunny`: `PUT https://<hostname>/<zone>/svgs/<course-slug>/<name>.svg` with the `AccessKey` header).
 
 4. **Link after uploading**: take each returned pull-zone URL (`<pullZoneUrl>/svgs/<course-slug>/<name>.svg`) and reference it in module bodies as `![alt](url)`. Never put a local staging path in `bodyMdx` — if a body still references `scratch/...`, the upload/link pass isn't finished.
 
@@ -383,7 +383,7 @@ Format rules:
 
 Order matters: images go up first into the course's own subfolder, module bodies get the real pull-zone URLs, and only then does the driver write anything to the apps/web database.
 
-1. **Upload** each SVG from `scratch/<course-slug>/images/` to `svgs/<course-slug>/` on Bunny CDN (a small inline Node script using the same PUT contract as `uploadToBunny`, configured from `NEXT_PUBLIC_BUNNY_*` in `apps/web/.env`). Collect the returned pull-zone URL for every file.
+1. **Upload** each SVG from `scratch/<course-slug>/images/` to `svgs/<course-slug>/` on Bunny CDN (a small inline Node script using the same PUT contract as `uploadToBunny`, configured from `BUNNY_*` in `apps/web/.env`). Collect the returned pull-zone URL for every file.
 
 2. **Link**: rewrite image references in the staging `.mdx` files to those exact URLs (skip if Step 3 already used them). Verify no body still points at `scratch/...`.
 

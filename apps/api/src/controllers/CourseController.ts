@@ -45,6 +45,21 @@ interface CourseCreateRequest {
   audienceRole?: string | null;
 }
 
+// Dedicated update DTO rather than Partial<CourseCreateRequest>: tsoa expands
+// the Partial<> mapped type inline and drops the `| null` from every member, so
+// PUT /courses/{id} rejected an explicit `coverImageUrl: null` ("invalid string
+// value") even though POST /courses accepts it — which blocked publishing any
+// course without a cover image. Also intentionally omits `slug` so an update
+// can't silently rename the course out from under its /learn/[slug] URLs.
+interface CourseUpdateRequest {
+  name?: string;
+  description?: string | null;
+  coverImageUrl?: string | null;
+  category?: string | null;
+  relatedCourses?: string | null;
+  audienceRole?: string | null;
+}
+
 interface CourseSetStatusRequest {
   status: 'draft' | 'published';
 }
@@ -74,6 +89,12 @@ interface CourseWithAccess extends Course {
   // course still reads true here (ModuleProgress rows persist forever),
   // so revisiting it never resets or re-tracks anything.
   started: boolean;
+  // Progress bar on the My Courses / Browse Courses card. completedModules
+  // is clamped to totalModules so a course that has since lost modules
+  // can't report over 100%. totalModules is the course's CURRENT module
+  // count (0 for an empty course — render no bar).
+  completedModules: number;
+  totalModules: number;
 }
 
 interface CourseByIdsRequest {
@@ -151,10 +172,20 @@ export interface CoursePage {
 async function computeAllWithAccess(user: User): Promise<CourseWithAccess[]> {
   const courses = await courseRepository.listPublished();
   const startedIds = await moduleProgressRepository.listStartedCourseIds(user.id);
+  const completedByCourse = await moduleProgressRepository.countCompletedByCourse(user.id);
+  const totalByCourse = await courseModuleRepository.countByCourse(courses.map((c) => c.id));
   const results: CourseWithAccess[] = [];
   for (const course of courses) {
     const info = await courseAccessInfo(user, course);
-    results.push({ ...course, hasFullAccess: info.hasFullAccess, started: startedIds.has(course.id) });
+    const totalModules = totalByCourse.get(course.id) ?? 0;
+    const completedModules = Math.min(completedByCourse.get(course.id) ?? 0, totalModules);
+    results.push({
+      ...course,
+      hasFullAccess: info.hasFullAccess,
+      started: startedIds.has(course.id),
+      completedModules,
+      totalModules,
+    });
   }
   return results;
 }
@@ -410,7 +441,7 @@ export class CourseController extends Controller {
 
   @Put('{id}')
   @Security('session')
-  public async update(@Path() id: string, @Body() body: Partial<CourseCreateRequest>, @Request() request: ExpressRequest): Promise<void> {
+  public async update(@Path() id: string, @Body() body: CourseUpdateRequest, @Request() request: ExpressRequest): Promise<void> {
     await requireCanManageCourses(request.user as User);
     assertNoReplacementChar(body.name, 'Name');
     assertNoReplacementChar(body.description, 'Description');
@@ -547,6 +578,14 @@ export class CourseController extends Controller {
     const info = await courseAccessInfo(user, course);
     if (!info.visible) return notFound(404);
     const startedIds = await moduleProgressRepository.listStartedCourseIds(user.id);
-    return { ...course, hasFullAccess: info.hasFullAccess, started: startedIds.has(course.id) };
+    const completedIds = await moduleProgressRepository.listCompletedModuleIds(user.id, course.id);
+    const totalModules = await courseModuleRepository.countForCourse(course.id);
+    return {
+      ...course,
+      hasFullAccess: info.hasFullAccess,
+      started: startedIds.has(course.id),
+      completedModules: Math.min(completedIds.size, totalModules),
+      totalModules,
+    };
   }
 }

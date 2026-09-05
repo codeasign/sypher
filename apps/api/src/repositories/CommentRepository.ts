@@ -42,6 +42,7 @@ export interface CommentAuthorData {
   fullName: string | null;
   username: string;
   role: string;
+  avatarUrl: string | null;
 }
 
 export interface CommentViewData {
@@ -99,7 +100,7 @@ export interface CommentActionContext {
 }
 
 const commentRowInclude = {
-  user: { select: { id: true, fullName: true, username: true, role: true } },
+  user: { select: { id: true, fullName: true, username: true, role: true, avatarUrl: true } },
   // All three optional includes are cheap; exactly one resolves non-null (CHECK).
   courseModule: { select: { course: { select: { authorId: true } } } },
   blogPost: { select: { authorId: true } },
@@ -606,6 +607,7 @@ export class CommentRepository {
         fullName: row.user.fullName,
         username: row.user.username,
         role: row.user.role,
+        avatarUrl: row.user.avatarUrl,
       },
       isContentAuthor: contentAuthorIdOf(row) === row.user.id,
       mentions: mentionsByComment.get(row.id) ?? [],

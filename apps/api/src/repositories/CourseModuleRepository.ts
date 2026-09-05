@@ -86,6 +86,21 @@ export class CourseModuleRepository {
     return prisma.courseModule.count({ where: { courseId } });
   }
 
+  /**
+   * Total module count per course, for the given course ids — the
+   * denominator of the My Courses / Browse Courses progress bar. One
+   * grouped query; a course with no modules is simply absent (treat as 0).
+   */
+  async countByCourse(courseIds: string[]): Promise<Map<string, number>> {
+    if (courseIds.length === 0) return new Map();
+    const rows = await prisma.courseModule.groupBy({
+      by: ['courseId'],
+      where: { courseId: { in: courseIds } },
+      _count: { id: true },
+    });
+    return new Map(rows.map((r) => [r.courseId, r._count.id]));
+  }
+
   // For /bookmarks — same "not filtered by status" reasoning as
   // CourseRepository.findByIds.
   async findByIdsWithCourse(ids: string[]): Promise<ModuleWithCourseEntry[]> {

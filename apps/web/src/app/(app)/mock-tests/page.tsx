@@ -29,11 +29,6 @@ export default async function MockTestsPage(): Promise<React.JSX.Element> {
   return (
     <div className={styles.page}>
       <div className={styles.container}>
-        <div className={styles.pageHeader}>
-          <h1 className={styles.pageTitle}>Mock Test</h1>
-          <p className={styles.pageSubtitle}>Timed mock exams that mirror the real certification experience.</p>
-        </div>
-
         <MockExamList initialExams={page.exams} total={page.total} pageSize={PAGE_SIZE} />
       </div>
     </div>

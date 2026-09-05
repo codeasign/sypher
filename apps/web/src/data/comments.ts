@@ -16,6 +16,7 @@ export interface CommentAuthorView {
   fullName: string | null;
   username: string;
   role: string;
+  avatarUrl: string | null;
 }
 
 export interface CommentMentionRef {

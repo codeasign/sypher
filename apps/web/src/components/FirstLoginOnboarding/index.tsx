@@ -7,13 +7,6 @@ import { uploadToBunny } from '@/data/bunnyUpload';
 import { PRESET_AVATARS, checkHandleAvailable, submitOnboarding } from '@/data/onboarding';
 import styles from './styles.module.css';
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
-
 // Pre-auth / password screens where a blocking onboarding modal would be
 // wrong. Everything else — main host AND corporate.sypher.local, every
 // role — shows the modal until onboarding is done.
@@ -104,7 +97,7 @@ function OnboardingModal({ initialHandle }: { initialHandle: string }): React.JS
     setUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, 'users/avatars', BUNNY_CONFIG);
+      const url = await uploadToBunny(file, 'users/avatars');
       setUploadedUrl(url);
       setAvatar(url);
     } catch {

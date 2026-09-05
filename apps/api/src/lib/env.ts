@@ -58,7 +58,7 @@ export const env = {
       monthlyLimit: process.env.RESEND_MONTHLY_LIMIT ?? '',
     },
   },
-  // Same Bunny zone as apps/web (apps/web/.env.example's NEXT_PUBLIC_BUNNY_*)
+  // Same Bunny zone as apps/web (apps/web/.env's BUNNY_* — server-only)
   // — plain server-side names here since apps/api never ships to a browser
   // bundle. Only used by scripts/import-docusaurus-course.ts today.
   bunny: {

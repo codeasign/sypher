@@ -262,7 +262,7 @@ Before declaring the course complete, verify:
 - **Module order = free preview order** — the first N modules by `orderIndex` are the free preview. Plan this deliberately.
 - **Use Caddy HTTPS for testing** — `https://next.sypher.local`, not `http://localhost:3000`. The scheme mismatch silently breaks session cookies.
 - **Idempotent publishing** — you can safely re-run `/create-course-web` on an existing course; it should update fields, not create duplicates. The slug is unique in Prisma.
-- **Never hardcode API keys** — Bunny config comes from env vars (`NEXT_PUBLIC_BUNNY_*`), Supabase from `.env.local`.
+- **Never hardcode API keys** — Bunny config comes from env vars (`BUNNY_*`), Supabase from `.env.local`.
 - **One course per invocation** — `$ARGUMENTS` takes a single slug. For multiple courses, call the command multiple times.
 
 ---

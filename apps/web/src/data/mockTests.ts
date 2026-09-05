@@ -12,6 +12,10 @@ export interface MockExamSummary {
   easyCount: number;
   mediumCount: number;
   hardCount: number;
+  role: string | null;
+  officialLink: string | null;
+  logoUrl: string | null;
+  priceUsd: number | null;
 }
 
 export interface MockExamSummaryPage {

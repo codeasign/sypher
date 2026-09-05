@@ -1,39 +1,23 @@
-function sanitizeFilename(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9.\-]/g, '-')
-    .replace(/-+/g, '-');
-}
+// Uploads go through our own server route (`/api/upload`), which holds the
+// Bunny storage key server-side, authenticates the caller, and validates
+// type/size/path before PUTting to Bunny. The client never sees the key.
 
-export interface BunnyConfig {
-  bunnyStorageZone?: string;
-  bunnyStorageAccessKey?: string;
-  bunnyStorageHostname?: string;
-  bunnyPullZoneUrl?: string;
-}
+export async function uploadToBunny(file: File, pathPrefix: string): Promise<string> {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('prefix', pathPrefix);
 
-export async function uploadToBunny(file: File, pathPrefix: string, config: BunnyConfig): Promise<string> {
-  const { bunnyStorageZone: zone, bunnyStorageAccessKey: accessKey, bunnyStorageHostname: hostname, bunnyPullZoneUrl: pullZoneUrl } = config;
-
-  if (!zone || !accessKey || !hostname || !pullZoneUrl) {
-    throw new Error('Bunny.net is not configured. Check BUNNY_* environment variables.');
-  }
-
-  const filename = `${Date.now()}-${sanitizeFilename(file.name)}`;
-  const path = `${pathPrefix}/${filename}`;
-
-  const response = await fetch(`https://${hostname}/${zone}/${path}`, {
-    method: 'PUT',
-    headers: {
-      AccessKey: accessKey,
-      'Content-Type': file.type || 'application/octet-stream',
-    },
-    body: file,
+  const res = await fetch('/api/upload', {
+    method: 'POST',
+    body: form,
+    credentials: 'include',
   });
 
-  if (!response.ok) {
-    throw new Error(`Bunny.net upload failed: ${response.status} ${response.statusText}`);
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { message?: string };
+    throw new Error(body.message ?? `Upload failed (${res.status})`);
   }
 
-  return `${pullZoneUrl.replace(/\/$/, '')}/${path}`;
+  const { url } = (await res.json()) as { url: string };
+  return url;
 }

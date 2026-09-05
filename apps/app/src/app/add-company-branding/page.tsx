@@ -16,13 +16,6 @@ interface LocationsCatalog {
   locations: { id: string; name: string; slug: string; stateId: string }[];
 }
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
-
 const EMPLOYEE_RANGES = [
   { value: '1-10', label: '1-10 employees' },
   { value: '11-50', label: '11-50 employees' },
@@ -150,7 +143,7 @@ function AddCompanyBrandingContent(): React.JSX.Element {
     setLogoUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, `branding/${activeCompanyName}`, BUNNY_CONFIG);
+      const url = await uploadToBunny(file, `branding/${activeCompanyName}`);
       trackEvent('branding_logo_upload');
       setLogoUrl(url);
     } catch (err) {

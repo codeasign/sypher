@@ -9,6 +9,6 @@ sidebar_position: 0
 
 import DocCardList from '@theme/DocCardList';
 
-Build a tool that transforms raw meeting transcripts into structured, actionable summaries — extracting decisions, action items, and key discussion points automatically.
+Build a tool that transforms raw meeting transcripts into structured, actionable summaries, extracting decisions, action items, and key discussion points automatically.
 
 <DocCardList />

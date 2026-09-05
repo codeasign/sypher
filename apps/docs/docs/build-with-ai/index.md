@@ -5,19 +5,19 @@ sidebar_label: Course Home
 
 # Build with AI
 
-*Estimated completion time: 80–120 hours*
+*Estimated completion time: 80 to 120 hours*
 
-**Difficulty:** Beginner to Advanced
+**Difficulty:** Beginner to advanced
 
-## What This Course Covers
+## What this course covers
 
-Build with AI is a project-based course where you build real AI applications from scratch. Each project guides you through the full development lifecycle — from architecture and planning through implementation, testing, and deployment. You will start with small, focused mini projects and progress to production-grade systems, portfolio-worthy applications, and enterprise-scale architectures.
+Build with AI is a project-based course where you build real AI applications from scratch. Each project guides you through the full development lifecycle: from architecture and planning through implementation, testing, and deployment. You will start with small, focused mini projects and progress to production-grade systems, portfolio-worthy applications, and enterprise-scale architectures.
 
-## Why This Matters
+## Why this matters
 
-The best way to learn AI engineering is by building. Theory gives you the map, but projects give you the terrain. By the end of this course, you will have built everything from a daily AI news digest to a multi-agent research platform — each project adding new skills, tools, and patterns to your engineering toolkit.
+The best way to learn AI engineering is by building. Theory gives you the map, but projects give you the terrain. By the end of this course, you will have built everything from a daily AI news digest to a multi-agent research platform, each project adding new skills, tools, and patterns to your engineering toolkit.
 
-## Skills You Will Gain
+## Skills you will gain
 
 - Build AI-powered applications using LLM APIs, embeddings, and RAG
 - Architect and deploy production-grade AI systems with Docker and CI/CD
@@ -30,44 +30,44 @@ The best way to learn AI engineering is by building. Theory gives you the map, b
 
 ## Prerequisites
 
-- Python programming — functions, classes, and basic async/await
+- Python programming: functions, classes, and basic async/await
 - Familiarity with LLM APIs (calling Anthropic or OpenAI at least once)
 - Basic understanding of REST APIs and JSON
 
-## Course Roadmap
+## Course roadmap
 
 <CourseCurriculum />
 
-## Project Tracks
+## Project tracks
 
-### Mini Projects
+### Mini projects
 Start with focused, single-feature projects that build foundational skills:
 - AI news digest, movie release tracker, recipe finder, travel planner
 - Job listing scraper, research paper emailer, interview coach
 - Git commit message generator, PR reviewer, README generator
 
-### Intermediate Projects
+### Intermediate projects
 Build full-stack AI applications with multiple features:
 - Chat with PDFs, meeting notes summarizer, resume reviewer
 - Customer support bot, voice notes summarizer
 
-### Production Projects
+### Production projects
 Build production-ready systems with enterprise architecture:
 - Enterprise RAG systems, AI helpdesk, AI coding assistant
 - AI QA engineer, MCP servers, LangGraph workflows
 - ChatGPT clone, AI learning platform
 
-### Portfolio Projects
+### Portfolio projects
 Capstone projects that showcase end-to-end AI engineering:
 - Multi-agent research platform, AI testing framework
 - AI observability platform, enterprise knowledge assistant
 
-## How to Use This Course
+## How to use this course
 
 Each project follows a structured format:
 
-- **Architecture** — system design, components, and data flow
-- **Build** — step-by-step implementation with complete code
-- **Deploy** — deployment, testing, and production considerations
+- **Architecture**: system design, components, and data flow
+- **Build**: step-by-step implementation with complete code
+- **Deploy**: deployment, testing, and production considerations
 
 You can follow the projects in order or jump to a specific track. Mini projects are recommended first if you are new to building with AI.

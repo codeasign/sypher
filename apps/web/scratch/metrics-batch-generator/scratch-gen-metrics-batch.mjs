@@ -11,7 +11,8 @@ const API = 'http://localhost:4000';
 // Loads apps/web/.env into process.env (Node 20.6+ built-in — this is a
 // plain `node` script, not `next dev`, so nothing loads .env for it
 // automatically). Never hardcode the Bunny credentials here — see
-// apps/web/.env.example for the four expected NEXT_PUBLIC_BUNNY_* names.
+// apps/web/.env.example for the four expected BUNNY_* names (server-only,
+// no NEXT_PUBLIC_ prefix — the storage key must never reach a client bundle).
 process.loadEnvFile(path.join(ROOT, '.env'));
 
 function requireEnv(name) {
@@ -21,10 +22,10 @@ function requireEnv(name) {
 }
 
 const BUNNY = {
-  zone: requireEnv('NEXT_PUBLIC_BUNNY_STORAGE_ZONE'),
-  accessKey: requireEnv('NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY'),
-  hostname: requireEnv('NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME'),
-  pullZoneUrl: requireEnv('NEXT_PUBLIC_BUNNY_PULL_ZONE_URL'),
+  zone: requireEnv('BUNNY_STORAGE_ZONE'),
+  accessKey: requireEnv('BUNNY_STORAGE_ACCESS_KEY'),
+  hostname: requireEnv('BUNNY_STORAGE_HOSTNAME'),
+  pullZoneUrl: requireEnv('BUNNY_PULL_ZONE_URL'),
 };
 
 // ---------- small utils ----------

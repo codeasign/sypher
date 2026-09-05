@@ -1,40 +1,23 @@
-function sanitizeFilename(name) {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9.\-]/g, '-')
-    .replace(/-+/g, '-');
-}
+// Uploads go through our own server route (`/api/upload`), which holds the
+// Bunny storage key server-side, authenticates the caller, and validates
+// type/size/path before PUTting to Bunny. The client never sees the key.
 
-// customFields comes from useDocusaurusContext().siteConfig.customFields —
-// see bunnyStorageZone/bunnyStorageAccessKey/bunnyStorageHostname/bunnyPullZoneUrl
-// in docusaurus.config.js, same pattern as web3formsAccessKey.
-export async function uploadToBunny(file, pathPrefix, customFields) {
-  const {
-    bunnyStorageZone: zone,
-    bunnyStorageAccessKey: accessKey,
-    bunnyStorageHostname: hostname,
-    bunnyPullZoneUrl: pullZoneUrl,
-  } = customFields ?? {};
+export async function uploadToBunny(file, pathPrefix) {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('prefix', pathPrefix);
 
-  if (!zone || !accessKey || !pullZoneUrl) {
-    throw new Error('Bunny.net is not configured. Check BUNNY_* environment variables.');
-  }
-
-  const filename = `${Date.now()}-${sanitizeFilename(file.name)}`;
-  const path = `${pathPrefix}/${filename}`;
-
-  const response = await fetch(`https://${hostname}/${zone}/${path}`, {
-    method: 'PUT',
-    headers: {
-      AccessKey: accessKey,
-      'Content-Type': file.type || 'application/octet-stream',
-    },
-    body: file,
+  const res = await fetch('/api/upload', {
+    method: 'POST',
+    body: form,
+    credentials: 'include',
   });
 
-  if (!response.ok) {
-    throw new Error(`Bunny.net upload failed: ${response.status} ${response.statusText}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.message ?? `Upload failed (${res.status})`);
   }
 
-  return `${pullZoneUrl.replace(/\/$/, '')}/${path}`;
+  const { url } = await res.json();
+  return url;
 }

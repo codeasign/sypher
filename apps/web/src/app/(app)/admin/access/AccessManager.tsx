@@ -11,13 +11,6 @@ import { roleColor } from '@/lib/roleColors';
 import courseCatalog from '@sypher/course-catalog/src/courses';
 import styles from './styles.module.css';
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
-
 const ROLES = ['ADMIN', 'FREE_USER', 'PAID_USER', 'INTERNAL_HR', 'COMPANY_HR', 'COMPANY_EMPLOYEE', 'BRANDER', 'COHORT_USER'] as const;
 type Role = (typeof ROLES)[number];
 const NON_ADMIN_ROLES = ROLES.filter((r) => r !== 'ADMIN');
@@ -473,7 +466,7 @@ function CompanyFormModal({
     try {
       // Uploaded to Bunny (no external-logo linking) — the form carries the
       // resulting CDN URL like every other image in the app.
-      const url = await uploadToBunny(file, 'companies/logos', BUNNY_CONFIG);
+      const url = await uploadToBunny(file, 'companies/logos');
       set('logoUrl', url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload logo.');

@@ -172,7 +172,10 @@ export default function CommentItem({
   const badgeText = comment.author.role === 'ADMIN' && !comment.isContentAuthor ? 'Admin' : badgeLabel;
 
   return (
-    <article className={`${styles.commentItem} ${isReply ? styles.commentItemReply : ''}`}>
+    <article
+      id={`comment-${comment.id}`}
+      className={`${styles.commentItem} ${isReply ? styles.commentItemReply : ''}`}
+    >
       {comment.isBestAnswer && (
         <div className={styles.bestAnswerBanner}>✔ Best Answer</div>
       )}
@@ -209,7 +212,12 @@ export default function CommentItem({
         <div className={styles.commentMain}>
           <div className={styles.commentHeaderRow}>
             <span className={`${styles.avatar} ${isReply ? styles.avatarSmall : ''}`} aria-hidden="true">
-              {initialsOf(comment.author.fullName, comment.author.username)}
+              {comment.author.avatarUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={comment.author.avatarUrl} alt="" />
+              ) : (
+                initialsOf(comment.author.fullName, comment.author.username)
+              )}
             </span>
             <div className={styles.commentIdentity}>
               <span className={styles.commentName}>{comment.author.fullName || comment.author.username}</span>

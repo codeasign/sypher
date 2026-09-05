@@ -9,6 +9,6 @@ sidebar_position: 0
 
 import DocCardList from '@theme/DocCardList';
 
-Build a tool that transcribes voice recordings, extracts key insights, and generates structured summaries — turning spoken notes into organised, searchable documents.
+Build a tool that transcribes voice recordings, extracts key insights, and generates structured summaries, turning spoken notes into organised, searchable documents.
 
 <DocCardList />

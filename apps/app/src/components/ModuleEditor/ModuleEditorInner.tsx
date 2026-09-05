@@ -75,13 +75,6 @@ interface ModuleEditorProps {
   onBack?: () => void;
 }
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
-
 export default function ModuleEditorInner({
   courseId,
   courseSlug,
@@ -118,7 +111,7 @@ export default function ModuleEditorInner({
   }
 
   async function handleImageUpload(file: File): Promise<string> {
-    return uploadToBunny(file, `courses/${courseSlug}/modules`, BUNNY_CONFIG);
+    return uploadToBunny(file, `courses/${courseSlug}/modules`);
   }
 
   async function persist(): Promise<string | null> {

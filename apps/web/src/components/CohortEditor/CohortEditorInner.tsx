@@ -22,6 +22,7 @@ import {
   CreateLink,
 } from '@mdxeditor/editor';
 import { hardLineBreakPlugin } from '@/lib/mdxeditor/hardLineBreakPlugin';
+import { useColorMode } from '@/hooks/useColorMode';
 import { createCohort, updateCohort, setCohortStatus } from '@/data/cohorts';
 import { uploadToBunny } from '@/data/bunnyUpload';
 import CohortArticle from '@/components/CohortPostPage/CohortArticle';
@@ -77,13 +78,6 @@ interface CohortEditorProps {
   onBack?: () => void;
 }
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
-
 export default function CohortEditorInner({ cohort, onSaved, onCancel, onBack }: CohortEditorProps): React.JSX.Element {
   const isEditing = Boolean(cohort);
 
@@ -100,6 +94,7 @@ export default function CohortEditorInner({ cohort, onSaved, onCancel, onBack }:
   const [error, setError] = useState<string | null>(null);
   const [previewMode, setPreviewMode] = useState(false);
   const [editorInstanceKey, setEditorInstanceKey] = useState(0);
+  const { colorMode } = useColorMode();
 
   function togglePreview(): void {
     if (previewMode) {
@@ -112,7 +107,7 @@ export default function CohortEditorInner({ cohort, onSaved, onCancel, onBack }:
     setCoverUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, 'cohorts/covers', BUNNY_CONFIG);
+      const url = await uploadToBunny(file, 'cohorts/covers');
       setCoverImageUrl(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload cover image.');
@@ -276,6 +271,7 @@ export default function CohortEditorInner({ cohort, onSaved, onCancel, onBack }:
             <div className={styles.mdxWrapper}>
               <MDXEditor
                 key={editorInstanceKey}
+                className={colorMode === 'dark' ? 'dark-theme' : undefined}
                 contentEditableClassName={styles.mdxContentEditable}
                 markdown={content}
                 onChange={setContent}

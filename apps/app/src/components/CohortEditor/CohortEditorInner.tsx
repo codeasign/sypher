@@ -65,13 +65,6 @@ interface CohortEditorProps {
   onBack?: () => void;
 }
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
-
 export default function CohortEditorInner({ cohort, onSaved, onCancel, onBack }: CohortEditorProps): React.JSX.Element {
   const { supabase, user } = useAuth();
   const { colorMode } = useColorMode();
@@ -105,7 +98,7 @@ export default function CohortEditorInner({ cohort, onSaved, onCancel, onBack }:
     setCoverUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, 'cohorts/covers', BUNNY_CONFIG);
+      const url = await uploadToBunny(file, 'cohorts/covers');
       setCoverImageUrl(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload cover image.');

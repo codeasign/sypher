@@ -78,13 +78,6 @@ interface BlogPostEditorProps {
   onBack?: () => void;
 }
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
-
 export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }: BlogPostEditorProps): React.JSX.Element {
   const { colorMode } = useColorMode();
   const { supabase, user } = useAuth();
@@ -130,7 +123,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
     setCoverUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, 'blog/covers', BUNNY_CONFIG);
+      const url = await uploadToBunny(file, 'blog/covers');
       setCoverImageUrl(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload cover image.');
@@ -140,7 +133,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
   }
 
   async function handleImageUpload(file: File): Promise<string> {
-    return uploadToBunny(file, 'blog/content', BUNNY_CONFIG);
+    return uploadToBunny(file, 'blog/content');
   }
 
   function selectFeaturedMediaType(type: FeaturedMediaType | null): void {
@@ -160,7 +153,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
     setFeaturedMediaUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, 'blog/featured-media', BUNNY_CONFIG);
+      const url = await uploadToBunny(file, 'blog/featured-media');
       setFeaturedMediaValue(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload PDF.');

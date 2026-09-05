@@ -31,6 +31,7 @@ import {
 } from '@mdxeditor/editor';
 import type { MDXEditorMethods } from '@mdxeditor/editor';
 import { hardLineBreakPlugin } from '@/lib/mdxeditor/hardLineBreakPlugin';
+import { useColorMode } from '@/hooks/useColorMode';
 import { createCourseModule, updateCourseModule, type CourseModule } from '@/data/courses';
 import { uploadToBunny } from '@/data/bunnyUpload';
 import '@mdxeditor/editor/style.css';
@@ -62,13 +63,6 @@ interface ModuleEditorProps {
   onBack?: () => void;
 }
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
-
 export default function ModuleEditorInner({ courseId, module: mod, onSaved, onCancel, onBack }: ModuleEditorProps): React.JSX.Element {
   const [title, setTitle] = useState(mod?.title ?? '');
   const [showInGettingStarted, setShowInGettingStarted] = useState(mod?.showInGettingStarted ?? false);
@@ -79,6 +73,7 @@ export default function ModuleEditorInner({ courseId, module: mod, onSaved, onCa
   const [contentMarkdown, setContentMarkdown] = useState(mod?.bodyMdx ?? '');
   const [editorInstanceKey, setEditorInstanceKey] = useState(0);
   const editorRef = useRef<MDXEditorMethods>(null);
+  const { colorMode } = useColorMode();
 
   const isEditing = Boolean(mod);
   const canSave = title.trim().length > 0 && contentMarkdown.trim().length > 0 && !saving;
@@ -96,7 +91,7 @@ export default function ModuleEditorInner({ courseId, module: mod, onSaved, onCa
   }
 
   async function handleImageUpload(file: File): Promise<string> {
-    return uploadToBunny(file, `courses/${courseId}/modules`, BUNNY_CONFIG);
+    return uploadToBunny(file, `courses/${courseId}/modules`);
   }
 
   async function handleSave(): Promise<void> {
@@ -196,6 +191,7 @@ export default function ModuleEditorInner({ courseId, module: mod, onSaved, onCa
               <MDXEditor
                 key={editorInstanceKey}
                 ref={editorRef}
+                className={colorMode === 'dark' ? 'dark-theme' : undefined}
                 contentEditableClassName={styles.mdxContentEditable}
                 markdown={draftMarkdown}
                 onChange={(markdown) => setContentMarkdown(markdown)}

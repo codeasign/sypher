@@ -29,6 +29,10 @@ interface MockExamSummaryEntry {
   easyCount: number;
   mediumCount: number;
   hardCount: number;
+  role: string | null;
+  officialLink: string | null;
+  logoUrl: string | null;
+  priceUsd: number | null;
 }
 
 // Options ship as the full key -> text map ("A" -> "ML is a subset of AI…")
@@ -106,6 +110,10 @@ function toSummaryEntry(exam: MockExam): MockExamSummaryEntry {
     easyCount: exam.easyCount,
     mediumCount: exam.mediumCount,
     hardCount: exam.hardCount,
+    role: exam.role,
+    officialLink: exam.officialLink,
+    logoUrl: exam.logoUrl,
+    priceUsd: exam.priceUsd,
   };
 }
 

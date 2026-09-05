@@ -31,14 +31,16 @@ import {
 } from '@mdxeditor/editor';
 import type { MDXEditorMethods } from '@mdxeditor/editor';
 import { hardLineBreakPlugin } from '@/lib/mdxeditor/hardLineBreakPlugin';
+import { PdfIcon, VideoIcon, NoMediaIcon } from '@/components/icons/ActionIcons';
+import { useColorMode } from '@/hooks/useColorMode';
 import { extractYouTubeId } from '@/lib/youtube';
 import { apiFetch } from '@/lib/api';
 import { uploadToBunny } from '@/data/bunnyUpload';
 import '@mdxeditor/editor/style.css';
 import styles from './styles.module.css';
 
-const TITLE_MAX = 80;
-const DESCRIPTION_MAX = 120;
+const TITLE_MAX = 150;
+const DESCRIPTION_MAX = 250;
 
 function EyeIcon(): React.JSX.Element {
   return (
@@ -79,13 +81,6 @@ interface BlogPostEditorProps {
   onBack?: () => void;
 }
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
-
 export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }: BlogPostEditorProps): React.JSX.Element {
   const [title, setTitle] = useState(post?.title ?? '');
   const [description, setDescription] = useState(post?.description ?? '');
@@ -106,6 +101,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
   const [editorInstanceKey, setEditorInstanceKey] = useState(0);
   const editorRef = useRef<MDXEditorMethods>(null);
   const coverInputRef = useRef<HTMLInputElement>(null);
+  const { colorMode } = useColorMode();
 
   const isEditing = Boolean(post);
   const canSave =
@@ -129,7 +125,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
     setCoverUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, 'blog/covers', BUNNY_CONFIG);
+      const url = await uploadToBunny(file, 'blog/covers');
       setCoverImageUrl(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload cover image.');
@@ -139,7 +135,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
   }
 
   async function handleImageUpload(file: File): Promise<string> {
-    return uploadToBunny(file, 'blog/content', BUNNY_CONFIG);
+    return uploadToBunny(file, 'blog/content');
   }
 
   function selectFeaturedMediaType(type: FeaturedMediaType | null): void {
@@ -159,7 +155,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
     setFeaturedMediaUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, 'blog/featured-media', BUNNY_CONFIG);
+      const url = await uploadToBunny(file, 'blog/featured-media');
       setFeaturedMediaValue(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload PDF.');
@@ -284,6 +280,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
             ← Back to posts
           </button>
         )}
+        <div className={styles.toolbarSpacer} />
         <button
           type="button"
           className={clsx(styles.toolbarBtn, previewMode && styles.toolbarBtnActive)}
@@ -361,7 +358,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
                 maxLength={DESCRIPTION_MAX}
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="Short summary shown on the blog listing"
-                rows={2}
+                rows={3}
                 disabled={saving}
               />
               <div className={styles.fieldMetaRow}>
@@ -372,6 +369,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
               </div>
             </div>
 
+            <div className={styles.formRow}>
             <div className={styles.formGroup}>
               <label className={styles.fieldLabel} htmlFor="blog-post-cover">
                 Cover image
@@ -399,26 +397,29 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
               <div className={styles.mediaTypeRow}>
                 <button
                   type="button"
-                  className={clsx(styles.toolbarBtn, featuredMediaType === null && styles.toolbarBtnActive)}
+                  className={clsx(styles.mediaTypeBtn, featuredMediaType === null && styles.mediaTypeBtnActive)}
                   onClick={() => selectFeaturedMediaType(null)}
                   disabled={saving}
                 >
+                  <NoMediaIcon />
                   None
                 </button>
                 <button
                   type="button"
-                  className={clsx(styles.toolbarBtn, featuredMediaType === 'pdf' && styles.toolbarBtnActive)}
+                  className={clsx(styles.mediaTypeBtn, featuredMediaType === 'pdf' && styles.mediaTypeBtnActive)}
                   onClick={() => selectFeaturedMediaType('pdf')}
                   disabled={saving}
                 >
+                  <PdfIcon />
                   PDF
                 </button>
                 <button
                   type="button"
-                  className={clsx(styles.toolbarBtn, featuredMediaType === 'youtube' && styles.toolbarBtnActive)}
+                  className={clsx(styles.mediaTypeBtn, featuredMediaType === 'youtube' && styles.mediaTypeBtnActive)}
                   onClick={() => selectFeaturedMediaType('youtube')}
                   disabled={saving}
                 >
+                  <VideoIcon />
                   YouTube
                 </button>
               </div>
@@ -459,6 +460,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
                 </div>
               )}
             </div>
+            </div>
           </div>
 
           <div className={clsx(styles.card, styles.contentCard)}>
@@ -469,6 +471,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
               <MDXEditor
                 key={editorInstanceKey}
                 ref={editorRef}
+                className={colorMode === 'dark' ? 'dark-theme' : undefined}
                 contentEditableClassName={styles.mdxContentEditable}
                 markdown={draftMarkdown}
                 onChange={(markdown) => setContentMarkdown(markdown)}

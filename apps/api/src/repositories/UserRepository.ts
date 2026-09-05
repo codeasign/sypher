@@ -121,6 +121,17 @@ export class UserRepository {
     }
   }
 
+  /** Profile-settings avatar change — preset path or Bunny URL, validated
+   * by the caller (see lib/avatar.ts). */
+  async setAvatarUrl(userId: string, avatarUrl: string): Promise<void> {
+    await prisma.user.update({ where: { id: userId }, data: { avatarUrl } });
+  }
+
+  /** Profile-settings About/bio change — null clears it. */
+  async setBio(userId: string, bio: string | null): Promise<void> {
+    await prisma.user.update({ where: { id: userId }, data: { bio } });
+  }
+
   /**
    * Completes first-login onboarding in one write: handle + avatar + the
    * two acceptance timestamps. Same unique-username race handling as

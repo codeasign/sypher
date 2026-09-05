@@ -93,6 +93,7 @@ interface AuthUser {
   username: string;
   fullName: string | null;
   avatarUrl: string | null;
+  bio: string | null;
   role: string;
   companyId: string | null;
   paidUntil: string | null;
@@ -113,6 +114,7 @@ function toAuthUser(user: User): AuthUser {
     username: user.username,
     fullName: user.fullName,
     avatarUrl: user.avatarUrl,
+    bio: user.bio,
     role: user.role,
     companyId: user.companyId,
     paidUntil: user.paidUntil ? user.paidUntil.toISOString() : null,

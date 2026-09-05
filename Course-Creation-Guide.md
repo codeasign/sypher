@@ -820,10 +820,10 @@ apps/app/
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Public anon key (for client reads) |
 | `SUPABASE_SERVICE_ROLE_KEY` | Admin key (bypasses RLS — compose script only) |
-| `NEXT_PUBLIC_BUNNY_STORAGE_ZONE` | Bunny storage zone name |
-| `NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY` | Bunny upload key |
-| `NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME` | Bunny storage hostname |
-| `NEXT_PUBLIC_BUNNY_PULL_ZONE_URL` | Bunny pull zone URL (for reading) |
+| `BUNNY_STORAGE_ZONE` | Bunny storage zone name |
+| `BUNNY_STORAGE_ACCESS_KEY` | Bunny upload key |
+| `BUNNY_STORAGE_HOSTNAME` | Bunny storage hostname |
+| `BUNNY_PULL_ZONE_URL` | Bunny pull zone URL (for reading) |
 | `NEXT_PUBLIC_API_BASE_URL` | Deployed app origin (for revalidation POST) |
 | `COURSES_REVALIDATE_SECRET` | Secret for revalidation endpoint |
 

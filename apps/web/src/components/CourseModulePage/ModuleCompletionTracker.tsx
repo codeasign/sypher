@@ -34,13 +34,12 @@ export default function ModuleCompletionTracker({ courseSlug, moduleSlug, alread
           console.error(`[ModuleCompletionTracker] mark-complete failed: ${res.status} ${res.statusText} (${path})`);
           return;
         }
-        // The /learn/[slug] layout (CourseModuleIndex + the prev/next
-        // pager) is rendered server-side and its RSC payload is cached for
-        // the whole subtree — client navigation between modules never
-        // re-runs its data fetch, so the just-earned completion dot would
-        // stay grey until a full reload. router.refresh() refetches the
-        // Server Components for the current route INCLUDING the layout,
-        // so the dot (and course-outline progress) updates immediately.
+        // This page (and the course home page's Topics list) is rendered
+        // server-side and its RSC payload is cached for the whole subtree
+        // — client navigation between modules never re-runs its data
+        // fetch, so a just-earned completion wouldn't be reflected until a
+        // full reload. router.refresh() refetches the Server Components
+        // for the current route so completion state updates immediately.
         if (!alreadyComplete) {
           router.refresh();
         }

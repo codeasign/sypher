@@ -5,14 +5,8 @@ import { createCourse, updateCourse, setCourseStatus, AUDIENCE_ROLES, type Cours
 import { uploadToBunny } from '@/data/bunnyUpload';
 import styles from './manage-courses.module.css';
 
-const NAME_MAX = 80;
-
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
+const NAME_MAX = 250;
+const DESCRIPTION_MAX = 500;
 
 interface CourseEditorProps {
   course?: Course | null;
@@ -61,7 +55,7 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
     setCoverUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, `courses/${course?.slug ?? 'new'}/covers`, BUNNY_CONFIG);
+      const url = await uploadToBunny(file, `courses/${course?.slug ?? 'new'}/covers`);
       setCoverImageUrl(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload cover image.');
@@ -171,19 +165,44 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
       {error && <p className={styles.error}>{error}</p>}
 
       <div className={styles.formGroup}>
+        <div className={styles.coverHeaderRow}>
+          <label className={styles.fieldLabel} htmlFor="course-cover">
+            Cover image
+          </label>
+          <input
+            id="course-cover"
+            ref={coverInputRef}
+            type="file"
+            accept="image/*"
+            className={styles.fileInput}
+            onChange={handleCoverImageChange}
+            disabled={saving || coverUploading}
+          />
+        </div>
+        {coverImageUrl && <img src={coverImageUrl} alt="Cover preview" className={styles.coverPreview} />}
+        {coverUploading && <p className={styles.uploadStatus}>Uploading…</p>}
+      </div>
+
+      <div className={styles.formGroup}>
         <label className={styles.fieldLabel} htmlFor="course-name">
           Name<span className={styles.requiredMark}>*</span>
         </label>
-        <input
+        <textarea
           id="course-name"
-          type="text"
-          className={styles.textInput}
+          className={`${styles.textInput} ${styles.nameArea}`}
+          rows={2}
           value={name}
           maxLength={NAME_MAX}
-          onChange={(e) => setName(e.target.value)}
+          onChange={(e) => setName(e.target.value.replace(/\n/g, ''))}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') e.preventDefault();
+          }}
           placeholder="Course name"
           disabled={saving}
         />
+        <span className={styles.charCount}>
+          {name.length}/{NAME_MAX}
+        </span>
         {isEditing && <p className={styles.slugPreview}>/learn/{course!.slug}</p>}
       </div>
 
@@ -195,11 +214,15 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
           id="course-description"
           className={styles.textArea}
           rows={3}
+          maxLength={DESCRIPTION_MAX}
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           placeholder="Shown to learners on the course home page"
           disabled={saving}
         />
+        <span className={styles.charCount}>
+          {description.length}/{DESCRIPTION_MAX}
+        </span>
       </div>
 
       <div className={styles.formGroup}>
@@ -255,22 +278,6 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
           placeholder="Comma-separated course slugs, e.g. learn-typescript,agentic-ai-fundamentals"
           disabled={saving}
         />
-      </div>
-
-      <div className={styles.formGroup}>
-        <label className={styles.fieldLabel} htmlFor="course-cover">
-          Cover image
-        </label>
-        {coverImageUrl && <img src={coverImageUrl} alt="Cover preview" className={styles.coverPreview} />}
-        <input
-          id="course-cover"
-          ref={coverInputRef}
-          type="file"
-          accept="image/*"
-          onChange={handleCoverImageChange}
-          disabled={saving || coverUploading}
-        />
-        {coverUploading && <p className={styles.uploadStatus}>Uploading…</p>}
       </div>
     </div>
   );

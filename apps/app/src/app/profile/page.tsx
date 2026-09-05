@@ -31,13 +31,6 @@ import ExpandMoreRoundedIcon from '@mui/icons-material/ExpandMoreRounded';
 import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded';
 import styles from './profile.module.css';
 
-const BUNNY_CONFIG = {
-  bunnyStorageZone: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ZONE,
-  bunnyStorageAccessKey: process.env.NEXT_PUBLIC_BUNNY_STORAGE_ACCESS_KEY,
-  bunnyStorageHostname: process.env.NEXT_PUBLIC_BUNNY_STORAGE_HOSTNAME,
-  bunnyPullZoneUrl: process.env.NEXT_PUBLIC_BUNNY_PULL_ZONE_URL,
-};
-
 const BIO_WORD_LIMIT = 250;
 
 interface TaxonomyCatalog {
@@ -483,7 +476,7 @@ function LearnerProfileContent(): React.JSX.Element {
     setIsUploadingResume(true);
     trackEvent('profile_resume_upload_click');
     try {
-      const url = await uploadToBunny(file, `resume/${session.user.id}`, BUNNY_CONFIG);
+      const url = await uploadToBunny(file, `resume/${session.user.id}`);
       const { error } = await updateOwnBio(
         supabase,
         bioInput.trim(),
