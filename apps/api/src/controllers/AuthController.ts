@@ -56,13 +56,13 @@ interface AuthRegisterRequest {
   email: string;
   password: string;
   fullName?: string;
-  recaptchaToken?: string;
+  recaptchaToken?: string | null;
 }
 
 interface AuthLoginRequest {
   email: string;
   password: string;
-  recaptchaToken?: string;
+  recaptchaToken?: string | null;
 }
 
 interface AuthCompanyLoginRequest {

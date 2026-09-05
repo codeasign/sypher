@@ -9,7 +9,7 @@ interface RecaptchaVerifyResponse {
  * usable until RECAPTCHA_REQUIRED=true and a server secret are configured;
  * production defaults to required verification.
  */
-export async function verifyRecaptchaToken(token: string | undefined, remoteIp?: string): Promise<boolean> {
+export async function verifyRecaptchaToken(token: string | null | undefined, remoteIp?: string): Promise<boolean> {
   const enabled = env.recaptcha.required || Boolean(env.recaptcha.secretKey);
   if (!enabled) return true;
   if (!env.recaptcha.secretKey || !token) return false;

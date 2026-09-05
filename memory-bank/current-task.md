@@ -5,7 +5,8 @@ Add Google reCAPTCHA v2 checkbox bot protection to Sign In, Sign Up, and Contact
 on https://next.sypher.local.
 
 ## Status
-Complete and verified by the user. Committed as `1b159734`.
+Complete. Original integration is committed as 1b159734. The nullable-token
+compatibility fix is staged and ready for the user's commit.
 
 ## Completed
 - Confirmed Sign In and Sign Up share apps/web/src/app/login/page.tsx;
@@ -17,12 +18,12 @@ Complete and verified by the user. Committed as `1b159734`.
 - Added API-side verification through Google's siteverify endpoint before
   authentication, account creation, or contact persistence/notification.
 - Preserved the contact honeypot's fake-success behavior for filled botcheck.
-- Production requires verification by default, even if RECAPTCHA_REQUIRED=false;
-  local development remains backward-compatible until RECAPTCHA_REQUIRED=true
-  and a server secret are configured.
-- Added API and web environment examples without secrets.
+- Production requires verification by default; local development is opt-in.
+- Fixed Tsoa validation rejecting recaptchaToken: null by making login,
+  register, contact DTOs and verifier input explicitly nullable.
+- User's exact payload now returns HTTP 200 and authenticates on the local API.
+- User confirmed this task is completed.
 - Google OAuth and corporate login remain outside this requested scope.
-- User checked the Sign In, Sign Up, and Contact flows after deployment.
 
 ## Decisions
 - Use v2 checkbox as selected by user.
@@ -31,26 +32,45 @@ Complete and verified by the user. Committed as `1b159734`.
 - No schema, RLS, or database changes.
 
 ## Known Issues
+- No site key or secret is configured in the current local env, so the checkbox
+  is not rendered locally until NEXT_PUBLIC_RECAPTCHA_SITE_KEY is supplied.
+- Real Google token success/failure cannot be exercised without matching Google
+  keys and a registered domain.
 - Previous tasks: ESLint 9 flat config missing; Next build worker spawn EPERM.
 
 ## Tests/Validation
-- npm run build --workspace apps/api: passed (including tsoa generation).
-- npx tsc --noEmit -p apps/web/tsconfig.json: passed.
-- Direct verifier test with RECAPTCHA_REQUIRED=true and no secret returned false
-  for both missing and supplied test tokens (fail-closed).
-- User verified the rendered checkbox and protected submissions on all three
-  flows after configuring the Google site key and API secret.
-- git diff --check passed before this handoff update.
+- npm run build --workspace apps/api: passed after nullable DTO fix.
+- npx tsc --noEmit -p apps/web/tsconfig.json: passed before this follow-up;
+  no web files changed by the fix.
+- Direct verifier test with RECAPTCHA_REQUIRED=true and no secret failed closed.
+- Exact payload {email,password,recaptchaToken:null} returned HTTP 200 locally.
+- git diff --check passed.
 - No credentials, database rows, schema, RLS, or authorization policy files
   changed.
 
 ## Files Modified
-- None; implementation files are committed in `1b159734`.
-- memory-bank/current-task.md is updated by this handoff checkpoint.
+Committed in 1b159734:
+- apps/api/.env.example
+- apps/api/src/controllers/AuthController.ts (base integration)
+- apps/api/src/controllers/ContactController.ts (base integration)
+- apps/api/src/lib/env.ts
+- apps/api/src/lib/recaptcha.ts (base integration)
+- apps/web/.env.example
+- apps/web/src/app/login/page.tsx
+- apps/web/src/app/login/styles.module.css
+- apps/web/src/app/contact/ContactForm.tsx
+- apps/web/src/components/RecaptchaV2.tsx
+- apps/web/src/components/RecaptchaV2.module.css
+Staged follow-up:
+- apps/api/src/controllers/AuthController.ts (nullable DTO fields)
+- apps/api/src/controllers/ContactController.ts (nullable DTO field)
+- apps/api/src/lib/recaptcha.ts (nullable verifier input)
+- memory-bank/current-task.md (handoff update)
 
 ## Next Action
-Await the next task. Do not change the completed reCAPTCHA integration unless a
-new issue is reported.
+User commits the staged nullable-token compatibility fix. Then await the next
+task; do not alter the completed reCAPTCHA integration unless a new issue is
+reported.
 
 ## Last Updated
 2026-09-05

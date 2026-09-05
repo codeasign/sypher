@@ -14,7 +14,7 @@ interface ContactRequest {
   message: string;
   /** Honeypot — real users never fill this in; bots that do get a fake success. */
   botcheck?: string;
-  recaptchaToken?: string;
+  recaptchaToken?: string | null;
 }
 
 interface ContactMessageResponse {
