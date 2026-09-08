@@ -12,7 +12,47 @@ bugs (duplicate heading, missing captions, missing course-nav sidebar,
 unstyled/monochrome code blocks) â€” fixing those became part of the same
 task, see "session 2"/"session 3" below.
 
-## Active Follow-up (2026-09-09: re-import two audited courses)
+## Completed Follow-up (2026-09-09: deepen Life Skills courses)
+The user authorized revisions to only the two courses whose category is exactly
+`life-skills`: `communication-skills` and `negotiation-skills`. Do not modify
+the 17 `Presentation` courses. Requirements: increase useful depth without
+padding, add no external links, and rename every `TRY IT` section to
+`PRACTICE`. Preserve the current published status and `FREE_USER,PAID_USER`
+access. All database writes must use the authenticated apps/api management
+endpoints through `apps/web/scripts/import-authored-course.mjs`; never write
+course rows directly through Prisma or Supabase.
+
+Baseline before editing: Effective Communication has 12 published modules and
+6,117 words; Negotiation Skills has 10 published modules and 4,742 words. Both
+have one-exercise overview practices and no final integrated practice. The
+committed staging files at `scratch/communication-skills/` and
+`scratch/negotiation-skills/` match the recoverable source baseline in commit
+`f767952d`. New lessons must be reordered through the management API because
+the idempotent importer updates existing slugs in place and appends new ones.
+
+The revision, authenticated API import, reordering, and post-import validation
+are complete. Both courses now have 15 modules and one `PRACTICE` section per
+module, with 2-3 visible suggested answers in every section. Effective
+Communication has 8,397 words and 43 suggested answers; Negotiation Skills has
+7,672 words and 44 suggested answers. The content review also corrected the
+BATNA/reservation-point distinction, qualified anchoring and budget guidance,
+and removed invented anecdotes and unsupported absolute claims.
+
+The importer updated all 22 existing modules in place and inserted 8 new
+modules. The management reorder endpoint then placed the new modules into the
+exact planned sequences (11 adjacent swaps for communication, 20 for
+negotiation). Authenticated API validation confirms both courses are published,
+categorized `life-skills`, contain 15 manual modules with canonical 1000..15000
+order indexes, and retain exactly `FREE_USER,PAID_USER` access. Every stored
+body exactly matches its staging source and passes the frontmatter/order, no
+leading H1, no `TRY IT`, no external URL, no unsupported MDX/Docusaurus syntax,
+quoted dialogue-block, and no en/em dash checks. The catalog contains exactly
+these two `life-skills` slugs; the 17 `Presentation` courses and their 90
+modules remain unchanged. Authenticated web renders returned HTTP 200 for both
+course homes and one new lesson from each course; the new lessons render
+`PRACTICE` and contain no `TRY IT`.
+
+## Completed Follow-up (2026-09-09: re-import two audited courses)
 The user requested re-importing `design-patterns` and
 `python-for-ai-engineers` from their completed, uncommitted content-quality
 edits, with the existing blackboard-v3 SVG normalization applied during Bunny
@@ -39,8 +79,9 @@ Storage and public-CDN audits both passed 221/221 for HTTP success, the
 `blackboard-v3` marker, and all four palette values. The earlier 222 expectation
 included the now-orphaned `state/lifecycle` manifest entry whose filler
 `AsciiDiagram` was deliberately removed from `state/01-theory.mdx` during the
-quality audit; current source contains exactly 172 + 49 = 221 tags. Preserve
-every pre-existing working-tree change; nothing is staged or committed.
+quality audit; current source contains exactly 172 + 49 = 221 tags. The source,
+importer, web/API work, and prior handoff were committed in `f767952d`
+(`Old Course Import and Design Overhaul`) on 2026-09-09.
 
 ## Status
 The user clarified that the 14-course screenshot was only the Docusaurus
@@ -1049,29 +1090,21 @@ miscolored.
   itself.
 
 ## Files Modified
-Reconciled from actual Git output on 2026-09-09. Nothing is staged. There are
-394 tracked file diffs and 13 untracked files:
+Reconciled from actual `git status --short` output on 2026-09-09. Nothing is
+staged and no commit has been made for the Life Skills follow-up:
 
-- 162 tracked files under `apps/docs/docs/design-patterns/`.
-- 202 tracked files under `apps/docs/docs/python-for-ai-engineers/`.
-- `apps/api/scripts/import-docusaurus-course.ts`.
-- `apps/api/src/repositories/CourseRepository.ts`.
-- `apps/api/src/repositories/DashboardRepository.ts`.
-- `apps/docs/diagram-manifests/git-github-actions.json`.
-- `apps/docs/diagram-manifests/python-for-ai-engineers.json`.
-- `apps/docs/diagram-manifests/summary.json`.
-- 22 tracked files under `apps/web/` (course catalog/reader/management and
-  Dashboard changes described above).
-- `memory-bank/current-task.md`.
-- Three untracked web files: `CourseLearnSidebar/index.tsx`,
-  `courseCoverImage.ts`, and `newCourses.ts` at their paths documented above.
-- Ten untracked authored modules under `scratch/negotiation-skills/`.
-
-`git status` additionally reports
-`apps/api/src/controllers/CourseController.ts` as stat-dirty, but its index and
-working-tree blob hashes are identical and both `git diff --raw` and
-`git diff --numstat` are empty for it; treat Git's content diff as authoritative.
-No files are currently moved or restored in the working tree.
+- `memory-bank/current-task.md`
+- All 12 previously tracked files under `scratch/communication-skills/`
+- All 10 previously tracked files under `scratch/negotiation-skills/`
+- New communication modules:
+  `06-manage-emotions-before-you-respond.mdx`,
+  `12-communicate-across-cultures-and-styles.mdx`, and
+  `13-persuade-without-pushing.mdx`
+- New negotiation modules:
+  `03-set-your-target-and-bargaining-range.mdx`,
+  `07-create-value-with-multiple-issues.mdx`,
+  `11-handle-pressure-and-unfair-tactics.mdx`, `13-break-a-deadlock.mdx`, and
+  `14-close-and-confirm-the-agreement.mdx`
 
 ## Unrelated small change (mid-session tangent)
 User pointed at GitHub's basic markdown formatting guide and asked that
@@ -1085,6 +1118,9 @@ flag if the rule should live there too, since `Course-Creation-Guide.md`
 is Sypher Next (apps/web)-specific by its own title.
 
 ## Next Action
+The Life Skills follow-up is complete; only user review and an explicitly
+requested commit remain. The older migration backlog follows:
+
 0. Reconcile/remove the orphaned `state/lifecycle` entry from the Design
    Patterns diagram manifest if the manifests will be archived before
    `apps/docs` is removed.
@@ -1119,6 +1155,20 @@ is Sypher Next (apps/web)-specific by its own title.
 2026-09-09
 
 ## Handoff Events
+
+- 2026-09-09 (Life Skills depth pass complete) - updated only
+  `communication-skills` and `negotiation-skills` through authenticated API
+  endpoints. Both are published `life-skills` courses with 15 ordered manual
+  modules, `FREE_USER,PAID_USER` access, one `PRACTICE` section per module,
+  2-3 visible suggested answers per section, and no external URLs. Stored bodies
+  exactly match the content-gated staging sources. The 17 Presentation courses
+  and 90 modules remain unchanged. Authenticated course-home and new-module web
+  renders returned HTTP 200. No commit made.
+
+- 2026-09-09 (committed) - user committed the completed work as `f767952d`
+  (`Old Course Import and Design Overhaul`). `git status` and `git diff --stat`
+  were empty immediately afterward. Updated this handoff after the commit; only
+  `memory-bank/current-task.md` is now modified and unstaged.
 
 - 2026-09-09 (legacy title-quote decision) - user decided to retain the 148
   semantically neutral YAML title quotes in the retiring Docusaurus source.
