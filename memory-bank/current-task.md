@@ -52,6 +52,10 @@ modules remain unchanged. Authenticated web renders returned HTTP 200 for both
 course homes and one new lesson from each course; the new lessons render
 `PRACTICE` and contain no `TRY IT`.
 
+The user committed this completed source and handoff state as `15b088d6`
+(`Communication Skills Overwrite`) on 2026-09-09. The commit contains all 22
+updated staging modules, all 8 new staging modules, and the prior handoff update.
+
 ## Completed Follow-up (2026-09-09: re-import two audited courses)
 The user requested re-importing `design-patterns` and
 `python-for-ai-engineers` from their completed, uncommitted content-quality
@@ -107,9 +111,11 @@ backup is at
 `C:\Users\admin\AppData\Local\Temp\sypher-course-prune-backups\before-14-course-prune-2026-09-07.json`
 (10,566,316 bytes; SHA-256
 `0fd31bbbb5ebe8b9f091cd67e786db3777fcab8f771dc68bf2a47e4c85b50a67`).
-Fresh Prisma and authenticated API reads now return 32 published courses:
-14 Tech migration courses, 17 Presentation courses, and one Life Skills course.
-The six other removed Tech courses remain outside the approved migration set.
+After the later audited-course reimports and Life Skills update, authenticated
+API reads return 35 courses total: 33 published courses (14 Tech migration
+courses, 17 Presentation courses, and 2 Life Skills courses) plus the 2 draft
+audited reimports (`design-patterns` and `python-for-ai-engineers`). The six
+other removed Tech courses remain outside the approved migration set.
 
 Importer pilot complete and verified. All reported bugs fixed and
 confirmed live in an actual browser (browser tools became available
@@ -250,18 +256,16 @@ redesigned Dashboard and the Published/Draft tabs on Manage Courses/Manage
 Blog, `/learn/[slug]` sidebar behavior (shared DashboardSidebar on course-home
 vs. CourseModuleIndex outline on lesson pages), and the imported-course About
 pages/New badges/Browse Courses tab ordering/Manage Courses back-link. No
-issues were reported. Everything in this task remains uncommitted.
+issues were reported. That work was later committed in `f767952d`.
 
 Separately, a full content-quality audit-and-humanization pass (relevance,
 accuracy, readability, engagement, zero em/en dashes, human-voice; 95% minimum
 per file) is now complete on both `apps/docs/docs/design-patterns` (185 files,
 ~81%->~98%) and `apps/docs/docs/python-for-ai-engineers` (202 files,
 ~87%->~98%) - see the two dedicated `(COMPLETE)` sections directly below for
-full detail, real bugs found/fixed, and open judgment calls. Neither course's
-edits are committed yet. `design-patterns` content already lives in the live
-apps/web DB (imported earlier); per explicit user decision this pass only
-fixed the apps/docs source, the live DB copy was NOT re-imported/refreshed.
-`python-for-ai-engineers` is still apps/docs-only (never imported to apps/web).
+full detail, real bugs found/fixed, and open judgment calls. Both courses'
+source edits were later committed in `f767952d`, then reimported into apps/web
+as drafts and fully validated as described in the completed follow-up above.
 
 ## design-patterns content-quality audit (COMPLETE)
 6-parallel-batch pass (later switched to a single-agent model for the sibling python-for-ai-engineers course, see below). Scope: apps/docs/docs/design-patterns/, 185 files across 23 patterns + top index. Rubric: relevance, accuracy, readability, engagement, zero em/en dashes (expanded scope: prose, frontmatter values, headings, code-fence comments/string-literals/printed-output, AsciiDiagram alt/caption props - never AsciiDiagram content/id, Mermaid, or code logic/values), human-voice. Minimum target 95% per file.
@@ -1090,21 +1094,11 @@ miscolored.
   itself.
 
 ## Files Modified
-Reconciled from actual `git status --short` output on 2026-09-09. Nothing is
-staged and no commit has been made for the Life Skills follow-up:
+Reconciled from actual Git output on 2026-09-09 after commit `15b088d6`. The
+working tree was completely clean immediately after that commit. This handoff
+update is the only subsequent working-tree modification:
 
-- `memory-bank/current-task.md`
-- All 12 previously tracked files under `scratch/communication-skills/`
-- All 10 previously tracked files under `scratch/negotiation-skills/`
-- New communication modules:
-  `06-manage-emotions-before-you-respond.mdx`,
-  `12-communicate-across-cultures-and-styles.mdx`, and
-  `13-persuade-without-pushing.mdx`
-- New negotiation modules:
-  `03-set-your-target-and-bargaining-range.mdx`,
-  `07-create-value-with-multiple-issues.mdx`,
-  `11-handle-pressure-and-unfair-tactics.mdx`, `13-break-a-deadlock.mdx`, and
-  `14-close-and-confirm-the-agreement.mdx`
+- `memory-bank/current-task.md` (handoff-only update; unstaged).
 
 ## Unrelated small change (mid-session tangent)
 User pointed at GitHub's basic markdown formatting guide and asked that
@@ -1118,8 +1112,8 @@ flag if the rule should live there too, since `Course-Creation-Guide.md`
 is Sypher Next (apps/web)-specific by its own title.
 
 ## Next Action
-The Life Skills follow-up is complete; only user review and an explicitly
-requested commit remain. The older migration backlog follows:
+The Life Skills follow-up is complete and committed. The older migration
+backlog follows:
 
 0. Reconcile/remove the orphaned `state/lifecycle` entry from the Design
    Patterns diagram manifest if the manifests will be archived before
@@ -1156,14 +1150,16 @@ requested commit remain. The older migration backlog follows:
 
 ## Handoff Events
 
-- 2026-09-09 (Life Skills depth pass complete) - updated only
+- 2026-09-09 (Life Skills depth pass committed) - updated only
   `communication-skills` and `negotiation-skills` through authenticated API
   endpoints. Both are published `life-skills` courses with 15 ordered manual
   modules, `FREE_USER,PAID_USER` access, one `PRACTICE` section per module,
   2-3 visible suggested answers per section, and no external URLs. Stored bodies
   exactly match the content-gated staging sources. The 17 Presentation courses
   and 90 modules remain unchanged. Authenticated course-home and new-module web
-  renders returned HTTP 200. No commit made.
+  renders returned HTTP 200. The user committed all 30 staging files and the
+  prior handoff update in `15b088d6` (`Communication Skills Overwrite`); the
+  working tree was clean immediately afterward.
 
 - 2026-09-09 (committed) - user committed the completed work as `f767952d`
   (`Old Course Import and Design Overhaul`). `git status` and `git diff --stat`
