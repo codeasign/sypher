@@ -25,6 +25,12 @@ interface BlogPostSummary {
 }
 
 const PAGE_SIZE = 10;
+type StatusFilter = BlogPostSummary['status'];
+
+const STATUS_TABS: { value: StatusFilter; label: string }[] = [
+  { value: 'published', label: 'Published' },
+  { value: 'draft', label: 'Draft' },
+];
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
@@ -36,21 +42,36 @@ function formatDate(iso: string): string {
 // 2026-08-27).
 export default function ManageBlogContent({ initialPosts }: { initialPosts: BlogPostSummary[] }): React.JSX.Element {
   const [posts, setPosts] = useState<BlogPostSummary[]>(initialPosts);
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('published');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [mode, setMode] = useState<'list' | 'new' | 'edit'>('list');
   const [editingPost, setEditingPost] = useState<BlogPostSummary | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  const statusCounts = useMemo(
+    () => ({
+      published: posts.filter((post) => post.status === 'published').length,
+      draft: posts.filter((post) => post.status === 'draft').length,
+    }),
+    [posts],
+  );
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return q ? posts.filter((p) => p.title.toLowerCase().includes(q)) : posts;
-  }, [posts, search]);
+    const postsForStatus = posts.filter((post) => post.status === statusFilter);
+    return q ? postsForStatus.filter((post) => post.title.toLowerCase().includes(q)) : postsForStatus;
+  }, [posts, search, statusFilter]);
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const visible = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   function handleSearchChange(value: string): void {
     setSearch(value);
+    setPage(1);
+  }
+
+  function handleStatusChange(status: StatusFilter): void {
+    setStatusFilter(status);
     setPage(1);
   }
 
@@ -119,6 +140,21 @@ export default function ManageBlogContent({ initialPosts }: { initialPosts: Blog
 
       {actionError && <p className={styles.errorText}>{actionError}</p>}
 
+      <div className={styles.statusTabs} role="tablist" aria-label="Blog post status">
+        {STATUS_TABS.map((tab) => (
+          <button
+            key={tab.value}
+            type="button"
+            role="tab"
+            aria-selected={statusFilter === tab.value}
+            className={`${styles.statusTab} ${statusFilter === tab.value ? styles.statusTabActive : ''}`}
+            onClick={() => handleStatusChange(tab.value)}
+          >
+            {tab.label} ({statusCounts[tab.value]})
+          </button>
+        ))}
+      </div>
+
       {posts.length === 0 ? (
         <div className={styles.emptyState}>
           <p>No blog posts yet. Create your first one.</p>
@@ -128,7 +164,11 @@ export default function ManageBlogContent({ initialPosts }: { initialPosts: Blog
           <TableSearchBar value={search} onChange={handleSearchChange} placeholder="Search posts by title…" />
           {visible.length === 0 ? (
             <div className={styles.emptyState}>
-              <p>No posts match &quot;{search}&quot;.</p>
+              <p>
+                {search.trim()
+                  ? `No ${statusFilter} posts match \"${search}\".`
+                  : `No ${statusFilter} posts yet.`}
+              </p>
             </div>
           ) : (
             <>

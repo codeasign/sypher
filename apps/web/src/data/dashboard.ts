@@ -47,13 +47,20 @@ export interface UserDashboard {
     bestScore: number | null;
     averageScore: number | null;
     passRate: number | null;
-    trend: { label: string; score: number; date: string }[];
+    trend: { label: string; title: string; slug: string; score: number; date: string }[];
   };
   community: {
     comments: number;
     upvotesReceived: number;
     helpfulReceived: number;
     bestAnswers: number;
+  };
+  blogActivity: {
+    publishedPosts: number;
+    comments: number;
+    postsDiscussed: number;
+    recognitionReceived: number;
+    recent: { title: string; slug: string; date: string }[];
   };
   activity: {
     weekly: { weekStart: string; modules: number }[];

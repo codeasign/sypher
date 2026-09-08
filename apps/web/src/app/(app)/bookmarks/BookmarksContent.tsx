@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import type { Course } from '@/data/courses';
+import { courseDescriptionExcerpt, type Course } from '@/data/courses';
 import { CourseBookmarkButton, ModuleBookmarkButton } from '@/components/AuthoredBookmarkButton';
 import styles from './styles.module.css';
 
@@ -45,7 +45,9 @@ export default function BookmarksContent({ initialCourses, initialModules }: Boo
                   {course.coverImageUrl && <img src={course.coverImageUrl} alt={course.name} className={styles.courseCardImage} />}
                   <div className={styles.courseCardBody}>
                     <h3 className={styles.courseCardTitle}>{course.name}</h3>
-                    {course.description && <p className={styles.courseCardDescription}>{course.description}</p>}
+                    {courseDescriptionExcerpt(course.description) && (
+                      <p className={styles.courseCardDescription}>{courseDescriptionExcerpt(course.description)}</p>
+                    )}
                   </div>
                 </Link>
                 <div className={styles.bookmarkSlot}>

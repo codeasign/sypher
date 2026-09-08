@@ -2,7 +2,7 @@ import Link from 'next/link';
 import CourseProgressBar from '@/components/CourseProgressBar';
 import CourseCover from '@/components/CourseCover';
 import { CourseBookmarkButton } from '@/components/AuthoredBookmarkButton';
-import { courseActionLabel, courseActionTone, type CourseCardData } from '@/data/courses';
+import { courseActionLabel, courseActionTone, courseDescriptionExcerpt, type CourseCardData } from '@/data/courses';
 import styles from './styles.module.css';
 
 const ACTION_TONE_CLASS = {
@@ -23,21 +23,27 @@ const ACTION_TONE_CLASS = {
 export default function CourseCard({
   course,
   bookmarked,
+  isNew = false,
+  variant = 'default',
 }: {
   course: CourseCardData;
   bookmarked: boolean;
+  isNew?: boolean;
+  variant?: 'default' | 'catalog';
 }): React.JSX.Element {
   const toneClass = ACTION_TONE_CLASS[courseActionTone(course)];
+  const description = courseDescriptionExcerpt(course.description);
 
   return (
-    <div className={styles.wrapper}>
+    <div className={`${styles.wrapper} ${variant === 'catalog' ? styles.catalog : ''}`}>
       <Link href={`/learn/${course.slug}`} className={styles.card}>
         <span className={styles.image}>
           <CourseCover name={course.name} src={course.coverImageUrl} seed={course.slug} />
+          {isNew && <span className={styles.newBadge}>New</span>}
         </span>
         <div className={styles.body}>
           <h3 className={styles.title}>{course.name}</h3>
-          {course.description && <p className={styles.description}>{course.description}</p>}
+          {description && <p className={styles.description}>{description}</p>}
           <div className={styles.tags}>
             <span className={`${styles.actionTag} ${toneClass}`}>{courseActionLabel(course)}</span>
           </div>

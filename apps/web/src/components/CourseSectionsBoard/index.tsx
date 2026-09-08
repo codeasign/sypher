@@ -2,11 +2,11 @@
 
 import { useMemo, useState } from 'react';
 import CourseScroller from '@/components/CourseScroller';
-import { AUDIENCE_ROLES, type CourseWithAccess } from '@/data/courses';
+import type { CourseWithAccess } from '@/data/courses';
+import { NEW_COURSE_SLUGS, NEW_COURSE_SLUG_SET } from '@/lib/newCourses';
 import styles from './styles.module.css';
 
 const ALL_TAB = '__all__';
-const ALL_ROLES = '__all_roles__';
 const UNCATEGORIZED_KEY = '__uncategorized__';
 
 // Known categories in display order; any other value the free-form DB
@@ -15,7 +15,7 @@ const CATEGORY_ORDER = ['tech', 'life-skills', 'Presentation'];
 const CATEGORY_LABELS: Record<string, string> = {
   tech: 'Tech',
   'life-skills': 'Life Skills',
-  Presentation: 'Presentation',
+  Presentation: 'Presentation Skills',
 };
 
 function titleCase(raw: string): string {
@@ -30,10 +30,6 @@ function categoryLabel(key: string): string {
   if (key === ALL_TAB) return 'All';
   if (key === UNCATEGORIZED_KEY) return 'Other';
   return CATEGORY_LABELS[key] ?? titleCase(key);
-}
-
-function roleLabel(value: string): string {
-  return AUDIENCE_ROLES.find((r) => r.value === value)?.label ?? titleCase(value.replace(/-/g, ' '));
 }
 
 function isInProgress(c: CourseWithAccess): boolean {
@@ -67,8 +63,7 @@ type Variant = 'my-courses' | 'browse';
  * tab shows the FULL catalog for its scope, grouped into one section per
  * category (Continue where you left off still sits on top). The "All" tab
  * lists every category section in tab order; a category tab shows just that
- * one. No curation, no cap, no Completed strip. `showRoleFilter` adds an
- * audience-role dropdown above the tabs (default None = no filter).
+ * one. No curation, no cap, and no Completed strip.
  *
  * "Courses you might like" is, in priority order: courses named in the
  * relatedCourses of what you're taking/finished, then full-access courses
@@ -82,40 +77,18 @@ export default function CourseSectionsBoard({
   courses,
   bookmarkedIds,
   variant = 'my-courses',
-  showRoleFilter = false,
 }: {
   courses: CourseWithAccess[];
   bookmarkedIds: string[];
   variant?: Variant;
-  /** Show the audience-role dropdown (Browse Courses). Default None = no filter. */
-  showRoleFilter?: boolean;
 }): React.JSX.Element {
   const showCompleted = variant === 'my-courses';
-
-  // Audience-role options: every audienceRole present in the catalog,
-  // canonical order (AUDIENCE_ROLES) first, then any extras alphabetically.
-  const roleOptions = useMemo(() => {
-    if (!showRoleFilter) return [];
-    const present = new Set(courses.map((c) => c.audienceRole).filter((r): r is string => Boolean(r && r.trim())));
-    const canonical = AUDIENCE_ROLES.map((r) => r.value).filter((v) => present.has(v));
-    const extras = [...present].filter((r) => !canonical.includes(r)).sort((a, b) => a.localeCompare(b));
-    return [...canonical, ...extras];
-  }, [courses, showRoleFilter]);
-
-  const [roleFilter, setRoleFilter] = useState(ALL_ROLES);
-  const activeRole = roleOptions.includes(roleFilter) ? roleFilter : ALL_ROLES;
-
-  // Everything downstream (tabs + strips) works off the role-filtered set.
-  const scopedByRole = useMemo(
-    () => (activeRole === ALL_ROLES ? courses : courses.filter((c) => c.audienceRole === activeRole)),
-    [courses, activeRole],
-  );
 
   // Which courses seed the tab bar: everything on Browse, only the
   // user's own on My Courses.
   const tabSource = useMemo(
-    () => (variant === 'browse' ? scopedByRole : scopedByRole.filter((c) => c.hasFullAccess)),
-    [scopedByRole, variant],
+    () => (variant === 'browse' ? courses : courses.filter((c) => c.hasFullAccess)),
+    [courses, variant],
   );
 
   const tabs = useMemo(() => {
@@ -130,10 +103,11 @@ export default function CourseSectionsBoard({
 
   const [activeTab, setActiveTab] = useState(ALL_TAB);
   const currentTab = tabs.includes(activeTab) ? activeTab : ALL_TAB;
+  const showNewCourses = variant === 'browse' && currentTab === ALL_TAB;
 
   const { continueList, mightLike, completedList } = useMemo(() => {
     const inScope = (c: CourseWithAccess): boolean => currentTab === ALL_TAB || categoryKey(c) === currentTab;
-    const scoped = scopedByRole.filter(inScope);
+    const scoped = courses.filter(inScope);
 
     const continueList = scoped
       .filter(isInProgress)
@@ -160,7 +134,16 @@ export default function CourseSectionsBoard({
     const mightLike = variant === 'browse' ? blended : blended.slice(0, MIGHT_LIKE_CAP);
 
     return { continueList, mightLike, completedList };
-  }, [scopedByRole, currentTab, showCompleted, variant]);
+  }, [courses, currentTab, showCompleted, variant]);
+
+  const newCourses = useMemo(() => {
+    if (!showNewCourses) return [];
+    const alreadyShown = new Set(continueList.map((course) => course.id));
+    const rank = new Map<string, number>(NEW_COURSE_SLUGS.map((slug, index) => [slug, index]));
+    return courses
+      .filter((course) => NEW_COURSE_SLUG_SET.has(course.slug) && !alreadyShown.has(course.id))
+      .sort((a, b) => (rank.get(a.slug) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b.slug) ?? Number.MAX_SAFE_INTEGER));
+  }, [continueList, courses, showNewCourses]);
 
   // Browse variant: the current tab's whole scope, split into one section
   // per category (tab order). "All" → every category; a category tab → just
@@ -170,9 +153,9 @@ export default function CourseSectionsBoard({
   const categoryGroups = useMemo(() => {
     if (variant !== 'browse') return [] as { key: string; label: string; courses: CourseWithAccess[] }[];
     const inScope = (c: CourseWithAccess): boolean => currentTab === ALL_TAB || categoryKey(c) === currentTab;
-    const alreadyShown = new Set(continueList.map((c) => c.id));
+    const alreadyShown = new Set([...continueList, ...newCourses].map((c) => c.id));
     const byCat = new Map<string, CourseWithAccess[]>();
-    for (const c of scopedByRole.filter(inScope)) {
+    for (const c of courses.filter(inScope)) {
       if (alreadyShown.has(c.id)) continue;
       const k = categoryKey(c);
       const bucket = byCat.get(k);
@@ -186,41 +169,18 @@ export default function CourseSectionsBoard({
         label: categoryLabel(k),
         courses: [...(byCat.get(k) ?? [])].sort((a, b) => a.name.localeCompare(b.name)),
       }));
-  }, [variant, scopedByRole, currentTab, tabs, continueList]);
+  }, [variant, courses, currentTab, tabs, continueList, newCourses]);
 
   const noCourses = tabSource.length === 0;
   const nothingInTab =
     variant === 'browse'
-      ? continueList.length === 0 && categoryGroups.length === 0
+      ? continueList.length === 0 && newCourses.length === 0 && categoryGroups.length === 0
       : continueList.length === 0 && mightLike.length === 0 && completedList.length === 0;
 
   return (
     <>
-      {showRoleFilter && roleOptions.length > 0 && (
-        <div className={styles.filterBar}>
-          <label className={styles.filterLabel} htmlFor="role-filter">
-            Role
-          </label>
-          <select
-            id="role-filter"
-            className={styles.roleSelect}
-            value={activeRole}
-            onChange={(e) => setRoleFilter(e.target.value)}
-          >
-            <option value={ALL_ROLES}>None</option>
-            {roleOptions.map((role) => (
-              <option key={role} value={role}>
-                {roleLabel(role)}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
-
       {noCourses ? (
-        <p className={styles.emptyText}>
-          {activeRole === ALL_ROLES ? 'No courses available yet.' : `No ${roleLabel(activeRole)} courses.`}
-        </p>
+        <p className={styles.emptyText}>No courses available yet.</p>
       ) : (
         <>
           {tabs.length > 1 && (
@@ -244,9 +204,21 @@ export default function CourseSectionsBoard({
             <p className={styles.emptyText}>Nothing in this category yet.</p>
           ) : variant === 'browse' ? (
             <>
-              <CourseScroller title="Continue where you left off" courses={continueList} bookmarkedIds={bookmarkedIds} />
+              <CourseScroller
+                title="Continue where you left off"
+                courses={continueList}
+                bookmarkedIds={bookmarkedIds}
+                showNewBadges
+              />
+              <CourseScroller title="New Courses" courses={newCourses} bookmarkedIds={bookmarkedIds} showNewBadges />
               {categoryGroups.map((group) => (
-                <CourseScroller key={group.key} title={group.label} courses={group.courses} bookmarkedIds={bookmarkedIds} />
+                <CourseScroller
+                  key={group.key}
+                  title={group.label}
+                  courses={group.courses}
+                  bookmarkedIds={bookmarkedIds}
+                  showNewBadges
+                />
               ))}
             </>
           ) : (

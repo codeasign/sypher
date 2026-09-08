@@ -15,7 +15,7 @@ const PASS_THRESHOLD = 70;
 const CATEGORY_LABELS: Record<string, string> = {
   tech: 'Tech',
   'life-skills': 'Life Skills',
-  Presentation: 'Presentation',
+  Presentation: 'Presentation Skills',
 };
 const UNCATEGORIZED_KEY = 'other';
 
@@ -79,13 +79,20 @@ export interface DashboardData {
     bestScore: number | null;
     averageScore: number | null;
     passRate: number | null;
-    trend: { label: string; score: number; date: string }[];
+    trend: { label: string; title: string; slug: string; score: number; date: string }[];
   };
   community: {
     comments: number;
     upvotesReceived: number;
     helpfulReceived: number;
     bestAnswers: number;
+  };
+  blogActivity: {
+    publishedPosts: number;
+    comments: number;
+    postsDiscussed: number;
+    recognitionReceived: number;
+    recent: { title: string; slug: string; date: string }[];
   };
   activity: {
     weekly: { weekStart: string; modules: number }[];
@@ -117,7 +124,7 @@ export interface DashboardData {
 
 /**
  * Everything the signed-in user's Dashboard renders, assembled in one
- * pass (~11 parallel queries, all bounded — the catalog is dozens of
+ * pass (~14 parallel queries, all bounded — the catalog is dozens of
  * courses, and per-user progress/attempt/comment rows are small). Access
  * per course is resolved with the same `hasCourseAccess` primitive the
  * course reads use, plus the company-group union for COMPANY_EMPLOYEE.
@@ -135,6 +142,8 @@ export class DashboardRepository {
       attemptsTotal,
       completedAttempts,
       commentAgg,
+      blogComments,
+      publishedBlogPosts,
       bestAnswers,
       accessRows,
       learners,
@@ -152,7 +161,7 @@ export class DashboardRepository {
       prisma.mockExamAttempt.count({ where: { userId: user.id } }),
       prisma.mockExamAttempt.findMany({
         where: { userId: user.id, status: 'completed' },
-        select: { score: true, submittedAt: true, exam: { select: { title: true, examCode: true } } },
+        select: { score: true, submittedAt: true, exam: { select: { title: true, examCode: true, slug: true } } },
         orderBy: { submittedAt: 'asc' },
       }),
       prisma.comment.aggregate({
@@ -160,6 +169,18 @@ export class DashboardRepository {
         _sum: { upvoteCount: true, helpfulCount: true },
         _count: { _all: true },
       }),
+      prisma.comment.findMany({
+        where: { userId: user.id, isDeleted: false, blogPostId: { not: null } },
+        select: {
+          blogPostId: true,
+          createdAt: true,
+          upvoteCount: true,
+          helpfulCount: true,
+          blogPost: { select: { title: true, slug: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+      prisma.blogPost.count({ where: { status: 'published' } }),
       prisma.comment.count({ where: { userId: user.id, isDeleted: false, isBestAnswer: true } }),
       prisma.authoredCourseAccess.findMany({ select: { courseId: true, allowedRoles: true } }),
       prisma.user.count({ where: { deletedAt: null } }),
@@ -307,6 +328,8 @@ export class DashboardRepository {
     const passRate = scores.length ? Math.round((100 * scores.filter((s) => s >= PASS_THRESHOLD).length) / scores.length) : null;
     const trend = completedAttempts.slice(-EXAM_TREND_POINTS).map((a) => ({
       label: a.exam.examCode || a.exam.title,
+      title: a.exam.title,
+      slug: a.exam.slug,
       score: a.score ?? 0,
       date: a.submittedAt ? a.submittedAt.toISOString() : '',
     }));
@@ -355,6 +378,20 @@ export class DashboardRepository {
         upvotesReceived: commentAgg._sum.upvoteCount ?? 0,
         helpfulReceived: commentAgg._sum.helpfulCount ?? 0,
         bestAnswers,
+      },
+      blogActivity: {
+        publishedPosts: publishedBlogPosts,
+        comments: blogComments.length,
+        postsDiscussed: new Set(blogComments.map((comment) => comment.blogPostId)).size,
+        recognitionReceived: blogComments.reduce(
+          (total, comment) => total + comment.upvoteCount + comment.helpfulCount,
+          0,
+        ),
+        recent: blogComments.slice(0, 3).flatMap((comment) =>
+          comment.blogPost
+            ? [{ title: comment.blogPost.title, slug: comment.blogPost.slug, date: comment.createdAt.toISOString() }]
+            : [],
+        ),
       },
       activity: {
         weekly: weekly.map((w) => ({ weekStart: w.weekStart, modules: w.modules })),

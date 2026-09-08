@@ -92,6 +92,16 @@ export interface CourseModule {
   locked?: boolean;
 }
 
+/** Keep structured About markdown out of compact course cards. */
+export function courseDescriptionExcerpt(description: string | null): string | null {
+  if (!description) return null;
+  const firstParagraph = description.split(/\n\s*##\s+/)[0] ?? description;
+  return firstParagraph
+    .replace(/[*_`]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /** Public course navigation data. Lesson bodies only come from the single-module endpoint. */
 export interface CourseModuleSummary extends Omit<CourseModule, 'bodyMdx'> {
   completed: boolean;

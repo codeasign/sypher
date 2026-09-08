@@ -94,11 +94,24 @@ export class CourseRepository {
   // is idempotent so re-running the importer after a source fix updates in
   // place rather than duplicating. Always lands in draft, same as create(),
   // so imported courses need an explicit publish before they're visible.
-  async upsertBySlug(slug: string, fields: { name: string; description?: string | null }): Promise<Course> {
+  async upsertBySlug(
+    slug: string,
+    fields: { name: string; description?: string | null; category?: string | null },
+  ): Promise<Course> {
     return prisma.course.upsert({
       where: { slug },
-      create: { slug, name: fields.name, description: fields.description ?? null, status: 'draft' },
-      update: { name: fields.name, description: fields.description ?? null },
+      create: {
+        slug,
+        name: fields.name,
+        description: fields.description ?? null,
+        category: fields.category ?? null,
+        status: 'draft',
+      },
+      update: {
+        name: fields.name,
+        description: fields.description ?? null,
+        category: fields.category,
+      },
     });
   }
 

@@ -7,6 +7,7 @@ import { CourseBookmarkButton } from '@/components/AuthoredBookmarkButton';
 import { LockIcon } from '@/components/icons/SidebarIcons';
 import CourseHomeTabs from '@/components/CourseHomeTabs';
 import DiscussionSection from '@/components/DiscussionSection';
+import CourseDescriptionMarkdown from '@/components/CourseDescriptionMarkdown';
 import styles from './styles.module.css';
 
 async function fetchCourse(slug: string): Promise<{ course: CourseWithAccess | null; unauthenticated: boolean }> {
@@ -88,7 +89,7 @@ export default async function CourseHomePage({ params }: { params: Promise<{ slu
           about={
             <>
               {course.description ? (
-                <p className={styles.description}>{course.description}</p>
+                <CourseDescriptionMarkdown text={course.description} className={styles.description} />
               ) : (
                 <p className={styles.emptyText}>No description yet.</p>
               )}

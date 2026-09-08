@@ -2,13 +2,12 @@ import type { ReactNode } from 'react';
 import { redirect } from 'next/navigation';
 import { serverApiFetch } from '@/lib/serverApi';
 import type { Course, CourseModule, CourseWithAccess } from '@/data/courses';
-import CourseModuleIndex from '@/components/CourseModuleIndex';
+import CourseLearnSidebar from '@/components/CourseLearnSidebar';
 import styles from './layout.module.css';
 
-// Deliberately NOT inside the (app) route group — replaces
-// DashboardSidebar with CourseModuleIndex for the whole /learn/[slug]
-// subtree (course home + every module page), confirmed with the user
-// 2026-08-22: the generic app nav isn't useful while inside a course.
+// Deliberately NOT inside the (app) route group. CourseLearnSidebar keeps the
+// shared DashboardSidebar on the course home (About/Topics/Discussion) and
+// switches to the course module outline only on an actual lesson page.
 //
 // CourseModuleIndex itself is now context-dependent (both the course
 // switcher AND the per-course module outline live in one component,
@@ -17,8 +16,8 @@ import styles from './layout.module.css';
 // other courses" back to "this course's own outline with progress dots,"
 // same green-dot tracking already built. Both data sources are fetched
 // here and handed down; which one renders is the component's own call.
-// The plain course list at /learn (no slug) is unaffected — that route
-// stays inside (app), same DashboardSidebar as every other dashboard page.
+// The plain course list at /learn (no slug) is unaffected — that route stays
+// inside (app), with the same DashboardSidebar as every other dashboard page.
 //
 // Own auth check, same small-duplicated-fetch tradeoff (app)/layout.tsx's
 // own comment already documents — this layout has no parent auth guard to
@@ -30,6 +29,10 @@ export default async function CourseLayout({ children, params }: { children: Rea
   if (!meRes.ok) {
     redirect('/login');
   }
+  const user: { email: string; fullName: string | null; role: string; paidUntil: string | null } = await meRes.json();
+  const isPaidAndActive = user.role === 'PAID_USER' && !!user.paidUntil && new Date(user.paidUntil) > new Date();
+  const navRes = await serverApiFetch('/access/my-nav');
+  const visibleKeys: string[] = navRes.ok ? await navRes.json() : [];
 
   const courseRes = await serverApiFetch(`/courses/${encodeURIComponent(slug)}`);
   if (!courseRes.ok) {
@@ -69,7 +72,17 @@ export default async function CourseLayout({ children, params }: { children: Rea
 
   return (
     <div className={styles.shell}>
-      <CourseModuleIndex courseSlug={slug} courseName={course.name} courses={courses} modules={modules} />
+      <CourseLearnSidebar
+        courseSlug={slug}
+        courseName={course.name}
+        courses={courses}
+        modules={modules}
+        role={user.role}
+        email={user.email}
+        fullName={user.fullName}
+        visibleKeys={visibleKeys}
+        isPaidAndActive={isPaidAndActive}
+      />
       <div className={styles.content}>{children}</div>
     </div>
   );

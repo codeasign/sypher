@@ -13,6 +13,12 @@ import TableSearchBar from '@/components/TableSearchBar';
 import styles from './manage-courses.module.css';
 
 const PAGE_SIZE = 10;
+type StatusFilter = 'published' | 'draft';
+
+const STATUS_TABS: { value: StatusFilter; label: string }[] = [
+  { value: 'published', label: 'Published' },
+  { value: 'draft', label: 'Draft' },
+];
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
@@ -24,21 +30,36 @@ function formatDate(iso: string): string {
 // 2026-08-27). Course counts are small enough for this to be cheap.
 export default function ManageCoursesContent({ initialCourses }: { initialCourses: Course[] }): React.JSX.Element {
   const [courses, setCourses] = useState<Course[]>(initialCourses);
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('published');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [mode, setMode] = useState<'list' | 'new' | 'workspace'>('list');
   const [workspaceCourse, setWorkspaceCourse] = useState<Course | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  const statusCounts = useMemo(
+    () => ({
+      published: courses.filter((course) => course.status === 'published').length,
+      draft: courses.filter((course) => course.status === 'draft').length,
+    }),
+    [courses],
+  );
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return q ? courses.filter((c) => c.name.toLowerCase().includes(q)) : courses;
-  }, [courses, search]);
+    const coursesForStatus = courses.filter((course) => course.status === statusFilter);
+    return q ? coursesForStatus.filter((course) => course.name.toLowerCase().includes(q)) : coursesForStatus;
+  }, [courses, search, statusFilter]);
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const visible = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   function handleSearchChange(value: string): void {
     setSearch(value);
+    setPage(1);
+  }
+
+  function handleStatusChange(status: StatusFilter): void {
+    setStatusFilter(status);
     setPage(1);
   }
 
@@ -122,6 +143,21 @@ export default function ManageCoursesContent({ initialCourses }: { initialCourse
 
       {actionError && <p className={styles.errorText}>{actionError}</p>}
 
+      <div className={`${styles.tabBar} ${styles.statusTabs}`} role="tablist" aria-label="Course status">
+        {STATUS_TABS.map((tab) => (
+          <button
+            key={tab.value}
+            type="button"
+            role="tab"
+            aria-selected={statusFilter === tab.value}
+            className={`${styles.tab} ${statusFilter === tab.value ? styles.tabActive : ''}`}
+            onClick={() => handleStatusChange(tab.value)}
+          >
+            {tab.label} ({statusCounts[tab.value]})
+          </button>
+        ))}
+      </div>
+
       {courses.length === 0 ? (
         <div className={styles.emptyState}>
           <p>No courses yet. Create your first one.</p>
@@ -131,7 +167,11 @@ export default function ManageCoursesContent({ initialCourses }: { initialCourse
           <TableSearchBar value={search} onChange={handleSearchChange} placeholder="Search courses by name…" />
           {visible.length === 0 ? (
             <div className={styles.emptyState}>
-              <p>No courses match &quot;{search}&quot;.</p>
+              <p>
+                {search.trim()
+                  ? `No ${statusFilter} courses match \"${search}\".`
+                  : `No ${statusFilter} courses yet.`}
+              </p>
             </div>
           ) : (
             <>

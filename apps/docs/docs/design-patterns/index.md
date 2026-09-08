@@ -5,7 +5,7 @@ sidebar_label: Course Home
 
 # Design Patterns
 
-*Estimated completion time: 25–35 hours*
+*Estimated completion time: 25-35 hours*
 
 **Difficulty:** Intermediate to Advanced
 
@@ -15,14 +15,14 @@ This course covers all 23 Gang-of-Four design patterns, organized by creational,
 
 ## Why This Matters
 
-Design patterns give engineers a shared vocabulary for solving recurring design problems. Once you recognize a pattern, you can talk about a design in one or two words instead of re-explaining the same structure from scratch — and you can borrow decades of accumulated experience about when a pattern helps and when it's overkill.
+Design patterns give engineers a shared vocabulary for solving recurring design problems. Once you recognize a pattern, you can talk about a design in one or two words instead of re-explaining the same structure from scratch; and you can borrow decades of accumulated experience about when a pattern helps and when it's overkill.
 
 ## Skills You Will Gain
 
 - Recognize and implement creational patterns: Factory Method, Abstract Factory, Singleton, Builder, Prototype
 - Recognize and implement structural patterns: Adapter, Bridge, Composite, Decorator, Facade, Flyweight, Proxy
 - Recognize and implement behavioral patterns: Chain of Responsibility, Command, Interpreter, Iterator, Mediator, Memento, Observer, State, Strategy, Template Method, Visitor
-- Choose the right design pattern for a given problem — and recognize when a simpler solution (a map, a function, a switch) is better
+- Choose the right design pattern for a given problem; and recognize when a simpler solution (a map, a function, a switch) is better
 - Write clean, testable, and extensible code across multiple languages
 
 ## Prerequisites
@@ -39,13 +39,13 @@ Design patterns give engineers a shared vocabulary for solving recurring design 
 
 Explore the three categories of Gang of Four design patterns:
 
-**Creational** — object creation mechanisms:
+**Creational**: object creation mechanisms:
 Factory Method, Abstract Factory, Singleton, Builder, Prototype
 
-**Structural** — object composition and relationships:
+**Structural**: object composition and relationships:
 Adapter, Bridge, Composite, Decorator, Facade, Flyweight, Proxy
 
-**Behavioral** — object communication and responsibility:
+**Behavioral**: object communication and responsibility:
 Chain of Responsibility, Command, Interpreter, Iterator, Mediator, Memento, Observer, State, Strategy, Template Method, Visitor
 
 ## How to Use This Course

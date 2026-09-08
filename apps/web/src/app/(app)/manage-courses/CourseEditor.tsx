@@ -3,10 +3,11 @@
 import React, { useRef, useState } from 'react';
 import { createCourse, updateCourse, setCourseStatus, AUDIENCE_ROLES, type Course } from '@/data/courses';
 import { uploadToBunny } from '@/data/bunnyUpload';
+import { prepareCourseCover } from '@/lib/courseCoverImage';
 import styles from './manage-courses.module.css';
 
 const NAME_MAX = 250;
-const DESCRIPTION_MAX = 500;
+const DESCRIPTION_MAX = 3000;
 
 interface CourseEditorProps {
   course?: Course | null;
@@ -55,7 +56,8 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
     setCoverUploading(true);
     setError(null);
     try {
-      const url = await uploadToBunny(file, `courses/${course?.slug ?? 'new'}/covers`);
+      const preparedCover = await prepareCourseCover(file);
+      const url = await uploadToBunny(preparedCover, `courses/${course?.slug ?? 'new'}/covers`);
       setCoverImageUrl(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload cover image.');
@@ -173,12 +175,16 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
             id="course-cover"
             ref={coverInputRef}
             type="file"
-            accept="image/*"
+            accept="image/png,image/jpeg,image/webp"
             className={styles.fileInput}
             onChange={handleCoverImageChange}
             disabled={saving || coverUploading}
           />
         </div>
+        <p className={styles.coverInstruction}>
+          Create a 2:1 cover at 1600 x 800 pixels or larger. Use PNG, JPEG, or WebP and keep text and
+          important details inside the central 80%. Uploads are center-cropped and optimized to 1600 x 800.
+        </p>
         {coverImageUrl && <img src={coverImageUrl} alt="Cover preview" className={styles.coverPreview} />}
         {coverUploading && <p className={styles.uploadStatus}>Uploading…</p>}
       </div>
@@ -203,12 +209,16 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
         <span className={styles.charCount}>
           {name.length}/{NAME_MAX}
         </span>
-        {isEditing && <p className={styles.slugPreview}>/learn/{course!.slug}</p>}
+        {isEditing && (
+          <p className={styles.slugPreview}>
+            Course URL: <q className={styles.slugValue}>/learn/{course!.slug}</q>
+          </p>
+        )}
       </div>
 
       <div className={styles.formGroup}>
         <label className={styles.fieldLabel} htmlFor="course-description">
-          Description
+          Description / About content
         </label>
         <textarea
           id="course-description"

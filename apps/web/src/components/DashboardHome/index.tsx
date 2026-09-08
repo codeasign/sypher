@@ -57,7 +57,7 @@ export default function DashboardHome({ data, userEmail, fullName, completions }
   const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid(userEmail, () => router.refresh());
   const firstName = (fullName?.trim().split(/\s+/)[0] || userEmail.split('@')[0]) ?? 'there';
 
-  const { plan, access, learning, exams, community, activity, categories, continueLearning, recommended, platform, upgrade } = data;
+  const { plan, access, learning, exams, community, blogActivity, activity, categories, continueLearning, recommended, platform, upgrade } = data;
 
   const completionPct =
     learning.accessibleModules > 0 ? Math.round((learning.modulesCompletedInAccessible / learning.accessibleModules) * 100) : 0;
@@ -70,6 +70,7 @@ export default function DashboardHome({ data, userEmail, fullName, completions }
     { value: exams.bestScore === null ? '—' : `${exams.bestScore}%`, label: 'Best exam score', hint: exams.completedAttempts ? `${exams.completedAttempts} taken` : undefined },
     { value: fmtNum(community.upvotesReceived), label: 'Upvotes received' },
   ].map((t, i) => ({ ...t, accent: TILE_ACCENTS[i % TILE_ACCENTS.length] }));
+  const recentExamAttempts = [...exams.trend].reverse().slice(0, 5);
 
   return (
     <div className={styles.root}>
@@ -158,57 +159,156 @@ export default function DashboardHome({ data, userEmail, fullName, completions }
       )}
 
       {/* ── Stat tiles ────────────────────────────────────────────────── */}
-      <section className={styles.tiles}>
-        {tiles.map((t) => (
-          <div
-            key={t.label}
-            className={styles.tile}
-            style={t.accent ? ({ '--tile-accent': t.accent } as React.CSSProperties) : undefined}
-          >
-            <span className={styles.tileValue}>{t.value}</span>
-            <span className={styles.tileLabel}>{t.label}</span>
-            {t.hint && <span className={styles.tileHint}>{t.hint}</span>}
+      <section className={styles.overview} aria-labelledby="learning-overview-title">
+        <div className={styles.sectionHead}>
+          <div>
+            <span className={styles.sectionKicker}>Your progress</span>
+            <h2 id="learning-overview-title" className={styles.sectionTitle}>Learning overview</h2>
           </div>
-        ))}
+          <span className={styles.sectionMeta}>{learning.activeDays} active learning days</span>
+        </div>
+        <div className={styles.tiles}>
+          {tiles.map((t) => (
+            <div
+              key={t.label}
+              className={styles.tile}
+              style={t.accent ? ({ '--tile-accent': t.accent } as React.CSSProperties) : undefined}
+            >
+              <span className={styles.tileValue}>{t.value}</span>
+              <span className={styles.tileLabel}>{t.label}</span>
+              {t.hint && <span className={styles.tileHint}>{t.hint}</span>}
+            </div>
+          ))}
+        </div>
       </section>
 
       {/* ── Charts ────────────────────────────────────────────────────── */}
       <section className={styles.charts}>
-        <article className={styles.card}>
+        <article className={`${styles.card} ${styles.activityCard}`}>
           <div className={styles.cardHead}>
             <h3 className={styles.cardTitle}>Lessons completed</h3>
             <span className={styles.cardSub}>Last 12 weeks</span>
           </div>
-          <MiniBars
-            data={activity.weekly.map((w) => ({ label: weekTick(w.weekStart), value: w.modules }))}
-            ariaLabel="Lessons completed per week over the last 12 weeks"
-            labelEvery={3}
-            accent={ACTIVITY_ACCENT}
-          />
+          <div className={styles.chartSurface}>
+            <MiniBars
+              data={activity.weekly.map((w) => ({ label: weekTick(w.weekStart), value: w.modules }))}
+              ariaLabel="Lessons completed per week over the last 12 weeks"
+              labelEvery={3}
+              accent={ACTIVITY_ACCENT}
+            />
+          </div>
         </article>
 
-        <article className={styles.card}>
+        <article className={`${styles.card} ${styles.blogCard}`}>
           <div className={styles.cardHead}>
-            <h3 className={styles.cardTitle}>Certification practice exam scores</h3>
-            <span className={styles.cardSub}>{exams.averageScore !== null ? `Avg ${exams.averageScore}% · pass ${exams.passRate}%` : 'No attempts yet'}</span>
+            <div>
+              <span className={styles.cardKicker}>Your conversations</span>
+              <h3 className={styles.cardTitle}>Blog activity</h3>
+            </div>
+            <Link href="/blog" className={styles.cardHeadLink}>Visit blog</Link>
           </div>
-          {exams.trend.length >= 2 ? (
-            <TrendArea
-              points={exams.trend.map((p) => ({ label: p.label, value: p.score }))}
-              ariaLabel="Certification practice exam score trend"
-              accent={EXAM_ACCENT}
-            />
+          <div className={styles.blogStats}>
+            <div>
+              <span className={styles.blogStatValue}>{blogActivity.publishedPosts}</span>
+              <span className={styles.blogStatLabel}>Blog posts</span>
+            </div>
+            <div>
+              <span className={styles.blogStatValue}>{blogActivity.comments}</span>
+              <span className={styles.blogStatLabel}>Comments</span>
+            </div>
+            <div>
+              <span className={styles.blogStatValue}>{blogActivity.postsDiscussed}</span>
+              <span className={styles.blogStatLabel}>Posts discussed</span>
+            </div>
+            <div>
+              <span className={styles.blogStatValue}>{blogActivity.recognitionReceived}</span>
+              <span className={styles.blogStatLabel}>Recognition</span>
+            </div>
+          </div>
+          {blogActivity.recent.length > 0 ? (
+            <ul className={styles.blogRecentList}>
+              {blogActivity.recent.map((item, index) => (
+                <li key={`${item.slug}-${item.date}-${index}`}>
+                  <Link href={`/blog/${item.slug}`} className={styles.blogRecentLink}>
+                    <span className={styles.blogRecentTitle}>{item.title}</span>
+                    <span className={styles.blogRecentDate}>{fmtDate(item.date)}</span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
           ) : (
-            <div className={styles.chartEmpty}>
-              <p>Take a timed certification practice exam to start tracking your scores.</p>
-              <Link href="/mock-tests" className={styles.chartEmptyLink}>
-                Go to Certification Practice Exams
-              </Link>
+            <div className={styles.blogEmpty}>
+              <p>Join a blog discussion and your activity will appear here.</p>
+              <Link href="/blog" className={styles.chartEmptyLink}>Explore articles</Link>
             </div>
           )}
         </article>
 
-        <article className={styles.card}>
+        <article className={`${styles.card} ${styles.examCard}`}>
+          <div className={styles.cardHead}>
+            <div>
+              <span className={styles.cardKicker}>Certification practice</span>
+              <h3 className={styles.cardTitle}>Exam performance</h3>
+            </div>
+            <Link href="/mock-tests" className={styles.cardHeadLink}>View exams</Link>
+          </div>
+          <div className={styles.examStats}>
+            <div>
+              <span className={styles.examStatValue}>{exams.bestScore === null ? '—' : `${exams.bestScore}%`}</span>
+              <span className={styles.examStatLabel}>Best score</span>
+            </div>
+            <div>
+              <span className={styles.examStatValue}>{exams.averageScore === null ? '—' : `${exams.averageScore}%`}</span>
+              <span className={styles.examStatLabel}>Average</span>
+            </div>
+            <div>
+              <span className={styles.examStatValue}>{exams.completedAttempts}</span>
+              <span className={styles.examStatLabel}>Completed</span>
+            </div>
+          </div>
+          <div className={styles.examBody}>
+            <div className={styles.examTrend}>
+              <span className={styles.panelLabel}>Score trend</span>
+              {exams.trend.length >= 2 ? (
+                <div className={styles.chartSurface}>
+                  <TrendArea
+                    points={exams.trend.map((p) => ({ label: p.label, value: p.score }))}
+                    ariaLabel="Certification practice exam score trend"
+                    accent={EXAM_ACCENT}
+                  />
+                </div>
+              ) : (
+                <div className={styles.chartEmpty}>
+                  <p>Take a timed certification practice exam to start tracking your scores.</p>
+                  <Link href="/mock-tests" className={styles.chartEmptyLink}>Start an exam</Link>
+                </div>
+              )}
+            </div>
+            <div className={styles.examHistory}>
+              <span className={styles.panelLabel}>Recent attempts</span>
+              {recentExamAttempts.length > 0 ? (
+                <ol className={styles.attemptList}>
+                  {recentExamAttempts.map((attempt, index) => (
+                    <li key={`${attempt.label}-${attempt.date}-${index}`} className={styles.attemptRow}>
+                      <Link href={`/mock-tests/${attempt.slug}`} className={styles.attemptLink}>
+                        <span className={styles.attemptMarker} aria-hidden />
+                        <span className={styles.attemptInfo}>
+                          <span className={styles.attemptTitle}>{attempt.title}</span>
+                          <span className={styles.attemptDate}>{attempt.label} · {fmtDate(attempt.date)}</span>
+                        </span>
+                        <span className={styles.attemptScore}>{attempt.score}%</span>
+                      </Link>
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <p className={styles.historyEmpty}>Your completed attempts will appear here.</p>
+              )}
+            </div>
+          </div>
+        </article>
+
+        <article className={`${styles.card} ${styles.categoryCard}`}>
           <div className={styles.cardHead}>
             <h3 className={styles.cardTitle}>Progress by category</h3>
           </div>
@@ -241,7 +341,7 @@ export default function DashboardHome({ data, userEmail, fullName, completions }
           </ul>
         </article>
 
-        <article className={styles.card}>
+        <article className={`${styles.card} ${styles.communityCard}`}>
           <div className={styles.cardHead}>
             <h3 className={styles.cardTitle}>Community</h3>
           </div>
@@ -252,8 +352,8 @@ export default function DashboardHome({ data, userEmail, fullName, completions }
               { value: community.helpfulReceived, label: 'Helpful marks' },
               { value: community.bestAnswers, label: 'Best answers' },
             ].map((item, i) => (
-              <div key={item.label}>
-                <span className={styles.commValue} style={{ color: COMMUNITY_ACCENTS[i] }}>
+              <div key={item.label} style={{ '--metric-accent': COMMUNITY_ACCENTS[i] } as React.CSSProperties}>
+                <span className={styles.commValue}>
                   {fmtNum(item.value)}
                 </span>
                 <span className={styles.commLabel}>{item.label}</span>

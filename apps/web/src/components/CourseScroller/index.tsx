@@ -1,5 +1,6 @@
 import CourseCard from '@/components/CourseCard';
 import type { CourseWithAccess } from '@/data/courses';
+import { NEW_COURSE_SLUG_SET } from '@/lib/newCourses';
 import styles from './styles.module.css';
 
 interface CourseScrollerProps {
@@ -8,6 +9,7 @@ interface CourseScrollerProps {
   subtitle?: string;
   courses: CourseWithAccess[];
   bookmarkedIds: string[];
+  showNewBadges?: boolean;
 }
 
 /**
@@ -16,7 +18,13 @@ interface CourseScrollerProps {
  * horizontal strip, no prev/next buttons. Renders nothing when it has no
  * courses.
  */
-export default function CourseScroller({ title, subtitle, courses, bookmarkedIds }: CourseScrollerProps): React.JSX.Element | null {
+export default function CourseScroller({
+  title,
+  subtitle,
+  courses,
+  bookmarkedIds,
+  showNewBadges = false,
+}: CourseScrollerProps): React.JSX.Element | null {
   if (courses.length === 0) return null;
 
   return (
@@ -31,7 +39,12 @@ export default function CourseScroller({ title, subtitle, courses, bookmarkedIds
       <ul className={styles.grid}>
         {courses.map((course) => (
           <li key={course.id} className={styles.cell}>
-            <CourseCard course={course} bookmarked={bookmarkedIds.includes(course.id)} />
+            <CourseCard
+              course={course}
+              bookmarked={bookmarkedIds.includes(course.id)}
+              isNew={showNewBadges && NEW_COURSE_SLUG_SET.has(course.slug)}
+              variant="catalog"
+            />
           </li>
         ))}
       </ul>
