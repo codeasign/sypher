@@ -5,13 +5,13 @@ sidebar_label: Lesson Home
 
 # Authentication
 
-*Estimated completion time: 45–60 minutes*
+*Estimated completion time: 45-60 minutes*
 
 **Difficulty:** Advanced
 
 ## What This Lesson Covers
 
-Agents that interact with external services — sending emails, querying CRMs, reading cloud storage, posting to Slack — need credentials. Unlike a human user who can type a password or approve a push notification, an agent runs autonomously. Every credential must be available before the task begins, stored securely, and refreshed automatically when it expires.
+Agents that interact with external services (sending emails, querying CRMs, reading cloud storage, posting to Slack) need credentials. Unlike a human user who can type a password or approve a push notification, an agent runs autonomously. Every credential must be available before the task begins, stored securely, and refreshed automatically when it expires.
 
 This lesson teaches you how to authenticate agents to access external tools and APIs using OAuth 2.0, API keys, and service accounts. You will learn to design secure OAuth 2.0 flows that work with unattended agent execution, implement user impersonation patterns so agents act on behalf of a specific user, and manage credentials with secure storage and automated rotation.
 
@@ -43,7 +43,7 @@ Each topic in this lesson has four pages:
 |------|---------------|
 | [Overview](./overview) | Core concepts, trade-offs, and the big picture of agent authentication |
 | [Build It](./build-it) | Hands-on implementation of API key management, OAuth 2.0 refresh, and service account authentication |
-| [Avoid Mistakes](./avoid-mistakes) | Common pitfalls — hardcoded credentials, expired tokens, leaked secrets — and how to fix them |
+| [Avoid Mistakes](./avoid-mistakes) | Common pitfalls (hardcoded credentials, expired tokens, leaked secrets) and how to fix them |
 | [Review](./review) | Key takeaways and self-test to reinforce your understanding |
 
 ## Start Here

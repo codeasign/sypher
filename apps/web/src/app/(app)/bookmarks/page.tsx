@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import { redirect } from 'next/navigation';
 import { serverApiFetch } from '@/lib/serverApi';
-import type { Course } from '@/data/courses';
+import type { Course, CourseWithAccess } from '@/data/courses';
 import type { AuthoredModuleBookmarkEntry } from '@/data/bookmarks';
 import BookmarksContent, { type BookmarkedModule } from './BookmarksContent';
 import styles from './styles.module.css';
@@ -11,18 +11,26 @@ export const metadata: Metadata = {
   description: 'Courses and modules you’ve bookmarked on Sypher.',
 };
 
+// A bookmarked course that isn't in the per-user catalog list (unpublished,
+// or otherwise out of scope) still gets a card — as a no-access Preview.
+function asCardCourse(course: Course): CourseWithAccess {
+  return { ...course, hasFullAccess: false, started: false, completedModules: 0, totalModules: 0 };
+}
+
 export default async function BookmarksPage(): Promise<React.JSX.Element> {
   const meRes = await serverApiFetch('/auth/me');
   if (!meRes.ok) {
     redirect('/login');
   }
 
-  const [courseIdsRes, moduleBookmarksRes] = await Promise.all([
+  const [courseIdsRes, moduleBookmarksRes, sidebarRes] = await Promise.all([
     serverApiFetch('/bookmarks/authored-courses'),
     serverApiFetch('/bookmarks/authored-modules'),
+    serverApiFetch('/courses/sidebar-list'),
   ]);
   const courseIds: string[] = courseIdsRes.ok ? await courseIdsRes.json() : [];
   const moduleBookmarks: AuthoredModuleBookmarkEntry[] = moduleBookmarksRes.ok ? await moduleBookmarksRes.json() : [];
+  const sidebarCourses: CourseWithAccess[] = sidebarRes.ok ? await sidebarRes.json() : [];
   const moduleIds = moduleBookmarks.map((b) => b.moduleId);
 
   const [coursesRes, modulesRes] = await Promise.all([
@@ -33,8 +41,23 @@ export default async function BookmarksPage(): Promise<React.JSX.Element> {
       ? serverApiFetch('/courses/modules/by-ids', { method: 'POST', body: JSON.stringify({ ids: moduleIds }) })
       : Promise.resolve(null),
   ]);
-  const courses: Course[] = coursesRes?.ok ? await coursesRes.json() : [];
+  const baseCourses: Course[] = coursesRes?.ok ? await coursesRes.json() : [];
   const modules: BookmarkedModule[] = modulesRes?.ok ? await modulesRes.json() : [];
+
+  // Prefer the per-user catalog entry (carries access + progress, so the card
+  // shows Start / Resume / Preview and a progress bar exactly like My Courses
+  // and Browse Courses); fall back to the bare course record. Order follows
+  // the bookmark list the API returned.
+  const enrichedById = new Map(sidebarCourses.map((c) => [c.id, c]));
+  const baseById = new Map(baseCourses.map((c) => [c.id, c]));
+  const courses: CourseWithAccess[] = courseIds
+    .map((id) => {
+      const enriched = enrichedById.get(id);
+      if (enriched) return enriched;
+      const base = baseById.get(id);
+      return base ? asCardCourse(base) : null;
+    })
+    .filter((c): c is CourseWithAccess => c !== null);
 
   return (
     <div className={styles.page}>

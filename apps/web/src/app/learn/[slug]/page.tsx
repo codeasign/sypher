@@ -3,6 +3,7 @@ import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
 import { serverApiFetch } from '@/lib/serverApi';
 import type { CourseWithAccess, CourseModuleSummary } from '@/data/courses';
+import { courseActionLabel, courseActionTone } from '@/data/courses';
 import { CourseBookmarkButton } from '@/components/AuthoredBookmarkButton';
 import { LockIcon } from '@/components/icons/SidebarIcons';
 import CourseHomeTabs from '@/components/CourseHomeTabs';
@@ -72,6 +73,21 @@ export default async function CourseHomePage({ params }: { params: Promise<{ slu
     fetchRelatedCourses(course),
   ]);
 
+  // Same Start / Resume / Preview logic the My Courses card uses, surfaced
+  // here as an actual link into the reader. Resume lands on the first
+  // unlocked-but-unfinished module; Start/Preview on the first openable one.
+  const ACTION_TONE_CLASS = {
+    start: styles.actionStart,
+    resume: styles.actionResume,
+    preview: styles.actionPreview,
+  } as const;
+  const openableModules = modules.filter((mod) => !mod.locked);
+  const targetModule = course.started
+    ? openableModules.find((mod) => !mod.completed) ?? openableModules[0] ?? modules[0]
+    : openableModules[0] ?? modules[0];
+  const actionLabel = `${courseActionLabel(course)} Course`;
+  const actionToneClass = ACTION_TONE_CLASS[courseActionTone(course)];
+
   return (
     <div className={styles.page}>
       <div className={styles.container}>
@@ -79,11 +95,17 @@ export default async function CourseHomePage({ params }: { params: Promise<{ slu
           ← My Courses
         </Link>
 
-        {course.category && <span className={styles.categoryBadge}>{course.category}</span>}
         {course.coverImageUrl && <img src={course.coverImageUrl} alt={course.name} className={styles.coverImage} />}
         <div className={styles.titleRow}>
           <h1 className={styles.title}>{course.name}</h1>
-          <CourseBookmarkButton courseId={course.id} initialBookmarked={bookmarkedIds.includes(course.id)} />
+          <div className={styles.titleActions}>
+            {targetModule && (
+              <Link href={`/learn/${slug}/${targetModule.slug}`} className={`${styles.actionButton} ${actionToneClass}`}>
+                {actionLabel}
+              </Link>
+            )}
+            <CourseBookmarkButton courseId={course.id} initialBookmarked={bookmarkedIds.includes(course.id)} />
+          </div>
         </div>
         <CourseHomeTabs
           about={

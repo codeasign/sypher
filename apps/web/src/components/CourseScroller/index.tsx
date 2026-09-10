@@ -4,7 +4,8 @@ import { NEW_COURSE_SLUG_SET } from '@/lib/newCourses';
 import styles from './styles.module.css';
 
 interface CourseScrollerProps {
-  title: string;
+  /** Section heading. Omit to render just the card grid (e.g. the Bookmarks tabs). */
+  title?: string;
   /** Optional line under the title (e.g. "Because you're taking …"). */
   subtitle?: string;
   courses: CourseWithAccess[];
@@ -16,7 +17,8 @@ interface CourseScrollerProps {
  * A titled section of course cards in a wrapping grid. The grid grows
  * downward as more cards are added and the page scrolls vertically — no
  * horizontal strip, no prev/next buttons. Renders nothing when it has no
- * courses.
+ * courses. With no title/subtitle the header is dropped and only the grid
+ * renders.
  */
 export default function CourseScroller({
   title,
@@ -29,12 +31,14 @@ export default function CourseScroller({
 
   return (
     <section className={styles.section}>
-      <div className={styles.header}>
-        <div className={styles.heading}>
-          <h2 className={styles.title}>{title}</h2>
-          {subtitle && <p className={styles.subtitle}>{subtitle}</p>}
+      {(title || subtitle) && (
+        <div className={styles.header}>
+          <div className={styles.heading}>
+            {title && <h2 className={styles.title}>{title}</h2>}
+            {subtitle && <p className={styles.subtitle}>{subtitle}</p>}
+          </div>
         </div>
-      </div>
+      )}
 
       <ul className={styles.grid}>
         {courses.map((course) => (

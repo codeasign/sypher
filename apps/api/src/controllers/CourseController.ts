@@ -7,6 +7,7 @@ import {
   type CourseModuleSummary,
   type GettingStartedModuleEntry,
   type ModuleWithCourseEntry,
+  type ImportCourseModuleInput,
 } from '../repositories/CourseModuleRepository';
 import { AuthoredCourseAccessRepository } from '../repositories/AuthoredCourseAccessRepository';
 import { AuthoredCompanyCourseAccessRepository } from '../repositories/AuthoredCompanyCourseAccessRepository';
@@ -18,6 +19,8 @@ import { hasCourseAccess } from '../lib/accessControl';
 import { isModuleFreelyVisible } from '../lib/coursePreview';
 import { getOrSet, purge } from '../lib/cache';
 import { assertNoReplacementChar } from '../lib/textSanitize';
+import { HttpError } from '../lib/errors';
+import { assertImportedDiagramCaptions } from '../lib/diagramMarkup';
 
 const courseRepository = new CourseRepository();
 const courseModuleRepository = new CourseModuleRepository();
@@ -497,7 +500,29 @@ export class CourseController extends Controller {
   ): Promise<CourseModule> {
     await requireCanManageCourses(request.user as User);
     assertNoReplacementChar(body.title, 'Title');
+    assertImportedDiagramCaptions(body.bodyMdx);
     const mod = await courseModuleRepository.create(courseId, body);
+    purge('courses');
+    return mod;
+  }
+
+  // Migration imports retain stable source slugs, section metadata and order.
+  // Use the same management authorization as ordinary module creation.
+  @Post('{courseId}/modules/import')
+  @Security('session')
+  public async importModule(
+    @Path() courseId: string,
+    @Body() body: ImportCourseModuleInput,
+    @Request() request: ExpressRequest,
+  ): Promise<CourseModule> {
+    await requireCanManageCourses(request.user as User);
+    if (!await courseRepository.findById(courseId)) throw new HttpError(404, 'Course not found');
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(body.slug)) throw new HttpError(400, 'Invalid module slug');
+    if (!Number.isInteger(body.orderIndex) || body.orderIndex < 0) throw new HttpError(400, 'Invalid module order');
+    assertNoReplacementChar(body.title, 'Title');
+    assertNoReplacementChar(body.bodyMdx, 'Body');
+    assertImportedDiagramCaptions(body.bodyMdx);
+    const mod = await courseModuleRepository.upsertImported(courseId, body);
     purge('courses');
     return mod;
   }
@@ -512,6 +537,7 @@ export class CourseController extends Controller {
   ): Promise<void> {
     await requireCanManageCourses(request.user as User);
     assertNoReplacementChar(body.title, 'Title');
+    assertImportedDiagramCaptions(body.bodyMdx);
     await courseModuleRepository.update(moduleId, body);
     purge('courses');
   }

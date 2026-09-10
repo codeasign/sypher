@@ -50,17 +50,56 @@
 //
 // Usage (from apps/api):
 //   npx tsx scripts/import-docusaurus-course.ts [slug ...]
+//   npx tsx scripts/import-docusaurus-course.ts --verify [slug ...]
+// Verification compares stored content against source without uploading or writing.
+// All course/module writes use the seeded admin's authenticated management API.
 //   (no args = all 20 target courses)
 
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
-import { prisma } from '../src/lib/prisma';
-import { CourseRepository } from '../src/repositories/CourseRepository';
-import { CourseModuleRepository, type ImportCourseModuleInput } from '../src/repositories/CourseModuleRepository';
+import type { ImportCourseModuleInput } from '../src/repositories/CourseModuleRepository';
 import { uploadBufferToBunny } from '../src/lib/bunnyUploadServer';
+import { env } from '../src/lib/env';
+import { readableBlackboardSvg, diagramSvgFilename } from '../src/lib/diagramSvg';
+import { diagramCaption, renderDiagramFigure } from '../src/lib/diagramMarkup';
 
 const DOCS_ROOT = path.resolve(__dirname, '../../docs');
+const API_URL = process.env.IMPORT_API_URL || 'http://localhost:4000';
+let sessionCookie = '';
+const VERIFY_ONLY = process.argv.includes('--verify');
+
+async function findCourse(slug: string): Promise<any> {
+  for (let offset = 0; ; offset += 100) {
+    const page = await api('GET', `/courses/manage/list?limit=100&offset=${offset}`);
+    const found = page.courses.find((c: { slug: string }) => c.slug === slug);
+    if (found) return found;
+    if (offset + page.courses.length >= page.total || !page.courses.length) return undefined;
+  }
+}
+
+async function api<T = any>(method: string, route: string, body?: unknown): Promise<T> {
+  const response = await fetch(`${API_URL}${route}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', Cookie: sessionCookie },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(`${method} ${route}: HTTP ${response.status}`);
+  return response.status === 204 ? undefined as T : response.json() as Promise<T>;
+}
+
+async function login(): Promise<void> {
+  const response = await fetch(`${API_URL}/auth/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: process.env.IMPORT_ADMIN_EMAIL || 'admin@sypher.local',
+      password: process.env.IMPORT_ADMIN_PASSWORD || 'devpassword123',
+    }),
+  });
+  if (!response.ok) throw new Error(`Admin login failed: HTTP ${response.status}`);
+  sessionCookie = response.headers.getSetCookie().map(c => c.split(';')[0]).join('; ');
+  if (!sessionCookie) throw new Error('Admin login returned no session cookie');
+}
 
 const TARGET_COURSES = [
   'agentic-ai-fundamentals',
@@ -260,7 +299,7 @@ async function convertAsciiDiagrams(
     const id = extractAttr(tag.text, 'id');
     const mermaidSrc = extractAttr(tag.text, 'mermaidSrc');
     const alt = extractAttr(tag.text, 'alt') ?? '';
-    const caption = extractAttr(tag.text, 'caption');
+    const caption = diagramCaption(extractAttr(tag.text, 'caption'), extractAttr(tag.text, 'title'));
 
     if (!id) throw new CourseImportError(`${docId}: <AsciiDiagram> tag has no id attribute`);
     if (!mermaidSrc) throw new CourseImportError(`${docId}: AsciiDiagram "${id}" has no mermaidSrc — not actually converted despite course being marked fully converted`);
@@ -285,15 +324,12 @@ async function convertAsciiDiagrams(
     }
 
     const svgBuffer = readableBlackboardSvg(readFileSync(svgAbsPath));
-    const filename = path.basename(svgAbsPath);
+    const filename = diagramSvgFilename(path.basename(svgAbsPath), svgBuffer);
     const pathPrefix = `svgs/${courseSlug}/${renderedModuleSlug(courseSlug, docId)}`;
-    const bunnyUrl = await uploadBufferToBunny(svgBuffer, filename, pathPrefix, 'image/svg+xml');
-    // <figure>/<figcaption> aren't in the reader's rehype-sanitize allowlist
-    // (CourseModuleArticle.tsx extends defaultSchema with only 'u') — a
-    // plain italic paragraph is the closest allowed equivalent, so a
-    // caption survives instead of being silently dropped like before.
-    const captionHtml = caption ? `\n\n<p><em>${escapeHtmlAttr(caption)}</em></p>` : '';
-    replacements.push({ start: tag.start, end: tag.end, replacement: `<img src="${bunnyUrl}" alt="${escapeHtmlAttr(alt)}" />${captionHtml}` });
+    const bunnyUrl = VERIFY_ONLY
+      ? `${env.bunny.pullZoneUrl.replace(/\/+$/, '')}/${pathPrefix}/${filename}`
+      : await uploadBufferToBunny(svgBuffer, filename, pathPrefix, 'image/svg+xml');
+    replacements.push({ start: tag.start, end: tag.end, replacement: renderDiagramFigure(bunnyUrl, alt, caption) });
   }
 
   let out = '';
@@ -310,27 +346,6 @@ async function convertAsciiDiagrams(
 // This final, high-specificity palette makes the exported SVG itself the source
 // of truth, so the same asset stays consistent in both app themes and when it is
 // opened directly from Bunny.
-function readableBlackboardSvg(buffer: Buffer): Buffer {
-  const svg = buffer.toString('utf8');
-  const style = `<style data-sypher-theme="blackboard-v3">
-#my-svg{background:#0B0F14!important;background-color:#0B0F14!important;color:#E8EEF5!important;}
-#my-svg text,#my-svg tspan,#my-svg .nodeLabel,#my-svg .nodeLabel *,#my-svg .edgeLabel,#my-svg .edgeLabel *,#my-svg .label,#my-svg .label *,#my-svg .labelText,#my-svg .loopText,#my-svg .messageText,#my-svg .noteText,#my-svg .actor,#my-svg .actor *,#my-svg .cluster-label,#my-svg .cluster-label *,#my-svg .classTitleText,#my-svg .taskText,#my-svg .taskTextOutsideRight,#my-svg .taskTextOutsideLeft,#my-svg .sectionTitle,#my-svg .titleText,#my-svg .pieTitleText,#my-svg .legend,#my-svg .branch-label,#my-svg .commit-label,#my-svg .mindmap-node,#my-svg .timeline-node,#my-svg .packetLabel,#my-svg .architecture-service,#my-svg foreignObject,#my-svg foreignObject *{color:#E8EEF5!important;fill:#E8EEF5!important;stroke:none!important;}
-#my-svg .node rect,#my-svg .node circle,#my-svg .node ellipse,#my-svg .node polygon,#my-svg .node .label-container,#my-svg .node .outer-path,#my-svg g.classGroup rect,#my-svg .statediagram-state rect,#my-svg .statediagram-state polygon,#my-svg rect.actor,#my-svg .actor-box,#my-svg .labelBox,#my-svg .requirementBox,#my-svg .elementBox,#my-svg .entityBox,#my-svg .attributeBoxEven,#my-svg .attributeBoxOdd,#my-svg .block rect,#my-svg .block polygon,#my-svg .kanban-item .label-container,#my-svg .architecture-service rect,#my-svg .architecture-group rect,#my-svg .c4Shape rect,#my-svg .packet rect,#my-svg [class*="packet"] rect,#my-svg [class*="event"] .label-container,#my-svg [class*="swimlane"] .label-container{fill:#16202C!important;stroke:#5EA3E6!important;}
-#my-svg .node .label-container path,#my-svg .node .outer-path path,#my-svg .node-bkg{stroke:#5EA3E6!important;}#my-svg .node .label-container path[fill]:not([fill="none"]):not([fill="transparent"]),#my-svg .node .outer-path path[fill]:not([fill="none"]):not([fill="transparent"]),#my-svg .node-bkg{fill:#16202C!important;}
-#my-svg rect[class*="task"],#my-svg polygon[class*="task"],#my-svg .journey-section rect,#my-svg .gantt .task,#my-svg .kanban-item rect,#my-svg .timeline-node rect,#my-svg .timeline-node-section rect,#my-svg .architecture-service .label-container,#my-svg .architecture-group .label-container,#my-svg .person rect,#my-svg .system rect,#my-svg .container rect,#my-svg .component rect{fill:#16202C!important;stroke:#5EA3E6!important;}
-#my-svg .cluster rect,#my-svg .cluster polygon,#my-svg .architecture-group rect,#my-svg .boundary,#my-svg .section,#my-svg .kanban-section{fill:#101720!important;stroke:#33465C!important;}
-#my-svg rect.note,#my-svg polygon.note,#my-svg .note rect,#my-svg .note polygon,#my-svg .statediagram-note rect,#my-svg .note-cluster rect{fill:#16202C!important;stroke:#5EA3E6!important;}
-#my-svg .labelBkg,#my-svg .edgeLabel rect,#my-svg .edgeLabel polygon,#my-svg .edgeLabel span,#my-svg .relationshipLabelBox,#my-svg .requirementLabelBox{fill:#0B0F14!important;background:#0B0F14!important;background-color:#0B0F14!important;}
-#my-svg .flowchart-link,#my-svg .edgePath path,#my-svg .edgePaths path,#my-svg .messageLine0,#my-svg .messageLine1,#my-svg .actor-line,#my-svg .loopLine,#my-svg .relation,#my-svg .relationshipLine,#my-svg .transition,#my-svg .requirementRelation,#my-svg .mindmap-edge,#my-svg .timeline-edge,#my-svg .architecture-edge,#my-svg .c4Shape line,#my-svg .divider,#my-svg .divider path,#my-svg line{stroke:#5EA3E6!important;}
-#my-svg .gitGraph path,#my-svg path[class*="branch"],#my-svg path[class*="edge"],#my-svg path[class*="relation"],#my-svg path[class*="transition"],#my-svg path[class*="connector"],#my-svg path[class*="link"]{stroke:#5EA3E6!important;}
-#my-svg marker path,#my-svg marker polygon,#my-svg .marker,#my-svg .arrowMarkerPath,#my-svg [id*="arrowhead"] path,#my-svg [id*="arrowhead"] polygon,#my-svg [id*="composition"] path,#my-svg [id*="composition"] polygon,#my-svg [id*="dependency"] path,#my-svg [id*="dependency"] polygon,#my-svg [id*="extension"] path,#my-svg [id*="extension"] polygon,#my-svg [id*="aggregation"] path,#my-svg [id*="aggregation"] polygon{fill:#5EA3E6!important;stroke:#5EA3E6!important;}
-#my-svg .state-start,#my-svg .state-end,#my-svg .commit,#my-svg .quadrant-point{fill:#5EA3E6!important;stroke:#5EA3E6!important;}
-#my-svg .grid .tick line,#my-svg .axis-line,#my-svg .quadrant-x-axis line,#my-svg .quadrant-y-axis line,#my-svg .radar-axis-line,#my-svg .radar-graticule{stroke:#33465C!important;}
-#my-svg .sankey-link{stroke:#5EA3E6!important;fill:none!important;}
-#my-svg .label-icon path,#my-svg .icon-shape path,#my-svg .icon-neo path{fill:#E8EEF5!important;stroke:#E8EEF5!important;}
-</style>`;
-  return Buffer.from(svg.replace('</svg>', `${style}</svg>`), 'utf8');
-}
 
 function stripKnownImports(body: string): string {
   return body.replace(/^import\s+.*from\s+['"]@(?:site|theme)\/.*['"];?\s*$/gm, '').replace(/^<CourseCurriculum\s*\/>\s*$/gm, '');
@@ -464,18 +479,33 @@ async function importCourse(courseSlug: string): Promise<void> {
     });
   }
 
-  // Everything validated — now write. Course + all modules for one course
-  // commit together only after every diagram in it passed the safety check
-  // above; a thrown CourseImportError anywhere before this point means
-  // nothing for this course has been written yet.
-  const courseRepository = new CourseRepository();
-  const courseModuleRepository = new CourseModuleRepository();
-
-  const course = await courseRepository.upsertBySlug(courseSlug, {
+  // All content converted before database writes. Each authenticated request
+  // commits independently; reruns resume by stable course/module slug.
+  let course = await findCourse(courseSlug);
+  if (VERIFY_ONLY) {
+    if (!course) throw new Error(`Course missing: ${courseSlug}`);
+    const stored = await api('GET', `/courses/${course.id}/manage/modules`);
+    if (stored.length !== modules.length) throw new Error(`Module count differs: ${stored.length} vs ${modules.length}`);
+    for (const [index, mod] of modules.entries()) {
+      const actual = stored[index];
+      if (actual.slug !== mod.slugSegment || actual.title !== mod.title || actual.bodyMdx !== mod.body ||
+          actual.orderIndex !== index * 10 || actual.sectionLabel !== mod.sectionLabel || actual.sectionOrder !== mod.sectionOrder) {
+        throw new Error(`Stored module differs from source: ${mod.docId}`);
+      }
+    }
+    console.log(`  VERIFIED: ${modules.length} exact source bodies, titles, slugs, order and sections; status=${course.status}`);
+    return;
+  }
+  const fields = {
     name: overview.name,
     description: overview.description,
     category: 'tech',
-  });
+  };
+  if (course) {
+    await api('PUT', `/courses/${course.id}`, fields);
+  } else {
+    course = await api('POST', '/courses', { slug: courseSlug, ...fields });
+  }
 
   let orderIndex = 0;
   for (const mod of modules) {
@@ -487,7 +517,7 @@ async function importCourse(courseSlug: string): Promise<void> {
       sectionLabel: mod.sectionLabel,
       sectionOrder: mod.sectionOrder,
     };
-    await courseModuleRepository.upsertImported(course.id, input);
+    await api('POST', `/courses/${course.id}/modules/import`, input);
     orderIndex += 10;
   }
 
@@ -498,7 +528,7 @@ async function importCourse(courseSlug: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const requested = process.argv.slice(2);
+  const requested = process.argv.slice(2).filter(arg => arg !== '--verify');
   const slugs = requested.length > 0 ? requested : TARGET_COURSES;
 
   const unknown = slugs.filter((s) => !TARGET_COURSES.includes(s));
@@ -508,12 +538,13 @@ async function main(): Promise<void> {
   }
 
   const failures: Array<{ course: string; error: string }> = [];
+  await login();
   for (const slug of slugs) {
     try {
       await importCourse(slug);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(`  HARD STOP — ${slug} import aborted, nothing written: ${message}`);
+      console.error(`  HARD STOP — ${slug} import stopped (completed API writes may remain; rerun to resume): ${message}`);
       failures.push({ course: slug, error: message });
     }
   }
@@ -525,7 +556,6 @@ async function main(): Promise<void> {
     for (const f of failures) console.log(`    - ${f.course}: ${f.error}`);
   }
 
-  await prisma.$disconnect();
   process.exit(failures.length > 0 ? 1 : 0);
 }
 

@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { apiFetch } from '@/lib/api';
 import { useColorMode } from '@/hooks/useColorMode';
+import { DashboardIcon, ManageCoursesIcon } from '@/components/icons/SidebarIcons';
 import styles from './styles.module.css';
 
 interface AuthUser {
@@ -163,7 +164,12 @@ export default function Navbar(): React.JSX.Element | null {
           <ColorModeToggle />
           {user ? (
             <div className={styles.userArea}>
+              <Link href="/learn" className={styles.myCoursesBtn}>
+                <ManageCoursesIcon className={styles.navBtnIcon} />
+                My Courses
+              </Link>
               <Link href="/dashboard" className={styles.dashboardBtn}>
+                <DashboardIcon className={styles.navBtnIcon} />
                 Dashboard
               </Link>
             </div>

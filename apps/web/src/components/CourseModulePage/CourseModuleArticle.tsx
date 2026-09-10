@@ -5,14 +5,10 @@ import ReactMarkdown from 'react-markdown';
 import remarkBreaks from 'remark-breaks';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
-import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
+import rehypeSanitize from 'rehype-sanitize';
 import CodeBlock from '@/components/BlogPostPage/CodeBlock';
 import styles from './styles.module.css';
-
-const schema = {
-  ...defaultSchema,
-  tagNames: [...(defaultSchema.tagNames ?? []), 'u'],
-};
+import { courseMarkdownSchema } from './markdownSchema.mjs';
 
 interface CourseModuleArticleProps {
   title: string;
@@ -24,7 +20,7 @@ export default function CourseModuleArticle({ title, content }: CourseModuleArti
     <article className={styles.article}>
       <h1 className={styles.title}>{title}</h1>
       <div className={styles.body}>
-        <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} rehypePlugins={[rehypeRaw, [rehypeSanitize, schema]]} components={{ pre: CodeBlock }}>
+        <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} rehypePlugins={[rehypeRaw, [rehypeSanitize, courseMarkdownSchema]]} components={{ pre: CodeBlock }}>
           {content}
         </ReactMarkdown>
       </div>

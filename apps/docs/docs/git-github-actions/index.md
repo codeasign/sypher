@@ -5,17 +5,17 @@ sidebar_label: Course Home
 
 # Git and GitHub Actions
 
-*Estimated completion time: 25–35 hours*
+*Estimated completion time: 25-35 hours*
 
 **Difficulty:** Beginner to Advanced
 
 ## What This Course Covers
 
-This course teaches Git from the ground up — from your first commit to production CI/CD pipelines. You will learn version control fundamentals, branching strategies, collaboration workflows, and GitHub Actions for automated testing and deployment. Every topic follows the same structure: understand the concept, build it with real commands, avoid common mistakes, and practice on your own.
+This course teaches Git from the ground up, starting at your first commit and building toward production CI/CD pipelines. You will learn version control fundamentals, branching strategies, collaboration workflows, and GitHub Actions for automated testing and deployment. Every topic follows the same structure: understand the concept, build it with real commands, avoid common mistakes, and practice on your own.
 
 ## Why This Matters
 
-Git is the universal version control system in software engineering. GitHub Actions is the most widely used CI/CD platform. Together they form the foundation of modern software development — every engineer needs to master both to collaborate effectively, automate quality gates, and ship reliable software.
+Git is the universal version control system in software engineering. GitHub Actions is the most widely used CI/CD platform. Together they form the foundation of modern software development, and every engineer needs to master both to collaborate effectively, automate quality gates, and ship reliable software.
 
 ## Skills You Will Gain
 
@@ -41,8 +41,8 @@ Git is the universal version control system in software engineering. GitHub Acti
 
 Each lesson has three pages:
 
-- **Overview** — the concept, commands, and mental model
-- **Practice Exercise** — a guided build with real commands and expected output
-- **Practice Exercises** — unguided tiered exercises to prove your skills
+- **Overview**: the concept, commands, and mental model
+- **Practice Exercise**: a guided build with real commands and expected output
+- **Practice Exercises**: unguided tiered exercises to prove your skills
 
 You can read in order or jump to a specific lesson. The Practice Exercise pages assume you have completed the Overview for that lesson.

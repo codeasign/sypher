@@ -1,6 +1,6 @@
 ---
 id: pipelines-as-quality-gates
-title: Pipelines as Quality Gates — The QE Mindset
+title: "Pipelines as Quality Gates: The QE Mindset"
 sidebar_label: Pipelines as Quality Gates
 ---
 
