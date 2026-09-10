@@ -17,8 +17,11 @@ further down remain historical context.
 ### Commit / push
 
 - Commit `43b2dd39` "UI - UX Changes , Audited Course and Diagrams" (author
-  codeasign), pushed to `origin/v2-openrouter` on 2026-09-11. Branch up to date
-  with origin.
+  codeasign), pushed to `origin/v2-openrouter` on 2026-09-11.
+- Follow-up commit `e5a80f1e` "Updated Instructions for handover file" (author
+  codeasign), pushed 2026-09-11: adds the "DO NOT COMMIT WITHOUT EXPLICIT
+  APPROVAL" standing rule to `AGENTS.md` (Git Safety Rules) and to the top of
+  this file. Branch up to date with origin; working tree clean.
 - It bundles THREE streams that were all uncommitted at the time: (A) the prior
   agent's Docusaurus import of agentic-ai-fundamentals + git-github-actions
   (importer, CourseController import endpoint, package*.json parse5, 2 manifests,
