@@ -263,6 +263,14 @@ Boundary section.
 
 ## Git Safety Rules (all agents)
 
+- **DO NOT COMMIT WITHOUT EXPLICIT APPROVAL.** Never run `git commit` (or
+  `git add` in preparation for one, or `git push`) unless the user has, in the
+  current session, explicitly asked for that specific commit/push. "Finish the
+  task", "make it work", "update the file", a green build, or approval of an
+  earlier commit do NOT authorize a commit. When work is done, leave it as
+  uncommitted working-tree changes and tell the user it is ready to commit.
+  Approval is per-action: one "yes, commit" does not authorize the next commit,
+  amend, or push.
 - Run `git status` and `git diff` before starting substantial work, and again before
   any command that could discard uncommitted work.
 - NEVER run git reset --hard, git clean, git checkout -- <path>, git restore, or git

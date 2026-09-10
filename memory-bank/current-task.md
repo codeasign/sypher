@@ -1,10 +1,42 @@
 # Current Task Handoff
 
-## Current Status (COMPLETE, 2026-09-11: apps/web diagram/caption repair)
+> **STANDING RULE — DO NOT COMMIT WITHOUT EXPLICIT APPROVAL.** Never run
+> `git commit` / `git add` (in preparation for a commit) / `git push` unless the
+> user has, in this session, explicitly asked for that specific commit or push.
+> Finishing the task, updating a file, a passing build, or approval of an
+> earlier commit do NOT authorize one. Leave completed work as uncommitted
+> working-tree changes and say it is ready. Approval is per-action. (Also in
+> `AGENTS.md` → Git Safety Rules.)
 
-The repair the prior checkpoints scoped is DONE and verified end to end. No
-commit was made (per standing instruction). The preventive-code section and the
-Metrics-course notes further down remain historical context.
+## Current Status (COMPLETE + COMMITTED + PUSHED, 2026-09-11: apps/web diagram/caption repair)
+
+The repair the prior checkpoints scoped is DONE and verified end to end, then
+committed and pushed. The preventive-code section and the Metrics-course notes
+further down remain historical context.
+
+### Commit / push
+
+- Commit `43b2dd39` "UI - UX Changes , Audited Course and Diagrams" (author
+  codeasign), pushed to `origin/v2-openrouter` on 2026-09-11. Branch up to date
+  with origin.
+- It bundles THREE streams that were all uncommitted at the time: (A) the prior
+  agent's Docusaurus import of agentic-ai-fundamentals + git-github-actions
+  (importer, CourseController import endpoint, package*.json parse5, 2 manifests,
+  ~395 `apps/docs/docs/**` YAML/content files, helper scripts); (B) this
+  session's diagram/caption repair (see New/changed files below); (C) unrelated
+  in-progress apps/web UI work (bookmarks two-pane, navbar "My Courses",
+  dashboard scrollbar, course-cover banners, CourseScroller, ActionIcons).
+- `scratch/diagram-browser-profile/` was initially committed by mistake. Its
+  Chrome Crashpad dump contained two OpenRouter API keys, so GitHub push
+  protection blocked the first push. Fixed by `git rm -r` of that dir +
+  `.gitignore` entries (`scratch/diagram-browser-profile/`,
+  `scratch/*-browser-profile/`) + `git commit --amend` (old unpushed hash
+  `11b4a8dc` discarded). Final commit scanned clean for secrets before push.
+- OUTSTANDING (user action, not code): rotate the two leaked OpenRouter keys
+  (`sk-or-v1-1dde9797…`, `sk-or-v1-3ec55efd…`). They never reached the remote
+  (push protection blocked the first attempt) and are in no tracked file, but
+  they were briefly written to disk in a locally-committed artifact. The live
+  key in `apps/docs/.env` (gitignored) is unaffected.
 
 ### Outcome
 
@@ -41,7 +73,7 @@ Metrics-course notes further down remain historical context.
 - `Course-Diagram-Audit.md` (repo root) rewritten with the before/after table
   and the full change list.
 
-### New / changed files this session (all uncommitted, none are course content)
+### New / changed files this session (now in commit 43b2dd39; none are course content)
 
 - NEW `apps/api/scripts/repair-course-diagrams.mjs` — the repair driver.
 - NEW `apps/api/scripts/diagram-safeguards.test.mjs` — `node --test` regression suite.
@@ -55,17 +87,18 @@ Metrics-course notes further down remain historical context.
   adds `--course` filter and `bareImportedImg` / `figuresWithCaption` fields.
 - The DB (949 module bodies) and Bunny CDN (13 new v4 SVGs) changed; those are
   not in git.
-- Everything else matches the prior checkpoint's Files Modified list below
-  (235 agentic-ai-fundamentals + 160 git-github-actions apps/docs audit files,
-  the 11 unrelated pre-existing apps/web changes, package.json/lock, manifests,
-  the earlier untracked helper scripts, `scratch/diagram-browser-profile/`).
+- All of it (streams A/B/C) landed in commit 43b2dd39 EXCEPT
+  `scratch/diagram-browser-profile/`, which was removed and gitignored.
+  Working tree is now clean; `git status` shows up to date with origin.
 
 ### If anything else is wanted
 
 - Re-verify any time: `cd apps/api && node scripts/audit-course-diagrams.mjs`.
 - The preventive-code review, `parse5` dependency note, and Puppeteer/EPERM
   notes below are still accurate history.
-- No commit unless the user explicitly asks for it.
+- The diagram/caption repair is shipped. Any further diagram work would be new
+  scope (e.g. authoring real captions for the 37 caption-less git-github-actions
+  figures, or reviewing the ~49 source-hash drifts deliberately left alone).
 
 
 ### Objective and authority
