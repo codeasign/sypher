@@ -30,11 +30,16 @@ const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
 export default function VideoPlayer({ slug }: { slug: string }): React.JSX.Element {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [rate, setRate] = useState(1);
+  const [paused, setPaused] = useState(true);
   const src = `${API_BASE_URL}/videos/${encodeURIComponent(slug)}/stream`;
 
   function handleRateChange(next: number): void {
     setRate(next);
     if (videoRef.current) videoRef.current.playbackRate = next;
+  }
+
+  function handlePlayIconClick(): void {
+    videoRef.current?.play();
   }
 
   return (
@@ -46,8 +51,22 @@ export default function VideoPlayer({ slug }: { slug: string }): React.JSX.Eleme
         controlsList="nodownload noremoteplayback"
         disablePictureInPicture
         onContextMenu={(e) => e.preventDefault()}
+        onPlay={() => setPaused(false)}
+        onPause={() => setPaused(true)}
         className={styles.video}
       />
+      {paused && (
+        <button
+          type="button"
+          aria-label="Play video"
+          className={styles.centerPlayButton}
+          onClick={handlePlayIconClick}
+        >
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor" aria-hidden="true">
+            <path d="M8 5v14l11-7z" />
+          </svg>
+        </button>
+      )}
       <label className={styles.rateOverlay}>
         {/* Material Symbols "speed" glyph (outlined variant's path) */}
         <svg viewBox="0 -960 960 960" width="16" height="16" fill="currentColor" aria-hidden="true">

@@ -3,7 +3,7 @@
 import React, { useEffect, useState } from 'react';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import CohortEditor from '@/components/CohortEditor';
-import { ViewIcon, SettingsIcon, EditIcon, DeleteIcon } from '@/components/icons/ActionIcons';
+import { ViewIcon, SettingsIcon, EditIcon, DeleteIcon, GroupsIcon } from '@/components/icons/ActionIcons';
 import Tooltip from '@/components/Tooltip';
 import {
   listCohorts,
@@ -298,7 +298,8 @@ export default function LaunchCohortContent({ isAdmin }: { isAdmin: boolean }): 
           </div>
         </div>
         <button type="button" className={styles.newPostBtn} onClick={openNew}>
-          + New Cohort
+          <GroupsIcon />
+          New Cohort
         </button>
       </div>
 

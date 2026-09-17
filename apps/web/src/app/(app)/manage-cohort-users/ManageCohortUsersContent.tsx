@@ -2,7 +2,7 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import ConfirmDialog from '@/components/ConfirmDialog';
-import { RestoreIcon, RemoveIcon } from '@/components/icons/ActionIcons';
+import { RestoreIcon, RemoveIcon, GroupAddIcon } from '@/components/icons/ActionIcons';
 import Tooltip from '@/components/Tooltip';
 import Pagination from '@/components/Pagination';
 import TableSearchBar from '@/components/TableSearchBar';
@@ -308,7 +308,8 @@ export default function ManageCohortUsersContent(): React.JSX.Element {
             ))}
           </select>
           <button type="button" className={styles.inviteBtn} disabled={!selectedCohortId} onClick={() => setAddOpen(true)}>
-            + Add Member
+            <GroupAddIcon />
+            Add Member
           </button>
         </div>
       </div>

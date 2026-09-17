@@ -8,7 +8,95 @@
 > working-tree changes and say it is ready. Approval is per-action. (Also in
 > `AGENTS.md` → Git Safety Rules.)
 
-## Current Status (COMPLETE + COMMITTED + PUSHED, 2026-09-11: apps/web diagram/caption repair)
+## Current Status (IN PROGRESS, 2026-09-17: post-"API Audit and Mobile readiness" UI follow-on)
+
+Last commit on `v2-openrouter` is `075c1a99` "API Audit and Mobile readiness"
+(author codeasign, 2026-09-17 12:29 IST) — NOT this session's work, but the
+baseline this session built on. It bundled a large, mostly-unrelated set of
+streams; summarized here since no prior handoff section covers it:
+
+- **New Videos feature** (full vertical slice): `Video` Prisma model,
+  `apps/api/src/repositories/VideoRepository.ts` + `VideoController.ts`
+  (streaming proxy via `apps/api/src/lib/videoStream.ts` — the real Bunny URL
+  is never sent to the client), `VideoCommentController.ts`, apps/web pages
+  `manage-videos` (admin CRUD, `ManageVideosContent.tsx` + `VideoEditor.tsx`),
+  `browse-videos` (catalog) and `videos/[slug]` (watch page + playlist rail),
+  `components/VideoPlayer`. Nav: `manage-videos` + `browse-videos` keys added
+  to `apps/web/src/lib/navItems.ts`; Browse Videos was placed in the Overview
+  section (not Manage) directly above Browse Courses — see
+  `apps/web/Sidebar-Components-Map.md` (new this session, see below).
+- **Course Auditor workflow**: new `REVIEWER` and `COURSE_AUDITOR` roles,
+  `ModuleEditRequest` model/repository/controller — a Reviewer's proposed
+  content edit is held for a Course Auditor to approve before it goes live.
+  apps/web: `course-audit` page/nav key, `CourseModulePage/AdminModuleBody.tsx`
+  + `AdminModuleEditContext.tsx` + `AdminModuleHeaderActions.tsx`.
+- **API security/mobile-readiness audit** (apps/api, dated 2026-09-15 per its
+  own doc header): `CONTRIBUTING.md` (new standing rules for every
+  tsoa controller — `@Security('session')` gating, ownership re-derivation,
+  never trust client-supplied ids), `Mobile-Auth-Design.md` (design-only,
+  NOT implemented — bearer-token delivery path for the existing `Session`
+  table, for a future Expo/RN client), `lib/rateLimit.ts` rewrite +
+  `RateLimitBucket` model (Postgres-backed, fixes the multi-instance
+  in-memory counter bug), `lib/httpCache.ts` (new shared cache-header
+  helpers), `lib/cache.ts` (in-process purge-on-write cache — see its own
+  file-header comment on the single-instance invariant), `lib/contentAuthz.ts`,
+  `lib/bunnySign.ts`, new test files (`AuthController.test.ts`,
+  `httpCachingAndPagination.test.ts`, `httpCache.test.ts`, `rateLimit.test.ts`,
+  `tsoaAuth.test.ts`, `CohortRepository.test.ts`), `vitest.config.ts`.
+- Renamed nav labels: "Launch Cohort" -> "Manage Cohort", "Setup & Dependencies"
+  -> "Resources & Guides", "Bookmarks" -> "My Bookmarks" (all reflected in
+  `Sidebar-Components-Map.md`).
+- Also in that commit: `Toast/ToastProvider` (new global toast system),
+  `zipGuard.ts`, avatar support on `DashboardSidebar`, two new question-bank
+  `easy_extra.json` files, and routine question-bank/migration/package-lock
+  churn. Not independently re-verified by this session; treat the above as a
+  summary of what shipped, not a fresh audit.
+
+This session (uncommitted, on top of that baseline) did small, independent
+UI polish requested live, unrelated to the audit above:
+- `videos/[slug]`: playlist-item hover background, description emphasis
+  bumped to `--ifm-color-emphasis-900`, category line removed from playlist
+  cards; `VideoPlayer`: centered play-icon overlay (shows while paused,
+  solid `--ifm-color-primary` background) on top of the existing speed
+  control.
+- `browse-videos`: removed the play-icon badge overlay from catalog cards
+  (`.playBadge` CSS deleted).
+- `/blog` (`components/BlogList`): list-row thumbnail now a true fixed
+  56x56 square, card-view image now full-width 16:9 with `object-fit:
+  contain` (was cropping banner SVGs). Root cause of "fixed size not
+  working": a global `img[src*="/svgs/"]` rule in `globals.css` (meant for
+  course-diagram SVGs) also matches Bunny-hosted blog cover/content SVGs
+  and out-specificities `.rowThumb`/`.cardImage` — fixed with `!important`
+  on the thumbnail rules, not by touching the global rule (still needed
+  for its original course-diagram use case).
+- **New**: global upload-loading overlay. `data/uploadStatus.ts` (tiny
+  external-store counter) + `components/UploadOverlay` (mounted once in
+  root `app/layout.tsx`), wired through the single shared
+  `data/bunnyUpload.ts#uploadToBunny` so every existing call site (blog/
+  course/video/cohort editors, profile avatar, onboarding, access manager —
+  9 call sites) gets a centered full-screen spinner automatically, no
+  per-call-site changes needed.
+- **New**: `apps/web/Sidebar-Components-Map.md` — durable map of every
+  sidebar nav item -> route -> page -> component, created this session and
+  already current as of the 075c1a99 baseline above. Paired with a new
+  `AGENTS.md` Hard Rule: any future change to `navItems.ts` or a sidebar
+  page's components must update this map in the same change.
+- `apps/web/src/app/api/upload/route.ts` gen_ct_ai.py-adjacent script
+  `apps/api/scripts/gen_ct_ai.py` is untracked and unrelated to this
+  session's work (pre-existing untracked file, not touched).
+
+Not done / not verified this session: no browser screenshot re-verification
+of the last commit's Videos/Course-Audit features themselves (only this
+session's own small CSS/JS changes were browser-checked, via Claude in
+Chrome, against `https://next.sypher.local/blog` and the video pages).
+`npx tsc --noEmit` passed for apps/web after the upload-overlay change.
+No commit made this session — all of the above (except the prior commit
+itself) is uncommitted working-tree state per the standing no-commit rule.
+
+Next action: none pending from the user as of this handoff; resume from
+git status if picking this back up.
+
+## Previous Status (COMPLETE + COMMITTED + PUSHED, 2026-09-11: apps/web diagram/caption repair)
 
 The repair the prior checkpoints scoped is DONE and verified end to end, then
 committed and pushed. The preventive-code section and the Metrics-course notes

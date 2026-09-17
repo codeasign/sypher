@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { uploadToBunny } from '@/data/bunnyUpload';
 import { PRESET_AVATARS } from '@/data/onboarding';
 import {
@@ -52,6 +53,7 @@ export default function ProfileView({
   counts: ProfileCounts;
   initialReplies: ActivityCommentPage;
 }): React.JSX.Element {
+  const router = useRouter();
   const [me, setMe] = useState(initialMe);
   const [toast, setToast] = useState<string | null>(null);
 
@@ -157,6 +159,10 @@ export default function ProfileView({
     setMe(updated);
     setAvatarOpen(false);
     setToast('Avatar updated');
+    // DashboardSidebar's avatarUrl is a server-fetched prop from
+    // (app)/layout.tsx — without this it stays stale until the next
+    // full navigation.
+    router.refresh();
   }
 
   async function handleUpload(e: React.ChangeEvent<HTMLInputElement>): Promise<void> {

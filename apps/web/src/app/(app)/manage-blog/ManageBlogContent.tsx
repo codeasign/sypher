@@ -3,7 +3,7 @@
 import React, { useMemo, useState } from 'react';
 import { apiFetch } from '@/lib/api';
 import BlogPostEditor from '@/components/BlogPostEditor';
-import { ViewIcon, EditIcon, DeleteIcon } from '@/components/icons/ActionIcons';
+import { ViewIcon, EditIcon, DeleteIcon, PostAddIcon } from '@/components/icons/ActionIcons';
 import Tooltip from '@/components/Tooltip';
 import Pagination from '@/components/Pagination';
 import TableSearchBar from '@/components/TableSearchBar';
@@ -134,7 +134,8 @@ export default function ManageBlogContent({ initialPosts }: { initialPosts: Blog
           </div>
         </div>
         <button type="button" className={styles.newPostBtn} onClick={openNew}>
-          + New Post
+          <PostAddIcon />
+          New Post
         </button>
       </div>
 

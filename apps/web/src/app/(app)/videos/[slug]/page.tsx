@@ -127,7 +127,6 @@ export default async function VideoPage({ params }: { params: Promise<{ slug: st
                   <div className={styles.playlistMeta}>
                     <span className={styles.playlistItemTitle}>{v.title}</span>
                     {v.description && <span className={styles.playlistItemDescription}>{v.description}</span>}
-                    {v.category && <span className={styles.playlistItemCategory}>{v.category}</span>}
                   </div>
                 </Link>
               ))}

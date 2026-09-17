@@ -6,7 +6,7 @@ import type { Course } from '@/data/courses';
 import CourseEditor from './CourseEditor';
 import CourseWorkspace from './CourseWorkspace';
 import { ManageCoursesIcon } from '@/components/icons/SidebarIcons';
-import { EditIcon, DeleteIcon } from '@/components/icons/ActionIcons';
+import { EditIcon, DeleteIcon, MenuBookIcon } from '@/components/icons/ActionIcons';
 import Tooltip from '@/components/Tooltip';
 import Pagination from '@/components/Pagination';
 import TableSearchBar from '@/components/TableSearchBar';
@@ -155,7 +155,8 @@ export default function ManageCoursesContent({ initialCourses }: { initialCourse
           </div>
         </div>
         <button type="button" className={styles.newBtn} onClick={openNew}>
-          + New Course
+          <MenuBookIcon />
+          New Course
         </button>
       </div>
 

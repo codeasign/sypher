@@ -4,7 +4,7 @@ import React, { useMemo, useState } from 'react';
 import { apiFetch } from '@/lib/api';
 import type { Video } from '@/data/videos';
 import VideoEditor from './VideoEditor';
-import { EditIcon, DeleteIcon } from '@/components/icons/ActionIcons';
+import { EditIcon, DeleteIcon, VideoIcon } from '@/components/icons/ActionIcons';
 import Tooltip from '@/components/Tooltip';
 import Pagination from '@/components/Pagination';
 import TableSearchBar from '@/components/TableSearchBar';
@@ -125,7 +125,8 @@ export default function ManageVideosContent({ initialVideos }: { initialVideos: 
           </div>
         </div>
         <button type="button" className={styles.newBtn} onClick={openNew}>
-          + New Video
+          <VideoIcon />
+          New Video
         </button>
       </div>
 

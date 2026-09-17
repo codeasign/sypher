@@ -58,11 +58,6 @@ export default async function BrowseVideosPage(): Promise<React.JSX.Element> {
                     ) : (
                       <div className={styles.thumbnailPlaceholder} />
                     )}
-                    <span className={styles.playBadge} aria-hidden="true">
-                      <svg viewBox="0 0 24 24" width="34" height="34" fill="currentColor">
-                        <path d="M8 5v14l11-7z" />
-                      </svg>
-                    </span>
                   </div>
                   <div className={styles.cardBody}>
                     <h3 className={styles.cardTitle}>{video.title}</h3>

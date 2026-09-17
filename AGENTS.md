@@ -260,6 +260,11 @@ Boundary section.
 - AsciiDiagram id values must be unique across the project
 - Use .mdx extension for all pages that contain components
 - Do not edit sidebars.js directly to add topics
+- Sypher Next (apps/web) dashboard sidebar: whenever a nav item is added,
+  removed, or repointed in `apps/web/src/lib/navItems.ts`, or its page's
+  main/sub-components change, update `apps/web/Sidebar-Components-Map.md`
+  in the same change — that file is the source of truth for what renders
+  behind each sidebar link and goes stale silently otherwise
 
 ## Git Safety Rules (all agents)
 
