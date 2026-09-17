@@ -5,6 +5,7 @@ import { BlogPostRepository, type PublishedPostSummaryPage, type PublishedPostWi
 import { requireCanManageBlog } from '../lib/contentAuthz';
 import { ForbiddenError } from '../lib/authz';
 import { getOrSet, purge } from '../lib/cache';
+import { applyPublicDetailCache, setPrivateNoStoreCache, setPublicListCache } from '../lib/httpCache';
 import { assertNoReplacementChar } from '../lib/textSanitize';
 
 const blogPostRepository = new BlogPostRepository();
@@ -27,6 +28,22 @@ interface CreateBlogPostRequest {
   tags?: string[];
 }
 
+// Dedicated update DTO rather than Partial<CreateBlogPostRequest>: tsoa
+// expands the Partial<> mapped type inline and drops the `| null` from
+// every member, so PUT /blog/{id} rejected explicit nulls for
+// coverImageUrl/featuredMediaType/featuredMediaValue ("Validation failed")
+// on every republish of a post with no cover/featured media set — same
+// bug CourseController.ts's CourseUpdateRequest was split out to fix.
+interface UpdateBlogPostRequest {
+  title?: string;
+  description?: string;
+  content?: string;
+  coverImageUrl?: string | null;
+  featuredMediaType?: 'pdf' | 'youtube' | null;
+  featuredMediaValue?: string | null;
+  tags?: string[];
+}
+
 interface SetBlogStatusRequest {
   status: 'draft' | 'published';
 }
@@ -42,6 +59,7 @@ export class BlogController extends Controller {
   // hasMore from total without an extra round trip.
   @Get()
   public async listPublished(@Query() limit?: string, @Query() offset?: string): Promise<PublishedPostSummaryPage> {
+    setPublicListCache(this);
     const parsedLimit = limit === undefined ? DEFAULT_PAGE_SIZE : Number.parseInt(limit, 10);
     const parsedOffset = offset === undefined ? 0 : Number.parseInt(offset, 10);
     const pageSize = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, MAX_PAGE_SIZE) : DEFAULT_PAGE_SIZE;
@@ -52,10 +70,16 @@ export class BlogController extends Controller {
   }
 
   @Get('{slug}')
-  public async getBySlug(@Path() slug: string): Promise<PublishedPostWithAuthor | null> {
-    return getOrSet(`blog:published-detail:${slug}`, PUBLIC_CACHE_TTL_MS, () =>
+  public async getBySlug(@Path() slug: string, @Request() request: ExpressRequest): Promise<PublishedPostWithAuthor | void> {
+    const post = await getOrSet(`blog:published-detail:${slug}`, PUBLIC_CACHE_TTL_MS, () =>
       blogPostRepository.getPublishedBySlugWithAuthor(slug),
     );
+    if (!post) return undefined;
+    if (applyPublicDetailCache(this, request, post.updatedAt)) {
+      this.setStatus(304);
+      return;
+    }
+    return post;
   }
 
   @Post('revalidate')
@@ -76,6 +100,7 @@ export class BlogController extends Controller {
     @Query() offset?: string,
     @Query() search?: string,
   ): Promise<{ posts: BlogPost[]; total: number }> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     await requireCanManageBlog(user);
     const parsedLimit = limit === undefined ? 10 : Number.parseInt(limit, 10);
@@ -108,7 +133,7 @@ export class BlogController extends Controller {
 
   @Put('{id}')
   @Security('session')
-  public async update(@Path() id: string, @Body() body: Partial<CreateBlogPostRequest>, @Request() request: ExpressRequest): Promise<void> {
+  public async update(@Path() id: string, @Body() body: UpdateBlogPostRequest, @Request() request: ExpressRequest): Promise<void> {
     await this.assertOwnsPost(request.user as User, id);
     assertNoReplacementChar(body.title, 'Title');
     assertNoReplacementChar(body.description, 'Description');

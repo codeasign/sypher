@@ -33,6 +33,8 @@ interface CommentTarget {
   // Course-level discussion (the /learn/[slug] home page's Discussion tab,
   // added 2026-08-27) — distinct from courseModuleId, one lesson's thread.
   courseId?: string;
+  // Standalone video discussion (Manage/Browse Videos, 2026-09-16).
+  videoId?: string;
 }
 
 // Author identity plus live-derived content-author flag ("Instructor" /
@@ -97,20 +99,22 @@ export interface CommentActionContext {
   courseModuleId: string | null;
   blogPostId: string | null;
   courseId: string | null;
+  videoId: string | null;
 }
 
 const commentRowInclude = {
   user: { select: { id: true, fullName: true, username: true, role: true, avatarUrl: true } },
-  // All three optional includes are cheap; exactly one resolves non-null (CHECK).
+  // All four optional includes are cheap; exactly one resolves non-null (CHECK).
   courseModule: { select: { course: { select: { authorId: true } } } },
   blogPost: { select: { authorId: true } },
   course: { select: { authorId: true } },
+  video: { select: { authorId: true } },
 } satisfies Prisma.CommentInclude;
 
 type CommentRowWithRelations = Prisma.CommentGetPayload<{ include: typeof commentRowInclude }>;
 
 function contentAuthorIdOf(row: CommentRowWithRelations): string | null {
-  return row.courseModule?.course.authorId ?? row.blogPost?.authorId ?? row.course?.authorId ?? null;
+  return row.courseModule?.course.authorId ?? row.blogPost?.authorId ?? row.course?.authorId ?? row.video?.authorId ?? null;
 }
 
 // ─── Cursor encoding (opaque to clients) ──────────────────────────────────
@@ -230,7 +234,7 @@ export class CommentRepository {
   async listReplies(parentId: string, viewerId: string | null, mode: CommentSortMode): Promise<CommentRepliesPage | null> {
     const parent = await prisma.comment.findFirst({
       where: { id: parentId, isDeleted: false },
-      select: { id: true, courseModuleId: true, blogPostId: true, courseId: true },
+      select: { id: true, courseModuleId: true, blogPostId: true, courseId: true, videoId: true },
     });
     if (!parent) return null;
 
@@ -241,7 +245,12 @@ export class CommentRepository {
         orderBy: orderByFor(mode, mode === 'chrono' ? 'asc' : 'desc'),
       }),
       this.isTargetContentAuthor(
-        { courseModuleId: parent.courseModuleId ?? undefined, blogPostId: parent.blogPostId ?? undefined, courseId: parent.courseId ?? undefined },
+        {
+          courseModuleId: parent.courseModuleId ?? undefined,
+          blogPostId: parent.blogPostId ?? undefined,
+          courseId: parent.courseId ?? undefined,
+          videoId: parent.videoId ?? undefined,
+        },
         viewerId,
       ),
     ]);
@@ -269,10 +278,12 @@ export class CommentRepository {
         courseModuleId: true,
         blogPostId: true,
         courseId: true,
+        videoId: true,
         parent: { select: { userId: true } },
         courseModule: { select: { course: { select: { authorId: true } } } },
         blogPost: { select: { authorId: true } },
         course: { select: { authorId: true } },
+        video: { select: { authorId: true } },
       },
     });
     if (!row) return null;
@@ -281,10 +292,11 @@ export class CommentRepository {
       parentId: row.parentId,
       authorId: row.userId,
       rootAuthorId: row.parent ? row.parent.userId : row.userId,
-      contentAuthorId: row.courseModule?.course.authorId ?? row.blogPost?.authorId ?? row.course?.authorId ?? null,
+      contentAuthorId: row.courseModule?.course.authorId ?? row.blogPost?.authorId ?? row.course?.authorId ?? row.video?.authorId ?? null,
       courseModuleId: row.courseModuleId,
       blogPostId: row.blogPostId,
       courseId: row.courseId,
+      videoId: row.videoId,
     };
   }
 
@@ -303,13 +315,14 @@ export class CommentRepository {
       if (parentId) {
         const parent = await tx.comment.findFirst({
           where: { id: parentId, parentId: null, isDeleted: false, ...target },
-          select: { courseModuleId: true, blogPostId: true, courseId: true },
+          select: { courseModuleId: true, blogPostId: true, courseId: true, videoId: true },
         });
         if (!parent) throw new HttpError(404, 'Comment not found');
         resolvedTarget = {
           courseModuleId: parent.courseModuleId ?? undefined,
           blogPostId: parent.blogPostId ?? undefined,
           courseId: parent.courseId ?? undefined,
+          videoId: parent.videoId ?? undefined,
         };
       }
 
@@ -318,6 +331,7 @@ export class CommentRepository {
           courseModuleId: resolvedTarget.courseModuleId,
           blogPostId: resolvedTarget.blogPostId,
           courseId: resolvedTarget.courseId,
+          videoId: resolvedTarget.videoId,
           userId,
           parentId: parentId ?? null,
           body,
@@ -509,6 +523,13 @@ export class CommentRepository {
     if (target.courseId) {
       const row = await prisma.course.findUnique({
         where: { id: target.courseId },
+        select: { authorId: true },
+      });
+      return row?.authorId === viewerId;
+    }
+    if (target.videoId) {
+      const row = await prisma.video.findUnique({
+        where: { id: target.videoId },
         select: { authorId: true },
       });
       return row?.authorId === viewerId;

@@ -8,10 +8,12 @@ import {
   createBlogPostComment,
   createCourseComment,
   createModuleComment,
+  createVideoComment,
   listBlogPostComments,
   listCommentReplies,
   listCourseComments,
   listModuleComments,
+  listVideoComments,
   type CommentListPageData,
   type CommentSortMode,
   type CommentView,
@@ -21,7 +23,7 @@ import Composer from './Composer';
 import CommentItem from './CommentItem';
 import styles from './styles.module.css';
 
-type DiscussionTargetType = 'courseModule' | 'blogPost' | 'course';
+type DiscussionTargetType = 'courseModule' | 'blogPost' | 'course' | 'video';
 
 interface DiscussionSectionProps {
   /** What this discussion is attached to — the ONLY content-type switch in the UI. */
@@ -48,6 +50,7 @@ function listForTarget(
 ): ReturnType<typeof listModuleComments> {
   if (targetType === 'courseModule') return listModuleComments(targetId, mode, cursor);
   if (targetType === 'blogPost') return listBlogPostComments(targetId, mode, cursor);
+  if (targetType === 'video') return listVideoComments(targetId, mode, cursor);
   return listCourseComments(targetId, mode, cursor);
 }
 
@@ -58,6 +61,7 @@ function createForTarget(
 ): ReturnType<typeof createModuleComment> {
   if (targetType === 'courseModule') return createModuleComment(targetId, input);
   if (targetType === 'blogPost') return createBlogPostComment(targetId, input);
+  if (targetType === 'video') return createVideoComment(targetId, input);
   return createCourseComment(targetId, input);
 }
 

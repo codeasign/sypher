@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import Navbar from '@/components/Navbar';
 import FirstLoginOnboarding from '@/components/FirstLoginOnboarding';
 import ThemeScript from '@/components/ThemeScript';
+import { ToastProvider } from '@/components/Toast/ToastProvider';
 import './globals.css';
 
 export const metadata = {
@@ -13,9 +14,11 @@ export default function RootLayout({ children }: { children: ReactNode }): React
     <html lang="en" suppressHydrationWarning>
       <body>
         <ThemeScript />
-        <Navbar />
-        {children}
-        <FirstLoginOnboarding />
+        <ToastProvider>
+          <Navbar />
+          {children}
+          <FirstLoginOnboarding />
+        </ToastProvider>
       </body>
     </html>
   );

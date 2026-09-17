@@ -115,6 +115,18 @@ export async function listCourseComments(
   return { error: null, page: await res.json() };
 }
 
+export async function listVideoComments(
+  videoId: string,
+  sort: CommentSortMode,
+  cursor?: string,
+): Promise<{ error: string | null; page: CommentListPageData | null }> {
+  const params = new URLSearchParams({ sort });
+  if (cursor) params.set('cursor', cursor);
+  const res = await apiFetch(`/video-discussions/${encodeURIComponent(videoId)}/comments?${params.toString()}`);
+  if (!res.ok) return { error: await asError(res), page: null };
+  return { error: null, page: await res.json() };
+}
+
 export async function listCommentReplies(
   commentId: string,
   sort: CommentSortMode,
@@ -155,6 +167,15 @@ export async function createCourseComment(
   input: CommentComposeInput,
 ): Promise<{ error: string | null; comment: CommentView | null }> {
   const res = await apiFetch(`/course-discussions/${encodeURIComponent(courseId)}/comments`, jsonInit('POST', input));
+  if (!res.ok) return { error: await asError(res), comment: null };
+  return { error: null, comment: await res.json() };
+}
+
+export async function createVideoComment(
+  videoId: string,
+  input: CommentComposeInput,
+): Promise<{ error: string | null; comment: CommentView | null }> {
+  const res = await apiFetch(`/video-discussions/${encodeURIComponent(videoId)}/comments`, jsonInit('POST', input));
   if (!res.ok) return { error: await asError(res), comment: null };
   return { error: null, comment: await res.json() };
 }

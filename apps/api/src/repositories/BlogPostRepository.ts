@@ -54,6 +54,8 @@ export interface PublishedPostWithAuthor {
   publishedAt: Date | null;
   authorFullName: string | null;
   authorBio: string | null;
+  /** Version marker for HTTP caching (ETag) — not otherwise rendered. */
+  updatedAt: Date;
 }
 
 export class BlogPostRepository {
@@ -160,6 +162,7 @@ export class BlogPostRepository {
       publishedAt: post.publishedAt,
       authorFullName: post.author?.fullName ?? null,
       authorBio: post.author?.bio ?? null,
+      updatedAt: post.updatedAt,
     };
   }
 

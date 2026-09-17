@@ -18,10 +18,19 @@ import {
   sessionExpiry,
 } from '../lib/session';
 import { sendPasswordResetEmail, sendWelcomeEmail } from '../lib/email';
+import {
+  consumeForgotPasswordAllowance,
+  consumeLoginAllowance,
+  consumeRegisterAllowance,
+  consumeResetPasswordAllowance,
+  getClientKey,
+} from '../lib/rateLimit';
 import { buildGoogleAuthUrl, exchangeGoogleCode } from '../lib/googleOAuth';
 import { env } from '../lib/env';
 import { createLogger } from '../lib/logger';
 import { verifyRecaptchaToken } from '../lib/recaptcha';
+import { extractSessionToken } from '../lib/tsoaAuth';
+import { setPrivateNoStoreCache } from '../lib/httpCache';
 
 const logger = createLogger('AuthController');
 const userRepository = new UserRepository();
@@ -104,6 +113,15 @@ interface AuthUser {
   mustResetPassword: boolean;
   /** null → the app-wide first-login onboarding modal must be completed. */
   onboardedAt: string | null;
+  /**
+   * The raw session token — present ONLY when the caller signaled a mobile
+   * client (x-sypher-client: mobile) at login/register. A browser response
+   * never carries this; the httpOnly cookie is its only copy of the token.
+   * See Mobile-Auth-Design.md — a native client has no persistent cookie
+   * jar, so it authenticates subsequent requests with this value via
+   * `Authorization: Bearer <sessionToken>` instead.
+   */
+  sessionToken?: string;
 }
 
 interface AuthMessageResponse {
@@ -143,6 +161,29 @@ async function createSessionAndCookie(user: User, request: ExpressRequest): Prom
   return buildSetCookieHeader(env.sessionCookieName, token, env.sessionTtlDays * 24 * 60 * 60);
 }
 
+// Mobile-Auth-Design.md: same token generation and Session row as
+// createSessionAndCookie above, but also hands back the raw token so a
+// caller that signaled a mobile client (x-sypher-client: mobile) can put it
+// in the JSON body for Authorization: Bearer use — a browser client has no
+// use for the raw value (its only copy is the httpOnly cookie) so callers
+// gate including it in the response on that header, not on this function.
+async function createSession(user: User, request: ExpressRequest): Promise<{ token: string; cookie: string }> {
+  const token = generateSessionToken();
+  await sessionRepository.create({
+    userId: user.id,
+    token,
+    expiresAt: sessionExpiry(),
+    userAgent: request.headers['user-agent'] ?? null,
+  });
+  const cookie = buildSetCookieHeader(env.sessionCookieName, token, env.sessionTtlDays * 24 * 60 * 60);
+  return { token, cookie };
+}
+
+/** x-sypher-client: mobile signals a native caller with no cookie jar — see Mobile-Auth-Design.md. */
+function wantsSessionToken(request: ExpressRequest): boolean {
+  return request.headers['x-sypher-client'] === 'mobile';
+}
+
 @Route('auth')
 @Tags('Auth')
 export class AuthController extends Controller {
@@ -152,8 +193,17 @@ export class AuthController extends Controller {
     @Request() request: ExpressRequest,
     @Res() conflict: TsoaResponse<409, AuthMessageResponse>,
     @Res() badRequest: TsoaResponse<400, AuthMessageResponse>,
+    @Res() tooManyRequests: TsoaResponse<429, AuthMessageResponse, { 'Retry-After': string }>,
     @Res() created: TsoaResponse<201, AuthUser, { 'Set-Cookie': string }>,
   ): Promise<void> {
+    const registerRetryAfter = await consumeRegisterAllowance(getClientKey(request));
+    if (registerRetryAfter > 0) {
+      return tooManyRequests(
+        429,
+        { message: 'Too many signups from this connection. Please wait and try again.' },
+        { 'Retry-After': String(registerRetryAfter) },
+      );
+    }
     if (!(await verifyRecaptchaToken(body.recaptchaToken, request.ip))) {
       return badRequest(400, { message: 'Please complete the bot verification and try again.' });
     }
@@ -177,8 +227,8 @@ export class AuthController extends Controller {
     // because of) an external email API round-trip.
     void sendWelcomeEmail(user.email, user.fullName);
 
-    const cookie = await createSessionAndCookie(user, request);
-    return created(201, toAuthUser(user), { 'Set-Cookie': cookie });
+    const { token, cookie } = await createSession(user, request);
+    return created(201, { ...toAuthUser(user), sessionToken: wantsSessionToken(request) ? token : undefined }, { 'Set-Cookie': cookie });
   }
 
   @Post('login')
@@ -187,8 +237,17 @@ export class AuthController extends Controller {
     @Request() request: ExpressRequest,
     @Res() unauthorized: TsoaResponse<401, AuthMessageResponse>,
     @Res() badRequest: TsoaResponse<400, AuthMessageResponse>,
+    @Res() tooManyRequests: TsoaResponse<429, AuthMessageResponse, { 'Retry-After': string }>,
     @Res() ok: TsoaResponse<200, AuthUser, { 'Set-Cookie': string }>,
   ): Promise<void> {
+    const loginRetryAfter = await consumeLoginAllowance(body.email.trim().toLowerCase(), getClientKey(request));
+    if (loginRetryAfter > 0) {
+      return tooManyRequests(
+        429,
+        { message: 'Too many login attempts. Please wait and try again.' },
+        { 'Retry-After': String(loginRetryAfter) },
+      );
+    }
     if (!(await verifyRecaptchaToken(body.recaptchaToken, request.ip))) {
       return badRequest(400, { message: 'Please complete the bot verification and try again.' });
     }
@@ -206,8 +265,8 @@ export class AuthController extends Controller {
     // createSessionAndCookie) aren't defined yet. The twin hook for the
     // OAuth path is commented in `googleCallback`.
 
-    const cookie = await createSessionAndCookie(user, request);
-    return ok(200, toAuthUser(user), { 'Set-Cookie': cookie });
+    const { token, cookie } = await createSession(user, request);
+    return ok(200, { ...toAuthUser(user), sessionToken: wantsSessionToken(request) ? token : undefined }, { 'Set-Cookie': cookie });
   }
 
   /**
@@ -225,8 +284,17 @@ export class AuthController extends Controller {
     @Request() request: ExpressRequest,
     @Res() unauthorized: TsoaResponse<401, AuthMessageResponse>,
     @Res() forbidden: TsoaResponse<403, AuthMessageResponse>,
+    @Res() tooManyRequests: TsoaResponse<429, AuthMessageResponse, { 'Retry-After': string }>,
     @Res() ok: TsoaResponse<200, AuthUser, { 'Set-Cookie': string }>,
   ): Promise<void> {
+    const loginRetryAfter = await consumeLoginAllowance(body.email.trim().toLowerCase(), getClientKey(request));
+    if (loginRetryAfter > 0) {
+      return tooManyRequests(
+        429,
+        { message: 'Too many login attempts. Please wait and try again.' },
+        { 'Retry-After': String(loginRetryAfter) },
+      );
+    }
     const code = (body.companyCode ?? '').trim().toUpperCase();
     const company = code ? await companyRepository.findByBusinessId(code) : null;
     if (!company) return unauthorized(401, { message: 'Unknown company code. Start again from the company screen.' });
@@ -252,8 +320,8 @@ export class AuthController extends Controller {
       return forbidden(403, { message: `${company.name}'s Sypher access has expired. Contact your administrator.` });
     }
 
-    const cookie = await createSessionAndCookie(user, request);
-    return ok(200, toAuthUser(user), { 'Set-Cookie': cookie });
+    const { token, cookie } = await createSession(user, request);
+    return ok(200, { ...toAuthUser(user), sessionToken: wantsSessionToken(request) ? token : undefined }, { 'Set-Cookie': cookie });
   }
 
   /**
@@ -340,6 +408,7 @@ export class AuthController extends Controller {
   @Get('handle-available')
   @Security('session')
   public async handleAvailable(@Query() handle: string, @Request() request: ExpressRequest): Promise<{ available: boolean; valid: boolean }> {
+    setPrivateNoStoreCache(this);
     const normalized = (handle ?? '').trim().toLowerCase();
     const valid = USERNAME_PATTERN.test(normalized);
     if (!valid) return { available: false, valid: false };
@@ -353,7 +422,7 @@ export class AuthController extends Controller {
     @Request() request: ExpressRequest,
     @Res() noContent: TsoaResponse<204, void, { 'Set-Cookie': string }>,
   ): Promise<void> {
-    const token = request.cookies?.[env.sessionCookieName];
+    const token = extractSessionToken(request);
     if (token) await sessionRepository.deleteByToken(token);
     return noContent(204, undefined, { 'Set-Cookie': buildClearedCookieHeader(env.sessionCookieName) });
   }
@@ -361,11 +430,24 @@ export class AuthController extends Controller {
   @Get('me')
   @Security('session')
   public async me(@Request() request: ExpressRequest): Promise<AuthUser> {
+    setPrivateNoStoreCache(this);
     return toAuthUser(request.user as User);
   }
 
   @Post('forgot-password')
-  public async forgotPassword(@Body() body: AuthForgotPasswordRequest): Promise<AuthMessageResponse> {
+  public async forgotPassword(
+    @Body() body: AuthForgotPasswordRequest,
+    @Request() request: ExpressRequest,
+    @Res() tooManyRequests: TsoaResponse<429, AuthMessageResponse, { 'Retry-After': string }>,
+  ): Promise<AuthMessageResponse | void> {
+    const forgotPasswordRetryAfter = await consumeForgotPasswordAllowance(getClientKey(request));
+    if (forgotPasswordRetryAfter > 0) {
+      return tooManyRequests(
+        429,
+        { message: 'Too many requests. Please wait and try again.' },
+        { 'Retry-After': String(forgotPasswordRetryAfter) },
+      );
+    }
     const email = body.email.trim().toLowerCase();
     const user = await userRepository.findByEmail(email);
     // Always return the same message, whether or not the account exists —
@@ -386,9 +468,19 @@ export class AuthController extends Controller {
   @Post('reset-password')
   public async resetPassword(
     @Body() body: AuthResetPasswordRequest,
+    @Request() request: ExpressRequest,
     @Res() badRequest: TsoaResponse<400, AuthMessageResponse>,
+    @Res() tooManyRequests: TsoaResponse<429, AuthMessageResponse, { 'Retry-After': string }>,
     @Res() ok: TsoaResponse<200, AuthMessageResponse>,
   ): Promise<void> {
+    const resetPasswordRetryAfter = await consumeResetPasswordAllowance(getClientKey(request));
+    if (resetPasswordRetryAfter > 0) {
+      return tooManyRequests(
+        429,
+        { message: 'Too many requests. Please wait and try again.' },
+        { 'Retry-After': String(resetPasswordRetryAfter) },
+      );
+    }
     if (body.newPassword.length < 8) {
       return badRequest(400, { message: 'Password must be at least 8 characters' });
     }

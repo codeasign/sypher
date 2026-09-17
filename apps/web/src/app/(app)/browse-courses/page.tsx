@@ -31,11 +31,6 @@ export default async function BrowseCoursesPage(): Promise<React.JSX.Element> {
   return (
     <div className={styles.page}>
       <div className={styles.container}>
-        <div className={styles.pageHeader}>
-          <h1 className={styles.pageTitle}>Browse Courses</h1>
-          <p className={styles.pageSubtitle}>Every course on Sypher — pick up what you started, and find what to learn next.</p>
-        </div>
-
         <CourseSectionsBoard courses={courses} bookmarkedIds={bookmarkedIds} variant="browse" />
       </div>
     </div>

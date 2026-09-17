@@ -11,6 +11,7 @@ import { requireAdmin } from '../lib/authz';
 import { canManageCohorts, requireCanManageCohorts, requireCanManageCohortRoster, rosterPickerScope } from '../lib/contentAuthz';
 import { ForbiddenError } from '../lib/authz';
 import { getOrSet, purge } from '../lib/cache';
+import { applyPublicDetailCache, setPrivateNoStoreCache, setPublicListCache } from '../lib/httpCache';
 import { assertNoReplacementChar } from '../lib/textSanitize';
 import { sendCohortWelcomeEmail } from '../lib/email';
 import { ensureUserByEmail } from '../lib/userProvisioning';
@@ -24,6 +25,14 @@ const userRepository = new UserRepository();
 
 const PUBLIC_CACHE_TTL_MS = 60_000;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Same "fetch-once, bounded" convention as Course/Blog/Video's manage
+// endpoints — the launch-cohort admin table and the roster table both
+// fetch their full list client-side (no limit/offset passed today) and
+// paginate/search in the browser, so the default has to stay large enough
+// to mean "everyone" while still capping the worst case.
+const MAX_MANAGE_PAGE_SIZE = 1000;
+const DEFAULT_ROSTER_PAGE_SIZE = 1000;
+const MAX_ROSTER_PAGE_SIZE = 2000;
 
 // Fire-and-forget cohort-welcome email on a fresh enrolment / reactivation
 // (never on a no-op re-set). A send failure never fails the roster change —
@@ -91,6 +100,7 @@ export class CohortController extends Controller {
 
   @Get()
   public async listPublic(): Promise<Cohort[]> {
+    setPublicListCache(this);
     return getOrSet('cohorts:public-list', PUBLIC_CACHE_TTL_MS, () => cohortRepository.listPublicLive());
   }
 
@@ -103,11 +113,25 @@ export class CohortController extends Controller {
 
   // ---- Management (launch-cohort) ----
 
+  // Unbounded until this pagination audit — the admin table fetches once
+  // and paginates/searches client-side (no limit/offset passed today), so
+  // the fix is the same "fetch-once, bounded" cap Course/Blog/Video's
+  // manage lists already use, not a real per-page contract change.
   @Get('manage/list')
   @Security('session')
-  public async listManage(@Request() request: ExpressRequest): Promise<Cohort[]> {
+  public async listManage(
+    @Request() request: ExpressRequest,
+    @Query() limit?: string,
+    @Query() offset?: string,
+  ): Promise<Cohort[]> {
+    setPrivateNoStoreCache(this);
     await requireCanManageCohorts(request.user as User);
-    return cohortRepository.listAll();
+    const parsedLimit = limit === undefined ? MAX_MANAGE_PAGE_SIZE : Number.parseInt(limit, 10);
+    const parsedOffset = offset === undefined ? 0 : Number.parseInt(offset, 10);
+    const pageSize = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, MAX_MANAGE_PAGE_SIZE) : MAX_MANAGE_PAGE_SIZE;
+    const pageOffset = Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
+    const { cohorts } = await cohortRepository.listAllPage(pageSize, pageOffset);
+    return cohorts;
   }
 
   @Post()
@@ -154,19 +178,41 @@ export class CohortController extends Controller {
 
   // ---- Roster ----
 
+  // Picker dropdown — needs the complete set of manageable cohorts every
+  // time, same reasoning as CourseController.listForSidebar; cohort count
+  // is bounded by admin-authored program count, not user volume.
   @Get('manage/roster-cohorts')
   @Security('session')
   public async listRosterCohorts(@Request() request: ExpressRequest): Promise<Cohort[]> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     const scope = await rosterPickerScope(user);
     return scope === 'all' ? cohortRepository.listAll() : cohortRepository.listForManager(user.id);
   }
 
+  // Was genuinely unbounded — a cohort's enrolled member count grows with
+  // real user activity (enrollment), not admin-authored content, so this
+  // is the one CohortController list that actually needed a fix. Wires up
+  // CohortMemberRepository.listRosterPage (previously built but never
+  // called from a route) with the same "fetch-once, bounded" defaults as
+  // listManage above — the roster table also paginates/searches
+  // client-side over the full response today.
   @Get('{id}/roster')
   @Security('session')
-  public async getRoster(@Path() id: string, @Request() request: ExpressRequest): Promise<RosterEntry[]> {
+  public async getRoster(
+    @Path() id: string,
+    @Request() request: ExpressRequest,
+    @Query() limit?: string,
+    @Query() offset?: string,
+  ): Promise<RosterEntry[]> {
+    setPrivateNoStoreCache(this);
     await requireCanManageCohortRoster(request.user as User, id);
-    return cohortMemberRepository.listRoster(id);
+    const parsedLimit = limit === undefined ? DEFAULT_ROSTER_PAGE_SIZE : Number.parseInt(limit, 10);
+    const parsedOffset = offset === undefined ? 0 : Number.parseInt(offset, 10);
+    const pageSize = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, MAX_ROSTER_PAGE_SIZE) : DEFAULT_ROSTER_PAGE_SIZE;
+    const pageOffset = Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
+    const { members } = await cohortMemberRepository.listRosterPage(id, pageSize, pageOffset);
+    return members;
   }
 
   @Put('{id}/roster/{userId}')
@@ -210,10 +256,15 @@ export class CohortController extends Controller {
   }
 
   // ---- Course pool (admin-only write, matching the original RLS exactly —
-  // narrower than requireCanManageCohorts) ----
+  // narrower than requireCanManageCohorts; reads are roster-manager-gated,
+  // same reasoning as the managers section below — no public consumer ever
+  // needed this, and it discloses which courses a cohort is scoped to) ----
 
   @Get('{id}/course-pool')
-  public async getCoursePool(@Path() id: string): Promise<string[]> {
+  @Security('session')
+  public async getCoursePool(@Path() id: string, @Request() request: ExpressRequest): Promise<string[]> {
+    setPrivateNoStoreCache(this);
+    await requireCanManageCohortRoster(request.user as User, id);
     return cohortCourseAccessRepository.listForCohort(id);
   }
 
@@ -233,10 +284,15 @@ export class CohortController extends Controller {
     }
   }
 
-  // ---- Per-member course access ----
+  // ---- Per-member course access (roster-manager-gated reads — this
+  // returns per-userId course grants, so an ungated read would leak which
+  // specific members have which courses) ----
 
   @Get('{id}/member-course-access')
-  public async getMemberCourseAccess(@Path() id: string): Promise<MemberCourseAccessEntry[]> {
+  @Security('session')
+  public async getMemberCourseAccess(@Path() id: string, @Request() request: ExpressRequest): Promise<MemberCourseAccessEntry[]> {
+    setPrivateNoStoreCache(this);
+    await requireCanManageCohortRoster(request.user as User, id);
     return cohortMemberCourseAccessRepository.listForCohort(id);
   }
 
@@ -278,6 +334,7 @@ export class CohortController extends Controller {
   @Get('{id}/managers')
   @Security('session')
   public async getManagers(@Path() id: string, @Request() request: ExpressRequest): Promise<ManagerEntry[]> {
+    setPrivateNoStoreCache(this);
     requireAdmin(request.user as User);
     return cohortManagerRepository.listForCohort(id);
   }
@@ -321,6 +378,7 @@ export class CohortController extends Controller {
   @Get('lookup-user')
   @Security('session')
   public async lookupUser(@Query() email: string, @Request() request: ExpressRequest): Promise<CohortLookupUser | null> {
+    setPrivateNoStoreCache(this);
     requireAdmin(request.user as User);
     const user = await userRepository.findByEmail(email);
     if (!user || user.deletedAt) return null;
@@ -332,7 +390,13 @@ export class CohortController extends Controller {
   // Express/tsoa's first-match routing would swallow those requests here
   // instead (e.g. GET /cohorts/lookup-user matching slug="lookup-user").
   @Get('{slug}')
-  public async getPublicBySlug(@Path() slug: string): Promise<Cohort | null> {
-    return getOrSet(`cohorts:public-detail:${slug}`, PUBLIC_CACHE_TTL_MS, () => cohortRepository.findBySlugLive(slug));
+  public async getPublicBySlug(@Path() slug: string, @Request() request: ExpressRequest): Promise<Cohort | void> {
+    const cohort = await getOrSet(`cohorts:public-detail:${slug}`, PUBLIC_CACHE_TTL_MS, () => cohortRepository.findBySlugLive(slug));
+    if (!cohort) return undefined;
+    if (applyPublicDetailCache(this, request, cohort.updatedAt)) {
+      this.setStatus(304);
+      return;
+    }
+    return cohort;
   }
 }

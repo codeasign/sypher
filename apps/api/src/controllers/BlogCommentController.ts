@@ -18,6 +18,7 @@ import { consumeCommentAllowance } from '../lib/rateLimit';
 import { resolveOptionalUser } from '../lib/tsoaAuth';
 import { CommentMessageResponse, COMMENT_RATE_LIMIT_MESSAGE } from './ModuleCommentController';
 import { HttpError } from '../lib/errors';
+import { setPrivateNoCacheCache } from '../lib/httpCache';
 
 /**
  * Blog-post twin of ModuleCommentController (spec scope extension) — same
@@ -50,6 +51,7 @@ export class BlogCommentController extends Controller {
     @Query() cursor?: string,
     @Query() limit?: string,
   ): Promise<CommentListPage | void> {
+    setPrivateNoCacheCache(this);
     const user = await resolveOptionalUser(request);
     if (sort !== undefined && !isCommentSortMode(sort)) {
       return badRequest(400, { message: 'sort must be one of: chrono, upvotes, useful' });
@@ -87,7 +89,7 @@ export class BlogCommentController extends Controller {
   ): Promise<CommentViewData | void> {
     const user = request.user as User;
 
-    const retryAfterSeconds = consumeCommentAllowance(user.id);
+    const retryAfterSeconds = await consumeCommentAllowance(user.id);
     if (retryAfterSeconds > 0) {
       return tooManyRequests(429, { message: COMMENT_RATE_LIMIT_MESSAGE }, { 'Retry-After': String(retryAfterSeconds) });
     }

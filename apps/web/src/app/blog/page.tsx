@@ -38,9 +38,7 @@ export default async function BlogIndexPage(): Promise<React.JSX.Element> {
       <div className={styles.page}>
         <div className={styles.container}>
           <div className={styles.pageHeader}>
-            <span className={styles.pageEyebrow}>The Blog</span>
             <h1 className={styles.pageTitle}>Latest articles and updates</h1>
-            <p className={styles.pageSubtitle}>Latest articles and updates from the Sypher team.</p>
           </div>
           <BlogList initialPosts={page.posts} total={page.total} pageSize={PAGE_SIZE} />
         </div>

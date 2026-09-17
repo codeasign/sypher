@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import clsx from 'clsx';
 import BlogPostArticle from '@/components/BlogPostPage/BlogPostArticle';
 import {
@@ -60,6 +60,22 @@ function EyeOffIcon(): React.JSX.Element {
   );
 }
 
+function ExpandIcon(): React.JSX.Element {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+    </svg>
+  );
+}
+
+function CollapseIcon(): React.JSX.Element {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7" />
+    </svg>
+  );
+}
+
 type FeaturedMediaType = 'pdf' | 'youtube';
 
 interface BlogPost {
@@ -99,6 +115,7 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
   const [draftMarkdown, setDraftMarkdown] = useState(post?.content ?? '');
   const [contentMarkdown, setContentMarkdown] = useState(post?.content ?? '');
   const [editorInstanceKey, setEditorInstanceKey] = useState(0);
+  const [fullscreen, setFullscreen] = useState(false);
   const editorRef = useRef<MDXEditorMethods>(null);
   const coverInputRef = useRef<HTMLInputElement>(null);
   const { colorMode } = useColorMode();
@@ -106,6 +123,15 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
   const isEditing = Boolean(post);
   const canSave =
     title.trim().length > 0 && description.trim().length > 0 && contentMarkdown.trim().length > 0 && !saving;
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    function handleKeyDown(e: KeyboardEvent): void {
+      if (e.key === 'Escape') setFullscreen(false);
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [fullscreen]);
 
   function togglePreview(): void {
     if (!previewMode) {
@@ -289,6 +315,12 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
           {previewMode ? <EyeOffIcon /> : <EyeIcon />}
           {previewMode ? 'Edit' : 'Preview'}
         </button>
+        {!previewMode && (
+          <button type="button" className={styles.toolbarBtn} onClick={() => setFullscreen((f) => !f)}>
+            {fullscreen ? <CollapseIcon /> : <ExpandIcon />}
+            {fullscreen ? 'Exit full screen' : 'Full screen'}
+          </button>
+        )}
         <div className={styles.toolbarSpacer} />
         <button type="button" className={styles.cancelBtn} onClick={onCancel} disabled={saving}>
           Cancel
@@ -467,12 +499,17 @@ export default function BlogPostEditorInner({ post, onSaved, onCancel, onBack }:
             <label className={styles.fieldLabel}>
               Content<span className={styles.requiredMark}>*</span>
             </label>
-            <div className={styles.mdxWrapper}>
+            <div className={clsx(styles.mdxWrapper, fullscreen && styles.mdxWrapperFullscreen)}>
+              {fullscreen && (
+                <button type="button" className={styles.fullscreenExitBtn} onClick={() => setFullscreen(false)} aria-label="Exit full screen">
+                  <CollapseIcon />
+                </button>
+              )}
               <MDXEditor
                 key={editorInstanceKey}
                 ref={editorRef}
                 className={colorMode === 'dark' ? 'dark-theme' : undefined}
-                contentEditableClassName={styles.mdxContentEditable}
+                contentEditableClassName={clsx(styles.mdxContentEditable, fullscreen && styles.mdxContentEditableFullscreen)}
                 markdown={draftMarkdown}
                 onChange={(markdown) => setContentMarkdown(markdown)}
                 onError={({ error: mdxError }) => setError(mdxError)}

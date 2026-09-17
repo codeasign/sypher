@@ -14,10 +14,12 @@ import { AuthoredCompanyCourseAccessRepository } from '../repositories/AuthoredC
 import { CompanyDirectoryRepository } from '../repositories/CompanyDirectoryRepository';
 import { ModuleProgressRepository } from '../repositories/ModuleProgressRepository';
 import { CourseCompletionRepository } from '../repositories/CourseCompletionRepository';
-import { requireCanManageCourses } from '../lib/contentAuthz';
+import { requireCanManageCourses, canEditModuleContentDirectly } from '../lib/contentAuthz';
+import { ForbiddenError } from '../lib/authz';
 import { hasCourseAccess } from '../lib/accessControl';
 import { isModuleFreelyVisible } from '../lib/coursePreview';
 import { getOrSet, purge } from '../lib/cache';
+import { setPublicListCache, setPrivateNoStoreCache } from '../lib/httpCache';
 import { assertNoReplacementChar } from '../lib/textSanitize';
 import { HttpError } from '../lib/errors';
 import { assertImportedDiagramCaptions } from '../lib/diagramMarkup';
@@ -137,7 +139,12 @@ interface CourseAccessInfo {
 // into another's response. Same reasoning as apps/app's
 // listAccessibleAuthoredCourses. Only the getting-started list (identical
 // for every signed-in user) is safe to cache.
-async function courseAccessInfo(user: User, course: Course): Promise<CourseAccessInfo> {
+// `knownTotalModules` lets a caller that's already batched the module count
+// (computeAllWithAccess, via countByCourse) pass it straight in instead of
+// this function re-querying it per course — callers that don't have it yet
+// (listModules/getModule/completeModule/getBySlug, which only ever check
+// one course at a time) simply omit it and keep the original single query.
+async function courseAccessInfo(user: User, course: Course, knownTotalModules?: number): Promise<CourseAccessInfo> {
   const allowedRoles = await authoredCourseAccessRepository.getAllowedRoles(course.id);
   let companyAllowedIds: Set<string> | undefined;
   if (user.companyId) {
@@ -158,7 +165,7 @@ async function courseAccessInfo(user: User, course: Course): Promise<CourseAcces
   // now (a getting-started module, if present, is itself one of the
   // module rows counted here, so this fully subsumes the old check rather
   // than needing both).
-  const moduleCount = await courseModuleRepository.countForCourse(course.id);
+  const moduleCount = knownTotalModules ?? (await courseModuleRepository.countForCourse(course.id));
   return { hasFullAccess: false, visible: moduleCount > 0 };
 }
 
@@ -170,6 +177,10 @@ const MAX_PAGE_SIZE = 50;
 // so this needs to comfortably exceed any realistic course count, unlike
 // the public-facing MAX_PAGE_SIZE above which bounds real per-request cost.
 const MAX_MANAGE_PAGE_SIZE = 1000;
+// Cap on by-ids/modules-by-ids batch lookups — same defense-in-depth
+// reasoning as the page-size caps above: an authenticated caller shouldn't
+// be able to force an unbounded IN (...) query.
+const MAX_IDS_PER_REQUEST = 200;
 
 export interface CoursePage {
   courses: CourseWithAccess[];
@@ -184,22 +195,28 @@ export interface CoursePage {
 // enough; revisit with real DB-level pagination if that stops being true.
 async function computeAllWithAccess(user: User): Promise<CourseWithAccess[]> {
   const courses = await courseRepository.listPublished();
-  const startedIds = await moduleProgressRepository.listStartedCourseIds(user.id);
-  const completedByCourse = await moduleProgressRepository.countCompletedByCourse(user.id);
-  const totalByCourse = await courseModuleRepository.countByCourse(courses.map((c) => c.id));
-  const results: CourseWithAccess[] = [];
-  for (const course of courses) {
-    const info = await courseAccessInfo(user, course);
-    const totalModules = totalByCourse.get(course.id) ?? 0;
-    const completedModules = Math.min(completedByCourse.get(course.id) ?? 0, totalModules);
-    results.push({
-      ...course,
-      hasFullAccess: info.hasFullAccess,
-      started: startedIds.has(course.id),
-      completedModules,
-      totalModules,
-    });
-  }
+  const [startedIds, completedByCourse, totalByCourse] = await Promise.all([
+    moduleProgressRepository.listStartedCourseIds(user.id),
+    moduleProgressRepository.countCompletedByCourse(user.id),
+    courseModuleRepository.countByCourse(courses.map((c) => c.id)),
+  ]);
+  // Per-course access checks are independent of each other — run them
+  // concurrently instead of one at a time, and hand each one the module
+  // count already batched above so courseAccessInfo never re-queries it.
+  const results = await Promise.all(
+    courses.map(async (course) => {
+      const totalModules = totalByCourse.get(course.id) ?? 0;
+      const info = await courseAccessInfo(user, course, totalModules);
+      const completedModules = Math.min(completedByCourse.get(course.id) ?? 0, totalModules);
+      return {
+        ...course,
+        hasFullAccess: info.hasFullAccess,
+        started: startedIds.has(course.id),
+        completedModules,
+        totalModules,
+      };
+    }),
+  );
   return results;
 }
 
@@ -234,6 +251,7 @@ export class CourseController extends Controller {
     @Query() offset?: string,
     @Query() role?: string,
   ): Promise<CoursePage> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     const all = await computeAllWithAccess(user);
     const filtered = all.filter((c) => c.hasFullAccess && (role === undefined || c.audienceRole === role));
@@ -252,6 +270,7 @@ export class CourseController extends Controller {
     @Query() offset?: string,
     @Query() role?: string,
   ): Promise<CoursePage> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     const all = await computeAllWithAccess(user);
     const filtered = role === undefined ? all : all.filter((c) => c.audienceRole === role);
@@ -266,9 +285,14 @@ export class CourseController extends Controller {
   // hidden. Kept separate from listBrowse above (which paginates) because
   // the switcher is a small in-page dropdown, not a browse-everything view
   // — it needs the full list in one request every time, not pages of it.
+  // Reviewed in the pagination audit (2026-09): left unpaginated on
+  // purpose — course count is bounded by admin-authored catalog size
+  // (dozens, not user-generated volume), and a paginated switcher would
+  // silently hide courses from the dropdown.
   @Get('sidebar-list')
   @Security('session')
   public async listForSidebar(@Request() request: ExpressRequest): Promise<CourseWithAccess[]> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     const results = await computeAllWithAccess(user);
     return results;
@@ -282,13 +306,25 @@ export class CourseController extends Controller {
   // public catalog already exposes, and no module body content is included.
   @Post('by-ids')
   @Security('session')
-  public async getByIds(@Body() body: CourseByIdsRequest): Promise<Course[]> {
+  public async getByIds(
+    @Body() body: CourseByIdsRequest,
+    @Res() badRequest: TsoaResponse<400, { message: string }>,
+  ): Promise<Course[] | void> {
+    if (body.ids.length > MAX_IDS_PER_REQUEST) {
+      return badRequest(400, { message: `Too many ids — max ${MAX_IDS_PER_REQUEST} per request` });
+    }
     return courseRepository.findByIds(body.ids);
   }
 
   @Post('modules/by-ids')
   @Security('session')
-  public async getModulesByIds(@Body() body: CourseByIdsRequest): Promise<ModuleWithCourseEntry[]> {
+  public async getModulesByIds(
+    @Body() body: CourseByIdsRequest,
+    @Res() badRequest: TsoaResponse<400, { message: string }>,
+  ): Promise<ModuleWithCourseEntry[] | void> {
+    if (body.ids.length > MAX_IDS_PER_REQUEST) {
+      return badRequest(400, { message: `Too many ids — max ${MAX_IDS_PER_REQUEST} per request` });
+    }
     return courseModuleRepository.findByIdsWithCourse(body.ids);
   }
 
@@ -303,6 +339,7 @@ export class CourseController extends Controller {
     @Query() offset?: string,
     @Query() search?: string,
   ): Promise<{ courses: Course[]; total: number }> {
+    setPrivateNoStoreCache(this);
     await requireCanManageCourses(request.user as User);
     const parsedLimit = limit === undefined ? 10 : Number.parseInt(limit, 10);
     const parsedOffset = offset === undefined ? 0 : Number.parseInt(offset, 10);
@@ -314,15 +351,20 @@ export class CourseController extends Controller {
   @Get('manage/{id}')
   @Security('session')
   public async getManage(@Path() id: string, @Request() request: ExpressRequest, @Res() notFound: TsoaResponse<404, void>): Promise<Course | void> {
+    setPrivateNoStoreCache(this);
     await requireCanManageCourses(request.user as User);
     const course = await courseRepository.findById(id);
     if (!course) return notFound(404);
     return course;
   }
 
+  // Identical for every signed-in user (no per-user branching at all) —
+  // the one CourseController read that's genuinely safe as a shared,
+  // public cache entry, same as Blog/Cohort/Video's public catalogs.
   @Get('getting-started')
   @Security('session')
   public async gettingStarted(): Promise<GettingStartedModuleEntry[]> {
+    setPublicListCache(this);
     return getOrSet('courses:getting-started', GETTING_STARTED_CACHE_TTL_MS, () => courseModuleRepository.listGettingStarted());
   }
 
@@ -336,6 +378,7 @@ export class CourseController extends Controller {
   @Get('mock-tests')
   @Security('session')
   public async listMockTests(@Request() request: ExpressRequest): Promise<MockTestEntry[]> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     const completions = await courseCompletionRepository.listForUser(user.id);
     const courses = await courseRepository.findByIds(completions.map((c) => c.courseId));
@@ -364,6 +407,7 @@ export class CourseController extends Controller {
     @Request() request: ExpressRequest,
     @Res() notFound: TsoaResponse<404, void>,
   ): Promise<CourseModuleSummaryWithProgress[] | void> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     const course = await courseRepository.findPublishedBySlug(slug);
     if (!course) return notFound(404);
@@ -391,6 +435,7 @@ export class CourseController extends Controller {
     @Request() request: ExpressRequest,
     @Res() notFound: TsoaResponse<404, void>,
   ): Promise<CourseModuleWithProgress | void> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     const course = await courseRepository.findPublishedBySlug(slug);
     if (!course) return notFound(404);
@@ -430,7 +475,11 @@ export class CourseController extends Controller {
     // read — a locked module still 404s here, it isn't discoverable in
     // the sense the read endpoints mean.
     if (!info.hasFullAccess) {
-      const modules = await courseModuleRepository.listForCourse(course.id);
+      // Metadata-only — isModuleFreelyVisible only needs id/
+      // showInGettingStarted, so there's no reason to pull every module's
+      // full bodyMdx just to answer a visibility check that fires on every
+      // module-page load.
+      const modules = await courseModuleRepository.listMetadataForCourse(course.id);
       if (!isModuleFreelyVisible(mod, modules)) return notFound(404);
     }
     await moduleProgressRepository.markComplete(user.id, mod.id, course.id);
@@ -484,9 +533,16 @@ export class CourseController extends Controller {
 
   // ---- Management (modules) ----
 
+  // Unpaginated by necessity, not oversight — the reorder UI (PUT
+  // .../modules/{moduleId}/reorder, adjacent orderIndex swap) needs the
+  // COMPLETE ordered list to make sense; a paginated page-2 module
+  // couldn't be reordered against a page-1 neighbor. Reviewed in the
+  // pagination audit (2026-09): module count per course is bounded by
+  // admin-authored content, not user-generated volume.
   @Get('{courseId}/manage/modules')
   @Security('session')
   public async listManageModules(@Path() courseId: string, @Request() request: ExpressRequest): Promise<CourseModule[]> {
+    setPrivateNoStoreCache(this);
     await requireCanManageCourses(request.user as User);
     return courseModuleRepository.listForCourse(courseId);
   }
@@ -498,7 +554,13 @@ export class CourseController extends Controller {
     @Body() body: CourseModuleCreateRequest,
     @Request() request: ExpressRequest,
   ): Promise<CourseModule> {
-    await requireCanManageCourses(request.user as User);
+    const user = request.user as User;
+    await requireCanManageCourses(user);
+    // Same content gate as updateModule — non-Admins can still create the
+    // module (title, settings), just not with live content attached.
+    if (body.bodyMdx && !canEditModuleContentDirectly(user)) {
+      throw new ForbiddenError('Content edits require Course Auditor approval — submit via /module-edit-requests instead');
+    }
     assertNoReplacementChar(body.title, 'Title');
     assertImportedDiagramCaptions(body.bodyMdx);
     const mod = await courseModuleRepository.create(courseId, body);
@@ -535,7 +597,16 @@ export class CourseController extends Controller {
     @Body() body: Partial<CourseModuleCreateRequest>,
     @Request() request: ExpressRequest,
   ): Promise<void> {
-    await requireCanManageCourses(request.user as User);
+    const user = request.user as User;
+    await requireCanManageCourses(user);
+    // Content (bodyMdx) can only go live directly for Admins — everyone
+    // else who canManageCourses (Reviewer included) must submit a
+    // ModuleEditRequest instead (POST /module-edit-requests) for a Course
+    // Auditor to approve (user request 2026-09-16). Non-content fields
+    // (title, showInGettingStarted) are unaffected.
+    if (body.bodyMdx !== undefined && !canEditModuleContentDirectly(user)) {
+      throw new ForbiddenError('Content edits require Course Auditor approval — submit via /module-edit-requests instead');
+    }
     assertNoReplacementChar(body.title, 'Title');
     assertImportedDiagramCaptions(body.bodyMdx);
     await courseModuleRepository.update(moduleId, body);
@@ -568,6 +639,7 @@ export class CourseController extends Controller {
   @Get('{courseId}/access')
   @Security('session')
   public async getAccess(@Path() courseId: string, @Request() request: ExpressRequest): Promise<{ allowedRoles: Role[] }> {
+    setPrivateNoStoreCache(this);
     await requireCanManageCourses(request.user as User);
     return { allowedRoles: await authoredCourseAccessRepository.getAllowedRoles(courseId) };
   }
@@ -582,6 +654,7 @@ export class CourseController extends Controller {
   @Get('{courseId}/access/companies')
   @Security('session')
   public async getAccessCompanies(@Path() courseId: string, @Request() request: ExpressRequest): Promise<string[]> {
+    setPrivateNoStoreCache(this);
     await requireCanManageCourses(request.user as User);
     return authoredCompanyCourseAccessRepository.listCompanyIdsForCourse(courseId);
   }
@@ -612,14 +685,19 @@ export class CourseController extends Controller {
     @Request() request: ExpressRequest,
     @Res() notFound: TsoaResponse<404, void>,
   ): Promise<CourseWithAccess | void> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     const course = await courseRepository.findPublishedBySlug(slug);
     if (!course) return notFound(404);
     const info = await courseAccessInfo(user, course);
     if (!info.visible) return notFound(404);
-    const startedIds = await moduleProgressRepository.listStartedCourseIds(user.id);
-    const completedIds = await moduleProgressRepository.listCompletedModuleIds(user.id, course.id);
-    const totalModules = await courseModuleRepository.countForCourse(course.id);
+    // Independent of each other and of `info` above — no reason to await
+    // them one at a time.
+    const [startedIds, completedIds, totalModules] = await Promise.all([
+      moduleProgressRepository.listStartedCourseIds(user.id),
+      moduleProgressRepository.listCompletedModuleIds(user.id, course.id),
+      courseModuleRepository.countForCourse(course.id),
+    ]);
     return {
       ...course,
       hasFullAccess: info.hasFullAccess,

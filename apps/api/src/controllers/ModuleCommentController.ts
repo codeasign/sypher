@@ -16,6 +16,7 @@ import {
 } from '../lib/commentAccess';
 import { consumeCommentAllowance } from '../lib/rateLimit';
 import { HttpError } from '../lib/errors';
+import { setPrivateNoCacheCache } from '../lib/httpCache';
 
 /**
  * Lesson-scoped discussion endpoints (spec §13). Response DTOs are the
@@ -54,6 +55,7 @@ export class ModuleCommentController extends Controller {
     @Query() cursor?: string,
     @Query() limit?: string,
   ): Promise<CommentListPage | void> {
+    setPrivateNoCacheCache(this);
     const user = request.user as User;
     if (sort !== undefined && !isCommentSortMode(sort)) {
       return badRequest(400, { message: 'sort must be one of: chrono, upvotes, useful' });
@@ -90,7 +92,7 @@ export class ModuleCommentController extends Controller {
 
     // Rate limit first — rejected floods cost no DB reads (deliberate:
     // probing locked modules also burns budget, which is harmless).
-    const retryAfterSeconds = consumeCommentAllowance(user.id);
+    const retryAfterSeconds = await consumeCommentAllowance(user.id);
     if (retryAfterSeconds > 0) {
       return tooManyRequests(429, { message: COMMENT_RATE_LIMIT_MESSAGE }, { 'Retry-After': String(retryAfterSeconds) });
     }

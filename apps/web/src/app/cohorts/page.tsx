@@ -17,7 +17,6 @@ export default async function CohortsIndexPage(): Promise<React.JSX.Element> {
     <div className={styles.page}>
       <div className={styles.container}>
         <div className={styles.pageHeader}>
-          <h1 className={styles.pageTitle}>Cohorts</h1>
           <p className={styles.pageSubtitle}>Live cohorts running now on Sypher.</p>
         </div>
         <CohortList initialCohorts={cohorts} />

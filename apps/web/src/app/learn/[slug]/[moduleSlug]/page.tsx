@@ -4,7 +4,9 @@ import { notFound, redirect } from 'next/navigation';
 import { serverApiFetch } from '@/lib/serverApi';
 import type { CourseModule, CourseModuleSummary } from '@/data/courses';
 import type { AuthoredModuleBookmarkEntry } from '@/data/bookmarks';
-import CourseModuleArticle from '@/components/CourseModulePage/CourseModuleArticle';
+import { AdminModuleEditProvider } from '@/components/CourseModulePage/AdminModuleEditContext';
+import AdminModuleHeaderActions from '@/components/CourseModulePage/AdminModuleHeaderActions';
+import AdminModuleBody from '@/components/CourseModulePage/AdminModuleBody';
 import ModuleCompletionTracker from '@/components/CourseModulePage/ModuleCompletionTracker';
 import LockedModuleNotice from '@/components/CourseModulePage/LockedModuleNotice';
 import { ModuleBookmarkButton } from '@/components/AuthoredBookmarkButton';
@@ -13,6 +15,7 @@ import styles from '@/components/CourseModulePage/styles.module.css';
 
 interface AuthUser {
   email: string;
+  role?: string;
 }
 
 async function fetchModule(slug: string, moduleSlug: string): Promise<{ module: CourseModule | null; unauthenticated: boolean }> {
@@ -42,6 +45,17 @@ async function fetchAuthUser(): Promise<AuthUser> {
   const res = await serverApiFetch('/auth/me');
   if (!res.ok) throw new Error(`Could not load account details (${res.status})`);
   return res.json();
+}
+
+// Mirrors the API's canManageCourses gate (ADMIN, or role holds the
+// 'manage-course-authoring' NavAccess grant — REVIEWER gets it by default,
+// see the 2026-09-15 migration) rather than hardcoding a role check here,
+// so this button stays in sync if an admin edits grants via /admin/access.
+async function fetchCanEditCourseContent(): Promise<boolean> {
+  const res = await serverApiFetch('/access/my-nav');
+  if (!res.ok) return false;
+  const keys: string[] = await res.json();
+  return keys.includes('manage-course-authoring');
 }
 
 // Big edge-pager chevrons — simple stroked geometry drawn locally (same
@@ -85,53 +99,60 @@ export default async function CourseModulePage({
   if (unauthenticated) redirect('/login');
   if (!mod) notFound();
 
-  const [bookmarks, allModules, me] = await Promise.all([
+  const [bookmarks, allModules, me, canEditContent] = await Promise.all([
     fetchModuleBookmarks(),
     fetchCourseModules(slug),
-    mod.locked ? fetchAuthUser() : Promise.resolve(null),
+    fetchAuthUser(),
+    fetchCanEditCourseContent(),
   ]);
   const isBookmarked = bookmarks.some((b) => b.moduleId === mod.id);
+  const canPublishDirectly = me?.role === 'ADMIN';
 
   const currentIndex = allModules.findIndex((m) => m.id === mod.id);
   const previous = currentIndex > 0 ? allModules[currentIndex - 1] : null;
   const next = currentIndex >= 0 && currentIndex < allModules.length - 1 ? allModules[currentIndex + 1] : null;
 
-  // Only fetched when actually needed — the locked-notice CTA is the only
-  // consumer, and it's the uncommon path (most module views are
-  // unlocked).
+  // The locked-notice CTA is the only consumer of the email.
   const userEmail = me?.email ?? '';
 
   return (
     <div className={styles.page}>
-      {/* Outside the paper sheet, pinned under the navbar — Back to Course
-          on the left, Bookmark on the right, visible for the entire scroll
-          (user request 2026-08-23). The x/N counter between them shows the
-          current topic's position in the course. */}
-      <div className={styles.moduleTopRow}>
-        <Link href={`/learn/${slug}`} className={styles.backLink}>
-          ← Back to course
-        </Link>
-        {currentIndex >= 0 && (
-          <span
-            className={styles.modulePosition}
-            aria-label={`Topic ${currentIndex + 1} of ${allModules.length}`}
-          >
-            {currentIndex + 1} / {allModules.length}
-          </span>
-        )}
-        <ModuleBookmarkButton moduleId={mod.id} courseId={mod.courseId} initialBookmarked={isBookmarked} />
-      </div>
-      <div className={styles.container}>
-        {!mod.locked && <ModuleCompletionTracker courseSlug={slug} moduleSlug={moduleSlug} alreadyComplete={mod.completed ?? false} />}
-        {mod.locked ? (
-          <>
-            <h1 className={styles.title}>{mod.title}</h1>
-            <LockedModuleNotice userEmail={userEmail} />
-          </>
-        ) : (
-          <CourseModuleArticle title={mod.title} content={mod.bodyMdx} />
-        )}
-      </div>
+      <AdminModuleEditProvider canEdit={canEditContent} canPublishDirectly={canPublishDirectly} courseId={mod.courseId} moduleId={mod.id} title={mod.title} content={mod.bodyMdx}>
+        {/* Outside the paper sheet, pinned under the navbar — Back to Course
+            on the left, Bookmark on the right, visible for the entire scroll
+            (user request 2026-08-23). The x/N counter between them shows the
+            current topic's position in the course. Admin Edit/Cancel/Save
+            controls sit before Bookmark in the same right-hand cluster
+            (user request 2026-09-15). */}
+        <div className={styles.moduleTopRow}>
+          <Link href={`/learn/${slug}`} className={styles.backLink}>
+            ← Back to course
+          </Link>
+          {currentIndex >= 0 && (
+            <span
+              className={styles.modulePosition}
+              aria-label={`Topic ${currentIndex + 1} of ${allModules.length}`}
+            >
+              {currentIndex + 1} / {allModules.length}
+            </span>
+          )}
+          <div className={styles.topRowActions}>
+            <AdminModuleHeaderActions />
+            <ModuleBookmarkButton moduleId={mod.id} courseId={mod.courseId} initialBookmarked={isBookmarked} />
+          </div>
+        </div>
+        <div className={styles.container}>
+          {!mod.locked && <ModuleCompletionTracker courseSlug={slug} moduleSlug={moduleSlug} alreadyComplete={mod.completed ?? false} />}
+          {mod.locked ? (
+            <>
+              <h1 className={styles.title}>{mod.title}</h1>
+              <LockedModuleNotice userEmail={userEmail} />
+            </>
+          ) : (
+            <AdminModuleBody />
+          )}
+        </div>
+      </AdminModuleEditProvider>
 
       {/* Edge pager OUTSIDE the paper sheet — big chevrons on the left and
           right screen edges, vertically centered, always visible while

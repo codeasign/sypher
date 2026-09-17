@@ -11,6 +11,18 @@
  * with the old call sites and as a general-purpose invalidation primitive,
  * but the write endpoints don't depend on the frontend remembering to call
  * them — they purge themselves.
+ *
+ * Single-instance invariant: this store is a plain in-process Map, so it is
+ * only correct as long as apps/api runs as a single instance. Confirmed
+ * 2026-09-17 — current deployment is single-instance. Under horizontal
+ * scaling each instance would hold its own independent cache, so a purge()
+ * triggered by a write on one instance would leave the others serving stale
+ * data for up to the TTL — the exact bug class rateLimit.ts's
+ * consumeAllowance was rewritten to close for rate-limit counters (see that
+ * file's comment). If apps/api ever moves to multiple instances, this needs
+ * the same treatment: a shared store (e.g. the same Postgres-backed
+ * approach) or an invalidation broadcast across instances. Revisit this
+ * comment before scaling out rather than debugging stale-cache reports.
  */
 
 interface Entry {

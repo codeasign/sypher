@@ -11,6 +11,8 @@ import {
 } from '../repositories/CommentRepository';
 import { assertCommentTargetVisible, cleanMentionIds, normalizeCommentBody } from '../lib/commentAccess';
 import { resolveOptionalUser } from '../lib/tsoaAuth';
+import { consumeCommentToggleAllowance } from '../lib/rateLimit';
+import { setPrivateNoCacheCache } from '../lib/httpCache';
 import { CommentMessageResponse } from './ModuleCommentController';
 
 /**
@@ -63,6 +65,10 @@ export class CommentController extends Controller {
     @Res() badRequest: TsoaResponse<400, CommentMessageResponse>,
     @Query() sort?: string,
   ): Promise<CommentRepliesPage | void> {
+    // Unpaginated by design (spec §2 — "bounded by thread size"), reviewed
+    // again in the pagination audit (2026-09) and left as-is: a reply list
+    // needs to render as one complete flat thread, not a paginated subset.
+    setPrivateNoCacheCache(this);
     const user = await resolveOptionalUser(request);
     if (sort !== undefined && !isCommentSortMode(sort)) {
       return badRequest(400, { message: 'sort must be one of: chrono, upvotes, useful' });
@@ -137,8 +143,13 @@ export class CommentController extends Controller {
     @Body() body: CommentVoteRequest,
     @Request() request: ExpressRequest,
     @Res() notFound: TsoaResponse<404, void>,
+    @Res() tooManyRequests: TsoaResponse<429, CommentMessageResponse, { 'Retry-After': string }>,
   ): Promise<CommentVoteStateResponse | void> {
     const user = request.user as User;
+    const retryAfterSeconds = await consumeCommentToggleAllowance(user.id);
+    if (retryAfterSeconds > 0) {
+      return tooManyRequests(429, { message: "You're doing that too quickly. Please wait a moment." }, { 'Retry-After': String(retryAfterSeconds) });
+    }
     const ctx = await commentRepository.getActionContext(commentId);
     if (!ctx) return notFound(404);
     await assertCommentTargetVisible(user, ctx);
@@ -154,8 +165,13 @@ export class CommentController extends Controller {
     @Path() commentId: string,
     @Request() request: ExpressRequest,
     @Res() notFound: TsoaResponse<404, void>,
+    @Res() tooManyRequests: TsoaResponse<429, CommentMessageResponse, { 'Retry-After': string }>,
   ): Promise<CommentHelpfulStateResponse | void> {
     const user = request.user as User;
+    const retryAfterSeconds = await consumeCommentToggleAllowance(user.id);
+    if (retryAfterSeconds > 0) {
+      return tooManyRequests(429, { message: "You're doing that too quickly. Please wait a moment." }, { 'Retry-After': String(retryAfterSeconds) });
+    }
     const ctx = await commentRepository.getActionContext(commentId);
     if (!ctx) return notFound(404);
     await assertCommentTargetVisible(user, ctx);

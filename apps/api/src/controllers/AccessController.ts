@@ -15,6 +15,8 @@ import { canSeeNavItem, hasCourseAccess } from '../lib/accessControl';
 import { isCompanyAccessActive } from '../lib/companyAccess';
 import { HttpError } from '../lib/errors';
 import { hashPassword } from '../lib/password';
+import { getOrSet, purge } from '../lib/cache';
+import { setPrivateNoStoreCache, setPublicListCache } from '../lib/httpCache';
 
 const courseAccessRepository = new CourseAccessRepository();
 const navAccessRepository = new NavAccessRepository();
@@ -23,6 +25,24 @@ const companyNavAccessRepository = new CompanyNavAccessRepository();
 const companyRepository = new CompanyRepository();
 const companyDirectoryRepository = new CompanyDirectoryRepository();
 const userRepository = new UserRepository();
+
+// CourseAccess/NavAccess are small, rarely-changing role-mapping tables
+// (edited only from the admin Access screen), but listAll() over each is
+// re-run on every dashboard-shell load — both by the public listCourseAccess/
+// listNavAccess endpoints below AND by myCourses/myNav, which re-derive the
+// same rows per request just to filter them per user. Cached here, same
+// getOrSet/purge shape as the public Course/Blog/Cohort/Video reads; the
+// per-user filtering in myCourses/myNav stays outside the cache so it's
+// never at risk of leaking one user's view into another's.
+const ACCESS_TABLE_CACHE_TTL_MS = 60_000;
+
+function listAllCourseAccess(): Promise<CourseAccess[]> {
+  return getOrSet('access:courses', ACCESS_TABLE_CACHE_TTL_MS, () => courseAccessRepository.listAll());
+}
+
+function listAllNavAccess(): Promise<NavAccess[]> {
+  return getOrSet('access:nav', ACCESS_TABLE_CACHE_TTL_MS, () => navAccessRepository.listAll());
+}
 
 interface AccessSetRolesRequest {
   allowedRoles: Role[];
@@ -125,9 +145,16 @@ type CompanySaveData = {
 @Route('access')
 @Tags('Access')
 export class AccessController extends Controller {
+  // Unpaginated picker (course-access company checklist, AccessTab.tsx) —
+  // needs the complete set, same reasoning as CourseController.listForSidebar.
+  // Reviewed in the pagination audit (2026-09): company count is bounded by
+  // real enterprise-customer volume (B2B tenants, not user-generated
+  // content), and the properly-paginated company DIRECTORY table already
+  // exists separately below as listCompaniesPaged.
   @Get('companies')
   @Security('session')
   public async listCompanies(@Request() request: ExpressRequest): Promise<Company[]> {
+    setPrivateNoStoreCache(this);
     requireAdmin(request.user as User);
     return companyRepository.list();
   }
@@ -142,6 +169,7 @@ export class AccessController extends Controller {
     @Query() page?: number,
     @Query() pageSize?: number,
   ): Promise<AccessCompanyListResponse> {
+    setPrivateNoStoreCache(this);
     requireAdmin(request.user as User);
     const term = (q ?? '').trim().slice(0, 100);
     const safePage = Math.max(1, Math.floor(page ?? 1));
@@ -302,7 +330,8 @@ export class AccessController extends Controller {
 
   @Get('courses')
   public async listCourseAccess(): Promise<CourseAccess[]> {
-    return courseAccessRepository.listAll();
+    setPublicListCache(this);
+    return listAllCourseAccess();
   }
 
   @Put('courses/{slug}')
@@ -313,14 +342,17 @@ export class AccessController extends Controller {
     @Request() request: ExpressRequest,
   ): Promise<CourseAccess> {
     requireAdmin(request.user as User);
-    return courseAccessRepository.setAllowedRoles(slug, body.allowedRoles);
+    const result = await courseAccessRepository.setAllowedRoles(slug, body.allowedRoles);
+    purge('access:courses');
+    return result;
   }
 
   // ---- Role-based nav access (public read, admin write) ----
 
   @Get('nav')
   public async listNavAccess(): Promise<NavAccess[]> {
-    return navAccessRepository.listAll();
+    setPublicListCache(this);
+    return listAllNavAccess();
   }
 
   @Put('nav/{itemKey}')
@@ -331,14 +363,19 @@ export class AccessController extends Controller {
     @Request() request: ExpressRequest,
   ): Promise<NavAccess> {
     requireAdmin(request.user as User);
-    return navAccessRepository.setAllowedRoles(itemKey, body.allowedRoles);
+    const result = await navAccessRepository.setAllowedRoles(itemKey, body.allowedRoles);
+    purge('access:nav');
+    return result;
   }
 
-  // ---- Company-scoped course access (admin, or that company's HR) ----
+  // ---- Company-scoped course access (Sypher-staff only — sets the
+  // company-wide ceiling; a COMPANY_HR self-serves their own company's
+  // group-level grants, bounded by this ceiling, via CompanyAdminController) ----
 
   @Get('companies/{companyId}/courses')
   @Security('session')
   public async listCompanyCourseAccess(@Path() companyId: string, @Request() request: ExpressRequest): Promise<string[]> {
+    setPrivateNoStoreCache(this);
     requireAdmin(request.user as User);
     return companyCourseAccessRepository.listSlugsForCompany(companyId);
   }
@@ -359,11 +396,13 @@ export class AccessController extends Controller {
     }
   }
 
-  // ---- Company-scoped nav access (admin, or that company's HR) ----
+  // ---- Company-scoped nav access (Sypher-staff only — sets the
+  // company-wide ceiling; same split as course access above) ----
 
   @Get('companies/{companyId}/nav')
   @Security('session')
   public async listCompanyNavAccess(@Path() companyId: string, @Request() request: ExpressRequest): Promise<string[]> {
+    setPrivateNoStoreCache(this);
     requireAdmin(request.user as User);
     return companyNavAccessRepository.listKeysForCompany(companyId);
   }
@@ -394,6 +433,7 @@ export class AccessController extends Controller {
     @Query() page?: number,
     @Query() pageSize?: number,
   ): Promise<AccessUserListResponse> {
+    setPrivateNoStoreCache(this);
     requireAdmin(request.user as User);
     const term = (q ?? '').trim().slice(0, 100);
     const safePage = Math.max(1, Math.floor(page ?? 1));
@@ -467,9 +507,8 @@ export class AccessController extends Controller {
     if (admin.id === userId) {
       return badRequest(400, { message: 'You cannot change your own role.' });
     }
-    await userRepository.setRole(userId, body.role);
-    const fresh = await userRepository.findById(userId);
-    return fresh ? toRoleRow(fresh) : undefined;
+    const fresh = await userRepository.setRole(userId, body.role);
+    return toRoleRow(fresh);
   }
 
   // ---- Self-service: what can the current user actually see? ----
@@ -480,8 +519,9 @@ export class AccessController extends Controller {
   @Get('my-courses')
   @Security('session')
   public async myCourses(@Request() request: ExpressRequest): Promise<string[]> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
-    const rows = await courseAccessRepository.listAll();
+    const rows = await listAllCourseAccess();
     // Company grants stop counting once the company's accessUntil has
     // passed (see lib/companyAccess.ts) — mirrors the in-repo gate on the
     // authored-course path (AuthoredCompanyCourseAccessRepository).
@@ -496,8 +536,9 @@ export class AccessController extends Controller {
   @Get('my-nav')
   @Security('session')
   public async myNav(@Request() request: ExpressRequest): Promise<string[]> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
-    const rows = await navAccessRepository.listAll();
+    const rows = await listAllNavAccess();
     // Sidebar access reaches an employee through their GROUPS (managed on
     // the corporate portal); the company-wide CompanyNavAccess is now just
     // the ceiling the portal admin picks from. listNavKeysForUserGroups

@@ -28,11 +28,6 @@ export default async function LearnIndexPage(): Promise<React.JSX.Element> {
   return (
     <div className={styles.page}>
       <div className={styles.container}>
-        <div className={styles.pageHeader}>
-          <h1 className={styles.pageTitle}>My Courses</h1>
-          <p className={styles.pageSubtitle}>Pick up where you left off, see what to learn next, and revisit what you&rsquo;ve finished.</p>
-        </div>
-
         <CourseSectionsBoard courses={courses} bookmarkedIds={bookmarkedIds} variant="my-courses" />
       </div>
     </div>

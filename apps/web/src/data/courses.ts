@@ -165,9 +165,13 @@ async function asError(res: Response): Promise<string> {
 
 // ---- Management (courses) ----
 
+// limit=1000 (the API's own cap, MAX_MANAGE_PAGE_SIZE) — /courses/manage/list
+// defaults to 10/page when no ?limit is given, which silently truncated every
+// caller of this function to the first 10 courses (admin/access's category
+// bug, 2026-09-15).
 export async function listCourses(): Promise<Course[]> {
-  const res = await apiFetch('/courses/manage/list');
-  return res.ok ? asJson(res) : [];
+  const res = await apiFetch('/courses/manage/list?limit=1000');
+  return res.ok ? (await asJson<{ courses: Course[]; total: number }>(res)).courses : [];
 }
 
 export async function getCourse(id: string): Promise<Course | null> {

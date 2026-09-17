@@ -1,6 +1,7 @@
 import { Controller, Get, Route, Tags } from 'tsoa';
 import { HealthRepository } from '../repositories/HealthRepository';
 import { createLogger } from '../lib/logger';
+import { setPrivateNoStoreCache } from '../lib/httpCache';
 
 const logger = createLogger('HealthController');
 const healthRepository = new HealthRepository();
@@ -16,6 +17,10 @@ interface HealthStatus {
 export class HealthController extends Controller {
   @Get()
   public async check(): Promise<HealthStatus> {
+    // Must always reflect live DB connectivity — never cacheable, same
+    // private,no-store default as anything else with no shared/public
+    // reasoning for caching it.
+    setPrivateNoStoreCache(this);
     const database = await healthRepository.pingDatabase().catch((error) => {
       logger.error('Database ping failed', error);
       return false;

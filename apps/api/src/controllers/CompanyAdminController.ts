@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Path, Post, Put, Request, Res, Route, Security, Tags, type TsoaResponse } from 'tsoa';
+import { Body, Controller, Delete, Get, Path, Post, Put, Query, Request, Res, Route, Security, Tags, type TsoaResponse } from 'tsoa';
 import type { Request as ExpressRequest } from 'express';
 import type { User } from '@prisma/client';
 import { requireCompanyAdmin } from '../lib/authz';
@@ -9,6 +9,22 @@ import { CompanyNavAccessRepository } from '../repositories/CompanyNavAccessRepo
 import { CourseRepository } from '../repositories/CourseRepository';
 import { UserRepository } from '../repositories/UserRepository';
 import { provisionCompanyEmployee, issueSetPasswordLink, createSetPasswordLink } from '../lib/companyProvisioning';
+import { consumeCompanyInviteAllowance } from '../lib/rateLimit';
+import { setPrivateNoStoreCache } from '../lib/httpCache';
+
+// Cap on a single CSV import — protects both against pathological input
+// (a huge paste processed row-by-row in a sequential await loop) and bounds
+// the worst case for how many invite/welcome emails one call can trigger,
+// alongside the per-company rate limit on the calls themselves below.
+const MAX_IMPORT_ROWS = 2000;
+
+// Same "fetch-once, bounded" convention as Course/Blog/Video's manage
+// endpoints (MAX_MANAGE_PAGE_SIZE): the Employees tab has no paging UI
+// today and fetches the whole roster on load, so the default has to stay
+// large enough to mean "everyone" for realistic company sizes — this is a
+// defensive cap against an unbounded scan, not a real paging contract yet.
+const DEFAULT_EMPLOYEES_PAGE_SIZE = 1000;
+const MAX_EMPLOYEES_PAGE_SIZE = 2000;
 
 /**
  * The corporate portal's admin API (corporate.sypher.local). EVERY method
@@ -35,6 +51,7 @@ export class CompanyAdminController extends Controller {
   // ── Overview ──
   @Get('overview')
   public async overview(@Request() request: ExpressRequest): Promise<CompanyAdminOverview> {
+    setPrivateNoStoreCache(this);
     const companyId = requireCompanyAdmin(request.user as User);
     const [company, employeeCount, groupCount, ceilingCourses, ceilingNav] = await Promise.all([
       companyRepository.findById(companyId),
@@ -57,16 +74,31 @@ export class CompanyAdminController extends Controller {
   // ── Groups ──
   @Get('groups')
   public async listGroups(@Request() request: ExpressRequest): Promise<CompanyAdminGroup[]> {
+    setPrivateNoStoreCache(this);
     const companyId = requireCompanyAdmin(request.user as User);
-    const [groups, memberships] = await Promise.all([dir.listGroups(companyId), dir.listAllMemberships(companyId)]);
+    // One query per grant table for the WHOLE company, aggregated in memory
+    // below — same shape as the memberCount rollup, instead of firing
+    // listGroupCourseIds/listGroupNavKeys once per group (N groups x 2
+    // queries).
+    const [groups, memberships, courseGrants, navGrants] = await Promise.all([
+      dir.listGroups(companyId),
+      dir.listAllMemberships(companyId),
+      dir.listAllGroupCourseAccess(companyId),
+      dir.listAllGroupNavAccess(companyId),
+    ]);
     const memberCount = new Map<string, number>();
     for (const m of memberships) memberCount.set(m.groupId, (memberCount.get(m.groupId) ?? 0) + 1);
-    const withCounts = await Promise.all(
-      groups.map(async (g) => {
-        const [courses, nav] = await Promise.all([dir.listGroupCourseIds(companyId, g.id), dir.listGroupNavKeys(companyId, g.id)]);
-        return { id: g.id, name: g.name, memberCount: memberCount.get(g.id) ?? 0, courseCount: courses.length, navCount: nav.length };
-      }),
-    );
+    const courseCount = new Map<string, number>();
+    for (const c of courseGrants) courseCount.set(c.groupId, (courseCount.get(c.groupId) ?? 0) + 1);
+    const navCount = new Map<string, number>();
+    for (const n of navGrants) navCount.set(n.groupId, (navCount.get(n.groupId) ?? 0) + 1);
+    const withCounts = groups.map((g) => ({
+      id: g.id,
+      name: g.name,
+      memberCount: memberCount.get(g.id) ?? 0,
+      courseCount: courseCount.get(g.id) ?? 0,
+      navCount: navCount.get(g.id) ?? 0,
+    }));
     return withCounts;
   }
 
@@ -121,18 +153,33 @@ export class CompanyAdminController extends Controller {
 
   // ── Employees ──
   @Get('employees')
-  public async listEmployees(@Request() request: ExpressRequest): Promise<CompanyAdminEmployee[]> {
+  public async listEmployees(
+    @Request() request: ExpressRequest,
+    @Query() limit?: string,
+    @Query() offset?: string,
+  ): Promise<CompanyAdminEmployee[]> {
+    setPrivateNoStoreCache(this);
     const companyId = requireCompanyAdmin(request.user as User);
-    const [roster, memberships] = await Promise.all([dir.listEmployees(companyId), dir.listAllMemberships(companyId)]);
+    const parsedLimit = limit === undefined ? DEFAULT_EMPLOYEES_PAGE_SIZE : Number.parseInt(limit, 10);
+    const parsedOffset = offset === undefined ? 0 : Number.parseInt(offset, 10);
+    const pageSize = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, MAX_EMPLOYEES_PAGE_SIZE) : DEFAULT_EMPLOYEES_PAGE_SIZE;
+    const pageOffset = Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
+
+    const [{ employees: roster }, memberships] = await Promise.all([
+      dir.listEmployeesPage(companyId, pageSize, pageOffset),
+      dir.listAllMemberships(companyId),
+    ]);
     const groupsByUser = new Map<string, string[]>();
     for (const m of memberships) {
       const list = groupsByUser.get(m.userId) ?? [];
       list.push(m.groupId);
       groupsByUser.set(m.userId, list);
     }
-    const users = await Promise.all(roster.map((r) => userRepository.findById(r.userId)));
-    return roster.map((r, i) => {
-      const u = users[i];
+    // One batched lookup instead of one findById per employee.
+    const users = await userRepository.findByIds(roster.map((r) => r.userId));
+    const userById = new Map(users.map((u) => [u.id, u]));
+    return roster.map((r) => {
+      const u = userById.get(r.userId);
       return {
         userId: r.userId,
         email: u?.email ?? '',
@@ -146,16 +193,38 @@ export class CompanyAdminController extends Controller {
     });
   }
 
+  // FOLLOW-UP (not fixed in this pass): up to MAX_IMPORT_ROWS (2000) rows
+  // are processed sequentially inside this one HTTP request (each row does
+  // several awaits — provisioning, upsertEmployee, possibly ensureGroup +
+  // addMember), which is real request-timeout risk on a large CSV. The
+  // per-row sequencing itself is deliberate (see MAX_IMPORT_ROWS's comment —
+  // avoids a pathological-input concurrency blowup and keeps the in-request
+  // groupCache correct), so the fix isn't "parallelize this loop," it's
+  // moving large imports to a background job with progress polling instead
+  // of a synchronous request/response. Out of scope here — flagged for a
+  // follow-up pass.
   @Post('employees/import')
   public async importEmployees(
     @Body() body: CompanyAdminImportRequest,
     @Request() request: ExpressRequest,
     @Res() badRequest: TsoaResponse<400, CompanyAdminMessageResponse>,
+    @Res() tooManyRequests: TsoaResponse<429, CompanyAdminMessageResponse, { 'Retry-After': string }>,
   ): Promise<CompanyAdminImportReport | void> {
     const companyId = requireCompanyAdmin(request.user as User);
+    const inviteRetryAfter = await consumeCompanyInviteAllowance(companyId);
+    if (inviteRetryAfter > 0) {
+      return tooManyRequests(
+        429,
+        { message: 'Too many invite-triggering requests from this company. Please wait and try again.' },
+        { 'Retry-After': String(inviteRetryAfter) },
+      );
+    }
     const rows = parseEmployeeCsv(body.csv ?? '');
     if (rows === null) return badRequest(400, { message: 'Could not read the CSV. Expected a header row with Full Name, Email Id, Department, Role, Manager Name.' });
     if (rows.length === 0) return badRequest(400, { message: 'No data rows found in the CSV.' });
+    if (rows.length > MAX_IMPORT_ROWS) {
+      return badRequest(400, { message: `Too many rows — max ${MAX_IMPORT_ROWS} per import. Split the file and import in batches.` });
+    }
 
     const company = await companyRepository.findById(companyId);
     const companyName = company?.name ?? 'your company';
@@ -220,8 +289,17 @@ export class CompanyAdminController extends Controller {
     @Request() request: ExpressRequest,
     @Res() notFound: TsoaResponse<404, CompanyAdminMessageResponse>,
     @Res() badRequest: TsoaResponse<400, CompanyAdminMessageResponse>,
+    @Res() tooManyRequests: TsoaResponse<429, CompanyAdminMessageResponse, { 'Retry-After': string }>,
   ): Promise<void> {
     const companyId = requireCompanyAdmin(request.user as User);
+    const inviteRetryAfter = await consumeCompanyInviteAllowance(companyId);
+    if (inviteRetryAfter > 0) {
+      return tooManyRequests(
+        429,
+        { message: 'Too many invite-triggering requests from this company. Please wait and try again.' },
+        { 'Retry-After': String(inviteRetryAfter) },
+      );
+    }
     const employee = await dir.getEmployee(companyId, userId);
     if (!employee) return notFound(404, { message: 'Employee not found.' });
     const user = await userRepository.findById(userId);
@@ -241,8 +319,17 @@ export class CompanyAdminController extends Controller {
     @Request() request: ExpressRequest,
     @Res() notFound: TsoaResponse<404, CompanyAdminMessageResponse>,
     @Res() badRequest: TsoaResponse<400, CompanyAdminMessageResponse>,
+    @Res() tooManyRequests: TsoaResponse<429, CompanyAdminMessageResponse, { 'Retry-After': string }>,
   ): Promise<CompanyAdminInviteLink | void> {
     const companyId = requireCompanyAdmin(request.user as User);
+    const inviteRetryAfter = await consumeCompanyInviteAllowance(companyId);
+    if (inviteRetryAfter > 0) {
+      return tooManyRequests(
+        429,
+        { message: 'Too many invite-triggering requests from this company. Please wait and try again.' },
+        { 'Retry-After': String(inviteRetryAfter) },
+      );
+    }
     const employee = await dir.getEmployee(companyId, userId);
     if (!employee) return notFound(404, { message: 'Employee not found.' });
     const user = await userRepository.findById(userId);
@@ -273,6 +360,7 @@ export class CompanyAdminController extends Controller {
     @Request() request: ExpressRequest,
     @Res() notFound: TsoaResponse<404, CompanyAdminMessageResponse>,
   ): Promise<CompanyAdminGroupCourseAccess | void> {
+    setPrivateNoStoreCache(this);
     const companyId = requireCompanyAdmin(request.user as User);
     const group = await dir.getGroup(companyId, groupId);
     if (!group) return notFound(404, { message: 'Group not found.' });
@@ -315,6 +403,7 @@ export class CompanyAdminController extends Controller {
     @Request() request: ExpressRequest,
     @Res() notFound: TsoaResponse<404, CompanyAdminMessageResponse>,
   ): Promise<CompanyAdminGroupNavAccess | void> {
+    setPrivateNoStoreCache(this);
     const companyId = requireCompanyAdmin(request.user as User);
     const group = await dir.getGroup(companyId, groupId);
     if (!group) return notFound(404, { message: 'Group not found.' });

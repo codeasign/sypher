@@ -62,11 +62,6 @@ export default async function BookmarksPage(): Promise<React.JSX.Element> {
   return (
     <div className={styles.page}>
       <div className={styles.container}>
-        <div className={styles.pageHeader}>
-          <h1 className={styles.pageTitle}>Bookmarks</h1>
-          <p className={styles.pageSubtitle}>Courses and modules you&apos;ve bookmarked.</p>
-        </div>
-
         <BookmarksContent initialCourses={courses} initialModules={modules} />
       </div>
     </div>

@@ -143,6 +143,7 @@ export default function MockExamList({
                           title={`Official certification page for ${exam.title}`}
                         >
                           {exam.examCode}
+                          <OpenInNewIcon className={styles.cardActionIcon} />
                         </a>
                       ) : (
                         <span className={styles.examCode}>{exam.examCode}</span>
@@ -159,17 +160,6 @@ export default function MockExamList({
                       </div>
                     </div>
                     <div className={styles.cardActions}>
-                      {officialLink && (
-                        <a
-                          href={officialLink}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className={`${styles.cardActionBtn} ${styles.cardActionNeutral}`}
-                        >
-                          Official Site
-                          <OpenInNewIcon className={styles.cardActionIcon} />
-                        </a>
-                      )}
                       <Link href={`/mock-tests/${exam.slug}`} className={`${styles.cardActionBtn} ${styles.cardActionPrimary}`}>
                         Start Test
                         <ChevronRightIcon className={styles.cardActionIcon} />

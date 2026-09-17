@@ -13,6 +13,7 @@ interface Props {
   role: string;
   email: string;
   fullName: string | null;
+  avatarUrl: string | null;
   visibleKeys: string[];
   isPaidAndActive: boolean;
 }
@@ -26,13 +27,23 @@ export default function CourseLearnSidebar({
   role,
   email,
   fullName,
+  avatarUrl,
   visibleKeys,
   isPaidAndActive,
 }: Props): React.JSX.Element {
   const pathname = usePathname();
 
   if (pathname === `/learn/${courseSlug}`) {
-    return <DashboardSidebar role={role} email={email} fullName={fullName} visibleKeys={visibleKeys} isPaidAndActive={isPaidAndActive} />;
+    return (
+      <DashboardSidebar
+        role={role}
+        email={email}
+        fullName={fullName}
+        avatarUrl={avatarUrl}
+        visibleKeys={visibleKeys}
+        isPaidAndActive={isPaidAndActive}
+      />
+    );
   }
 
   return <CourseModuleIndex courseSlug={courseSlug} courseName={courseName} courses={courses} modules={modules} />;

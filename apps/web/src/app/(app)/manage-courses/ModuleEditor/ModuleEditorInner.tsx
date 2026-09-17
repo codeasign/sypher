@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import clsx from 'clsx';
 import CourseModuleArticle from '@/components/CourseModulePage/CourseModuleArticle';
 import {
@@ -33,7 +33,10 @@ import type { MDXEditorMethods } from '@mdxeditor/editor';
 import { hardLineBreakPlugin } from '@/lib/mdxeditor/hardLineBreakPlugin';
 import { useColorMode } from '@/hooks/useColorMode';
 import { createCourseModule, updateCourseModule, type CourseModule } from '@/data/courses';
+import { submitModuleEditRequest } from '@/data/moduleEditRequests';
 import { uploadToBunny } from '@/data/bunnyUpload';
+import { apiFetch } from '@/lib/api';
+import { useToast } from '@/components/Toast/ToastProvider';
 import '@mdxeditor/editor/style.css';
 import styles from '../manage-courses.module.css';
 
@@ -55,6 +58,22 @@ function EyeOffIcon(): React.JSX.Element {
   );
 }
 
+function ExpandIcon(): React.JSX.Element {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+    </svg>
+  );
+}
+
+function CollapseIcon(): React.JSX.Element {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7" />
+    </svg>
+  );
+}
+
 interface ModuleEditorProps {
   courseId: string;
   module?: CourseModule | null;
@@ -72,11 +91,40 @@ export default function ModuleEditorInner({ courseId, module: mod, onSaved, onCa
   const [draftMarkdown, setDraftMarkdown] = useState(mod?.bodyMdx ?? '');
   const [contentMarkdown, setContentMarkdown] = useState(mod?.bodyMdx ?? '');
   const [editorInstanceKey, setEditorInstanceKey] = useState(0);
+  const [fullscreen, setFullscreen] = useState(false);
+  // Same content-approval gate as the reader page's inline editor (user
+  // request 2026-09-16) — Admins publish content directly, everyone else
+  // (Reviewer included) submits a ModuleEditRequest instead. Defaults to
+  // false (safest assumption) until /auth/me resolves.
+  const [canPublishDirectly, setCanPublishDirectly] = useState(false);
   const editorRef = useRef<MDXEditorMethods>(null);
   const { colorMode } = useColorMode();
+  const { showToast } = useToast();
 
   const isEditing = Boolean(mod);
   const canSave = title.trim().length > 0 && contentMarkdown.trim().length > 0 && !saving;
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch('/auth/me')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((me: { role?: string } | null) => {
+        if (!cancelled) setCanPublishDirectly(me?.role === 'ADMIN');
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    function handleKeyDown(e: KeyboardEvent): void {
+      if (e.key === 'Escape') setFullscreen(false);
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [fullscreen]);
 
   function togglePreview(): void {
     if (!previewMode) {
@@ -103,22 +151,48 @@ export default function ModuleEditorInner({ courseId, module: mod, onSaved, onCa
       if (!isEditing) {
         const { error: createError, module: created } = await createCourseModule(courseId, {
           title: title.trim(),
-          bodyMdx,
+          // Non-admins can still create the module itself (title,
+          // settings) — content just can't land directly, so it's
+          // submitted as a follow-up edit request below.
+          bodyMdx: canPublishDirectly ? bodyMdx : '',
           showInGettingStarted,
         });
         if (createError || !created) {
           setError(createError ?? 'Failed to create module.');
           return;
         }
+        if (!canPublishDirectly && bodyMdx.trim().length > 0) {
+          const { error: submitError } = await submitModuleEditRequest(courseId, created.id, bodyMdx);
+          if (submitError) {
+            setError(submitError);
+            return;
+          }
+          showToast('Module created; content submitted for review.', 'info');
+        } else {
+          showToast('Module created.', 'success');
+        }
       } else {
         const { error: updateError } = await updateCourseModule(courseId, mod!.id, {
           title: title.trim(),
-          bodyMdx,
           showInGettingStarted,
+          // Omitted entirely (not just emptied) for non-admins — the API
+          // rejects a bodyMdx key on this endpoint unless the caller can
+          // publish directly.
+          ...(canPublishDirectly ? { bodyMdx } : {}),
         });
         if (updateError) {
           setError(updateError);
           return;
+        }
+        if (!canPublishDirectly) {
+          const { error: submitError } = await submitModuleEditRequest(courseId, mod!.id, bodyMdx);
+          if (submitError) {
+            setError(submitError);
+            return;
+          }
+          showToast('Submitted for review. A Course Auditor will approve it before it goes live.', 'info');
+        } else {
+          showToast('Module updated.', 'success');
         }
       }
       onSaved();
@@ -139,12 +213,18 @@ export default function ModuleEditorInner({ courseId, module: mod, onSaved, onCa
           {previewMode ? <EyeOffIcon /> : <EyeIcon />}
           {previewMode ? 'Edit' : 'Preview'}
         </button>
+        {!previewMode && (
+          <button type="button" className={styles.toolbarBtn} onClick={() => setFullscreen((f) => !f)}>
+            {fullscreen ? <CollapseIcon /> : <ExpandIcon />}
+            {fullscreen ? 'Exit full screen' : 'Full screen'}
+          </button>
+        )}
         <div className={styles.toolbarSpacer} />
         <button type="button" className={styles.cancelBtn} onClick={onCancel} disabled={saving}>
           Cancel
         </button>
         <button type="button" className={styles.saveBtn} onClick={handleSave} disabled={!canSave}>
-          {saving ? 'Saving…' : 'Save'}
+          {saving ? 'Saving…' : canPublishDirectly ? 'Save' : 'Submit for review'}
         </button>
       </div>
 
@@ -187,12 +267,17 @@ export default function ModuleEditorInner({ courseId, module: mod, onSaved, onCa
             <label className={styles.fieldLabel}>
               Content<span className={styles.requiredMark}>*</span>
             </label>
-            <div className={styles.mdxWrapper}>
+            <div className={clsx(styles.mdxWrapper, fullscreen && styles.mdxWrapperFullscreen)}>
+              {fullscreen && (
+                <button type="button" className={styles.fullscreenExitBtn} onClick={() => setFullscreen(false)} aria-label="Exit full screen">
+                  <CollapseIcon />
+                </button>
+              )}
               <MDXEditor
                 key={editorInstanceKey}
                 ref={editorRef}
                 className={colorMode === 'dark' ? 'dark-theme' : undefined}
-                contentEditableClassName={styles.mdxContentEditable}
+                contentEditableClassName={clsx(styles.mdxContentEditable, fullscreen && styles.mdxContentEditableFullscreen)}
                 markdown={draftMarkdown}
                 onChange={(markdown) => setContentMarkdown(markdown)}
                 onError={({ error: mdxError }) => setError(mdxError)}

@@ -11,13 +11,15 @@ import cors from 'cors';
 import helmet from 'helmet';
 import swaggerUi from 'swagger-ui-express';
 import { ValidateError } from 'tsoa';
-import type { ErrorRequestHandler } from 'express';
+import type { ErrorRequestHandler, RequestHandler } from 'express';
 import { env } from './lib/env';
 import { createLogger } from './lib/logger';
 import { HttpError } from './lib/errors';
 import { RegisterRoutes } from './generated/routes';
 import { paymentsWebhookHandler } from './lib/paymentsWebhook';
 import { startCronJobs } from './lib/cronJobs';
+import { resolveOptionalUser } from './lib/tsoaAuth';
+import { videoStreamHandler } from './lib/videoStream';
 
 const logger = createLogger('server');
 const app = express();
@@ -39,9 +41,41 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), payment
 app.use(express.json());
 app.use(cookieParser());
 
+// Raw route, not a tsoa controller (see lib/videoStream.ts's top comment
+// for why: Range/206 passthrough and manual response streaming aren't
+// something tsoa's JSON-response model supports). Needs cookieParser
+// above for session auth, so it's registered after that, same as every
+// tsoa route below.
+app.get('/videos/:slug/stream', (req, res) => {
+  videoStreamHandler(req, res).catch((error) => {
+    if (!res.headersSent) res.status(500).json({ message: 'Internal error' });
+    logger.error('videoStreamHandler failed', error);
+  });
+});
+
 RegisterRoutes(app);
 
-app.use('/docs', swaggerUi.serve, swaggerUi.setup(require('./generated/swagger.json')));
+// The generated OpenAPI schema documents every route/DTO shape in the API —
+// harmless to leave open in local dev, but in production it's handed to
+// anyone who requests it, admin included. Gated to signed-in ADMINs only,
+// and a plain 404 (not 401/403) so an unauthenticated caller can't even
+// tell the endpoint exists. Session-cookie lookup only (not tsoa's
+// @Security, which this handler predates and isn't wired through) — same
+// resolveOptionalUser used to personalize public reads.
+const requireAdminForDocs: RequestHandler = (req, res, next) => {
+  if (env.nodeEnv !== 'production') return next();
+  resolveOptionalUser(req)
+    .then((user) => {
+      if (!user || user.role !== 'ADMIN') {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
+      next();
+    })
+    .catch(next);
+};
+
+app.use('/docs', requireAdminForDocs, swaggerUi.serve, swaggerUi.setup(require('./generated/swagger.json')));
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });

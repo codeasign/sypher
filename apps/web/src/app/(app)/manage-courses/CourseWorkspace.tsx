@@ -61,7 +61,7 @@ export default function CourseWorkspace({ course, onBack, onCourseUpdated }: Cou
         </button>
       </div>
 
-      {activeTab === 'details' && <CourseEditor course={course} onSaved={handleDetailsSaved} onCancel={onBack} />}
+      {activeTab === 'details' && <CourseEditor course={course} onSaved={handleDetailsSaved} onCancel={onBack} onRepublished={onBack} />}
       {activeTab === 'modules' && <ModulesTab courseId={course.id} />}
       {activeTab === 'access' && <AccessTab courseId={course.id} />}
     </div>

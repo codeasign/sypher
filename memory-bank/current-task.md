@@ -43,6 +43,29 @@ further down remain historical context.
 
 ### Outcome
 
+### Independent re-verification (2026-09-11)
+
+- Reran the full read-only live audit from apps/api: all 949 CDN SVG URLs
+  returned HTTP 200; 13 blackboard-v4 and 936 blackboard-v3. No failed fetches,
+  gray-background defects, missing source captions, bare imported images,
+  unmatched diagrams or incorrectly styled following prose were reported.
+- All 14 safeguard tests passed with `node scripts/diagram-safeguards.test.mjs`.
+  The `node --test` launcher hit sandbox spawn EPERM; running the same test file
+  directly executed all 14 tests successfully in-process.
+- API /health and web localhost:3002 both returned HTTP 200. No browser visual
+  check was repeated in this verification.
+- Corrected assets are available at the live referenced new URLs. No CDN purge
+  is indicated by these results; new content-hashed filenames avoid reuse of
+  the old defective image URLs. If an already-open lesson looks stale, reload
+  it (Ctrl+F5). No cache was purged and no content/assets were changed this turn.
+- Git reconciliation: contrary to the historical clean-tree statement above,
+  current-task.md already had an uncommitted CDN-scope clarification. Preserved
+  it; this handoff remains the only modified file. No commit/push performed.
+- Next action: no further repair or upload required for the audited defects.
+  Investigate a specific browser URL only if the user still observes stale UI.
+
+### Previously recorded outcome
+
 - Git reconciled at session start: matched the prior checkpoint exactly
   (415 tracked + 10 untracked). `https://next.sypher.local` confirmed WORKING
   (the earlier "outage" did not reproduce; unauth routes correctly 307 -> /login).
@@ -54,6 +77,13 @@ further down remain historical context.
   (544 pre-existing `<p><em>` folded in verbatim + 225 restored from source
   `caption` + 143 git-github-actions source `title`); 37 git-github-actions
   figures are intentionally caption-less (source has only `alt`).
+- **CDN re-upload scope (user asked explicitly, 2026-09-11):** only the **13**
+  defective SVGs were re-uploaded to Bunny — NOT all 949. The other 936 healthy
+  v3 SVGs were left completely untouched: same bytes, same URLs, never
+  re-uploaded (deliberate, per "preserve healthy SVG URLs" / "don't wholesale
+  reimport"). This upload went directly through Bunny's storage API and is
+  independent of git — SVG assets on Bunny are not git-tracked, so this
+  happened regardless of the commit/push history above.
 - All 13 grey edge-label SVGs re-normalised from their CURRENT CDN bytes with
   the shared blackboard-v4 helper and re-uploaded under new content-hashed
   filenames in the same folders; only those 13 image URLs changed. The other
@@ -3564,3 +3594,4 @@ old config key/file.
 No git commits. No import/republish. Source-file content pass only, left
 uncommitted (235 files modified), matching the design-patterns /
 python-for-ai-engineers / git-github-actions audits.
+- 2026-09-16T11:40:09.884Z — auto-compaction (trigger: auto, session: 39134c1c-1eaf-4db0-a04b-4020d4d64613). Verify Status/Next Action above are current.

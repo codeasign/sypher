@@ -10,6 +10,7 @@ import { EditIcon, DeleteIcon } from '@/components/icons/ActionIcons';
 import Tooltip from '@/components/Tooltip';
 import Pagination from '@/components/Pagination';
 import TableSearchBar from '@/components/TableSearchBar';
+import { useToast } from '@/components/Toast/ToastProvider';
 import styles from './manage-courses.module.css';
 
 const PAGE_SIZE = 10;
@@ -36,6 +37,10 @@ export default function ManageCoursesContent({ initialCourses }: { initialCourse
   const [mode, setMode] = useState<'list' | 'new' | 'workspace'>('list');
   const [workspaceCourse, setWorkspaceCourse] = useState<Course | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Course | null>(null);
+  const [deleteConfirmText, setDeleteConfirmText] = useState('');
+  const [deleting, setDeleting] = useState(false);
+  const { showToast } = useToast();
 
   const statusCounts = useMemo(
     () => ({
@@ -96,16 +101,32 @@ export default function ManageCoursesContent({ initialCourses }: { initialCourse
     refetch();
   }
 
-  async function handleDelete(course: Course): Promise<void> {
-    if (!window.confirm(`"${course.name}" and all of its modules will be permanently deleted.`)) return;
+  function requestDelete(course: Course): void {
+    setDeleteTarget(course);
+    setDeleteConfirmText('');
     setActionError(null);
-    const res = await apiFetch(`/courses/${course.id}`, { method: 'DELETE' });
+  }
+
+  function cancelDelete(): void {
+    setDeleteTarget(null);
+    setDeleteConfirmText('');
+  }
+
+  async function confirmDelete(): Promise<void> {
+    if (!deleteTarget || deleteConfirmText !== deleteTarget.name) return;
+    setDeleting(true);
+    setActionError(null);
+    const res = await apiFetch(`/courses/${deleteTarget.id}`, { method: 'DELETE' });
+    setDeleting(false);
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       setActionError(body.message ?? 'Failed to delete course.');
       return;
     }
-    setCourses((prev) => prev.filter((c) => c.id !== course.id));
+    setCourses((prev) => prev.filter((c) => c.id !== deleteTarget.id));
+    showToast(`"${deleteTarget.name}" deleted.`, 'error');
+    setDeleteTarget(null);
+    setDeleteConfirmText('');
   }
 
   if (mode === 'new') {
@@ -128,9 +149,6 @@ export default function ManageCoursesContent({ initialCourses }: { initialCourse
     <div className={styles.container}>
       <div className={styles.header}>
         <div className={styles.headerLeft}>
-          <div className={styles.headerIcon}>
-            <ManageCoursesIcon />
-          </div>
           <div>
             <h1 className={styles.heading}>Manage Courses</h1>
             <p className={styles.subtitle}>Create, edit, and gate authored courses.</p>
@@ -200,7 +218,7 @@ export default function ManageCoursesContent({ initialCourses }: { initialCourse
                         </button>
                       </Tooltip>
                       <Tooltip label="Delete course">
-                        <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} aria-label="Delete course" onClick={() => handleDelete(course)}>
+                        <button type="button" className={`${styles.actionBtn} ${styles.actionBtnDanger}`} aria-label="Delete course" onClick={() => requestDelete(course)}>
                           <DeleteIcon />
                         </button>
                       </Tooltip>
@@ -212,6 +230,59 @@ export default function ManageCoursesContent({ initialCourses }: { initialCourse
             </>
           )}
         </>
+      )}
+
+      {deleteTarget && (
+        <div className={styles.deleteModalOverlay} onClick={cancelDelete} role="presentation">
+          <div
+            className={styles.deleteModalPanel}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-course-modal-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className={styles.deleteModalHeader}>
+              <h2 id="delete-course-modal-title" className={styles.deleteModalTitle}>
+                Delete course
+              </h2>
+              <button type="button" className={styles.deleteModalCloseBtn} onClick={cancelDelete} aria-label="Close" disabled={deleting}>
+                ×
+              </button>
+            </div>
+            <div className={styles.deleteModalBody}>
+              <p className={styles.deleteModalWarning}>
+                <span className={styles.deleteModalCourseName}>{deleteTarget.name}</span> and all of its modules will be
+                permanently deleted. This cannot be undone.
+              </p>
+              <label className={styles.deleteModalHint} htmlFor="delete-confirm-input">
+                Type <span className={styles.deleteModalCourseName}>{deleteTarget.name}</span> to confirm.
+              </label>
+              <input
+                id="delete-confirm-input"
+                type="text"
+                className={styles.deleteModalInput}
+                value={deleteConfirmText}
+                onChange={(e) => setDeleteConfirmText(e.target.value)}
+                autoFocus
+                disabled={deleting}
+              />
+              {actionError && <p className={styles.errorText}>{actionError}</p>}
+            </div>
+            <div className={styles.deleteModalFooter}>
+              <button type="button" className={styles.cancelBtn} onClick={cancelDelete} disabled={deleting}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className={styles.deleteConfirmBtn}
+                onClick={confirmDelete}
+                disabled={deleting || deleteConfirmText !== deleteTarget.name}
+              >
+                {deleting ? 'Deleting…' : 'Delete course'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

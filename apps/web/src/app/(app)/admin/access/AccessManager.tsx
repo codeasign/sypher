@@ -5,13 +5,13 @@ import { apiFetch } from '@/lib/api';
 import { EditIcon, ImageIcon, InfoIcon, SettingsIcon, UploadIcon } from '@/components/icons/ActionIcons';
 import Pagination from '@/components/Pagination';
 import { uploadToBunny } from '@/data/bunnyUpload';
+import { listCourses } from '@/data/courses';
 import { NAV_ITEMS } from '@/lib/navItems';
 import { roleLabel } from '@/lib/roleLabels';
 import { roleColor } from '@/lib/roleColors';
-import courseCatalog from '@sypher/course-catalog/src/courses';
 import styles from './styles.module.css';
 
-const ROLES = ['ADMIN', 'FREE_USER', 'PAID_USER', 'INTERNAL_HR', 'COMPANY_HR', 'COMPANY_EMPLOYEE', 'BRANDER', 'COHORT_USER'] as const;
+const ROLES = ['ADMIN', 'FREE_USER', 'PAID_USER', 'INTERNAL_HR', 'COMPANY_HR', 'COMPANY_EMPLOYEE', 'BRANDER', 'COHORT_USER', 'REVIEWER', 'COURSE_AUDITOR'] as const;
 type Role = (typeof ROLES)[number];
 const NON_ADMIN_ROLES = ROLES.filter((r) => r !== 'ADMIN');
 
@@ -19,10 +19,43 @@ interface AccessItem {
   key: string;
   label: string;
   sublabel?: string;
+  category?: string;
+  status?: 'draft' | 'published';
 }
 
-const COURSE_ITEMS: AccessItem[] = courseCatalog.map((c) => ({ key: c.slug, label: c.title, sublabel: c.tag }));
 const NAV_ITEMS_LIST: AccessItem[] = NAV_ITEMS.map((n) => ({ key: n.key, label: n.label, sublabel: n.href }));
+
+const UNCATEGORIZED = 'Uncategorized';
+
+// Real DB-backed courses (every category — tech, life-skills, metrics,
+// etc.), not the static @sypher/course-catalog package, which only ever
+// held the legacy tech catalog and was silently hiding every other
+// category from this page (user report 2026-09-15). Shared module-level
+// cache so CourseRoleAccessSection and the company GrantsModal don't each
+// issue their own fetch.
+let courseItemsPromise: Promise<AccessItem[]> | null = null;
+function loadCourseItems(): Promise<AccessItem[]> {
+  if (!courseItemsPromise) {
+    courseItemsPromise = listCourses().then((courses) =>
+      courses.map((c) => ({ key: c.slug, label: c.name, category: c.category || UNCATEGORIZED, status: c.status })),
+    );
+  }
+  return courseItemsPromise;
+}
+
+function useCourseItems(): AccessItem[] {
+  const [items, setItems] = useState<AccessItem[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    loadCourseItems().then((loaded) => {
+      if (!cancelled) setItems(loaded);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return items;
+}
 
 interface Company {
   id: string;
@@ -178,6 +211,7 @@ function RoleAccessModal({
   rowErrors,
   onToggle,
   onClose,
+  grouped,
 }: {
   role: Role;
   title: string;
@@ -186,6 +220,11 @@ function RoleAccessModal({
   rowErrors: Record<string, string>;
   onToggle: (itemKey: string, role: Role, checked: boolean) => void;
   onClose: () => void;
+  // Courses span many categories now (tech, life-skills, metrics, ...) —
+  // grouped rendering with category headers keeps a long list scannable
+  // instead of one undifferentiated column (user report 2026-09-15). Nav
+  // items have no category, so they fall back to the flat list.
+  grouped?: boolean;
 }): React.JSX.Element {
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent): void {
@@ -195,10 +234,66 @@ function RoleAccessModal({
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [onClose]);
 
+  function renderItem(item: AccessItem): React.JSX.Element {
+    const allowed = allowedByKey[item.key] ?? [];
+    return (
+      <div key={item.key} className={styles.modalItemRow}>
+        <div className={styles.itemLabelCell}>
+          <span className={styles.itemLabel}>{item.label}</span>
+          {item.sublabel && <span className={styles.itemHref}>{item.sublabel}</span>}
+          {rowErrors[item.key] && <p className={styles.rowError}>{rowErrors[item.key]}</p>}
+        </div>
+        <input
+          type="checkbox"
+          className={styles.checkbox}
+          checked={allowed.includes(role)}
+          onChange={(e) => onToggle(item.key, role, e.target.checked)}
+          aria-label={`Toggle ${roleLabel(role)} access to ${item.label}`}
+        />
+      </div>
+    );
+  }
+
+  // Grouped (course) rendering: checkbox-before-label, the familiar
+  // signup-form checkbox-group pattern (user request 2026-09-15) —
+  // simpler than the card-row layout above, and the whole row is a
+  // <label> so clicking the text also toggles the box.
+  function renderCheckItem(item: AccessItem): React.JSX.Element {
+    const allowed = allowedByKey[item.key] ?? [];
+    return (
+      <label key={item.key} className={styles.checkItem}>
+        <input
+          type="checkbox"
+          className={styles.checkbox}
+          checked={allowed.includes(role)}
+          onChange={(e) => onToggle(item.key, role, e.target.checked)}
+          aria-label={`Toggle ${roleLabel(role)} access to ${item.label}`}
+        />
+        <span className={styles.checkItemLabel}>{item.label}</span>
+        {item.status && (
+          <span className={item.status === 'published' ? styles.statusBadgePublished : styles.statusBadgeDraft}>
+            {item.status === 'published' ? 'Published' : 'Draft'}
+          </span>
+        )}
+      </label>
+    );
+  }
+
+  const groups: Array<[string, AccessItem[]]> = [];
+  if (grouped) {
+    const byCategory = new Map<string, AccessItem[]>();
+    for (const item of items) {
+      const key = item.category ?? UNCATEGORIZED;
+      if (!byCategory.has(key)) byCategory.set(key, []);
+      byCategory.get(key)!.push(item);
+    }
+    groups.push(...byCategory.entries());
+  }
+
   return (
     <div className={styles.modalOverlay} onClick={onClose} role="presentation">
       <div
-        className={styles.modalPanel}
+        className={grouped ? `${styles.modalPanel} ${styles.modalPanelCourses}` : styles.modalPanel}
         role="dialog"
         aria-modal="true"
         aria-labelledby="role-access-modal-title"
@@ -213,25 +308,16 @@ function RoleAccessModal({
           </button>
         </div>
         <div className={styles.modalBody}>
-          {items.map((item) => {
-            const allowed = allowedByKey[item.key] ?? [];
-            return (
-              <div key={item.key} className={styles.modalItemRow}>
-                <div className={styles.itemLabelCell}>
-                  <span className={styles.itemLabel}>{item.label}</span>
-                  {item.sublabel && <span className={styles.itemHref}>{item.sublabel}</span>}
-                  {rowErrors[item.key] && <p className={styles.rowError}>{rowErrors[item.key]}</p>}
-                </div>
-                <input
-                  type="checkbox"
-                  className={styles.checkbox}
-                  checked={allowed.includes(role)}
-                  onChange={(e) => onToggle(item.key, role, e.target.checked)}
-                  aria-label={`Toggle ${roleLabel(role)} access to ${item.label}`}
-                />
+          {grouped ? (
+            groups.map(([category, categoryItems]) => (
+              <div key={category} className={styles.categorySection}>
+                <h3 className={styles.categorySeparator}>{category}</h3>
+                <div className={styles.checkGrid}>{categoryItems.map(renderCheckItem)}</div>
               </div>
-            );
-          })}
+            ))
+          ) : (
+            items.map(renderItem)
+          )}
         </div>
         <div className={styles.modalFooter}>
           <button type="button" className={styles.modalDoneBtn} onClick={onClose}>
@@ -244,6 +330,7 @@ function RoleAccessModal({
 }
 
 function CourseRoleAccessSection(): React.JSX.Element {
+  const courseItems = useCourseItems();
   const [allowedByKey, setAllowedByKey] = useState<Record<string, string[]>>({});
   const [loading, setLoading] = useState(true);
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
@@ -299,16 +386,16 @@ function CourseRoleAccessSection(): React.JSX.Element {
         >
           <span className={styles.roleCardLabel}>{roleLabel('ADMIN')}</span>
           <span className={styles.roleCardCount}>
-            {COURSE_ITEMS.length} of {COURSE_ITEMS.length} courses accessible — always full access
+            {courseItems.length} of {courseItems.length} courses accessible — always full access
           </span>
         </div>
         {NON_ADMIN_ROLES.map((r) => {
-          const count = COURSE_ITEMS.filter((item) => (allowedByKey[item.key] ?? []).includes(r)).length;
+          const count = courseItems.filter((item) => (allowedByKey[item.key] ?? []).includes(r)).length;
           return (
             <button key={r} type="button" className={styles.roleCard} style={{ '--role-color': roleColor(r) } as React.CSSProperties} onClick={() => setSelectedRole(r)}>
               <span className={styles.roleCardLabel}>{roleLabel(r)}</span>
               <span className={styles.roleCardCount}>
-                {count} of {COURSE_ITEMS.length} courses accessible
+                {count} of {courseItems.length} courses accessible
               </span>
             </button>
           );
@@ -319,15 +406,16 @@ function CourseRoleAccessSection(): React.JSX.Element {
         <RoleAccessModal
           role={selectedRole}
           title="Course Access"
-          items={COURSE_ITEMS}
+          items={courseItems}
           allowedByKey={allowedByKey}
           rowErrors={rowErrors}
           onToggle={handleToggle}
           onClose={() => setSelectedRole(null)}
+          grouped
         />
       )}
 
-      <AtAGlance items={COURSE_ITEMS} allowedByKey={allowedByKey} />
+      <AtAGlance items={courseItems} allowedByKey={allowedByKey} />
     </section>
   );
 }
@@ -720,6 +808,7 @@ function GrantsModal({
   company: Pick<Company, 'id' | 'name'>;
   onClose: () => void;
 }): React.JSX.Element {
+  const courseItems = useCourseItems();
   const [courseSlugs, setCourseSlugs] = useState<string[]>([]);
   const [navKeys, setNavKeys] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
@@ -805,7 +894,7 @@ function GrantsModal({
           ) : (
             <>
               <h4 className={styles.grantsHeading}>Courses</h4>
-              {renderRows(COURSE_ITEMS, courseSlugs, 'courses', 'employees\'')}
+              {renderRows(courseItems, courseSlugs, 'courses', 'employees\'')}
               <h4 className={styles.grantsHeading}>Sidebar items</h4>
               {renderRows(NAV_ITEMS_LIST, navKeys, 'nav', 'employees\'')}
             </>
@@ -987,7 +1076,7 @@ function CompanyListSection(): React.JSX.Element {
 
 // Roles offered on the User Role tab — the set admins are meant to assign
 // from this page. The API still validates against the full schema enum.
-const ASSIGNABLE_ROLES: readonly Role[] = ['FREE_USER', 'PAID_USER', 'INTERNAL_HR', 'BRANDER', 'ADMIN'];
+const ASSIGNABLE_ROLES: readonly Role[] = ['FREE_USER', 'PAID_USER', 'INTERNAL_HR', 'BRANDER', 'REVIEWER', 'COURSE_AUDITOR', 'ADMIN'];
 
 const USER_PAGE_SIZE = 10;
 

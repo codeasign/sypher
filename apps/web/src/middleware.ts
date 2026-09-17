@@ -42,7 +42,12 @@ export function middleware(request: NextRequest): NextResponse {
 }
 
 export const config = {
-  // Skip Next internals and common static files; everything else on the
-  // corporate host flows through the rewrite above.
-  matcher: ['/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)'],
+  // Skip Next internals, common static files, and /api/* — /api routes
+  // never need the corporate-host redirect this middleware exists for,
+  // and Next.js clones every request body that flows through middleware
+  // (DEFAULT_BODY_CLONE_SIZE_LIMIT = 10MB in body-streams.js), which was
+  // silently corrupting multipart bodies over 10MB before they reached
+  // /api/upload's route handler ("Expected multipart/form-data" on any
+  // video upload >10MB — found 2026-09-16 investigating that report).
+  matcher: ['/((?!api/|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)'],
 };

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import {
   MDXEditor,
@@ -57,6 +57,22 @@ function EyeOffIcon(): React.JSX.Element {
   );
 }
 
+function ExpandIcon(): React.JSX.Element {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+    </svg>
+  );
+}
+
+function CollapseIcon(): React.JSX.Element {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7" />
+    </svg>
+  );
+}
+
 interface Cohort {
   id: string;
   slug: string;
@@ -94,7 +110,17 @@ export default function CohortEditorInner({ cohort, onSaved, onCancel, onBack }:
   const [error, setError] = useState<string | null>(null);
   const [previewMode, setPreviewMode] = useState(false);
   const [editorInstanceKey, setEditorInstanceKey] = useState(0);
+  const [fullscreen, setFullscreen] = useState(false);
   const { colorMode } = useColorMode();
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    function handleKeyDown(e: KeyboardEvent): void {
+      if (e.key === 'Escape') setFullscreen(false);
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [fullscreen]);
 
   function togglePreview(): void {
     if (previewMode) {
@@ -187,6 +213,12 @@ export default function CohortEditorInner({ cohort, onSaved, onCancel, onBack }:
           {previewMode ? <EyeOffIcon /> : <EyeIcon />}
           {previewMode ? 'Edit' : 'Preview'}
         </button>
+        {!previewMode && (
+          <button type="button" className={styles.toolbarBtn} onClick={() => setFullscreen((f) => !f)}>
+            {fullscreen ? <CollapseIcon /> : <ExpandIcon />}
+            {fullscreen ? 'Exit full screen' : 'Full screen'}
+          </button>
+        )}
         <div className={styles.toolbarSpacer} />
         <button type="button" className={styles.cancelBtn} onClick={onCancel} disabled={saving}>
           Cancel
@@ -268,11 +300,16 @@ export default function CohortEditorInner({ cohort, onSaved, onCancel, onBack }:
 
           <div className={styles.formGroup}>
             <label className={styles.fieldLabel} htmlFor="cohort-content">Details (markdown)</label>
-            <div className={styles.mdxWrapper}>
+            <div className={clsx(styles.mdxWrapper, fullscreen && styles.mdxWrapperFullscreen)}>
+              {fullscreen && (
+                <button type="button" className={styles.fullscreenExitBtn} onClick={() => setFullscreen(false)} aria-label="Exit full screen">
+                  <CollapseIcon />
+                </button>
+              )}
               <MDXEditor
                 key={editorInstanceKey}
                 className={colorMode === 'dark' ? 'dark-theme' : undefined}
-                contentEditableClassName={styles.mdxContentEditable}
+                contentEditableClassName={clsx(styles.mdxContentEditable, fullscreen && styles.mdxContentEditableFullscreen)}
                 markdown={content}
                 onChange={setContent}
                 placeholder="Curriculum, prerequisites, what learners will build…"

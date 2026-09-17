@@ -47,7 +47,11 @@ export class ContactController extends Controller {
     if (!message) return badRequest(400, { message: 'Message is required' });
 
     await contactSubmissionRepository.create({ name, email, message });
-    await sendContactNotification(name, email, message);
+    // Fire-and-forget, same convention as every other transactional email in
+    // this codebase (welcome, password-reset, cohort-welcome) — the
+    // submission is already durably recorded above, so the response
+    // shouldn't block on (or fail because of) an external email API call.
+    void sendContactNotification(name, email, message);
 
     return { message: 'Thanks for reaching out — we will get back to you soon.' };
   }

@@ -65,6 +65,16 @@ export async function requireCanManageBlog(user: User): Promise<void> {
   if (!(await canManageBlog(user))) throw new ForbiddenError('Blog management access required');
 }
 
+/** Admin, or role holds 'manage-videos' nav access (Manage Videos, 2026-09-16). */
+export async function canManageVideos(user: User): Promise<boolean> {
+  if (user.role === 'ADMIN') return true;
+  return hasNavAccess(user.role, 'manage-videos');
+}
+
+export async function requireCanManageVideos(user: User): Promise<void> {
+  if (!(await canManageVideos(user))) throw new ForbiddenError('Video management access required');
+}
+
 /** Ports can_manage_courses(): admin, or role holds 'manage-course-authoring' nav access. */
 export async function canManageCourses(user: User): Promise<boolean> {
   if (user.role === 'ADMIN') return true;
@@ -73,4 +83,24 @@ export async function canManageCourses(user: User): Promise<boolean> {
 
 export async function requireCanManageCourses(user: User): Promise<void> {
   if (!(await canManageCourses(user))) throw new ForbiddenError('Course management access required');
+}
+
+/**
+ * Can this user write module content directly? Only ADMIN — every other
+ * canManageCourses() holder (REVIEWER included) must go through a
+ * ModuleEditRequest instead (user request 2026-09-16: Reviewers propose,
+ * Course Auditors approve, Admins still edit live directly).
+ */
+export function canEditModuleContentDirectly(user: User): boolean {
+  return user.role === 'ADMIN';
+}
+
+/** Ports can_approve_module_edits(): admin, or role holds 'course-audit' nav access. */
+export async function canApproveModuleEdits(user: User): Promise<boolean> {
+  if (user.role === 'ADMIN') return true;
+  return hasNavAccess(user.role, 'course-audit');
+}
+
+export async function requireCanApproveModuleEdits(user: User): Promise<void> {
+  if (!(await canApproveModuleEdits(user))) throw new ForbiddenError('Course audit access required');
 }

@@ -64,6 +64,12 @@ export class UserRepository {
     return prisma.user.findUnique({ where: { id } });
   }
 
+  /** Batch lookup — one query instead of N findById calls. Order not guaranteed; callers key off `id`. */
+  async findByIds(ids: string[]): Promise<User[]> {
+    if (ids.length === 0) return [];
+    return prisma.user.findMany({ where: { id: { in: ids } } });
+  }
+
   /**
    * Auto-generates a unique username at signup so @mentions work with no
    * setup step (spec §11): deterministic base from the email local-part,
@@ -210,9 +216,9 @@ export class UserRepository {
   }
 
   /** Role assignment is admin-only at the controller; DB enforces the enum. */
-  async setRole(userId: string, role: Role): Promise<void> {
+  async setRole(userId: string, role: Role): Promise<User> {
     try {
-      await prisma.user.update({ where: { id: userId }, data: { role } });
+      return await prisma.user.update({ where: { id: userId }, data: { role } });
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
         throw new HttpError(404, 'User not found');

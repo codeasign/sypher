@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { serverApiFetch } from '@/lib/serverApi';
+import { summarizeZip, isZipBomb } from '@/lib/zipGuard';
 
 // Server-side proxy for Bunny.net storage uploads. The storage access key
 // is a server-only secret (BUNNY_STORAGE_ACCESS_KEY, no NEXT_PUBLIC_
@@ -8,10 +9,32 @@ import { serverApiFetch } from '@/lib/serverApi';
 // to Bunny with the key. Replaces the old pattern where every editor
 // shipped the key in the client bundle and PUT straight to Bunny.
 
+// Configurable via .env (user request 2026-09-16) rather than hardcoded —
+// MB values, converted to bytes below. Falls back to the previous
+// defaults if unset/invalid so this never silently disables the caps.
+function mbFromEnv(name: string, fallbackMb: number): number {
+  const parsed = Number.parseFloat(process.env[name] ?? '');
+  return (Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMb) * 1024 * 1024;
+}
+
 // 10 MB — covers blog featured-media PDFs and cover images, and stays
 // comfortably under the runtime's multipart body ceiling so oversized
 // uploads surface as a clean 413 here rather than a parser error.
-const MAX_BYTES = 10 * 1024 * 1024;
+const MAX_BYTES = mbFromEnv('UPLOAD_MAX_MB', 10);
+
+// Manage Videos' video-file uploads (mp4 only, capped at 50 MB by default).
+const MAX_VIDEO_BYTES = mbFromEnv('UPLOAD_MAX_VIDEO_MB', 50);
+
+// Video resource downloads (zip only). Capped well short of the general
+// limit by default since resource attachments are meant to be small
+// handouts, not bulk archives.
+const MAX_ZIP_BYTES = mbFromEnv('UPLOAD_MAX_ZIP_MB', 10);
+// Zip-bomb guard thresholds — see lib/zipGuard.ts. 200 MB uncompressed is
+// generous for a resource handout; 100x is well above ordinary
+// compression ratios for real documents (typically 2-10x) but far below
+// what a crafted bomb reaches (often 1000x+).
+const MAX_ZIP_UNCOMPRESSED_BYTES = 200 * 1024 * 1024;
+const MAX_ZIP_RATIO = 100;
 
 // No image/svg+xml: an uploaded SVG can carry <script>, and while Bunny
 // serves it from a separate origin, dropping it removes the phishing /
@@ -23,7 +46,14 @@ const ALLOWED_TYPES = new Set([
   'image/webp',
   'image/gif',
   'application/pdf',
+  'video/mp4',
+  'application/zip',
+  'application/x-zip-compressed',
+  'application/x-zip',
 ]);
+
+const VIDEO_TYPES = new Set(['video/mp4']);
+const ZIP_TYPES = new Set(['application/zip', 'application/x-zip-compressed', 'application/x-zip']);
 
 // Lowercase segments, "/"-separated, no traversal. e.g. "avatars/<id>",
 // "courses/<slug>/covers", "blog/featured-media".
@@ -85,8 +115,22 @@ export async function POST(request: Request): Promise<NextResponse> {
       { status: 415 },
     );
   }
-  if (file.size <= 0 || file.size > MAX_BYTES) {
-    return NextResponse.json({ message: 'File is empty or larger than 10 MB' }, { status: 413 });
+  const isVideo = VIDEO_TYPES.has(file.type);
+  const isZip = ZIP_TYPES.has(file.type);
+  const sizeLimit = isVideo ? MAX_VIDEO_BYTES : isZip ? MAX_ZIP_BYTES : MAX_BYTES;
+  if (file.size <= 0 || file.size > sizeLimit) {
+    return NextResponse.json({ message: `File is empty or larger than ${Math.round(sizeLimit / (1024 * 1024))} MB` }, { status: 413 });
+  }
+
+  const fileArrayBuffer = await file.arrayBuffer();
+  if (isZip) {
+    const summary = summarizeZip(Buffer.from(fileArrayBuffer));
+    if (!summary) {
+      return NextResponse.json({ message: 'Not a valid zip file' }, { status: 415 });
+    }
+    if (isZipBomb(summary, MAX_ZIP_UNCOMPRESSED_BYTES, MAX_ZIP_RATIO)) {
+      return NextResponse.json({ message: 'Zip rejected — its contents are too large or too compressed to be legitimate' }, { status: 413 });
+    }
   }
 
   // Authorization + path resolution. Self uploads are pinned to the
@@ -110,7 +154,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       AccessKey: accessKey,
       'Content-Type': file.type || 'application/octet-stream',
     },
-    body: Buffer.from(await file.arrayBuffer()),
+    body: fileArrayBuffer,
   });
 
   if (!put.ok) {

@@ -1,7 +1,7 @@
 import { Body, Controller, Post, Request, Res, Route, Tags, type TsoaResponse } from 'tsoa';
 import type { Request as ExpressRequest } from 'express';
 import { CompanyRepository } from '../repositories/CompanyRepository';
-import { consumeCompanyResolveAllowance } from '../lib/rateLimit';
+import { consumeCompanyResolveAllowance, getClientKey } from '../lib/rateLimit';
 
 /**
  * Public (no session) endpoints for the corporate portal on
@@ -28,11 +28,7 @@ export class CompanyPortalController extends Controller {
     @Res() notFound: TsoaResponse<404, CompanyPortalMessageResponse>,
     @Res() tooManyRequests: TsoaResponse<429, CompanyPortalMessageResponse, { 'Retry-After': string }>,
   ): Promise<CompanyPortalView | void> {
-    // Behind Caddy every socket is localhost, so prefer the forwarded
-    // client IP; the key only needs to be stable per caller, not perfect.
-    const forwarded = (request.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim();
-    const clientKey = forwarded || request.ip || request.socket.remoteAddress || 'unknown';
-    const retryAfter = consumeCompanyResolveAllowance(clientKey);
+    const retryAfter = await consumeCompanyResolveAllowance(getClientKey(request));
     if (retryAfter > 0) {
       return tooManyRequests(
         429,

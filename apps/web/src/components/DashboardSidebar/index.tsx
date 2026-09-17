@@ -20,6 +20,7 @@ import {
   BookmarksIcon,
   MockTestIcon,
   ProfileIcon,
+  VideoIcon,
 } from '@/components/icons/SidebarIcons';
 import styles from './styles.module.css';
 
@@ -29,12 +30,22 @@ const NAV_ICON_BY_KEY: Record<string, (props: { className?: string }) => React.J
   'manage-cohort-users': ManageCohortUsersIcon,
   'manage-blog-post': ManageBlogIcon,
   'manage-course-authoring': ManageCoursesIcon,
+  'manage-videos': VideoIcon,
+  'browse-videos': VideoIcon,
 };
+
+// Browse Videos moved into Overview, directly above Browse Courses (user
+// request 2026-09-16, superseding the earlier separate "Videos" section)
+// — it's a browsing page like Browse Courses, not a "manage" action, so
+// it belongs next to its course equivalent rather than off on its own.
+// Manage Videos stays a normal "Manage" section item alongside the other
+// manage-* keys.
 
 interface Props {
   role: string;
   email: string;
   fullName: string | null;
+  avatarUrl: string | null;
   visibleKeys: string[];
   isPaidAndActive: boolean;
 }
@@ -46,10 +57,12 @@ interface Props {
 // (app)/layout.tsx and passed in as props, same as before, so there's no
 // flash of a different link set — this component only owns presentation
 // and the client-only active-link/logout behavior.
-export default function DashboardSidebar({ role, email, fullName, visibleKeys, isPaidAndActive }: Props): React.JSX.Element {
+export default function DashboardSidebar({ role, email, fullName, avatarUrl, visibleKeys, isPaidAndActive }: Props): React.JSX.Element {
   const pathname = usePathname();
   const router = useRouter();
-  const items = NAV_ITEMS.filter((item) => visibleKeys.includes(item.key));
+  const allItems = NAV_ITEMS.filter((item) => visibleKeys.includes(item.key));
+  const browseVideosItem = allItems.find((item) => item.key === 'browse-videos') ?? null;
+  const items = allItems.filter((item) => item.key !== 'browse-videos');
   const displayName = fullName || email.split('@')[0] || 'User';
   const { handleUpgrade, isProcessing } = useUpgradeToPaid(email, () => router.refresh());
 
@@ -70,7 +83,12 @@ export default function DashboardSidebar({ role, email, fullName, visibleKeys, i
   return (
     <aside className={`${styles.sidebar} ${styles.sidebarPinned}`}>
       <div className={styles.userSection}>
-        <span className={styles.avatar}>{displayName.slice(0, 1).toUpperCase()}</span>
+        {avatarUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={avatarUrl} alt="" className={styles.avatar} />
+        ) : (
+          <span className={styles.avatar}>{displayName.slice(0, 1).toUpperCase()}</span>
+        )}
         <div className={styles.userInfo}>
           <span className={styles.name}>{displayName}</span>
           <div className={styles.badgeRow}>
@@ -93,6 +111,15 @@ export default function DashboardSidebar({ role, email, fullName, visibleKeys, i
             <DashboardIcon className={styles.navIcon} />
             <span className={styles.navLabel}>Dashboard</span>
           </Link>
+          {browseVideosItem && (
+            <Link
+              href={browseVideosItem.href}
+              className={isActive(browseVideosItem.href) ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
+            >
+              <VideoIcon className={styles.navIcon} />
+              <span className={styles.navLabel}>{browseVideosItem.label}</span>
+            </Link>
+          )}
           <Link
             href="/browse-courses"
             className={isActive('/browse-courses') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
@@ -120,11 +147,11 @@ export default function DashboardSidebar({ role, email, fullName, visibleKeys, i
             className={isActive('/getting-started') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
           >
             <SetupGuidesIcon className={styles.navIcon} />
-            <span className={styles.navLabel}>Setup & Dependencies</span>
+            <span className={styles.navLabel}>Resources & Guides</span>
           </Link>
           <Link href="/bookmarks" className={isActive('/bookmarks') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}>
             <BookmarksIcon className={styles.navIcon} />
-            <span className={styles.navLabel}>Bookmarks</span>
+            <span className={styles.navLabel}>My Bookmarks</span>
           </Link>
         </div>
 

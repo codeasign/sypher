@@ -6,7 +6,8 @@ import { CourseRepository } from '../repositories/CourseRepository';
 import { AuthoredCourseAccessRepository } from '../repositories/AuthoredCourseAccessRepository';
 import { CompanyDirectoryRepository } from '../repositories/CompanyDirectoryRepository';
 import { BlogPostRepository } from '../repositories/BlogPostRepository';
-import type { BlogPost, Course, CourseModule, User } from '@prisma/client';
+import { VideoRepository } from '../repositories/VideoRepository';
+import type { BlogPost, Course, CourseModule, User, Video } from '@prisma/client';
 
 /** Spec-adjacent guardrail (spec §13 leaves length open): 1–5000 chars trimmed. */
 const COMMENT_BODY_MAX_LENGTH = 5000;
@@ -31,6 +32,7 @@ const courseRepository = new CourseRepository();
 const authoredCourseAccessRepository = new AuthoredCourseAccessRepository();
 const companyDirectoryRepository = new CompanyDirectoryRepository();
 const blogPostRepository = new BlogPostRepository();
+const videoRepository = new VideoRepository();
 
 function notFound(): HttpError {
   return new HttpError(404, 'Not found');
@@ -67,7 +69,10 @@ export async function resolveModuleTargetOr404(user: User | null, moduleId: stri
     slug: course.id,
   });
   if (!hasFullAccess) {
-    const modules = await courseModuleRepository.listForCourse(course.id);
+    // Metadata-only, same reasoning as CourseController.completeModule —
+    // isModuleFreelyVisible never touches bodyMdx, and this gate runs on
+    // every module-discussion list/create call.
+    const modules = await courseModuleRepository.listMetadataForCourse(course.id);
     if (!isModuleFreelyVisible(mod, modules)) throw notFound();
   }
   return mod;
@@ -88,6 +93,21 @@ export async function resolveBlogPostTargetOr404(user: User | null, postId: stri
   const canSeeDrafts = user !== null && (user.role === 'ADMIN' || post.authorId === user.id);
   if (post.status !== 'published' && !canSeeDrafts) throw notFound();
   return post;
+}
+
+/**
+ * A video's discussion is only reachable once the video itself is (Manage
+ * Videos, 2026-09-16): published AND has an uploaded videoUrl — same
+ * "not shown until uploaded" rule the public listing/detail endpoints
+ * enforce. Author/ADMIN can still see it pre-publish, same as blog.
+ */
+export async function resolveVideoTargetOr404(user: User | null, videoId: string): Promise<Video> {
+  const video = await videoRepository.findById(videoId);
+  if (!video) throw notFound();
+  const canSeeDrafts = user !== null && (user.role === 'ADMIN' || video.authorId === user.id);
+  const isLive = video.status === 'published' && !!video.videoUrl;
+  if (!isLive && !canSeeDrafts) throw notFound();
+  return video;
 }
 
 /**
@@ -137,7 +157,7 @@ export async function resolveCourseTargetOr404(user: User | null, courseId: stri
  */
 export async function assertCommentTargetVisible(
   user: User | null,
-  target: { courseModuleId: string | null; blogPostId: string | null; courseId: string | null },
+  target: { courseModuleId: string | null; blogPostId: string | null; courseId: string | null; videoId: string | null },
 ): Promise<void> {
   if (target.courseModuleId) {
     await resolveModuleTargetOr404(user, target.courseModuleId);
@@ -151,7 +171,11 @@ export async function assertCommentTargetVisible(
     await resolveCourseTargetOr404(user, target.courseId);
     return;
   }
-  // All three null can't happen (Comment_exactly_one_target CHECK
+  if (target.videoId) {
+    await resolveVideoTargetOr404(user, target.videoId);
+    return;
+  }
+  // All four null can't happen (Comment_exactly_one_target CHECK
   // constraint), but fail closed rather than silently allow if it ever did.
   throw notFound();
 }

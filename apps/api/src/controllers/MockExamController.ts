@@ -7,6 +7,8 @@ import { CourseRepository } from '../repositories/CourseRepository';
 import { AuthoredCourseAccessRepository } from '../repositories/AuthoredCourseAccessRepository';
 import { CompanyDirectoryRepository } from '../repositories/CompanyDirectoryRepository';
 import { hasCourseAccess } from '../lib/accessControl';
+import { getOrSet } from '../lib/cache';
+import { applyPublicDetailCache, setPublicListCache } from '../lib/httpCache';
 
 const mockExamRepository = new MockExamRepository();
 const DEFAULT_PAGE_SIZE = 20;
@@ -15,6 +17,14 @@ const mockExamAttemptRepository = new MockExamAttemptRepository();
 const courseRepository = new CourseRepository();
 const authoredCourseAccessRepository = new AuthoredCourseAccessRepository();
 const companyDirectoryRepository = new CompanyDirectoryRepository();
+
+// Published-exam reads are the same shape as Blog/Cohort/Video's public
+// catalog: identical for every caller (not access-gated beyond publication —
+// see listPublished's own comment), and exams are managed out-of-band via
+// the import script (no live write endpoint in this controller to purge
+// from), so TTL-only expiry is enough — same convention as
+// courses:getting-started.
+const PUBLIC_CACHE_TTL_MS = 60_000;
 
 // One exam on the /mock-tests list page — explicit field projection, the
 // list page never needs anything beyond what it renders.
@@ -129,12 +139,16 @@ export class MockExamController extends Controller {
   // access-gated beyond that: seeing that an exam exists costs nothing;
   // the gate bites at start-attempt time for course-linked exams.
   //
-  // Retain the unpaginated catalog contract for existing consumers. The
-  // detail page uses the single-slug route; the list page uses `page`.
+  // Retain the unpaginated catalog contract for existing consumers — exam
+  // count is bounded by curated certification content (same admin-authored
+  // scale as courses), not user-generated volume; reviewed in the
+  // pagination audit (2026-09), not a gap. The detail page uses the
+  // single-slug route; the list page uses `page`.
   @Get()
   @Security('session')
   public async listPublished(): Promise<MockExamSummaryEntry[]> {
-    const exams = await mockExamRepository.listPublished();
+    setPublicListCache(this);
+    const exams = await getOrSet('mock-exams:published-list', PUBLIC_CACHE_TTL_MS, () => mockExamRepository.listPublished());
     return exams.map(toSummaryEntry);
   }
 
@@ -143,11 +157,14 @@ export class MockExamController extends Controller {
   @Get('page')
   @Security('session')
   public async listPublishedPage(@Query() limit?: string, @Query() offset?: string): Promise<MockExamSummaryPage> {
+    setPublicListCache(this);
     const parsedLimit = limit === undefined ? DEFAULT_PAGE_SIZE : Number.parseInt(limit, 10);
     const parsedOffset = offset === undefined ? 0 : Number.parseInt(offset, 10);
     const pageSize = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, MAX_PAGE_SIZE) : DEFAULT_PAGE_SIZE;
     const pageOffset = Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
-    const { exams, total } = await mockExamRepository.listPublishedPage(pageSize, pageOffset);
+    const { exams, total } = await getOrSet(`mock-exams:published-page:${pageSize}:${pageOffset}`, PUBLIC_CACHE_TTL_MS, () =>
+      mockExamRepository.listPublishedPage(pageSize, pageOffset),
+    );
     return { exams: exams.map(toSummaryEntry), total };
   }
 
@@ -157,10 +174,15 @@ export class MockExamController extends Controller {
   @Security('session')
   public async getPublishedBySlug(
     @Path() slug: string,
+    @Request() request: ExpressRequest,
     @Res() notFound: TsoaResponse<404, void>,
   ): Promise<MockExamSummaryEntry | void> {
-    const exam = await mockExamRepository.findPublishedBySlug(slug);
+    const exam = await getOrSet(`mock-exams:published-detail:${slug}`, PUBLIC_CACHE_TTL_MS, () => mockExamRepository.findPublishedBySlug(slug));
     if (!exam) return notFound(404);
+    if (applyPublicDetailCache(this, request, exam.updatedAt)) {
+      this.setStatus(304);
+      return;
+    }
     return toSummaryEntry(exam);
   }
 

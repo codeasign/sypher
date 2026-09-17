@@ -120,6 +120,13 @@ export const ManageCoursesIcon = stroke(
   </>,
 );
 
+export const VideoIcon = stroke(
+  <>
+    <rect x="2" y="5" width="15" height="14" rx="2" />
+    <path d="M17 10l5-3v10l-5-3" />
+  </>,
+);
+
 export const ManageBlogIcon = stroke(
   <>
     <circle cx="12" cy="12" r="3" />

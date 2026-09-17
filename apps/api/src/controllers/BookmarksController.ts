@@ -5,6 +5,7 @@ import { BookmarkRepository } from '../repositories/BookmarkRepository';
 import { DocBookmarkRepository, type DocBookmarkEntry } from '../repositories/DocBookmarkRepository';
 import { AuthoredCourseBookmarkRepository } from '../repositories/AuthoredCourseBookmarkRepository';
 import { AuthoredModuleBookmarkRepository, type AuthoredModuleBookmarkEntry } from '../repositories/AuthoredModuleBookmarkRepository';
+import { setPrivateNoStoreCache } from '../lib/httpCache';
 
 const bookmarkRepository = new BookmarkRepository();
 const docBookmarkRepository = new DocBookmarkRepository();
@@ -32,8 +33,15 @@ interface BookmarkAddAuthoredModuleRequest {
 export class BookmarksController extends Controller {
   // ---- Whole-course bookmarks (docs course catalog, slug-keyed) ----
 
+  // Unpaginated on purpose — reviewed in the pagination audit (2026-09):
+  // browse-courses/learn pages fetch this FULL id list to render each
+  // course card's bookmark icon (membership check against the complete
+  // set), so a paginated response would silently make older bookmarks
+  // show as "not bookmarked" anywhere past page 1. Realistic growth is
+  // also catalog-bounded (a user can only bookmark what exists).
   @Get('courses')
   public async listCourseBookmarks(@Request() request: ExpressRequest): Promise<string[]> {
+    setPrivateNoStoreCache(this);
     return bookmarkRepository.listSlugsForUser((request.user as User).id);
   }
 
@@ -49,8 +57,11 @@ export class BookmarksController extends Controller {
 
   // ---- Individual docs-page bookmarks ----
 
+  // Same "needs the complete set for membership checks" reasoning as
+  // listCourseBookmarks above.
   @Get('docs')
   public async listDocBookmarks(@Request() request: ExpressRequest): Promise<DocBookmarkEntry[]> {
+    setPrivateNoStoreCache(this);
     return docBookmarkRepository.listForUser((request.user as User).id);
   }
 
@@ -66,8 +77,11 @@ export class BookmarksController extends Controller {
 
   // ---- Authored course bookmarks (DB-backed course system, id-keyed) ----
 
+  // Same reasoning as listCourseBookmarks — browse-courses/learn pages use
+  // the complete id list for the bookmark-icon membership check.
   @Get('authored-courses')
   public async listAuthoredCourseBookmarks(@Request() request: ExpressRequest): Promise<string[]> {
+    setPrivateNoStoreCache(this);
     return authoredCourseBookmarkRepository.listCourseIdsForUser((request.user as User).id);
   }
 
@@ -83,8 +97,11 @@ export class BookmarksController extends Controller {
 
   // ---- Authored module bookmarks ----
 
+  // Same reasoning as listCourseBookmarks — module pages check the
+  // complete list for bookmark-icon state.
   @Get('authored-modules')
   public async listAuthoredModuleBookmarks(@Request() request: ExpressRequest): Promise<AuthoredModuleBookmarkEntry[]> {
+    setPrivateNoStoreCache(this);
     return authoredModuleBookmarkRepository.listForUser((request.user as User).id);
   }
 

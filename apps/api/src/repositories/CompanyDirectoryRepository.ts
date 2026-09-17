@@ -114,8 +114,24 @@ export class CompanyDirectoryRepository {
     return prisma.companyEmployee.findFirst({ where: { companyId, userId } });
   }
 
-  async listEmployees(companyId: string): Promise<CompanyEmployee[]> {
-    return prisma.companyEmployee.findMany({ where: { companyId }, orderBy: { createdAt: 'desc' } });
+  /**
+   * Paginated roster — bounded like every other admin list in this codebase
+   * (see MAX_MANAGE_PAGE_SIZE on Course/Blog/Video's manage endpoints) so a
+   * very large company can't force an unbounded scan. `total` lets a future
+   * caller build real paging; today's only consumer still just wants
+   * "everyone," which a generous default limit satisfies without a query.
+   */
+  async listEmployeesPage(companyId: string, limit: number, offset: number): Promise<{ employees: CompanyEmployee[]; total: number }> {
+    const [employees, total] = await Promise.all([
+      prisma.companyEmployee.findMany({
+        where: { companyId },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit,
+        skip: offset,
+      }),
+      prisma.companyEmployee.count({ where: { companyId } }),
+    ]);
+    return { employees, total };
   }
 
   /** Roster upsert — CSV import & manual edits. Never flips status here. */
@@ -190,6 +206,11 @@ export class CompanyDirectoryRepository {
     return rows.map((r) => r.courseId);
   }
 
+  /** All (groupId,courseId) grant pairs for the company — for building the groups list in one query, same shape as listAllMemberships. */
+  async listAllGroupCourseAccess(companyId: string): Promise<{ groupId: string; courseId: string }[]> {
+    return prisma.companyGroupCourseAccess.findMany({ where: { companyId }, select: { groupId: true, courseId: true } });
+  }
+
   async setGroupCourse(companyId: string, groupId: string, courseId: string, allowed: boolean): Promise<void> {
     if (allowed) {
       await prisma.companyGroupCourseAccess.upsert({
@@ -205,6 +226,11 @@ export class CompanyDirectoryRepository {
   async listGroupNavKeys(companyId: string, groupId: string): Promise<string[]> {
     const rows = await prisma.companyGroupNavAccess.findMany({ where: { companyId, groupId }, select: { itemKey: true } });
     return rows.map((r) => r.itemKey);
+  }
+
+  /** All (groupId,itemKey) grant pairs for the company — same shape as listAllGroupCourseAccess. */
+  async listAllGroupNavAccess(companyId: string): Promise<{ groupId: string; itemKey: string }[]> {
+    return prisma.companyGroupNavAccess.findMany({ where: { companyId }, select: { groupId: true, itemKey: true } });
   }
 
   async setGroupNav(companyId: string, groupId: string, itemKey: string, allowed: boolean): Promise<void> {

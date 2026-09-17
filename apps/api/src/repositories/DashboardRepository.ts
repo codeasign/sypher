@@ -1,6 +1,7 @@
-import type { User } from '@prisma/client';
+import type { Course, Role, User } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { hasCourseAccess } from '../lib/accessControl';
+import { getOrSet } from '../lib/cache';
 import { CompanyDirectoryRepository } from './CompanyDirectoryRepository';
 
 const companyDirectoryRepository = new CompanyDirectoryRepository();
@@ -9,6 +10,26 @@ const DAY_MS = 86_400_000;
 const ACTIVITY_WEEKS = 12;
 const EXAM_TREND_POINTS = 8;
 const PASS_THRESHOLD = 70;
+
+// Every dashboard load re-derives these same 7 queries regardless of WHICH
+// user is asking — the published course catalog, its module counts, the
+// role-access table, and four platform-wide totals. None of them depend on
+// request.user, so unlike the rest of build() (live per-user progress/
+// attempts/comments) they're safe to share across every caller behind a
+// short TTL. Dashboard is almost certainly the single highest-traffic
+// authenticated endpoint in the app, so this cuts real query volume on it
+// roughly in half without touching per-user freshness.
+const PLATFORM_STATS_CACHE_TTL_MS = 60_000;
+
+interface PlatformStats {
+  courses: Pick<Course, 'id' | 'slug' | 'name' | 'description' | 'category' | 'coverImageUrl'>[];
+  moduleGroups: { courseId: string; _count: { _all: number } }[];
+  publishedBlogPosts: number;
+  accessRows: { courseId: string; allowedRoles: Role[] }[];
+  learners: number;
+  mockExams: number;
+  lessonsAllTime: number;
+}
 
 // Same category vocabulary the /learn + /browse-courses board uses, kept in
 // sync by hand (small, rarely-changing list).
@@ -123,39 +144,55 @@ export interface DashboardData {
 }
 
 /**
- * Everything the signed-in user's Dashboard renders, assembled in one
- * pass (~14 parallel queries, all bounded — the catalog is dozens of
- * courses, and per-user progress/attempt/comment rows are small). Access
- * per course is resolved with the same `hasCourseAccess` primitive the
- * course reads use, plus the company-group union for COMPANY_EMPLOYEE.
+ * Everything the signed-in user's Dashboard renders, assembled in one pass
+ * (~14 queries total, all bounded — the catalog is dozens of courses, and
+ * per-user progress/attempt/comment rows are small). Access per course is
+ * resolved with the same `hasCourseAccess` primitive the course reads use,
+ * plus the company-group union for COMPANY_EMPLOYEE.
+ *
+ * The 7 queries that don't depend on the calling user go through
+ * platformStats()'s shared 60s cache instead of running fresh every call —
+ * dashboard is the highest-traffic authenticated endpoint, so this halves
+ * real query volume on it. TTL-only invalidation (no purge wiring into
+ * every course/blog/mock-exam/access write path) — a stale platform stat
+ * for up to 60s is an acceptable tradeoff here, same reasoning as the
+ * public getOrSet caches elsewhere in this codebase.
  */
 export class DashboardRepository {
+  private async platformStats(): Promise<PlatformStats> {
+    return getOrSet('dashboard:platform-stats', PLATFORM_STATS_CACHE_TTL_MS, async () => {
+      const [courses, moduleGroups, publishedBlogPosts, accessRows, learners, mockExams, lessonsAllTime] = await Promise.all([
+        prisma.course.findMany({
+          where: { status: 'published' },
+          select: { id: true, slug: true, name: true, description: true, category: true, coverImageUrl: true },
+          orderBy: { createdAt: 'asc' },
+        }),
+        prisma.courseModule.groupBy({ by: ['courseId'], _count: { _all: true } }),
+        prisma.blogPost.count({ where: { status: 'published' } }),
+        prisma.authoredCourseAccess.findMany({ select: { courseId: true, allowedRoles: true } }),
+        prisma.user.count({ where: { deletedAt: null } }),
+        prisma.mockExam.count({ where: { isPublished: true } }),
+        prisma.moduleProgress.count(),
+      ]);
+      return { courses, moduleGroups, publishedBlogPosts, accessRows, learners, mockExams, lessonsAllTime };
+    });
+  }
+
   async build(user: User): Promise<DashboardData> {
     const now = new Date();
     const todayStart = startOfUtcDay(now);
 
     const [
-      courses,
-      moduleGroups,
+      { courses, moduleGroups, publishedBlogPosts, accessRows, learners, mockExams, lessonsAllTime },
       progressRows,
       courseCompletions,
       attemptsTotal,
       completedAttempts,
       commentAgg,
       blogComments,
-      publishedBlogPosts,
       bestAnswers,
-      accessRows,
-      learners,
-      mockExams,
-      lessonsAllTime,
     ] = await Promise.all([
-      prisma.course.findMany({
-        where: { status: 'published' },
-        select: { id: true, slug: true, name: true, description: true, category: true, coverImageUrl: true },
-        orderBy: { createdAt: 'asc' },
-      }),
-      prisma.courseModule.groupBy({ by: ['courseId'], _count: { _all: true } }),
+      this.platformStats(),
       prisma.moduleProgress.findMany({ where: { userId: user.id }, select: { courseId: true, completedAt: true } }),
       prisma.courseCompletion.count({ where: { userId: user.id } }),
       prisma.mockExamAttempt.count({ where: { userId: user.id } }),
@@ -180,12 +217,7 @@ export class DashboardRepository {
         },
         orderBy: { createdAt: 'desc' },
       }),
-      prisma.blogPost.count({ where: { status: 'published' } }),
       prisma.comment.count({ where: { userId: user.id, isDeleted: false, isBestAnswer: true } }),
-      prisma.authoredCourseAccess.findMany({ select: { courseId: true, allowedRoles: true } }),
-      prisma.user.count({ where: { deletedAt: null } }),
-      prisma.mockExam.count({ where: { isPublished: true } }),
-      prisma.moduleProgress.count(),
     ]);
 
     const moduleCountByCourse = new Map(moduleGroups.map((g) => [g.courseId, g._count._all]));

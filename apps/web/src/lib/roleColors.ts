@@ -13,6 +13,8 @@ export const ROLE_COLORS: Record<string, string> = {
   COMPANY_EMPLOYEE: '#15803d', // muted green
   BRANDER: '#4338ca', // muted indigo
   COHORT_USER: '#0f766e', // muted teal
+  REVIEWER: '#92400e', // muted brown
+  COURSE_AUDITOR: '#374151', // muted charcoal
 };
 
 export function roleColor(role: string): string {

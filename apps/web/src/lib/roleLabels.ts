@@ -13,6 +13,8 @@ export const ROLE_LABELS: Record<string, string> = {
   COMPANY_EMPLOYEE: 'Company Employee',
   BRANDER: 'Brander',
   COHORT_USER: 'Cohort Member',
+  REVIEWER: 'Reviewer',
+  COURSE_AUDITOR: 'Course Auditor',
 };
 
 export function roleLabel(role: string): string {

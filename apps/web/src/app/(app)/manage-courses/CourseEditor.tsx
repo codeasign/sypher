@@ -4,6 +4,7 @@ import React, { useRef, useState } from 'react';
 import { createCourse, updateCourse, setCourseStatus, AUDIENCE_ROLES, type Course } from '@/data/courses';
 import { uploadToBunny } from '@/data/bunnyUpload';
 import { prepareCourseCover } from '@/lib/courseCoverImage';
+import { useToast } from '@/components/Toast/ToastProvider';
 import styles from './manage-courses.module.css';
 
 const NAME_MAX = 250;
@@ -14,6 +15,11 @@ interface CourseEditorProps {
   onSaved: () => void;
   onCancel: () => void;
   onBack?: () => void;
+  // Called after a successful Publish/Republish instead of onSaved (user
+  // request 2026-09-15: republishing should return to the courses list,
+  // not just refresh the Details tab in place). Falls back to onSaved
+  // when not given.
+  onRepublished?: () => void;
 }
 
 const CATEGORY_OPTIONS = ['tech', 'life-skills'] as const;
@@ -35,7 +41,7 @@ function normalizeCsv(raw: string): string {
     .join(',');
 }
 
-export default function CourseEditor({ course, onSaved, onCancel, onBack }: CourseEditorProps): React.JSX.Element {
+export default function CourseEditor({ course, onSaved, onCancel, onBack, onRepublished }: CourseEditorProps): React.JSX.Element {
   const [name, setName] = useState(course?.name ?? '');
   const [description, setDescription] = useState(course?.description ?? '');
   const [category, setCategory] = useState(course?.category ?? '');
@@ -46,6 +52,7 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const coverInputRef = useRef<HTMLInputElement>(null);
+  const { showToast } = useToast();
 
   const isEditing = Boolean(course);
   const canSave = name.trim().length > 0 && !saving;
@@ -128,12 +135,23 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack }: Cour
   async function handlePublishToggle(): Promise<void> {
     const nextStatus = course?.status === 'published' ? 'draft' : 'published';
     const id = await persist(nextStatus);
-    if (id) onSaved();
+    if (id) {
+      if (nextStatus === 'published') {
+        showToast('Course published.', 'success');
+      } else {
+        showToast('Course saved as draft.', 'warning');
+      }
+      onSaved();
+    }
   }
 
   async function handleRepublish(): Promise<void> {
+    const wasPublished = course?.status === 'published';
     const id = await persist('published');
-    if (id) onSaved();
+    if (id) {
+      showToast(wasPublished ? 'Course republished.' : 'Course published.', wasPublished ? 'info' : 'success');
+      (onRepublished ?? onSaved)();
+    }
   }
 
   return (

@@ -19,6 +19,23 @@ export class CohortRepository {
     return prisma.cohort.findMany({ orderBy: { updatedAt: 'desc' } });
   }
 
+  // Paginated twin for the launch-cohort admin table — same shape/rationale
+  // as CourseRepository.listAllPage / BlogPostRepository.listPage (id as
+  // tiebreaker, optional case-insensitive title search).
+  async listAllPage(limit: number, offset: number, search?: string): Promise<{ cohorts: Cohort[]; total: number }> {
+    const where = search ? { title: { contains: search, mode: 'insensitive' as const } } : undefined;
+    const [cohorts, total] = await Promise.all([
+      prisma.cohort.findMany({
+        where,
+        orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+        take: limit,
+        skip: offset,
+      }),
+      prisma.cohort.count({ where }),
+    ]);
+    return { cohorts, total };
+  }
+
   async listPublicLive(): Promise<Cohort[]> {
     return prisma.cohort.findMany({ where: { status: 'live' }, orderBy: { startDate: 'asc' } });
   }

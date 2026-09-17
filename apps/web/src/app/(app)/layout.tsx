@@ -11,6 +11,7 @@ interface AuthUser {
   role: string;
   companyId: string | null;
   paidUntil: string | null;
+  avatarUrl: string | null;
 }
 
 // Route group (app) — covers every page a logged-in user actually
@@ -38,6 +39,7 @@ export default async function AppLayout({ children }: { children: ReactNode }): 
         role={user.role}
         email={user.email}
         fullName={user.fullName}
+        avatarUrl={user.avatarUrl}
         visibleKeys={visibleKeys}
         isPaidAndActive={isPaidAndActive}
       />

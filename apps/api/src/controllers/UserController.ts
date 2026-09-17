@@ -12,6 +12,7 @@ import {
 import { DashboardRepository, type DashboardData } from '../repositories/DashboardRepository';
 import { isAllowedAvatarUrl } from '../lib/avatar';
 import { HttpError } from '../lib/errors';
+import { setPrivateNoStoreCache } from '../lib/httpCache';
 
 /**
  * User-scoped endpoints for the discussion system: mention autocomplete
@@ -75,6 +76,7 @@ export class UserController extends Controller {
   @Get('mention-search')
   @Security('session')
   public async mentionSearch(@Query() q: string): Promise<MentionCandidate[]> {
+    setPrivateNoStoreCache(this);
     const term = q.trim().replace(/^@+/, '').slice(0, 50);
     if (term.length === 0) return [];
     return userRepository.searchMentionCandidates(term);
@@ -85,6 +87,7 @@ export class UserController extends Controller {
   @Get('me/activity')
   @Security('session')
   public async myActivity(@Request() request: ExpressRequest): Promise<UserActivityCountsResponse> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     return userActivityRepository.counts(user.id);
   }
@@ -97,6 +100,12 @@ export class UserController extends Controller {
   @Get('me/dashboard')
   @Security('session')
   public async myDashboard(@Request() request: ExpressRequest): Promise<UserDashboardResponse> {
+    // Highest-value private,no-store target for the future Expo app — the
+    // dashboard is almost certainly the post-login landing screen, hit on
+    // every cold app open. Never cache it: it's the single most
+    // personalized response in the API (plan, progress, streaks, exam
+    // trend, per-user recommendations).
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     return dashboardRepository.build(user);
   }
@@ -114,6 +123,7 @@ export class UserController extends Controller {
     @Query() cursor?: string,
     @Query() limit?: string,
   ): Promise<UserActivityCommentPageResponse> {
+    setPrivateNoStoreCache(this);
     const user = request.user as User;
     const resolvedKind: ActivityCommentKind =
       kind === 'post' || kind === 'reply' || kind === 'any' ? kind : 'any';

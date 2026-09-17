@@ -29,7 +29,7 @@ export default async function CourseLayout({ children, params }: { children: Rea
   if (!meRes.ok) {
     redirect('/login');
   }
-  const user: { email: string; fullName: string | null; role: string; paidUntil: string | null } = await meRes.json();
+  const user: { email: string; fullName: string | null; role: string; paidUntil: string | null; avatarUrl: string | null } = await meRes.json();
   const isPaidAndActive = user.role === 'PAID_USER' && !!user.paidUntil && new Date(user.paidUntil) > new Date();
   const navRes = await serverApiFetch('/access/my-nav');
   const visibleKeys: string[] = navRes.ok ? await navRes.json() : [];
@@ -80,6 +80,7 @@ export default async function CourseLayout({ children, params }: { children: Rea
         role={user.role}
         email={user.email}
         fullName={user.fullName}
+        avatarUrl={user.avatarUrl}
         visibleKeys={visibleKeys}
         isPaidAndActive={isPaidAndActive}
       />

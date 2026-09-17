@@ -16,8 +16,11 @@ export interface NavItemDef {
  */
 export const NAV_ITEMS: NavItemDef[] = [
   { key: 'manage-access', label: 'Manage Access', href: '/admin/access' },
-  { key: 'launch-cohort', label: 'Launch Cohort', href: '/launch-cohort' },
+  { key: 'launch-cohort', label: 'Manage Cohort', href: '/launch-cohort' },
   { key: 'manage-cohort-users', label: 'Manage Cohort Users', href: '/manage-cohort-users' },
   { key: 'manage-blog-post', label: 'Manage Blog', href: '/manage-blog' },
   { key: 'manage-course-authoring', label: 'Manage Courses', href: '/manage-courses' },
+  { key: 'course-audit', label: 'Course Audit', href: '/course-audit' },
+  { key: 'manage-videos', label: 'Manage Videos', href: '/manage-videos' },
+  { key: 'browse-videos', label: 'Browse Videos', href: '/browse-videos' },
 ];
