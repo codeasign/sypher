@@ -11,6 +11,9 @@ import { BlogController } from './BlogController';
 import { BlogCommentController } from './BlogCommentController';
 import { AccessController } from './AccessController';
 import { CohortController } from './CohortController';
+import { CodingProblemsController } from './CodingProblemsController';
+import { Judge0Controller } from './Judge0Controller';
+import { TestAccountsController } from './TestAccountsController';
 
 // Covers the audit's four Cache-Control categories end to end (real DB,
 // direct controller invocation — same convention as AuthController.test.ts)
@@ -176,6 +179,51 @@ describe('HTTP caching policy — wired end to end', () => {
       const result = await controller.listManage(makeRequest({ user: admin }), 'not-a-number', undefined);
       const ours = result.filter((c) => c.title.startsWith(titlePrefix));
       expect(ours).toHaveLength(5);
+    });
+  });
+
+  // 2026-09-18 compliance pass over the three controllers added since the
+  // last commit (CodingProblemsController, Judge0Controller,
+  // TestAccountsController): every method reads request.user (directly, or
+  // via requireAdmin) and must carry private, no-store — same rule as
+  // AccessController.myCourses above, just newly-added endpoints.
+  describe('2026-09-18 compliance pass — personalized endpoints still private, no-store', () => {
+    let admin: User;
+
+    beforeAll(async () => {
+      admin = await userRepository.create({
+        email: `compliance-admin-${randomUUID()}@example.com`,
+        passwordHash: await hashPassword('irrelevant-not-used-12345'),
+        fullName: 'Compliance Admin',
+        provider: 'EMAIL',
+        role: 'ADMIN',
+      });
+      createdUserIds.push(admin.id);
+    });
+
+    it('GET /coding-problems (list) is private, no-store now that it requires a session', async () => {
+      const controller = new CodingProblemsController();
+      await controller.list();
+      expect(controller.getHeaders()['Cache-Control']).toBe('private, no-store');
+    });
+
+    it('GET /coding-problems/{category}/{problemSlug} is private, no-store', async () => {
+      const controller = new CodingProblemsController();
+      await controller.getBySlug('no-such-category', `no-such-slug-${randomUUID()}`);
+      expect(controller.getHeaders()['Cache-Control']).toBe('private, no-store');
+    });
+
+    it('GET /coding-problems/judge0/usage is private, no-store', async () => {
+      const controller = new Judge0Controller();
+      await controller.usage(makeRequest({ user: admin }));
+      expect(controller.getHeaders()['Cache-Control']).toBe('private, no-store');
+    });
+
+    it('GET /admin/test-accounts (list) is private, no-store', async () => {
+      const controller = new TestAccountsController();
+      const forbidden = () => undefined as never;
+      await controller.list(makeRequest({ user: admin }), forbidden);
+      expect(controller.getHeaders()['Cache-Control']).toBe('private, no-store');
     });
   });
 });

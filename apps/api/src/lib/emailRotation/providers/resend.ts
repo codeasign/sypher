@@ -18,7 +18,7 @@ async function send(params: SendEmailParams): Promise<SendEmailResult> {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        from: senderEmail,
+        from: `Sypher Next <${senderEmail}>`,
         to: [params.to],
         subject: params.subject,
         html: params.html,

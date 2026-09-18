@@ -7,12 +7,14 @@ import {
   COMPANY_INVITE_LIMIT,
   FORGOT_PASSWORD_IP_LIMIT,
   RESET_PASSWORD_IP_LIMIT,
+  TEST_ACCOUNT_RESET_LIMIT,
   consumeAllowance,
   consumeCommentAllowance,
   consumeCommentToggleAllowance,
   consumeCompanyInviteAllowance,
   consumeForgotPasswordAllowance,
   consumeResetPasswordAllowance,
+  consumeTestAccountResetAllowance,
 } from './rateLimit';
 
 // Proves the atomic INSERT ... ON CONFLICT ... RETURNING in consumeAllowance
@@ -75,6 +77,7 @@ describe('rateLimit concurrent race', () => {
     { label: 'consumeResetPasswordAllowance', limit: RESET_PASSWORD_IP_LIMIT, prefix: 'reset-password-ip', call: consumeResetPasswordAllowance },
     { label: 'consumeCompanyInviteAllowance', limit: COMPANY_INVITE_LIMIT, prefix: 'company-invite', call: consumeCompanyInviteAllowance },
     { label: 'consumeCommentToggleAllowance', limit: COMMENT_TOGGLE_LIMIT, prefix: 'comment-toggle', call: consumeCommentToggleAllowance },
+    { label: 'consumeTestAccountResetAllowance', limit: TEST_ACCOUNT_RESET_LIMIT, prefix: 'test-account-reset', call: consumeTestAccountResetAllowance },
   ])('$label allows exactly its configured limit under concurrency, never more', async ({ limit, prefix, call }) => {
     const id = `test-${randomUUID()}`;
     keys.push(`${prefix}:${id}`);

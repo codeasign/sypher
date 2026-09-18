@@ -58,6 +58,14 @@ export const ManageAccessIcon = stroke(
   </>,
 );
 
+export const TestAccountsIcon = stroke(
+  <>
+    <path d="M9 2v6L4 18a2 2 0 0 0 1.8 3h12.4A2 2 0 0 0 20 18l-5-10V2" />
+    <path d="M8.5 2h7" />
+    <path d="M7 15h10" />
+  </>,
+);
+
 export const LaunchCohortIcon = stroke(
   <>
     <path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z" />
@@ -124,6 +132,13 @@ export const VideoIcon = stroke(
   <>
     <rect x="2" y="5" width="15" height="14" rx="2" />
     <path d="M17 10l5-3v10l-5-3" />
+  </>,
+);
+
+export const PracticeCodingIcon = stroke(
+  <>
+    <polyline points="16 18 22 12 16 6" />
+    <polyline points="8 6 2 12 8 18" />
   </>,
 );
 

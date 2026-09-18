@@ -28,6 +28,10 @@ Password for all: **`password`**. Sign in at `https://next.sypher.local/login`.
 | COMPANY_EMPLOYEE | `companyemployee-test@sypher.local` |
 | BRANDER | `brander-test@sypher.local` |
 | COHORT_USER | `cohortuser-test@sypher.local` |
+| REVIEWER | `reviewer-test@sypher.local` |
+| COURSE_AUDITOR | `courseauditor-test@sypher.local` |
+
+Also on the roster: `forcloudread@gmail.com` — a real inbox (not `@sypher.local`), role-switchable in place from `/test-accounts` (no delete/recreate needed), for verifying onboarding/email templates land in an actual mailbox.
 
 Seed accounts (`apps/api/prisma/seed.ts`, password `devpassword123`):
 `admin@sypher.local`, `hr@acme.example`, `employee@acme.example`.

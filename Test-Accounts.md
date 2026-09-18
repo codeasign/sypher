@@ -19,6 +19,9 @@ stack (`https://next.sypher.local`). One account per `Role` enum value
 | COMPANY_EMPLOYEE | `companyemployee-test@sypher.local` | Belongs to the seeded "Acme Corp" company. |
 | BRANDER | `brander-test@sypher.local` | Not currently gated by any access check in the codebase — behaves like FREE_USER today. |
 | COHORT_USER | `cohortuser-test@sypher.local` | Not currently gated by any access check in the codebase — behaves like FREE_USER today. |
+| REVIEWER | `reviewer-test@sypher.local` | Course-authoring review role (`apps/api/src/lib/contentAuthz.ts`) — can propose module edits via `ModuleEditRequest` if granted `manage-course-authoring` NavAccess, but never writes live content directly (ADMIN-only). |
+| COURSE_AUDITOR | `courseauditor-test@sypher.local` | Course-authoring review role — approves `ModuleEditRequest`s from Reviewers, same NavAccess gating as REVIEWER. |
+| (role-switchable) | `forcloudread@gmail.com` | Real inbox, not `@sypher.local` — used to verify onboarding + transactional emails actually land, since the `*-test@sypher.local` accounts route to local GreenMail. Role can be changed in place from `/test-accounts` (FREE_USER / PAID_USER / INTERNAL_HR / BRANDER / ADMIN) without a delete/recreate round-trip — a delete/recreate would fire a fresh welcome email every time. |
 
 ## Notes
 

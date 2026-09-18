@@ -259,6 +259,17 @@ export class UserRepository {
    * another company. A COMPANY_EMPLOYEE drops back to FREE_USER;
    * COMPANY_HR is left alone (that's an admin, handled elsewhere).
    */
+  /**
+   * Hard delete — actually removes the row (not the soft `deletedAt` flag
+   * used elsewhere), for the Test Accounts reset harness only, where the
+   * goal is a genuinely fresh signup, not an ordinary account removal.
+   * Most User relations cascade on delete (schema.prisma); a no-op if the
+   * email doesn't exist.
+   */
+  async hardDeleteByEmail(email: string): Promise<void> {
+    await prisma.user.deleteMany({ where: { email: email.toLowerCase() } });
+  }
+
   async unlinkFromCompany(userId: string, companyId: string): Promise<void> {
     await prisma.user.updateMany({
       where: { id: userId, companyId, role: 'COMPANY_EMPLOYEE' },

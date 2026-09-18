@@ -45,6 +45,23 @@ export function extractSessionToken(request: Request): string | null {
 }
 
 /**
+ * Which mechanism extractSessionToken actually used for this request — same
+ * precedence (cookie wins if present, otherwise bearer header), exposed for
+ * callers that need to branch on it. Currently just videoStream.ts: a
+ * cookie-authenticated request gets the Referer/Origin hotlink check
+ * (same-site subresource requests carry cookies automatically, so a
+ * mismatched Referer is a real signal); a bearer-authenticated request
+ * (Expo/React Native — no cookie jar, and no browser Referer/Origin to
+ * check in the first place) skips it, since the bearer token itself is
+ * already proof of a legitimate authenticated caller.
+ */
+export function usedBearerAuth(request: Request): boolean {
+  const cookieToken = request.cookies?.[env.sessionCookieName];
+  if (cookieToken) return false;
+  return Boolean(request.headers.authorization?.startsWith('Bearer '));
+}
+
+/**
  * tsoa's @Security('session') hook. Resolves the request's session token
  * (cookie or bearer — see extractSessionToken), looks up the session row,
  * and resolves to the attached User — tsoa puts this on `request.user` for

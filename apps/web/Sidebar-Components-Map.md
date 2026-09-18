@@ -14,6 +14,7 @@ and the footer (Profile / Log out).
 | Browse Courses | `/browse-courses` | `browse-courses/page.tsx` | `components/CourseSectionsBoard` | `CourseScroller` |
 | My Courses | `/learn` | `learn/page.tsx` | `components/CourseSectionsBoard` | `CourseScroller` |
 | Certification Practice Exam | `/mock-tests` | `mock-tests/page.tsx` | `components/MockExamList` | — |
+| Practice Coding | `/practice-coding` | `practice-coding/page.tsx` | `components/CodingProblemsBoard` | `CodingProblemCard`, `CodingProblemBookmarkButton`; detail route `practice-coding/[...slug]/page.tsx` → `components/CodingProblemDetail` (IDE/Solutions/Code tabs) → `components/CodingIDE` (Monaco, talks to apps/api's `/coding-problems/judge0/*`), `components/CodingProblemMarkdown` (reuses `CourseModulePage`'s `.body` CSS module) |
 | Resources & Guides | `/getting-started` | `getting-started/page.tsx` | inline (no dedicated content component) | — |
 | My Bookmarks | `/bookmarks` | `bookmarks/page.tsx` | `bookmarks/BookmarksContent.tsx` | — |
 

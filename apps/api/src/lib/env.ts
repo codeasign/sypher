@@ -48,7 +48,7 @@ export const env = {
       // -Dgreenmail.auth.disabled; set them for an external server.
       user: process.env.SMTP_USER ?? '',
       pass: process.env.SMTP_PASS ?? '',
-      from: process.env.SMTP_FROM ?? 'Sypher <no-reply@sypher.local>',
+      from: process.env.SMTP_FROM ?? 'Sypher Next <no-reply@sypher.local>',
     },
     brevo: {
       apiKey: process.env.BREVO_API_KEY ?? '',
@@ -70,6 +70,11 @@ export const env = {
     storageAccessKey: process.env.BUNNY_STORAGE_ACCESS_KEY ?? '',
     storageHostname: process.env.BUNNY_STORAGE_HOSTNAME ?? '',
     pullZoneUrl: process.env.BUNNY_PULL_ZONE_URL ?? '',
+  },
+  judge0: {
+    rapidApiKey: process.env.JUDGE0_RAPIDAPI_KEY ?? '',
+    rapidApiHost: process.env.JUDGE0_RAPIDAPI_HOST ?? 'judge0-ce.p.rapidapi.com',
+    monthlyLimitPaid: process.env.JUDGE0_MONTHLY_LIMIT_PAID ?? '',
   },
   razorpay: {
     keyId: process.env.RAZORPAY_KEY_ID ?? '',

@@ -8,7 +8,365 @@
 > working-tree changes and say it is ready. Approval is per-action. (Also in
 > `AGENTS.md` → Git Safety Rules.)
 
-## Current Status (IN PROGRESS, 2026-09-17: post-"API Audit and Mobile readiness" UI follow-on)
+## Session summary (2026-09-18, later session — env/email, Test Accounts, One Compiler tried+removed, Bunny incident, mobile-readiness pass)
+
+Everything below is uncommitted working-tree state on top of the two
+2026-09-18 sections that follow (mock-exam bank + Practice Coding feature).
+`npx tsc --noEmit` clean in both apps after every change; API test suite
+82/82 passing (`cd apps/api && npm test`).
+
+### Env / secrets filled in `apps/api/.env`
+Added blank-stub or real values for `JUDGE0_MONTHLY_LIMIT_PAID`,
+`BREVO_API_KEY`/`BREVO_SENDER_EMAIL`/`BREVO_DAILY_LIMIT` (real values,
+user-provided), `RESEND_API_KEY`/`RESEND_SENDER_EMAIL`/`RESEND_DAILY_LIMIT`/
+`RESEND_MONTHLY_LIMIT` (real values), `RECAPTCHA_SECRET_KEY` (still blank —
+user hasn't created the Google reCAPTCHA key pair yet; `apps/web/.env`'s
+`NEXT_PUBLIC_RECAPTCHA_SITE_KEY` also still blank).
+`BUNNY_TOKEN_AUTH_KEY` got a real value mid-session (see Bunny incident
+below) — currently harmless since Bunny-side Token Authentication is now
+OFF again.
+
+### Sender display name → "Sypher Next"
+- `apps/api/src/lib/emailRotation/providers/resend.ts`: `from` now
+  `` `Sypher Next <${senderEmail}>` `` (Resend has no dashboard override —
+  must be in the API call).
+- `apps/api/src/lib/env.ts` + `.env`: `SMTP_FROM` default/value →
+  `Sypher Next <no-reply@sypher.local>`.
+- Brevo: **not a code fix** — display name is set on Brevo's own dashboard
+  (Settings → Senders, Domains & Dedicated IPs → edit sender → "From Name").
+  User did this. **Still pending on the user's side**: the underlying
+  sending domain isn't DNS-verified with Brevo/Resend yet, which is why the
+  display name kept reverting to the account owner's name ("Abhishek")
+  regardless of the From Name setting — needs SPF/DKIM domain verification
+  in both providers' dashboards before the name reliably sticks.
+
+### Email testing tooling (new)
+- `apps/api/scripts/send-test-emails.ts` — sends all 4 real templates
+  (welcome/set-password/password-reset/cohort-welcome) to a real inbox via
+  Brevo/Resend rotation (forces `EMAIL_TRANSPORT` away from `smtp` for the
+  one run only). `npx tsx scripts/send-test-emails.ts [email]`.
+- `apps/api/scripts/build-email-previews.ts` — renders the same 4 templates
+  to static HTML in `apps/api/email-templates/` (gitignored-worthy but not
+  yet added to `.gitignore`) straight from the real template functions, for
+  browser preview without sending anything.
+- `Testing-Emails.md` (new, repo root) — how-to for both scripts + the
+  provider-key table.
+
+### Mock-exam question bank — **now imported, contradicts the section below**
+The "In-progress" section immediately below this one (still reads "NOT
+imported" / "Awaiting user instruction") is **stale** — user asked for the
+import mid-session and it was run successfully:
+`node scripts/import-mock-exams.mjs` from `apps/api` → **1,010 questions
+created**, 1,120 existing updated in place, 0 skipped, across all 8 exams
+with `_extra.json` files. Verified via the script's own per-exam
+created/updated/skipped counts in its stdout. Leave that section's history
+as-is below (accurate for when it was written), just know the "awaiting
+import" framing is resolved.
+
+### Test Accounts feature (new, full stack)
+Admin-only dev tooling to hard-delete + re-provision a fixed roster of test
+accounts (one per `Role` enum value, 10 total, matching `Test-Accounts.md`)
+so onboarding + transactional emails can be re-tested without touching the
+DB by hand.
+- **Backend**: `TestAccountsController.ts` (`/admin/test-accounts` list,
+  `/reset`, `/role`) — admin-only (`requireAdmin` + blocked in production),
+  `private, no-store` cache, rate-limited (`consumeTestAccountResetAllowance`,
+  30/hour per admin, new in `rateLimit.ts`). `UserRepository.hardDeleteByEmail`
+  added (real Prisma delete, not the usual soft `deletedAt`). Roster is a
+  hardcoded array of the 10 role accounts **plus** `forcloudread@gmail.com`
+  (real inbox, `roleEditable: true` — can flip role in place via `/role`
+  without a delete/recreate round-trip, across ALL 10 Role values, wider
+  than the admin User Role tab's assignable set — this is dev tooling, a
+  COMPANY_HR row without a company just means that dependency won't work).
+  Ad-hoc emails typed into the "add email" box on the frontend also reuse
+  the SAME `/reset` endpoint (no dedicated create endpoint) — an unknown
+  email gets registered as a new role-editable custom account. These custom
+  entries persist across API server restarts via a tiny JSON file store,
+  `apps/api/src/lib/testAccountStore.ts` (`apps/api/.test-accounts-custom.json`,
+  gitignored), capped at `MAX_CUSTOM_TEST_ACCOUNTS = 50`.
+- **Frontend**: new sidebar section "Test Accounts" (ADMIN-only, hardcoded
+  role check — NOT the DB-driven NavAccess system, deliberately, since this
+  deletes/recreates real rows) → `/test-accounts`. Two-column layout: fixed
+  roster table (left) + "Role-Switchable Accounts" panel (right, vertical
+  divider) with the role dropdown (all 10 roles) and the add-email form.
+- Test accounts doc updated: `Test-Accounts.md` and
+  `Testing-Accounts-and-Emailers.md` both list all 10 roles +
+  `forcloudread@gmail.com`.
+
+### One Compiler — built, then fully deleted per user request
+A "/one-compiler" page (OneCompiler.com iframe embeds — coding + MySQL
+tabs) was built, iterated on (tabs, language restriction, problem statement
+from Practice Coding shown above the embed, a custom "Run Sample Test
+Cases" wired to a new `Judge0Controller.run-raw` endpoint), then the user
+said to undo the run-raw feature, and finally to **delete the whole thing**.
+**Nothing from this remains** — page, sidebar section, icon, and the
+run-raw endpoint were all removed and verified clean (`tsc --noEmit`, full
+test suite). Mentioned here only so nobody re-discovers a half-memory of it
+and wonders where it went.
+
+### Bunny Token Authentication incident (dashboard-side, resolved)
+User enabled Token Authentication on the Bunny Pull Zone (Security tab) —
+broke ALL diagram SVGs site-wide (403 Forbidden), since `signBunnyUrl()`
+(`apps/api/src/lib/bunnySign.ts`) is only wired into `videoStream.ts` for
+video URLs, never into SVG delivery (SVGs are static `<img src="...">` tags
+baked into course content, `diagramMarkup.ts` — no per-request server route
+to sign from). Diagnosed live by process of elimination (Shield rules
+empty, Allowed Referrers is a different feature, IP Validation would be
+actively wrong for public multi-user content). **User turned Token
+Authentication back OFF** — recommended as the permanent fix, not a
+stopgap: `videoStreamHandler` already fully protects videos itself (raw
+Bunny URL never reaches the client, session + Referer/bearer gated — see
+mobile-readiness section below), so Bunny-side Token Auth was redundant for
+video and actively wrong for public SVGs. No code changes resulted from
+this; purely a Bunny dashboard setting.
+
+### CONTRIBUTING.md compliance pass — 3 new controllers
+Audited `CodingProblemsController`, `Judge0Controller`, `TestAccountsController`
+against `apps/api/CONTRIBUTING.md` (security gating, IDOR, rate limiting,
+mobile-auth, pagination, HTTP caching, input-array caps). Findings, then
+fixes (user decided: "everything behind login," no public-content carve-out):
+- `CodingProblemsController.list()` + `.getBySlug()`: added
+  `@Security('session')` (were previously public) + `private, no-store`.
+- `Judge0Controller.usage()`: added `private, no-store` (was missing
+  entirely). `MAX_TEST_CASES = 100` defensive cap added before batching to
+  Judge0 (testCases is DB-sourced, not client input, but no cap existed).
+- `TestAccountsController`: `private, no-store` added to all 3 methods
+  (was missing entirely); `reset()` rate-limited (see Test Accounts section
+  above — was completely unlimited despite firing a real email per call).
+- Tests added/extended: `rateLimit.test.ts` (new limiter in the concurrency
+  wiring table), `httpCachingAndPagination.test.ts` (new compliance-pass
+  describe block, 4 endpoints), new `newControllersCompliance.test.ts`
+  (spec-based `@Security` check for all 11 routes across the 3 controllers
+  — reads the generated `swagger.json` since `@Security` enforcement is
+  Express middleware, not testable by calling a controller method directly
+  — plus real rate-limit-exhaustion and roster-cap tests using seeded state
+  to avoid 30+/50+ real DB round-trips).
+
+### Full-API mobile-readiness pass (2026-09-18, this session)
+Audited the WHOLE API surface (not just the 3 new controllers) against
+`Mobile-Auth-Design.md`'s cookie-or-bearer model. Found and fixed one real
+gap: **`videoStream.ts`'s Referer/Origin hotlink check was unconditionally
+enforced, which would 403 every legitimate bearer-authenticated (Expo/React
+Native) video request** — a mobile client has no browser Referer/Origin to
+send. Not documented anywhere as a known gap (only Google OAuth's
+mobile-redirect gap is documented and stays out of scope).
+- Fix: new `usedBearerAuth(request)` in `tsoaAuth.ts` (same
+  cookie-wins-if-present precedence as `extractSessionToken`), and
+  `videoStream.ts` only calls `isAllowedReferer()` when
+  `!usedBearerAuth(req)` — cookie/browser path unchanged, bearer/mobile
+  path skips the Referer check entirely (the bearer token itself is
+  sufficient proof of a legitimate caller).
+- Everything else audited clean: no other endpoint reads `request.cookies`
+  directly outside the known Google-OAuth-state-cookie case; `logout` +
+  password-reset's `deleteAllForUser` already revoke bearer sessions
+  correctly (one shared `Session` table, no per-mechanism storage);
+  `private, no-store` is a plain HTTP header, inherently client-agnostic;
+  every `consumeAllowance` rate-limit key is userId/email/IP/companyId,
+  none cookie-derived.
+- Tests added: `tsoaAuth.test.ts` (5 cases for `usedBearerAuth`), new
+  `videoStream.test.ts` (6 cases against the real handler with real DB
+  sessions — bearer-no-Referer passes, cookie-no/wrong-Referer still 403,
+  cookie-correct-Referer passes, bearer-invalid-token still 401, no-auth
+  still 401 — all using a nonexistent video slug so a passed gate resolves
+  as a 404 from the DB lookup rather than needing a real Bunny network
+  call).
+
+### Next action
+No pending approval needed for anything above — all done and verified.
+Still open/waiting on the user: reCAPTCHA key pair creation (both
+`RECAPTCHA_SECRET_KEY` and `NEXT_PUBLIC_RECAPTCHA_SITE_KEY` blank), Brevo/
+Resend sending-domain DNS verification (SPF/DKIM) so the "Sypher Next"
+display name sticks reliably, and whether to commit any of this working
+tree (explicit instruction throughout: don't commit without being asked).
+
+---
+
+## In-progress: Mock-exam question bank expansion (2026-09-18, JSON only — NOT imported)
+
+Goal from the user: grow the **easy** tier to ≥100 for every course, then the
+**medium** tier (200 target for aws-genai-pro / azure-ai-200; 100 for the other
+six). **No DB import has been run** — explicit instruction is to prepare JSON
+only. Existing `easy.json` / `medium.json` master files are untouched; every new
+question lives in a sibling `<tier>_extra.json`.
+
+### Counts after this session (verified by `apps/api/scripts/verify-question-bank.js`)
+
+| exam | easy | medium | hard |
+|---|---|---|---|
+| aws-ai-practicioner | 300 | 300 | 300 |
+| aws-generative-ai-developer-professional | 100 | 200 | 45 |
+| azure-ai-200 | 100 | 200 | 40 |
+| istqb-ct-ai | 100 | 100 | 45 |
+| istqb-ct-genai | 100 | 100 | 40 |
+| istqb-ct-pt | 100 | 100 | 40 |
+| istqb-ct-sec | 100 | 100 | 40 |
+| istqb-ct-tas | 100 | 100 | 40 |
+| istqb-ctal-tae | 100 | 100 | 40 |
+
+### New `_extra.json` files (all untracked except the two noted as modified)
+
+easy: aws-genai-pro (70), azure-ai-200 (62), istqb-ct-ai (40),
+istqb-ct-genai (60), istqb-ct-pt (62), istqb-ct-sec (62), istqb-ct-tas (62),
+istqb-ctal-tae (62).
+medium: aws-genai-pro (145), azure-ai-200 (145), istqb-ct-ai (15),
+istqb-ct-genai (45), istqb-ct-pt (45), istqb-ct-sec (45), istqb-ct-tas (45),
+istqb-ctal-tae (45).
+All extra files carry `target_for_tier` = 200 (aws-genai-pro, azure-ai-200) or
+100 (the six ISTQB exams).
+
+### Verified state
+
+- `verify-question-bank.js` → 0 structural problems: every question has all 8
+  keys (`id, difficulty, type, domain, question, options, correct_answer,
+  explanation`), exactly 4 options, `correct_answer` ⊆ options, `difficulty`
+  matches its tier, no duplicate `id` within any exam.
+- `normalize-extra-keys.js` reordered every `_extra.json` header + question keys
+  to match its master tier file exactly (previously same key sets, different
+  order). Re-verified: `git show HEAD:` vs working copy of the two **tracked**
+  easy_extra files is byte-different but **value-identical** (pure key reorder).
+
+### Scratch scripts left in `apps/api/scripts/` (session tools, prune if unwanted)
+
+`gen_ct_ai.py`, `gen_ct_genai.py`, `gen_ct_pt.py`, `gen_ct_sec.py`,
+`gen_ct_tas.py`, `gen_ct_tae.py`, `gen_med_aip.py`, `gen_med_ai200.py`,
+`gen_med_ctai.py`, `gen_med_ctgenai.py`, `gen_med_remaining.py`,
+`checkmed.py`, `count_remaining.py`, `normalize-extra-keys.js`,
+`verify-question-bank.js`.
+
+### Next action
+
+Awaiting user instruction to import. When approved, run from `apps/api`:
+`node scripts/import-mock-exams.mjs` (idempotent upsert by `slug` +
+`(examId, sourceId)`; never deletes). Unrelated pre-existing uncommitted work
+(coding-problems feature, coding IDE, etc.) is also in the tree — do not touch.
+
+---
+
+
+## Current Status (IN PROGRESS, 2026-09-18: Practice Coding feature — coding-bootcamp migration off apps/docs)
+
+Built a full "Practice Coding" feature on apps/web + apps/api, migrating the
+190-problem coding-bootcamp course off apps/docs (which is being retired) into
+a DB-backed catalog with its own Judge0-powered IDE. All uncommitted, on top
+of the 2026-09-17 baseline below. `npx tsc --noEmit` clean in both apps/api
+and apps/web after every change this session.
+
+### Backend (apps/api)
+
+- New Prisma models (migrated): `CodingProblem`, `CodingProblemBookmark`,
+  `Judge0SubmissionCache`, `Judge0MonthlySubmission`.
+- Judge0 RapidAPI proxy ported in from apps/app (`src/lib/judge0Client.ts`,
+  `judge0Cache.ts`, `judge0Quota.ts`) — key lives only in `apps/api/.env`
+  (`JUDGE0_RAPIDAPI_KEY` — **still blank, needs the user's value**), never
+  sent to the client. Security tightening vs. the original apps/app design:
+  run/submit/custom now resolve test cases AND time/memory limits
+  server-side only, by `problemId` — the client can no longer supply its own
+  `expectedOutput` or limits (the old design trusted the caller for both).
+- Rate limiting: flat 100 calls/month per user (all roles, not just paid —
+  explicit product decision), stacked with the existing 10-min rolling
+  buckets (20 run / 3 submit) in `lib/rateLimit.ts`.
+- `CodingProblemsController` (catalog + bookmarks, `/coding-problems`) and
+  `Judge0Controller` (`/coding-problems/judge0/{run,submit,custom,usage}`).
+- **Bug fixed live**: `GET /coding-problems/{category}/{problemSlug}` was
+  registered before the literal `GET /coding-problems/bookmarks/mine` route
+  in the tsoa-generated Express routes — Express matches by registration
+  order, so `bookmarks/mine` was being swallowed by the wildcard
+  (`category="bookmarks"`, `problemSlug="mine"`), returning an empty 204 that
+  crashed the client's `res.json()`. Fixed by reordering the controller
+  methods so the literal route registers first (see the comment on
+  `listMyBookmarks` in `CodingProblemsController.ts`).
+
+### Content migration (apps/api/scripts/)
+
+- `seed-coding-problems.ts` — parses all 190 apps/docs coding-bootcamp
+  exercise+solution MDX files (26 categories) into `CodingProblem` rows.
+  Idempotent/re-runnable. Fixed a real bug found mid-migration: ~94 problems
+  had ambiguous `meta.id` values that would have collided slugs across
+  categories; slugs are now derived from file path instead.
+  `categoryLabel` mapped to the user's canonical DSA-pattern names (Two
+  Pointers, Sliding Window, Binary Search, Prefix Sum, Hashing / Frequency
+  Map, Fast & Slow Pointers, Merge Intervals, BFS / DFS, Backtracking,
+  Greedy, Dynamic Programming (DP), Heap / Priority Queue, Union Find (DSU),
+  Topological Sort, Trie, Bit Manipulation; leftovers like arrays/bst/
+  graph-algorithms keep plain Title Case labels).
+- Follow-up one-off cleanup scripts (all idempotent, re-run safe):
+  `fixup-coding-problem-solutions-shared.ts` (stripped leftover Docusaurus
+  `import Tabs...` lines + converted `<AsciiDiagram>` JSX to plain fenced
+  code blocks in `solutionsMd.shared`), `fixup-coding-problem-remove-back-link.ts`
+  (stripped a dead `## Back to Problem` section + relative link left over
+  from the old exercise-page cross-link), `fixup-coding-problem-remove-code-heading.ts`
+  (stripped a stray empty `## Code` heading left where the per-language Tabs
+  code block used to sit), `fixup-coding-problem-example-headings.ts` +
+  `fixup-coding-problem-spec-headings.ts` (demoted `## Example N`, `##
+  Input/Output Specification`, `## Constraints`, `## Hints` from real
+  headings to bold inline labels — too heavy visually as full headings).
+  `solutionsMd` shape: `{ shared: '<prose>', <language>: '<code-only>' }` —
+  `shared` is NOT a language key, apps/web's Solutions tab renders it once
+  above the per-language code switcher.
+
+### Frontend (apps/web)
+
+- Sidebar: "Practice Coding" link in the Overview section, right after
+  Certification Practice Exam. `Sidebar-Components-Map.md` updated.
+- `/practice-coding` — two-column layout: numbered problem list on the left
+  (grouped into sections — by category when "All" is selected, by
+  Easy/Medium/Hard when one category is selected; only categories/sections
+  that actually have problems render, never an empty one), tag-cloud
+  category filter (pills sized by problem count) + colored Easy/Medium/Hard
+  filter pills on the right (380px pane). Selecting a category shows it as a
+  removable chip (× resets to "All") above the list. `CodingProblemsBoard`
+  built as a sibling to `CourseSectionsBoard`, not a reuse (course
+  access/progress fields don't apply to coding problems).
+- `/practice-coding/<category>/<problem-slug>` (catch-all `[...slug]`) —
+  three tabs: **Problem** (description + Monaco IDE split), **Solutions**
+  (writeup only), **Code** (per-language pill switcher + solution code,
+  split out of Solutions per user request). "← Back to Coding Problems" link
+  above the title (Rule-8 bare-text-link style); category+difficulty tags
+  sit inline next to the title.
+- `CodingIDE` — Monaco editor ported from apps/docs's `CoreEditor`, talking
+  to apps/api's new Judge0 endpoints via `apiFetch` (session cookie) instead
+  of apps/app's Supabase-bearer proxy. Editor pane 380px normal / 547px in
+  Focus Mode. Run/Submit/Run Custom buttons color-coded distinctly (blue/
+  green/teal, all softened off the original neon hex — palette now derives
+  from `--ifm-color-primary`/`--ifm-color-success`/theme tokens via
+  `color-mix()` instead of hardcoded saturated hex). Custom Input/Expected
+  Output textareas fixed at 72px height, no resize handle.
+- **Focus Mode** (LeetCode-style fullscreen): toggle button lives in
+  `CodingIDE`'s own toolbar now (moved out of the tabs row per user
+  request), positioned right before the Run button, using new
+  `OpenInFullIcon`/`CloseFullscreenIcon` Material Symbols glyphs added to
+  `components/icons/ActionIcons.tsx`. Expands the Problem/IDE split to a
+  `position: fixed` full-viewport overlay (z-index 1000, background-page
+  scroll locked via `document.body.style.overflow`), Escape key or the
+  button exits. A "Press Esc to go back" hint chip (black `Esc` kbd, colored
+  background) shows while active.
+- `CodingProblemMarkdown` renders through `CourseModulePage`'s own `.body`
+  CSS module directly (not a duplicate copy) — guarantees identical
+  typography with course topic pages, zero drift risk. A `compact.module.css`
+  override (`!important`, `font-size: 0.93rem`) sits on top for a slightly
+  smaller/denser read than course pages, applied by default.
+- Client-side (non-destructive) content clean-up in `CodingProblemDetail`:
+  strips the duplicate `# <Title>` heading and the duplicate
+  `**Difficulty:** Easy` line that `bodyMd` carries from migration, since
+  both are already shown in the page's own header.
+- Same thin/transparent-until-hover scrollbar convention as
+  `DashboardSidebar`/`CourseModuleIndex` applied to the Problem description
+  panel and `CodingIDE`'s console/editor panes (`thinScroll` utility class,
+  plus Monaco's own `scrollbar` option set to 6px/no-shadow).
+
+### Still open
+
+1. **User needs to fill in `JUDGE0_RAPIDAPI_KEY` in `apps/api/.env`** — left
+   blank deliberately, no key was pasted into the session.
+2. **No live browser verification this session** — everything above is
+   typecheck-clean and one live curl-level check confirmed the route-order
+   bug fix and the catalog/detail JSON shapes, but nobody has clicked through
+   Run/Submit/Focus Mode/Solutions in an actual browser yet. Do that first
+   once the Judge0 key is in.
+3. No commit made — all of the above is uncommitted per the standing
+   no-commit rule.
+
+## Previous Status (IN PROGRESS, 2026-09-17: post-"API Audit and Mobile readiness" UI follow-on)
 
 Last commit on `v2-openrouter` is `075c1a99` "API Audit and Mobile readiness"
 (author codeasign, 2026-09-17 12:29 IST) — NOT this session's work, but the

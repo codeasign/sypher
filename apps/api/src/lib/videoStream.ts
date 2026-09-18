@@ -1,6 +1,6 @@
 import type { Request, Response } from 'express';
 import { VideoRepository } from '../repositories/VideoRepository';
-import { resolveOptionalUser } from './tsoaAuth';
+import { resolveOptionalUser, usedBearerAuth } from './tsoaAuth';
 import { signBunnyUrl } from './bunnySign';
 import { env } from './env';
 import { createLogger } from './logger';
@@ -20,13 +20,21 @@ const videoRepository = new VideoRepository();
 // @Security entirely (raw Express route, registered before RegisterRoutes
 // in server.ts — needed for direct control over Range/206 passthrough,
 // which tsoa's JSON-response model doesn't support):
-//   1. Session cookie required — same-site subresource requests (video/img)
-//      carry cookies automatically, so a signed-in browser tab just works;
-//      a bare URL pasted into curl/another browser with no session does not.
+//   1. A valid session required — cookie (browser) or bearer (mobile), via
+//      resolveOptionalUser/extractSessionToken same as every tsoa route.
 //   2. Referer must be one of our own origins — blocks the common "some
 //      other site hotlinks the stream URL" case. Spoofable by a determined
 //      caller with control over request headers (curl, a script) — this is
 //      a deterrent against casual reuse, not a cryptographic guarantee.
+//      ONLY enforced for cookie-authenticated requests (2026-09-18 mobile-
+//      readiness fix): a same-site subresource request carries cookies
+//      automatically, so a mismatched Referer on a cookie-authenticated
+//      request is a real signal something's off. A bearer-authenticated
+//      request (Expo/React Native — no cookie jar, no browser Referer/
+//      Origin to check in the first place) has no such signal to check;
+//      the bearer token itself already proves a legitimate authenticated
+//      caller, so this gate would just 403 every mobile request for no
+//      security benefit.
 function isAllowedReferer(req: Request): boolean {
   const referer = req.headers.referer ?? req.headers.origin;
   if (!referer) return false;
@@ -46,7 +54,7 @@ export async function videoStreamHandler(req: Request, res: Response): Promise<v
     res.status(401).json({ message: 'Not authenticated' });
     return;
   }
-  if (!isAllowedReferer(req)) {
+  if (!usedBearerAuth(req) && !isAllowedReferer(req)) {
     res.status(403).json({ message: 'Forbidden' });
     return;
   }

@@ -21,6 +21,8 @@ import {
   MockTestIcon,
   ProfileIcon,
   VideoIcon,
+  PracticeCodingIcon,
+  TestAccountsIcon,
 } from '@/components/icons/SidebarIcons';
 import styles from './styles.module.css';
 
@@ -143,6 +145,13 @@ export default function DashboardSidebar({ role, email, fullName, avatarUrl, vis
             <span className={`${styles.navLabel} ${styles.navLabelWrap}`}>Certification Practice Exam</span>
           </Link>
           <Link
+            href="/practice-coding"
+            className={isActive('/practice-coding') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
+          >
+            <PracticeCodingIcon className={styles.navIcon} />
+            <span className={styles.navLabel}>Practice Coding</span>
+          </Link>
+          <Link
             href="/getting-started"
             className={isActive('/getting-started') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
           >
@@ -171,6 +180,19 @@ export default function DashboardSidebar({ role, email, fullName, avatarUrl, vis
                 </Link>
               );
             })}
+          </div>
+        )}
+
+        {role === 'ADMIN' && (
+          <div className={`${styles.section} ${styles.sectionDivider}`}>
+            <span className={styles.sectionHeader}>Test Accounts</span>
+            <Link
+              href="/test-accounts"
+              className={isActive('/test-accounts') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
+            >
+              <TestAccountsIcon className={styles.navIcon} />
+              <span className={styles.navLabel}>Reset Test Accounts</span>
+            </Link>
           </div>
         )}
       </nav>

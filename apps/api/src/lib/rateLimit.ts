@@ -108,6 +108,20 @@ export async function consumeCompanyInviteAllowance(companyId: string): Promise<
   return consumeAllowance(`company-invite:${companyId}`, COMPANY_INVITE_LIMIT, COMPANY_INVITE_WINDOW_SECONDS);
 }
 
+// Same fan-out-brake reasoning as consumeCompanyInviteAllowance, applied to
+// TestAccountsController.reset() (2026-09-18 compliance pass): every reset
+// fires a real welcome/set-password email via createProvisionedUser, and
+// the endpoint's own allowlist can now grow via ad-hoc custom emails, so an
+// admin session looping it has no backstop beyond requireAdmin without
+// this. Keyed per admin user id (there's no "company" here), generous on
+// purpose — a backstop, not the primary defense.
+const TEST_ACCOUNT_RESET_WINDOW_SECONDS = 60 * 60;
+export const TEST_ACCOUNT_RESET_LIMIT = 30;
+
+export async function consumeTestAccountResetAllowance(adminUserId: string): Promise<number> {
+  return consumeAllowance(`test-account-reset:${adminUserId}`, TEST_ACCOUNT_RESET_LIMIT, TEST_ACCOUNT_RESET_WINDOW_SECONDS);
+}
+
 // Vote/helpful toggle brake, per user — not a primary abuse vector (both
 // endpoints just flip a boolean/enum on one row), but a generous backstop
 // against a scripted tight loop hammering the DB.
@@ -116,6 +130,24 @@ export const COMMENT_TOGGLE_LIMIT = 30;
 
 export async function consumeCommentToggleAllowance(userId: string): Promise<number> {
   return consumeAllowance(`comment-toggle:${userId}`, COMMENT_TOGGLE_LIMIT, COMMENT_TOGGLE_WINDOW_SECONDS);
+}
+
+// Judge0 run/submit buckets, ported from apps/app's route-level RATE_LIMITS
+// (2026-09-17 coding-bootcamp migration). Submit costs ~10x Run in RapidAPI
+// calls -- separate buckets so a student spamming Submit can't burn through
+// budget meant for iterative Run clicks. On top of the flat 100/month cap
+// (judge0Quota.ts), which is the real spend backstop.
+const JUDGE0_RUN_WINDOW_SECONDS = 10 * 60;
+export const JUDGE0_RUN_LIMIT = 20;
+const JUDGE0_SUBMIT_WINDOW_SECONDS = 10 * 60;
+export const JUDGE0_SUBMIT_LIMIT = 3;
+
+export async function consumeJudge0RunAllowance(userId: string): Promise<number> {
+  return consumeAllowance(`judge0-run:${userId}`, JUDGE0_RUN_LIMIT, JUDGE0_RUN_WINDOW_SECONDS);
+}
+
+export async function consumeJudge0SubmitAllowance(userId: string): Promise<number> {
+  return consumeAllowance(`judge0-submit:${userId}`, JUDGE0_SUBMIT_LIMIT, JUDGE0_SUBMIT_WINDOW_SECONDS);
 }
 
 /**
