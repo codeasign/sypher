@@ -131,13 +131,14 @@ const TARGET_COURSES = [
 // sidebar of `docsCourse`, but only the sidebar category named `sidebarSection`, and lands in the
 // database under its own slug/name/category. Each topic (sidebar sub-category) becomes a section.
 // There is no course-level index page to seed a Course Overview from, so none is created.
-const VIRTUAL_COURSES: Record<string, { docsCourse: string; sidebarSection: string; name: string; description: string; category: string }> = {
+const VIRTUAL_COURSES: Record<string, { docsCourse: string; sidebarSection: string; name: string; description: string; category: string; unwrapParagraphs?: boolean }> = {
   'ai-system-design': {
     docsCourse: 'system-design-fundamentals',
     sidebarSection: 'Section 14 - AI System Design',
     name: 'AI System Design',
     description: 'Nine topics on designing AI-powered systems: LLM serving, embeddings, vector databases, RAG architecture, AI agent architecture, model routing, prompt caching, AI observability and AI cost optimization.',
     category: 'System Design',
+    unwrapParagraphs: true, // rag-architecture's source is hard-wrapped at ~80 cols; the reader honors single newlines (remark-breaks)
   },
 };
 
@@ -380,6 +381,31 @@ function stripLeadingH1(body: string): string {
   return body.replace(/^#\s+.+(?:\r?\n)*/, '');
 }
 
+// Docusaurus/Markdown joins a paragraph's source lines with spaces, but the reader uses remark-breaks, which
+// turns every single newline into a <br>. Source that is hard-wrapped at ~80 columns therefore renders ragged.
+// Joins consecutive plain-text lines of a paragraph; never touches fenced code, headings, lists, blockquotes,
+// tables, HTML lines, indented code or explicit hard breaks. Throws if any non-whitespace character changes.
+function unwrapHardWrappedParagraphs(body: string): string {
+  const out: string[] = [];
+  let buf: string[] = [];
+  let fence: string | null = null;
+  const flush = () => { if (buf.length) { out.push(buf.map((l) => l.trim()).join(' ')); buf = []; } };
+  const isPlain = (l: string) =>
+    l.trim() !== '' &&
+    !/^\s{0,3}(#{1,6}\s|>|[-*+]\s|\d+[.)]\s|\||<|```|~~~|-{3,}\s*$|={3,}\s*$|\[[^\]]+\]:)/.test(l) &&
+    !/^\s{4,}/.test(l) && !/( {2}|\\)$/.test(l);
+  for (const line of body.split('\n')) {
+    const f = line.match(/^\s{0,3}(```+|~~~+)/);
+    if (fence) { out.push(line); if (f && f[1][0] === fence[0] && f[1].length >= fence.length) fence = null; continue; }
+    if (f) { flush(); fence = f[1]; out.push(line); continue; }
+    if (isPlain(line)) buf.push(line); else { flush(); out.push(line); }
+  }
+  flush();
+  const result = out.join('\n');
+  if (result.replace(/\s+/g, '') !== body.replace(/\s+/g, '')) throw new CourseImportError('unwrapHardWrappedParagraphs changed non-whitespace content');
+  return result;
+}
+
 async function loadCourseOverview(
   courseSlug: string,
   docIdIndex: Map<string, string>,
@@ -493,6 +519,7 @@ async function importCourse(courseSlug: string): Promise<void> {
     const title = (data.title as string | undefined) ?? path.basename(leaf.docId);
     let body = stripLeadingH1(stripKnownImports(content).trim()).trim();
     body = await convertAsciiDiagrams(body, courseSlug, docsSlug, leaf.docId, manifest, log);
+    if (virtual?.unwrapParagraphs) body = unwrapHardWrappedParagraphs(body);
 
     const slugSegment = leaf.docId
       .replace(`${docsSlug}/`, '')
