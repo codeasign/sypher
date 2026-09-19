@@ -123,7 +123,23 @@ const TARGET_COURSES = [
   'design-patterns',
   'git-github-actions',
   'coding-bootcamp',
+  // Added 2026-09-20: virtual course carved out of system-design-fundamentals Section 14.
+  'ai-system-design',
 ];
+
+// A "virtual" course is a slice of a larger Docusaurus course: it reads the docs, manifest and
+// sidebar of `docsCourse`, but only the sidebar category named `sidebarSection`, and lands in the
+// database under its own slug/name/category. Each topic (sidebar sub-category) becomes a section.
+// There is no course-level index page to seed a Course Overview from, so none is created.
+const VIRTUAL_COURSES: Record<string, { docsCourse: string; sidebarSection: string; name: string; description: string; category: string }> = {
+  'ai-system-design': {
+    docsCourse: 'system-design-fundamentals',
+    sidebarSection: 'Section 14 - AI System Design',
+    name: 'AI System Design',
+    description: 'Nine topics on designing AI-powered systems: LLM serving, embeddings, vector databases, RAG architecture, AI agent architecture, model routing, prompt caching, AI observability and AI cost optimization.',
+    category: 'System Design',
+  },
+};
 
 // The one diagram confirmed 2026-08-21 as local-.mmd-cache drift, not a
 // real shipped defect — see the header comment above.
@@ -268,9 +284,9 @@ function escapeHtmlAttr(value: string): string {
 // one folder per rendered URL rather than one flat folder per course —
 // confirmed 2026-08-22, folder rename from imported-diagrams/<course> to
 // svgs/<course>/<moduleSlug>.
-function renderedModuleSlug(courseSlug: string, docId: string): string {
-  if (docId === `${courseSlug}/index`) return 'overview';
-  return docId.replace(`${courseSlug}/`, '').replace(/\//g, '-');
+function renderedModuleSlug(docsSlug: string, docId: string): string {
+  if (docId === `${docsSlug}/index`) return 'overview';
+  return docId.replace(`${docsSlug}/`, '').replace(/\//g, '-');
 }
 
 // Detects a page whose only real content is a Docusaurus auto-nav
@@ -287,6 +303,7 @@ function isPureAutoNavStub(bodyWithoutFrontmatter: string): boolean {
 async function convertAsciiDiagrams(
   body: string,
   courseSlug: string,
+  docsSlug: string,
   docId: string,
   manifest: Map<string, ManifestDiagramEntry>,
   log: string[],
@@ -325,7 +342,7 @@ async function convertAsciiDiagrams(
 
     const svgBuffer = readableBlackboardSvg(readFileSync(svgAbsPath));
     const filename = diagramSvgFilename(path.basename(svgAbsPath), svgBuffer);
-    const pathPrefix = `svgs/${courseSlug}/${renderedModuleSlug(courseSlug, docId)}`;
+    const pathPrefix = `svgs/${courseSlug}/${renderedModuleSlug(docsSlug, docId)}`;
     const bunnyUrl = VERIFY_ONLY
       ? `${env.bunny.pullZoneUrl.replace(/\/+$/, '')}/${pathPrefix}/${filename}`
       : await uploadBufferToBunny(svgBuffer, filename, pathPrefix, 'image/svg+xml');
@@ -375,7 +392,7 @@ async function loadCourseOverview(
   const title = (data.title as string | undefined) ?? courseSlug;
 
   let body = stripLeadingH1(stripKnownImports(content).trim()).trim();
-  body = await convertAsciiDiagrams(body, courseSlug, `${courseSlug}/index`, manifest, log);
+  body = await convertAsciiDiagrams(body, courseSlug, courseSlug, `${courseSlug}/index`, manifest, log);
 
   const firstParagraph = body.split(/\n\s*\n/).find((block) => block.trim() && !block.trim().startsWith('#')) ?? '';
   const description = firstParagraph.trim().replace(/\s+/g, ' ').slice(0, 500);
@@ -420,17 +437,29 @@ function collectLeaves(nodes: SidebarNode[], courseSlug: string): Array<{ docId:
 
 async function importCourse(courseSlug: string): Promise<void> {
   const log: string[] = [];
-  console.log(`\n=== ${courseSlug} ===`);
+  console.log(`
+=== ${courseSlug} ===`);
 
-  const sidebarPath = path.resolve(DOCS_ROOT, 'sidebars', `${courseSlug}.json`);
+  const virtual = VIRTUAL_COURSES[courseSlug];
+  const docsSlug = virtual ? virtual.docsCourse : courseSlug;
+
+  const sidebarPath = path.resolve(DOCS_ROOT, 'sidebars', `${docsSlug}.json`);
   const sidebarFile = JSON.parse(readFileSync(sidebarPath, 'utf-8')) as Record<string, SidebarNode[]>;
   const sidebarKey = Object.keys(sidebarFile)[0];
-  const allNodes = sidebarFile[sidebarKey];
+  let allNodes = sidebarFile[sidebarKey];
+  if (virtual) {
+    const section = allNodes.find((n): n is SidebarCategory => typeof n !== 'string' && n.label === virtual.sidebarSection);
+    if (!section) throw new CourseImportError(`Sidebar section "${virtual.sidebarSection}" not found in ${docsSlug}`);
+    allNodes = section.items;
+  }
 
-  const manifest = loadManifest(courseSlug);
-  const docIdIndex = buildDocIdIndex(courseSlug);
+  const manifest = loadManifest(docsSlug);
+  const docIdIndex = buildDocIdIndex(docsSlug);
 
-  const overview = await loadCourseOverview(courseSlug, docIdIndex, manifest, log);
+  // A virtual course has no course-level index page, hence no synthetic Course Overview module.
+  const overview = virtual
+    ? { name: virtual.name, description: virtual.description, overviewBody: null as string | null }
+    : await loadCourseOverview(courseSlug, docIdIndex, manifest, log);
 
   // First entry is always this course's own "<slug>/index" landing page —
   // exclude it from the leaf walk, it's handled by loadCourseOverview above.
@@ -463,10 +492,10 @@ async function importCourse(courseSlug: string): Promise<void> {
 
     const title = (data.title as string | undefined) ?? path.basename(leaf.docId);
     let body = stripLeadingH1(stripKnownImports(content).trim()).trim();
-    body = await convertAsciiDiagrams(body, courseSlug, leaf.docId, manifest, log);
+    body = await convertAsciiDiagrams(body, courseSlug, docsSlug, leaf.docId, manifest, log);
 
     const slugSegment = leaf.docId
-      .replace(`${courseSlug}/`, '')
+      .replace(`${docsSlug}/`, '')
       .replace(/\//g, '-');
 
     modules.push({
@@ -499,7 +528,7 @@ async function importCourse(courseSlug: string): Promise<void> {
   const fields = {
     name: overview.name,
     description: overview.description,
-    category: 'tech',
+    category: virtual ? virtual.category : 'tech',
   };
   if (course) {
     await api('PUT', `/courses/${course.id}`, fields);
