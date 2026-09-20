@@ -140,6 +140,13 @@ const VIRTUAL_COURSES: Record<string, { docsCourse: string; sidebarSection: stri
     category: 'System Design',
     unwrapParagraphs: true, // rag-architecture's source is hard-wrapped at ~80 cols; the reader honors single newlines (remark-breaks)
   },
+  caching: {
+    docsCourse: 'system-design-fundamentals',
+    sidebarSection: 'Section 6 - Caching',
+    name: 'Caching',
+    description: 'Ten topics on caching in system design: why caching, cache-aside, read-through, write-through, write-back, cache invalidation, cache eviction, Redis, Memcached and distributed caches.',
+    category: 'System Design',
+  },
 };
 
 // The one diagram confirmed 2026-08-21 as local-.mmd-cache drift, not a
