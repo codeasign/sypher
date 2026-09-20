@@ -125,6 +125,8 @@ const TARGET_COURSES = [
   'coding-bootcamp',
   // Added 2026-09-20: virtual course carved out of system-design-fundamentals Section 14.
   'ai-system-design',
+  // Added 2026-09-20: virtual course carved out of system-design-fundamentals Section 6.
+  'caching',
 ];
 
 // A "virtual" course is a slice of a larger Docusaurus course: it reads the docs, manifest and
