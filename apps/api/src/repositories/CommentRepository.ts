@@ -1,6 +1,7 @@
 import { prisma } from '../lib/prisma';
 import { HttpError } from '../lib/errors';
-import type { CommentVoteType, Prisma } from '@prisma/client';
+import type { Prisma } from '@prisma/client';
+import type { CommentVoteType } from '../lib/apiEnums';
 
 /**
  * All discussion reads/writes (spec §2–§11). Controllers never touch Prisma.

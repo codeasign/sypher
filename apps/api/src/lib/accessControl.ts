@@ -13,6 +13,10 @@ export interface CompanyAccessContext {
 
 export function hasCourseAccess(role: Role | null, allowedRoles: Role[], ctx?: CompanyAccessContext): boolean {
   if (role === 'ADMIN') return true;
+  // Mobile User: every course, present and future, without a per-course
+  // grant. Read access only. Managing/editing is gated separately on ADMIN
+  // or NavAccess keys (contentAuthz.ts), which this role never holds.
+  if (role === 'MOBILE_USER') return true;
   if (role === null) return allowedRoles.includes('FREE_USER');
   if (allowedRoles.includes(role)) return true;
   if (role === 'COMPANY_EMPLOYEE' && ctx?.companyAllowedSlugs && ctx.slug) {

@@ -1,7 +1,7 @@
 import type { Role, User } from '@prisma/client';
 import { UserRepository } from '../repositories/UserRepository';
 import { PasswordResetTokenRepository } from '../repositories/PasswordResetTokenRepository';
-import { generateResetToken, hashToken } from './session';
+import { SET_PASSWORD_LINK_HOURS, generateResetToken, hashToken } from './session';
 import { sendSetPasswordEmail } from './email';
 import { env } from './env';
 import { createLogger } from './logger';
@@ -25,7 +25,7 @@ const logger = createLogger('userProvisioning');
 const userRepository = new UserRepository();
 const resetTokenRepository = new PasswordResetTokenRepository();
 
-const SET_PASSWORD_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days — onboarding, not a security reset
+const SET_PASSWORD_TTL_MS = SET_PASSWORD_LINK_HOURS * 60 * 60 * 1000; // one-time link, 24 hours max
 
 /** Mint a one-time set-password token and return the link. Sends no email. */
 export async function createSetPasswordLink(userId: string): Promise<string> {

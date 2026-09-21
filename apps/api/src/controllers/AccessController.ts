@@ -1,7 +1,8 @@
 import { Body, Controller, Get, Path, Post, Put, Query, Request, Res, Route, Security, Tags, type TsoaResponse } from 'tsoa';
 import type { Request as ExpressRequest } from 'express';
 import { Prisma } from '@prisma/client';
-import type { Company, CourseAccess, NavAccess, Role, User } from '@prisma/client';
+import type { Company, CourseAccess, NavAccess, User } from '@prisma/client';
+import type { Role } from '../lib/apiEnums';
 import { CourseAccessRepository } from '../repositories/CourseAccessRepository';
 import { NavAccessRepository } from '../repositories/NavAccessRepository';
 import { CompanyCourseAccessRepository } from '../repositories/CompanyCourseAccessRepository';
@@ -36,8 +37,30 @@ const userRepository = new UserRepository();
 // never at risk of leaking one user's view into another's.
 const ACCESS_TABLE_CACHE_TTL_MS = 60_000;
 
+/** Response shape for one course's role grant. Explicit DTO instead of Prisma's `CourseAccess` model type. */
+export interface CourseAccessResponse {
+  courseSlug: string;
+  allowedRoles: Role[];
+  updatedAt: Date;
+}
+
+function toCourseAccessResponse(row: CourseAccess): CourseAccessResponse {
+  return { courseSlug: row.courseSlug, allowedRoles: row.allowedRoles, updatedAt: row.updatedAt };
+}
+
 function listAllCourseAccess(): Promise<CourseAccess[]> {
   return getOrSet('access:courses', ACCESS_TABLE_CACHE_TTL_MS, () => courseAccessRepository.listAll());
+}
+
+/** Response shape for one sidebar item's role grant. Explicit DTO instead of Prisma's `NavAccess` model type. */
+export interface NavAccessResponse {
+  itemKey: string;
+  allowedRoles: Role[];
+  updatedAt: Date;
+}
+
+function toNavAccessResponse(row: NavAccess): NavAccessResponse {
+  return { itemKey: row.itemKey, allowedRoles: row.allowedRoles, updatedAt: row.updatedAt };
 }
 
 function listAllNavAccess(): Promise<NavAccess[]> {
@@ -78,8 +101,55 @@ interface AccessSetUserRoleRequest {
   role: Role;
 }
 
+// Response shape for a company. Explicit DTO instead of Prisma's `Company`
+// model type, which leaks Prisma's `DefaultSelection` payload wrapper into
+// the OpenAPI spec. Same columns as the model, with honest nullability.
+/** A company (corporate customer). */
+export interface CompanyResponse {
+  id: string;
+  /** Human-readable business code (e.g. ACME), unique; separate from the cuid `id`. */
+  companyId: string;
+  name: string;
+  logoUrl: string | null;
+  primaryEmail: string | null;
+  secondaryEmail: string | null;
+  adminEmail: string | null;
+  address: string | null;
+  city: string | null;
+  stateProvince: string | null;
+  countyDistrict: string | null;
+  country: string | null;
+  seats: number | null;
+  /** INR, whole rupees; an informational planning figure. */
+  totalYearlyCost: number | null;
+  /** Until when this company's employees can access the site. */
+  accessUntil: Date;
+  createdAt: Date;
+}
+
+function toCompanyResponse(company: Company): CompanyResponse {
+  return {
+    id: company.id,
+    companyId: company.companyId,
+    name: company.name,
+    logoUrl: company.logoUrl,
+    primaryEmail: company.primaryEmail,
+    secondaryEmail: company.secondaryEmail,
+    adminEmail: company.adminEmail,
+    address: company.address,
+    city: company.city,
+    stateProvince: company.stateProvince,
+    countyDistrict: company.countyDistrict,
+    country: company.country,
+    seats: company.seats,
+    totalYearlyCost: company.totalYearlyCost,
+    accessUntil: company.accessUntil,
+    createdAt: company.createdAt,
+  };
+}
+
 interface AccessCompanyListResponse {
-  items: Company[];
+  items: CompanyResponse[];
   total: number;
   page: number;
   pageSize: number;
@@ -109,7 +179,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // Roles admins may assign through these endpoints (the User Role tab's
 // offer list). Anything else — COMPANY_HR/EMPLOYEE, COHORT_USER — comes
 // from company/cohort flows or direct seeding, not manual reassignment.
-const ASSIGNABLE_ROLES: readonly Role[] = ['FREE_USER', 'PAID_USER', 'INTERNAL_HR', 'BRANDER', 'ADMIN'];
+const ASSIGNABLE_ROLES: readonly Role[] = ['FREE_USER', 'PAID_USER', 'MOBILE_USER', 'INTERNAL_HR', 'BRANDER', 'ADMIN'];
 
 // Company business-code format: 3-12 uppercase letters/digits, starting
 // with a letter (e.g. ACME, GNFC01). Human-facing, unique, immutable in
@@ -153,10 +223,10 @@ export class AccessController extends Controller {
   // exists separately below as listCompaniesPaged.
   @Get('companies')
   @Security('session')
-  public async listCompanies(@Request() request: ExpressRequest): Promise<Company[]> {
+  public async listCompanies(@Request() request: ExpressRequest): Promise<CompanyResponse[]> {
     setPrivateNoStoreCache(this);
     requireAdmin(request.user as User);
-    return companyRepository.list();
+    return (await companyRepository.list()).map(toCompanyResponse);
   }
 
   // ---- Company directory (admin only): paged list + create + edit ----
@@ -175,7 +245,7 @@ export class AccessController extends Controller {
     const safePage = Math.max(1, Math.floor(page ?? 1));
     const safePageSize = Math.min(50, Math.max(1, Math.floor(pageSize ?? 10)));
     const { items, total } = await companyRepository.searchPage(term, (safePage - 1) * safePageSize, safePageSize);
-    return { items, total, page: safePage, pageSize: safePageSize };
+    return { items: items.map(toCompanyResponse), total, page: safePage, pageSize: safePageSize };
   }
 
   // Shared shape/validation for create + edit — every field is mandatory.
@@ -250,7 +320,7 @@ export class AccessController extends Controller {
     @Request() request: ExpressRequest,
     @Res() badRequest: TsoaResponse<400, { message: string }>,
     @Res() conflict: TsoaResponse<409, { message: string }>,
-  ): Promise<Company | void> {
+  ): Promise<CompanyResponse | void> {
     requireAdmin(request.user as User);
     const data = this.parseCompanyBody(body, badRequest);
     if (!data) return;
@@ -261,7 +331,7 @@ export class AccessController extends Controller {
       // provisioning hiccup (e.g. that email already belongs to another
       // company) is logged, never fails the company save.
       void provisionCompanyAdmin(company.id, data.adminEmail, company.name);
-      return company;
+      return toCompanyResponse(company);
     } catch (error) {
       if (error instanceof HttpError && error.status === 409) {
         return conflict(409, { message: error.message });
@@ -279,7 +349,7 @@ export class AccessController extends Controller {
     @Res() badRequest: TsoaResponse<400, { message: string }>,
     @Res() notFound: TsoaResponse<404, { message: string }>,
     @Res() conflict: TsoaResponse<409, { message: string }>,
-  ): Promise<Company | void> {
+  ): Promise<CompanyResponse | void> {
     requireAdmin(request.user as User);
     const existing = await companyRepository.findById(companyId);
     if (!existing) return notFound(404, { message: 'Company not found' });
@@ -291,7 +361,7 @@ export class AccessController extends Controller {
       if (data.adminEmail.toLowerCase() !== (existing.adminEmail ?? '').toLowerCase()) {
         void provisionCompanyAdmin(companyId, data.adminEmail, updated.name);
       }
-      return updated;
+      return toCompanyResponse(updated);
     } catch (error) {
       if (error instanceof HttpError && error.status === 409) {
         return conflict(409, { message: error.message });
@@ -329,9 +399,9 @@ export class AccessController extends Controller {
   // ---- Role-based course access (public read, admin write) ----
 
   @Get('courses')
-  public async listCourseAccess(): Promise<CourseAccess[]> {
+  public async listCourseAccess(): Promise<CourseAccessResponse[]> {
     setPublicListCache(this);
-    return listAllCourseAccess();
+    return (await listAllCourseAccess()).map(toCourseAccessResponse);
   }
 
   @Put('courses/{slug}')
@@ -340,19 +410,19 @@ export class AccessController extends Controller {
     @Path() slug: string,
     @Body() body: AccessSetRolesRequest,
     @Request() request: ExpressRequest,
-  ): Promise<CourseAccess> {
+  ): Promise<CourseAccessResponse> {
     requireAdmin(request.user as User);
     const result = await courseAccessRepository.setAllowedRoles(slug, body.allowedRoles);
     purge('access:courses');
-    return result;
+    return toCourseAccessResponse(result);
   }
 
   // ---- Role-based nav access (public read, admin write) ----
 
   @Get('nav')
-  public async listNavAccess(): Promise<NavAccess[]> {
+  public async listNavAccess(): Promise<NavAccessResponse[]> {
     setPublicListCache(this);
-    return listAllNavAccess();
+    return (await listAllNavAccess()).map(toNavAccessResponse);
   }
 
   @Put('nav/{itemKey}')
@@ -361,11 +431,11 @@ export class AccessController extends Controller {
     @Path() itemKey: string,
     @Body() body: AccessSetRolesRequest,
     @Request() request: ExpressRequest,
-  ): Promise<NavAccess> {
+  ): Promise<NavAccessResponse> {
     requireAdmin(request.user as User);
     const result = await navAccessRepository.setAllowedRoles(itemKey, body.allowedRoles);
     purge('access:nav');
-    return result;
+    return toNavAccessResponse(result);
   }
 
   // ---- Company-scoped course access (Sypher-staff only — sets the

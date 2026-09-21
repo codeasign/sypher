@@ -9,7 +9,7 @@ import {
   type ActivityCounts,
   type ActivityScope,
 } from '../repositories/UserActivityRepository';
-import { DashboardRepository, type DashboardData } from '../repositories/DashboardRepository';
+import { DashboardRepository, type UserDashboardResponse } from '../repositories/DashboardRepository';
 import { isAllowedAvatarUrl } from '../lib/avatar';
 import { HttpError } from '../lib/errors';
 import { setPrivateNoStoreCache } from '../lib/httpCache';
@@ -55,7 +55,6 @@ const BIO_MAX = 500;
 
 export type UserActivityCountsResponse = ActivityCounts;
 export type UserActivityCommentPageResponse = ActivityCommentPage;
-export type UserDashboardResponse = DashboardData;
 
 function toMe(user: User): UserMeResponse {
   return {

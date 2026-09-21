@@ -6,6 +6,9 @@ export function generateSessionToken(): string {
   return randomBytes(32).toString('hex');
 }
 
+/** How long an emailed set-password link stays valid. Also quoted in the email copy. */
+export const SET_PASSWORD_LINK_HOURS = 24;
+
 export function generateResetToken(): string {
   return randomBytes(32).toString('hex');
 }

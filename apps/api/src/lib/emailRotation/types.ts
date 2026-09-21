@@ -2,6 +2,8 @@ export interface SendEmailParams {
   to: string;
   subject: string;
   html: string;
+  /** Plain-text alternative; sent as multipart/alternative next to `html`. */
+  text?: string;
 }
 
 export interface SendEmailResult {

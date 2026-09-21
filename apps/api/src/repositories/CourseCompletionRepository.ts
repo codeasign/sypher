@@ -1,15 +1,30 @@
+import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 
 export class CourseCompletionRepository {
   // Idempotent, same as ModuleProgressRepository.markComplete: the unique
   // (userId, courseId) constraint means an already-completed course is a
   // no-op, not a duplicate row or a reset completedAt.
+  //
+  // Prisma's upsert is read-then-write, so two concurrent calls can both
+  // miss the read and both attempt the create; the loser hits the unique
+  // constraint as a P2002. That's exactly what happens on a course's final
+  // module: ModuleCompletionTracker fires its POST twice under React Strict
+  // Mode's dev double-invoke, both requests see completed == total, and one
+  // 500'd. P2002 means "the row we wanted already exists" — the same
+  // success outcome as the update branch — so swallow it, as
+  // ModuleProgressRepository.markComplete does.
   async markComplete(userId: string, courseId: string): Promise<void> {
-    await prisma.courseCompletion.upsert({
-      where: { userId_courseId: { userId, courseId } },
-      create: { userId, courseId },
-      update: {},
-    });
+    try {
+      await prisma.courseCompletion.upsert({
+        where: { userId_courseId: { userId, courseId } },
+        create: { userId, courseId },
+        update: {},
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return;
+      throw error;
+    }
   }
 
   // Called after every module completion (see

@@ -182,14 +182,54 @@ export async function assertCommentTargetVisible(
 
 // ─── Shared request-input normalization ───────────────────────────────────
 
-/** Trimmed comment body, or null when empty after trim / over the cap. */
+// Control characters other than tab / newline / CR. NUL in particular makes
+// Postgres reject the whole INSERT ("invalid byte sequence"), i.e. a 500.
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+
+const HAS_CONTROL_CHAR_RE = new RegExp(CONTROL_CHARS_RE.source);
+
+// Markdown block markers ("> ", "- ", "1. ") stacked at the start of one
+// line. Every extra one is another level of nesting in the rendered tree;
+// a few thousand overflow the renderer's call stack (client-side crash on
+// every viewer of the thread), so cap it far above any real use.
+const LEADING_BLOCK_MARKER_RE = /^[ \t]{0,3}(?:>|[-*+]|\d{1,9}[.)])[ \t]?/;
+const MAX_BLOCK_NESTING = 8;
+
+function hasExcessiveNesting(body: string): boolean {
+  for (const line of body.split(/\r?\n/)) {
+    let rest = line;
+    let depth = 0;
+    let match: RegExpExecArray | null;
+    while ((match = LEADING_BLOCK_MARKER_RE.exec(rest)) !== null) {
+      depth += 1;
+      if (depth > MAX_BLOCK_NESTING) return true;
+      rest = rest.slice(match[0].length);
+    }
+  }
+  return false;
+}
+
+/**
+ * Trimmed, control-character-free comment body, or null when empty after
+ * trim / over the cap. Throws a 400 for pathologically nested Markdown.
+ */
 export function normalizeCommentBody(raw: string): string | null {
-  const body = raw.trim();
+  const body = raw.replace(CONTROL_CHARS_RE, '').trim();
   if (body.length === 0 || body.length > COMMENT_BODY_MAX_LENGTH) return null;
+  if (hasExcessiveNesting(body)) {
+    throw new HttpError(400, `Comment is too deeply nested — use at most ${MAX_BLOCK_NESTING} stacked quote/list markers on one line`);
+  }
   return body;
 }
 
-/** Deduped, non-empty mention ids (cap enforced again defensively at the repository). */
+/** Deduped, plausible mention ids (cap enforced again defensively at the repository). */
 export function cleanMentionIds(raw: string[] | undefined): string[] {
-  return [...new Set((raw ?? []).filter((id) => typeof id === 'string' && id.length > 0))];
+  // Real ids are cuids (~25 chars); the length cap and control-char strip
+  // keep junk out of the `id IN (...)` lookup.
+  return [
+    ...new Set(
+      (raw ?? []).filter((id) => typeof id === 'string' && id.length > 0 && id.length <= 64 && !HAS_CONTROL_CHAR_RE.test(id)),
+    ),
+  ];
 }

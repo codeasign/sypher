@@ -22,6 +22,7 @@ async function send(params: SendEmailParams): Promise<SendEmailResult> {
         to: [params.to],
         subject: params.subject,
         html: params.html,
+        ...(params.text ? { text: params.text } : {}),
       }),
     });
   } catch (err) {

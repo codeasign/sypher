@@ -38,6 +38,10 @@ export const env = {
     // transactional email. Unset (the default, and production) → Brevo →
     // Resend as before.
     transport: process.env.EMAIL_TRANSPORT ?? '',
+    // Header logo in every email. Must be a public https URL — inbox clients
+    // fetch it themselves, so a local host (next.sypher.local) never renders.
+    // Hosted on the Bunny CDN under branding/.
+    logoUrl: process.env.EMAIL_LOGO_URL ?? 'https://syhpher-next-datastore-gvaf.b-cdn.net/branding/sypher-logo.png',
     smtp: {
       host: process.env.SMTP_HOST ?? 'localhost',
       port: Number(process.env.SMTP_PORT ?? 3025),

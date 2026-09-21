@@ -93,15 +93,55 @@ interface CohortLookupUser {
   fullName: string | null;
 }
 
+// Response shape for a cohort. Explicit DTO instead of Prisma's `Cohort`
+// model type, which leaks Prisma's `DefaultSelection` payload wrapper into
+// the OpenAPI spec. Same columns as the model, with honest nullability.
+/** A cohort. */
+export interface CohortResponse {
+  id: string;
+  slug: string;
+  title: string;
+  description: string;
+  content: string;
+  coverImageUrl: string | null;
+  startDate: Date | null;
+  durationWeeks: number | null;
+  seatsTotal: number | null;
+  priceLabel: string | null;
+  /** draft | live | closed */
+  status: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+function toCohortResponse(cohort: Cohort): CohortResponse {
+  return {
+    id: cohort.id,
+    slug: cohort.slug,
+    title: cohort.title,
+    description: cohort.description,
+    content: cohort.content,
+    coverImageUrl: cohort.coverImageUrl,
+    startDate: cohort.startDate,
+    durationWeeks: cohort.durationWeeks,
+    seatsTotal: cohort.seatsTotal,
+    priceLabel: cohort.priceLabel,
+    status: cohort.status,
+    createdAt: cohort.createdAt,
+    updatedAt: cohort.updatedAt,
+  };
+}
+
 @Route('cohorts')
 @Tags('Cohorts')
 export class CohortController extends Controller {
   // ---- Public ----
 
   @Get()
-  public async listPublic(): Promise<Cohort[]> {
+  public async listPublic(): Promise<CohortResponse[]> {
     setPublicListCache(this);
-    return getOrSet('cohorts:public-list', PUBLIC_CACHE_TTL_MS, () => cohortRepository.listPublicLive());
+    const cohorts = await getOrSet('cohorts:public-list', PUBLIC_CACHE_TTL_MS, () => cohortRepository.listPublicLive());
+    return cohorts.map(toCohortResponse);
   }
 
   @Post('revalidate')
@@ -123,7 +163,7 @@ export class CohortController extends Controller {
     @Request() request: ExpressRequest,
     @Query() limit?: string,
     @Query() offset?: string,
-  ): Promise<Cohort[]> {
+  ): Promise<CohortResponse[]> {
     setPrivateNoStoreCache(this);
     await requireCanManageCohorts(request.user as User);
     const parsedLimit = limit === undefined ? MAX_MANAGE_PAGE_SIZE : Number.parseInt(limit, 10);
@@ -131,12 +171,12 @@ export class CohortController extends Controller {
     const pageSize = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, MAX_MANAGE_PAGE_SIZE) : MAX_MANAGE_PAGE_SIZE;
     const pageOffset = Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
     const { cohorts } = await cohortRepository.listAllPage(pageSize, pageOffset);
-    return cohorts;
+    return cohorts.map(toCohortResponse);
   }
 
   @Post()
   @Security('session')
-  public async create(@Body() body: CreateCohortRequest, @Request() request: ExpressRequest): Promise<Cohort> {
+  public async create(@Body() body: CreateCohortRequest, @Request() request: ExpressRequest): Promise<CohortResponse> {
     const user = request.user as User;
     await requireCanManageCohorts(user);
     assertNoReplacementChar(body.title, 'Title');
@@ -147,7 +187,7 @@ export class CohortController extends Controller {
       createdById: user.id,
     });
     purge('cohorts');
-    return cohort;
+    return toCohortResponse(cohort);
   }
 
   @Put('{id}')
@@ -183,11 +223,12 @@ export class CohortController extends Controller {
   // is bounded by admin-authored program count, not user volume.
   @Get('manage/roster-cohorts')
   @Security('session')
-  public async listRosterCohorts(@Request() request: ExpressRequest): Promise<Cohort[]> {
+  public async listRosterCohorts(@Request() request: ExpressRequest): Promise<CohortResponse[]> {
     setPrivateNoStoreCache(this);
     const user = request.user as User;
     const scope = await rosterPickerScope(user);
-    return scope === 'all' ? cohortRepository.listAll() : cohortRepository.listForManager(user.id);
+    const cohorts = scope === 'all' ? await cohortRepository.listAll() : await cohortRepository.listForManager(user.id);
+    return cohorts.map(toCohortResponse);
   }
 
   // Was genuinely unbounded — a cohort's enrolled member count grows with
@@ -390,13 +431,13 @@ export class CohortController extends Controller {
   // Express/tsoa's first-match routing would swallow those requests here
   // instead (e.g. GET /cohorts/lookup-user matching slug="lookup-user").
   @Get('{slug}')
-  public async getPublicBySlug(@Path() slug: string, @Request() request: ExpressRequest): Promise<Cohort | void> {
+  public async getPublicBySlug(@Path() slug: string, @Request() request: ExpressRequest): Promise<CohortResponse | void> {
     const cohort = await getOrSet(`cohorts:public-detail:${slug}`, PUBLIC_CACHE_TTL_MS, () => cohortRepository.findBySlugLive(slug));
     if (!cohort) return undefined;
     if (applyPublicDetailCache(this, request, cohort.updatedAt)) {
       this.setStatus(304);
       return;
     }
-    return cohort;
+    return toCohortResponse(cohort);
   }
 }

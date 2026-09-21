@@ -19,10 +19,11 @@ async function send(params: SendEmailParams): Promise<SendEmailResult> {
         Accept: 'application/json',
       },
       body: JSON.stringify({
-        sender: { email: senderEmail },
+        sender: { name: 'Sypher Next', email: senderEmail },
         to: [{ email: params.to }],
         subject: params.subject,
         htmlContent: params.html,
+        ...(params.text ? { textContent: params.text } : {}),
       }),
     });
   } catch (err) {

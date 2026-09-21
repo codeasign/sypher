@@ -27,6 +27,47 @@ interface CreateModuleEditRequestBody {
 // CourseController's module endpoints since the access model differs:
 // submitting requires only manage-course-authoring, approving requires
 // the separate course-audit grant.
+// Response shape for a module edit request in the review queue. Explicit DTO
+// instead of the repository's `ModuleEditRequestWithContext`, which extends
+// Prisma's `ModuleEditRequest` model type and so dragged Prisma's
+// `DefaultSelection` payload wrapper into the OpenAPI spec.
+/** A proposed module edit in the review queue, with its module, course and requester. */
+export interface ModuleEditRequestResponse {
+  id: string;
+  moduleId: string;
+  courseId: string;
+  /** The full proposed replacement body for the module. */
+  proposedBodyMdx: string;
+  /** pending | approved | rejected */
+  status: string;
+  requestedById: string;
+  reviewedById: string | null;
+  reviewedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+  module: { title: string; slug: string; courseId: string };
+  course: { name: string; slug: string };
+  requestedBy: { fullName: string | null; email: string };
+}
+
+function toModuleEditRequestResponse(row: ModuleEditRequestWithContext): ModuleEditRequestResponse {
+  return {
+    id: row.id,
+    moduleId: row.moduleId,
+    courseId: row.courseId,
+    proposedBodyMdx: row.proposedBodyMdx,
+    status: row.status,
+    requestedById: row.requestedById,
+    reviewedById: row.reviewedById,
+    reviewedAt: row.reviewedAt,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    module: { title: row.module.title, slug: row.module.slug, courseId: row.module.courseId },
+    course: { name: row.course.name, slug: row.course.slug },
+    requestedBy: { fullName: row.requestedBy.fullName, email: row.requestedBy.email },
+  };
+}
+
 @Route('module-edit-requests')
 @Tags('ModuleEditRequests')
 export class ModuleEditRequestController extends Controller {
@@ -52,24 +93,24 @@ export class ModuleEditRequestController extends Controller {
     @Request() request: ExpressRequest,
     @Query() limit?: string,
     @Query() offset?: string,
-  ): Promise<ModuleEditRequestWithContext[]> {
+  ): Promise<ModuleEditRequestResponse[]> {
     setPrivateNoStoreCache(this);
     await requireCanApproveModuleEdits(request.user as User);
     const parsedLimit = limit === undefined ? DEFAULT_QUEUE_PAGE_SIZE : Number.parseInt(limit, 10);
     const parsedOffset = offset === undefined ? 0 : Number.parseInt(offset, 10);
     const pageSize = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, MAX_QUEUE_PAGE_SIZE) : DEFAULT_QUEUE_PAGE_SIZE;
     const pageOffset = Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
-    return moduleEditRequestRepository.listByStatus(status, pageSize, pageOffset);
+    return (await moduleEditRequestRepository.listByStatus(status, pageSize, pageOffset)).map(toModuleEditRequestResponse);
   }
 
   @Get('{id}')
   @Security('session')
-  public async getOne(@Path() id: string, @Request() request: ExpressRequest, @Res() notFound: TsoaResponse<404, void>): Promise<ModuleEditRequestWithContext | void> {
+  public async getOne(@Path() id: string, @Request() request: ExpressRequest, @Res() notFound: TsoaResponse<404, void>): Promise<ModuleEditRequestResponse | void> {
     setPrivateNoStoreCache(this);
     await requireCanApproveModuleEdits(request.user as User);
     const row = await moduleEditRequestRepository.findById(id);
     if (!row) return notFound(404);
-    return row;
+    return toModuleEditRequestResponse(row);
   }
 
   @Put('{id}/approve')

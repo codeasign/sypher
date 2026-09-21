@@ -26,7 +26,7 @@ const transport = nodemailer.createTransport({
 
 async function send(params: SendEmailParams): Promise<SendEmailResult> {
   try {
-    await transport.sendMail({ from, to: params.to, subject: params.subject, html: params.html });
+    await transport.sendMail({ from, to: params.to, subject: params.subject, html: params.html, text: params.text });
     return { success: true, provider: 'smtp' };
   } catch (err) {
     return { success: false, provider: 'smtp', error: err instanceof Error ? err.message : 'SMTP send failed' };

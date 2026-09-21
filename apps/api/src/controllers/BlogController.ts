@@ -48,6 +48,53 @@ interface SetBlogStatusRequest {
   status: 'draft' | 'published';
 }
 
+// Response shape for a blog post. Explicit DTO instead of Prisma's `BlogPost`
+// model type, which leaks Prisma's `DefaultSelection` payload wrapper into
+// the OpenAPI spec. Same columns as the model, with honest nullability.
+/** A blog post. */
+export interface BlogPostResponse {
+  id: string;
+  slug: string;
+  title: string;
+  description: string;
+  content: string;
+  coverImageUrl: string | null;
+  /** pdf | youtube */
+  featuredMediaType: string | null;
+  featuredMediaValue: string | null;
+  tags: string[];
+  /** draft | published */
+  status: string;
+  authorId: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  publishedAt: Date | null;
+}
+
+export interface BlogPostListResponse {
+  posts: BlogPostResponse[];
+  total: number;
+}
+
+function toBlogPostResponse(post: BlogPost): BlogPostResponse {
+  return {
+    id: post.id,
+    slug: post.slug,
+    title: post.title,
+    description: post.description,
+    content: post.content,
+    coverImageUrl: post.coverImageUrl,
+    featuredMediaType: post.featuredMediaType,
+    featuredMediaValue: post.featuredMediaValue,
+    tags: post.tags,
+    status: post.status,
+    authorId: post.authorId,
+    createdAt: post.createdAt,
+    updatedAt: post.updatedAt,
+    publishedAt: post.publishedAt,
+  };
+}
+
 @Route('blog')
 @Tags('Blog')
 export class BlogController extends Controller {
@@ -99,7 +146,7 @@ export class BlogController extends Controller {
     @Query() limit?: string,
     @Query() offset?: string,
     @Query() search?: string,
-  ): Promise<{ posts: BlogPost[]; total: number }> {
+  ): Promise<BlogPostListResponse> {
     setPrivateNoStoreCache(this);
     const user = request.user as User;
     await requireCanManageBlog(user);
@@ -107,19 +154,20 @@ export class BlogController extends Controller {
     const parsedOffset = offset === undefined ? 0 : Number.parseInt(offset, 10);
     const pageSize = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, MAX_MANAGE_PAGE_SIZE) : 10;
     const pageOffset = Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
-    return blogPostRepository.listPage(pageSize, pageOffset, user.role === 'ADMIN' ? undefined : user.id, search);
+    const { posts, total } = await blogPostRepository.listPage(pageSize, pageOffset, user.role === 'ADMIN' ? undefined : user.id, search);
+    return { posts: posts.map(toBlogPostResponse), total };
   }
 
   @Post()
   @Security('session')
-  public async create(@Body() body: CreateBlogPostRequest, @Request() request: ExpressRequest): Promise<BlogPost> {
+  public async create(@Body() body: CreateBlogPostRequest, @Request() request: ExpressRequest): Promise<BlogPostResponse> {
     const user = request.user as User;
     await requireCanManageBlog(user);
     assertNoReplacementChar(body.title, 'Title');
     assertNoReplacementChar(body.description, 'Description');
     const post = await blogPostRepository.create({ ...body, authorId: user.id });
     purge('blog');
-    return post;
+    return toBlogPostResponse(post);
   }
 
   private async assertOwnsPost(user: User, id: string): Promise<void> {

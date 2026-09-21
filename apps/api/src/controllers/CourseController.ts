@@ -1,6 +1,7 @@
 import { Body, Controller, Delete, Get, Path, Post, Put, Query, Request, Res, Route, Security, Tags, type TsoaResponse } from 'tsoa';
 import type { Request as ExpressRequest } from 'express';
-import type { Course, CourseModule, Role, User } from '@prisma/client';
+import type { Course, CourseModule, User } from '@prisma/client';
+import type { Role } from '../lib/apiEnums';
 import { CourseRepository } from '../repositories/CourseRepository';
 import {
   CourseModuleRepository,
@@ -92,7 +93,52 @@ interface CourseSetCompanyGrantRequest {
   allowed: boolean;
 }
 
-interface CourseWithAccess extends Course {
+// Response shape for a course. An explicit DTO instead of Prisma's `Course`
+// model type, which leaks Prisma's `DefaultSelection` payload wrapper into
+// the OpenAPI spec. Same columns as the model, with honest nullability.
+/** A course. */
+export interface CourseResponse {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  coverImageUrl: string | null;
+  category: string | null;
+  /** Comma-separated slugs of related courses. */
+  relatedCourses: string | null;
+  audienceRole: string | null;
+  /** draft | published */
+  status: string;
+  authorId: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  publishedAt: Date | null;
+}
+
+export interface CourseListResponse {
+  courses: CourseResponse[];
+  total: number;
+}
+
+function toCourseResponse(course: Course): CourseResponse {
+  return {
+    id: course.id,
+    slug: course.slug,
+    name: course.name,
+    description: course.description,
+    coverImageUrl: course.coverImageUrl,
+    category: course.category,
+    relatedCourses: course.relatedCourses,
+    audienceRole: course.audienceRole,
+    status: course.status,
+    authorId: course.authorId,
+    createdAt: course.createdAt,
+    updatedAt: course.updatedAt,
+    publishedAt: course.publishedAt,
+  };
+}
+
+interface CourseWithAccess extends CourseResponse {
   hasFullAccess: boolean;
   // Has the user completed at least one module of this course (ever) —
   // Enroll (false) vs Resume (true) on the course card. A fully completed
@@ -111,12 +157,59 @@ interface CourseByIdsRequest {
   ids: string[];
 }
 
-interface CourseModuleWithProgress extends CourseModule {
+/** Response shape for a course module (lesson), including its body. Explicit DTO instead of Prisma's `CourseModule` model type. */
+export interface CourseModuleResponse {
+  id: string;
+  courseId: string;
+  slug: string;
+  title: string;
+  /** content | assignment | video | mcq */
+  moduleType: string;
+  isCertification: boolean;
+  bodyMdx: string;
+  orderIndex: number;
+  sectionLabel: string | null;
+  sectionOrder: number | null;
+  /** manual | generated */
+  authoringMode: string;
+  showInGettingStarted: boolean;
+  gettingStartedOrder: number | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** A module without its (large) body, for navigation lists. */
+export type CourseModuleSummaryResponse = Omit<CourseModuleResponse, 'bodyMdx'>;
+
+function toCourseModuleSummaryResponse(mod: CourseModuleSummary): CourseModuleSummaryResponse {
+  return {
+    id: mod.id,
+    courseId: mod.courseId,
+    slug: mod.slug,
+    title: mod.title,
+    moduleType: mod.moduleType,
+    isCertification: mod.isCertification,
+    orderIndex: mod.orderIndex,
+    sectionLabel: mod.sectionLabel,
+    sectionOrder: mod.sectionOrder,
+    authoringMode: mod.authoringMode,
+    showInGettingStarted: mod.showInGettingStarted,
+    gettingStartedOrder: mod.gettingStartedOrder,
+    createdAt: mod.createdAt,
+    updatedAt: mod.updatedAt,
+  };
+}
+
+function toCourseModuleResponse(mod: CourseModule): CourseModuleResponse {
+  return { ...toCourseModuleSummaryResponse(mod), bodyMdx: mod.bodyMdx };
+}
+
+interface CourseModuleWithProgress extends CourseModuleResponse {
   completed: boolean;
   locked: boolean;
 }
 
-interface CourseModuleSummaryWithProgress extends CourseModuleSummary {
+interface CourseModuleSummaryWithProgress extends CourseModuleSummaryResponse {
   completed: boolean;
   locked: boolean;
 }
@@ -124,7 +217,7 @@ interface CourseModuleSummaryWithProgress extends CourseModuleSummary {
 // One earned course completion as listed on /mock-tests — the course is
 // embedded so the page renders name/link without a second round-trip.
 interface MockTestEntry {
-  course: Course;
+  course: CourseResponse;
   completedAt: Date;
 }
 
@@ -209,7 +302,7 @@ async function computeAllWithAccess(user: User): Promise<CourseWithAccess[]> {
       const info = await courseAccessInfo(user, course, totalModules);
       const completedModules = Math.min(completedByCourse.get(course.id) ?? 0, totalModules);
       return {
-        ...course,
+        ...toCourseResponse(course),
         hasFullAccess: info.hasFullAccess,
         started: startedIds.has(course.id),
         completedModules,
@@ -309,11 +402,11 @@ export class CourseController extends Controller {
   public async getByIds(
     @Body() body: CourseByIdsRequest,
     @Res() badRequest: TsoaResponse<400, { message: string }>,
-  ): Promise<Course[] | void> {
+  ): Promise<CourseResponse[] | void> {
     if (body.ids.length > MAX_IDS_PER_REQUEST) {
       return badRequest(400, { message: `Too many ids — max ${MAX_IDS_PER_REQUEST} per request` });
     }
-    return courseRepository.findByIds(body.ids);
+    return (await courseRepository.findByIds(body.ids)).map(toCourseResponse);
   }
 
   @Post('modules/by-ids')
@@ -338,24 +431,25 @@ export class CourseController extends Controller {
     @Query() limit?: string,
     @Query() offset?: string,
     @Query() search?: string,
-  ): Promise<{ courses: Course[]; total: number }> {
+  ): Promise<CourseListResponse> {
     setPrivateNoStoreCache(this);
     await requireCanManageCourses(request.user as User);
     const parsedLimit = limit === undefined ? 10 : Number.parseInt(limit, 10);
     const parsedOffset = offset === undefined ? 0 : Number.parseInt(offset, 10);
     const pageSize = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, MAX_MANAGE_PAGE_SIZE) : 10;
     const pageOffset = Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
-    return courseRepository.listAllPage(pageSize, pageOffset, search);
+    const { courses, total } = await courseRepository.listAllPage(pageSize, pageOffset, search);
+    return { courses: courses.map(toCourseResponse), total };
   }
 
   @Get('manage/{id}')
   @Security('session')
-  public async getManage(@Path() id: string, @Request() request: ExpressRequest, @Res() notFound: TsoaResponse<404, void>): Promise<Course | void> {
+  public async getManage(@Path() id: string, @Request() request: ExpressRequest, @Res() notFound: TsoaResponse<404, void>): Promise<CourseResponse | void> {
     setPrivateNoStoreCache(this);
     await requireCanManageCourses(request.user as User);
     const course = await courseRepository.findById(id);
     if (!course) return notFound(404);
-    return course;
+    return toCourseResponse(course);
   }
 
   // Identical for every signed-in user (no per-user branching at all) —
@@ -385,7 +479,7 @@ export class CourseController extends Controller {
     const publishedById = new Map(courses.filter((c) => c.status === 'published').map((c) => [c.id, c]));
     return completions.flatMap((completion) => {
       const course = publishedById.get(completion.courseId);
-      return course ? [{ course, completedAt: completion.completedAt }] : [];
+      return course ? [{ course: toCourseResponse(course), completedAt: completion.completedAt }] : [];
     });
   }
 
@@ -419,7 +513,7 @@ export class CourseController extends Controller {
     ]);
     return modules.map((m) => {
       const locked = !info.hasFullAccess && !isModuleFreelyVisible(m, modules);
-      return { ...m, completed: completedIds.has(m.id), locked };
+      return { ...toCourseModuleSummaryResponse(m), completed: completedIds.has(m.id), locked };
     });
   }
 
@@ -448,7 +542,7 @@ export class CourseController extends Controller {
     ]);
     if (!mod) return notFound(404);
     const locked = !info.hasFullAccess && !isModuleFreelyVisible(mod, modules);
-    return { ...mod, bodyMdx: locked ? '' : mod.bodyMdx, completed: completedIds.has(mod.id), locked };
+    return { ...toCourseModuleResponse(mod), bodyMdx: locked ? '' : mod.bodyMdx, completed: completedIds.has(mod.id), locked };
   }
 
   // Marks the module read/completed for the calling user. Idempotent —
@@ -497,12 +591,12 @@ export class CourseController extends Controller {
 
   @Post()
   @Security('session')
-  public async create(@Body() body: CourseCreateRequest, @Request() request: ExpressRequest): Promise<Course> {
+  public async create(@Body() body: CourseCreateRequest, @Request() request: ExpressRequest): Promise<CourseResponse> {
     const user = request.user as User;
     await requireCanManageCourses(user);
     assertNoReplacementChar(body.name, 'Name');
     assertNoReplacementChar(body.description, 'Description');
-    return courseRepository.create({ ...body, authorId: user.id });
+    return toCourseResponse(await courseRepository.create({ ...body, authorId: user.id }));
   }
 
   @Put('{id}')
@@ -541,10 +635,10 @@ export class CourseController extends Controller {
   // admin-authored content, not user-generated volume.
   @Get('{courseId}/manage/modules')
   @Security('session')
-  public async listManageModules(@Path() courseId: string, @Request() request: ExpressRequest): Promise<CourseModule[]> {
+  public async listManageModules(@Path() courseId: string, @Request() request: ExpressRequest): Promise<CourseModuleResponse[]> {
     setPrivateNoStoreCache(this);
     await requireCanManageCourses(request.user as User);
-    return courseModuleRepository.listForCourse(courseId);
+    return (await courseModuleRepository.listForCourse(courseId)).map(toCourseModuleResponse);
   }
 
   @Post('{courseId}/modules')
@@ -553,7 +647,7 @@ export class CourseController extends Controller {
     @Path() courseId: string,
     @Body() body: CourseModuleCreateRequest,
     @Request() request: ExpressRequest,
-  ): Promise<CourseModule> {
+  ): Promise<CourseModuleResponse> {
     const user = request.user as User;
     await requireCanManageCourses(user);
     // Same content gate as updateModule — non-Admins can still create the
@@ -565,7 +659,7 @@ export class CourseController extends Controller {
     assertImportedDiagramCaptions(body.bodyMdx);
     const mod = await courseModuleRepository.create(courseId, body);
     purge('courses');
-    return mod;
+    return toCourseModuleResponse(mod);
   }
 
   // Migration imports retain stable source slugs, section metadata and order.
@@ -576,7 +670,7 @@ export class CourseController extends Controller {
     @Path() courseId: string,
     @Body() body: ImportCourseModuleInput,
     @Request() request: ExpressRequest,
-  ): Promise<CourseModule> {
+  ): Promise<CourseModuleResponse> {
     await requireCanManageCourses(request.user as User);
     if (!await courseRepository.findById(courseId)) throw new HttpError(404, 'Course not found');
     if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(body.slug)) throw new HttpError(400, 'Invalid module slug');
@@ -586,7 +680,7 @@ export class CourseController extends Controller {
     assertImportedDiagramCaptions(body.bodyMdx);
     const mod = await courseModuleRepository.upsertImported(courseId, body);
     purge('courses');
-    return mod;
+    return toCourseModuleResponse(mod);
   }
 
   @Put('{courseId}/modules/{moduleId}')
@@ -699,7 +793,7 @@ export class CourseController extends Controller {
       courseModuleRepository.countForCourse(course.id),
     ]);
     return {
-      ...course,
+      ...toCourseResponse(course),
       hasFullAccess: info.hasFullAccess,
       started: startedIds.has(course.id),
       completedModules: Math.min(completedIds.size, totalModules),

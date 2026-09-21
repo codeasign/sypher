@@ -1,6 +1,7 @@
 import { Controller, Get, Post, Body, Request, Res, Route, Security, Tags, type TsoaResponse } from 'tsoa';
 import type { Request as ExpressRequest } from 'express';
-import type { Role, User } from '@prisma/client';
+import type { User } from '@prisma/client';
+import type { Role } from '../lib/apiEnums';
 import { UserRepository } from '../repositories/UserRepository';
 import { CompanyRepository } from '../repositories/CompanyRepository';
 import { createProvisionedUser } from '../lib/userProvisioning';
@@ -49,6 +50,7 @@ const ROLE_EDITABLE_ROLES: readonly Role[] = [
   'ADMIN',
   'FREE_USER',
   'PAID_USER',
+  'MOBILE_USER',
   'INTERNAL_HR',
   'COMPANY_HR',
   'COMPANY_EMPLOYEE',
@@ -58,7 +60,7 @@ const ROLE_EDITABLE_ROLES: readonly Role[] = [
   'COURSE_AUDITOR',
 ];
 
-// FIXED roster only — the 10 role accounts + forcloudread@gmail.com. Static
+// FIXED roster only — the 11 role accounts + forcloudread@gmail.com. Static
 // source code, never mutated at runtime, so it's identical on every apps/api
 // instance by construction and needs no shared table. Ad-hoc accounts added
 // via the "add email" box live in the DB ("CustomTestAccount", see
@@ -71,6 +73,7 @@ const TEST_ACCOUNTS: readonly TestAccountDef[] = [
   { email: 'admin-test@sypher.local', fullName: 'Admin Test', role: 'ADMIN' },
   { email: 'free-test@sypher.local', fullName: 'Free Test', role: 'FREE_USER' },
   { email: 'paid-test@sypher.local', fullName: 'Paid Test', role: 'PAID_USER' },
+  { email: 'mobile-test@sypher.local', fullName: 'Mobile Test', role: 'MOBILE_USER' },
   { email: 'internalhr-test@sypher.local', fullName: 'Internal HR Test', role: 'INTERNAL_HR' },
   { email: 'companyhr-test@sypher.local', fullName: 'Company HR Test', role: 'COMPANY_HR', companyName: 'Acme Corp' },
   { email: 'companyemployee-test@sypher.local', fullName: 'Company Employee Test', role: 'COMPANY_EMPLOYEE', companyName: 'Acme Corp' },

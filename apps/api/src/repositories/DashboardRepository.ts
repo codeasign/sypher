@@ -35,6 +35,8 @@ interface PlatformStats {
 // sync by hand (small, rarely-changing list).
 const CATEGORY_LABELS: Record<string, string> = {
   tech: 'Tech',
+  coding: 'Coding',
+  databases: 'Databases',
   'life-skills': 'Life Skills',
   Presentation: 'Presentation Skills',
 };
@@ -70,7 +72,7 @@ export interface DashboardCourseRef {
   totalModules: number;
 }
 
-export interface DashboardData {
+export interface UserDashboardResponse {
   plan: {
     role: string;
     isPaidActive: boolean;
@@ -178,7 +180,7 @@ export class DashboardRepository {
     });
   }
 
-  async build(user: User): Promise<DashboardData> {
+  async build(user: User): Promise<UserDashboardResponse> {
     const now = new Date();
     const todayStart = startOfUtcDay(now);
 

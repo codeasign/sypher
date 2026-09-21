@@ -75,7 +75,16 @@ const requireAdminForDocs: RequestHandler = (req, res, next) => {
     .catch(next);
 };
 
-app.use('/docs', requireAdminForDocs, swaggerUi.serve, swaggerUi.setup(require('./generated/swagger.json')));
+// Raw OpenAPI document (the same object tsoa writes to generated/swagger.json),
+// for API clients and codegen. Deliberately NOT behind requireAdminForDocs:
+// it describes the API's shape, it carries no user data. Registered before
+// the /docs mount so the admin gate on the Swagger UI never catches it.
+const swaggerDocument = require('./generated/swagger.json');
+app.get('/docs/swagger.json', (_req, res) => {
+  res.json(swaggerDocument);
+});
+
+app.use('/docs', requireAdminForDocs, swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });

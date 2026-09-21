@@ -1,6 +1,7 @@
 import { Body, Controller, Delete, Get, Patch, Path, Post, Query, Request, Res, Route, Security, Tags, type TsoaResponse } from 'tsoa';
 import type { Request as ExpressRequest } from 'express';
-import type { CommentVoteType, User } from '@prisma/client';
+import type { User } from '@prisma/client';
+import type { CommentVoteType } from '../lib/apiEnums';
 import {
   CommentRepository,
   isCommentSortMode,
