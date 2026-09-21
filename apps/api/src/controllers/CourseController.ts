@@ -23,6 +23,7 @@ import { getOrSet, purge } from '../lib/cache';
 import { setPublicListCache, setPrivateNoStoreCache } from '../lib/httpCache';
 import { assertNoReplacementChar } from '../lib/textSanitize';
 import { HttpError } from '../lib/errors';
+import { createLogger } from '../lib/logger';
 import { assertImportedDiagramCaptions } from '../lib/diagramMarkup';
 
 const courseRepository = new CourseRepository();
@@ -321,6 +322,8 @@ function paginate<T>(items: T[], limit?: string, offset?: string): { items: T[];
   return { items: items.slice(pageOffset, pageOffset + pageSize), total: items.length };
 }
 
+const logger = createLogger('courses');
+
 @Route('courses')
 @Tags('Courses')
 export class CourseController extends Controller {
@@ -612,8 +615,10 @@ export class CourseController extends Controller {
   @Put('{id}/status')
   @Security('session')
   public async updateStatus(@Path() id: string, @Body() body: CourseSetStatusRequest, @Request() request: ExpressRequest): Promise<void> {
-    await requireCanManageCourses(request.user as User);
-    await courseRepository.setStatus(id, body.status);
+    const user = request.user as User;
+    await requireCanManageCourses(user);
+    const { from, to } = await courseRepository.setStatus(id, body.status, user.id);
+    logger.info(`course status changed: ${id} ${from} -> ${to} by ${user.email} (${user.id})`);
     purge('courses');
   }
 

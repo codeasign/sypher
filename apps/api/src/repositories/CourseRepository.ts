@@ -133,10 +133,19 @@ export class CourseRepository {
     await prisma.course.update({ where: { id }, data });
   }
 
-  async setStatus(id: string, status: 'draft' | 'published'): Promise<void> {
-    await prisma.course.update({
-      where: { id },
-      data: { status, publishedAt: status === 'published' ? new Date() : null },
+  // Changes the status AND records who/what/when in CourseStatusChange, in one transaction, so a
+  // status can never change without an audit row. Returns the transition for logging.
+  async setStatus(id: string, status: 'draft' | 'published', changedById: string): Promise<{ from: string; to: string }> {
+    return prisma.$transaction(async (tx) => {
+      const current = await tx.course.findUniqueOrThrow({ where: { id }, select: { status: true } });
+      await tx.course.update({
+        where: { id },
+        data: { status, publishedAt: status === 'published' ? new Date() : null },
+      });
+      await tx.courseStatusChange.create({
+        data: { courseId: id, fromStatus: current.status, toStatus: status, changedById },
+      });
+      return { from: current.status, to: status };
     });
   }
 
