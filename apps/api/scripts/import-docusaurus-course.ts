@@ -51,6 +51,8 @@
 // Usage (from apps/api):
 //   npx tsx scripts/import-docusaurus-course.ts [slug ...]
 //   npx tsx scripts/import-docusaurus-course.ts --verify [slug ...]
+//   npx tsx scripts/import-docusaurus-course.ts --force [slug ...]   (re-import over a non-draft course)
+// A course that is not a draft is refused unless --force is passed; new courses are always created as draft.
 // Verification compares stored content against source without uploading or writing.
 // All course/module writes use the seeded admin's authenticated management API.
 //   (no args = all 20 target courses)
@@ -68,6 +70,7 @@ const DOCS_ROOT = path.resolve(__dirname, '../../docs');
 const API_URL = process.env.IMPORT_API_URL || 'http://localhost:4000';
 let sessionCookie = '';
 const VERIFY_ONLY = process.argv.includes('--verify');
+const FORCE = process.argv.includes('--force');
 
 async function findCourse(slug: string): Promise<any> {
   for (let offset = 0; ; offset += 100) {
@@ -501,6 +504,14 @@ async function importCourse(courseSlug: string): Promise<void> {
   console.log(`
 === ${courseSlug} ===`);
 
+  // Refuse before converting or uploading anything if this would overwrite a live course.
+  if (!VERIFY_ONLY && !FORCE) {
+    const existing = await findCourse(courseSlug);
+    if (existing && existing.status !== 'draft') {
+      throw new Error(`${courseSlug} is "${existing.status}", not draft. Re-importing would overwrite its live module content. Nothing was written. Re-run with --force if that is really intended (the status is left unchanged).`);
+    }
+  }
+
   const virtual = VIRTUAL_COURSES[courseSlug];
   const docsSlug = virtual ? virtual.docsCourse : courseSlug;
 
@@ -602,9 +613,21 @@ async function importCourse(courseSlug: string): Promise<void> {
     category: virtual ? virtual.category : 'tech',
   };
   if (course) {
+    // Never touch a live course by accident. A re-import overwrites every module body, so it
+    // is only allowed over a draft; anything else needs an explicit --force.
+    if (course.status !== 'draft' && !FORCE) {
+      throw new Error(`${courseSlug} is "${course.status}", not draft. Re-importing would overwrite its live module content. Nothing was written. Re-run with --force if that is really intended (the status is left unchanged).`);
+    }
+    if (course.status !== 'draft') {
+      console.warn(`  --force: overwriting live content of ${courseSlug} (status "${course.status}" is left unchanged).`);
+    }
     await api('PUT', `/courses/${course.id}`, fields);
   } else {
     course = await api('POST', '/courses', { slug: courseSlug, ...fields });
+    // New courses must always start as draft, whatever the API default is. Publishing is an
+    // explicit admin action after review (see the header comment), never a side effect of import.
+    await api('PUT', `/courses/${course.id}/status`, { status: 'draft' });
+    course = { ...course, status: 'draft' };
   }
 
   let orderIndex = 0;
@@ -628,7 +651,7 @@ async function importCourse(courseSlug: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const requested = process.argv.slice(2).filter(arg => arg !== '--verify');
+  const requested = process.argv.slice(2).filter(arg => arg !== '--verify' && arg !== '--force');
   const slugs = requested.length > 0 ? requested : TARGET_COURSES;
 
   const unknown = slugs.filter((s) => !TARGET_COURSES.includes(s));
