@@ -22,7 +22,7 @@ don't rely on memory of what it says. Every rule in it applies here
 unchanged: what "converted" means, the landscape-band gate enforced by
 `scripts/check-landscape-band.mjs` in Phase 2b (a real script, not a
 manual check — never wire in anything it doesn't report `PASS` for),
-transparent-background-always, the special-character escaping gotchas,
+the blackboard-theme-always render rule (no transparent backgrounds), the special-character escaping gotchas,
 the corrupted-content handling, and the hard rule to never touch `content`
 on anything that isn't corrupted. The only thing this command changes is
 the *scope* of Phase 1 and Phase 3 — batch-sized instead of whole-course.

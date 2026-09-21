@@ -12,6 +12,9 @@
  * completely untouched and listed in NEEDS_LLM.md — that's the only work
  * left for the existing Phase 2a/2b/2c reasoning pass.
  *
+ * Rendering, band-check and type-check are delegated to the shared gate
+ * (scripts/check-landscape-band-parallel.mjs) — nothing is rendered here.
+ *
  * Hard rules preserved from the parent command:
  *   - `content` is NEVER touched, ever
  *   - background is ALWAYS transparent
@@ -35,11 +38,23 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
+import { classifyFile } from './classify-diagram-type.mjs';
 
 // ---------- CLI args ----------
 
 const rawArgs = process.argv.slice(2);
 const DRY_RUN = rawArgs.includes('--dry-run');
+// SAFETY STOP (2026-09-19): this deterministic parser picks up only the boxes it can trace and
+// silently drops the rest. In the first real run it wired three diagrams that passed the shape
+// gate but were wrong — one showed 2 nodes out of ~12 (plus a literal "&lt;br/&gt;" in a label),
+// one kept 5 of ~10 state transitions with a mangled label. The gate checks SHAPE, not content.
+// Real runs therefore need an explicit override AND a manual comparison of every output against
+// its source ASCII; the LLM path (convert-ascii-diagrams.md) + check-diagram-fidelity.mjs is the
+// supported route. --dry-run (counting only) is always safe.
+if (!DRY_RUN && !rawArgs.includes('--force-unverified')) {
+  console.error('Refusing to run: autoconvert output is not content-verified. Use --dry-run to count, or pass --force-unverified and hand-check every result against its ASCII.');
+  process.exit(1);
+}
 const SLUGS = rawArgs.filter((a) => !a.startsWith('--'));
 if (SLUGS.length === 0) {
   console.error('Usage: node ascii-to-mermaid-autoconvert.mjs <course-slug> [more-slugs...] [--dry-run]');
@@ -83,8 +98,10 @@ function normalizeChar(ch) {
 // attempted here. Signature: long runs of punctuation noise that aren't
 // legitimate box-drawing/ascii-art characters.
 function looksCorrupted(content) {
-  const noisePattern = /[a-z]--[,.]--\?[a-z]|[?$%^&*]{4,}/i;
-  return noisePattern.test(content);
+  // Only the documented encoding-corruption signature (f--,--?s...) or U+FFFD. The old
+  // catch-all [?$%^&*]{4,} false-positived on legit art ($$, ****, ^^^^).
+  const noisePattern = /[a-z]--[,.]--\?[a-z]/i;
+  return noisePattern.test(content) || content.includes('\uFFFD');
 }
 
 // ---------- JSX <AsciiDiagram> extraction (brace/backtick-aware) ----------
@@ -122,7 +139,7 @@ function extractAsciiDiagramTags(source) {
 }
 
 function getContentValue(tagText) {
-  const m = tagText.match(/content=\{`([\s\S]*?)`\}/);
+  const m = tagText.match(/content=\{\s*`([\s\S]*?)`\s*\}/); // tolerates multi-line content={ <newline> `...` <newline> }
   return m ? m[1] : null;
 }
 
@@ -306,52 +323,30 @@ function pickInitialDirection(parsed) {
   return horizontalEdges.length >= parsed.edges.length / 2 ? 'LR' : 'TD';
 }
 
-// ---------- rendering + landscape-band check ----------
+// ---------- rendering + gating (delegated to the shared gate) ----------
+// This script no longer renders or band-checks anything itself. Every generated
+// .mmd goes through scripts/check-landscape-band-parallel.mjs ->
+// check-landscape-band.mjs: the same blackboard theme (#0B0F14 board), 12-char
+// hash, intrinsic-size fix, landscape band, direction-flip retry and
+// classifier type check the manual/LLM path uses. (It used to call mmdc with
+// -b transparent and no theme config, which produced off-theme SVGs.)
 
-function hashContent(content) {
-  return createHash('sha256').update(content).digest('hex').slice(0, 16);
-}
+const GATE_RUNNER = path.resolve('scripts/check-landscape-band-parallel.mjs');
 
-let mmdcChecked = false, mmdcAvailable = false;
-function checkMmdc() {
-  if (mmdcChecked) return mmdcAvailable;
-  mmdcChecked = true;
+function runGate(mmdPaths) {
+  const results = new Map();
+  if (mmdPaths.length === 0) return results;
+  const listFile = path.join(os.tmpdir(), `autoconvert-gate-${process.pid}.txt`);
+  writeFileSync(listFile, mmdPaths.join('\n'), 'utf8');
+  let out;
   try {
-    execFileSync('npx', ['--no-install', 'mmdc', '--version'], { stdio: 'ignore', shell: true });
-    mmdcAvailable = true;
-  } catch { mmdcAvailable = false; }
-  return mmdcAvailable;
-}
-
-function renderMermaid(mermaidCode, hash) {
-  const tmpFile = path.join(os.tmpdir(), `${hash}.mmd`);
-  writeFileSync(tmpFile, mermaidCode, 'utf8');
-  const outFile = path.join(IMG_OUT_DIR, `${hash}.svg`);
-  const puppeteerConfig = path.join(os.tmpdir(), 'mmdc-puppeteer.json');
-  if (!existsSync(puppeteerConfig)) {
-    writeFileSync(puppeteerConfig, JSON.stringify({ args: ['--no-sandbox'] }), 'utf8');
+    out = execFileSync(process.execPath, [GATE_RUNNER, '--json', '--list', listFile], { encoding: 'utf8', maxBuffer: 1 << 29, stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch (err) {
+    out = err.stdout; // the runner exits 1 when any file failed; the JSON is still on stdout
+    if (!out) throw new Error(`gate runner failed: ${err.message}`);
   }
-  const args = ['--no-install', 'mmdc', '-i', tmpFile, '-o', outFile, '-e', 'svg', '-b', 'transparent', '-p', puppeteerConfig];
-  try {
-    execFileSync('npx', args, { stdio: 'ignore', shell: true });
-  } catch {
-    try {
-      execFileSync('npx', args, { stdio: 'ignore', shell: true }); // one retry, per repo convention
-    } catch (err) {
-      throw new Error(`mmdc failed after retry: ${err.message}`);
-    }
-  }
-  return outFile;
-}
-
-function checkLandscapeBand(svgPath) {
-  const svg = readFileSync(svgPath, 'utf8');
-  const m = svg.match(/viewBox="([^"]*)"/);
-  if (!m) return { ok: false, reason: 'no viewBox found' };
-  const [, , w, h] = m[1].split(/\s+/).map(Number);
-  const ratio = w / h;
-  const ok = w <= 1400 && ratio >= 1.3 && ratio <= 3.5;
-  return { ok, w, h, ratio };
+  for (const r of JSON.parse(out)) results.set(path.resolve(r.mmdFile), r);
+  return results;
 }
 
 // ---------- file walk ----------
@@ -379,103 +374,88 @@ async function processCourse(slug) {
     return;
   }
 
-  const canRender = checkMmdc();
-  if (!canRender) {
-    console.warn('@mermaid-js/mermaid-cli not found — install with: npm install --save-dev @mermaid-js/mermaid-cli --prefix apps/docs');
-  }
-  if (!DRY_RUN) {
-    mkdirSync(IMG_OUT_DIR, { recursive: true });
-    mkdirSync(CACHE_DIR, { recursive: true });
-  }
+  if (!DRY_RUN) mkdirSync(CACHE_DIR, { recursive: true });
 
   const files = statSync(scanDir).isDirectory() ? walk(scanDir) : [scanDir];
   let found = 0, alreadyDone = 0, autoConverted = 0, needsLlm = 0, corrupted = 0;
   const needsLlmList = [];
+  const candidates = []; // { file, tag, tagIdx, mmdPath }
+  const relFile = (f) => path.relative(DOCS_ROOT, f);
 
+  // Pass 1 — parse. tagIdx is the tag's position among ALL <AsciiDiagram> tags in
+  // the file, which is exactly the manifest's diagramIndex, so the .mmd name here
+  // equals the manifest's mmdFile (the gate's type check looks diagrams up by it).
   for (const file of files) {
-    let source = readFileSync(file, 'utf8');
+    const source = readFileSync(file, 'utf8');
     const tags = extractAsciiDiagramTags(source);
-    if (tags.length === 0) continue;
-
-    let diagramIndex = 0;
-    const replacements = []; // { start, end, newTagText } bottom-up
-
-    for (const tag of tags) {
-      if (hasMermaidSrc(tag.text)) { alreadyDone++; continue; }
+    // This script only ever emits flowcharts, so it must not decide a diagram the
+    // classifier says is (or might be) another type — those go to the authoring step.
+    const classByIdx = new Map(classifyFile(file).map((r) => [r.diagramIndex, r]));
+    tags.forEach((tag, i) => {
+      const tagIdx = i + 1;
+      if (hasMermaidSrc(tag.text)) { alreadyDone++; return; }
       const content = getContentValue(tag.text);
-      if (content === null) continue; // not the expected shape, leave for manual review
+      if (content === null) return; // not the expected shape, leave for manual review
       found++;
-      diagramIndex++;
+
+      const cls = classByIdx.get(tagIdx);
+      if (cls && (cls.confidence === 'ambiguous' || cls.recommendedType !== 'flowchart')) {
+        needsLlm++;
+        needsLlmList.push({ file: relFile(file), index: tagIdx, reason: `type needs judgment (classifier: ${cls.confidence}, ${cls.recommendedType}) — this script only emits flowcharts` });
+        return;
+      }
 
       const parsed = parseAsciiDiagram(content);
-
       if (!parsed) {
         needsLlm++;
-        needsLlmList.push({ file: path.relative(DOCS_ROOT, file), index: diagramIndex, reason: 'unparseable (bent line, non-flowchart shape, or too few boxes)' });
-        continue;
+        needsLlmList.push({ file: relFile(file), index: tagIdx, reason: 'unparseable (bent line, non-flowchart shape, or too few boxes)' });
+        return;
       }
       if (parsed.corrupted) {
         corrupted++;
-        needsLlmList.push({ file: path.relative(DOCS_ROOT, file), index: diagramIndex, reason: 'corrupted content — needs reconstruction' });
-        continue;
+        needsLlmList.push({ file: relFile(file), index: tagIdx, reason: 'corrupted content — needs reconstruction' });
+        return;
       }
+      if (DRY_RUN) { autoConverted++; return; }
 
-      let direction = pickInitialDirection(parsed);
-      let mermaidCode = generateMermaid(parsed, direction);
-      const hash = hashContent(mermaidCode);
+      const mmdPath = path.join(CACHE_DIR, `${pageSlug(file)}-${tagIdx}.mmd`);
+      writeFileSync(mmdPath, generateMermaid(parsed, pickInitialDirection(parsed)), 'utf8');
+      candidates.push({ file, tag, tagIdx, mmdPath });
+    });
+  }
 
-      if (DRY_RUN) { autoConverted++; continue; }
-      if (!canRender) { needsLlm++; needsLlmList.push({ file: path.relative(DOCS_ROOT, file), index: diagramIndex, reason: 'mmdc unavailable' }); continue; }
+  // Pass 2 — gate every generated .mmd in one parallel run.
+  const gateResults = runGate(candidates.map((c) => c.mmdPath));
 
-      writeFileSync(path.join(CACHE_DIR, `${pageSlug(file)}-${diagramIndex}.mmd`), mermaidCode, 'utf8');
-
-      let svgPath, band;
-      try {
-        svgPath = renderMermaid(mermaidCode, hash);
-        band = checkLandscapeBand(svgPath);
-
-        if (!band.ok) {
-          // One retry: flip direction, per the documented direction heuristic.
-          direction = direction === 'LR' ? 'TD' : 'LR';
-          mermaidCode = generateMermaid(parsed, direction);
-          const hash2 = hashContent(mermaidCode);
-          svgPath = renderMermaid(mermaidCode, hash2);
-          band = checkLandscapeBand(svgPath);
-        }
-      } catch (err) {
-        needsLlm++;
-        needsLlmList.push({ file: path.relative(DOCS_ROOT, file), index: diagramIndex, reason: `render failed: ${err.message}` });
-        continue;
-      }
-
-      if (!band.ok) {
-        needsLlm++;
-        needsLlmList.push({
-          file: path.relative(DOCS_ROOT, file), index: diagramIndex,
-          reason: `renders outside landscape band (ratio=${band.ratio?.toFixed(2)}, w=${band.w}) — needs restructuring (split row, subgraphs, shorter labels)`,
-        });
-        continue;
-      }
-
-      const relSvg = `/img/diagrams/${path.basename(svgPath)}`;
-      const newTagText = tag.text.replace('/>', ` mermaidSrc="${relSvg}" />`);
-      replacements.push({ start: tag.start, end: tag.end, newTagText });
-      autoConverted++;
+  // Pass 3 — wire only what the gate passed.
+  const wiring = new Map(); // file -> [{ start, end, text, relSvg }]
+  for (const c of candidates) {
+    const r = gateResults.get(path.resolve(c.mmdPath));
+    if (!r || r.status !== 'pass') {
+      needsLlm++;
+      needsLlmList.push({ file: relFile(c.file), index: c.tagIdx, reason: r ? `gate FAIL: ${r.reason}` : 'gate returned no result' });
+      continue;
     }
-
-    if (replacements.length > 0 && !DRY_RUN) {
-      replacements.sort((a, b) => b.start - a.start);
-      for (const { start, end, newTagText } of replacements) {
-        source = source.slice(0, start) + newTagText + source.slice(end);
-      }
-      writeFileSync(file, source, 'utf8');
+    if (!wiring.has(c.file)) wiring.set(c.file, []);
+    wiring.get(c.file).push({ start: c.tag.start, end: c.tag.end, text: c.tag.text, relSvg: `/img/diagrams/${path.basename(r.svgPath)}` });
+    autoConverted++;
+  }
+  for (const [file, reps] of wiring) {
+    let source = readFileSync(file, 'utf8');
+    reps.sort((a, b) => b.start - a.start); // bottom-up keeps earlier offsets valid
+    for (const { start, end, text, relSvg } of reps) {
+      // A tag always ends in "/>"; append at the END (a first-match replace could hit a "/>" inside the ASCII content).
+      const close = text.lastIndexOf('/>');
+      const newTag = text.slice(0, close).replace(/\s*$/, '') + ` mermaidSrc="${relSvg}" />`;
+      source = source.slice(0, start) + newTag + source.slice(end);
     }
+    writeFileSync(file, source, 'utf8');
   }
 
   console.log(`\n=== ${slug} ===`);
   console.log(`Diagrams found (excl. already-converted): ${found}`);
   console.log(`Already had mermaidSrc (skipped): ${alreadyDone}`);
-  console.log(`Auto-converted (zero tokens): ${autoConverted}`);
+  console.log(`Auto-converted (zero tokens): ${autoConverted}${DRY_RUN ? ' (dry-run: upper bound, before gate)' : ''}`);
   console.log(`Corrupted content flagged: ${corrupted}`);
   console.log(`Needs LLM-assisted conversion: ${needsLlm}`);
 

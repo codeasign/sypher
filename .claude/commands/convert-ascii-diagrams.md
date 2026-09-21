@@ -369,15 +369,28 @@ Render and check every new `.mmd` file with the checked-in gate script:
 node scripts/check-landscape-band.mjs .cache/ascii-to-mermaid/<file-1>.mmd .cache/ascii-to-mermaid/<file-2>.mmd ...
 ```
 
-It always renders with `mmdc -b transparent` (never vary this flag between
-diagrams, courses, or runs — a mix of transparent and white/colored
-backgrounds is a visible inconsistency across the site), then checks the
+It always renders with the blackboard theme (`scripts/mermaid-blackboard.config.json`,
+board background `#0B0F14`, passed as `mmdc -b "#0B0F14" -c <config>`) — one baked-in
+look for dark AND light pages, user decision 2026-08-23. Never render with a
+different background or theme by hand (a mix of styles is a visible inconsistency
+across the site); the gate script is the only renderer that should be used. Before
+rendering, it also type-checks the `.mmd` against `classify-diagram-type.mjs` and
+FAILs on a clear-match, non-flowchart mismatch (`--no-type-check` for a deliberate,
+recorded exception). It then checks the
 band (`w<=1400`, `ratio 1.3-3.5`). For any diagram type with a direction
 hint it can flip (`flowchart <DIR>`/`graph <DIR>` as the declaration line,
 or a standalone `direction <DIR>` line — covers flowchart, classDiagram,
 stateDiagram-v2), it automatically flips and retries **once** if the first
 render fails. Diagrams with no direction hint (sequenceDiagram, erDiagram)
 get one render+check, no retry — there's nothing to mechanically flip.
+
+For a whole wave (dozens+ of files), use the parallel driver instead — same gate,
+same theme, same type check, same exit-code contract, just fanned out across worker
+processes (default 6; inputs must be disjoint files):
+
+```bash
+node scripts/check-landscape-band-parallel.mjs --workers 6 --list <files.txt>
+```
 
 Exit code is `0` only if every input passed. Read the output:
 - `PASS <file> ... -> <svgPath>` — use that `svgPath`'s hash in 2c.
@@ -408,6 +421,31 @@ grep -lE '&amp;\{|&amp;\}|&amp;#[0-9]' apps/docs/static/img/diagrams/*.svg
 Any match is a real bug in that diagram's source label — fix the `.mmd`
 (usually: strip the numeric entity down to the bare character) and
 re-run `check-landscape-band.mjs` on that file before moving to 2c.
+
+### 2b-2. Fidelity check (REQUIRED before wiring)
+
+The band gate proves *shape*, not that the Mermaid says what the ASCII says. Authoring
+agents were caught inventing structure (wave 1, 2026-09-19): edges the ASCII never draws
+("Cache Miss", "Health -> Alert Routing", a target for a dangling "Cache Hit" branch) and
+grouping titles that are not in the source ("Request path", "Legend", "Reading the chart").
+Every batch must pass this before anything is wired:
+
+```bash
+node scripts/check-diagram-fidelity.mjs --list <files.txt>
+```
+
+- **Blocking** — an *invented subgraph title* (a word not in the diagram's source ASCII or
+  `title=`), or *sibling panels rendered in reverse order*. Structural grouping clusters take a
+  blank title `subgraph X[" "]`; a numbered `Steps 1 to 4` marker is allowed (it carries order
+  when a long chain is split into rows). `--blank-invented-titles` fixes the mechanical cases in
+  place; "MIXED" titles (real + invented words) need a human edit. Order fix: chain the panels
+  (`A ~~~ B ~~~ C`) under an `LR` root. After any edit, re-run the gate and re-wire (the hash changes).
+- **Advisory** — label words absent from the source. Read each one against the rendered image;
+  this is where invented *edges* show up, which no script can detect.
+- Author rule for agents: **draw only edges, arrows and titles that exist in the ASCII.** If the
+  ASCII shows a line with no arrowhead or no target, use an undirected `---`, not an invented
+  `-->`. Never add a semantic relationship (a "feedback" arrow, a "miss" path) the source only implies
+  in prose.
 
 ### 2c. Wire every diagram in
 
@@ -500,8 +538,9 @@ except the shared `mmdc`/manifest tooling.
   `data-ascii-source`.
 - Never touch anything outside `<AsciiDiagram>` components in scope — no
   prose edits, no code-sample edits, no reformatting.
-- Background must be transparent on every single render, no exceptions —
-  that's what "consistent" means here.
+- Every render uses the blackboard theme and `#0B0F14` board background via
+  `check-landscape-band.mjs`, no exceptions — that's what "consistent" means
+  here (supersedes the old transparent-background rule, 2026-08-23).
 - Don't run `git add`/`commit`/`push` — leave changes in the working tree
   for review, same as every other content-fix command in this repo.
 - Re-running this command on an already-converted course must be a safe

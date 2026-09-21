@@ -129,6 +129,8 @@ const TARGET_COURSES = [
   'caching',
   // Added 2026-09-21: virtual course carved out of system-design-fundamentals Sections 5 and 8.
   'scaling-distributed-systems',
+  // Added 2026-09-21: virtual course carved out of system-design-fundamentals Sections 11 and 12.
+  'observability-cloud-infrastructure',
 ];
 
 // A "virtual" course is a slice of a larger Docusaurus course: it reads the docs, manifest and
@@ -138,6 +140,13 @@ const TARGET_COURSES = [
 // slug/name/category. Each topic (sidebar sub-category) becomes a section.
 // There is no course-level index page to seed a Course Overview from, so none is created.
 const VIRTUAL_COURSES: Record<string, { docsCourse: string; sidebarSection?: string; sidebarSections?: string[]; name: string; description: string; category: string; unwrapParagraphs?: boolean }> = {
+  'observability-cloud-infrastructure': {
+    docsCourse: 'system-design-fundamentals',
+    sidebarSections: ['Section 11 - Observability', 'Section 12 - Cloud and Infrastructure'],
+    name: 'Observability & Cloud Infrastructure',
+    description: 'Seventeen topics on running systems in production: SLIs, SLOs, error budgets, metrics, logging, tracing, alerting, dashboards and monitoring, then Docker, Kubernetes, autoscaling, serverless, deployment strategies, infrastructure as code, disaster recovery and multi-region design.',
+    category: 'System Design',
+  },
   'scaling-distributed-systems': {
     docsCourse: 'system-design-fundamentals',
     // Section 8 re-lists CAP Theorem, PACELC and Leader Election (same docs as Section 5): imported once.
