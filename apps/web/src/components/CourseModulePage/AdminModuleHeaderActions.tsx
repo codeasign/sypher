@@ -1,15 +1,13 @@
 'use client';
 
+import { PenLine } from 'lucide-react';
 import React from 'react';
 import { useAdminModuleEdit } from './AdminModuleEditContext';
 import styles from './styles.module.css';
 
 function EditIcon(): React.JSX.Element {
   return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M12 20h9" />
-      <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
-    </svg>
+    <PenLine size={14} />
   );
 }
 

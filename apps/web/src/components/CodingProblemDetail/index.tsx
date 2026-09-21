@@ -3,8 +3,10 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import CodingIDE from '@/components/CodingIDE';
+import CodingProblemBookmarkButton from '@/components/CodingProblemBookmarkButton';
 import CodingProblemMarkdown from '@/components/CodingProblemMarkdown';
 import type { CodingProblemDetail as CodingProblemDetailData } from '@/data/codingProblems';
+import EmptyState from '@/components/EmptyState';
 import styles from './styles.module.css';
 
 const DIFFICULTY_CLASS: Record<string, string> = {
@@ -36,7 +38,13 @@ function stripLeadingDifficultyLine(bodyMd: string): string {
   return bodyMd.replace(/^\s*\*\*Difficulty:?\*\*[^\n]*\r?\n+/i, '');
 }
 
-export default function CodingProblemDetail({ problem }: { problem: CodingProblemDetailData }): React.JSX.Element {
+export default function CodingProblemDetail({
+  problem,
+  initialBookmarked,
+}: {
+  problem: CodingProblemDetailData;
+  initialBookmarked: boolean;
+}): React.JSX.Element {
   const [tab, setTab] = useState<Tab>('ide');
   // LeetCode-style fullscreen: expands the Problem/IDE split to a fixed
   // full-viewport overlay instead of navigating anywhere else — Escape or
@@ -72,6 +80,9 @@ export default function CodingProblemDetail({ problem }: { problem: CodingProble
         <h1 className={styles.title}>{problem.title}</h1>
         <span className={styles.categoryTag}>{problem.categoryLabel}</span>
         <span className={`${styles.difficultyTag} ${DIFFICULTY_CLASS[problem.difficulty] ?? ''}`}>{difficultyLabel(problem.difficulty)}</span>
+        <span className={styles.bookmarkSlot}>
+          <CodingProblemBookmarkButton problemId={problem.id} initialBookmarked={initialBookmarked} />
+        </span>
       </div>
 
       <div className={styles.tabs} role="tablist" aria-label="Problem view">
@@ -116,7 +127,7 @@ export default function CodingProblemDetail({ problem }: { problem: CodingProble
               <CodingProblemMarkdown content={sharedWriteup} />
             </div>
           ) : (
-            <p className={styles.emptyText}>No solution published yet.</p>
+            <EmptyState illustration="folder" compact title="No solution published yet." description="The write-up for this problem hasn't been published yet." />
           )}
         </div>
       )}
@@ -124,7 +135,7 @@ export default function CodingProblemDetail({ problem }: { problem: CodingProble
       {tab === 'code' && (
         <div className={styles.solutions}>
           {solutionLanguages.length === 0 ? (
-            <p className={styles.emptyText}>No solution code published yet.</p>
+            <EmptyState illustration="folder" compact title="No solution code published yet." description="Code solutions for this problem haven't been published yet." />
           ) : (
             <div className={styles.solutionCard}>
               <div className={styles.solutionCodeHeader}>

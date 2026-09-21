@@ -1,3 +1,4 @@
+import { ChevronLeft, ChevronRight } from 'lucide-react';
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
@@ -58,23 +59,17 @@ async function fetchCanEditCourseContent(): Promise<boolean> {
   return keys.includes('manage-course-authoring');
 }
 
-// Big edge-pager chevrons — simple stroked geometry drawn locally (same
-// inline-stroke convention as BlogPostPage/CodeBlock's copy icons). Not
-// added to ActionIcons because those use filled Material Symbols path
-// data, and guessing that path data from memory is banned.
+// Big edge-pager chevrons — Lucide chevrons at a heavier stroke than the
+// row-action icons, so they stay local instead of joining ActionIcons.
 function ChevronLeftIcon({ className }: { className?: string }): React.JSX.Element {
   return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <polyline points="15 18 9 12 15 6" />
-    </svg>
+    <ChevronLeft className={className} strokeWidth={2.25} />
   );
 }
 
 function ChevronRightIcon({ className }: { className?: string }): React.JSX.Element {
   return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <polyline points="9 18 15 12 9 6" />
-    </svg>
+    <ChevronRight className={className} strokeWidth={2.25} />
   );
 }
 

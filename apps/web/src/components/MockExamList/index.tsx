@@ -7,6 +7,7 @@ import { usePaginatedListView } from '@/hooks/usePaginatedListView';
 import { ListViewToolbar } from '@/components/ListViewToolbar';
 import Pagination from '@/components/Pagination';
 import { OpenInNewIcon, ChevronRightIcon } from '@/components/icons/ActionIcons';
+import EmptyState from '@/components/EmptyState';
 import styles from './styles.module.css';
 
 // Fixed display order for the /mock-tests role sections — matches the
@@ -92,7 +93,7 @@ export default function MockExamList({
   });
 
   if (liveTotal === 0) {
-    return <p className={styles.emptyText}>No certification practice exams available yet — check back soon.</p>;
+    return <EmptyState illustration="exam" title="No practice exams available yet." description="Certification practice exams will appear here once they're available — check back soon." />;
   }
 
   const groups = groupByRole(exams);

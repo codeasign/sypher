@@ -11,12 +11,15 @@ import styles from './manage-courses.module.css';
 interface CourseWorkspaceProps {
   course: Course;
   onBack: () => void;
+  // Runs after a successful Publish/Republish (should refresh the list, then leave the workspace).
+  onRepublished?: () => void;
   onCourseUpdated: (course: Course) => void;
+  existingCategories: string[];
 }
 
 type Tab = 'details' | 'modules' | 'access';
 
-export default function CourseWorkspace({ course, onBack, onCourseUpdated }: CourseWorkspaceProps): React.JSX.Element {
+export default function CourseWorkspace({ course, onBack, onRepublished, onCourseUpdated, existingCategories }: CourseWorkspaceProps): React.JSX.Element {
   const [activeTab, setActiveTab] = useState<Tab>('details');
 
   async function handleDetailsSaved(): Promise<void> {
@@ -61,7 +64,7 @@ export default function CourseWorkspace({ course, onBack, onCourseUpdated }: Cou
         </button>
       </div>
 
-      {activeTab === 'details' && <CourseEditor course={course} onSaved={handleDetailsSaved} onCancel={onBack} onRepublished={onBack} />}
+      {activeTab === 'details' && <CourseEditor course={course} onSaved={handleDetailsSaved} onCancel={onBack} onRepublished={onRepublished ?? onBack} existingCategories={existingCategories} />}
       {activeTab === 'modules' && <ModulesTab courseId={course.id} />}
       {activeTab === 'access' && <AccessTab courseId={course.id} />}
     </div>

@@ -9,6 +9,7 @@ import { LockIcon } from '@/components/icons/SidebarIcons';
 import CourseHomeTabs from '@/components/CourseHomeTabs';
 import DiscussionSection from '@/components/DiscussionSection';
 import CourseDescriptionMarkdown from '@/components/CourseDescriptionMarkdown';
+import EmptyState from '@/components/EmptyState';
 import styles from './styles.module.css';
 
 async function fetchCourse(slug: string): Promise<{ course: CourseWithAccess | null; unauthenticated: boolean }> {
@@ -140,7 +141,7 @@ export default async function CourseHomePage({ params }: { params: Promise<{ slu
               )}
 
               {modules.length === 0 ? (
-                <p className={styles.emptyText}>No modules published yet.</p>
+                <EmptyState illustration="courses" compact title="No modules published yet." description="Modules will appear here as soon as they're published." />
               ) : (
                 <ul className={styles.moduleList}>
                   {modules.map((mod, index) => (

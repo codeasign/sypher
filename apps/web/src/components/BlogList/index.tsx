@@ -6,6 +6,7 @@ import { usePaginatedListView } from '@/hooks/usePaginatedListView';
 import { ListViewToolbar } from '@/components/ListViewToolbar';
 import { CommentIcon } from '@/components/icons/ActionIcons';
 import Pagination from '@/components/Pagination';
+import EmptyState from '@/components/EmptyState';
 import styles from './styles.module.css';
 
 interface PostSummary {
@@ -62,7 +63,7 @@ export default function BlogList({
   });
 
   if (liveTotal === 0) {
-    return <p className={styles.statusText}>No posts published yet. Check back soon.</p>;
+    return <EmptyState illustration="posts" title="No posts published yet." description="Check back soon for new articles." />;
   }
 
   return (

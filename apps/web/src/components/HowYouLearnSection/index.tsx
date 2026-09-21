@@ -1,55 +1,23 @@
 import type { SVGProps } from 'react';
+import { BookOpen, Code, Target, type LucideProps } from 'lucide-react';
 import { getDocsOrigin } from '@sypher/auth-core/src/urls';
 import StorySection from '@/components/StorySection';
 
-type IconProps = SVGProps<SVGSVGElement>;
 
-function base(props: IconProps) {
-  return {
-    width: 24,
-    height: 24,
-    viewBox: '0 0 24 24',
-    fill: 'none' as const,
-    stroke: 'currentColor',
-    strokeWidth: 1.8,
-    strokeLinecap: 'round' as const,
-    strokeLinejoin: 'round' as const,
-    'aria-hidden': true as const,
-    ...props,
-  };
+function BookIcon(props: LucideProps) {
+  return <BookOpen size={24} strokeWidth={1.8} aria-hidden="true" {...props} />;
 }
 
-function BookIcon(props: IconProps) {
-  return (
-    <svg {...base(props)}>
-      <path d="M4 5.5C4 4.67 4.67 4 5.5 4H12v16H5.5A1.5 1.5 0 0 1 4 18.5z" />
-      <path d="M20 5.5c0-.83-.67-1.5-1.5-1.5H12v16h6.5c.83 0 1.5-.67 1.5-1.5z" />
-      <path d="M12 4v16" />
-    </svg>
-  );
+function CodeIcon(props: LucideProps) {
+  return <Code size={24} strokeWidth={1.8} aria-hidden="true" {...props} />;
 }
 
-function CodeIcon(props: IconProps) {
-  return (
-    <svg {...base(props)}>
-      <path d="M9 8 5 12l4 4" />
-      <path d="M15 8l4 4-4 4" />
-    </svg>
-  );
-}
-
-function TargetIcon(props: IconProps) {
-  return (
-    <svg {...base(props)}>
-      <circle cx="12" cy="12" r="8" />
-      <circle cx="12" cy="12" r="4" />
-      <circle cx="12" cy="12" r="0.6" fill="currentColor" stroke="none" />
-    </svg>
-  );
+function TargetIcon(props: LucideProps) {
+  return <Target size={24} strokeWidth={1.8} aria-hidden="true" {...props} />;
 }
 
 // Abstract SVG illustration of an open book with floating concept bubbles --
-// hand-built, no stock art (see apps/app CLAUDE.md: no icon library installed).
+// hand-built, no stock art. (The small 24px feature icons above are Lucide.)
 function LearnGraphic(props: SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 480 420" fill="none" role="img" aria-label="Abstract illustration of an open book with floating concept bubbles" {...props}>

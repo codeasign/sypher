@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { FileText, Monitor, type LucideIcon } from 'lucide-react';
 import { getDocsOrigin } from '@sypher/auth-core/src/urls';
 import styles from './styles.module.css';
 
@@ -21,27 +21,14 @@ const services = [
   },
 ].filter((service) => service.shown);
 
+const serviceIcons: Record<string, LucideIcon> = {
+  resume: FileText,
+  interview: Monitor,
+};
+
 function ServiceIcon({ name }: { name: string }) {
-  const icons: Record<string, ReactNode> = {
-    resume: (
-      <>
-        <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-        <path d="M14 3v5h5" />
-        <path d="M9 13h6M9 17h6" />
-      </>
-    ),
-    interview: (
-      <>
-        <rect x="3" y="4" width="18" height="13" rx="2" />
-        <path d="M8 21h8M12 17v4" />
-      </>
-    ),
-  };
-  return (
-    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      {icons[name]}
-    </svg>
-  );
+  const Glyph = serviceIcons[name];
+  return Glyph ? <Glyph size={26} strokeWidth={1.6} aria-hidden="true" /> : null;
 }
 
 export default function CareerServicesSection() {

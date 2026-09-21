@@ -1,5 +1,6 @@
 'use client';
 
+import { Gauge, Play } from 'lucide-react';
 import { useRef, useState } from 'react';
 import { API_BASE_URL } from '@/lib/api';
 import styles from './styles.module.css';
@@ -62,16 +63,12 @@ export default function VideoPlayer({ slug }: { slug: string }): React.JSX.Eleme
           className={styles.centerPlayButton}
           onClick={handlePlayIconClick}
         >
-          <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor" aria-hidden="true">
-            <path d="M8 5v14l11-7z" />
-          </svg>
+          <Play size={28} fill="currentColor" />
         </button>
       )}
       <label className={styles.rateOverlay}>
-        {/* Material Symbols "speed" glyph (outlined variant's path) */}
-        <svg viewBox="0 -960 960 960" width="16" height="16" fill="currentColor" aria-hidden="true">
-          <path d="m555-317 106-106q17-17 17-42t-17-42q-17-17-42-17t-42 17L471-401q-8 8-13 18t-5 21q0 25 17 42t42 17q11 0 21-5t22-13ZM480-80q-75 0-140.5-28.5t-114-77q-48.5-48.5-77-114T120-440q0-75 28.5-140.5t77-114q48.5-48.5 114-77T480-800q65 0 122.5 22t102.5 61l55-55 57 57-55 55q39 45 61 102.5T845-480q0 75-28.5 140.5t-77 114q-48.5 48.5-114 77T480-80Zm0-80q116 0 198-82t82-198q0-116-82-198t-198-82q-116 0-198 82t-82 198q0 116 82 198t198 82Zm0-280Z" />
-        </svg>
+        {/* Playback-speed glyph */}
+        <Gauge size={16} />
         <select
           aria-label="Playback speed"
           className={styles.rateSelect}

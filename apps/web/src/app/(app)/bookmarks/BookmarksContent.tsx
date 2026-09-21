@@ -5,9 +5,13 @@ import Link from "next/link";
 import dynamic from "next/dynamic";
 import { apiFetch } from "@/lib/api";
 import type { CourseWithAccess } from "@/data/courses";
+import type { CodingProblemSummary } from "@/data/codingProblems";
 import CourseScroller from "@/components/CourseScroller";
+import CodingProblemCard from "@/components/CodingProblemCard";
+import EmptyState from "@/components/EmptyState";
 import { MenuBookIcon } from "@/components/icons/ActionIcons";
 import { ModuleBookmarkButton } from "@/components/AuthoredBookmarkButton";
+import { groupProblemsByCategory } from "@/lib/codingCategoryOrder";
 import styles from "./styles.module.css";
 
 // The lesson renderer pulls in react-markdown + plugins + the code-block
@@ -32,9 +36,10 @@ export interface BookmarkedModule {
 interface BookmarksContentProps {
     initialCourses: CourseWithAccess[];
     initialModules: BookmarkedModule[];
+    initialProblems: CodingProblemSummary[];
 }
 
-type Tab = "courses" | "modules";
+type Tab = "courses" | "modules" | "coding";
 
 interface ModuleDetail {
     title: string;
@@ -189,134 +194,11 @@ function ModulesPane({
 
     if (modules.length === 0) {
         return (
-            <p className={styles.emptyText}>
-                <div
-                    style={{
-                        minHeight: "400px",
-                        display: "flex",
-                        flexDirection: "column",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        textAlign: "center",
-                    }}
-                >
-                    <svg
-                        width="220"
-                        height="220"
-                        viewBox="0 0 220 220"
-                        fill="none"
-                        xmlns="http://www.w3.org/2000/svg"
-                        aria-hidden="true"
-                    >
-                        {/* Module card */}
-                        <rect
-                            x="52"
-                            y="48"
-                            width="116"
-                            height="124"
-                            rx="10"
-                            fill="white"
-                            stroke="#9CA3AF"
-                            strokeWidth="5"
-                        />
-
-                        {/* Module icon */}
-                        <circle
-                            cx="82"
-                            cy="78"
-                            r="12"
-                            stroke="#6366F1"
-                            strokeWidth="4"
-                        />
-
-                        <path
-                            d="M78 78L81 81L87 75"
-                            stroke="#6366F1"
-                            strokeWidth="4"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                        />
-
-                        {/* Bookmark */}
-                        <path
-                            d="M132 62H157V113L144.5 105L132 113V62Z"
-                            fill="#6366F1"
-                        />
-
-                        {/* Module title lines */}
-                        <path
-                            d="M68 106H132"
-                            stroke="#D1D5DB"
-                            strokeWidth="5"
-                            strokeLinecap="round"
-                        />
-
-                        <path
-                            d="M68 121H144"
-                            stroke="#D1D5DB"
-                            strokeWidth="5"
-                            strokeLinecap="round"
-                        />
-
-                        <path
-                            d="M68 136H124"
-                            stroke="#D1D5DB"
-                            strokeWidth="5"
-                            strokeLinecap="round"
-                        />
-
-                        {/* Progress/module indicator */}
-                        <rect
-                            x="68"
-                            y="151"
-                            width="76"
-                            height="6"
-                            rx="3"
-                            fill="#E5E7EB"
-                        />
-
-                        <rect
-                            x="68"
-                            y="151"
-                            width="28"
-                            height="6"
-                            rx="3"
-                            fill="#C4B5FD"
-                        />
-
-                        {/* Floating dots */}
-                        <circle cx="42" cy="76" r="5" fill="#D1D5DB" />
-                        <circle cx="180" cy="142" r="5" fill="#D1D5DB" />
-
-                        {/* Small sparkle */}
-                        <path
-                            d="M177 78L180 85L187 88L180 91L177 98L174 91L167 88L174 85L177 78Z"
-                            fill="#C4B5FD"
-                        />
-                    </svg>
-
-                    <div
-                        style={{
-                            marginTop: "20px",
-                            fontSize: "24px",
-                            fontWeight: 600,
-                            color: "#374151",
-                        }}
-                    >
-                        No bookmarked modules yet.
-                    </div>
-
-                    <div
-                        style={{
-                            marginTop: "8px",
-                            fontSize: "16px",
-                            color: "#6B7280",
-                        }}
-                    >
-                        Bookmark modules you want to revisit later.
-                    </div>
-                </div>
-            </p>
+            <EmptyState
+                illustration="bookmarkModules"
+                title="No bookmarked modules yet."
+                description="Bookmark modules you want to revisit later."
+            />
         );
     }
 
@@ -353,26 +235,11 @@ function ModulesPane({
 
             <div className={styles.moduleDetail}>
                 {!selected ? (
-                    <div className={styles.detailEmpty}>
-                        <svg
-                            className={styles.detailEmptyIcon}
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.5"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            aria-hidden="true"
-                        >
-                            <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
-                        </svg>
-                        <p className={styles.detailEmptyTitle}>
-                            Select a bookmarked lesson
-                        </p>
-                        <p className={styles.detailEmptyText}>
-                            Pick one from the list to read it here.
-                        </p>
-                    </div>
+                    <EmptyState
+                        illustration="pick"
+                        title="Select a bookmarked lesson"
+                        description="Pick one from the list to read it here."
+                    />
                 ) : (
                     <>
                         <div className={styles.detailHeader}>
@@ -389,6 +256,7 @@ function ModulesPane({
                                 moduleId={selected.id}
                                 courseId={selected.courseId}
                                 initialBookmarked
+                                iconOnly
                                 onChange={(b) => onModuleChange(selected.id, b)}
                             />
                         </div>
@@ -469,9 +337,59 @@ function ModulesPane({
     );
 }
 
+/**
+ * Coding Problems tab: bookmarked problems listed under their category
+ * heading, same rows (number, title, bookmark toggle) as Practice Coding.
+ * Un-bookmarking a row hides it instantly (the parent tracks removed ids),
+ * and its category heading goes with it if it was the last one -- see
+ * BookmarksContent. The server refetch afterwards just confirms it.
+ */
+function CodingProblemsPane({
+    problems,
+    onProblemChange,
+}: {
+    problems: CodingProblemSummary[];
+    onProblemChange: (problemId: string, bookmarked: boolean) => void;
+}): React.JSX.Element {
+    const groups = useMemo(() => groupProblemsByCategory(problems), [problems]);
+
+    if (groups.length === 0) {
+        return (
+            <EmptyState
+                illustration="code"
+                title="No bookmarked coding problems yet."
+                description="Bookmark problems from Practice Coding and they'll show up here, grouped by category."
+            />
+        );
+    }
+
+    return (
+        <div>
+            {groups.map((group) => (
+                <section key={group.category} className={styles.codingGroup}>
+                    <h2 className={styles.codingGroupHeading}>{group.label}</h2>
+                    <ul className={styles.codingList}>
+                        {group.items.map((problem, i) => (
+                            <li key={problem.id}>
+                                <CodingProblemCard
+                                    problem={problem}
+                                    bookmarked
+                                    index={i + 1}
+                                    onBookmarkChange={onProblemChange}
+                                />
+                            </li>
+                        ))}
+                    </ul>
+                </section>
+            ))}
+        </div>
+    );
+}
+
 export default function BookmarksContent({
     initialCourses,
     initialModules,
+    initialProblems,
 }: BookmarksContentProps): React.JSX.Element {
     // Courses come straight from the server component so an un-bookmark on a
     // card (which triggers router.refresh()) drops the card on the refetch.
@@ -488,6 +406,39 @@ export default function BookmarksContent({
     function handleModuleChange(moduleId: string, bookmarked: boolean): void {
         if (!bookmarked)
             setModules((prev) => prev.filter((m) => m.id !== moduleId));
+    }
+
+    // Coding problems: ids the user has just un-bookmarked are hidden right
+    // away, without waiting for the un-bookmark request + server refetch. A
+    // failed request reports bookmarked=true again, which un-hides the row.
+    const [removedProblemIds, setRemovedProblemIds] = useState<Set<string>>(
+        () => new Set(),
+    );
+
+    // Once the refetched server list no longer contains an id, it doesn't
+    // need tracking any more. Ids still in the list (a second removal still
+    // in flight) stay hidden, so they don't flicker back mid-refetch.
+    useEffect(() => {
+        setRemovedProblemIds((prev) => {
+            if (prev.size === 0) return prev;
+            const present = new Set(initialProblems.map((p) => p.id));
+            const next = new Set([...prev].filter((id) => present.has(id)));
+            return next.size === prev.size ? prev : next;
+        });
+    }, [initialProblems]);
+
+    const problems = useMemo(
+        () => initialProblems.filter((p) => !removedProblemIds.has(p.id)),
+        [initialProblems, removedProblemIds],
+    );
+
+    function handleProblemChange(problemId: string, bookmarked: boolean): void {
+        setRemovedProblemIds((prev) => {
+            const next = new Set(prev);
+            if (bookmarked) next.delete(problemId);
+            else next.add(problemId);
+            return next;
+        });
     }
 
     return (
@@ -515,126 +466,25 @@ export default function BookmarksContent({
                 >
                     Modules ({modules.length})
                 </button>
+                <button
+                    type="button"
+                    role="tab"
+                    aria-selected={tab === "coding"}
+                    className={`${styles.tab} ${tab === "coding" ? styles.tabActive : ""}`}
+                    onClick={() => setTab("coding")}
+                >
+                    Coding Problems ({problems.length})
+                </button>
             </div>
 
             <div className={styles.tabPanel}>
                 {tab === "courses" ? (
                     courses.length === 0 ? (
-                        <p className={styles.emptyText}>
-                            <div
-                                style={{
-                                    minHeight: "400px",
-                                    display: "flex",
-                                    flexDirection: "column",
-                                    alignItems: "center",
-                                    justifyContent: "center",
-                                    textAlign: "center",
-                                }}
-                            >
-                                <svg
-                                    width="220"
-                                    height="220"
-                                    viewBox="0 0 220 220"
-                                    fill="none"
-                                    xmlns="http://www.w3.org/2000/svg"
-                                    aria-hidden="true"
-                                >
-                                    {/* Open book */}
-                                    <path
-                                        d="M110 65C96 52 78 48 55 52V155C78 151 96 155 110 168V65Z"
-                                        fill="white"
-                                        stroke="#9CA3AF"
-                                        strokeWidth="5"
-                                        strokeLinejoin="round"
-                                    />
-
-                                    <path
-                                        d="M110 65C124 52 142 48 165 52V155C142 151 124 155 110 168V65Z"
-                                        fill="white"
-                                        stroke="#9CA3AF"
-                                        strokeWidth="5"
-                                        strokeLinejoin="round"
-                                    />
-
-                                    {/* Bookmark */}
-                                    <path
-                                        d="M143 62H168V112L155.5 104L143 112V62Z"
-                                        fill="#6366F1"
-                                    />
-
-                                    {/* Left page lines */}
-                                    <path
-                                        d="M68 78H94"
-                                        stroke="#D1D5DB"
-                                        strokeWidth="5"
-                                        strokeLinecap="round"
-                                    />
-                                    <path
-                                        d="M68 94H94"
-                                        stroke="#D1D5DB"
-                                        strokeWidth="5"
-                                        strokeLinecap="round"
-                                    />
-                                    <path
-                                        d="M68 110H88"
-                                        stroke="#D1D5DB"
-                                        strokeWidth="5"
-                                        strokeLinecap="round"
-                                    />
-
-                                    {/* Right page lines */}
-                                    <path
-                                        d="M126 125H151"
-                                        stroke="#D1D5DB"
-                                        strokeWidth="5"
-                                        strokeLinecap="round"
-                                    />
-                                    <path
-                                        d="M126 141H151"
-                                        stroke="#D1D5DB"
-                                        strokeWidth="5"
-                                        strokeLinecap="round"
-                                    />
-
-                                    {/* Small floating bookmark symbol */}
-                                    <path
-                                        d="M43 116V143L50 139L57 143V116"
-                                        stroke="#C4B5FD"
-                                        strokeWidth="4"
-                                        strokeLinecap="round"
-                                        strokeLinejoin="round"
-                                    />
-
-                                    {/* Small star */}
-                                    <path
-                                        d="M178 118L181 125L188 128L181 131L178 138L175 131L168 128L175 125L178 118Z"
-                                        fill="#C4B5FD"
-                                    />
-                                </svg>
-
-                                <div
-                                    style={{
-                                        marginTop: "20px",
-                                        fontSize: "24px",
-                                        fontWeight: 600,
-                                        color: "#374151",
-                                    }}
-                                >
-                                    No bookmarked courses yet.
-                                </div>
-
-                                <div
-                                    style={{
-                                        marginTop: "8px",
-                                        fontSize: "16px",
-                                        color: "#6B7280",
-                                    }}
-                                >
-                                    Bookmark courses you want to come back to
-                                    later.
-                                </div>
-                            </div>
-                        </p>
+                        <EmptyState
+                            illustration="bookmarkCourses"
+                            title="No bookmarked courses yet."
+                            description="Bookmark courses you want to come back to later."
+                        />
                     ) : (
                         // Same card view as Browse Courses / My Courses.
                         <CourseScroller
@@ -642,10 +492,15 @@ export default function BookmarksContent({
                             bookmarkedIds={courses.map((c) => c.id)}
                         />
                     )
-                ) : (
+                ) : tab === "modules" ? (
                     <ModulesPane
                         modules={modules}
                         onModuleChange={handleModuleChange}
+                    />
+                ) : (
+                    <CodingProblemsPane
+                        problems={problems}
+                        onProblemChange={handleProblemChange}
                     />
                 )}
             </div>

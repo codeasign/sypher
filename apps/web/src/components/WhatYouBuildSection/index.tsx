@@ -1,50 +1,18 @@
 import type { SVGProps } from 'react';
+import { Compass, GraduationCap, Layers, type LucideProps } from 'lucide-react';
 import StorySection from '@/components/StorySection';
 
-type IconProps = SVGProps<SVGSVGElement>;
 
-function base(props: IconProps) {
-  return {
-    width: 24,
-    height: 24,
-    viewBox: '0 0 24 24',
-    fill: 'none' as const,
-    stroke: 'currentColor',
-    strokeWidth: 1.8,
-    strokeLinecap: 'round' as const,
-    strokeLinejoin: 'round' as const,
-    'aria-hidden': true as const,
-    ...props,
-  };
+function CompassIcon(props: LucideProps) {
+  return <Compass size={24} strokeWidth={1.8} aria-hidden="true" {...props} />;
 }
 
-function CompassIcon(props: IconProps) {
-  return (
-    <svg {...base(props)}>
-      <circle cx="12" cy="12" r="9" />
-      <path d="m14.5 9.5-1.7 5.2a.6.6 0 0 1-.4.4l-5.2 1.7 1.7-5.2a.6.6 0 0 1 .4-.4z" />
-    </svg>
-  );
+function LayersIcon(props: LucideProps) {
+  return <Layers size={24} strokeWidth={1.8} aria-hidden="true" {...props} />;
 }
 
-function LayersIcon(props: IconProps) {
-  return (
-    <svg {...base(props)}>
-      <path d="m12 3 8 4.5-8 4.5-8-4.5Z" />
-      <path d="m4 12 8 4.5 8-4.5" />
-      <path d="m4 16.5 8 4.5 8-4.5" />
-    </svg>
-  );
-}
-
-function GraduationIcon(props: IconProps) {
-  return (
-    <svg {...base(props)}>
-      <path d="m3 9 9-4.5L21 9l-9 4.5Z" />
-      <path d="M7 11.3V16c0 1.4 2.2 2.5 5 2.5s5-1.1 5-2.5v-4.7" />
-      <path d="M21 9v6" />
-    </svg>
-  );
+function GraduationIcon(props: LucideProps) {
+  return <GraduationCap size={24} strokeWidth={1.8} aria-hidden="true" {...props} />;
 }
 
 // Abstract SVG illustration of stacked building blocks representing a real

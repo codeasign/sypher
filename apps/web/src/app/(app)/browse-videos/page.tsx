@@ -3,6 +3,7 @@ import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { serverApiFetch } from '@/lib/serverApi';
 import type { PublishedVideoSummary } from '@/data/videos';
+import EmptyState from '@/components/EmptyState';
 import styles from './styles.module.css';
 
 export const metadata: Metadata = {
@@ -40,7 +41,7 @@ export default async function BrowseVideosPage(): Promise<React.JSX.Element> {
       </div>
 
       {videos.length === 0 ? (
-        <p className={styles.emptyText}>No videos published yet.</p>
+        <EmptyState illustration="videos" title="No videos published yet." description="New videos will appear here as soon as they're published." />
       ) : (
         groups.map(([category, categoryVideos]) => (
           <section key={category} className={styles.categorySection}>

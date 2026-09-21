@@ -18,6 +18,7 @@ import {
   type RosterEntry,
 } from '@/data/cohorts';
 import courses from '@sypher/course-catalog/src/courses';
+import EmptyState from '@/components/EmptyState';
 import styles from './manage-cohort-users.module.css';
 
 const COURSE_TITLE_BY_SLUG: Record<string, string> = Object.fromEntries(
@@ -326,16 +327,12 @@ export default function ManageCohortUsersContent(): React.JSX.Element {
           <p>Loading roster...</p>
         </div>
       ) : members.length === 0 ? (
-        <div className={styles.emptyState}>
-          <p>No members yet. Add your first one.</p>
-        </div>
+        <EmptyState illustration="people" compact title="No members yet." description="Add your first one to get started." />
       ) : (
         <>
         <TableSearchBar value={search} onChange={handleSearchChange} placeholder="Search members by name or email…" />
         {visibleMembers.length === 0 ? (
-          <div className={styles.emptyState}>
-            <p>No members match &quot;{search}&quot;.</p>
-          </div>
+          <EmptyState illustration="search" compact title={`No members match "${search}".`} />
         ) : (
         <div className={styles.tableWrapper}>
           <div className={styles.tableHeader}>

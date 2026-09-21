@@ -1,29 +1,20 @@
 'use client';
 
+import { LayoutGrid, List } from 'lucide-react';
 import type { ListViewMode } from '@/hooks/usePaginatedListView';
 import styles from './styles.module.css';
 
-// Bare glyph icons — simple shape primitives (not a memorized Material
-// Symbols path string) so they're guaranteed to render correctly, same
-// "currentColor, no background" convention as components/icons/ActionIcons.
+// Bare Lucide glyph icons — "currentColor, no background", same convention
+// as components/icons/ActionIcons.
 function GridIcon(): React.JSX.Element {
   return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <rect x="1" y="1" width="6" height="6" rx="1.2" fill="currentColor" />
-      <rect x="9" y="1" width="6" height="6" rx="1.2" fill="currentColor" />
-      <rect x="1" y="9" width="6" height="6" rx="1.2" fill="currentColor" />
-      <rect x="9" y="9" width="6" height="6" rx="1.2" fill="currentColor" />
-    </svg>
+    <LayoutGrid size={16} />
   );
 }
 
 function ListIcon(): React.JSX.Element {
   return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <rect x="1" y="2" width="14" height="2.4" rx="1.2" fill="currentColor" />
-      <rect x="1" y="6.8" width="14" height="2.4" rx="1.2" fill="currentColor" />
-      <rect x="1" y="11.6" width="14" height="2.4" rx="1.2" fill="currentColor" />
-    </svg>
+    <List size={16} />
   );
 }
 

@@ -5,6 +5,7 @@ import { createCourse, updateCourse, setCourseStatus, AUDIENCE_ROLES, type Cours
 import { uploadToBunny } from '@/data/bunnyUpload';
 import { prepareCourseCover } from '@/lib/courseCoverImage';
 import { useToast } from '@/components/Toast/ToastProvider';
+import MarkdownEditor from '@/components/MarkdownEditor';
 import styles from './manage-courses.module.css';
 
 const NAME_MAX = 250;
@@ -20,9 +21,11 @@ interface CourseEditorProps {
   // not just refresh the Details tab in place). Falls back to onSaved
   // when not given.
   onRepublished?: () => void;
+  // Every category already used by any course, so the dropdown lists them all.
+  existingCategories?: string[];
 }
 
-const CATEGORY_OPTIONS = ['tech', 'life-skills'] as const;
+const CATEGORY_OPTIONS = ['tech', 'coding', 'databases', 'life-skills'] as const;
 
 // Audience-role select options: canonical list first, then any free-form
 // value already stored on other courses (so nothing saved outside this
@@ -41,10 +44,16 @@ function normalizeCsv(raw: string): string {
     .join(',');
 }
 
-export default function CourseEditor({ course, onSaved, onCancel, onBack, onRepublished }: CourseEditorProps): React.JSX.Element {
+export default function CourseEditor({ course, onSaved, onCancel, onBack, onRepublished, existingCategories = [] }: CourseEditorProps): React.JSX.Element {
   const [name, setName] = useState(course?.name ?? '');
   const [description, setDescription] = useState(course?.description ?? '');
   const [category, setCategory] = useState(course?.category ?? '');
+  // Canonical list first, then every other category already in use (e.g.
+  // "System Design", "Presentation"), so all are selectable and saving
+  // never blanks a stored value.
+  const categoryOptions: string[] = [...CATEGORY_OPTIONS];
+  const extraCategories = [...existingCategories, category].filter((c) => c && !categoryOptions.includes(c as (typeof CATEGORY_OPTIONS)[number]));
+  for (const c of [...new Set(extraCategories)].sort((a, b) => a.localeCompare(b))) categoryOptions.push(c);
   const [relatedCourses, setRelatedCourses] = useState(course?.relatedCourses ?? '');
   const [audienceRole, setAudienceRole] = useState(course?.audienceRole ?? '');
   const [coverImageUrl, setCoverImageUrl] = useState<string | null>(course?.coverImageUrl ?? null);
@@ -55,7 +64,7 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack, onRepu
   const { showToast } = useToast();
 
   const isEditing = Boolean(course);
-  const canSave = name.trim().length > 0 && !saving;
+  const canSave = name.trim().length > 0 && description.length <= DESCRIPTION_MAX && !saving;
 
   async function handleCoverImageChange(event: React.ChangeEvent<HTMLInputElement>): Promise<void> {
     const file = event.target.files?.[0];
@@ -235,22 +244,21 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack, onRepu
       </div>
 
       <div className={styles.formGroup}>
-        <label className={styles.fieldLabel} htmlFor="course-description">
+        <label className={styles.fieldLabel} id="course-description-label">
           Description / About content
         </label>
-        <textarea
-          id="course-description"
-          className={styles.textArea}
-          rows={3}
-          maxLength={DESCRIPTION_MAX}
+        <MarkdownEditor
           value={description}
-          onChange={(e) => setDescription(e.target.value)}
+          onChange={setDescription}
+          maxLength={DESCRIPTION_MAX}
           placeholder="Shown to learners on the course home page"
           disabled={saving}
+          minHeight="10rem"
+          labelledBy="course-description-label"
         />
-        <span className={styles.charCount}>
-          {description.length}/{DESCRIPTION_MAX}
-        </span>
+        {description.length > DESCRIPTION_MAX && (
+          <p className={styles.error}>Description is over {DESCRIPTION_MAX} characters. Shorten it to save.</p>
+        )}
       </div>
 
       <div className={styles.formGroup}>
@@ -265,7 +273,7 @@ export default function CourseEditor({ course, onSaved, onCancel, onBack, onRepu
           disabled={saving}
         >
           <option value="">None</option>
-          {CATEGORY_OPTIONS.map((opt) => (
+          {categoryOptions.map((opt) => (
             <option key={opt} value={opt}>
               {opt}
             </option>

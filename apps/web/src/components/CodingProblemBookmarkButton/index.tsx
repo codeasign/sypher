@@ -1,5 +1,6 @@
 'use client';
 
+import { Bookmark } from 'lucide-react';
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { addCodingProblemBookmark, removeCodingProblemBookmark } from '@/data/codingProblems';
@@ -7,22 +8,28 @@ import styles from './styles.module.css';
 
 function BookmarkIcon({ filled }: { filled: boolean }): React.JSX.Element {
   return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill={filled ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
-    </svg>
+    <Bookmark size={13} fill={filled ? 'currentColor' : 'none'} />
   );
 }
 
 interface CodingProblemBookmarkButtonProps {
   problemId: string;
   initialBookmarked: boolean;
+  /**
+   * Optional. Called with the new state as soon as the user toggles
+   * (optimistically, before the request finishes) and again with the previous
+   * state if the request fails. Lets a list that shows only bookmarked
+   * problems (the Bookmarks tab) hide a row instantly and restore it on
+   * failure, instead of waiting for the router.refresh() round trip.
+   */
+  onChange?: (bookmarked: boolean) => void;
 }
 
 // Same optimistic-toggle-then-router.refresh() pattern as
 // AuthoredBookmarkButton's CourseBookmarkButton, kept as its own component
 // since coding problems bookmark by CodingProblem.id through a different
 // apps/api route (/coding-problems/{id}/bookmark) than course bookmarks.
-export default function CodingProblemBookmarkButton({ problemId, initialBookmarked }: CodingProblemBookmarkButtonProps): React.JSX.Element {
+export default function CodingProblemBookmarkButton({ problemId, initialBookmarked, onChange }: CodingProblemBookmarkButtonProps): React.JSX.Element {
   const router = useRouter();
   const [bookmarked, setBookmarked] = useState(initialBookmarked);
   const [pending, setPending] = useState(false);
@@ -34,11 +41,13 @@ export default function CodingProblemBookmarkButton({ problemId, initialBookmark
     setPending(true);
     const next = !bookmarked;
     setBookmarked(next);
+    onChange?.(next);
     try {
       await (next ? addCodingProblemBookmark(problemId) : removeCodingProblemBookmark(problemId));
       router.refresh();
     } catch {
       setBookmarked(!next);
+      onChange?.(!next);
     } finally {
       setPending(false);
     }

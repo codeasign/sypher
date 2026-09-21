@@ -1,12 +1,14 @@
 'use client';
 
 import React, { useMemo, useState } from 'react';
+import { Image as ImageIcon, ImageOff } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import BlogPostEditor from '@/components/BlogPostEditor';
-import { ViewIcon, EditIcon, DeleteIcon, PostAddIcon } from '@/components/icons/ActionIcons';
+import { OpenInNewIcon, EditIcon, DeleteIcon, PostAddIcon } from '@/components/icons/ActionIcons';
 import Tooltip from '@/components/Tooltip';
 import Pagination from '@/components/Pagination';
 import TableSearchBar from '@/components/TableSearchBar';
+import EmptyState from '@/components/EmptyState';
 import styles from './manage-blog.module.css';
 
 interface BlogPostSummary {
@@ -157,20 +159,14 @@ export default function ManageBlogContent({ initialPosts }: { initialPosts: Blog
       </div>
 
       {posts.length === 0 ? (
-        <div className={styles.emptyState}>
-          <p>No blog posts yet. Create your first one.</p>
-        </div>
+        <EmptyState illustration="posts" compact title="No blog posts yet." description="Create your first one to get started." />
       ) : (
         <>
-          <TableSearchBar value={search} onChange={handleSearchChange} placeholder="Search posts by title…" />
+          <div className={styles.searchRow}>
+            <TableSearchBar value={search} onChange={handleSearchChange} placeholder="Search posts by title…" />
+          </div>
           {visible.length === 0 ? (
-            <div className={styles.emptyState}>
-              <p>
-                {search.trim()
-                  ? `No ${statusFilter} posts match \"${search}\".`
-                  : `No ${statusFilter} posts yet.`}
-              </p>
-            </div>
+            <EmptyState illustration={search.trim() ? 'search' : 'posts'} compact title={search.trim() ? `No ${statusFilter} posts match "${search}".` : `No ${statusFilter} posts yet.`} />
           ) : (
             <>
               <div className={styles.tableWrapper}>
@@ -183,6 +179,11 @@ export default function ManageBlogContent({ initialPosts }: { initialPosts: Blog
                 {visible.map((post) => (
                   <div key={post.id} className={styles.tableRow}>
                     <div className={styles.titleCell}>
+                      {post.coverImageUrl ? (
+                        <ImageIcon size={18} className={styles.coverIconPresent} aria-label="Has cover image" />
+                      ) : (
+                        <ImageOff size={18} className={styles.coverIconMissing} aria-label="No cover image" />
+                      )}
                       <span>{post.title}</span>
                     </div>
                     <span className={styles.tableCell}>
@@ -192,11 +193,17 @@ export default function ManageBlogContent({ initialPosts }: { initialPosts: Blog
                     </span>
                     <span className={styles.tableCell}>{formatDate(post.updatedAt)}</span>
                     <div className={styles.actions}>
-                      {post.status === 'published' && (
-                        <Tooltip label="View post">
-                          <a className={styles.actionBtn} aria-label="View post" href={`/blog/${post.slug}`} target="_blank" rel="noopener noreferrer">
-                            <ViewIcon />
+                      {post.status === 'published' ? (
+                        <Tooltip label="Open post in new tab">
+                          <a className={styles.actionBtn} aria-label="Open post in new tab" href={`/blog/${post.slug}`} target="_blank" rel="noopener noreferrer">
+                            <OpenInNewIcon />
                           </a>
+                        </Tooltip>
+                      ) : (
+                        <Tooltip label="Publish the post to open it">
+                          <button type="button" className={styles.actionBtn} aria-label="Open post in new tab (unavailable for drafts)" disabled>
+                            <OpenInNewIcon />
+                          </button>
                         </Tooltip>
                       )}
                       <Tooltip label="Edit post">

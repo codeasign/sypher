@@ -1,28 +1,24 @@
 'use client';
 
+import { ArrowDown, ArrowUp } from 'lucide-react';
 import React, { useEffect, useState } from 'react';
 import clsx from 'clsx';
 import { listCourseModules, deleteCourseModule, reorderCourseModule, type CourseModule } from '@/data/courses';
 import ModuleEditor from './ModuleEditor';
 import { EditIcon, DeleteIcon } from '@/components/icons/ActionIcons';
 import Tooltip from '@/components/Tooltip';
+import EmptyState from '@/components/EmptyState';
 import styles from './manage-courses.module.css';
 
 function UpIcon(): React.JSX.Element {
   return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <line x1="12" y1="19" x2="12" y2="5" />
-      <polyline points="5 12 12 5 19 12" />
-    </svg>
+    <ArrowUp size={14} />
   );
 }
 
 function DownIcon(): React.JSX.Element {
   return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <line x1="12" y1="5" x2="12" y2="19" />
-      <polyline points="19 12 12 19 5 12" />
-    </svg>
+    <ArrowDown size={14} />
   );
 }
 
@@ -112,9 +108,7 @@ export default function ModulesTab({ courseId }: ModulesTabProps): React.JSX.Ele
       {actionError && <p className={styles.errorText}>{actionError}</p>}
 
       {modules.length === 0 ? (
-        <div className={styles.emptyState}>
-          <p>No modules yet. Create your first one.</p>
-        </div>
+        <EmptyState illustration="courses" compact title="No modules yet." description="Create your first one to get started." />
       ) : (
         <div className={styles.tableWrapper}>
           {modules.map((mod, index) => (

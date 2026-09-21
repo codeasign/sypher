@@ -8,6 +8,7 @@ export const ROLE_COLORS: Record<string, string> = {
   ADMIN: '#475569', // slate
   FREE_USER: '#0891b2', // muted cyan
   PAID_USER: '#7c3aed', // muted violet
+  MOBILE_USER: '#0369a1', // muted sky blue
   INTERNAL_HR: '#b45309', // muted amber
   COMPANY_HR: '#be185d', // muted rose
   COMPANY_EMPLOYEE: '#15803d', // muted green

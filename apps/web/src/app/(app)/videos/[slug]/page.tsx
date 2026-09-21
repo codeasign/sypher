@@ -1,3 +1,4 @@
+import { Play } from 'lucide-react';
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound, redirect } from 'next/navigation';
@@ -119,9 +120,7 @@ export default async function VideoPage({ params }: { params: Promise<{ slug: st
                       <div className={styles.playlistThumbPlaceholder} />
                     )}
                     <span className={styles.playlistPlayBadge} aria-hidden="true">
-                      <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-                        <path d="M8 5v14l11-7z" />
-                      </svg>
+                      <Play size={16} fill="currentColor" />
                     </span>
                   </div>
                   <div className={styles.playlistMeta}>

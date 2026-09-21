@@ -17,6 +17,7 @@ import {
   type ManagerEntry,
 } from '@/data/cohorts';
 import courses from '@sypher/course-catalog/src/courses';
+import EmptyState from '@/components/EmptyState';
 import styles from './launch-cohort.module.css';
 
 interface CourseCatalogEntry {
@@ -310,9 +311,7 @@ export default function LaunchCohortContent({ isAdmin }: { isAdmin: boolean }): 
       )}
 
       {cohorts.length === 0 ? (
-        <div className={styles.emptyState}>
-          <p>No cohorts yet. Launch your first one.</p>
-        </div>
+        <EmptyState illustration="people" compact title="No cohorts yet." description="Launch your first one to get started." />
       ) : (
         <div className={styles.tableWrapper}>
           <div className={styles.tableHeader}>

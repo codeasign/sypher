@@ -11,7 +11,7 @@ import { roleLabel } from '@/lib/roleLabels';
 import { roleColor } from '@/lib/roleColors';
 import styles from './styles.module.css';
 
-const ROLES = ['ADMIN', 'FREE_USER', 'PAID_USER', 'INTERNAL_HR', 'COMPANY_HR', 'COMPANY_EMPLOYEE', 'BRANDER', 'COHORT_USER', 'REVIEWER', 'COURSE_AUDITOR'] as const;
+const ROLES = ['ADMIN', 'FREE_USER', 'PAID_USER', 'MOBILE_USER', 'INTERNAL_HR', 'COMPANY_HR', 'COMPANY_EMPLOYEE', 'BRANDER', 'COHORT_USER', 'REVIEWER', 'COURSE_AUDITOR'] as const;
 type Role = (typeof ROLES)[number];
 const NON_ADMIN_ROLES = ROLES.filter((r) => r !== 'ADMIN');
 
@@ -1076,7 +1076,7 @@ function CompanyListSection(): React.JSX.Element {
 
 // Roles offered on the User Role tab — the set admins are meant to assign
 // from this page. The API still validates against the full schema enum.
-const ASSIGNABLE_ROLES: readonly Role[] = ['FREE_USER', 'PAID_USER', 'INTERNAL_HR', 'BRANDER', 'REVIEWER', 'COURSE_AUDITOR', 'ADMIN'];
+const ASSIGNABLE_ROLES: readonly Role[] = ['FREE_USER', 'PAID_USER', 'MOBILE_USER', 'INTERNAL_HR', 'BRANDER', 'REVIEWER', 'COURSE_AUDITOR', 'ADMIN'];
 
 const USER_PAGE_SIZE = 10;
 

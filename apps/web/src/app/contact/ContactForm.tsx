@@ -1,5 +1,6 @@
 'use client';
 
+import { Check } from 'lucide-react';
 import { useState, type FormEvent } from 'react';
 import { apiFetch } from '@/lib/api';
 import RecaptchaV2, { recaptchaConfigured } from '@/components/RecaptchaV2';
@@ -45,9 +46,7 @@ export default function ContactForm(): React.JSX.Element {
   if (status === 'success') {
     return (
       <div className={styles.successCard}>
-        <svg className={styles.successIcon} width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <path d="M20 6 9 17l-5-5" />
-        </svg>
+        <Check className={styles.successIcon} size={40} />
         <h2 className={styles.successTitle}>Message sent</h2>
         <p className={styles.successText}>Thanks for reaching out — we&apos;ll get back to you soon.</p>
       </div>

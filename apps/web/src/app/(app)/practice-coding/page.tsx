@@ -13,9 +13,6 @@ export default async function PracticeCodingPage(): Promise<React.JSX.Element> {
     const res = await serverApiFetch("/coding-problems");
     const problems: CodingProblemSummary[] = res.ok ? await res.json() : [];
 
-    const bookmarksRes = await serverApiFetch("/coding-problems/bookmarks/mine");
-    const bookmarkedIds: string[] = bookmarksRes.ok ? await bookmarksRes.json() : [];
-
     return (
         <div className={styles.page}>
             <div className={styles.container}>
@@ -26,7 +23,7 @@ export default async function PracticeCodingPage(): Promise<React.JSX.Element> {
                     </p>
                 </div>
 
-                <CodingProblemsBoard problems={problems} bookmarkedIds={bookmarkedIds} />
+                <CodingProblemsBoard problems={problems} />
             </div>
         </div>
     );

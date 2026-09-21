@@ -28,7 +28,8 @@ export default async function AppLayout({ children }: { children: ReactNode }): 
     redirect('/login');
   }
   const user: AuthUser = await meRes.json();
-  const isPaidAndActive = user.role === 'PAID_USER' && !!user.paidUntil && new Date(user.paidUntil) > new Date();
+  const isPaidAndActive =
+    user.role === 'MOBILE_USER' || (user.role === 'PAID_USER' && !!user.paidUntil && new Date(user.paidUntil) > new Date());
 
   const navRes = await serverApiFetch('/access/my-nav');
   const visibleKeys: string[] = navRes.ok ? await navRes.json() : [];

@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 import CourseScroller from '@/components/CourseScroller';
 import type { CourseWithAccess } from '@/data/courses';
 import { NEW_COURSE_SLUGS, NEW_COURSE_SLUG_SET } from '@/lib/newCourses';
+import EmptyState from '@/components/EmptyState';
 import styles from './styles.module.css';
 
 const ALL_TAB = '__all__';
@@ -11,9 +12,11 @@ const UNCATEGORIZED_KEY = '__uncategorized__';
 
 // Known categories in display order; any other value the free-form DB
 // column holds is appended alphabetically, with "no category" last.
-const CATEGORY_ORDER = ['tech', 'life-skills', 'Presentation'];
+const CATEGORY_ORDER = ['tech', 'coding', 'databases', 'life-skills', 'Presentation'];
 const CATEGORY_LABELS: Record<string, string> = {
   tech: 'Tech',
+  coding: 'Coding',
+  databases: 'Databases',
   'life-skills': 'Life Skills',
   Presentation: 'Presentation Skills',
 };
@@ -180,7 +183,7 @@ export default function CourseSectionsBoard({
   return (
     <>
       {noCourses ? (
-        <p className={styles.emptyText}>No courses available yet.</p>
+        <EmptyState illustration="courses" title="No courses available yet." description="Courses will appear here as soon as they're published." />
       ) : (
         <>
           {tabs.length > 1 && (
@@ -201,7 +204,7 @@ export default function CourseSectionsBoard({
           )}
 
           {nothingInTab ? (
-            <p className={styles.emptyText}>Nothing in this category yet.</p>
+            <EmptyState illustration="courses" compact title="Nothing in this category yet." description="Check back soon, or try another category." />
           ) : variant === 'browse' ? (
             <>
               <CourseScroller

@@ -1,50 +1,15 @@
-import type { SVGProps } from 'react';
+import { Briefcase, Users, type LucideProps } from 'lucide-react';
 import { getDocsOrigin } from '@sypher/auth-core/src/urls';
 import styles from './styles.module.css';
 
 const DOCS_ORIGIN = getDocsOrigin();
 
-function BriefcaseIcon(props: SVGProps<SVGSVGElement>) {
-  return (
-    <svg
-      width={24}
-      height={24}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={1.8}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-      {...props}
-    >
-      <rect x="3" y="7.5" width="18" height="12" rx="2" />
-      <path d="M8.5 7.5V6a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v1.5" />
-      <path d="M3 12.5h18" />
-    </svg>
-  );
+function BriefcaseIcon(props: LucideProps) {
+  return <Briefcase size={24} strokeWidth={1.8} aria-hidden="true" {...props} />;
 }
 
-function UsersIcon(props: SVGProps<SVGSVGElement>) {
-  return (
-    <svg
-      width={24}
-      height={24}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={1.8}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-      {...props}
-    >
-      <circle cx="9" cy="8.5" r="3" />
-      <path d="M3.5 19c.7-3 2.9-4.8 5.5-4.8s4.8 1.8 5.5 4.8" />
-      <circle cx="17" cy="9" r="2.4" />
-      <path d="M15.5 14.5c2.1.3 3.7 1.9 4.3 4.5" />
-    </svg>
-  );
+function UsersIcon(props: LucideProps) {
+  return <Users size={24} strokeWidth={1.8} aria-hidden="true" {...props} />;
 }
 
 const links = [

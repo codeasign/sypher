@@ -9,6 +9,7 @@ import {
   setCourseAccessCompany,
 } from '@/data/courses';
 import { roleLabel } from '@/lib/roleLabels';
+import EmptyState from '@/components/EmptyState';
 import styles from './manage-courses.module.css';
 
 // Same exclusions as v1's GLOBALLY_CONFIGURABLE_ROLES: admin always has
@@ -133,7 +134,7 @@ export default function AccessTab({ courseId }: AccessTabProps): React.JSX.Eleme
         </div>
 
         {grantedCompanies.length === 0 ? (
-          <p className={styles.emptyText}>No companies have access yet.</p>
+          <EmptyState illustration="folder" compact title="No companies have access yet." />
         ) : (
           <ul className={styles.companyList}>
             {grantedCompanies.map((c) => (

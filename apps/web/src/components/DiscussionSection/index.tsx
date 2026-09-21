@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
+import { ArrowBigUp, Clock, Lightbulb } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import {
   COMMENT_SORT_MODES,
@@ -23,7 +24,13 @@ import Composer from './Composer';
 import CommentItem from './CommentItem';
 import styles from './styles.module.css';
 
-type DiscussionTargetType = 'courseModule' | 'blogPost' | 'course' | 'video';
+const SORT_ICONS: Record<CommentSortMode, React.JSX.Element> = {
+  chrono: <Clock size={14} aria-hidden="true" />,
+  upvotes: <ArrowBigUp size={16} aria-hidden="true" />,
+  useful: <Lightbulb size={14} aria-hidden="true" />,
+};
+
+type DiscussionTargetType ='courseModule' | 'blogPost' | 'course' | 'video';
 
 interface DiscussionSectionProps {
   /** What this discussion is attached to — the ONLY content-type switch in the UI. */
@@ -302,6 +309,7 @@ export default function DiscussionSection({
             onClick={() => setSort(value)}
             aria-pressed={sort === value}
           >
+            {SORT_ICONS[value]}
             {label}
           </button>
         ))}

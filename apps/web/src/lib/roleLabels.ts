@@ -8,6 +8,7 @@ export const ROLE_LABELS: Record<string, string> = {
   ADMIN: 'Admin',
   FREE_USER: 'Free User',
   PAID_USER: 'Paid User',
+  MOBILE_USER: 'Mobile User',
   INTERNAL_HR: 'Internal HR',
   COMPANY_HR: 'Company HR',
   COMPANY_EMPLOYEE: 'Company Employee',

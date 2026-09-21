@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useShowMore } from '@/hooks/useShowMore';
 import type { Cohort } from '@/data/cohorts';
+import EmptyState from '@/components/EmptyState';
 import styles from './styles.module.css';
 
 function formatDate(iso: string): string {
@@ -29,7 +30,7 @@ export default function CohortList({ initialCohorts }: { initialCohorts: Cohort[
   const { visible, hasMore, showAll } = useShowMore(initialCohorts);
 
   if (initialCohorts.length === 0) {
-    return <p className={styles.statusText}>No cohorts running right now. Check back soon.</p>;
+    return <EmptyState illustration="people" title="No cohorts running right now." description="Check back soon for the next one." />;
   }
 
   return (

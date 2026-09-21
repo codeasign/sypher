@@ -392,7 +392,7 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
               <li key={question.id} className={styles.reviewCard}>
                 <div className={styles.questionMeta}>
                   <span className={styles.domainTag}>{question.domain}</span>
-                  <span className={styles.difficultyTag}>{question.difficulty}</span>
+                  <span className={styles.difficultyTag} data-difficulty={question.difficulty}>{question.difficulty}</span>
                   <span
                     className={
                       question.selectedAnswer === null
@@ -507,7 +507,7 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
           <div className={styles.questionCard}>
             <div className={styles.questionMeta}>
               <span className={styles.domainTag}>{question.domain}</span>
-              <span className={styles.difficultyTag}>{question.difficulty}</span>
+              <span className={styles.difficultyTag} data-difficulty={question.difficulty}>{question.difficulty}</span>
             </div>
             <p className={styles.questionText}>{question.question}</p>
             <ul className={styles.optionList}>

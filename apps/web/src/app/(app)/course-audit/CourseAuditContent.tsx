@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
 import { approveModuleEditRequest, rejectModuleEditRequest, type ModuleEditRequest } from '@/data/moduleEditRequests';
 import { useToast } from '@/components/Toast/ToastProvider';
+import EmptyState from '@/components/EmptyState';
 import styles from './styles.module.css';
 
 const CourseModuleArticle = dynamic(() => import('@/components/CourseModulePage/CourseModuleArticle'), {
@@ -80,10 +81,7 @@ export default function CourseAuditContent({ initialRequests }: { initialRequest
 
   if (requests.length === 0) {
     return (
-      <div className={styles.detailEmpty}>
-        <p className={styles.detailEmptyTitle}>No pending edits.</p>
-        <p className={styles.detailEmptyText}>Reviewer-submitted content changes will show up here for approval.</p>
-      </div>
+      <EmptyState illustration="folder" title="No pending edits." description="Reviewer-submitted content changes will show up here for approval." />
     );
   }
 
@@ -119,10 +117,7 @@ export default function CourseAuditContent({ initialRequests }: { initialRequest
 
       <div className={styles.detail}>
         {!selected ? (
-          <div className={styles.detailEmpty}>
-            <p className={styles.detailEmptyTitle}>Select a pending edit</p>
-            <p className={styles.detailEmptyText}>Pick one from the list to review its proposed content.</p>
-          </div>
+          <EmptyState illustration="pick" title="Select a pending edit" description="Pick one from the list to review its proposed content." />
         ) : (
           <>
             <div className={styles.detailHeader}>

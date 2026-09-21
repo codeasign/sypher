@@ -1,4 +1,5 @@
 import React from 'react';
+import Image from 'next/image';
 import Link from 'next/link';
 import styles from './styles.module.css';
 
@@ -32,8 +33,10 @@ export default function Footer(): React.JSX.Element {
       <div className={styles.container}>
         <div className={styles.grid}>
           <div className={styles.brandColumn}>
-            <span className={styles.brandTitle}>Sypher</span>
-            <p className={styles.brandTagline}>Learn by building</p>
+            <span className={styles.brandTitle}>
+              <Image src="/sypher-logo.png" alt="" width={45} height={45} className={styles.brandLogo} />
+              Sypher Next
+            </span>
           </div>
 
           <nav className={styles.linkColumn} aria-label="Legal">
@@ -51,7 +54,10 @@ export default function Footer(): React.JSX.Element {
         </div>
 
         <div className={styles.bottomBar}>
-          <span>© {year} Sypher. All rights reserved.</span>
+          <span className={styles.copyright}>
+            <Image src="/sypher-logo.png" alt="" width={20} height={20} className={styles.copyrightLogo} />
+            © {year} Sypher Next. All rights reserved.
+          </span>
         </div>
       </div>
     </footer>

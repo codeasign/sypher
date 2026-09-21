@@ -28,5 +28,10 @@ export default async function PracticeCodingProblemPage({ params }: PageProps): 
   const problem = await fetchProblem(slug.join('/'));
   if (!problem) notFound();
 
-  return <CodingProblemDetail problem={problem} />;
+  // Initial state for the bookmark button in the problem header. A failed
+  // lookup just shows the problem as not bookmarked rather than erroring.
+  const bookmarksRes = await serverApiFetch('/coding-problems/bookmarks/mine');
+  const bookmarkedIds: string[] = bookmarksRes.ok ? await bookmarksRes.json() : [];
+
+  return <CodingProblemDetail problem={problem} initialBookmarked={bookmarkedIds.includes(problem.id)} />;
 }

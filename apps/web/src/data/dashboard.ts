@@ -1,4 +1,4 @@
-// Mirrors apps/api's DashboardRepository.DashboardData (served by
+// Mirrors apps/api's DashboardRepository.UserDashboardResponse (served by
 // GET /users/me/dashboard). Kept as a hand-written type — there is no
 // generated client — so update both sides together.
 

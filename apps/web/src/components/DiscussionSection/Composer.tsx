@@ -1,8 +1,23 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { Bold, Code, Italic, List, ListOrdered, Underline, type LucideIcon } from 'lucide-react';
+import Tooltip from '@/components/Tooltip';
 import { searchMentions, type MentionCandidateData } from '@/data/comments';
+import { applyFormat, type FormatAction } from './formatting';
 import styles from './styles.module.css';
+
+// Mirrors COMMENT_BODY_MAX_LENGTH in apps/api/src/lib/commentAccess.ts.
+const COMMENT_MAX_LENGTH = 5000;
+
+const TOOLBAR_ITEMS: { action: FormatAction; label: string; Icon: LucideIcon }[] = [
+  { action: 'bold', label: 'Bold (Ctrl+B)', Icon: Bold },
+  { action: 'italic', label: 'Italic (Ctrl+I)', Icon: Italic },
+  { action: 'underline', label: 'Underline (Ctrl+U)', Icon: Underline },
+  { action: 'orderedList', label: 'Numbered list', Icon: ListOrdered },
+  { action: 'bulletList', label: 'Bullet list', Icon: List },
+  { action: 'code', label: 'Code', Icon: Code },
+];
 
 interface ComposerProps {
   placeholder: string;
@@ -104,6 +119,17 @@ export default function Composer({
     if (debounceRef.current) clearTimeout(debounceRef.current);
   }, []);
 
+  // Grow with the content so the whole comment is always visible. Runs on
+  // every value change (typing, mention insertion, reset after submit) —
+  // collapse to "auto" first so the box can also shrink when text is deleted.
+  useLayoutEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    const borders = el.offsetHeight - el.clientHeight;
+    el.style.height = `${el.scrollHeight + borders}px`;
+  }, [value]);
+
   function caretToken(text: string, caret: number): { matchStart: number; query: string } | null {
     const before = text.slice(0, caret);
     const match = MENTION_TRIGGER_RE.exec(before);
@@ -156,7 +182,34 @@ export default function Composer({
     });
   }
 
+  function format(action: FormatAction): void {
+    const el = textareaRef.current;
+    if (!el) return;
+    const result = applyFormat(value, el.selectionStart, el.selectionEnd, action);
+    if (result.value.length > COMMENT_MAX_LENGTH) {
+      setError(`Comments are limited to ${COMMENT_MAX_LENGTH} characters.`);
+      return;
+    }
+    setValue(result.value);
+    setError(null);
+    setDropdownOpen(false);
+    // Controlled value updates after this handler — restore focus and the
+    // selection once React has committed the new text.
+    requestAnimationFrame(() => {
+      el.focus();
+      el.setSelectionRange(result.selectionStart, result.selectionEnd);
+    });
+  }
+
   function handleKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>): void {
+    if (event.ctrlKey || event.metaKey) {
+      const shortcut = event.key.toLowerCase() === 'b' ? 'bold' : event.key.toLowerCase() === 'i' ? 'italic' : event.key.toLowerCase() === 'u' ? 'underline' : null;
+      if (shortcut) {
+        event.preventDefault();
+        format(shortcut);
+        return;
+      }
+    }
     if (!dropdownOpen || candidates.length === 0) return;
     if (event.key === 'ArrowDown') {
       event.preventDefault();
@@ -201,6 +254,22 @@ export default function Composer({
   return (
     <div className={compact ? styles.composerCompact : styles.composer}>
       <div className={styles.composerBox}>
+        <div className={styles.toolbar} role="toolbar" aria-label="Text formatting">
+          {TOOLBAR_ITEMS.map(({ action, label, Icon }) => (
+            <Tooltip key={action} label={label}>
+              <button
+                type="button"
+                className={styles.toolbarButton}
+                aria-label={label}
+                // Keep the textarea's focus and selection when clicking.
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => format(action)}
+              >
+                <Icon size={16} aria-hidden="true" />
+              </button>
+            </Tooltip>
+          ))}
+        </div>
         <textarea
           ref={textareaRef}
           className={styles.textarea}
@@ -208,7 +277,7 @@ export default function Composer({
           placeholder={placeholder}
           autoFocus={autoFocus}
           rows={compact ? 2 : 3}
-          maxLength={5000}
+          maxLength={COMMENT_MAX_LENGTH}
           onChange={(e) => handleChange(e.target.value)}
           onKeyDown={handleKeyDown}
         />

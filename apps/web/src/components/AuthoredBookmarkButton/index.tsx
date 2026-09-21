@@ -1,5 +1,6 @@
 'use client';
 
+import { Bookmark } from 'lucide-react';
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
@@ -12,9 +13,7 @@ import styles from './styles.module.css';
 
 function BookmarkIcon({ filled }: { filled: boolean }): React.JSX.Element {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill={filled ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
-    </svg>
+    <Bookmark size={18} fill={filled ? 'currentColor' : 'none'} />
   );
 }
 
@@ -70,9 +69,15 @@ interface ModuleBookmarkButtonProps {
   courseId: string;
   initialBookmarked: boolean;
   onChange?: (bookmarked: boolean) => void;
+  /**
+   * Render just the bookmark icon (round icon button, like the course
+   * bookmark) without the "Bookmark" / "Bookmarked" text. Default false --
+   * the lesson page keeps the labelled button.
+   */
+  iconOnly?: boolean;
 }
 
-export function ModuleBookmarkButton({ moduleId, courseId, initialBookmarked, onChange }: ModuleBookmarkButtonProps): React.JSX.Element {
+export function ModuleBookmarkButton({ moduleId, courseId, initialBookmarked, onChange, iconOnly = false }: ModuleBookmarkButtonProps): React.JSX.Element {
   const router = useRouter();
   const [bookmarked, setBookmarked] = useState(initialBookmarked);
   const [pending, setPending] = useState(false);
@@ -96,14 +101,14 @@ export function ModuleBookmarkButton({ moduleId, courseId, initialBookmarked, on
   return (
     <button
       type="button"
-      className={styles.textButton}
+      className={iconOnly ? styles.iconButton : styles.textButton}
       onClick={toggle}
       aria-pressed={bookmarked}
       aria-label={bookmarked ? 'Remove bookmark' : 'Bookmark this module'}
       title={bookmarked ? 'Remove bookmark' : 'Bookmark this module'}
     >
       <BookmarkIcon filled={bookmarked} />
-      {bookmarked ? 'Bookmarked' : 'Bookmark'}
+      {!iconOnly && (bookmarked ? 'Bookmarked' : 'Bookmark')}
     </button>
   );
 }

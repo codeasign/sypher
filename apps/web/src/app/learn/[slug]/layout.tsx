@@ -30,7 +30,8 @@ export default async function CourseLayout({ children, params }: { children: Rea
     redirect('/login');
   }
   const user: { email: string; fullName: string | null; role: string; paidUntil: string | null; avatarUrl: string | null } = await meRes.json();
-  const isPaidAndActive = user.role === 'PAID_USER' && !!user.paidUntil && new Date(user.paidUntil) > new Date();
+  const isPaidAndActive =
+    user.role === 'MOBILE_USER' || (user.role === 'PAID_USER' && !!user.paidUntil && new Date(user.paidUntil) > new Date());
   const navRes = await serverApiFetch('/access/my-nav');
   const visibleKeys: string[] = navRes.ok ? await navRes.json() : [];
 

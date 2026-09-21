@@ -13,6 +13,7 @@ type Tab = 'about' | 'topics' | 'discussion';
 
 export default function CourseHomeTabs({ about, topics, discussion }: CourseHomeTabsProps): React.JSX.Element {
   const [active, setActive] = useState<Tab>('about');
+  const panels: Record<Tab, ReactNode> = { about, topics, discussion };
 
   return (
     <div>
@@ -46,9 +47,7 @@ export default function CourseHomeTabs({ about, topics, discussion }: CourseHome
         </button>
       </div>
       <div className={styles.tabPanel} role="tabpanel">
-        {active === 'about' && about}
-        {active === 'topics' && topics}
-        {active === 'discussion' && discussion}
+        {panels[active]}
       </div>
     </div>
   );

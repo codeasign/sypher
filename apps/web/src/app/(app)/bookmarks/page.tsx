@@ -3,12 +3,13 @@ import { redirect } from 'next/navigation';
 import { serverApiFetch } from '@/lib/serverApi';
 import type { Course, CourseWithAccess } from '@/data/courses';
 import type { AuthoredModuleBookmarkEntry } from '@/data/bookmarks';
+import type { CodingProblemSummary } from '@/data/codingProblems';
 import BookmarksContent, { type BookmarkedModule } from './BookmarksContent';
 import styles from './styles.module.css';
 
 export const metadata: Metadata = {
   title: 'Bookmarks',
-  description: 'Courses and modules you’ve bookmarked on Sypher.',
+  description: 'Courses, modules and coding problems you’ve bookmarked on Sypher.',
 };
 
 // A bookmarked course that isn't in the per-user catalog list (unpublished,
@@ -23,11 +24,19 @@ export default async function BookmarksPage(): Promise<React.JSX.Element> {
     redirect('/login');
   }
 
-  const [courseIdsRes, moduleBookmarksRes, sidebarRes] = await Promise.all([
+  const [courseIdsRes, moduleBookmarksRes, sidebarRes, problemsRes, problemBookmarksRes] = await Promise.all([
     serverApiFetch('/bookmarks/authored-courses'),
     serverApiFetch('/bookmarks/authored-modules'),
     serverApiFetch('/courses/sidebar-list'),
+    serverApiFetch('/coding-problems'),
+    serverApiFetch('/coding-problems/bookmarks/mine'),
   ]);
+  // Coding problems: bookmarks come back as bare ids, so join them against the
+  // full problem list (summaries only) to get titles + categories. Grouping
+  // by category happens client-side in the Coding Problems tab.
+  const allProblems: CodingProblemSummary[] = problemsRes.ok ? await problemsRes.json() : [];
+  const problemBookmarkIds = new Set<string>(problemBookmarksRes.ok ? await problemBookmarksRes.json() : []);
+  const bookmarkedProblems = allProblems.filter((p) => problemBookmarkIds.has(p.id));
   const courseIds: string[] = courseIdsRes.ok ? await courseIdsRes.json() : [];
   const moduleBookmarks: AuthoredModuleBookmarkEntry[] = moduleBookmarksRes.ok ? await moduleBookmarksRes.json() : [];
   const sidebarCourses: CourseWithAccess[] = sidebarRes.ok ? await sidebarRes.json() : [];
@@ -62,7 +71,7 @@ export default async function BookmarksPage(): Promise<React.JSX.Element> {
   return (
     <div className={styles.page}>
       <div className={styles.container}>
-        <BookmarksContent initialCourses={courses} initialModules={modules} />
+        <BookmarksContent initialCourses={courses} initialModules={modules} initialProblems={bookmarkedProblems} />
       </div>
     </div>
   );

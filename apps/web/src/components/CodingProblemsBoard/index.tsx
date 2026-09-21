@@ -3,6 +3,8 @@
 import { useMemo, useState } from 'react';
 import CodingProblemCard from '@/components/CodingProblemCard';
 import type { CodingProblemSummary } from '@/data/codingProblems';
+import { compareCategoryLabels, packPillsByRow } from '@/lib/codingCategoryOrder';
+import EmptyState from '@/components/EmptyState';
 import styles from './styles.module.css';
 
 const ALL_CATEGORY = '__all__';
@@ -13,34 +15,16 @@ function difficultyLabel(difficulty: string): string {
   return difficulty.charAt(0).toUpperCase() + difficulty.slice(1);
 }
 
-// Canonical DSA-pattern order the user expects the category filter in — not
-// alphabetical, not DB insertion order (the content-migration script's
-// orderIndex doesn't follow this sequence). Matched against categoryLabel;
-// any category not in this list (arrays, bst, design, graph-algorithms,
-// linked-list, math, matrix-traversal, simulation, string-algorithms, ...)
-// is appended after it, alphabetically.
-const CATEGORY_ORDER = [
-  'Two Pointers', 'Sliding Window', 'Binary Search', 'Prefix Sum',
-  'Hashing / Frequency Map', 'Fast & Slow Pointers', 'Merge Intervals',
-  'Monotonic Stack / Queue', 'BFS / DFS', 'Backtracking', 'Greedy',
-  'Dynamic Programming (DP)', 'Heap / Priority Queue', 'Union Find (DSU)',
-  'Topological Sort', 'Trie', 'Bit Manipulation',
-];
-const CATEGORY_RANK = new Map(CATEGORY_ORDER.map((label, i) => [label, i]));
-
-function compareCategoryLabels(a: string, b: string): number {
-  const rankA = CATEGORY_RANK.get(a);
-  const rankB = CATEGORY_RANK.get(b);
-  if (rankA !== undefined && rankB !== undefined) return rankA - rankB;
-  if (rankA !== undefined) return -1;
-  if (rankB !== undefined) return 1;
-  return a.localeCompare(b);
-}
-
 // Tag-cloud font-size steps, keyed by how a category's problem count ranks
 // against the others (0 = most-populated category) — biggest category gets
 // the biggest pill, same idea as a classic word cloud.
 const CLOUD_SIZE_STEPS = [styles.cloudSize0, styles.cloudSize1, styles.cloudSize2, styles.cloudSize3];
+// The same steps as font sizes in px (.cloudSize0-3 in styles.module.css: 0.98,
+// 0.9, 0.82, 0.75rem) -- used to estimate pill widths for row packing. Keep in
+// step with the CSS.
+const CLOUD_FONT_PX = [0.98, 0.9, 0.82, 0.75].map((rem) => rem * 16);
+// "All" always uses the third step, as before.
+const ALL_STEP = 2;
 
 /**
  * Two-column layout for the Practice Coding catalog: the numbered problem
@@ -51,10 +35,8 @@ const CLOUD_SIZE_STEPS = [styles.cloudSize0, styles.cloudSize1, styles.cloudSize
  */
 export default function CodingProblemsBoard({
   problems,
-  bookmarkedIds,
 }: {
   problems: CodingProblemSummary[];
-  bookmarkedIds: string[];
 }): React.JSX.Element {
   const categories = useMemo(() => {
     const seen = new Map<string, string>();
@@ -71,20 +53,37 @@ export default function CodingProblemsBoard({
   // Rank categories by count (descending) to pick each pill's cloud size —
   // independent of the display order above (canonical DSA-pattern order),
   // which stays fixed regardless of count.
-  const cloudSizeByCategory = useMemo(() => {
+  const cloudStepByCategory = useMemo(() => {
     const ranked = [...categoryCounts.entries()].sort((a, b) => b[1] - a[1]);
-    const sizeByCount = new Map<number, string>();
+    const stepByCount = new Map<number, number>();
     let step = 0;
     for (const [, count] of ranked) {
-      if (!sizeByCount.has(count)) {
-        sizeByCount.set(count, CLOUD_SIZE_STEPS[Math.min(step, CLOUD_SIZE_STEPS.length - 1)]);
+      if (!stepByCount.has(count)) {
+        stepByCount.set(count, Math.min(step, CLOUD_SIZE_STEPS.length - 1));
         step++;
       }
     }
-    const byCategory = new Map<string, string>();
-    for (const [key, count] of categoryCounts) byCategory.set(key, sizeByCount.get(count) ?? styles.cloudSize3);
+    const byCategory = new Map<string, number>();
+    for (const [key, count] of categoryCounts) byCategory.set(key, stepByCount.get(count) ?? CLOUD_SIZE_STEPS.length - 1);
     return byCategory;
   }, [categoryCounts]);
+
+  // Pills in display order: "All" first, then the categories in canonical order
+  // -- except that when the next one wouldn't fit in the current row, a later,
+  // narrower one is pulled forward to fill the gap (see packPillsByRow).
+  const orderedPills = useMemo(() => {
+    const step = (key: string): number => cloudStepByCategory.get(key) ?? CLOUD_SIZE_STEPS.length - 1;
+    return packPillsByRow([
+      { key: ALL_CATEGORY, label: 'All', count: problems.length, step: ALL_STEP, fontPx: CLOUD_FONT_PX[ALL_STEP] },
+      ...categories.map(([key, label]) => ({
+        key,
+        label,
+        count: categoryCounts.get(key) ?? 0,
+        step: step(key),
+        fontPx: CLOUD_FONT_PX[step(key)],
+      })),
+    ]);
+  }, [categories, categoryCounts, cloudStepByCategory, problems.length]);
 
   const [activeCategory, setActiveCategory] = useState(ALL_CATEGORY);
   const currentCategory = activeCategory === ALL_CATEGORY || categories.some(([key]) => key === activeCategory) ? activeCategory : ALL_CATEGORY;
@@ -146,7 +145,7 @@ export default function CodingProblemsBoard({
   }, [visible]);
 
   if (problems.length === 0) {
-    return <p className={styles.emptyText}>No coding problems published yet.</p>;
+    return <EmptyState illustration="code" title="No coding problems published yet." description="Practice problems will appear here as soon as they're published." />;
   }
 
   const activeCategoryLabel = currentCategory === ALL_CATEGORY ? null : categories.find(([key]) => key === currentCategory)?.[1] ?? null;
@@ -157,6 +156,7 @@ export default function CodingProblemsBoard({
         <div className={styles.resultsHeader}>
           {activeCategoryLabel ? (
             <button type="button" className={styles.categoryChip} onClick={() => setActiveCategory(ALL_CATEGORY)}>
+              <span className={`${styles.categoryDot} ${styles.categoryDotOn}`} aria-hidden="true" />
               {activeCategoryLabel}
               <span className={styles.categoryChipClose} aria-hidden="true">×</span>
               <span className={styles.srOnly}>Clear category filter</span>
@@ -181,7 +181,7 @@ export default function CodingProblemsBoard({
           </div>
         </div>
         {visible.length === 0 ? (
-          <p className={styles.emptyText}>No problems match these filters.</p>
+          <EmptyState illustration="search" compact title="No problems match these filters." description="Try a different category or difficulty." />
         ) : activeCategoryLabel ? (
           visibleByDifficulty.map(([difficulty, items]) => (
             <div key={difficulty} className={styles.categorySection}>
@@ -191,7 +191,7 @@ export default function CodingProblemsBoard({
               <ul className={styles.list}>
                 {items.map((problem, i) => (
                   <li key={problem.id} className={styles.item}>
-                    <CodingProblemCard problem={problem} bookmarked={bookmarkedIds.includes(problem.id)} index={i + 1} />
+                    <CodingProblemCard problem={problem} index={i + 1} showBookmark={false} />
                   </li>
                 ))}
               </ul>
@@ -204,7 +204,7 @@ export default function CodingProblemsBoard({
               <ul className={styles.list}>
                 {group.items.map((problem, i) => (
                   <li key={problem.id} className={styles.item}>
-                    <CodingProblemCard problem={problem} bookmarked={bookmarkedIds.includes(problem.id)} index={i + 1} />
+                    <CodingProblemCard problem={problem} index={i + 1} showBookmark={false} />
                   </li>
                 ))}
               </ul>
@@ -217,25 +217,17 @@ export default function CodingProblemsBoard({
         <div className={styles.filterGroup}>
           <span className={styles.filterGroupLabel}>Category</span>
           <div className={styles.pillCloud}>
-            <button
-              type="button"
-              className={`${styles.pill} ${styles.cloudSize2} ${currentCategory === ALL_CATEGORY ? styles.pillActive : ''}`}
-              aria-pressed={currentCategory === ALL_CATEGORY}
-              onClick={() => setActiveCategory(ALL_CATEGORY)}
-            >
-              All
-              <span className={styles.pillCount}>{problems.length}</span>
-            </button>
-            {categories.map(([key, label]) => (
+            {orderedPills.map((pill) => (
               <button
-                key={key}
+                key={pill.key}
                 type="button"
-                className={`${styles.pill} ${cloudSizeByCategory.get(key) ?? styles.cloudSize3} ${currentCategory === key ? styles.pillActive : ''}`}
-                aria-pressed={currentCategory === key}
-                onClick={() => setActiveCategory(key)}
+                className={`${styles.pill} ${styles.categoryPill} ${CLOUD_SIZE_STEPS[pill.step]} ${currentCategory === pill.key ? styles.pillActive : ''}`}
+                aria-pressed={currentCategory === pill.key}
+                onClick={() => setActiveCategory(pill.key)}
               >
-                {label}
-                <span className={styles.pillCount}>{categoryCounts.get(key) ?? 0}</span>
+                <span className={styles.categoryDot} aria-hidden="true" />
+                {pill.label}
+                <span className={styles.pillCount}>{pill.count}</span>
               </button>
             ))}
           </div>

@@ -14,6 +14,7 @@ import {
   type MentionCandidateData,
 } from '@/data/comments';
 import Composer, { initialsOf } from './Composer';
+import CommentMarkdown from './CommentMarkdown';
 import styles from './styles.module.css';
 
 interface CommentItemProps {
@@ -59,36 +60,6 @@ function formatTimestamp(iso: string): string {
   const days = Math.floor(hours / 24);
   if (days < 30) return `${days}d ago`;
   return date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-}
-
-/**
- * Renders ONLY tracked mentions as chips: body tokens matching one of the
- * comment's CommentMention usernames (userId-keyed rows resolved at read
- * time). Free-typed "@text" that never came from the dropdown has no
- * matching mention row and stays plain — deliberately, per spec §11.
- */
-function renderBody(body: string, mentions: CommentView['mentions']): React.JSX.Element[] {
-  if (mentions.length === 0) return [<span key="body">{body}</span>];
-  const escaped = mentions.map((m) => m.username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  const re = new RegExp(`(^|\\s)@(${escaped.join('|')})(?=\\s|$|[^a-z0-9_])`, 'gi');
-  const parts: React.JSX.Element[] = [];
-  let last = 0;
-  let key = 0;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(body)) !== null) {
-    const username = match[2];
-    const tokenStart = match.index + match[1].length;
-    if (tokenStart > last) parts.push(<span key={key++}>{body.slice(last, tokenStart)}</span>);
-    parts.push(
-      <span key={key++} className={styles.mentionChip}>
-        @{username}
-      </span>,
-    );
-    last = tokenStart + username.length + 1;
-    if (match.index === re.lastIndex) re.lastIndex += 1; // zero-length safety
-  }
-  if (last < body.length) parts.push(<span key={key++}>{body.slice(last)}</span>);
-  return parts;
 }
 
 export default function CommentItem({
@@ -248,7 +219,7 @@ export default function CommentItem({
               onCancel={() => setEditing(false)}
             />
           ) : (
-            <p className={styles.commentBody}>{renderBody(comment.body, comment.mentions)}</p>
+            <CommentMarkdown body={comment.body} mentions={comment.mentions} />
           )}
 
           {!editing && (

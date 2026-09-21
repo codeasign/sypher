@@ -9,6 +9,7 @@ import Tooltip from '@/components/Tooltip';
 import Pagination from '@/components/Pagination';
 import TableSearchBar from '@/components/TableSearchBar';
 import { useToast } from '@/components/Toast/ToastProvider';
+import EmptyState from '@/components/EmptyState';
 import styles from '../manage-courses/manage-courses.module.css';
 
 const PAGE_SIZE = 10;
@@ -148,16 +149,12 @@ export default function ManageVideosContent({ initialVideos }: { initialVideos: 
       </div>
 
       {videos.length === 0 ? (
-        <div className={styles.emptyState}>
-          <p>No videos yet. Upload your first one.</p>
-        </div>
+        <EmptyState illustration="videos" compact title="No videos yet." description="Upload your first one to get started." />
       ) : (
         <>
           <TableSearchBar value={search} onChange={handleSearchChange} placeholder="Search videos by title…" />
           {visible.length === 0 ? (
-            <div className={styles.emptyState}>
-              <p>{search.trim() ? `No ${statusFilter} videos match "${search}".` : `No ${statusFilter} videos yet.`}</p>
-            </div>
+            <EmptyState illustration={search.trim() ? 'search' : 'videos'} compact title={search.trim() ? `No ${statusFilter} videos match "${search}".` : `No ${statusFilter} videos yet.`} />
           ) : (
             <>
               <div className={styles.tableWrapper}>
