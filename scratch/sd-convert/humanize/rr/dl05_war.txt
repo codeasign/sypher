@@ -1,0 +1,93 @@
+## Production War Stories
+
+The scenarios below are composites, written to illustrate failure patterns that are widely reported in distributed systems practice. They are not accounts of any specific company's incident, and the numbers in them are illustrative.
+
+### Scenario 1: Redis Failover Produces Duplicate Work
+
+A team runs a Redis master with replicas for a job scheduler. Workers take a lock on the job on the master before processing it. The master crashes, and a replica that has not yet received the most recent lock writes is promoted. A second worker acquires the lock for a job that the first worker is still processing. Both workers finish, and downstream systems receive duplicate events.
+
+The typical fixes come in layers:
+1. Make the downstream work idempotent, with the job ID as a deduplication key. This is the fix that actually removes the risk.
+2. Use Redis's `WAIT` command after lock writes to require acknowledgement from at least one replica. This narrows the window but does not close it.
+3. Move critical coordination to a consensus-based service (ZooKeeper or etcd) and keep Redis locks for cache invalidation and other work where a rare duplicate is cheap.
+
+### Scenario 2: Migrating from ZooKeeper to etcd
+
+A platform team wants to move its coordination layer from ZooKeeper to etcd, for example to standardize on the same store its Kubernetes clusters already use. Migrations like this commonly run for months and go through phases like these:
+
+1. **Shadow mode**: etcd is deployed alongside ZooKeeper, lock operations are sent to both, ZooKeeper's answer is authoritative, and etcd's answer is only logged for comparison. This phase tends to surface configuration problems such as disk sync settings.
+2. **Dual-authority mode**: A lock is considered acquired only if both systems grant it, which lets services migrate one at a time.
+3. **Primary mode**: etcd becomes the authority, and ZooKeeper remains as a fallback for a period.
+4. **etcd only**: ZooKeeper is decommissioned.
+
+Lessons that carry over to most such migrations:
+- Log every disagreement between the two systems while running in parallel.
+- Budget months, not weeks, and expect to touch every service that consumes locks.
+- Migrate services independently, so that the migration does not depend on a single coordinated release.
+
+### Scenario 3: Short Leases for Fast Failover
+
+A service assigns each voice channel to one server using a Redis lock. The lock has a 10-second TTL and the holder renews it every second. If the holder crashes, renewals stop and the lock expires within the TTL, so a replacement can take over in at most 10 seconds. The one-second renewal interval does not make failure detection faster than the TTL. It only gives the holder about ten chances to renew before the lock lapses, which keeps a transient network blip from causing a false takeover. A shorter TTL (with a matching renewal interval) is what speeds up failover, at the price of more renewal traffic and more false failovers.
+
+The pattern below shows a holder that renews in the background and exposes a flag it checks before every protected action.
+
+```python
+import threading
+
+class LockLostError(Exception):
+    pass
+
+class RenewingLock:
+    def __init__(self, lock, ttl_s):
+        self.lock, self.ttl_s = lock, ttl_s
+        self.lost = threading.Event()
+        self._stop = threading.Event()
+        threading.Thread(target=self._renew_loop, daemon=True).start()
+
+    def _renew_loop(self):
+        # Renew a few times per TTL; wait() returns True when stopped
+        while not self._stop.wait(self.ttl_s / 10):
+            try:
+                if not self.lock.renew(self.ttl_s):
+                    self.lost.set()
+                    return
+            except Exception:
+                self.lost.set()  # cannot confirm the lock: assume it is lost
+                return
+
+    def check(self):
+        """Call before every protected write."""
+        if self.lost.is_set():
+            raise LockLostError("lock lost, aborting")
+
+    def release(self):
+        self._stop.set()
+        self.lock.release()
+```
+
+Because the lock expires on its own if the holder dies, the design is crash-only: the holder does not need to release cleanly for others to make progress.
+
+## Lessons from Incident Patterns
+
+### Pattern 1: The Renewal Thread That Silently Stops
+
+A common incident pattern (reported in many postmortems in different forms) goes like this:
+1. A bug or a resource problem causes the lock renewal background thread to stop after a network hiccup, and nothing notices.
+2. The lock holder keeps working without the lock, believing it still holds it.
+3. Another process finds the lock expired, acquires it, and starts working on the same resource.
+4. Both processes write conflicting data to the storage layer.
+
+Contributing factors are usually the same:
+- The renewal thread had no health check, so no monitor noticed that it had died.
+- Lock loss was communicated asynchronously (an event), and the holder did not check for it before each write.
+- The storage layer accepted writes without verifying that they came from the current lock holder.
+
+The fixes follow directly:
+1. Monitor the renewal loop (for example, alert when a lock's last successful renewal is older than a threshold).
+2. Make lock loss a flag that is checked before every write, as in `RenewingLock.check()` above, and abort immediately if it is set.
+3. Have the storage layer verify a fencing token on every write and reject writes without a valid, current one.
+
+### Pattern 2: Metadata Locks in Sharded Databases
+
+Sharded databases coordinate metadata changes such as chunk migration and topology changes with some form of cluster-wide lock, and this pattern has produced real operational problems. In MongoDB's sharded clusters, for example, the balancer historically took a distributed lock stored on the config servers before migrating chunks, and chunk metadata carries a version that includes an epoch, so that stale routing information can be detected. The failure pattern is the general one: an operation outlives its lock, a second actor starts a conflicting change, and the system has to detect and repair inconsistent metadata. Recovery is faster when the operation is interruptible (it aborts and rolls back when it notices the lock is gone), when lock timeouts are set relative to the slowest realistic operation instead of the average one, and when writes carry a version or epoch that the storage layer can check. Check the documentation of your MongoDB version for how the balancer coordinates today, as this area has changed between releases.
+

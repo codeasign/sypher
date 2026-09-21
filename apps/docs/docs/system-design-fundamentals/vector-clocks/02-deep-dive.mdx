@@ -218,7 +218,7 @@ def compare(clock_a, clock_b):
     return "concurrent"
 ```
 
-Complexity: O(K) where K is the number of unique node identifiers across both clocks. In a system with N nodes where every node has touched the data, K = 2N. With pruning, K is the number of active nodes.
+Complexity: O(K) where K is the number of unique node identifiers across both clocks. In a system with N nodes where every node has touched the data, K = N (the two clocks share the same node set). With pruning, K is the number of active nodes.
 
 ### Vector Clock Merge
 
@@ -239,9 +239,9 @@ Complexity: O(K) where K is the number of unique node identifiers.
 
 ### Pruning for Size Management
 
-Vector clocks grow linearly with the number of nodes. To control size, systems implement pruning strategies. The simplest strategy removes nodes whose counter is zero (meaning that node has never modified the data item).
+Vector clocks grow linearly with the number of nodes. To control size, systems implement pruning strategies. The simplest strategy removes nodes whose counter is zero (meaning that node has never modified the data item). Most implementations never store those entries in the first place, so this rarely saves anything.
 
-More sophisticated pruning uses a threshold: if a node's counter has not changed for a configurable number of merge operations, remove it from the clock. The removed entries are treated as zero in subsequent comparisons.
+More sophisticated pruning removes entries that look stale: for example, if a node's counter has not changed for a configurable number of merge operations, remove it from the clock. The removed entries are treated as zero in subsequent comparisons. This is lossy. Once a real entry is dropped, two clocks that were causally related can compare as concurrent (or equal), so the system may produce extra siblings or, in the worst case, misjudge which version is newer. Dynamo's paper accepts this trade-off and notes that it did not cause problems in production, but it should be a deliberate decision.
 
 ```python
 def prune(clock, threshold=0):
@@ -321,7 +321,7 @@ Read request
 
 ### Step 2: Client modifies the value locally
 
-The client applies changes to the value. The vector clock is not yet modified — the client only holds the clock, it does not modify it until it writes back.
+The client applies changes to the value. The vector clock is not yet modified: the client only holds the clock, it does not modify it until it writes back.
 
 ### Step 3: Client sends a write request with the new value and clock
 
@@ -338,8 +338,8 @@ store.put("cart:42", new_value, clock=clock)
 
 The store node (coordinator) compares the clock provided by the client with its current clock for that key. There are three possible outcomes:
 
-- The client's clock is an ancestor of the current clock: the write is stale and can be rejected or treated as a no-op.
-- The client's clock is a descendant of the current clock: the write is fresh and can be applied directly.
+- The client's clock equals the current clock or is a descendant of it: the client saw the latest version (or something newer), so the write supersedes the current value and can be applied directly. This is the common case for a read-modify-write.
+- The client's clock is an ancestor of the current clock: the client read an older version. The store can reject the write as stale, or keep it as a sibling so nothing is lost, depending on the design.
 - The client's clock is concurrent with the current clock: a conflict exists and must be resolved.
 
 <AsciiDiagram
@@ -394,16 +394,16 @@ def handle_put(key, value, client_clock):
     relationship = compare(client_clock, current_clock)
 
     if relationship == "ancestor":
-        # Stale write — reject
+        # Stale write: reject (a store could also keep it as a sibling)
         raise StaleWriteError("Client clock is behind current state")
-    elif relationship == "descendant":
-        # Fresh write — apply
+    elif relationship in ("equal", "descendant"):
+        # Fresh write: the client saw the latest version, so this supersedes it
         new_clock = merge(client_clock, current_clock)
         new_clock.increment(local_node_id)
         store.put(key, value, clock=new_clock)
         return "applied"
     else:  # concurrent
-        # Conflict — trigger resolution
+        # Conflict: trigger resolution
         resolved_value = conflict_resolver.resolve(
             current_value=store.get_value(key),
             current_clock=current_clock,
@@ -418,7 +418,7 @@ def handle_put(key, value, client_clock):
 
 ### Step 6: Server responds to the client
 
-The server sends back the new vector clock. The client can use this clock for subsequent writes. This is write-path causal consistency — each write returns a clock that the client must send with the next write to establish the causal relationship.
+The server sends back the new vector clock. The client can use this clock for subsequent writes. This is write-path causal consistency: each write returns a clock that the client must send with the next write to establish the causal relationship.
 
 <AsciiDiagram
   id="vector-clocks/deep-req6"
@@ -510,23 +510,23 @@ Vector clock divergence during partition
 
 When two clients concurrently write to the same key from different nodes, both writes succeed but the system stores both versions. Each version has a vector clock that does not dominate the other. The versions accumulate until a read triggers conflict resolution.
 
-The number of concurrent versions is bounded by the number of replicas of the key. In a system with N replicas, at most N concurrent versions can exist for any key (assuming each replica modifies the key at most once without synchronization). In practice, N is typically 3, so the maximum sibling count is 3.
+When replicas coordinate writes, each replica can create one branch, so a key with N replicas is bounded by N concurrent versions only if every write goes through a distinct replica and each replica accepts one write between syncs. In practice the count is not bounded that tightly: several clients writing through the same replica with the same stale clock each create another sibling, and a busy key can accumulate dozens of siblings (the "sibling explosion" problem seen in Riak). Dotted version vectors and regular reconciliation on read keep the count down.
 
 ### Clock Size Growth Over Time
 
-Vector clock size grows as more nodes modify a data item. In a system with 100 nodes, a key that has been modified by every node would have a vector clock with 100 entries. Each entry is a node identifier plus a 64-bit counter: approximately 16 bytes per entry (8 bytes for node ID + 8 bytes for counter), totaling 1.6 KB for 100 entries.
+Vector clock size grows as more nodes modify a data item. In a system with 100 nodes where every node writes to the same key, a vector clock would have 100 entries. In Dynamo-style stores this is rare: only a key's few replicas (the top N nodes of its preference list, typically 3) usually coordinate its writes, so most per-key clocks stay at a handful of entries. Each entry is a node identifier plus a 64-bit counter: approximately 16 bytes per entry (8 bytes for node ID + 8 bytes for counter), totaling 1.6 KB for 100 entries.
 
 Pruning removes zero-count and stale entries, keeping only nodes that have actively modified the item. In a typical workload, only 5-20% of nodes modify any given key, so the actual size is 80-320 bytes per key.
 
 ### Clock Synchronization Across Restarts
 
-When a node restarts, its vector clock counters are lost. The node must recover its clock state from its persistent store or from other nodes. The recovery process involves:
+When a node restarts without its in-memory counters, it must recover its clock state from its persistent store or from other nodes. The recovery process involves:
 
 1. Reading all local data items and their associated vector clocks.
-2. Calculating the maximum counter value for each remote node from the stored clocks.
-3. Setting the local node's counter to the maximum value found in any stored clock.
+2. Calculating the maximum counter value for each node, including itself, from the stored clocks.
+3. Setting the local node's counter to its own maximum plus one.
 
-This ensures the node's clock is at least as large as any clock it had before the restart, preventing clock "reset" that could create false concurrent events.
+This ensures the node never issues a counter value it has already used, which would make two different writes look identical (or one look like a descendant of the other) and could silently lose data. The recovery is only as good as what was persisted: a write that was acknowledged but not yet flushed to disk can vanish in a crash, and the restarted node could then reuse its counter. Systems guard against this by persisting counters before acknowledging, or by giving each incarnation of a node a new identity (an epoch or a fresh node ID).
 
 ```python
 def recover_clock(local_node_id, stored_data_items):
@@ -562,12 +562,12 @@ Comparing two vector clocks is O(K) where K is the number of unique node identif
 # Comparison: O(K) where K = |nodes(clock_a) U nodes(clock_b)|
 # With 100 active nodes: 200 iterations maximum
 # Each iteration: 2 hash lookups, 2 integer comparisons
-# Total: ~400 operations — negligible at any reasonable node count
+# Total: ~400 operations: negligible at any reasonable node count
 ```
 
 ### Parallelism and Bottlenecks
 
-Vector clock operations are trivially parallelizable. The merge operation takes max of corresponding entries, which can be done per node independently. On a 16-core machine, merging 1,000-node clocks can process 62 entries per core.
+Vector clock operations are trivially parallelizable. The merge operation takes max of corresponding entries, which can be done per node independently. In practice it is not worth parallelizing: merging a 1,000-entry clock takes on the order of microseconds on one core.
 
 The bottleneck in vector clock systems is rarely the comparison or merge cost. It is the storage and network overhead of transmitting large clocks. Systems with thousands of nodes must either prune aggressively or use alternative clock structures (interval tree clocks, dotted version vectors) to keep clock size manageable.
 
@@ -584,7 +584,7 @@ The bottleneck in vector clock systems is rarely the comparison or merge cost. I
 
 ### Clock Truncation Limits
 
-Production systems set a maximum clock size per data item. When the clock exceeds the limit, the system truncates by removing the smallest counters. Truncation trades causal precision for bounded storage.
+Production systems set a maximum clock size per data item (the Dynamo paper describes a threshold of 10 entries, dropping the oldest by timestamp). When the clock exceeds the limit, the system truncates, for example by removing the smallest counters as in the sketch below. Truncation trades causal precision for bounded storage.
 
 ```python
 def truncate(clock, max_entries=100):
@@ -674,7 +674,7 @@ Vector clocks must be serialized for storage and network transmission. The seria
 }
 ```
 
-Pros: Human-readable, easy to debug. Cons: Verbose — 60+ bytes for 3 entries.
+Pros: Human-readable, easy to debug. Cons: Verbose, 60+ bytes for 3 entries.
 
 ### Compact Binary Encoding
 
@@ -747,7 +747,7 @@ def test_vector_clock_increment():
 Property-based tests verify that vector clocks maintain their fundamental guarantees:
 
 1. **Reflexivity**: A clock compared to itself always returns "equal".
-2. **Antisymmetry**: If A is ancestor of B, then B is descendant of A.
+2. **Duality**: If A is ancestor of B, then B is descendant of A.
 3. **Transitivity**: If A is ancestor of B and B is ancestor of C, then A is ancestor of C.
 4. **Idempotence of merge**: merging A with A returns A.
 5. **Commutativity of merge**: merge(A, B) equals merge(B, A).
@@ -802,7 +802,7 @@ Production vector clock systems should log:
 
 ### Partial Order vs Total Order
 
-The vector clock comparison produces a partial order. Some pairs of events have a defined ordering (ancestor/descendant), while others are incomparable (concurrent). This is a fundamental property of distributed systems — not all events have a causal relationship.
+The vector clock comparison produces a partial order. Some pairs of events have a defined ordering (ancestor/descendant), while others are incomparable (concurrent). This is a fundamental property of distributed systems: not all events have a causal relationship.
 
 A total order can be derived from the partial order by adding a tiebreaker, such as node ID or timestamp. For example, concurrent events can be ordered by node ID: [A=1, B=0] is ordered before [A=0, B=1] because A < B. This produces a total order but loses information about concurrency.
 
@@ -838,5 +838,5 @@ For clocks with thousands of entries, the O(K) comparison can be optimized:
 
 1. **Short-circuit on first dominance sign**: If we find a node where clock A > clock B AND a node where clock B > clock A, we can immediately return "concurrent".
 2. **Cache comparison results**: If the same pair of clocks is compared frequently, cache the result and invalidate when either clock changes.
-3. **Use Bloom filters**: Before doing the full comparison, check a Bloom filter to quickly determine if two clocks might be concurrent. This trades memory for comparison speed.
-4. **Hierarchical comparison**: Compare region-level clocks first, then per-node clocks only if the region-level clocks are concurrent.
+3. **Fast-path equality**: Store a hash or fingerprint alongside each clock. If two fingerprints match, the clocks are identical and no comparison is needed.
+4. **Sorted, dense encoding**: Keep entries sorted by node ID (for example as parallel arrays) so two clocks can be compared in a single merge-style pass with good cache behavior.

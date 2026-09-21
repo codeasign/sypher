@@ -59,7 +59,7 @@ The replica's CPU is at 90% during peak hours. Queries that took 10 ms now take 
 
 ### At 10 Million Users
 
-The primary handles 50,000 writes per second. Each write must be streamed to six replicas. The primary's network outbound is saturated at 9 Gbps. Replicas three and four are in a different AWS Availability Zone with 2 ms of additional latency, and they lag 8 seconds behind during peak. The manual failover process takes 15 minutes — long enough for users to notice and leave.
+The primary handles 50,000 writes per second. Each write generates about 5 KB of WAL (row data, index changes, and full-page images), so the primary produces roughly 250 MB/s of WAL. Streaming that to six replicas needs about 1.5 GB/s, more than a 10 Gbps network card can carry. Replicas three and four, in a different AWS Availability Zone, fall about 8 seconds behind at peak because the outbound link is saturated. The manual failover process takes 15 minutes, long enough for users to notice and leave.
 
 The naive setup fails at scale because it lacks automation, monitoring, load distribution, and operational tooling.
 
@@ -110,7 +110,7 @@ A production-grade replication architecture handles all of these failure modes a
 
 **Read-Only Load Balancer (HAProxy, NLB, or internal DNS):** Distributes read queries across replicas based on health and load. Removes unhealthy replicas from the pool. Supports weighted routing for heterogeneous replica hardware.
 
-**Backup Pipeline (pgBackRest, WAL-G, or cloud snapshot):** Streams WAL to long-term storage. Enables point-in-time recovery to any second. Independent of the replication topology — backups run from a dedicated replica to avoid load on the primary.
+**Backup Pipeline (pgBackRest, WAL-G, or cloud snapshot):** Streams WAL to long-term storage. Enables point-in-time recovery to any second. Independent of the replication topology: backups run from a dedicated replica to avoid load on the primary.
 
 ## Integration Patterns
 
@@ -145,20 +145,28 @@ Application routes:
 Caches sit in front of databases to absorb read traffic. Replication introduces the risk that a cache miss reads from a lagging replica and caches stale data.
 
 ```
-Solution: The cache invalidation message is sent through a queue that
-the primary processes. The primary writes the new value AND publishes
-an invalidation event. The cache evicts the stale entry. Subsequent
-reads fetch from a replica that has the latest data.
+The race: the application writes to the primary and immediately deletes the
+cache entry. Before the replica has replayed the write, a reader misses the
+cache, reads the OLD value from the replica, and caches it again. The stale
+value now lives in the cache until its TTL expires.
+
+Solutions:
+  - Drive invalidation from the replication stream itself (for example, a
+    service that tails the binlog or WAL and invalidates once the change is
+    committed), so invalidation follows the data instead of racing it.
+  - Or send the reads that repopulate the cache to the primary for a short window.
+  - Or store a version number with each cached value and refuse to overwrite a
+    newer version with an older one.
 ```
 
 ### Pattern 3: Message Queue Replication
 
-Kafka and RabbitMQ replicate data across brokers using their own replication protocols. The pattern differs from database replication because queues are ephemeral — they tolerate some data loss.
+Kafka and RabbitMQ replicate data across brokers using their own replication protocols. The pattern differs from database replication because queue messages are usually short-lived and consumers can often tolerate duplicates. Durability is still configurable: Kafka is frequently used as a durable log, so it is run with `acks=all` and `min.insync.replicas=2` when messages must not be lost.
 
 ```
 Kafka replication:
   - Each partition has one leader and N followers (ISR = in-sync replicas)
-  - acks=all: producer waits for all ISRs to confirm
+  - acks=all: producer waits for all current ISRs to confirm (pair with min.insync.replicas=2)
   - acks=1: producer waits only for the leader
   - acks=0: fire-and-forget
 ```
@@ -200,7 +208,7 @@ CDC pipeline:
 
 ## Multi-Region and Global Scale
 
-Global replication is the most demanding replication scenario. Writes must be fast everywhere, but strong consistency across continents is physically impossible — the speed of light limits you to approximately 67 ms between New York and Sydney.
+Global replication is the most demanding replication scenario. Writes must be fast everywhere, but strong consistency across continents is physically impossible: the speed of light limits you: even in ideal fiber, a signal needs about 80 ms one way between New York and Sydney, so a round trip is 160 ms or more.
 
 <AsciiDiagram id="system-design-fundamentals/replication/03-architecture/global-topology"
   mermaidSrc="/img/diagrams/dcad6a5f56a3.svg" title="Global Multi-Region Replication Topology" alt="Three AWS regions (US-East, EU-West, AP-Southeast) each with their own primary and replicas, connected via bidirectional async replication, with a global load balancer routing users to the nearest region" caption="Figure 5: Global multi-region replication topology" content={`
@@ -239,7 +247,7 @@ Global replication is the most demanding replication scenario. Writes must be fa
 
 **Option A: One global primary, replicas in every region.** All writes go to the primary region. Replicas serve reads locally. Simple to reason about. Write latency from distant regions is 100-300 ms for each write. Used by companies with a primary user base in one region.
 
-**Option B: Multi-leader, one leader per region.** Each region has a leader that accepts local writes. Leaders replicate to each other asynchronously. Writes are fast (under 10 ms local). Conflict resolution is required. Used by companies with global user bases like Google, Dropbox, and Notion.
+**Option B: Multi-leader, one leader per region.** Each region has a leader that accepts local writes. Leaders replicate to each other asynchronously. Writes are fast (under 10 ms local). Conflict resolution is required. Used by systems whose users are spread across the world and need local write latency, such as collaborative editors and some SaaS products.
 
 **Option C: Application-level sharding by region.** Users are assigned to a regional shard. Each shard is a single-leader cluster in that region. Cross-region queries are handled at the application layer. Used by large SaaS platforms that segment users by geography.
 
@@ -288,19 +296,20 @@ WAL bandwidth per write (1 KB per entry):
   3 replicas * 290 KB/s = 870 KB/s outbound from primary
 
 Replication lag at peak (assuming 10 MB/s replica apply speed):
-  WAL generation: 870 KB/s * 8 seconds buffer = 7 MB queue
-  Lag: under 1 second
+  Each replica receives about 290 KB/s and can apply about 10 MB/s,
+  so it consumes WAL more than 30x faster than it arrives.
+  Steady-state lag: milliseconds (a spike from a large batch job can add seconds)
 
 Storage per replica (data + WAL):
   Data: 200 GB (projected)
-  WAL retention: 16 GB (16 GB * 1024 segments)
+  WAL retention: 16 GB (1,024 segments of 16 MB)
   Total per replica: 216 GB
 ```
 
 ### Recommended Infrastructure (Year 1)
 
 - 1 primary (16 vCPU, 64 GB RAM, 500 GB provisioned IOPS SSD)
-- 3 replicas (8 vCPU, 32 GB RAM, 500 GB SSD — replicas need less CPU)
+- 3 replicas (8 vCPU, 32 GB RAM, 500 GB SSD; replicas need less CPU)
 - 1 synchronous replica in same AZ for zero data loss
 - 2 asynchronous replicas in different AZs for availability
 - 10 Gbps networking on all nodes

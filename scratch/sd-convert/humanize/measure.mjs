@@ -1,0 +1,10 @@
+import fs from 'node:fs'; import { createRequire } from 'node:module';
+const puppeteer = createRequire('D:/jenny/sypher/package.json')('puppeteer');
+const S='C:/Users/admin/AppData/Local/Temp/claude/D--jenny-sypher/48722be9-9d4f-4443-9697-de6a7fcb7873/scratchpad';
+const cookies=JSON.parse(fs.readFileSync(S+'/cookies.json','utf8'));
+const b=await puppeteer.launch({headless:'new',args:['--no-sandbox','--ignore-certificate-errors']});
+const p=await b.newPage();await p.setCookie(...cookies);await p.setViewport({width:+process.argv[3]||375,height:812});
+await p.goto('https://next.sypher.local/learn/ai-system-design/'+process.argv[2],{waitUntil:'networkidle2',timeout:60000});
+await p.waitForSelector('img[src*="b-cdn"]',{timeout:30000});await new Promise(r=>setTimeout(r,1500));
+console.log(JSON.stringify(await p.evaluate(()=>[...document.querySelectorAll('img')].filter(i=>/b-cdn/.test(i.src)).slice(0,4).map(i=>{const cs=getComputedStyle(i);return {w:Math.round(i.getBoundingClientRect().width),h:Math.round(i.getBoundingClientRect().height),nw:i.naturalWidth,nh:i.naturalHeight,cssw:cs.width,maxw:cs.maxWidth,fig:getComputedStyle(i.closest('figure')).overflowX}}))));
+await b.close();
