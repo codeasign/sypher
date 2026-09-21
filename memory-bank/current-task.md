@@ -7,6 +7,62 @@
 > earlier commit do NOT authorize one. Leave completed work as uncommitted
 > working-tree changes and say it is ready. Approval is per-action. (Also in
 > `AGENTS.md` → Git Safety Rules.)
+## Session summary (2026-09-19 — mock-exam question banks: 300/tier expansion)
+
+**Goal**: grow every exam in `apps/web/question-bank/` to 300 easy / 300 medium /
+300 hard questions (user decision), via NEW files (existing files untouched).
+DB is source of truth: verified 2026-09-19, all 9 exams published, totals:
+aws-ai-practicioner 900 (done), aws-genai-dev-prof 400 (e100/m200/h100),
+azure-ai-200 400 (e100/m200/h100), istqb-ct-ai 300 (100/100/100),
+istqb-ct-genai 300, istqb-ct-pt 300, istqb-ct-sec 300,
+istqb-ct-tas 240 (100/100/40), istqb-ctal-tae 240 (100/100/40). Grand 3,380.
+**Remaining to write: 4,720 questions.** User wants parallel batches; sub-agent
+infra failed all session (upstream errors, then persistent "Unauthorized —
+re-authenticate Cline" on spawn_agent; one 66-iteration run died mid-stream with
+nothing written). Fallback: authoring solo + one team_probe
+(`author-genai-easy` teammate spawned, run_00001 queued, status unverified).
+
+### Working pipeline (validated)
+- Per exam+tier: part files `scratch/<examshort>-<tier>-pN[a|b].mjs`, each
+  exporting a default array `{id, domain, question, options{A..D}, answer:['B'], explanation}`.
+- Generator `scratch/gen-cttas-hard.mjs` globs parts, sorts by id, emits
+  `apps/web/question-bank/<exam>/<tier>_extra2.json` (hard uses plain
+  `hard_extra.json` where none existed: ct-tas, ctal-tae) with header meta
+  copied from the exam's easy.json + `difficulty_tier`, `questions_in_this_file`
+  (computed), `target_for_tier: 300`, `last_updated: '2026'`.
+- Run from repo root: `node scratch/gen-cttas-hard.mjs`; verify with
+  `node -e "const j=require('./apps/web/question-bank/<exam>/<file>.json')..."`.
+- ID plan: continue existing prefixes — aws-genai: EASY 0101-0300,
+  MED 0201-0300, HARD 0101-0300; azure-ai-200 same (AI200-*, MED=…-MED-);
+  ct-ai/genai/pt/sec: *-0101..0300 all tiers (prefixes CTAI/CTGENAI/CTPT/CTSEC);
+  ct-tas & ctal-tae: EASY 0101-0300, MED 0101-0300, HARD 0041-0300.
+- CT-TAS domains (6): Introduction and Objectives for Test Automation
+  Strategy; Test Automation Resources; Roles, Skills, and Team Structures;
+  Test Automation Environments; Implementation and Improvement Strategies for
+  Test Automation; Organizational Deployment and Release Strategies for Test
+  Automation. Meta: "ISTQB Certified Tester Test Automation Strategy",
+  "CT-TAS v1.0", 60 min, 40 live.
+
+### Progress
+- istqb-ct-tas hard_extra.json: 197/260 (ids 0041-0237) via parts p1, p2a/b,
+  p3a/b ... p25a/b (49 part files in scratch/cttas-hard-p*.mjs). IN PROGRESS —
+  remaining range 0238-0300 (63 questions), then generator + verify + import gate.
+- Editor gotchas learned: keep new_text ≤6000 chars (4 questions/file); NEVER
+  pass old_text=`null` on an existing file (editor matches literal "null" and
+  can corrupt — it corrupted the generator once, was deleted+recreated).
+- Part-file pattern: each exports default array of
+  {id, domain, question, options{A..D}, answer:['X'], explanation}; generator
+  sorts by id, computes questions_in_this_file, writes JSON pretty 2-space.
+
+### Validation / next
+- validate: `node apps/api/scripts/verify-question-bank.js` (from repo root;
+  it reads all *.json incl. new files) + dup-id check. Import at the very end
+  ONLY with user go-ahead: `cd apps/api && node scripts/import-mock-exams.mjs`.
+- Next: await/check teammate run_00001 (team_list_runs); continue ct-tas hard
+  parts; then ct-tas easy/medium, ctal-tae, ct-ai, ct-genai, ct-pt, ct-sec,
+  aws-genai, azure.
+
+
 
 ## Session summary (2026-09-18, later session — env/email, Test Accounts, One Compiler tried+removed, Bunny incident, mobile-readiness pass)
 
@@ -4041,3 +4097,13 @@ No git commits. No import/republish. Source-file content pass only, left
 uncommitted (235 files modified), matching the design-patterns /
 python-for-ai-engineers / git-github-actions audits.
 - 2026-09-16T11:40:09.884Z — auto-compaction (trigger: auto, session: 39134c1c-1eaf-4db0-a04b-4020d4d64613). Verify Status/Next Action above are current.
+- 2026-09-18T19:19:57.093Z — auto-compaction (trigger: auto, session: ee1a21f6-d922-49b5-992d-579c0576c3e1). Verify Status/Next Action above are current.
+- 2026-09-19T16:00:40.754Z — auto-compaction (trigger: auto, session: 3c4d352f-981a-42a7-8a3a-c87125191160). Verify Status/Next Action above are current.
+- 2026-09-19T19:59:36.261Z — auto-compaction (trigger: auto, session: 48722be9-9d4f-4443-9697-de6a7fcb7873). Verify Status/Next Action above are current.
+- 2026-09-19T23:28:38.014Z — auto-compaction (trigger: auto, session: 3c4d352f-981a-42a7-8a3a-c87125191160). Verify Status/Next Action above are current.
+- 2026-09-20T07:32:18.690Z — auto-compaction (trigger: auto, session: 48722be9-9d4f-4443-9697-de6a7fcb7873). Verify Status/Next Action above are current.
+- 2026-09-20T19:45:55.695Z — auto-compaction (trigger: auto, session: 3391a65d-3f53-4640-9990-906472278e2e). Verify Status/Next Action above are current.
+- 2026-09-20T21:44:08.657Z — auto-compaction (trigger: auto, session: 48722be9-9d4f-4443-9697-de6a7fcb7873). Verify Status/Next Action above are current.
+- 2026-09-21T03:49:16.827Z — auto-compaction (trigger: auto, session: 74c2c3fe-13e6-4765-bad9-06431cbcfc67). Verify Status/Next Action above are current.
+- 2026-09-21T09:01:57.761Z — auto-compaction (trigger: auto, session: 3391a65d-3f53-4640-9990-906472278e2e). Verify Status/Next Action above are current.
+- 2026-09-21T10:46:51.049Z — auto-compaction (trigger: auto, session: 3391a65d-3f53-4640-9990-906472278e2e). Verify Status/Next Action above are current.

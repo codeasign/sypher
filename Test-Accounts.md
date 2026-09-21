@@ -14,6 +14,7 @@ stack (`https://next.sypher.local`). One account per `Role` enum value
 | ADMIN | `admin-test@sypher.local` | Full access everywhere, all Manage pages. |
 | FREE_USER | `free-test@sypher.local` | Default signup role — free/preview access only. |
 | PAID_USER | `paid-test@sypher.local` | `paidUntil` set ~1 year out so the paid-and-active check passes. |
+| MOBILE_USER | `mobile-test@sypher.local` | Read-only "paid" role for the mobile app: every course and all content (`hasCourseAccess` in `apps/api/src/lib/accessControl.ts`), Browse Videos in the sidebar, no manage/edit access, no "Go Pro" upsell, no expiry. |
 | INTERNAL_HR | `internalhr-test@sypher.local` | Not currently gated by any access check in the codebase — behaves like FREE_USER today. |
 | COMPANY_HR | `companyhr-test@sypher.local` | Belongs to the seeded "Acme Corp" company (`apps/api/prisma/seed.ts`). |
 | COMPANY_EMPLOYEE | `companyemployee-test@sypher.local` | Belongs to the seeded "Acme Corp" company. |

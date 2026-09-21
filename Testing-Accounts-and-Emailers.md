@@ -23,6 +23,7 @@ Password for all: **`password`**. Sign in at `https://next.sypher.local/login`.
 | ADMIN | `admin-test@sypher.local` |
 | FREE_USER | `free-test@sypher.local` |
 | PAID_USER | `paid-test@sypher.local` |
+| MOBILE_USER | `mobile-test@sypher.local` |
 | INTERNAL_HR | `internalhr-test@sypher.local` |
 | COMPANY_HR | `companyhr-test@sypher.local` |
 | COMPANY_EMPLOYEE | `companyemployee-test@sypher.local` |

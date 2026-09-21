@@ -12,7 +12,7 @@ is triggered, and how to turn real delivery on.
 
 ```
 flow code  →  send*Email(...)          apps/api/src/lib/email.ts
-           →  *EmailHtml(...)          apps/api/src/lib/emailTemplates.ts   (inline-HTML templates)
+           →  *Email(...)              apps/api/src/lib/emailTemplates.ts   (HTML + plain-text templates)
            →  sendEmailWithRotation()  apps/api/src/lib/emailRotation/rotation.ts
                  → Brevo, then Resend  apps/api/src/lib/emailRotation/providers/*.ts
                    (or ONLY smtp.ts when EMAIL_TRANSPORT=smtp — see §5)
@@ -40,16 +40,25 @@ flow code  →  send*Email(...)          apps/api/src/lib/email.ts
 
 ## 2. Templates
 
-All in `apps/api/src/lib/emailTemplates.ts` — table-based inline HTML, one
-shared `shell()` (coloured canvas → white card → brand header → footer),
-plus `button()` and a hidden `preheader()` preview line.
+All in `apps/api/src/lib/emailTemplates.ts`. Each template is a small data
+spec (`EmailSpec`: preview, heading, paragraphs, one CTA, notes, footer reason,
+optional consent line) that `renderEmail()` turns into **both** an HTML body
+and a plain-text body, so every send is multipart/alternative. The HTML is
+table-based with inline styles plus one `<style>` block for dark mode
+(`prefers-color-scheme`, Outlook.com `[data-ogsc]`) and the phone layout.
+Layout: dark brand band with the logo, gradient rule, 600 px card, fallback
+link panel, footer with the reason the email was sent and a contact link.
+The header logo is hosted on the Bunny CDN
+(`branding/sypher-logo.png`, default `env.email.logoUrl`; override with
+`EMAIL_LOGO_URL`) — inbox clients fetch it directly, so it must stay a public
+https URL rather than a `*.sypher.local` host.
 
 | Template fn | Subject | Sent by |
 | --- | --- | --- |
-| `welcomeEmailHtml(fullName, dashboardUrl)` | *Welcome to Sypher* | `sendWelcomeEmail` |
-| `setPasswordEmailHtml(fullName, link, orgLabel)` | *Set your Sypher password* / *Set your password — {org} on Sypher* | `sendSetPasswordEmail` |
-| `passwordResetEmailHtml(resetLink)` | *Reset your Sypher password* | `sendPasswordResetEmail` |
-| `cohortWelcomeEmailHtml(fullName, cohortTitle, cohortUrl)` | *You've been added to {cohort}* | `sendCohortWelcomeEmail` |
+| `welcomeEmail(fullName, dashboardUrl)` | *Welcome to Sypher Next* | `sendWelcomeEmail` |
+| `setPasswordEmail(fullName, link, orgLabel)` | *Set your Sypher Next password* / *Set your password for {org} on Sypher Next* | `sendSetPasswordEmail` |
+| `passwordResetEmail(resetLink)` | *Reset your Sypher Next password* | `sendPasswordResetEmail` |
+| `cohortWelcomeEmail(fullName, cohortTitle, cohortUrl)` | *You've been added to {cohort}* | `sendCohortWelcomeEmail` |
 
 `welcome` vs `setPassword`: **welcome** is for self-serve signups (the
 account already has a password — pure "you're in, here's your dashboard").
@@ -184,10 +193,10 @@ to go back to Brevo/Resend. Full walkthrough:
 
 ## 5. Adding a new email
 
-1. `emailTemplates.ts` — add `myThingEmailHtml(...)` using `shell()` +
-   `heading()` + `button()`.
+1. `emailTemplates.ts` — add `myThingEmail(...)` returning
+   `renderEmail({ preview, heading, paragraphs, cta, notes, reason })`.
 2. `email.ts` — add `sendMyThingEmail(...)` calling the shared `send()`
-   helper (kind label, to, subject, html).
+   helper (kind label, to, subject, content).
 3. Call `void sendMyThingEmail(...)` from the flow, **after** the state it
    announces is committed. Never `await` it in a way that can fail the
    request.
