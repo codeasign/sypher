@@ -38,6 +38,13 @@
 // Usage:
 //   node scripts/check-landscape-band.mjs <mmd-file> [more-mmd-files...]
 //   node scripts/check-landscape-band.mjs <mmd-file> --json
+//   node scripts/check-landscape-band.mjs <mmd-file> --no-type-check   (recorded exceptions only)
+//
+// Type check (runs before rendering): if classify-diagram-type.mjs has a
+// clear-match, non-flowchart recommendation for the diagram this .mmd belongs
+// to (looked up via the diagram manifests) and the .mmd declares a different
+// Mermaid type, the gate FAILs without rendering. Ambiguous/default-flowchart
+// classifications never block; ambiguous ones are surfaced as [type-review].
 //
 // Exit code: 0 if every input passed (after retry where applicable),
 // 1 if any failed — safe to use as a real gate in a command's flow, not
@@ -50,14 +57,19 @@
 // reported `svgPath`/`hash`. A FAILing diagram's .mmd is left untouched
 // for manual restructuring — never wire it in.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
+import { classifyFile } from './classify-diagram-type.mjs';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
-const IMG_OUT_DIR = path.join(REPO_ROOT, 'apps', 'docs', 'static', 'img', 'diagrams');
+// DIAGRAM_OUT_DIR lets pilots/tests render somewhere other than the tracked
+// SVG store; unset, behavior is unchanged.
+const IMG_OUT_DIR = process.env.DIAGRAM_OUT_DIR
+  ? path.resolve(process.env.DIAGRAM_OUT_DIR)
+  : path.join(REPO_ROOT, 'apps', 'docs', 'static', 'img', 'diagrams');
 
 // Blackboard technical theme — ONE canonical look baked into every SVG so
 // the same file reads correctly on dark AND light pages (user decision
@@ -89,7 +101,8 @@ function checkMmdc() {
 
 function renderMermaid(mermaidCode, hash) {
   mkdirSync(IMG_OUT_DIR, { recursive: true });
-  const tmpFile = path.join(os.tmpdir(), `${hash}.mmd`);
+  // pid-suffixed so parallel workers (check-landscape-band-parallel.mjs) never share a temp file
+  const tmpFile = path.join(os.tmpdir(), `${hash}-${process.pid}.mmd`);
   writeFileSync(tmpFile, mermaidCode, 'utf8');
   const outFile = path.join(IMG_OUT_DIR, `${hash}.svg`);
   const puppeteerConfig = path.join(os.tmpdir(), 'mmdc-puppeteer.json');
@@ -170,10 +183,89 @@ function flipDirection(mermaidCode) {
   return null; // nothing to flip — sequenceDiagram, erDiagram, or no direction hint present
 }
 
-function checkOne(mmdPath) {
+// ---------- type-check (classifier vs declared Mermaid type) ----------
+// Blocks ONLY when classify-diagram-type.mjs has real structural evidence for
+// a specific non-flowchart type (confidence "clear-match", recommendedType !=
+// flowchart) and the .mmd declares something else. Deliberately NOT blocking:
+//   - flowchart "clear-match" — that is the zero-signal default, not evidence
+//   - "ambiguous" — the classifier itself defers to authoring judgment
+// (same scoring rule analyze-diagram-types.mjs uses for "genuine gap").
+// The .mmd is matched to its diagram via the git-tracked manifests' mmdFile
+// field; a .mmd not in any manifest (ad hoc / scratch) skips the check.
+// Opt out for a deliberate, recorded exception with --no-type-check.
+
+const MANIFEST_DIR = path.join(REPO_ROOT, 'apps', 'docs', 'diagram-manifests');
+let manifestIndex = null;
+const classifiedFiles = new Map();
+
+function loadManifestIndex() {
+  if (manifestIndex) return manifestIndex;
+  manifestIndex = new Map(); // .mmd basename -> { file, diagramIndex, id }
+  for (const f of readdirSync(MANIFEST_DIR)) {
+    if (!f.endsWith('.json') || f === 'summary.json') continue;
+    let m;
+    try { m = JSON.parse(readFileSync(path.join(MANIFEST_DIR, f), 'utf8')); } catch { continue; }
+    for (const d of m.diagrams || []) {
+      if (d.mmdFile) manifestIndex.set(path.basename(d.mmdFile), { file: d.file, diagramIndex: d.diagramIndex, id: d.id });
+    }
+  }
+  return manifestIndex;
+}
+
+// First real declaration line, skipping blank lines, %% directives/comments
+// and a leading --- front-matter block.
+function declaredType(mermaidCode) {
+  let lines = mermaidCode.split(/\r?\n/);
+  if (lines[0]?.trim() === '---') {
+    const end = lines.findIndex((l, i) => i > 0 && l.trim() === '---');
+    if (end !== -1) lines = lines.slice(end + 1);
+  }
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith('%%')) continue;
+    const word = line.split(/[\s;]/)[0];
+    if (word === 'flowchart' || word === 'graph') return 'flowchart';
+    return word;
+  }
+  return null;
+}
+
+function typeCheck(mmdPath, mermaidCode) {
+  const entry = loadManifestIndex().get(path.basename(mmdPath));
+  if (!entry) return { status: 'skipped', note: 'not in any manifest' };
+  const abs = path.join(REPO_ROOT, entry.file);
+  if (!classifiedFiles.has(abs)) {
+    try { classifiedFiles.set(abs, classifyFile(abs)); } catch { classifiedFiles.set(abs, []); }
+  }
+  const rec = classifiedFiles.get(abs).find((r) => r.diagramIndex === entry.diagramIndex);
+  if (!rec) return { status: 'skipped', note: 'diagram has no parseable content to classify' };
+  const declared = declaredType(mermaidCode);
+  const base = { declared, recommended: rec.recommendedType, confidence: rec.confidence, id: entry.id };
+  if (rec.confidence === 'clear-match' && rec.recommendedType !== 'flowchart') {
+    return declared === rec.recommendedType
+      ? { status: 'ok', ...base }
+      : { status: 'mismatch', ...base };
+  }
+  if (rec.confidence === 'ambiguous') {
+    const top = Object.entries(rec.scores).sort((a, b) => b[1] - a[1])[0];
+    return { status: 'ambiguous', ...base, leading: top[1] > 0 ? top[0] : null };
+  }
+  return { status: 'ok', ...base }; // zero-signal flowchart default: nothing to contradict
+}
+
+function checkOne(mmdPath, opts = {}) {
   const original = readFileSync(mmdPath, 'utf8');
   const attempts = [];
   const portraitAllowed = isClassDiagram(original);
+
+  let tc = { status: 'skipped', note: '--no-type-check' };
+  if (opts.typeCheck !== false) tc = typeCheck(mmdPath, original);
+  if (tc.status === 'mismatch') {
+    return {
+      mmdFile: mmdPath, status: 'fail', typeCheck: tc, attempts,
+      reason: `type mismatch: classifier clear-match recommends ${tc.recommended} for "${tc.id}", but the .mmd declares ${tc.declared} — rewrite as ${tc.recommended} (or, for a deliberate exception, re-run with --no-type-check and record why)`,
+    };
+  }
 
   if (!checkMmdc()) {
     return { mmdFile: mmdPath, status: 'fail', reason: '@mermaid-js/mermaid-cli (mmdc) not available', attempts };
@@ -191,7 +283,7 @@ function checkOne(mmdPath) {
   attempts.push({ attempt: 1, direction: 'original', hash, w: band.w, h: band.h, ratio: band.ratio, ok: band.ok });
 
   if (band.ok) {
-    return { mmdFile: mmdPath, status: 'pass', hash, svgPath: path.relative(REPO_ROOT, svgPath).replace(/\\/g, '/'), w: band.w, h: band.h, ratio: band.ratio, attempts, ...(portraitAllowed ? { portraitAllowed: true } : {}) };
+    return { mmdFile: mmdPath, status: 'pass', hash, svgPath: path.relative(REPO_ROOT, svgPath).replace(/\\/g, '/'), w: band.w, h: band.h, ratio: band.ratio, attempts, typeCheck: tc, ...(portraitAllowed ? { portraitAllowed: true } : {}) };
   }
 
   const flipped = flipDirection(code);
@@ -219,7 +311,7 @@ function checkOne(mmdPath) {
     // to the .mmd cache file so the source of truth matches what was
     // actually rendered and wired in.
     writeFileSync(mmdPath, flipped, 'utf8');
-    return { mmdFile: mmdPath, status: 'pass', hash, svgPath: path.relative(REPO_ROOT, svgPath).replace(/\\/g, '/'), w: band.w, h: band.h, ratio: band.ratio, attempts, directionFlipped: true, ...(portraitAllowed ? { portraitAllowed: true } : {}) };
+    return { mmdFile: mmdPath, status: 'pass', hash, svgPath: path.relative(REPO_ROOT, svgPath).replace(/\\/g, '/'), w: band.w, h: band.h, ratio: band.ratio, attempts, typeCheck: tc, directionFlipped: true, ...(portraitAllowed ? { portraitAllowed: true } : {}) };
   }
 
   return {
@@ -234,6 +326,7 @@ function checkOne(mmdPath) {
 function main() {
   const args = process.argv.slice(2);
   const jsonOut = args.includes('--json');
+  const typeCheckOn = !args.includes('--no-type-check');
   const files = args.filter((a) => !a.startsWith('--'));
 
   if (files.length === 0) {
@@ -241,7 +334,7 @@ function main() {
     process.exit(1);
   }
 
-  const results = files.map((f) => checkOne(path.resolve(f)));
+  const results = files.map((f) => checkOne(path.resolve(f), { typeCheck: typeCheckOn }));
 
   if (jsonOut) {
     console.log(JSON.stringify(results, null, 2));
@@ -250,7 +343,10 @@ function main() {
       const rel = path.relative(REPO_ROOT, r.mmdFile).replace(/\\/g, '/');
       if (r.status === 'pass') {
         const flip = r.directionFlipped ? ' (direction flipped on retry)' : '';
-        console.log(`PASS  ${rel}  w=${Math.round(r.w)} h=${Math.round(r.h)} ratio=${r.ratio.toFixed(2)}  ->  ${r.svgPath}${flip}`);
+        const t = r.typeCheck?.status === 'ambiguous'
+          ? `  [type-review: classifier ambiguous${r.typeCheck.leading ? `, leans ${r.typeCheck.leading}` : ''}; declared ${r.typeCheck.declared}]`
+          : '';
+        console.log(`PASS  ${rel}  w=${Math.round(r.w)} h=${Math.round(r.h)} ratio=${r.ratio.toFixed(2)}  ->  ${r.svgPath}${flip}${t}`);
       } else {
         console.log(`FAIL  ${rel}  ${r.reason}`);
       }

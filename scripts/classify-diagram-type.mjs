@@ -69,7 +69,7 @@ function getAttr(tagText, name) {
 }
 
 function getContentValue(tagText) {
-  const m = tagText.match(/content=\{`([\s\S]*?)`\}/);
+  const m = tagText.match(/content=\{\s*`([\s\S]*?)`\s*\}/); // tolerates multi-line content={ <newline> `...` <newline> }
   return m ? m[1] : null;
 }
 
@@ -291,7 +291,7 @@ function classify(content) {
 
 // ---------- main ----------
 
-function classifyFile(file) {
+export function classifyFile(file) {
   const source = readFileSync(file, 'utf8');
   const tags = extractAsciiDiagramTags(source);
   const relFile = path.relative(REPO_ROOT, file).replace(/\\/g, '/');
@@ -347,4 +347,6 @@ function main() {
   console.log(JSON.stringify(allResults, null, 2));
 }
 
-main();
+// Only run the CLI when invoked directly, so check-landscape-band.mjs can
+// import classifyFile without triggering it.
+if (process.argv[1] && path.resolve(process.argv[1]) === import.meta.filename) main();

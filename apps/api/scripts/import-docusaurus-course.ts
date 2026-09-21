@@ -127,13 +127,25 @@ const TARGET_COURSES = [
   'ai-system-design',
   // Added 2026-09-20: virtual course carved out of system-design-fundamentals Section 6.
   'caching',
+  // Added 2026-09-21: virtual course carved out of system-design-fundamentals Sections 5 and 8.
+  'scaling-distributed-systems',
 ];
 
 // A "virtual" course is a slice of a larger Docusaurus course: it reads the docs, manifest and
-// sidebar of `docsCourse`, but only the sidebar category named `sidebarSection`, and lands in the
-// database under its own slug/name/category. Each topic (sidebar sub-category) becomes a section.
+// sidebar of `docsCourse`, but only the sidebar category named `sidebarSection` (or the categories
+// listed in `sidebarSections`, in order, with any doc that appears in more than one of them
+// imported once, at its first position), and lands in the database under its own
+// slug/name/category. Each topic (sidebar sub-category) becomes a section.
 // There is no course-level index page to seed a Course Overview from, so none is created.
-const VIRTUAL_COURSES: Record<string, { docsCourse: string; sidebarSection: string; name: string; description: string; category: string; unwrapParagraphs?: boolean }> = {
+const VIRTUAL_COURSES: Record<string, { docsCourse: string; sidebarSection?: string; sidebarSections?: string[]; name: string; description: string; category: string; unwrapParagraphs?: boolean }> = {
+  'scaling-distributed-systems': {
+    docsCourse: 'system-design-fundamentals',
+    // Section 8 re-lists CAP Theorem, PACELC and Leader Election (same docs as Section 5): imported once.
+    sidebarSections: ['Section 5 - Scaling Systems', 'Section 8 - Distributed Systems'],
+    name: 'Scaling & Distributed Systems',
+    description: 'Seventeen topics on scaling and distributed systems: vertical and horizontal scaling, stateless vs stateful services, replication, sharding, consistent hashing, the CAP theorem and PACELC, distributed counters and IDs, leader election, consensus, Raft, distributed locks, vector clocks, gossip protocols and split-brain prevention.',
+    category: 'System Design',
+  },
   'ai-system-design': {
     docsCourse: 'system-design-fundamentals',
     sidebarSection: 'Section 14 - AI System Design',
@@ -258,6 +270,11 @@ function findAsciiDiagramTags(source: string): Array<{ start: number; end: numbe
     let end = -1;
     while (j < source.length) {
       const ch = source[j];
+      if (inBacktick && ch === '\\') {
+        // escaped character inside the template literal (e.g. a literal \` in the ASCII art)
+        j += 2;
+        continue;
+      }
       if (ch === '`') {
         inBacktick = !inBacktick;
         j++;
@@ -483,9 +500,14 @@ async function importCourse(courseSlug: string): Promise<void> {
   const sidebarKey = Object.keys(sidebarFile)[0];
   let allNodes = sidebarFile[sidebarKey];
   if (virtual) {
-    const section = allNodes.find((n): n is SidebarCategory => typeof n !== 'string' && n.label === virtual.sidebarSection);
-    if (!section) throw new CourseImportError(`Sidebar section "${virtual.sidebarSection}" not found in ${docsSlug}`);
-    allNodes = section.items;
+    const sectionNames = virtual.sidebarSections ?? (virtual.sidebarSection ? [virtual.sidebarSection] : []);
+    const picked: SidebarNode[] = [];
+    for (const sectionName of sectionNames) {
+      const section = allNodes.find((n): n is SidebarCategory => typeof n !== 'string' && n.label === sectionName);
+      if (!section) throw new CourseImportError(`Sidebar section "${sectionName}" not found in ${docsSlug}`);
+      picked.push(...section.items);
+    }
+    allNodes = picked;
   }
 
   const manifest = loadManifest(docsSlug);
@@ -515,7 +537,11 @@ async function importCourse(courseSlug: string): Promise<void> {
     });
   }
 
+  const seenDocIds = new Set<string>();
   for (const leaf of leaves) {
+    // A doc listed under more than one sidebar section of a virtual course is imported once.
+    if (seenDocIds.has(leaf.docId)) continue;
+    seenDocIds.add(leaf.docId);
     const filePath = resolveDocFile(docIdIndex, leaf.docId);
     const raw = readFileSync(filePath, 'utf-8');
     const { data, content } = matter(raw);
