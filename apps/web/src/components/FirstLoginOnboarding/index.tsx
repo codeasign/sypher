@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import Image from 'next/image';
 import { usePathname } from 'next/navigation';
 import { apiFetch } from '@/lib/api';
 import { uploadToBunny } from '@/data/bunnyUpload';
@@ -21,9 +22,13 @@ interface Me {
 
 // Legal doc links must resolve to the MAIN app even on the corporate host
 // (middleware would rewrite a bare /terms-and-conditions into /corporate/…).
+// NEXT_PUBLIC_WEB_URL, not a hostname guess — see data/corporate.ts's
+// mainAppUrl() for why guessing from the corporate hostname doesn't
+// generalize across local dev and production naming schemes.
 function legalHref(path: string): string {
   if (typeof window !== 'undefined' && window.location.host.startsWith('corporate.')) {
-    return window.location.origin.replace('://corporate.', '://next.') + path;
+    const base = process.env.NEXT_PUBLIC_WEB_URL ?? 'https://next.sypher.local';
+    return `${base}${path}`;
   }
   return path;
 }
@@ -101,7 +106,7 @@ function OnboardingModal({ initialHandle }: { initialHandle: string }): React.JS
       setUploadedUrl(url);
       setAvatar(url);
     } catch {
-      setError('Could not upload that image. Pick one of the presets instead.');
+      setError('Only JPEG or PNG images are allowed.');
     } finally {
       setUploading(false);
     }
@@ -132,8 +137,11 @@ function OnboardingModal({ initialHandle }: { initialHandle: string }): React.JS
   return (
     <div className={styles.overlay} role="dialog" aria-modal="true" aria-labelledby="onb-title">
       <div className={styles.panel}>
-        <h1 id="onb-title" className={styles.title}>Welcome to Sypher</h1>
-        <p className={styles.subtitle}>A couple of quick things before you start.</p>
+        <div className={styles.brandRow}>
+          <Image src="/sypher-logo.png" alt="" width={40} height={40} className={styles.brandLogo} priority />
+          <h1 id="onb-title" className={styles.title}>Welcome to Sypher Next</h1>
+        </div>
+        <p className={styles.subtitle}>Just a couple of quick things, then you&apos;re ready to start learning.</p>
 
         <form onSubmit={handleSubmit}>
           {/* Handle */}
@@ -189,7 +197,7 @@ function OnboardingModal({ initialHandle }: { initialHandle: string }): React.JS
             <input
               ref={fileRef}
               type="file"
-              accept="image/*"
+              accept="image/png,image/jpeg"
               hidden
               onChange={(e) => e.target.files?.[0] && handleUpload(e.target.files[0])}
             />

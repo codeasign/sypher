@@ -10,7 +10,19 @@ import CourseHomeTabs from '@/components/CourseHomeTabs';
 import DiscussionSection from '@/components/DiscussionSection';
 import CourseDescriptionMarkdown from '@/components/CourseDescriptionMarkdown';
 import EmptyState from '@/components/EmptyState';
+import GoProCard from '@/components/GoProCard';
 import styles from './styles.module.css';
+
+interface AuthUser {
+  email: string;
+  role: string;
+}
+
+async function fetchMe(): Promise<AuthUser | null> {
+  const res = await serverApiFetch('/auth/me');
+  if (!res.ok) return null;
+  return res.json();
+}
 
 async function fetchCourse(slug: string): Promise<{ course: CourseWithAccess | null; unauthenticated: boolean }> {
   const res = await serverApiFetch(`/courses/${encodeURIComponent(slug)}`);
@@ -68,10 +80,11 @@ export default async function CourseHomePage({ params }: { params: Promise<{ slu
 
   // These reads are independent once the course metadata has supplied the
   // related slugs, so start all of them before waiting for any one response.
-  const [modules, bookmarkedIds, relatedCourses] = await Promise.all([
+  const [modules, bookmarkedIds, relatedCourses, me] = await Promise.all([
     fetchCourseModules(slug),
     fetchCourseBookmarks(),
     fetchRelatedCourses(course),
+    fetchMe(),
   ]);
 
   // Same Start / Resume / Preview logic the My Courses card uses, surfaced
@@ -96,18 +109,43 @@ export default async function CourseHomePage({ params }: { params: Promise<{ slu
           ← My Courses
         </Link>
 
-        {course.coverImageUrl && <img src={course.coverImageUrl} alt={course.name} className={styles.coverImage} />}
-        <div className={styles.titleRow}>
-          <h1 className={styles.title}>{course.name}</h1>
-          <div className={styles.titleActions}>
-            {targetModule && (
-              <Link href={`/learn/${slug}/${targetModule.slug}`} className={`${styles.actionButton} ${actionToneClass}`}>
-                {actionLabel}
-              </Link>
-            )}
-            <CourseBookmarkButton courseId={course.id} initialBookmarked={bookmarkedIds.includes(course.id)} />
+        {me?.role === 'FREE_USER' && (
+          <div className={styles.proCardSpacing}>
+            <GoProCard
+              userEmail={me.email}
+              message="You're on the free preview. Pro unlocks this course in full, every certification practice exam, and progress tracking that shows you what's working."
+            />
           </div>
-        </div>
+        )}
+
+        {course.coverImageUrl ? (
+          <div className={styles.heroRow}>
+            <img src={course.coverImageUrl} alt={course.name} className={styles.heroImage} />
+            <div className={styles.heroInfo}>
+              <h1 className={styles.title}>{course.name}</h1>
+              <div className={styles.titleActions}>
+                {targetModule && (
+                  <Link href={`/learn/${slug}/${targetModule.slug}`} className={`${styles.actionButton} ${actionToneClass}`}>
+                    {actionLabel}
+                  </Link>
+                )}
+                <CourseBookmarkButton courseId={course.id} initialBookmarked={bookmarkedIds.includes(course.id)} />
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className={styles.titleRow}>
+            <h1 className={styles.title}>{course.name}</h1>
+            <div className={styles.titleActions}>
+              {targetModule && (
+                <Link href={`/learn/${slug}/${targetModule.slug}`} className={`${styles.actionButton} ${actionToneClass}`}>
+                  {actionLabel}
+                </Link>
+              )}
+              <CourseBookmarkButton courseId={course.id} initialBookmarked={bookmarkedIds.includes(course.id)} />
+            </div>
+          </div>
+        )}
         <CourseHomeTabs
           about={
             <>

@@ -13,6 +13,7 @@ import {
   type CompanyAdminGroup,
   type CompanyAdminImportReport,
 } from '@/data/companyAdmin';
+import EmptyState from '@/components/EmptyState';
 import styles from '../admin.module.css';
 
 const CSV_TEMPLATE = 'Full Name,Email Id,Department,Role,Manager Name\nAsha Rao,asha@acme.com,Engineering,Senior Engineer,Ravi Kumar';
@@ -106,7 +107,7 @@ export default function CorporateAdminEmployeesPage(): React.JSX.Element {
         Roster ({employees.length})
       </div>
       {employees.length === 0 ? (
-        <p className={styles.hint}>No employees yet.</p>
+        <EmptyState illustration="people" compact title="No employees yet." />
       ) : (
         <table className={styles.table}>
           <thead>

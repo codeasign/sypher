@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { ArrowBigUp, Clock, Lightbulb } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
+import EmptyState from '@/components/EmptyState';
 import {
   COMMENT_SORT_MODES,
   createBlogPostComment,
@@ -334,7 +335,12 @@ export default function DiscussionSection({
       {!meLoaded && composerError === null && <p className={styles.loadingNote}>Loading…</p>}
       {initialLoading && <p className={styles.loadingNote}>Loading comments…</p>}
       {!initialLoading && totalVisible === 0 && (
-        <p className={styles.emptyNote}>No comments yet{me ? ' — start the conversation above.' : '.'}</p>
+        <EmptyState
+          illustration="posts"
+          compact
+          title="No comments yet."
+          description={me ? 'Start the conversation above.' : undefined}
+        />
       )}
 
       <div className={styles.threadList}>

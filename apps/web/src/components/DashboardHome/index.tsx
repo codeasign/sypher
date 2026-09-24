@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { ClipboardCheck } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useUpgradeToPaid } from "@/hooks/useUpgradeToPaid";
 import MiniBars from "@/components/charts/MiniBars";
@@ -488,45 +489,60 @@ export default function DashboardHome({
                                 </div>
                             ) : (
                                 <div className={styles.chartEmpty}>
-                                    <p>
+                                    <div
+                                        style={{
+                                            display: "flex",
+                                            alignItems: "center",
+                                            gap: "28px",
+                                            padding: "18px",
+                                        }}
+                                    >
                                         <div
                                             style={{
+                                                width: "48px",
+                                                height: "48px",
+                                                borderRadius: "50%",
+                                                background: "#EFF6FF",
                                                 display: "flex",
                                                 alignItems: "center",
-                                                gap: "28px",
-                                                padding: "18px",
+                                                justifyContent: "center",
+                                                flexShrink: 0,
                                             }}
                                         >
-                                            <div style={{ textAlign: "left" }}>
-                                                <h4
-                                                    style={{
-                                                        margin: 0,
-                                                        fontSize: "18px",
-                                                        fontWeight: 600,
-                                                        color: "#3c4148",
-                                                    }}
-                                                >
-                                                    No practice exams available
-                                                    yet.
-                                                </h4>
-
-                                                <p
-                                                    style={{
-                                                        marginTop: "10px",
-                                                        marginBottom: 0,
-                                                        fontSize: "16px",
-                                                        lineHeight: 1.5,
-                                                        color: "#6B7280",
-                                                    }}
-                                                >
-                                                    Test your skills with a
-                                                    timed certification practice
-                                                    exam and track your
-                                                    progress.
-                                                </p>
-                                            </div>
+                                            <ClipboardCheck
+                                                size={24}
+                                                color={EXAM_ACCENT}
+                                            />
                                         </div>
-                                    </p>
+                                        <div style={{ textAlign: "left" }}>
+                                            <h4
+                                                style={{
+                                                    margin: 0,
+                                                    fontSize: "18px",
+                                                    fontWeight: 600,
+                                                    color: "#3c4148",
+                                                }}
+                                            >
+                                                No practice exams available
+                                                yet.
+                                            </h4>
+
+                                            <p
+                                                style={{
+                                                    marginTop: "10px",
+                                                    marginBottom: 0,
+                                                    fontSize: "16px",
+                                                    lineHeight: 1.5,
+                                                    color: "#6B7280",
+                                                }}
+                                            >
+                                                Test your skills with a
+                                                timed certification practice
+                                                exam and track your
+                                                progress.
+                                            </p>
+                                        </div>
+                                    </div>
                                     <Link
                                         href="/mock-tests"
                                         className={styles.chartEmptyLink}
@@ -596,7 +612,7 @@ export default function DashboardHome({
                                     )}
                                 </ol>
                             ) : (
-                                <p className={styles.historyEmpty}>
+                                <div className={styles.historyEmpty}>
                                     <div
                                         style={{
                                             display: "flex",
@@ -605,6 +621,23 @@ export default function DashboardHome({
                                             padding: "20px",
                                         }}
                                     >
+                                        <div
+                                            style={{
+                                                width: "48px",
+                                                height: "48px",
+                                                borderRadius: "50%",
+                                                background: "#EFF6FF",
+                                                display: "flex",
+                                                alignItems: "center",
+                                                justifyContent: "center",
+                                                flexShrink: 0,
+                                            }}
+                                        >
+                                            <ClipboardCheck
+                                                size={24}
+                                                color={EXAM_ACCENT}
+                                            />
+                                        </div>
                                         <div style={{ textAlign: "left" }}>
                                             <h3
                                                 style={{
@@ -631,7 +664,7 @@ export default function DashboardHome({
                                             </p>
                                         </div>
                                     </div>
-                                </p>
+                                </div>
                             )}
                         </div>
                     </div>

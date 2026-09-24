@@ -7,6 +7,7 @@ import { CompanyRepository } from '../repositories/CompanyRepository';
 import { createProvisionedUser } from '../lib/userProvisioning';
 import { requireAdmin } from '../lib/authz';
 import { env } from '../lib/env';
+import { hashPassword } from '../lib/password';
 import {
   findCustomTestAccountByEmail,
   listCustomTestAccounts,
@@ -127,6 +128,20 @@ interface ResetTestAccountRequest {
 interface SetTestAccountRoleRequest {
   email: string;
   role: Role;
+}
+
+interface SetTestAccountPasswordRequest {
+  email: string;
+  password: string;
+}
+
+/** Shared lookup: is `email` a fixed roster entry or an existing custom one? */
+async function resolveTestAccountDef(email: string): Promise<TestAccountDef | undefined> {
+  const fixed = FIXED_TEST_ACCOUNT_BY_EMAIL.get(email);
+  if (fixed) return fixed;
+  const custom = await findCustomTestAccountByEmail(email);
+  if (!custom) return undefined;
+  return { email: custom.email, fullName: custom.fullName, role: custom.role, roleEditable: true };
 }
 
 @Route('admin/test-accounts')
@@ -301,5 +316,41 @@ export class TestAccountsController extends Controller {
       onboarded: updated.onboardedAt !== null,
       roleEditable: true,
     };
+  }
+
+  /**
+   * Sets a test account's password directly, bypassing the set-password
+   * email link — dev convenience for QA/login testing where waiting on
+   * GreenMail or a real inbox isn't worth it. Clears mustResetPassword
+   * (same as the real /auth/reset-password flow), so the account can sign
+   * in with this password immediately.
+   */
+  @Post('password')
+  @Security('session')
+  public async setPassword(
+    @Body() body: SetTestAccountPasswordRequest,
+    @Request() request: ExpressRequest,
+    @Res() badRequest: TsoaResponse<400, { message: string }>,
+    @Res() notFound: TsoaResponse<404, { message: string }>,
+    @Res() forbidden: TsoaResponse<403, { message: string }>,
+  ): Promise<{ ok: true } | void> {
+    requireAdmin(request.user as User);
+    setPrivateNoStoreCache(this);
+    if (env.nodeEnv === 'production') return forbidden(403, { message: 'Not available in production' });
+
+    const email = body.email?.trim().toLowerCase();
+    const def = email ? await resolveTestAccountDef(email) : undefined;
+    if (!def) return badRequest(400, { message: 'Not a recognized test account' });
+
+    if (!body.password || body.password.length < 8) {
+      return badRequest(400, { message: 'Password must be at least 8 characters' });
+    }
+
+    const existing = await userRepository.findByEmail(def.email);
+    if (!existing) return notFound(404, { message: 'Account does not exist yet — reset it first' });
+
+    const passwordHash = await hashPassword(body.password);
+    await userRepository.setPasswordHash(existing.id, passwordHash);
+    return { ok: true };
   }
 }

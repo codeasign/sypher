@@ -10,6 +10,7 @@ export const recaptchaConfigured = Boolean(SITE_KEY);
 declare global {
   interface Window {
     grecaptcha?: {
+      ready: (callback: () => void) => void;
       render: (container: HTMLElement, parameters: Record<string, unknown>) => number;
       reset: (widgetId?: number) => void;
     };
@@ -28,16 +29,26 @@ export default function RecaptchaV2({ resetSignal = 0, onTokenChange }: Recaptch
   const widgetIdRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (!SITE_KEY || !ready || !window.grecaptcha || !containerRef.current || widgetIdRef.current !== null) return;
-    widgetIdRef.current = window.grecaptcha.render(containerRef.current, {
-      sitekey: SITE_KEY,
-      callback: (token: string) => onTokenChange(token),
-      'expired-callback': () => onTokenChange(null),
-      'error-callback': () => {
-        onTokenChange(null);
-        setLoadError(true);
-      },
+    if (!SITE_KEY || !ready || !window.grecaptcha) return;
+    let cancelled = false;
+    // api.js fires <Script onLoad> as soon as the outer stub executes, but
+    // .render isn't attached until the internal chunk it lazy-loads finishes
+    // — grecaptcha.ready() is Google's own signal for that, unlike onLoad.
+    window.grecaptcha.ready(() => {
+      if (cancelled || !containerRef.current || widgetIdRef.current !== null) return;
+      widgetIdRef.current = window.grecaptcha!.render(containerRef.current, {
+        sitekey: SITE_KEY,
+        callback: (token: string) => onTokenChange(token),
+        'expired-callback': () => onTokenChange(null),
+        'error-callback': () => {
+          onTokenChange(null);
+          setLoadError(true);
+        },
+      });
     });
+    return () => {
+      cancelled = true;
+    };
   }, [onTokenChange, ready]);
 
   useEffect(() => {

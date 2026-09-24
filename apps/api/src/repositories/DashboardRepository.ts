@@ -24,7 +24,6 @@ const PLATFORM_STATS_CACHE_TTL_MS = 60_000;
 interface PlatformStats {
   courses: Pick<Course, 'id' | 'slug' | 'name' | 'description' | 'category' | 'coverImageUrl'>[];
   moduleGroups: { courseId: string; _count: { _all: number } }[];
-  publishedBlogPosts: number;
   accessRows: { courseId: string; allowedRoles: Role[] }[];
   learners: number;
   mockExams: number;
@@ -163,20 +162,19 @@ export interface UserDashboardResponse {
 export class DashboardRepository {
   private async platformStats(): Promise<PlatformStats> {
     return getOrSet('dashboard:platform-stats', PLATFORM_STATS_CACHE_TTL_MS, async () => {
-      const [courses, moduleGroups, publishedBlogPosts, accessRows, learners, mockExams, lessonsAllTime] = await Promise.all([
+      const [courses, moduleGroups, accessRows, learners, mockExams, lessonsAllTime] = await Promise.all([
         prisma.course.findMany({
           where: { status: 'published' },
           select: { id: true, slug: true, name: true, description: true, category: true, coverImageUrl: true },
           orderBy: { createdAt: 'asc' },
         }),
         prisma.courseModule.groupBy({ by: ['courseId'], _count: { _all: true } }),
-        prisma.blogPost.count({ where: { status: 'published' } }),
         prisma.authoredCourseAccess.findMany({ select: { courseId: true, allowedRoles: true } }),
         prisma.user.count({ where: { deletedAt: null } }),
         prisma.mockExam.count({ where: { isPublished: true } }),
         prisma.moduleProgress.count(),
       ]);
-      return { courses, moduleGroups, publishedBlogPosts, accessRows, learners, mockExams, lessonsAllTime };
+      return { courses, moduleGroups, accessRows, learners, mockExams, lessonsAllTime };
     });
   }
 
@@ -185,7 +183,7 @@ export class DashboardRepository {
     const todayStart = startOfUtcDay(now);
 
     const [
-      { courses, moduleGroups, publishedBlogPosts, accessRows, learners, mockExams, lessonsAllTime },
+      { courses, moduleGroups, accessRows, learners, mockExams, lessonsAllTime },
       progressRows,
       courseCompletions,
       attemptsTotal,
@@ -193,6 +191,7 @@ export class DashboardRepository {
       commentAgg,
       blogComments,
       bestAnswers,
+      authoredBlogPosts,
     ] = await Promise.all([
       this.platformStats(),
       prisma.moduleProgress.findMany({ where: { userId: user.id }, select: { courseId: true, completedAt: true } }),
@@ -220,6 +219,10 @@ export class DashboardRepository {
         orderBy: { createdAt: 'desc' },
       }),
       prisma.comment.count({ where: { userId: user.id, isDeleted: false, isBestAnswer: true } }),
+      // The user's OWN published posts — NOT the platform-wide total (this
+      // card shows personal blog activity: comments made, posts discussed,
+      // recognition received — a global count doesn't belong alongside them).
+      prisma.blogPost.count({ where: { authorId: user.id, status: 'published' } }),
     ]);
 
     const moduleCountByCourse = new Map(moduleGroups.map((g) => [g.courseId, g._count._all]));
@@ -414,7 +417,7 @@ export class DashboardRepository {
         bestAnswers,
       },
       blogActivity: {
-        publishedPosts: publishedBlogPosts,
+        publishedPosts: authoredBlogPosts,
         comments: blogComments.length,
         postsDiscussed: new Set(blogComments.map((comment) => comment.blogPostId)).size,
         recognitionReceived: blogComments.reduce(

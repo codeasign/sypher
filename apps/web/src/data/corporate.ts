@@ -94,15 +94,16 @@ export function clearCompanyContext(): void {
 }
 
 /**
- * Where to land after a successful corporate login. The session cookie is
- * scoped to `.sypher.local`, so it already covers the main app — we just
- * need to leave the corporate host. Swaps the `corporate.` host label for
- * `next.`; falls back to the known dev host.
+ * Where to land after a successful corporate login. The session cookie's
+ * domain (COOKIE_DOMAIN) already covers both hosts, so this just needs the
+ * main app's own URL — read from NEXT_PUBLIC_WEB_URL rather than derived
+ * from the current (corporate) hostname, since the two hosts don't share a
+ * predictable naming pattern across environments: local dev pairs two
+ * subdomains (corporate.sypher.local / next.sypher.local), while production
+ * pairs a subdomain with the bare apex (corporate.syphernext.com /
+ * syphernext.com) — no single string-swap rule covers both.
  */
 export function mainAppUrl(path = '/dashboard'): string {
-  if (typeof window !== 'undefined') {
-    const origin = window.location.origin;
-    if (origin.includes('://corporate.')) return origin.replace('://corporate.', '://next.') + path;
-  }
-  return `https://next.sypher.local${path}`;
+  const base = process.env.NEXT_PUBLIC_WEB_URL ?? 'https://next.sypher.local';
+  return `${base}${path}`;
 }

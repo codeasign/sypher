@@ -55,6 +55,12 @@ const ALLOWED_TYPES = new Set([
 const VIDEO_TYPES = new Set(['video/mp4']);
 const ZIP_TYPES = new Set(['application/zip', 'application/x-zip-compressed', 'application/x-zip']);
 
+// Avatars are the one upload surface every signed-in user can write to
+// (see SELF_PREFIXES below), so they get the tightest allow-list: no PDFs,
+// videos, or zips, regardless of what the generic ALLOWED_TYPES set permits
+// for role-gated content uploads.
+const AVATAR_TYPES = new Set(['image/png', 'image/jpeg']);
+
 // Lowercase segments, "/"-separated, no traversal. e.g. "avatars/<id>",
 // "courses/<slug>/covers", "blog/featured-media".
 const PREFIX_RE = /^[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*){0,4}$/;
@@ -109,9 +115,12 @@ export async function POST(request: Request): Promise<NextResponse> {
   if (!PREFIX_RE.test(prefix)) {
     return NextResponse.json({ message: 'Invalid upload path' }, { status: 400 });
   }
-  if (!ALLOWED_TYPES.has(file.type)) {
+  const isSelfUpload = SELF_PREFIXES.includes(prefix.split('/')[0]);
+  const allowedTypes = isSelfUpload ? AVATAR_TYPES : ALLOWED_TYPES;
+  if (!allowedTypes.has(file.type)) {
+    const hint = isSelfUpload ? ' Only JPEG and PNG images are allowed here.' : '';
     return NextResponse.json(
-      { message: `Unsupported file type${file.type ? `: ${file.type}` : ''}` },
+      { message: `Unsupported file type${file.type ? `: ${file.type}` : ''}.${hint}` },
       { status: 415 },
     );
   }
@@ -137,9 +146,8 @@ export async function POST(request: Request): Promise<NextResponse> {
   // caller's own id server-side (the client-supplied prefix is only used
   // to pick the top-level bucket) so no one can write into another user's
   // namespace. Everything else is content management and needs a role.
-  const topSegment = prefix.split('/')[0];
   let effectivePrefix: string;
-  if (SELF_PREFIXES.includes(topSegment)) {
+  if (isSelfUpload) {
     effectivePrefix = `avatars/${me.id}`;
   } else if (CONTENT_ROLES.has(me.role ?? '')) {
     effectivePrefix = prefix;

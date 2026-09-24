@@ -17,15 +17,19 @@ import {
   FileText,
   Image as ImageGlyph,
   Info,
+  KeyRound,
   LogOut,
+  Mail,
   Maximize2,
   MessageSquare,
   Minimize2,
   MonitorPlay,
   Pencil,
+  Plus,
   Reply,
   RotateCcw,
   Settings,
+  Sparkles,
   ThumbsUp,
   Timer,
   Trash2,
@@ -51,6 +55,7 @@ function wrap(Glyph: LucideIcon) {
 export const ViewIcon = wrap(Eye);
 export const SettingsIcon = wrap(Settings);
 export const EditIcon = wrap(Pencil);
+export const AddIcon = wrap(Plus);
 export const DeleteIcon = wrap(Trash2);
 export const RestoreIcon = wrap(RotateCcw);
 export const RemoveIcon = wrap(UserMinus);
@@ -59,9 +64,16 @@ export const OpenInFullIcon = wrap(Maximize2);
 export const CloseFullscreenIcon = wrap(Minimize2);
 export const LogoutMenuIcon = wrap(LogOut);
 export const TimerIcon = wrap(Timer);
+export const KeyIcon = wrap(KeyRound);
 
 // Shared by every info/tooltip hint (AccessManager's InfoIcon originally).
 export const InfoIcon = wrap(Info);
+
+export const MailIcon = wrap(Mail);
+
+// Friendly, low-key "psst, here's an idea" glyph (e.g. the profile page's
+// casual Go Pro nudge) — never used for a hard-sell CTA.
+export const SparkleIcon = wrap(Sparkles);
 
 // Empty-state placeholder for logo/avatar uploaders (e.g. the company form's
 // logo upload row).

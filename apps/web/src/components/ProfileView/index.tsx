@@ -5,6 +5,9 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { uploadToBunny } from '@/data/bunnyUpload';
 import { PRESET_AVATARS } from '@/data/onboarding';
+import { AddIcon, EditIcon, InfoIcon, MailIcon } from '@/components/icons/ActionIcons';
+import EmptyState from '@/components/EmptyState';
+import GoProCard from '@/components/GoProCard';
 import {
   fetchMyComments,
   updateProfile,
@@ -15,7 +18,6 @@ import {
   type ProfileCounts,
   type ProfileMe,
 } from '@/data/profile';
-import { roleLabel } from '@/lib/roleLabels';
 import styles from './styles.module.css';
 
 const HANDLE_RE = /^[a-z0-9_]{3,20}$/;
@@ -173,9 +175,9 @@ export default function ProfileView({
     try {
       const url = await uploadToBunny(file, `avatars/${me.id}`);
       await saveAvatar(url);
-    } catch (err) {
+    } catch {
       setSavingAvatar(false);
-      setAvatarError(err instanceof Error ? err.message : 'Upload failed');
+      setAvatarError('Only JPEG or PNG images are allowed.');
     } finally {
       if (fileRef.current) fileRef.current.value = '';
     }
@@ -239,135 +241,160 @@ export default function ProfileView({
         </div>
 
         <div className={styles.identityMain}>
-          <h1 className={styles.name}>{me.fullName || me.username}</h1>
+          <div className={styles.identityColumns}>
+            <div className={styles.identityLeft}>
+              <h1 className={styles.name}>{me.fullName || me.username}</h1>
 
-          <div className={styles.handleRow}>
-            {!editingHandle ? (
-              <>
-                <span className={styles.handle}>@{me.username}</span>
-                <button
-                  type="button"
-                  className={styles.linkBtn}
-                  onClick={() => {
-                    setEditingHandle(true);
-                    setHandleDraft(me.username);
-                    setHandleError(null);
-                  }}
-                >
-                  Edit
-                </button>
-              </>
-            ) : (
-              <>
-                <span className={styles.at}>@</span>
-                <input
-                  className={styles.handleInput}
-                  value={handleDraft}
-                  maxLength={20}
-                  autoFocus
-                  aria-label="New handle"
-                  onChange={(e) => setHandleDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') void saveHandle();
-                    if (e.key === 'Escape') setEditingHandle(false);
-                  }}
-                />
-                <button
-                  type="button"
-                  className={styles.primaryBtn}
-                  onClick={() => void saveHandle()}
-                  disabled={savingHandle}
-                >
-                  {savingHandle ? 'Saving…' : 'Save'}
-                </button>
-                <button
-                  type="button"
-                  className={styles.linkBtn}
-                  onClick={() => {
-                    setEditingHandle(false);
-                    setHandleError(null);
-                  }}
-                  disabled={savingHandle}
-                >
-                  Cancel
-                </button>
-              </>
-            )}
-          </div>
-          {handleError && <p className={styles.err}>{handleError}</p>}
+              <div className={styles.handleRow}>
+                {!editingHandle ? (
+                  <>
+                    <span className={styles.handle}>@{me.username}</span>
+                    <button
+                      type="button"
+                      className={styles.iconEditBtn}
+                      aria-label="Edit handle"
+                      title="Edit handle"
+                      onClick={() => {
+                        setEditingHandle(true);
+                        setHandleDraft(me.username);
+                        setHandleError(null);
+                      }}
+                    >
+                      <EditIcon className={styles.iconEditGlyph} />
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span className={styles.at}>@</span>
+                    <input
+                      className={styles.handleInput}
+                      value={handleDraft}
+                      maxLength={20}
+                      autoFocus
+                      aria-label="New handle"
+                      onChange={(e) => setHandleDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') void saveHandle();
+                        if (e.key === 'Escape') setEditingHandle(false);
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className={styles.primaryBtn}
+                      onClick={() => void saveHandle()}
+                      disabled={savingHandle}
+                    >
+                      {savingHandle ? 'Saving…' : 'Save'}
+                    </button>
+                    <button
+                      type="button"
+                      className={styles.linkBtn}
+                      onClick={() => {
+                        setEditingHandle(false);
+                        setHandleError(null);
+                      }}
+                      disabled={savingHandle}
+                    >
+                      Cancel
+                    </button>
+                  </>
+                )}
+              </div>
+              {handleError && <p className={styles.err}>{handleError}</p>}
 
-          <dl className={styles.meta}>
-            <div>
-              <dt>Email</dt>
-              <dd>{me.email}</dd>
+              <dl className={styles.meta}>
+                <div>
+                  <dt className={styles.metaLabel}>
+                    <MailIcon className={styles.labelIcon} />
+                    Email
+                  </dt>
+                  <dd>{me.email}</dd>
+                </div>
+              </dl>
             </div>
-            <div>
-              <dt>Role</dt>
-              <dd>{roleLabel(me.role)}</dd>
-            </div>
-          </dl>
 
-          <div className={styles.about}>
-            <div className={styles.aboutHead}>
-              <span className={styles.aboutLabel}>About</span>
-              {!editingBio && (
-                <button
-                  type="button"
-                  className={styles.linkBtn}
-                  onClick={() => {
-                    setEditingBio(true);
-                    setBioDraft(me.bio ?? '');
-                    setBioError(null);
-                  }}
-                >
-                  {me.bio ? 'Edit' : 'Add'}
-                </button>
+            <div className={styles.identityRight}>
+              <div className={styles.about}>
+                <div className={styles.aboutHead}>
+                  <span className={styles.aboutLabel}>
+                    <InfoIcon className={styles.labelIcon} />
+                    About
+                  </span>
+                  {!editingBio && (
+                    <button
+                      type="button"
+                      className={styles.iconEditBtn}
+                      aria-label={me.bio ? 'Edit about' : 'Add about'}
+                      title={me.bio ? 'Edit about' : 'Add about'}
+                      onClick={() => {
+                        setEditingBio(true);
+                        setBioDraft(me.bio ?? '');
+                        setBioError(null);
+                      }}
+                    >
+                      {me.bio ? (
+                        <EditIcon className={styles.iconEditGlyph} />
+                      ) : (
+                        <AddIcon className={styles.iconEditGlyph} />
+                      )}
+                    </button>
+                  )}
+                </div>
+                {editingBio ? (
+                  <>
+                    <textarea
+                      className={styles.bioInput}
+                      value={bioDraft}
+                      maxLength={200}
+                      rows={3}
+                      autoFocus
+                      aria-label="About you"
+                      placeholder="A sentence or two about you."
+                      onChange={(e) => setBioDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') setEditingBio(false);
+                      }}
+                    />
+                    <div className={styles.bioActions}>
+                      <button
+                        type="button"
+                        className={styles.primaryBtn}
+                        onClick={() => void saveBio()}
+                        disabled={savingBio}
+                      >
+                        {savingBio ? 'Saving…' : 'Save'}
+                      </button>
+                      <button
+                        type="button"
+                        className={styles.linkBtn}
+                        onClick={() => {
+                          setEditingBio(false);
+                          setBioError(null);
+                        }}
+                        disabled={savingBio}
+                      >
+                        Cancel
+                      </button>
+                      <span className={styles.bioCount}>{bioDraft.length}/200</span>
+                    </div>
+                  </>
+                ) : me.bio ? (
+                  <p className={styles.bioText}>{me.bio}</p>
+                ) : (
+                  <p className={styles.bioEmpty}>No About yet.</p>
+                )}
+                {bioError && <p className={styles.err}>{bioError}</p>}
+              </div>
+
+              {me.role === 'FREE_USER' && (
+                <div className={styles.proCardSpacing}>
+                  <GoProCard
+                    userEmail={me.email}
+                    message="You're on the free preview. Pro unlocks the full course library, every certification practice exam, and progress tracking that shows you what's working."
+                  />
+                </div>
               )}
             </div>
-            {editingBio ? (
-              <>
-                <textarea
-                  className={styles.bioInput}
-                  value={bioDraft}
-                  maxLength={500}
-                  rows={3}
-                  autoFocus
-                  aria-label="About you"
-                  placeholder="A sentence or two about you."
-                  onChange={(e) => setBioDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Escape') setEditingBio(false);
-                  }}
-                />
-                <div className={styles.bioActions}>
-                  <button
-                    type="button"
-                    className={styles.primaryBtn}
-                    onClick={() => void saveBio()}
-                    disabled={savingBio}
-                  >
-                    {savingBio ? 'Saving…' : 'Save'}
-                  </button>
-                  <button
-                    type="button"
-                    className={styles.linkBtn}
-                    onClick={() => {
-                      setEditingBio(false);
-                      setBioError(null);
-                    }}
-                    disabled={savingBio}
-                  >
-                    Cancel
-                  </button>
-                  <span className={styles.bioCount}>{bioDraft.length}/500</span>
-                </div>
-              </>
-            ) : me.bio ? (
-              <p className={styles.bioText}>{me.bio}</p>
-            ) : (
-              <p className={styles.bioEmpty}>No About yet.</p>
-            )}
-            {bioError && <p className={styles.err}>{bioError}</p>}
           </div>
         </div>
 
@@ -399,7 +426,7 @@ export default function ProfileView({
             >
               {savingAvatar ? 'Working…' : 'Upload an image'}
             </button>
-            <input ref={fileRef} type="file" accept="image/*" hidden onChange={(e) => void handleUpload(e)} />
+            <input ref={fileRef} type="file" accept="image/png,image/jpeg" hidden onChange={(e) => void handleUpload(e)} />
           </div>
           {avatarError && <p className={styles.err}>{avatarError}</p>}
         </section>
@@ -437,14 +464,12 @@ export default function ProfileView({
         </div>
 
         {items.length === 0 && !busy ? (
-          <p className={styles.empty}>
-            {tab === 'reply'
-              ? 'No blog replies yet.'
-              : tab === 'post'
-                ? 'No blog posts yet.'
-                : 'No course discussion yet.'}{' '}
-            Join a discussion on a course or a blog post.
-          </p>
+          <EmptyState
+            illustration="posts"
+            compact
+            title={tab === 'reply' ? 'No blog replies yet.' : tab === 'post' ? 'No blog posts yet.' : 'No course discussion yet.'}
+            description="Join a discussion on a course or a blog post."
+          />
         ) : (
           <ul className={styles.feed}>
             {items.map((item) => (

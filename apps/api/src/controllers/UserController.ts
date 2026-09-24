@@ -37,7 +37,7 @@ export interface UserUpdateProfileRequest {
   username?: string;
   /** Preset avatar path (/avatars/*.svg) or an uploaded Bunny URL. Omit to leave unchanged. */
   avatarUrl?: string;
-  /** About/bio text, up to 500 chars. Empty string clears it. Omit to leave unchanged. */
+  /** About/bio text, up to 200 chars. Empty string clears it. Omit to leave unchanged. */
   bio?: string;
 }
 
@@ -51,7 +51,7 @@ export interface UserMeResponse {
   role: string;
 }
 
-const BIO_MAX = 500;
+const BIO_MAX = 200;
 
 export type UserActivityCountsResponse = ActivityCounts;
 export type UserActivityCommentPageResponse = ActivityCommentPage;
@@ -141,7 +141,7 @@ export class UserController extends Controller {
   // Profile-settings edit (spec §11): handle format rules mirror signup
   // generation, uniqueness settled by the DB index with a losing race
   // surfacing as a clean 409. Avatar must be a preset path or a URL on our
-  // own Bunny pull zone. Bio is free text up to 500 chars ("" clears it).
+  // own Bunny pull zone. Bio is free text up to 200 chars ("" clears it).
   // Every field optional; sending none is a 400.
   @Patch('me')
   @Security('session')

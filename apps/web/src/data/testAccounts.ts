@@ -47,3 +47,15 @@ export async function setTestAccountRole(email: string, role: string): Promise<{
   }
   return {};
 }
+
+export async function setTestAccountPassword(email: string, password: string): Promise<{ error?: string }> {
+  const res = await apiFetch('/admin/test-accounts/password', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    return { error: body.message ?? 'Password change failed' };
+  }
+  return {};
+}

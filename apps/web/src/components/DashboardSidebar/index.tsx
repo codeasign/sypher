@@ -36,12 +36,16 @@ const NAV_ICON_BY_KEY: Record<string, (props: { className?: string }) => React.J
   'browse-videos': VideoIcon,
 };
 
-// Browse Videos moved into Overview, directly above Browse Courses (user
-// request 2026-09-16, superseding the earlier separate "Videos" section)
-// — it's a browsing page like Browse Courses, not a "manage" action, so
-// it belongs next to its course equivalent rather than off on its own.
-// Manage Videos stays a normal "Manage" section item alongside the other
-// manage-* keys.
+// Manage is split by what's being managed: who can get in (Access) vs.
+// what they see once in (Content). course-audit isn't gated by a
+// NavAccess key with its own icon today, so it falls into Content
+// alongside the other authoring keys.
+const ACCESS_MANAGE_KEYS = new Set(['manage-access', 'launch-cohort', 'manage-cohort-users']);
+
+// Browse Videos and Browse Courses live in the Library section, alongside
+// each other — they're both browsing pages, not "manage" actions. Manage
+// Videos stays a normal "Manage" section item alongside the other manage-*
+// keys.
 
 interface Props {
   role: string;
@@ -65,6 +69,8 @@ export default function DashboardSidebar({ role, email, fullName, avatarUrl, vis
   const allItems = NAV_ITEMS.filter((item) => visibleKeys.includes(item.key));
   const browseVideosItem = allItems.find((item) => item.key === 'browse-videos') ?? null;
   const items = allItems.filter((item) => item.key !== 'browse-videos');
+  const accessItems = items.filter((item) => ACCESS_MANAGE_KEYS.has(item.key));
+  const contentItems = items.filter((item) => !ACCESS_MANAGE_KEYS.has(item.key));
   const displayName = fullName || email.split('@')[0] || 'User';
   const { handleUpgrade, isProcessing } = useUpgradeToPaid(email, () => router.refresh());
 
@@ -113,6 +119,29 @@ export default function DashboardSidebar({ role, email, fullName, avatarUrl, vis
             <DashboardIcon className={styles.navIcon} />
             <span className={styles.navLabel}>Dashboard</span>
           </Link>
+          <Link
+            href="/getting-started"
+            className={isActive('/getting-started') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
+          >
+            <SetupGuidesIcon className={styles.navIcon} />
+            <span className={styles.navLabel}>Resources & Guides</span>
+          </Link>
+        </div>
+
+        <div className={`${styles.section} ${styles.sectionDivider}`}>
+          <span className={styles.sectionHeader}>My Learning</span>
+          <Link href="/learn" className={isActive('/learn') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}>
+            <ManageCoursesIcon className={styles.navIcon} />
+            <span className={styles.navLabel}>My Courses</span>
+          </Link>
+          <Link href="/bookmarks" className={isActive('/bookmarks') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}>
+            <BookmarksIcon className={styles.navIcon} />
+            <span className={styles.navLabel}>My Bookmarks</span>
+          </Link>
+        </div>
+
+        <div className={`${styles.section} ${styles.sectionDivider}`}>
+          <span className={styles.sectionHeader}>Library</span>
           {browseVideosItem && (
             <Link
               href={browseVideosItem.href}
@@ -129,10 +158,10 @@ export default function DashboardSidebar({ role, email, fullName, avatarUrl, vis
             <CoursesIcon className={styles.navIcon} />
             <span className={styles.navLabel}>Browse Courses</span>
           </Link>
-          <Link href="/learn" className={isActive('/learn') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}>
-            <ManageCoursesIcon className={styles.navIcon} />
-            <span className={styles.navLabel}>My Courses</span>
-          </Link>
+        </div>
+
+        <div className={`${styles.section} ${styles.sectionDivider}`}>
+          <span className={styles.sectionHeader}>Practice</span>
           <Link
             href="/mock-tests"
             className={
@@ -151,23 +180,31 @@ export default function DashboardSidebar({ role, email, fullName, avatarUrl, vis
             <PracticeCodingIcon className={styles.navIcon} />
             <span className={styles.navLabel}>Practice Coding</span>
           </Link>
-          <Link
-            href="/getting-started"
-            className={isActive('/getting-started') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
-          >
-            <SetupGuidesIcon className={styles.navIcon} />
-            <span className={styles.navLabel}>Resources & Guides</span>
-          </Link>
-          <Link href="/bookmarks" className={isActive('/bookmarks') ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}>
-            <BookmarksIcon className={styles.navIcon} />
-            <span className={styles.navLabel}>My Bookmarks</span>
-          </Link>
         </div>
 
-        {items.length > 0 && (
+        {accessItems.length > 0 && (
           <div className={`${styles.section} ${styles.sectionDivider}`}>
-            <span className={styles.sectionHeader}>Manage</span>
-            {items.map((item) => {
+            <span className={styles.sectionHeader}>Manage Access</span>
+            {accessItems.map((item) => {
+              const Icon = NAV_ICON_BY_KEY[item.key] ?? DashboardIcon;
+              return (
+                <Link
+                  key={item.key}
+                  href={item.href}
+                  className={isActive(item.href) ? `${styles.navItem} ${styles.navItemActive}` : styles.navItem}
+                >
+                  <Icon className={styles.navIcon} />
+                  <span className={styles.navLabel}>{item.label}</span>
+                </Link>
+              );
+            })}
+          </div>
+        )}
+
+        {contentItems.length > 0 && (
+          <div className={`${styles.section} ${styles.sectionDivider}`}>
+            <span className={styles.sectionHeader}>Manage Content</span>
+            {contentItems.map((item) => {
               const Icon = NAV_ICON_BY_KEY[item.key] ?? DashboardIcon;
               return (
                 <Link

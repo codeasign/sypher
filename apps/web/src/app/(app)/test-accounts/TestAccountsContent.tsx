@@ -2,9 +2,15 @@
 
 import React, { useEffect, useState } from 'react';
 import ConfirmDialog from '@/components/ConfirmDialog';
-import { RestoreIcon } from '@/components/icons/ActionIcons';
+import { KeyIcon, RestoreIcon } from '@/components/icons/ActionIcons';
 import { roleLabel } from '@/lib/roleLabels';
-import { listTestAccounts, resetTestAccount, setTestAccountRole, type TestAccountRow } from '@/data/testAccounts';
+import {
+  listTestAccounts,
+  resetTestAccount,
+  setTestAccountPassword,
+  setTestAccountRole,
+  type TestAccountRow,
+} from '@/data/testAccounts';
 import styles from './test-accounts.module.css';
 
 // Every Role enum value (apps/api/prisma/schema.prisma) — wider than the
@@ -35,6 +41,11 @@ export default function TestAccountsContent(): React.JSX.Element {
   const [newEmail, setNewEmail] = useState('');
   const [newRole, setNewRole] = useState('FREE_USER');
   const [adding, setAdding] = useState(false);
+
+  const [passwordEmail, setPasswordEmail] = useState<string | null>(null);
+  const [passwordValue, setPasswordValue] = useState('');
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+  const [settingPassword, setSettingPassword] = useState(false);
 
   async function load(): Promise<void> {
     setLoading(true);
@@ -91,6 +102,37 @@ export default function TestAccountsContent(): React.JSX.Element {
     await load();
   }
 
+  function openPasswordDialog(email: string): void {
+    setPasswordEmail(email);
+    setPasswordValue('');
+    setPasswordError(null);
+  }
+
+  function closePasswordDialog(): void {
+    if (settingPassword) return;
+    setPasswordEmail(null);
+    setPasswordValue('');
+    setPasswordError(null);
+  }
+
+  async function handleSetPassword(): Promise<void> {
+    if (!passwordEmail) return;
+    if (passwordValue.length < 8) {
+      setPasswordError('Password must be at least 8 characters');
+      return;
+    }
+    setSettingPassword(true);
+    setPasswordError(null);
+    const { error: pwError } = await setTestAccountPassword(passwordEmail, passwordValue);
+    setSettingPassword(false);
+    if (pwError) {
+      setPasswordError(pwError);
+      return;
+    }
+    setPasswordEmail(null);
+    setPasswordValue('');
+  }
+
   function renderRow(row: TestAccountRow): React.JSX.Element {
     return (
       <tr key={row.email}>
@@ -124,6 +166,17 @@ export default function TestAccountsContent(): React.JSX.Element {
           )}
         </td>
         <td className={styles.actions}>
+          {row.exists && (
+            <button
+              type="button"
+              className={styles.actionBtnEdit}
+              onClick={() => openPasswordDialog(row.email)}
+              aria-label={`Set password for ${row.email}`}
+              title="Set this account's password directly"
+            >
+              <KeyIcon className={styles.actionIcon} />
+            </button>
+          )}
           <button
             type="button"
             className={styles.actionBtnSuccess}
@@ -146,10 +199,10 @@ export default function TestAccountsContent(): React.JSX.Element {
     <div className={styles.container}>
       <h1 className={styles.heading}>Test Accounts</h1>
       <p className={styles.subheading}>
-        Dev-only roster from <code>Test-Accounts.md</code>. Password for every account: <code>password</code>.
-        Reset hard-deletes the account and re-provisions it fresh (passwordless, onboarding cleared) — fires the
-        same welcome + set-password email a real provisioned account gets, so you can re-test onboarding and
-        email templates.
+        Dev-only roster from <code>Test-Accounts.md</code>. Reset hard-deletes the account and re-provisions it
+        fresh (passwordless, onboarding cleared) — fires the same welcome + set-password email a real provisioned
+        account gets, so you can re-test onboarding and email templates. Use the key icon to set a password
+        directly and skip the email link.
       </p>
 
       {error && <div className={styles.errorBanner}>{error}</div>}
@@ -239,6 +292,49 @@ export default function TestAccountsContent(): React.JSX.Element {
         onConfirm={() => pendingEmail && void handleReset(pendingEmail)}
         onCancel={() => setPendingEmail(null)}
       />
+
+      {passwordEmail && (
+        <div className={styles.overlay} onClick={closePasswordDialog} role="presentation">
+          <div
+            className={styles.passwordModal}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="test-account-password-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2 id="test-account-password-title" className={styles.passwordModalTitle}>
+              Set password
+            </h2>
+            <p className={styles.passwordModalEmail}>{passwordEmail}</p>
+            <input
+              type="password"
+              className={styles.passwordInput}
+              placeholder="New password (min 8 characters)"
+              value={passwordValue}
+              onChange={(event) => setPasswordValue(event.target.value)}
+              disabled={settingPassword}
+              autoFocus
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void handleSetPassword();
+              }}
+            />
+            {passwordError && <p className={styles.passwordModalError}>{passwordError}</p>}
+            <div className={styles.passwordModalActions}>
+              <button type="button" className={styles.passwordCancelBtn} onClick={closePasswordDialog} disabled={settingPassword}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className={styles.passwordSaveBtn}
+                onClick={() => void handleSetPassword()}
+                disabled={settingPassword || passwordValue.length < 8}
+              >
+                {settingPassword ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

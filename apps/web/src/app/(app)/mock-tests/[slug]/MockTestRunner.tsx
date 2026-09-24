@@ -8,6 +8,7 @@ import { LogoutMenuIcon, TimerIcon } from '@/components/icons/ActionIcons';
 import MiniBars from '@/components/charts/MiniBars';
 import RankedBars from '@/components/charts/RankedBars';
 import SegmentedRing from '@/components/charts/SegmentedRing';
+import EmptyState from '@/components/EmptyState';
 import styles from './styles.module.css';
 
 // Fixed-order categorical hues (identity, never status) -- see the chart
@@ -385,7 +386,7 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
           ))}
         </div>
         {filteredQuestions.length === 0 ? (
-          <p className={styles.reviewEmpty}>No questions in this category.</p>
+          <EmptyState illustration="exam" compact title="No questions in this category." />
         ) : (
           <ol className={styles.reviewList}>
             {filteredQuestions.map((question) => (

@@ -15,6 +15,7 @@ import {
   type GroupNavCeilingItem,
 } from '@/data/companyAdmin';
 import { NAV_ITEMS } from '@/lib/navItems';
+import EmptyState from '@/components/EmptyState';
 import styles from '../admin.module.css';
 
 const NAV_LABEL = new Map(NAV_ITEMS.map((n) => [n.key, n.label]));
@@ -78,7 +79,7 @@ export default function CorporateAdminGroupsPage(): React.JSX.Element {
       {error && <p className={styles.error}>{error}</p>}
 
       {groups.length === 0 ? (
-        <p className={styles.hint}>No groups yet.</p>
+        <EmptyState illustration="people" compact title="No groups yet." />
       ) : (
         <div className={styles.split}>
           <div className={styles.groupList}>
@@ -189,7 +190,7 @@ function GroupDetail({ group, onChanged }: { group: CompanyAdminGroup; onChanged
       <div className={styles.sectionTitle}>Course access</div>
       <p className={styles.hint}>Only courses in your company plan are shown.</p>
       {courses.length === 0 ? (
-        <p className={styles.hint}>No courses in your plan yet — contact Sypher.</p>
+        <EmptyState illustration="courses" compact title="No courses in your plan yet." description="Contact Sypher to add courses to your plan." />
       ) : (
         <div className={styles.checkList}>
           {courses.map((c) => (
@@ -204,7 +205,7 @@ function GroupDetail({ group, onChanged }: { group: CompanyAdminGroup; onChanged
       <div className={styles.sectionTitle}>Sidebar access</div>
       <p className={styles.hint}>Only sidebar items in your company plan are shown.</p>
       {nav.length === 0 ? (
-        <p className={styles.hint}>No sidebar items in your plan.</p>
+        <EmptyState illustration="folder" compact title="No sidebar items in your plan." />
       ) : (
         <div className={styles.checkList}>
           {nav.map((n) => (
