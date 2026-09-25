@@ -25,6 +25,12 @@ export const env = {
   recaptcha: {
     secretKey: process.env.RECAPTCHA_SECRET_KEY ?? '',
     required: process.env.RECAPTCHA_REQUIRED === 'true' || (process.env.RECAPTCHA_REQUIRED !== 'false' && (process.env.NODE_ENV ?? 'development') === 'production'),
+    // DEV ONLY. Skips the reCAPTCHA check for `x-sypher-client: mobile` callers
+    // so the native app can sign in locally. Hard-disabled in production because
+    // that header is spoofable; the real fix is app attestation (App Attest /
+    // Play Integrity) — see the mobile repo's spec, "Known gap: bot verification".
+    mobileDevBypass:
+      process.env.RECAPTCHA_MOBILE_DEV_BYPASS === 'true' && (process.env.NODE_ENV ?? 'development') !== 'production',
   },
   google: {
     clientId: process.env.GOOGLE_CLIENT_ID ?? '',

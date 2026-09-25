@@ -7,6 +7,34 @@
 > earlier commit do NOT authorize one. Leave completed work as uncommitted
 > working-tree changes and say it is ready. Approval is per-action. (Also in
 > `AGENTS.md` → Git Safety Rules.)
+## Session summary (2026-09-25 — dev-only reCAPTCHA bypass for the mobile app)
+
+**Context**: the new React Native app (repo `D:\jenny\mobile`) cannot supply a
+reCAPTCHA token, so `POST /auth/login` / `/auth/register` rejected it with
+"Please complete the bot verification and try again." User decision: unblock
+local development with an env flag, explicitly NOT a production answer.
+
+**Status**: implemented, UNCOMMITTED (per standing rule), ready for review.
+
+**Files modified** (`git status`): `apps/api/src/lib/env.ts` (new
+`recaptcha.mobileDevBypass`, false whenever `NODE_ENV=production`),
+`apps/api/src/lib/recaptcha.ts` (new `isMobileRecaptchaDevBypass(request)`,
+warns once when used), `apps/api/src/controllers/AuthController.ts` (login +
+register guard: `!isMobileRecaptchaDevBypass(request) && !verify…`;
+`ContactController` unchanged), `apps/api/.env.example` (documents
+`RECAPTCHA_MOBILE_DEV_BYPASS`). Local `apps/api/.env` has
+`RECAPTCHA_MOBILE_DEV_BYPASS=true` (gitignored).
+
+**Decision / Known Issue**: `x-sypher-client: mobile` is a spoofable header, so
+this bypass must never be enabled in production. Production mobile sign-in
+requires native app attestation (Apple App Attest / Google Play Integrity)
+verified server-side — to be scoped as its own task before mobile login goes
+live. Mirrored in the mobile repo's spec
+(`docs/superpowers/specs/2026-09-25-app-navigation-design.md`, "Known gap").
+
+**Next Action**: restart the API on :4000 so the new env/code load; verify a
+mobile-header login without a token returns 200; then review/commit on request.
+
 ## Session summary (2026-09-19 — mock-exam question banks: 300/tier expansion)
 
 **Goal**: grow every exam in `apps/web/question-bank/` to 300 easy / 300 medium /
@@ -4107,3 +4135,4 @@ python-for-ai-engineers / git-github-actions audits.
 - 2026-09-21T03:49:16.827Z — auto-compaction (trigger: auto, session: 74c2c3fe-13e6-4765-bad9-06431cbcfc67). Verify Status/Next Action above are current.
 - 2026-09-21T09:01:57.761Z — auto-compaction (trigger: auto, session: 3391a65d-3f53-4640-9990-906472278e2e). Verify Status/Next Action above are current.
 - 2026-09-21T10:46:51.049Z — auto-compaction (trigger: auto, session: 3391a65d-3f53-4640-9990-906472278e2e). Verify Status/Next Action above are current.
+- 2026-09-25T09:45:59.282Z — auto-compaction (trigger: auto, session: 757c7d82-b458-4418-afca-c65ad2ea5fad). Verify Status/Next Action above are current.

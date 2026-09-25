@@ -28,7 +28,7 @@ import {
 import { buildGoogleAuthUrl, exchangeGoogleCode } from '../lib/googleOAuth';
 import { env } from '../lib/env';
 import { createLogger } from '../lib/logger';
-import { verifyRecaptchaToken } from '../lib/recaptcha';
+import { isMobileRecaptchaDevBypass, verifyRecaptchaToken } from '../lib/recaptcha';
 import { extractSessionToken } from '../lib/tsoaAuth';
 import { setPrivateNoStoreCache } from '../lib/httpCache';
 
@@ -204,7 +204,7 @@ export class AuthController extends Controller {
         { 'Retry-After': String(registerRetryAfter) },
       );
     }
-    if (!(await verifyRecaptchaToken(body.recaptchaToken, request.ip))) {
+    if (!isMobileRecaptchaDevBypass(request) && !(await verifyRecaptchaToken(body.recaptchaToken, request.ip))) {
       return badRequest(400, { message: 'Please complete the bot verification and try again.' });
     }
     const email = body.email.trim().toLowerCase();
@@ -248,7 +248,7 @@ export class AuthController extends Controller {
         { 'Retry-After': String(loginRetryAfter) },
       );
     }
-    if (!(await verifyRecaptchaToken(body.recaptchaToken, request.ip))) {
+    if (!isMobileRecaptchaDevBypass(request) && !(await verifyRecaptchaToken(body.recaptchaToken, request.ip))) {
       return badRequest(400, { message: 'Please complete the bot verification and try again.' });
     }
     const user = await authenticate(body.email, body.password);
