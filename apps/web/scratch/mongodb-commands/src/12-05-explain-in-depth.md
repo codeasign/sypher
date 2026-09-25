@@ -1,0 +1,183 @@
+---
+title: "Reading explain() in Depth"
+order: 0
+---
+
+`explain()` is the tool that turns "this query is slow" into "this query examined 20,000 documents to return 40". It has three verbosity levels, a handful of stages worth knowing, and a few numbers that tell the whole story.
+
+## What you'll learn
+
+- The three verbosity levels
+- The stages you will meet: `COLLSCAN`, `IXSCAN`, `FETCH`, `SORT`, `LIMIT`, `PROJECTION`
+- The numbers that matter: keys, documents, returned
+- Forcing a plan with `hint()`, and reading rejected plans
+
+## Syntax
+
+```js show
+db.c.find(q).explain()                     // queryPlanner: the chosen plan
+db.c.find(q).explain("executionStats")     // runs it, with counts
+db.c.find(q).explain("allPlansExecution")  // also the rejected plans
+db.c.find(q).hint({ field: 1 })
+```
+
+## Examples
+
+```js run destructive
+const lab = db.getSiblingDB("lab_explain")
+const docs = []
+for (let i = 1; i <= 10000; i++) docs.push({ _id: i, a: i % 100, b: i % 7, c: i });
+for (let i = 0; i < docs.length; i += 5000) lab.t.insertMany(docs.slice(i, i + 5000));
+lab.t.createIndex({ a: 1 });
+lab.t.createIndex({ b: 1, c: 1 });
+const stages = (plan) => { const out = []; let p = plan; while (p) { out.push(p.stage); p = p.inputStage; } return out; };
+lab.t.countDocuments()
+```
+
+### queryPlanner: the chosen plan
+
+The plan is a tree; the leaf reads data and each parent transforms it. Read it from the inside out:
+
+```js run destructive
+stages(lab.t.find({ a: 5 }).explain().queryPlanner.winningPlan)
+```
+
+`FETCH` on top of `IXSCAN`: find the entries in the index, then fetch the documents.
+
+### Without an index on the field
+
+```js run destructive
+stages(lab.t.find({ c: { $gt: 9990 } }).hint({ $natural: 1 }).explain().queryPlanner.winningPlan)
+```
+
+`$natural: 1` forces a collection scan, the way to see the cost of "no index".
+
+### executionStats: the numbers
+
+```js run destructive
+const s = (cur) => { const e = cur.explain("executionStats").executionStats; return { returned: e.nReturned, keys: e.totalKeysExamined, docs: e.totalDocsExamined }; };
+[s(lab.t.find({ a: 5 })), s(lab.t.find({ a: 5, b: 3 })), s(lab.t.find({ c: { $gt: 9990 } }).hint({ $natural: 1 }))]
+```
+
+Read three numbers: **returned**, **keys examined**, **documents examined**. The best case is all three equal. `docs` much larger than `returned` means the index is not selective enough; `keys` far larger than `returned` means the index is scanned wide.
+
+### A sort stage
+
+If no index provides the order, a `SORT` stage appears:
+
+```js run destructive
+[stages(lab.t.find({ a: 5 }).sort({ c: 1 }).explain().queryPlanner.winningPlan), stages(lab.t.find({ b: 3 }).sort({ c: 1 }).explain().queryPlanner.winningPlan)]
+```
+
+The first needs a `SORT` (index `a` does not order by `c`); the second reads the `{ b: 1, c: 1 }` index in order, no sort.
+
+### Rejected plans
+
+`allPlansExecution` shows the candidates the planner tried:
+
+```js run destructive
+const all = lab.t.find({ a: 5, b: 3 }).explain("allPlansExecution").queryPlanner;
+({ chosen: JSON.stringify(all.winningPlan).match(/"indexName":"([^"]+)"/)[1], rejected: all.rejectedPlans.length })
+```
+
+### hint: choose the plan yourself
+
+```js run destructive
+[s(lab.t.find({ a: 5, b: 3 }).hint({ a: 1 })), s(lab.t.find({ a: 5, b: 3 }).hint({ b: 1, c: 1 }))]
+```
+
+Both return the same documents; the numbers show which index is better for this query. Use `hint` for experiments, rarely in production.
+
+### Covered query
+
+```js run destructive
+s(lab.t.find({ b: 3, c: { $gt: 9990 } }, { _id: 0, b: 1, c: 1 }))
+```
+
+`docs: 0`: the index alone answered.
+
+### Clean up
+
+```js run destructive
+lab.dropDatabase()
+```
+
+## Try it yourself
+
+For a query of your own on a scratch collection, list the stages, the three numbers, and try `hint` with two different indexes. Which is better, and why?
+
+## Watch out
+
+### `explain()` alone does not run the query
+
+The default level shows only the plan. Use `executionStats` for real numbers (it executes the query, so beware of heavy queries).
+
+### Timings in explain are noisy
+
+Use the counts (keys, documents, returned) rather than milliseconds when you compare.
+
+### The planner caches plans
+
+After index changes the plan can change. When comparing, use `hint` or clear the cache with `planCacheClear`.
+
+### Aggregations have their own explain
+
+Use `db.c.explain("executionStats").aggregate([...])`. Only the initial stages that read the collection show index use.
+
+## Interview corner
+
+**"What do you look at first in an `explain` output?"**
+The winning plan stages (COLLSCAN vs IXSCAN) and the three numbers: `nReturned`, `totalKeysExamined`, `totalDocsExamined`.
+
+**"What does a `SORT` stage tell you?"**
+The order could not come from an index, so the server sorts in memory (limited to 100 MB unless it may use disk).
+
+**"What is a covered query?"**
+One where the index contains every needed field, so `totalDocsExamined` is 0.
+
+## Practice
+
+### Warm-up: the stage list
+
+For a scratch collection with an index on `a`, return the stage list of `find({ a: 1 })`.
+
+```js practice destructive
+// hint: Walk `inputStage` from `winningPlan`.
+const lab = db.getSiblingDB("lab_explain")
+lab.t.insertMany(Array.from({ length: 1000 }, (_, i) => ({ _id: i, a: i % 50 })));
+lab.t.createIndex({ a: 1 });
+const stages = (plan) => { const out = []; let p = plan; while (p) { out.push(p.stage); p = p.inputStage; } return out; };
+const r = stages(lab.t.find({ a: 1 }).explain().queryPlanner.winningPlan)
+lab.dropDatabase();
+r
+```
+
+### Core: selectivity
+
+With 1000 docs `{ a: i % 50, b: i % 2 }` and indexes on `a` and on `b`, return `keysExamined` for `hint({ a: 1 })` versus `hint({ b: 1 })` on `{ a: 3, b: 1 }`.
+
+```js practice destructive
+// hint: `explain("executionStats").executionStats.totalKeysExamined`.
+const lab = db.getSiblingDB("lab_explain")
+lab.t.insertMany(Array.from({ length: 1000 }, (_, i) => ({ _id: i, a: i % 50, b: i % 2 })));
+lab.t.createIndex({ a: 1 });
+lab.t.createIndex({ b: 1 });
+const k = (h) => lab.t.find({ a: 3, b: 1 }).hint(h).explain("executionStats").executionStats.totalKeysExamined;
+const r = [k({ a: 1 }), k({ b: 1 })]
+lab.dropDatabase();
+r
+```
+
+### Stretch: does it sort?
+
+With an index `{ b: 1, c: 1 }`, return whether `find({ b: 2 }).sort({ c: 1 })` needs an in-memory sort (use 700 docs `{ b: i % 7, c: i }`).
+
+```js practice destructive
+// hint: Look for `"SORT"` in the plan JSON.
+const lab = db.getSiblingDB("lab_explain")
+lab.t.insertMany(Array.from({ length: 700 }, (_, i) => ({ _id: i, b: i % 7, c: i })));
+lab.t.createIndex({ b: 1, c: 1 });
+const r = JSON.stringify(lab.t.find({ b: 2 }).sort({ c: 1 }).explain().queryPlanner.winningPlan).includes('"SORT"')
+lab.dropDatabase();
+r
+```

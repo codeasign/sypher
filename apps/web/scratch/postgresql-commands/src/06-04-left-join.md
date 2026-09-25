@@ -1,0 +1,144 @@
+---
+title: "LEFT JOIN"
+order: 0
+---
+
+`LEFT JOIN` keeps **every row of the left table**, whether or not it has a match on the right. Where there is no match, the right-hand columns are filled with `NULL`. It is the join for questions like "which ones have none?"
+
+## What you'll learn
+
+- Keeping unmatched rows with `LEFT JOIN`
+- Finding what is missing (the anti-join)
+- Why the position of a filter matters
+
+## Syntax
+
+```sql show
+SELECT ...
+FROM table1
+LEFT JOIN table2 ON table2.key = table1.key;
+```
+
+## Examples
+
+### Keep every film
+
+Some films have no copy in any store. Film 14 is one of them; film 15 has several copies. `INNER JOIN` would drop film 14, but `LEFT JOIN` keeps it, with `NULL` where the inventory columns would be:
+
+```sql run
+SELECT f.film_id, f.title, i.inventory_id, i.store_id
+FROM film f
+LEFT JOIN inventory i ON i.film_id = f.film_id
+WHERE f.film_id IN (14, 15)
+ORDER BY f.film_id, i.inventory_id;
+```
+
+### Finding what is missing
+
+Join, then keep only the rows where the right side is `NULL`. This is the classic *anti-join*: films that have **no copies at all**:
+
+```sql run
+SELECT f.film_id, f.title
+FROM film f
+LEFT JOIN inventory i ON i.film_id = f.film_id
+WHERE i.inventory_id IS NULL
+ORDER BY f.film_id;
+```
+
+That is {{= SELECT COUNT(*) FROM film f LEFT JOIN inventory i ON i.film_id = f.film_id WHERE i.inventory_id IS NULL }} films out of {{= SELECT COUNT(*) FROM film }}.
+
+### Counting per left row, including zero
+
+`COUNT(right_column)` skips the `NULL`s, so films with no copies show a `0` instead of vanishing:
+
+```sql run
+SELECT f.film_id, f.title, COUNT(i.inventory_id) AS copies
+FROM film f
+LEFT JOIN inventory i ON i.film_id = f.film_id
+WHERE f.film_id BETWEEN 13 AND 16
+GROUP BY f.film_id, f.title
+ORDER BY f.film_id;
+```
+
+Use `COUNT(i.inventory_id)`, not `COUNT(*)`. `COUNT(*)` would count the empty joined row as `1`.
+
+## Try it yourself
+
+Find the actors who appear in no films (there may be none), then the categories that no film belongs to.
+
+## Watch out
+
+### A WHERE on the right table quietly turns it into an INNER JOIN
+
+Once you filter on a right-table column in `WHERE`, the `NULL` rows fail the test and are removed. Compare:
+
+```sql run
+SELECT
+  (SELECT COUNT(*)
+   FROM film f LEFT JOIN inventory i ON i.film_id = f.film_id
+   WHERE i.store_id = 1) AS filter_in_where_rows,
+  (SELECT COUNT(DISTINCT f.film_id)
+   FROM film f LEFT JOIN inventory i ON i.film_id = f.film_id AND i.store_id = 1) AS filter_in_on_films;
+```
+
+The first drops every film with no copy in store 1, so it behaves like an inner join. The second keeps all films and only matches copies in store 1. When you want to keep the left rows, put right-table conditions in the `ON`.
+
+### `= NULL` still doesn't work
+
+To find missing matches, use `IS NULL` on a column that can never be `NULL` in real matches (a primary key such as `i.inventory_id` is ideal).
+
+### Left and right depend on the order you write
+
+The "left" table is the one written **before** `LEFT JOIN`. Swap the tables and you get a different result.
+
+## Interview corner
+
+**"What is the difference between `INNER JOIN` and `LEFT JOIN`?"**
+`INNER JOIN` keeps only rows with a match in both tables. `LEFT JOIN` keeps every row of the left table and fills `NULL` where the right table has no match.
+
+**"How do you find rows in one table that have no match in another?"**
+`LEFT JOIN ... WHERE right.key IS NULL`, or `NOT EXISTS`, or `NOT IN` (with the `NULL` trap from page 3.9). The first two are the safe choices.
+
+**"Why did my `LEFT JOIN` stop returning the unmatched rows after I added a `WHERE`?"**
+A `WHERE` condition on the right table removes the `NULL` rows. Move the condition into the `ON`.
+
+## Practice
+
+### Warm-up: films with no copies, counted
+
+Count the films that have no inventory at all. Return one number, `films_without_copies`.
+
+```sql practice
+-- hint: LEFT JOIN inventory, keep `i.inventory_id IS NULL`, then COUNT.
+SELECT COUNT(*) AS films_without_copies
+FROM film f
+LEFT JOIN inventory i ON i.film_id = f.film_id
+WHERE i.inventory_id IS NULL;
+```
+
+### Core: copies per film, including none
+
+Show `title` and the number of copies (`copies`) for films whose `film_id` is between 10 and 20, fewest first, then by title.
+
+```sql practice
+-- hint: `COUNT(i.inventory_id)` after a LEFT JOIN.
+SELECT f.title, COUNT(i.inventory_id) AS copies
+FROM film f
+LEFT JOIN inventory i ON i.film_id = f.film_id
+WHERE f.film_id BETWEEN 10 AND 20
+GROUP BY f.film_id, f.title
+ORDER BY copies, f.title;
+```
+
+### Stretch: films missing from one store
+
+Show the `title` of every film that has **no copy in store 2** (it may have copies elsewhere). Order by title, and show the first rows. (Keep the store condition in the `ON`.)
+
+```sql practice
+-- hint: LEFT JOIN with `AND i.store_id = 2` in the ON, then `WHERE i.inventory_id IS NULL`.
+SELECT f.title
+FROM film f
+LEFT JOIN inventory i ON i.film_id = f.film_id AND i.store_id = 2
+WHERE i.inventory_id IS NULL
+ORDER BY f.title;
+```

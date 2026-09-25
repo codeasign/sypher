@@ -1,0 +1,79 @@
+---
+title: "What Is MySQL?"
+order: 0
+---
+
+MySQL is a program that stores data in organised tables and lets you ask questions about that data using a language called **SQL**.
+
+Every app you use, from a bank to a streaming service, keeps its information in a database like this. Learning MySQL means learning to talk to that database: to read from it, change it, and design it well.
+
+## What you'll learn
+
+- What a relational database (RDBMS) is
+- What tables, rows and columns are
+- How keys link one table to another
+- What the DVD Rental database is and what it contains
+
+## The idea in plain English
+
+Think of a spreadsheet, but stricter. A relational database management system (**RDBMS**) keeps information in **tables**. Each table is about one kind of thing, such as films, customers or rentals.
+
+- A **column** is one property, such as `title` or `rental_rate`. Every column has a fixed **data type**: text, whole number, date, and so on.
+- A **row** is one item: one film, one customer, one rental.
+- A **primary key** is a column (often an ID number) that is different for every row, so each row can be pointed at without confusion.
+- A **foreign key** is a column that holds another table's primary key. That is how tables are linked. A rental holds a `customer_id`, which points at one row in the `customer` table.
+
+Splitting data across tables means each fact is stored **once**. A customer's name lives in one place, not copied onto every one of their 27 rentals. When the name changes, you change it once.
+
+## The DVD Rental database
+
+This whole course uses one sample database, **DVD Rental**, the records of a DVD-rental company. It has {{= SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' }} tables. Here are the ones we will use most:
+
+| Table | One row is... |
+|---|---|
+| `film` | a movie the shop can rent out |
+| `actor` | an actor |
+| `category` | a genre such as Action or Horror |
+| `customer` | a person who rents films |
+| `rental` | one time a customer took a film home |
+| `payment` | one payment a customer made |
+| `inventory` | one physical copy of a film in one store |
+| `store` and `staff` | a shop and its employees |
+
+The data is adapted from MySQL's open-source *Sakila* sample database (BSD licence), with the database renamed for this course.
+
+## Seeing it for real
+
+Here is a whole (small) table: the six languages a film can be in. Each row has a primary key, `language_id`.
+
+```sql run rows=6
+SELECT * FROM language;
+```
+
+And here are the first films, each pointing at a language with a foreign key:
+
+```sql run
+SELECT film_id, title, language_id
+FROM film
+ORDER BY film_id;
+```
+
+Every film says `language_id = 1`. That number is a link to the row in the `language` table where `language_id = 1`, which is English. The film table stores just the number, and the name `English` is stored once.
+
+## Watch out
+
+- **A table is not ordered.** Unless you ask for an order (you will learn `ORDER BY` soon), MySQL is free to return rows in any order.
+- **MySQL, SQL and "the database" are different things.** MySQL is the program, SQL is the language you speak to it, and the database is the collection of tables inside it.
+
+## Interview corner
+
+**"What is the difference between SQL and MySQL?"**
+SQL is the standard language for talking to relational databases. MySQL is one product that understands SQL, along with PostgreSQL, SQL Server, Oracle and others. They share most of the language and differ in details.
+
+**"What is a relational database?"**
+One that stores data in tables and links the tables through keys, so each fact is stored once and combined when needed.
+
+**"What is the difference between a primary key and a foreign key?"**
+A primary key uniquely identifies a row in its own table. A foreign key is a column that holds the primary key of a row in another table.
+
+Next you will set up your own copy of this database.

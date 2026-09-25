@@ -1,0 +1,137 @@
+---
+title: "NULL Functions: COALESCE and NULLIF"
+order: 0
+---
+
+`NULL` spreads: any calculation that touches it becomes `NULL`. A few small functions let you replace, create or test for `NULL` so your reports show something sensible.
+
+## What you'll learn
+
+- `COALESCE`: replace `NULL` with a default
+- `NULLIF`: turn a value into `NULL`
+- `GREATEST` and `LEAST`
+- Avoiding division by zero
+
+## Syntax
+
+```sql show
+SELECT COALESCE(a, b, c);   -- the first value that is not NULL
+SELECT NULLIF(a, b);        -- NULL if a equals b, otherwise a
+```
+
+## Examples
+
+### COALESCE
+
+`COALESCE` returns the first value in its list that is not `NULL`. It can take any number of arguments. Unreturned rentals have no return time:
+
+```sql run
+SELECT rental_id,
+       COALESCE(upper(rental_period)::text, 'still out') AS returned_on
+FROM rental
+WHERE rental_id IN (1, 11496, 11541)
+ORDER BY rental_id;
+```
+
+### NULLIF
+
+`NULLIF(a, b)` returns `NULL` if `a` equals `b`, and `a` otherwise. It is handy for turning "empty" markers into a true `NULL`. In this database most `address2` values are `''`, not `NULL`, so combine the two functions:
+
+```sql run
+SELECT address_id, address,
+       COALESCE(NULLIF(address2, ''), '(none)') AS second_line
+FROM address
+ORDER BY address_id
+LIMIT 3;
+```
+
+### Avoiding division by zero
+
+Dividing by `NULL` gives `NULL`, so `NULLIF(x, 0)` turns a zero divisor into a harmless `NULL` instead of an error:
+
+```sql run
+SELECT 10 / NULLIF(0, 0) AS safe_division;
+```
+
+### GREATEST and LEAST
+
+`GREATEST` and `LEAST` pick the biggest or smallest of several values in one row. They ignore `NULL`s (unless all are `NULL`):
+
+```sql run
+SELECT GREATEST(3, 9, 5) AS biggest, LEAST(3, 9, 5) AS smallest, GREATEST(NULL, 4) AS ignores_null;
+```
+
+### Testing with IS NULL
+
+`x IS NULL` is a true/false value you can select or sort by:
+
+```sql run
+SELECT COUNT(*) FILTER (WHERE upper(rental_period) IS NULL) AS unreturned, COUNT(*) AS total
+FROM rental;
+```
+
+## Try it yourself
+
+Show each address with `address2` replaced by the word `n/a` when it is `NULL` or empty.
+
+## Watch out
+
+### COALESCE does not handle empty strings
+
+`COALESCE(address2, 'n/a')` leaves `''` as `''`, because an empty string is not `NULL`. Use `NULLIF` first, as above.
+
+### All the values must have compatible types
+
+`COALESCE(upper(rental_period), 'still out')` mixes a timestamp with text and fails. Cast the timestamp to text first (`::text`), as in the example.
+
+### Empty strings and NULL sort differently
+
+`NULL` sorts after everything in an ascending sort, but `''` sorts first. After `COALESCE` the difference disappears, which may be what you want or not.
+
+## Interview corner
+
+**"What is `COALESCE`, and how is it different from `IFNULL` or `NVL`?"**
+`COALESCE` is standard SQL: it takes any number of arguments and returns the first one that is not `NULL`. `IFNULL` (MySQL) and `NVL` (Oracle) take exactly two, and PostgreSQL has neither.
+
+**"How do you avoid a division by zero?"**
+Divide by `NULLIF(divisor, 0)`, so a zero divisor makes the result `NULL` instead of an error.
+
+**"What does `NULLIF(a, b)` do?"**
+It returns `NULL` when `a = b`, otherwise `a`. It is the reverse of `COALESCE`.
+
+## Practice
+
+### Warm-up: label unreturned rentals
+
+For rentals with `rental_id` 1, 11496 and 11541, show `rental_id` and a column `returned_on` with the return time as text, or the text `still out` if it is `NULL`. Order by `rental_id`.
+
+```sql practice
+-- hint: `COALESCE(upper(rental_period)::text, 'still out')`.
+SELECT rental_id, COALESCE(upper(rental_period)::text, 'still out') AS returned_on
+FROM rental
+WHERE rental_id IN (1, 11496, 11541)
+ORDER BY rental_id;
+```
+
+### Core: fall back to the district
+
+Show `address_id`, `address`, and a column `line_two` that is the `address2` when it has something in it, and otherwise the `district`. Order by `address_id`. Show the first rows.
+
+```sql practice
+-- hint: `COALESCE(NULLIF(address2, ''), district)`.
+SELECT address_id, address, COALESCE(NULLIF(address2, ''), district) AS line_two
+FROM address
+ORDER BY address_id;
+```
+
+### Stretch: days kept, with a marker
+
+For rentals 1, 2, 11496 and 11541 show `rental_id` and `days_kept` (the whole days between the start and the end of `rental_period`, as a date difference), using `-1` when the film has not been returned. Order by `rental_id`.
+
+```sql practice
+-- hint: `COALESCE(upper(rental_period)::date - lower(rental_period)::date, -1)`.
+SELECT rental_id, COALESCE(upper(rental_period)::date - lower(rental_period)::date, -1) AS days_kept
+FROM rental
+WHERE rental_id IN (1, 2, 11496, 11541)
+ORDER BY rental_id;
+```

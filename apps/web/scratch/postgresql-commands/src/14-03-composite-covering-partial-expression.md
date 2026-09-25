@@ -1,0 +1,208 @@
+---
+title: "Composite, Covering, Partial and Expression Indexes"
+order: 0
+---
+
+An index can cover **several columns**, carry **extra columns** so the table is never touched, cover **only some rows**, or index the result of an **expression**. Choosing among these is where index design becomes a skill.
+
+## What you'll learn
+
+- Composite indexes and the leftmost-prefix rule
+- Covering indexes with `INCLUDE` and index-only scans
+- Partial indexes (`WHERE`)
+- Expression indexes
+
+## Syntax
+
+```sql show
+CREATE INDEX ON t (a, b);                       -- composite
+CREATE INDEX ON t (a, b) INCLUDE (c);           -- covering
+CREATE INDEX ON t (a) WHERE condition;          -- partial
+CREATE INDEX ON t (lower(email));               -- expression
+```
+
+## Set up
+
+Work on copies, so the real tables stay untouched. `VACUUM (ANALYZE)` refreshes statistics and marks pages all-visible, which index-only scans need:
+
+```sql run destructive
+CREATE TABLE payment_c AS SELECT * FROM payment;
+CREATE INDEX idx_pc ON payment_c (customer_id, payment_date);
+VACUUM (ANALYZE) payment_c;
+```
+
+Think of that index as a phone book sorted by **surname, then first name**: sorted by `customer_id` first, and within each customer by `payment_date`.
+
+## The leftmost-prefix rule
+
+A composite index can be used by a query that filters on the **first** column, or the first **two**, but not (efficiently) by one that skips the first column.
+
+### The first column alone: used
+
+```sql run destructive
+EXPLAIN (COSTS OFF) SELECT * FROM payment_c WHERE customer_id = 5;
+```
+
+### Both columns: used, and better
+
+```sql run destructive
+EXPLAIN (COSTS OFF) SELECT * FROM payment_c WHERE customer_id = 5 AND payment_date >= '2007-03-01';
+```
+
+The condition on both columns is part of the `Index Cond`: the index narrows the search using both.
+
+### The second column alone: not searchable
+
+You cannot find a first name in a phone book without the surname. Filtering only on `payment_date` cannot jump into the index. Here PostgreSQL falls back to reading the whole table (in other cases it may scan the whole index instead, which is cheaper than the table but still far slower than a direct lookup):
+
+```sql run destructive
+EXPLAIN (COSTS OFF) SELECT * FROM payment_c WHERE payment_date >= '2007-03-01' AND payment_date < '2007-03-02';
+```
+
+`Seq Scan`: a full scan.
+
+## Covering indexes: INCLUDE and index-only scans
+
+If the index contains **every column the query needs**, PostgreSQL answers from the index and never touches the table. This works here, because the query needs only indexed columns:
+
+```sql run destructive
+EXPLAIN (COSTS OFF) SELECT customer_id, payment_date FROM payment_c WHERE customer_id = 5;
+```
+
+The moment you also select a column that is not in the index (`amount`), PostgreSQL has to visit the table for it:
+
+```sql run destructive
+EXPLAIN (COSTS OFF) SELECT customer_id, payment_date, amount FROM payment_c WHERE customer_id = 5;
+```
+
+`INCLUDE` adds the extra column to the index **as payload**, without making it part of the sort order:
+
+```sql run destructive
+CREATE INDEX idx_pc_cover ON payment_c (customer_id, payment_date) INCLUDE (amount);
+VACUUM (ANALYZE) payment_c;
+
+EXPLAIN (COSTS OFF) SELECT customer_id, payment_date, amount FROM payment_c WHERE customer_id = 5;
+```
+
+Now it is an `Index Only Scan` again.
+
+## Partial indexes: only some rows
+
+If a query always asks about a small slice of the table, index only that slice. The index is much smaller and cheaper to keep up to date. Here, only rentals that have **not** come back (`upper_inf(rental_period)`):
+
+```sql run destructive
+CREATE TABLE rental_c AS SELECT * FROM rental;
+CREATE INDEX idx_rc_open ON rental_c (customer_id) WHERE upper_inf(rental_period);
+VACUUM (ANALYZE) rental_c;
+
+EXPLAIN (COSTS OFF) SELECT * FROM rental_c WHERE customer_id = 5 AND upper_inf(rental_period);
+```
+
+The query repeats the index's condition, so PostgreSQL may use it. Without that condition it cannot, because the index does not contain every row:
+
+```sql run destructive
+EXPLAIN (COSTS OFF) SELECT * FROM rental_c WHERE customer_id = 5;
+```
+
+The same idea makes a **unique** rule that applies to only some rows: `CREATE UNIQUE INDEX ON t (email) WHERE active`.
+
+## Expression indexes
+
+`WHERE lower(email) = ...` cannot use an ordinary index on `email`, because the index holds the original values. Index the **expression** itself:
+
+```sql run destructive
+CREATE TABLE customer_c AS SELECT * FROM customer;
+VACUUM (ANALYZE) customer_c;
+
+EXPLAIN (COSTS OFF) SELECT * FROM customer_c WHERE lower(email) = 'mary.smith@sakilacustomer.org';
+```
+
+```sql run destructive
+CREATE INDEX idx_cc_lower ON customer_c (lower(email));
+VACUUM (ANALYZE) customer_c;
+
+EXPLAIN (COSTS OFF) SELECT * FROM customer_c WHERE lower(email) = 'mary.smith@sakilacustomer.org';
+```
+
+The query must use exactly the same expression as the index.
+
+## Try it yourself
+
+Create an index on `(store_id, customer_id)` on a copy of `customer`, and use `EXPLAIN` on queries filtering on `store_id`, on `customer_id`, and on both.
+
+## Watch out
+
+### Column order is not interchangeable
+
+`(a, b)` and `(b, a)` are different indexes that serve different queries. Put the column you compare with `=` first, then the one with a range or sort. Look at your real queries before deciding.
+
+### A range stops the prefix
+
+Columns **after** a range condition cannot narrow the search. With `WHERE customer_id > 5 AND payment_date >= ...` on this index, only `customer_id` narrows the lookup.
+
+### Do not create an index for every column combination
+
+Each index costs writes and space. One well-chosen composite index usually replaces several single-column ones. An index on `(customer_id)` is redundant once `(customer_id, payment_date)` exists.
+
+### INCLUDE columns cannot be searched
+
+Columns in `INCLUDE` are only payload: you cannot use them for the search or sort order. If you filter on a column, it belongs in the key, not in `INCLUDE`.
+
+### Index-only scans need a vacuumed table
+
+PostgreSQL must check the **visibility map** to know a row is visible to everyone. On a table with many recent changes, an index-only scan still visits the table for some rows (`Heap Fetches`). `VACUUM` keeps the map current.
+
+## Interview corner
+
+**"What is the leftmost-prefix rule?"**
+A composite index on `(a, b, c)` can serve queries that filter on `a`, on `a, b`, or on `a, b, c`, but not efficiently on `b` or `c` alone.
+
+**"What is a covering index?"**
+An index that contains all the columns a query needs, so the query is answered from the index alone (`Index Only Scan`). PostgreSQL 11 added `INCLUDE` for extra payload columns.
+
+**"What is a partial index?"**
+An index built over only the rows that satisfy a condition. It is smaller and faster to maintain, and is used only by queries that imply that condition.
+
+**"When do you need an expression index?"**
+When the query filters on a function of a column (`lower(email)`, `date_trunc('day', ts)`), so a plain index on the column cannot be used.
+
+## Practice
+
+### Warm-up: is it used?
+
+On a copy `rental_p` of `rental` with an index on `(customer_id, inventory_id)` and fresh statistics, show the plan (`EXPLAIN (COSTS OFF)`) for `SELECT * FROM rental_p WHERE customer_id = 9`.
+
+```sql practice destructive
+-- hint: Create the copy and index, `VACUUM (ANALYZE) rental_p`, then EXPLAIN.
+CREATE TABLE rental_p AS SELECT * FROM rental;
+CREATE INDEX idx_rental_p ON rental_p (customer_id, inventory_id);
+VACUUM (ANALYZE) rental_p;
+
+EXPLAIN (COSTS OFF) SELECT * FROM rental_p WHERE customer_id = 9;
+```
+
+### Core: skip the first column
+
+With a similar index on a second copy `rental_p2`, show the plan for a query that filters **only** on `inventory_id = 100`. Does PostgreSQL jump straight to the rows, or does it have to look through the whole index? (Read the `Index Cond` line.)
+
+```sql practice destructive
+-- hint: The first index column is `customer_id`, which this query does not mention, so the index cannot be searched from the top. PostgreSQL may still choose to scan all of it, because the index is smaller than the table.
+CREATE TABLE rental_p2 AS SELECT * FROM rental;
+CREATE INDEX idx_rental_p2 ON rental_p2 (customer_id, inventory_id);
+VACUUM (ANALYZE) rental_p2;
+
+EXPLAIN (COSTS OFF) SELECT * FROM rental_p2 WHERE inventory_id = 100;
+```
+
+### Stretch: cover it
+
+With an index on `(customer_id) INCLUDE (inventory_id)` on a copy `rental_p3`, show the plan for `SELECT customer_id, inventory_id FROM rental_p3 WHERE customer_id = 9`. What node do you see?
+
+```sql practice destructive
+-- hint: `CREATE INDEX ... ON rental_p3 (customer_id) INCLUDE (inventory_id)`, then `VACUUM (ANALYZE)`.
+CREATE TABLE rental_p3 AS SELECT * FROM rental;
+CREATE INDEX idx_rental_p3 ON rental_p3 (customer_id) INCLUDE (inventory_id);
+VACUUM (ANALYZE) rental_p3;
+
+EXPLAIN (COSTS OFF) SELECT customer_id, inventory_id FROM rental_p3 WHERE customer_id = 9;
+```

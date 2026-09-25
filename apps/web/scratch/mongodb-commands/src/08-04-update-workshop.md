@@ -1,0 +1,155 @@
+---
+title: "Update Workshop: Eight Changes"
+order: 0
+---
+
+Time to combine the update commands and operators. Every task changes real data on the DVD Rental collections. The course restores the original data at the end of the page, so experiment freely.
+
+## What you'll learn
+
+- Choosing the right operator for each change
+- Verifying an update with counts and samples
+- Combining filters, operators, array updates and pipelines
+
+## Syntax
+
+```js show
+db.collection.updateMany(filter, { $set: {...}, $inc: {...}, $push: {...} })
+db.collection.updateOne(filter, [ { $set: { computed: <expression> } } ])
+```
+
+## Examples
+
+### A worked example: change, verify, compare
+
+*Give all `NC-17` films a 10 percent price rise, rounded to cents.* A pipeline update reads the old price:
+
+```js run destructive
+const before = db.films.aggregate([{ $match: { rating: "NC-17" } }, { $group: { _id: null, total: { $sum: "$rentalRate" } } }]).toArray()[0].total;
+db.films.updateMany({ rating: "NC-17" }, [{ $set: { rentalRate: { $round: [{ $multiply: ["$rentalRate", 1.1] }, 2] } } }]);
+const after = db.films.aggregate([{ $match: { rating: "NC-17" } }, { $group: { _id: null, total: { $sum: "$rentalRate" } } }]).toArray()[0].total;
+[Math.round(before * 100) / 100, Math.round(after * 100) / 100]
+```
+
+### A worked example: array plus field in one update
+
+*Add `Commentaries` to every film that does not have it yet, and count the films we changed.*
+
+```js run destructive
+db.films.updateMany({ specialFeatures: { $ne: "Commentaries" } }, { $push: { specialFeatures: "Commentaries" } }).modifiedCount
+```
+
+```js run destructive
+db.films.countDocuments({ specialFeatures: "Commentaries" })
+```
+
+## Try it yourself
+
+Change your mind: undo the `Commentaries` push with `$pull` and check that the count returns to what it was.
+
+## Watch out
+
+### Check each result
+
+After every change, count what you expected to change. If the numbers differ, stop and find out why before doing the next step.
+
+### The reset script is your friend
+
+This page and the course pages restore automatically. In your own lab, run `scripts/reset-mongodb.sh` when you want a clean database again.
+
+### Keep updates idempotent
+
+Filters that include the old state (`$ne`, the old value) make it safe to run an update twice.
+
+## Interview corner
+
+**"What is the difference between `$set` and `$inc`?"**
+`$set` writes a value. `$inc` adds to the current value atomically, so two concurrent increments both count.
+
+**"How do you add to an array only if the value is missing?"**
+`$addToSet`, or `$push` with a filter that excludes documents that already have it.
+
+## Practice
+
+Eight tasks. Each has a hidden hint and solution. They run in sequence on the same data, so an earlier change can be visible in a later task (we say so where it matters).
+
+### T1: set a field
+
+Set `rentalDurationDays` to 4 for film 20 and return it.
+
+```js practice destructive
+// hint: `$set`, then `findOne`.
+db.films.updateOne({ _id: 20 }, { $set: { rentalDurationDays: 4 } });
+db.films.findOne({ _id: 20 }).rentalDurationDays
+```
+
+### T2: increment
+
+Add 2 to `rentalDurationDays` of film 21 and return the difference between the new and the old value.
+
+```js practice destructive
+// hint: `$inc`.
+const before = db.films.findOne({ _id: 21 }).rentalDurationDays;
+db.films.updateOne({ _id: 21 }, { $inc: { rentalDurationDays: 2 } });
+db.films.findOne({ _id: 21 }).rentalDurationDays - before
+```
+
+### T3: many
+
+Set `rating` to `"PG"` for films 30 to 34 and return `modifiedCount` (some may already be PG).
+
+```js practice destructive
+// hint: `_id: { $gte: 30, $lte: 34 }`.
+const r = db.films.updateMany({ _id: { $gte: 30, $lte: 34 } }, { $set: { rating: "PG" } });
+[r.matchedCount, db.films.countDocuments({ _id: { $gte: 30, $lte: 34 }, rating: "PG" })]
+```
+
+### T4: unset
+
+Remove `description` from film 40 and return the field list of the document without `description`, sorted.
+
+```js practice destructive
+// hint: `$unset`, then `Object.keys(findOne(...)).sort()`.
+db.films.updateOne({ _id: 40 }, { $unset: { description: "" } });
+Object.keys(db.films.findOne({ _id: 40 })).sort()
+```
+
+### T5: rename
+
+Rename `lastUpdated` to `updatedAt` on film 41 and return whether `updatedAt` now exists.
+
+```js practice destructive
+// hint: `$rename`.
+db.films.updateOne({ _id: 41 }, { $rename: { lastUpdated: "updatedAt" } });
+db.films.findOne({ _id: 41 }).updatedAt !== undefined
+```
+
+### T6: array push
+
+Add `"Interviews"` to `specialFeatures` of film 42 and return the array's length.
+
+```js practice destructive
+// hint: `$push`.
+db.films.updateOne({ _id: 42 }, { $push: { specialFeatures: "Interviews" } });
+db.films.findOne({ _id: 42 }).specialFeatures.length
+```
+
+### T7: array pull
+
+Remove `"Trailers"` from every film and return how many films still have it.
+
+```js practice destructive
+// hint: `$pull` with `updateMany({})`.
+db.films.updateMany({}, { $pull: { specialFeatures: "Trailers" } });
+db.films.countDocuments({ specialFeatures: "Trailers" })
+```
+
+### T8: computed
+
+For film 50 set `costPerMinute` to `rentalRate / lengthMinutes` rounded to 4 decimals, with a pipeline update, and return it.
+
+```js practice destructive
+// hint: `[{ $set: { costPerMinute: { $round: [{ $divide: [...] }, 4] } } }]`.
+db.films.updateOne({ _id: 50 }, [{ $set: { costPerMinute: { $round: [{ $divide: ["$rentalRate", "$lengthMinutes"] }, 4] } } }]);
+db.films.findOne({ _id: 50 }).costPerMinute
+```

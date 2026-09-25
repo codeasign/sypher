@@ -1,0 +1,172 @@
+---
+title: "Indexes on Arrays and Embedded Documents"
+order: 0
+---
+
+Most of this database lives in arrays and subdocuments: a film's cast, a customer's rentals, a category name inside a film. MongoDB indexes them with **multikey** indexes (one entry per array element) and dotted paths. Knowing what they cover, and what they do not, avoids slow queries.
+
+## What you'll learn
+
+- Indexing a field inside an embedded document
+- Multikey indexes: how array fields are indexed
+- The limits: no two arrays in one compound index
+- Covered queries and `$elemMatch` with indexes
+
+## Syntax
+
+```js show
+db.films.createIndex({ "category.name": 1 })      // embedded field
+db.films.createIndex({ "actors.actorId": 1 })     // multikey: one entry per actor
+db.films.createIndex({ specialFeatures: 1 })      // multikey on plain values
+```
+
+## Examples
+
+### The existing indexes are multikey
+
+`idx_film_actor` indexes `actors.actorId`, and `actors` is an array, so each film has one index entry per actor:
+
+```js run
+db.films.getIndexes().filter((i) => i.name === "idx_film_actor").map((i) => i.key)
+```
+
+### A query on an array element uses it
+
+```js run
+const e = db.films.find({ "actors.actorId": 1 }).explain("executionStats").executionStats;
+({ returned: e.nReturned, keysExamined: e.totalKeysExamined, docsExamined: e.totalDocsExamined })
+```
+
+The index found the films of one actor without scanning all 1000. (Keys examined can exceed the returned count in a multikey index, which is normal.)
+
+### How many entries does a multikey index hold?
+
+One per element. The film collection has 5462 (film, actor) pairs, so the index has that many entries for actors:
+
+```js run
+db.films.aggregate([{ $group: { _id: null, entries: { $sum: { $size: "$actors" } } } }, { $project: { _id: 0, entries: 1 } }])
+```
+
+### Create a multikey index on plain values
+
+```js run destructive
+const lab = db.getSiblingDB("lab_multikey")
+db.films.aggregate([{ $project: { title: 1, specialFeatures: 1, actors: 1 } }, { $out: { db: "lab_multikey", coll: "films" } }]);
+lab.films.createIndex({ specialFeatures: 1 });
+const e = lab.films.find({ specialFeatures: "Trailers" }).explain("executionStats").executionStats;
+({ returned: e.nReturned, docsExamined: e.totalDocsExamined, usesIndex: JSON.stringify(lab.films.find({ specialFeatures: "Trailers" }).explain().queryPlanner.winningPlan).includes("IXSCAN") })
+```
+
+### Two arrays cannot share a compound index
+
+A compound index may contain at most **one** array field per document. Indexing two array fields together is refused when a document has arrays in both:
+
+```js run destructive error
+lab.films.createIndex({ specialFeatures: 1, "actors.actorId": 1 })
+```
+
+### $elemMatch and multikey bounds
+
+With `$elemMatch` the server can combine bounds on fields of the same array element:
+
+```js run destructive
+lab.films.createIndex({ "actors.firstName": 1, "actors.lastName": 1 });
+const q = { actors: { $elemMatch: { firstName: "PENELOPE", lastName: "GUINESS" } } };
+const e2 = lab.films.find(q).explain("executionStats").executionStats;
+({ returned: e2.nReturned, keysExamined: e2.totalKeysExamined })
+```
+
+### A covered query
+
+If the index has every field the query needs, MongoDB answers from the index alone and reads **no documents**. Multikey indexes cannot cover array fields, but a plain index can:
+
+```js run destructive
+lab.films.createIndex({ title: 1 });
+const c = lab.films.find({ title: { $gte: "ZO" } }, { _id: 0, title: 1 }).explain("executionStats").executionStats;
+({ returned: c.nReturned, docsExamined: c.totalDocsExamined })
+```
+
+`docsExamined: 0` means a covered query. It required projecting only `title` and excluding `_id`.
+
+### Clean up
+
+```js run destructive
+lab.dropDatabase()
+```
+
+## Try it yourself
+
+Create an index on `category.name` in a scratch copy of the films and check that `find({ "category.name": "Horror" })` uses it and examines exactly as many documents as it returns.
+
+## Watch out
+
+### A multikey index grows with the arrays
+
+A film with 10 actors makes 10 entries. Huge arrays make huge indexes and slow writes.
+
+### One array per compound index
+
+You cannot index two array fields together. Design queries and indexes so that at most one array is involved.
+
+### Sorting on an array field is special
+
+A sort on a multikey field uses the min (ascending) or max (descending) element, and the index cannot always provide the order.
+
+### Covered queries and arrays
+
+Because a multikey index stores elements, not the whole array, MongoDB cannot answer a query that returns the array from the index alone.
+
+### Indexing whole embedded documents
+
+`{ category: 1 }` indexes the entire subdocument, and matches only on the exact document. Prefer dotted paths (`category.name`).
+
+## Interview corner
+
+**"What is a multikey index?"**
+An index on an array field that has one entry per array element, so queries on any element can use it.
+
+**"Can you index two arrays in one compound index?"**
+No. A compound multikey index may cover at most one array field per document.
+
+**"What is a covered query?"**
+A query answered entirely from an index, without reading any documents, shown by `totalDocsExamined: 0`.
+
+## Practice
+
+### Warm-up: which key?
+
+Return the key of the existing category index on films.
+
+```js practice
+// hint: `getIndexes()` and find `idx_film_category`.
+db.films.getIndexes().find((i) => i.name === "idx_film_category").key
+```
+
+### Core: examine less
+
+In a scratch copy of films with an index on `actors.actorId`, return `[nReturned, totalDocsExamined]` for `{ "actors.actorId": 5 }`.
+
+```js practice destructive
+// hint: `explain("executionStats")`; the two numbers should match.
+const lab = db.getSiblingDB("lab_multikey")
+db.films.aggregate([{ $project: { actors: 1 } }, { $out: { db: "lab_multikey", coll: "f" } }]);
+lab.f.createIndex({ "actors.actorId": 1 });
+const e = lab.f.find({ "actors.actorId": 5 }).explain("executionStats").executionStats;
+const r = [e.nReturned, e.totalDocsExamined]
+lab.dropDatabase();
+r
+```
+
+### Stretch: covered
+
+Create an index on `{ rating: 1 }` in a scratch copy and return `totalDocsExamined` for `find({ rating: "G" }, { _id: 0, rating: 1 })`.
+
+```js practice destructive
+// hint: A projection of only indexed fields, with `_id: 0`.
+const lab = db.getSiblingDB("lab_multikey")
+db.films.aggregate([{ $project: { rating: 1 } }, { $out: { db: "lab_multikey", coll: "f" } }]);
+lab.f.createIndex({ rating: 1 });
+const d = lab.f.find({ rating: "G" }, { _id: 0, rating: 1 }).explain("executionStats").executionStats.totalDocsExamined
+lab.dropDatabase();
+d
+```

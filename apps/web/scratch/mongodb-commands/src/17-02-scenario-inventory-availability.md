@@ -1,0 +1,167 @@
+---
+title: "Scenario: Inventory and Availability"
+order: 0
+---
+
+A rental shop needs to know which copies are on the shelf. In this database each store lists its physical copies (`inventory`), and each customer lists their rentals with the `inventoryId` they took. A copy is **available** when no unreturned rental refers to it. This scenario answers three questions on that structure.
+
+## What you'll learn
+
+- Combining two collections whose link is an id inside arrays
+- Computing availability with `$filter` and `$in`
+- Reporting per store and per film
+- Thinking about consistency and write paths
+
+## Syntax
+
+```js show
+const out = /* inventory ids of unreturned rentals */;
+db.stores.aggregate([{ $project: { copies: { $filter: { input: "$inventory", as: "i", cond: { $not: { $in: ["$$i.inventoryId", out] } } } } } }])
+```
+
+## Examples
+
+### Step 1: which copies are out?
+
+A copy is out when a rental has `returnDate: null`. Collect those inventory ids:
+
+```js run
+const out = db.customers.aggregate([
+  { $unwind: "$rentals" },
+  { $match: { "rentals.returnDate": null } },
+  { $group: { _id: null, ids: { $addToSet: "$rentals.inventoryId" } } }
+]).toArray()[0].ids;
+[out.length, Math.min(...out), Math.max(...out)]
+```
+
+183 rentals are unreturned, and they refer to 183 different copies.
+
+### Step 2: copies per store, and how many are on the shelf
+
+```js run
+const out = db.customers.aggregate([{ $unwind: "$rentals" }, { $match: { "rentals.returnDate": null } }, { $group: { _id: null, ids: { $addToSet: "$rentals.inventoryId" } } }]).toArray()[0].ids;
+db.stores.aggregate([
+  { $project: { copies: { $size: "$inventory" }, available: { $size: { $filter: { input: "$inventory", as: "i", cond: { $not: { $in: ["$$i.inventoryId", out] } } } } } } },
+  { $sort: { _id: 1 } }
+])
+```
+
+### Step 3: availability per film in one store
+
+For store 1, how many copies of each film exist and how many are on the shelf? Unwind the inventory, mark each copy, group by film:
+
+```js run
+const out = db.customers.aggregate([{ $unwind: "$rentals" }, { $match: { "rentals.returnDate": null } }, { $group: { _id: null, ids: { $addToSet: "$rentals.inventoryId" } } }]).toArray()[0].ids;
+db.stores.aggregate([
+  { $match: { _id: 1 } },
+  { $unwind: "$inventory" },
+  { $group: { _id: "$inventory.filmId", copies: { $sum: 1 }, out: { $sum: { $cond: [{ $in: ["$inventory.inventoryId", out] }, 1, 0] } } } },
+  { $set: { available: { $subtract: ["$copies", "$out"] } } },
+  { $match: { available: 0 } },
+  { $sort: { _id: 1 } },
+  { $limit: 3 }
+])
+```
+
+These films have every copy of store 1 rented out.
+
+### Step 4: add the titles
+
+```js run
+const out = db.customers.aggregate([{ $unwind: "$rentals" }, { $match: { "rentals.returnDate": null } }, { $group: { _id: null, ids: { $addToSet: "$rentals.inventoryId" } } }]).toArray()[0].ids;
+db.stores.aggregate([
+  { $match: { _id: 1 } },
+  { $unwind: "$inventory" },
+  { $group: { _id: "$inventory.filmId", copies: { $sum: 1 }, out: { $sum: { $cond: [{ $in: ["$inventory.inventoryId", out] }, 1, 0] } } } },
+  { $match: { $expr: { $eq: ["$copies", "$out"] } } },
+  { $lookup: { from: "films", localField: "_id", foreignField: "_id", as: "f", pipeline: [{ $project: { title: 1 } }] } },
+  { $project: { _id: 0, film: { $arrayElemAt: ["$f.title", 0] }, copies: 1 } },
+  { $sort: { film: 1 } },
+  { $limit: 3 }
+])
+```
+
+### Step 5: check the two counts against each other
+
+Total copies minus copies out must equal the shelf count from Step 2:
+
+```js run
+const out = db.customers.aggregate([{ $unwind: "$rentals" }, { $match: { "rentals.returnDate": null } }, { $group: { _id: null, ids: { $addToSet: "$rentals.inventoryId" } } }]).toArray()[0].ids;
+const total = db.stores.aggregate([{ $project: { n: { $size: "$inventory" } } }, { $group: { _id: null, n: { $sum: "$n" } } }]).toArray()[0].n;
+[total, out.length, total - out.length]
+```
+
+### Design notes: what would you change?
+
+The two-array design forces this join every time. Two common fixes:
+
+1. **A separate `inventory` collection** with `{ inventoryId, storeId, filmId, outSince }`. "Out" becomes a field on the copy, updated when a rental starts and ends.
+2. **A computed `available` counter** per store and film, updated in the same transaction as the rental.
+
+Either makes availability a single indexed lookup instead of a report.
+
+## Try it yourself
+
+Find the films that have **no** copy in store 2, and the film with the most copies across both stores.
+
+## Watch out
+
+### A literal `$in` list must stay small
+
+The `out` array here has 183 ids. Thousands are fine, but a huge list belongs in a `$lookup` instead.
+
+### Consistency across documents
+
+When a rental starts, two things change: the rental (in a customer) and, in the redesigned model, the copy's state. Do them in one transaction, or accept eventual consistency and reconcile.
+
+### Do not compute availability on every page view
+
+If it is read often, precompute it (module 13) and update it on writes.
+
+### Time matters
+
+"Available now" changes every minute. Anything cached needs an expiry.
+
+## Interview corner
+
+**"How would you model inventory and rentals to answer 'is this copy available?' quickly?"**
+Keep the state on the copy (or a counter per film and store), updated transactionally with the rental, and index it, rather than computing it from rental history.
+
+**"How do you combine two collections in an aggregation when the join key sits inside an array?"**
+Unwind the array and `$lookup`, or compute a set of ids from one collection and use `$in` against the other, as long as the set is small.
+
+## Practice
+
+### Warm-up: copies out
+
+How many copies are currently out (unreturned)? Return the number.
+
+```js practice
+// hint: Distinct inventory ids of unreturned rentals.
+db.customers.aggregate([{ $unwind: "$rentals" }, { $match: { "rentals.returnDate": null } }, { $group: { _id: "$rentals.inventoryId" } }, { $count: "n" }]).toArray()[0].n
+```
+
+### Core: shelf count for store 2
+
+How many copies of store 2 are on the shelf?
+
+```js practice
+// hint: `$filter` with `$not` and `$in`.
+(() => {
+  const out = db.customers.aggregate([{ $unwind: "$rentals" }, { $match: { "rentals.returnDate": null } }, { $group: { _id: null, ids: { $addToSet: "$rentals.inventoryId" } } }]).toArray()[0].ids;
+  return db.stores.aggregate([{ $match: { _id: 2 } }, { $project: { _id: 0, available: { $size: { $filter: { input: "$inventory", as: "i", cond: { $not: { $in: ["$$i.inventoryId", out] } } } } } } }]).toArray()[0].available;
+})()
+```
+
+### Stretch: most copies
+
+The film with the most copies in store 1 (id and copies, ties by id).
+
+```js practice
+// hint: Unwind the inventory, group by film, sort.
+db.stores.aggregate([
+  { $match: { _id: 1 } }, { $unwind: "$inventory" },
+  { $group: { _id: "$inventory.filmId", copies: { $sum: 1 } } },
+  { $sort: { copies: -1, _id: 1 } }, { $limit: 1 }
+])
+```

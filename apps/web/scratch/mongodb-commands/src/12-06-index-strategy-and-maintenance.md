@@ -1,0 +1,193 @@
+---
+title: "Index Strategy and Maintenance"
+order: 0
+---
+
+Knowing how to create an index is the easy part. The real skill is deciding **which** indexes a system needs, finding the ones it does not, and looking after them: measuring use, spotting overlap, and building safely on live data.
+
+## What you'll learn
+
+- Designing indexes from the queries you actually run
+- Measuring index use with `$indexStats`
+- Finding redundant and unused indexes
+- Building, rebuilding and dropping safely
+
+## Syntax
+
+```js show
+db.c.aggregate([ { $indexStats: {} } ])
+db.c.getIndexes()
+db.c.dropIndex("name")
+db.currentOp({ "command.createIndexes": { $exists: true } })
+```
+
+## Examples
+
+### Start from the queries
+
+List the queries the application runs, with how often. For each one, decide equality, sort and range fields (ESR), then find one index that serves several queries. For example, for these three queries on customers:
+
+| Query | Needs |
+|---|---|
+| `{ "address.country": X }` | equality on country |
+| `{ "address.country": X }` sorted by `createdAt` | equality, then sort |
+| `{ email: X }` | equality on email (unique) |
+
+Two indexes cover all three: `{ "address.country": 1, createdAt: 1 }` and `{ email: 1 }`. The existing `uq_customer_email` already covers the third:
+
+```js run
+db.customers.getIndexes().map((i) => [i.name, JSON.stringify(i.key), !!i.unique])
+```
+
+### Measuring use: $indexStats
+
+`$indexStats` counts how many times each index served a query since the server started. The counters (`accesses.ops`) depend on how long the server has been running, so here we list only the index names and keys:
+
+```js run
+db.films.aggregate([{ $indexStats: {} }, { $project: { _id: 0, name: 1, key: 1 } }, { $sort: { name: 1 } }])
+```
+
+In production you run it over weeks and look for indexes whose `accesses.ops` stays near zero. Those are candidates for hiding, then dropping.
+
+### Finding redundant indexes
+
+An index whose keys are a **prefix** of another index is usually redundant. Detect it on a scratch collection:
+
+```js run destructive
+const lab = db.getSiblingDB("lab_strategy")
+lab.orders.createIndex({ customer: 1 });
+lab.orders.createIndex({ customer: 1, created: -1 });
+lab.orders.createIndex({ status: 1 });
+const idx = lab.orders.getIndexes().map((i) => ({ name: i.name, keys: Object.keys(i.key) }));
+idx.filter((a) => idx.some((b) => b.name !== a.name && b.keys.length > a.keys.length && a.keys.every((k, i) => b.keys[i] === k))).map((i) => i.name)
+```
+
+`customer_1` is redundant: `{ customer: 1, created: -1 }` serves every query it does.
+
+### Drop the redundant index
+
+```js run destructive
+lab.orders.dropIndex("customer_1");
+lab.orders.getIndexes().map((i) => i.name)
+```
+
+### Compare sizes
+
+Every index takes space. `totalIndexSize` next to `storageSize` shows the price. We compare the number of indexes rather than bytes (bytes vary by server):
+
+```js run destructive
+lab.orders.insertMany(Array.from({ length: 2000 }, (_, i) => ({ customer: "c" + (i % 50), created: i, status: i % 3 })));
+const st = lab.orders.stats();
+[st.nindexes, st.totalIndexSize > 0]
+```
+
+### Building indexes safely
+
+Since MongoDB 4.2 an index build holds a lock only briefly at the start and the end, and runs in the background. On a busy production system you still:
+
+1. Build during a quiet period.
+2. Watch it with `currentOp`.
+3. Build on secondaries first (rolling builds) for very large collections.
+
+A running build appears in `currentOp`. Nothing is running here, so the list is empty:
+
+```js run destructive
+db.getSiblingDB("admin").aggregate([{ $currentOp: {} }, { $match: { "command.createIndexes": { $exists: true } } }, { $count: "builds" }]).toArray()
+```
+
+### Rebuilding: change an index
+
+There is no "alter index". To change one, create the new one, then drop the old one. The exception: `collMod` can change TTL expiry and hidden state.
+
+```js run destructive
+lab.orders.createIndex({ status: 1, created: 1 });
+lab.orders.dropIndex("status_1");
+lab.orders.getIndexes().map((i) => i.name)
+```
+
+### A checklist for a new index
+
+Ask: which query does it serve, is that query frequent or slow, can an existing index be extended instead, what does it cost in writes and memory, and how will I know it is used (`$indexStats`)?
+
+### Clean up
+
+```js run destructive
+lab.dropDatabase()
+```
+
+## Try it yourself
+
+List the queries of a small application you know, design the minimal set of indexes with ESR, and check with `explain` that each query uses one and no in-memory sort is needed.
+
+## Watch out
+
+### Do not index every field "just in case"
+
+Each index slows every write and competes for RAM. Working-set indexes that do not fit in memory hurt reads too.
+
+### Dropping an index can break a query silently
+
+Use `hideIndex` first, watch latency and error rates, then drop.
+
+### Unique indexes are constraints, not just performance
+
+Never drop a unique index that guards data integrity because "it is not used by queries".
+
+### `$indexStats` resets on restart
+
+Counters start at zero when the server restarts. Look at a period that includes the full business cycle (a month-end report may be the only user of an index).
+
+### Compound index order is fixed at creation
+
+You cannot reorder fields. A different order is a different index.
+
+## Interview corner
+
+**"How do you decide which indexes to create?"**
+From the real queries: equality, sort and range fields (ESR), preferring one compound index to serve several queries, and checking with `explain`.
+
+**"How do you find unused indexes?"**
+`$indexStats` over a representative period; hide before dropping.
+
+**"Can you change an existing index?"**
+No, except TTL and hidden options with `collMod`. Create the new one, then drop the old.
+
+## Practice
+
+### Warm-up: how many indexes?
+
+How many indexes does the `films` collection have?
+
+```js practice
+// hint: `getIndexes().length`.
+db.films.getIndexes().length
+```
+
+### Core: find the redundant one
+
+In a scratch collection with indexes `{ a: 1 }`, `{ a: 1, b: 1 }` and `{ c: 1 }`, return the name of the redundant index.
+
+```js practice destructive
+// hint: `a_1` is a prefix of `a_1_b_1`.
+const lab = db.getSiblingDB("lab_strategy")
+lab.t.createIndex({ a: 1 }); lab.t.createIndex({ a: 1, b: 1 }); lab.t.createIndex({ c: 1 });
+const idx = lab.t.getIndexes().map((i) => ({ name: i.name, keys: Object.keys(i.key) }));
+const r = idx.filter((a) => idx.some((b) => b.name !== a.name && b.keys.length > a.keys.length && a.keys.every((k, i) => b.keys[i] === k))).map((i) => i.name)
+lab.dropDatabase();
+r
+```
+
+### Stretch: replace an index
+
+Create `{ x: 1 }`, then replace it by `{ x: 1, y: 1 }` (create new, drop old) and return the sorted index names.
+
+```js practice destructive
+// hint: `createIndex` then `dropIndex("x_1")`.
+const lab = db.getSiblingDB("lab_strategy")
+lab.t.createIndex({ x: 1 });
+lab.t.createIndex({ x: 1, y: 1 });
+lab.t.dropIndex("x_1");
+const r = lab.t.getIndexes().map((i) => i.name).sort()
+lab.dropDatabase();
+r
+```

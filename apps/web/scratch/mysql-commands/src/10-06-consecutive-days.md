@@ -1,0 +1,196 @@
+---
+title: "Interview Problem: Consecutive Days (Gaps and Islands)"
+order: 0
+---
+
+"Find users who were active on 3 or more days in a row" is a favourite at analytics and data engineering interviews. The trick has a name: **gaps and islands**. The runs of consecutive days are the "islands", and the breaks between them are the "gaps".
+
+## What you'll learn
+
+- The row-number trick that groups consecutive dates into islands
+- Measuring the length of each streak
+- Finding the longest streak per customer
+
+## The problem
+
+Find the runs of consecutive days on which the shop had at least one rental. Then find each customer's longest streak of consecutive rental days.
+
+## The trick
+
+Take the distinct dates in order and number them 1, 2, 3, ... . Inside a run of consecutive days, the date goes up by one **and** the number goes up by one, so `date - number` stays the same. A gap makes the date jump ahead, so that difference changes, and a new island starts.
+
+Here it is on the distinct rental days, for the first days in the data:
+
+```sql run rows=8
+WITH days AS (
+  SELECT DISTINCT DATE(rental_date) AS day
+  FROM rental
+),
+numbered AS (
+  SELECT day, ROW_NUMBER() OVER (ORDER BY day) AS rn
+  FROM days
+)
+SELECT day, rn, day - INTERVAL rn DAY AS island_key
+FROM numbered
+ORDER BY day;
+```
+
+Every day in the same run has the same `island_key`.
+
+## The islands themselves
+
+Group by that key to get each run's first day, last day and length:
+
+```sql run
+WITH days AS (
+  SELECT DISTINCT DATE(rental_date) AS day
+  FROM rental
+),
+numbered AS (
+  SELECT day, ROW_NUMBER() OVER (ORDER BY day) AS rn
+  FROM days
+)
+SELECT MIN(day) AS first_day, MAX(day) AS last_day, COUNT(*) AS days_in_a_row
+FROM numbered
+GROUP BY day - INTERVAL rn DAY
+ORDER BY first_day;
+```
+
+The data comes in bursts: rentals run for 8 days in a row, then stop for a while (early June has none at all), so the gaps split the runs.
+
+## Streaks of at least N days
+
+Add a `HAVING` to keep only the long runs. The runs of at least 8 days:
+
+```sql run
+WITH days AS (
+  SELECT DISTINCT DATE(rental_date) AS day
+  FROM rental
+),
+numbered AS (
+  SELECT day, ROW_NUMBER() OVER (ORDER BY day) AS rn
+  FROM days
+)
+SELECT MIN(day) AS first_day, MAX(day) AS last_day, COUNT(*) AS days_in_a_row
+FROM numbered
+GROUP BY day - INTERVAL rn DAY
+HAVING COUNT(*) >= 8
+ORDER BY first_day;
+```
+
+## Each customer's longest streak
+
+Do the same thing per customer, by partitioning the numbering:
+
+```sql run rows=6
+WITH days AS (
+  SELECT DISTINCT customer_id, DATE(rental_date) AS day
+  FROM rental
+),
+numbered AS (
+  SELECT customer_id, day,
+         ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY day) AS rn
+  FROM days
+),
+streaks AS (
+  SELECT customer_id, COUNT(*) AS streak_length
+  FROM numbered
+  GROUP BY customer_id, day - INTERVAL rn DAY
+)
+SELECT customer_id, MAX(streak_length) AS longest_streak
+FROM streaks
+GROUP BY customer_id
+ORDER BY longest_streak DESC, customer_id;
+```
+
+## Try it yourself
+
+Find the days that start each island, and the customers whose longest streak is at least 4 days.
+
+## Watch out
+
+### Duplicates break the trick
+
+If a customer rented several times on one day, use `DISTINCT` on the date first. Otherwise the row number advances without the date advancing, and one long streak is split into pieces.
+
+### The row number must follow the same order
+
+`ROW_NUMBER() OVER (ORDER BY day)` numbers the days by date. Numbering in any other order makes `day - rn` meaningless.
+
+### It works for dates and for numbers
+
+For consecutive **integers** (IDs, sequence numbers), use `value - rn`. For dates, subtract days as above.
+
+### "Consecutive" needs a definition
+
+Do weekends count? Are two days in a row across a month end consecutive? Decide, and say so, before writing the query.
+
+## Interview corner
+
+**"Find users who logged in on at least 3 consecutive days."**
+Gaps and islands. Number each user's distinct login dates, group by `date - rn`, and keep the groups with `COUNT(*) >= 3`.
+
+**"Why does subtracting the row number work?"**
+Within a run of consecutive dates, both the date and the row number grow by one per row, so their difference is constant. A gap makes the date jump while the row number only grows by one, so the difference changes.
+
+**"Is there another way?"**
+`LAG` to compare each date with the previous one and start a new island whenever the difference is more than one day, then a running `SUM` of those "new island" flags.
+
+## Practice
+
+### Warm-up: how many islands?
+
+How many separate runs of consecutive rental days does the shop have? Return one number, `runs`.
+
+```sql practice
+-- hint: The islands query in a derived table, then `COUNT(*)`.
+WITH days AS (
+  SELECT DISTINCT DATE(rental_date) AS day FROM rental
+),
+numbered AS (
+  SELECT day, ROW_NUMBER() OVER (ORDER BY day) AS rn FROM days
+)
+SELECT COUNT(*) AS runs
+FROM (SELECT 1 FROM numbered GROUP BY day - INTERVAL rn DAY) AS islands;
+```
+
+### Core: the longest run
+
+Show the `first_day`, `last_day` and `days_in_a_row` of the **longest** run of consecutive rental days for the whole shop (if tied, the earliest).
+
+```sql practice
+-- hint: Compute islands, then `ORDER BY days_in_a_row DESC, first_day LIMIT 1`.
+WITH days AS (
+  SELECT DISTINCT DATE(rental_date) AS day FROM rental
+),
+numbered AS (
+  SELECT day, ROW_NUMBER() OVER (ORDER BY day) AS rn FROM days
+)
+SELECT MIN(day) AS first_day, MAX(day) AS last_day, COUNT(*) AS days_in_a_row
+FROM numbered
+GROUP BY day - INTERVAL rn DAY
+ORDER BY days_in_a_row DESC, first_day
+LIMIT 1;
+```
+
+### Stretch: customers with a 5-day streak
+
+How many customers have a streak of **5 or more** consecutive rental days? Return one number, `customers_with_streak`.
+
+```sql practice
+-- hint: Per-customer islands, keep those with COUNT(*) >= 5, then count the different customers.
+WITH days AS (
+  SELECT DISTINCT customer_id, DATE(rental_date) AS day FROM rental
+),
+numbered AS (
+  SELECT customer_id, day, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY day) AS rn
+  FROM days
+)
+SELECT COUNT(DISTINCT customer_id) AS customers_with_streak
+FROM (
+  SELECT customer_id
+  FROM numbered
+  GROUP BY customer_id, day - INTERVAL rn DAY
+  HAVING COUNT(*) >= 5
+) AS s;
+```

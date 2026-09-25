@@ -1,0 +1,172 @@
+---
+title: "Element Operators: null, Missing and Types"
+order: 0
+---
+
+Documents in one collection can differ: a field may be present, absent, `null`, or of a different type. `$exists` and `$type` let you ask exactly which of these you mean. Getting this right is the difference between a correct count and an almost-correct one.
+
+## What you'll learn
+
+- `$exists` to test presence
+- `$type` to test the stored type
+- The difference between `null`, missing and empty
+- Finding data-quality problems
+
+## Syntax
+
+```js show
+{ field: { $exists: true } }
+{ field: { $exists: false } }
+{ field: { $type: "string" } }
+{ field: null }                       // null OR missing
+{ field: { $type: "null" } }          // stored null only
+```
+
+## Examples
+
+### A scratch collection with every case
+
+```js run destructive
+const lab = db.getSiblingDB("lab_elem")
+lab.people.insertMany([
+  { _id: 1, name: "Ann", phone: "555-0101" },
+  { _id: 2, name: "Bob", phone: null },
+  { _id: 3, name: "Cy" },
+  { _id: 4, name: "Di", phone: "" },
+  { _id: 5, name: "Ed", phone: 5550105 }
+]);
+lab.people.countDocuments()
+```
+
+### `{ phone: null }` matches null AND missing
+
+```js run destructive
+lab.people.find({ phone: null }, { name: 1 }).toArray().map((d) => d.name)
+```
+
+### `$exists` separates present from absent
+
+```js run destructive
+[
+  lab.people.find({ phone: { $exists: true } }, { name: 1 }).toArray().map((d) => d.name),
+  lab.people.find({ phone: { $exists: false } }, { name: 1 }).toArray().map((d) => d.name)
+]
+```
+
+### Only the stored nulls
+
+`$type: "null"` matches a stored `null` and nothing else:
+
+```js run destructive
+lab.people.find({ phone: { $type: "null" } }, { name: 1 }).toArray().map((d) => d.name)
+```
+
+### Present with a real value
+
+Exists, not null, not empty:
+
+```js run destructive
+lab.people.find({ phone: { $exists: true, $ne: null, $nin: [""] } }, { name: 1 }).toArray().map((d) => d.name)
+```
+
+### Types
+
+`$type` takes a name or a number, or a list of them:
+
+```js run destructive
+[
+  lab.people.find({ phone: { $type: "string" } }, { name: 1 }).toArray().map((d) => d.name),
+  lab.people.find({ phone: { $type: "number" } }, { name: 1 }).toArray().map((d) => d.name),
+  lab.people.find({ phone: { $type: ["string", "null"] } }, { name: 1 }).toArray().map((d) => d.name)
+]
+```
+
+### Clean up
+
+```js run destructive
+lab.dropDatabase()
+```
+
+### The same on real data
+
+`originalLanguage` is stored as `null` for every film. Present, but empty of meaning:
+
+```js run
+[
+  db.films.countDocuments({ originalLanguage: null }),
+  db.films.countDocuments({ originalLanguage: { $exists: true } }),
+  db.films.countDocuments({ originalLanguage: { $type: "null" } }),
+  db.films.countDocuments({ noSuchField: null }),
+  db.films.countDocuments({ noSuchField: { $exists: false } })
+]
+```
+
+### Data-quality check
+
+Are all the `lengthMinutes` values numbers? Count the documents where it is not:
+
+```js run
+db.films.countDocuments({ lengthMinutes: { $not: { $type: "number" } } })
+```
+
+## Try it yourself
+
+Count the customers whose `address.line2` is `null`, missing, or an empty string. Which of those three cases does the data actually have?
+
+## Watch out
+
+### `null` is a value, not the absence of one
+
+A stored `null` and a missing field behave the same in `{ f: null }`, but they are different in storage, in `$exists` and in indexes. Decide on one convention (for example, always omit or always store `null`).
+
+### `$exists: true` does not exclude `null`
+
+`{ f: { $exists: true } }` matches a stored `null`. Combine with `$ne: null` if you want real values.
+
+### `$type: "number"` covers several BSON types
+
+`"number"` is an alias for int, long, double and decimal. Use a specific name (`"int"`, `"double"`) when the exact type matters.
+
+### Empty string is not null
+
+Forms often store `""` when a field is left blank. Test for it explicitly.
+
+## Interview corner
+
+**"How do you find documents where a field is missing?"**
+`{ field: { $exists: false } }`.
+
+**"What does `{ field: null }` match?"**
+Documents where the field is `null` **or does not exist**. Use `$type: "null"` for stored nulls only.
+
+**"How would you find all documents with a wrong data type in a field?"**
+`{ field: { $not: { $type: "expectedType" } } }` finds every document where the field is not of that type (including missing).
+
+## Practice
+
+### Warm-up: an empty string
+
+How many customers have an empty-string `address.line2`?
+
+```js practice
+// hint: `{ "address.line2": "" }`.
+db.customers.countDocuments({ "address.line2": "" })
+```
+
+### Core: the type of a field
+
+How many films have `rentalRate` stored as a `double`?
+
+```js practice
+// hint: `$type: "double"`.
+db.films.countDocuments({ rentalRate: { $type: "double" } })
+```
+
+### Stretch: unreturned rentals
+
+How many rentals (across all customers) have `returnDate` stored as `null`, using `$type: "null"` after `$unwind`? Return `{ unreturned: n }`.
+
+```js practice
+// hint: `$unwind: "$rentals"`, `$match`, `$count`.
+db.customers.aggregate([{ $unwind: "$rentals" }, { $match: { "rentals.returnDate": { $type: "null" } } }, { $count: "unreturned" }])
+```

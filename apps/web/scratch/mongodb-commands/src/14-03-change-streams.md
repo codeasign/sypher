@@ -1,0 +1,209 @@
+---
+title: "Change Streams: Reacting to Data Changes"
+order: 0
+---
+
+A change stream lets an application **subscribe** to inserts, updates and deletes instead of polling for them. It is how you keep a cache, a search index or a notification service in sync with the database. Change streams need a replica set, like transactions.
+
+## What you'll learn
+
+- Opening a change stream on a collection
+- Reading events: operation type, document key, full document
+- Filtering events with a pipeline
+- Resuming after a disconnect
+
+## Syntax
+
+```js show
+const cs = db.collection.watch([ { $match: { operationType: "insert" } } ], { fullDocument: "updateLookup" })
+while (cs.hasNext()) { const ev = cs.next(); /* handle ev */ }
+```
+
+## Examples
+
+```js run rs
+const lab = db.getSiblingDB("lab_stream")
+lab.orders.insertOne({ _id: 0, status: "seed" });
+lab.orders.countDocuments()
+```
+
+### Open a stream, make changes, read events
+
+A stream sees changes made **after** it opens. Here we open it, make three changes, and read what it captured:
+
+```js run rs
+const cs = lab.orders.watch([], { fullDocument: "updateLookup" });
+lab.orders.insertOne({ _id: 1, status: "new", total: 10 });
+lab.orders.updateOne({ _id: 1 }, { $set: { status: "paid" } });
+lab.orders.deleteOne({ _id: 1 });
+const events = [];
+for (let i = 0; i < 3; i++) { const ev = cs.next(); events.push({ op: ev.operationType, key: ev.documentKey._id, status: ev.fullDocument ? ev.fullDocument.status : null }); }
+cs.close();
+events
+```
+
+`fullDocument: "updateLookup"` fetches the document **as it is now**. The update event shows `status: null` because, by the time we read it, the document had already been deleted. That is the weakness of `updateLookup` (see the notes below). Deletes never have a document, only the key.
+
+### Filter with a pipeline
+
+Only the events you care about are sent to the client:
+
+```js run rs
+const only = lab.orders.watch([{ $match: { operationType: "update", "updateDescription.updatedFields.status": "shipped" } }]);
+lab.orders.insertOne({ _id: 2, status: "new" });
+lab.orders.updateOne({ _id: 2 }, { $set: { status: "paid" } });
+lab.orders.updateOne({ _id: 2 }, { $set: { status: "shipped" } });
+const ev = only.next();
+only.close();
+({ op: ev.operationType, changed: ev.updateDescription.updatedFields })
+```
+
+### tryNext: do not wait
+
+`hasNext()` blocks until an event arrives. `tryNext()` returns `null` when there is nothing yet, which suits loops that do other work:
+
+```js run rs
+const cs2 = lab.orders.watch();
+const nothing = cs2.tryNext();
+cs2.close();
+nothing
+```
+
+### Resume after a disconnect
+
+Every event carries a resume token. Store it, and pass it as `resumeAfter` to continue exactly where you stopped, without losing events:
+
+```js run rs
+const c1 = lab.orders.watch();
+lab.orders.insertOne({ _id: 3, status: "new" });
+const first = c1.next();
+const token = first._id;
+c1.close();
+lab.orders.insertOne({ _id: 4, status: "new" });
+const c2 = lab.orders.watch([], { resumeAfter: token });
+const next = c2.next();
+c2.close();
+[first.documentKey._id, next.documentKey._id]
+```
+
+While no stream was open, document 4 was inserted; resuming from the token still delivers it.
+
+### Watching a whole database
+
+```js run rs
+const dbStream = lab.watch();
+lab.audit.insertOne({ note: "hello" });
+const ev2 = dbStream.next();
+dbStream.close();
+[ev2.ns.coll, ev2.operationType]
+```
+
+### What a change event looks like
+
+The important fields (the resume token `_id` and the timestamps are omitted):
+
+```js run rs
+const c3 = lab.orders.watch();
+lab.orders.insertOne({ _id: 5, status: "new" });
+const e = c3.next();
+c3.close();
+({ operationType: e.operationType, ns: e.ns, documentKey: e.documentKey, fullDocument: e.fullDocument })
+```
+
+### Clean up
+
+```js run rs
+lab.dropDatabase()
+```
+
+## Try it yourself
+
+Write a small loop that keeps a `summary` collection with the number of `paid` orders, updated from a change stream on `orders`.
+
+## Watch out
+
+### Change streams need a replica set
+
+A standalone server has no oplog to read. Use the replica set container of the lab.
+
+### Events only exist as long as the oplog does
+
+If a consumer is down longer than the oplog window, it cannot resume and must rebuild from the current data.
+
+### Order is per shard, not global
+
+On a sharded cluster the stream merges shards by cluster time, but application code should not assume that unrelated documents arrive in business order.
+
+### Handle duplicates
+
+A consumer that crashes after processing but before saving its token will see the event again after resuming. Make handlers idempotent.
+
+### `updateLookup` reads later data
+
+It returns the document as it is **now**, which may already include later changes. For the exact post-image use `fullDocument: "whenAvailable"` with pre and post images enabled on the collection.
+
+## Interview corner
+
+**"What is a change stream?"**
+A cursor of change events (insert, update, replace, delete, and more) built on the oplog, for collections, databases or a whole deployment, available on replica sets.
+
+**"How do you resume a change stream?"**
+Store the resume token (the event's `_id`) and pass it as `resumeAfter` or `startAfter` when reopening.
+
+**"How would you keep a search index in sync with MongoDB?"**
+A consumer of a change stream that applies each insert, update and delete to the index, saving its resume token and being idempotent.
+
+## Practice
+
+### Warm-up: capture an insert
+
+Open a stream on `lab_stream.c`, insert `{ _id: 1 }` and return the `operationType` of the event, then drop the database.
+
+```js practice rs
+// hint: `watch()`, insert, `next()`.
+const lab = db.getSiblingDB("lab_stream")
+lab.c.insertOne({ _id: 0 });
+const cs = lab.c.watch();
+lab.c.insertOne({ _id: 1 });
+const t = cs.next().operationType;
+cs.close();
+lab.dropDatabase();
+t
+```
+
+### Core: filter
+
+Open a stream that only reports deletes, insert then delete `{ _id: 1 }`, and return the deleted key.
+
+```js practice rs
+// hint: `$match: { operationType: "delete" }`.
+const lab = db.getSiblingDB("lab_stream")
+lab.c.insertOne({ _id: 0 });
+const cs = lab.c.watch([{ $match: { operationType: "delete" } }]);
+lab.c.insertOne({ _id: 1 });
+lab.c.deleteOne({ _id: 1 });
+const k = cs.next().documentKey._id;
+cs.close();
+lab.dropDatabase();
+k
+```
+
+### Stretch: resume
+
+Read one event, close the stream, make another change, resume from the token, and return the keys of both events.
+
+```js practice rs
+// hint: Keep `event._id` and pass it as `resumeAfter`.
+const lab = db.getSiblingDB("lab_stream")
+lab.c.insertOne({ _id: 0 });
+const c1 = lab.c.watch();
+lab.c.insertOne({ _id: 1 });
+const e1 = c1.next();
+c1.close();
+lab.c.insertOne({ _id: 2 });
+const c2 = lab.c.watch([], { resumeAfter: e1._id });
+const e2 = c2.next();
+c2.close();
+lab.dropDatabase();
+[e1.documentKey._id, e2.documentKey._id]
+```

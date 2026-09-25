@@ -1,0 +1,190 @@
+---
+title: "Array Update Operators"
+order: 0
+---
+
+Adding to, removing from and trimming arrays are common operations, and each has its own operator: `$push`, `$addToSet`, `$pop`, `$pull` and `$pullAll`. They change the array in place, atomically, without reading it first.
+
+## What you'll learn
+
+- `$push` to append, and `$addToSet` to append without duplicates
+- `$pop` to remove the first or last element
+- `$pull` and `$pullAll` to remove by value or condition
+- How each behaves with duplicates and missing arrays
+
+## Syntax
+
+```js show
+{ $push: { tags: "new" } }
+{ $addToSet: { tags: "new" } }
+{ $pop: { tags: 1 } }              // last element; -1 removes the first
+{ $pull: { tags: "old" } }
+{ $pullAll: { tags: ["a", "b"] } }
+```
+
+## Examples
+
+```js run destructive
+const lab = db.getSiblingDB("lab_arrops")
+lab.posts.insertMany([
+  { _id: 1, title: "Intro", tags: ["news", "tech"], comments: [{ by: "ann", stars: 5 }, { by: "bob", stars: 2 }] },
+  { _id: 2, title: "No tags yet" }
+]);
+lab.posts.countDocuments()
+```
+
+### $push: append
+
+```js run destructive
+lab.posts.updateOne({ _id: 1 }, { $push: { tags: "mongodb" } })
+lab.posts.findOne({ _id: 1 }).tags
+```
+
+`$push` allows duplicates:
+
+```js run destructive
+lab.posts.updateOne({ _id: 1 }, { $push: { tags: "mongodb" } })
+lab.posts.findOne({ _id: 1 }).tags
+```
+
+### $push creates a missing array
+
+```js run destructive
+lab.posts.updateOne({ _id: 2 }, { $push: { tags: "first" } })
+lab.posts.findOne({ _id: 2 }).tags
+```
+
+### $addToSet: append only if absent
+
+```js run destructive
+lab.posts.updateOne({ _id: 1 }, { $addToSet: { tags: "tech" } })
+lab.posts.updateOne({ _id: 1 }, { $addToSet: { tags: "new-tag" } })
+lab.posts.findOne({ _id: 1 }).tags
+```
+
+The first call matched but changed nothing, because `tech` was already there.
+
+### $pop: remove from an end
+
+```js run destructive
+lab.posts.updateOne({ _id: 1 }, { $pop: { tags: 1 } })
+lab.posts.updateOne({ _id: 1 }, { $pop: { tags: -1 } })
+lab.posts.findOne({ _id: 1 }).tags
+```
+
+### $pull: remove by value
+
+`$pull` removes **all** elements that match:
+
+```js run destructive
+lab.posts.updateOne({ _id: 1 }, { $pull: { tags: "mongodb" } })
+lab.posts.findOne({ _id: 1 }).tags
+```
+
+### $pull with a condition
+
+Remove the comments rated below 3 stars:
+
+```js run destructive
+lab.posts.updateOne({ _id: 1 }, { $pull: { comments: { stars: { $lt: 3 } } } })
+lab.posts.findOne({ _id: 1 }).comments
+```
+
+### $pullAll: remove a list of values
+
+```js run destructive
+lab.posts.updateOne({ _id: 2 }, { $push: { tags: { $each: ["x", "y", "z"] } } })
+lab.posts.updateOne({ _id: 2 }, { $pullAll: { tags: ["x", "z"] } })
+lab.posts.findOne({ _id: 2 }).tags
+```
+
+### Adding to an array of documents
+
+```js run destructive
+lab.posts.updateOne({ _id: 1 }, { $push: { comments: { by: "cy", stars: 4 } } })
+lab.posts.findOne({ _id: 1 }).comments.map((c) => c.by)
+```
+
+### Clean up
+
+```js run destructive
+lab.dropDatabase()
+```
+
+## Try it yourself
+
+Build a "recently viewed" list per user with `$push`, and a "followers" list with `$addToSet`. Try adding the same follower twice.
+
+## Watch out
+
+### `$push` on a field that is not an array fails
+
+If the field exists as a string or number, `$push` raises an error. Make sure the field is an array or missing.
+
+### `$addToSet` compares whole values
+
+For documents, `{ by: "ann", stars: 5 }` and `{ stars: 5, by: "ann" }` are different (field order matters). Use it for simple values or add a unique key yourself.
+
+### `$pull` removes every match
+
+Not just the first. To remove only one copy of a duplicated value, use `$pop` or `$set` a filtered array.
+
+### Arrays that grow forever
+
+Pushing without limit builds documents towards the 16 MB cap. Cap them with `$slice` (next page) or keep the data in its own collection.
+
+## Interview corner
+
+**"What is the difference between `$push` and `$addToSet`?"**
+`$push` always appends. `$addToSet` appends only when the value is not already in the array, so it keeps a set of unique values.
+
+**"How do you remove an element from an array?"**
+`$pull` (by value or condition), `$pullAll` (a list of values), or `$pop` (first or last element).
+
+**"How do you remove the first element of an array?"**
+`{ $pop: { arr: -1 } }`.
+
+## Practice
+
+### Warm-up: push
+
+Insert `{ _id: 1, list: [1] }`, push 2 and 3 (two separate pushes), and return `list`.
+
+```js practice destructive
+// hint: `$push` twice.
+const lab = db.getSiblingDB("lab_arrops")
+lab.t.insertOne({ _id: 1, list: [1] });
+lab.t.updateOne({ _id: 1 }, { $push: { list: 2 } });
+lab.t.updateOne({ _id: 1 }, { $push: { list: 3 } });
+const l = lab.t.findOne({ _id: 1 }).list
+lab.dropDatabase();
+l
+```
+
+### Core: a set
+
+Starting with `tags: ["a", "b"]`, add `b`, `c` and `a` with `$addToSet` (three calls) and return `tags`.
+
+```js practice destructive
+// hint: Only `c` is new.
+const lab = db.getSiblingDB("lab_arrops")
+lab.t.insertOne({ _id: 1, tags: ["a", "b"] });
+for (const x of ["b", "c", "a"]) lab.t.updateOne({ _id: 1 }, { $addToSet: { tags: x } });
+const t = lab.t.findOne({ _id: 1 }).tags
+lab.dropDatabase();
+t
+```
+
+### Stretch: pull with a condition
+
+Starting with `scores: [3, 8, 5, 10, 1]`, remove every score below 5 and return `scores`.
+
+```js practice destructive
+// hint: `$pull: { scores: { $lt: 5 } }`.
+const lab = db.getSiblingDB("lab_arrops")
+lab.t.insertOne({ _id: 1, scores: [3, 8, 5, 10, 1] });
+lab.t.updateOne({ _id: 1 }, { $pull: { scores: { $lt: 5 } } });
+const s = lab.t.findOne({ _id: 1 }).scores
+lab.dropDatabase();
+s
+```

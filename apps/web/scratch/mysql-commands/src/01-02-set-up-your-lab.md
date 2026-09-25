@@ -1,0 +1,86 @@
+---
+title: "Set Up Your Lab"
+order: 0
+---
+
+Reading about SQL is not enough. You learn it by running queries and seeing what comes back. This page gets a real MySQL database running on your own computer in a few minutes.
+
+## What you'll need
+
+- **Docker Desktop** (Windows or macOS), or Docker Engine with the Compose plugin (Linux). It runs MySQL for you, so you don't install MySQL itself.
+- The **sypher-db-lab** folder. It contains the DVD Rental database and everything needed to load it, and it is supplied with this course as a ready-to-run folder: you do not download the data separately, and starting MySQL only pulls the official MySQL image from Docker Hub. If you do not have the folder yet, get it from whoever gave you this course before you continue.
+
+Check that Docker works:
+
+```bash
+docker version
+docker compose version
+```
+
+## Start MySQL
+
+Open a terminal in the `sypher-db-lab` folder and run:
+
+```bash
+docker compose up -d mysql
+docker compose ps
+```
+
+The first start downloads MySQL and loads the DVD Rental database, which takes a minute or two. Wait until the `STATUS` column says `healthy`.
+
+## Connect
+
+This command opens a MySQL prompt inside the running container:
+
+```bash
+docker compose exec mysql mysql -usypher -ppassword sypher-mysql-DvdRental
+```
+
+Your prompt now looks like `mysql>`. Type a query, end it with a semicolon, and press Enter. Try this one:
+
+```sql run
+SELECT VERSION() AS mysql_version, DATABASE() AS current_database;
+```
+
+If you see something like the table above, you are connected to the right database. To leave the prompt, type `exit`.
+
+The connection details, in case a tool asks for them:
+
+| Setting | Value |
+|---|---|
+| Host | `localhost` |
+| Port | `3306` |
+| Database | `sypher-mysql-DvdRental` |
+| Username | `sypher` |
+| Password | `password` |
+
+These simple credentials are fine for a practice database on your own machine. Never use them for anything real.
+
+## Two ways to run queries
+
+1. **The command line** you just used. Fast, and available everywhere.
+2. **A visual tool** such as DBeaver or MySQL Workbench. Connect with the details above. Many people prefer these for longer queries, because you can save and edit them.
+
+Use whichever you like. Every query in this course works in both.
+
+## Start again from scratch
+
+You will practice `INSERT`, `UPDATE`, `DELETE` and `DROP` in this course. When you want a clean copy of the database again, delete the lab's data and start fresh:
+
+```bash
+docker compose down -v
+docker compose up -d mysql
+```
+
+`-v` deletes the stored data on purpose, so use it only when you want to wipe your changes. Without `-v`, `docker compose down` stops MySQL and keeps your data.
+
+## Watch out
+
+- **Port 3306 already in use.** Another MySQL is running on your machine. In `docker-compose.yml`, change `"3306:3306"` to `"3307:3306"` and connect on port `3307`.
+- **"Access denied".** The user is `sypher` and the password is `password`. There is no space after `-p`.
+- **A query "does nothing".** Every statement must end with `;`. If the prompt changes to `->`, MySQL is still waiting for the end. Type `;` and press Enter.
+
+## Interview corner
+
+**"How would you run MySQL locally without installing it?"**
+In a container, for example with Docker Compose. It keeps the database isolated, makes it easy to reset, and matches how many teams run databases in development.

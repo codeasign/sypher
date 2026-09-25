@@ -1,0 +1,173 @@
+---
+title: "$unionWith, $graphLookup and Other Stages"
+order: 0
+---
+
+Some questions need stages beyond filter, group and join: stacking two collections into one result, walking a tree of references, or reading server-level information. This page covers `$unionWith`, `$graphLookup`, `$documents` and two server-information stages.
+
+## What you'll learn
+
+- `$unionWith` to combine collections (SQL `UNION ALL`)
+- `$graphLookup` for hierarchies and networks
+- `$documents` to start a pipeline from literal data
+- `$collStats` and `$indexStats` for server information
+
+## Syntax
+
+```js show
+{ $unionWith: { coll: "other", pipeline: [ ... ] } }
+{ $graphLookup: { from: "coll", startWith: "$field", connectFromField: "a", connectToField: "b", as: "path", maxDepth: 3 } }
+```
+
+## Examples
+
+### $unionWith: stack two sources
+
+Combine the names of stores and the categories in one list, with a label for where each came from:
+
+```js run
+db.stores.aggregate([
+  { $project: { _id: 0, kind: { $literal: "store" }, name: { $concat: ["Store ", { $toString: "$_id" }] } } },
+  { $unionWith: { coll: "films", pipeline: [{ $group: { _id: "$category.name" } }, { $sort: { _id: 1 } }, { $limit: 3 }, { $project: { _id: 0, kind: { $literal: "category" }, name: "$_id" } }] } }
+])
+```
+
+### $unionWith for reporting across sources
+
+Total row counts of two collections in one pipeline:
+
+```js run
+db.films.aggregate([
+  { $count: "n" },
+  { $set: { source: "films" } },
+  { $unionWith: { coll: "customers", pipeline: [{ $count: "n" }, { $set: { source: "customers" } }] } }
+])
+```
+
+### $documents: a pipeline from literal data
+
+Handy for tests, or to join literal data with a collection:
+
+```js run
+db.aggregate([
+  { $documents: [{ rating: "G", label: "General" }, { rating: "PG", label: "Parental guidance" }] },
+  { $lookup: { from: "films", localField: "rating", foreignField: "rating", pipeline: [{ $count: "n" }], as: "counts" } },
+  { $project: { _id: 0, rating: 1, label: 1, films: { $arrayElemAt: ["$counts.n", 0] } } }
+])
+```
+
+### $graphLookup: walking a hierarchy
+
+Given documents that point at a parent, `$graphLookup` finds all ancestors or descendants. This database has no tree, so here is a small org chart in a scratch collection:
+
+```js run destructive
+const lab = db.getSiblingDB("lab_graph")
+lab.staff.insertMany([
+  { _id: "ceo", name: "Ada", boss: null },
+  { _id: "cto", name: "Bo", boss: "ceo" },
+  { _id: "dev1", name: "Cy", boss: "cto" },
+  { _id: "dev2", name: "Di", boss: "cto" },
+  { _id: "cfo", name: "Ed", boss: "ceo" }
+]);
+lab.staff.aggregate([
+  { $match: { _id: "dev1" } },
+  { $graphLookup: { from: "staff", startWith: "$boss", connectFromField: "boss", connectToField: "_id", as: "chain", depthField: "level" } },
+  { $project: { _id: 0, name: 1, chain: { $map: { input: { $sortArray: { input: "$chain", sortBy: { level: 1 } } }, as: "c", in: "$$c.name" } } } }
+])
+```
+
+### Descendants: everyone under the CTO
+
+```js run destructive
+lab.staff.aggregate([
+  { $match: { _id: "cto" } },
+  { $graphLookup: { from: "staff", startWith: "$_id", connectFromField: "_id", connectToField: "boss", as: "reports" } },
+  { $project: { _id: 0, name: 1, reports: { $sortArray: { input: { $map: { input: "$reports", as: "r", in: "$$r.name" } }, sortBy: 1 } } } }
+])
+```
+
+```js run destructive
+lab.dropDatabase()
+```
+
+### Server information stages
+
+`$indexStats` shows how often each index has been used. The counts depend on the session, so we only list which indexes exist:
+
+```js run
+db.films.aggregate([{ $indexStats: {} }, { $project: { _id: 0, name: 1 } }, { $sort: { name: 1 } }])
+```
+
+```js run
+db.films.aggregate([{ $collStats: { count: {} } }, { $project: { _id: 0, count: 1 } }])
+```
+
+## Try it yourself
+
+Use `$unionWith` to list `_id` and first name for the first two customers followed by the first two stores' manager staff ids, in one pipeline.
+
+## Watch out
+
+### `$unionWith` does not remove duplicates
+
+It is `UNION ALL`. Add a `$group` on the key when you need a distinct union.
+
+### `$graphLookup` can be deep
+
+Without `maxDepth` it follows links until there are no more, which can be expensive on big graphs. It also has a 100 MB memory limit unless `allowDiskUse` is set. Index `connectToField`.
+
+### Cycles are handled, but results are unordered
+
+`$graphLookup` avoids revisiting documents, but the output array has no defined order. Sort it (with `depthField` and `$sortArray`) for stable results.
+
+### `$collStats` and `$indexStats` must be the first stage
+
+They read server metadata, not documents, and are usually admin work.
+
+## Interview corner
+
+**"How do you combine results from two collections?"**
+`$unionWith` appends the documents of another collection (or its sub-pipeline) to the current stream, like `UNION ALL`. `$lookup` joins side by side instead.
+
+**"How do you query a hierarchy in MongoDB?"**
+With `$graphLookup`, or by storing materialised paths or ancestor arrays in the documents.
+
+**"What is `$documents`?"**
+A stage that creates documents from literal values so a pipeline can start without a collection.
+
+## Practice
+
+### Warm-up: union
+
+Return one array with the number of films and the number of customers, using `$unionWith` (`[films, customers]` order by source name).
+
+```js practice
+// hint: Two `$count` pipelines, then sort by `source` and map.
+db.films.aggregate([
+  { $count: "n" }, { $set: { source: "films" } },
+  { $unionWith: { coll: "customers", pipeline: [{ $count: "n" }, { $set: { source: "customers" } }] } },
+  { $sort: { source: 1 } }
+])
+```
+
+### Core: literal documents
+
+Start from `$documents: [{ x: 1 }, { x: 2 }, { x: 3 }]` and return the sum of `x`.
+
+```js practice
+// hint: `db.aggregate([{ $documents: [...] }, { $group: ... }])`.
+db.aggregate([{ $documents: [{ x: 1 }, { x: 2 }, { x: 3 }] }, { $group: { _id: null, sum: { $sum: "$x" } } }])
+```
+
+### Stretch: ancestors
+
+In a scratch collection with `{ _id: 1, up: null }`, `{ _id: 2, up: 1 }`, `{ _id: 3, up: 2 }`, return how many ancestors document 3 has.
+
+```js practice destructive
+// hint: `$graphLookup` with `startWith: "$up"`, then `$size`.
+const lab = db.getSiblingDB("lab_graph")
+lab.t.insertMany([{ _id: 1, up: null }, { _id: 2, up: 1 }, { _id: 3, up: 2 }]);
+const n = lab.t.aggregate([{ $match: { _id: 3 } }, { $graphLookup: { from: "t", startWith: "$up", connectFromField: "up", connectToField: "_id", as: "anc" } }, { $project: { n: { $size: "$anc" } } }]).toArray()[0].n
+lab.dropDatabase();
+n
+```

@@ -1,0 +1,160 @@
+---
+title: "Documents, BSON and Data Types"
+order: 0
+---
+
+A MongoDB document looks like JSON, but it is stored as **BSON**, a binary format with more types than JSON has: real dates, several kinds of numbers, `ObjectId`, and binary data. Knowing the types explains many surprises, including one about dates in this database.
+
+## What you'll learn
+
+- The main BSON types and how to check them with `$type`
+- `_id` and `ObjectId`
+- Numbers: integers, doubles and decimals
+- Why the dates in this database are text
+
+## Syntax
+
+```js show
+db.collection.find({ field: { $type: "string" } })
+typeof value          // JavaScript type in the shell
+ObjectId()            // a new unique id
+new Date()            // a BSON date
+```
+
+## Examples
+
+### The types you will meet
+
+| BSON type | Example | `$type` name |
+|---|---|---|
+| String | `"PG"` | `string` |
+| Number | `86`, `0.99` | `int`, `long`, `double`, `decimal` |
+| Boolean | `true` | `bool` |
+| Date | `new Date()` | `date` |
+| ObjectId | `ObjectId("...")` | `objectId` |
+| Array | `["a", "b"]` | `array` |
+| Embedded document | `{ name: "x" }` | `object` |
+| Null | `null` | `null` |
+
+### Checking a field's type
+
+`$type` in a query asks what a field holds. `$type` in an aggregation reports it. Here is what each field of a film really is:
+
+```js run
+db.films.aggregate([
+  { $match: { _id: 1 } },
+  { $project: { _id: 0, title: { $type: "$title" }, lengthMinutes: { $type: "$lengthMinutes" }, rentalRate: { $type: "$rentalRate" }, specialFeatures: { $type: "$specialFeatures" }, category: { $type: "$category" }, originalLanguage: { $type: "$originalLanguage" } } }
+])
+```
+
+### Whole numbers and decimals
+
+In mongosh a whole number that fits in 32 bits (such as `31`) is stored as an `int`, while a fraction (`0.99`) or a very large number is stored as a `double`. `NumberInt`, `NumberLong` and `Decimal128` let you choose the type yourself, and `Decimal128` is exact, which is what money needs:
+
+```js run
+const types = [NumberInt(5), NumberLong(5), 5.5, Decimal128("5.50")]
+types.map((v) => typeof v === "number" ? "number" : v.constructor.name)
+```
+
+```js run
+db.films.aggregate([
+  { $match: { _id: 1 } },
+  { $project: { _id: 0, as_double: "$rentalRate", as_decimal: { $toDecimal: "$rentalRate" }, type_after: { $type: { $toDecimal: "$rentalRate" } } } }
+])
+```
+
+### _id and ObjectId
+
+Every document has an `_id`. This database uses simple numbers, but if you omit `_id` on insert, MongoDB creates an `ObjectId`: 12 bytes that are unique and roughly time-ordered:
+
+```js run
+const id = ObjectId("65f0c0a1a1b2c3d4e5f60718");
+[typeof id.toString(), id.toString().length, id.getTimestamp().toISOString()]
+```
+
+### Dates: real and not
+
+BSON has a real date type. But look at what this database uses:
+
+```js run
+db.customers.findOne({ _id: 1 }, { createdAt: 1, lastUpdated: 1 })
+```
+
+```js run
+db.customers.aggregate([{ $match: { _id: 1 } }, { $project: { _id: 0, createdAtType: { $type: "$createdAt" } } }])
+```
+
+The dates here are **strings** (`"2006-02-14 22:04:36"`). They sort correctly as text because of the year-first format, but date functions do not work on them until you convert:
+
+```js run
+db.customers.aggregate([
+  { $match: { _id: 1 } },
+  { $project: { _id: 0, asDate: { $dateFromString: { dateString: "$createdAt", format: "%Y-%m-%d %H:%M:%S" } } } },
+  { $project: { year: { $year: "$asDate" }, weekday: { $dayOfWeek: "$asDate" } } }
+])
+```
+
+## Try it yourself
+
+Find which fields of a `rentals` entry can be `null`, and check the type of `rentalRate` and `replacementCost` on a film.
+
+## Watch out
+
+### Fractions are stored as doubles
+
+`0.1 + 0.2` is `0.30000000000000004` in MongoDB too. Store money as `Decimal128` (or as whole cents in an integer) when exactness matters.
+
+### Strings that look like dates are not dates
+
+Comparing `"2005-05-25"` with a date value gives no error and no match. Use one representation, and prefer real dates for new data.
+
+### ObjectId is not a random secret
+
+It embeds a timestamp and a counter. It is unique, not unguessable. Do not use it as a security token.
+
+### Type matters for queries
+
+`{ rating: "PG" }` matches a string `"PG"`, not a number or an array containing it (arrays match differently: see the array pages).
+
+## Interview corner
+
+**"What is BSON?"**
+Binary JSON: the format MongoDB stores and sends. It adds types JSON lacks (dates, `ObjectId`, 32 and 64-bit integers, `Decimal128`, binary) and is faster to traverse.
+
+**"What is an `ObjectId`?"**
+A 12-byte identifier made of a timestamp, a random value and a counter. It is the default `_id`, unique and roughly increasing.
+
+**"How should you store money in MongoDB?"**
+As `Decimal128`, or as an integer number of cents. A `double` cannot represent many decimal fractions exactly.
+
+## Practice
+
+### Warm-up: the type of a field
+
+Return the BSON type name of the `lengthMinutes` field of film 1, using `$type` in a `$project` stage (result `{ t: ... }`).
+
+```js practice
+// hint: `db.films.aggregate([{ $match: { _id: 1 } }, { $project: { _id: 0, t: { $type: "$lengthMinutes" } } }])`.
+db.films.aggregate([{ $match: { _id: 1 } }, { $project: { _id: 0, t: { $type: "$lengthMinutes" } } }])
+```
+
+### Core: count by type
+
+How many customers have `active` stored as a boolean? Return the number.
+
+```js practice
+// hint: `countDocuments({ active: { $type: "bool" } })`.
+db.customers.countDocuments({ active: { $type: "bool" } })
+```
+
+### Stretch: convert a text date
+
+For customer 2, return the **year** of `createdAt` as a number, converting the text with `$dateFromString` (`{ y: ... }`).
+
+```js practice
+// hint: Convert first, then `$year`.
+db.customers.aggregate([
+  { $match: { _id: 2 } },
+  { $project: { _id: 0, y: { $year: { $dateFromString: { dateString: "$createdAt", format: "%Y-%m-%d %H:%M:%S" } } } } }
+])
+```

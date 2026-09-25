@@ -1,0 +1,184 @@
+---
+title: "Interview Problems: Dates, Cohorts and Retention"
+order: 0
+---
+
+Business questions are about time: rentals per week, customers who came back, the first rental of each customer, days between orders. This page solves them on the rental data, converting the text dates as needed.
+
+## What you'll learn
+
+- Grouping by day, week and month
+- First and last event per customer
+- Cohorts: grouping customers by their first month
+- Retention and days between events
+
+## Syntax
+
+```js show
+{ $dateFromString: { dateString: "$s", format: "%Y-%m-%d %H:%M:%S" } }
+{ $dateTrunc: { date: "$d", unit: "week", startOfWeek: "monday" } }
+{ $dateDiff: { startDate: "$a", endDate: "$b", unit: "day" } }
+```
+
+## Examples
+
+### Problem 1: rentals per week
+
+Convert to a date, truncate to the week (Monday start), count:
+
+```js run
+db.customers.aggregate([
+  { $unwind: "$rentals" },
+  { $project: { week: { $dateToString: { date: { $dateTrunc: { date: { $dateFromString: { dateString: "$rentals.rentalDate" } }, unit: "week", startOfWeek: "monday" } }, format: "%Y-%m-%d" } } } },
+  { $group: { _id: "$week", rentals: { $sum: 1 } } },
+  { $sort: { _id: 1 } },
+  { $limit: 4 }
+])
+```
+
+### Problem 2: the busiest day
+
+```js run
+db.customers.aggregate([
+  { $unwind: "$rentals" },
+  { $group: { _id: { $substrCP: ["$rentals.rentalDate", 0, 10] }, rentals: { $sum: 1 } } },
+  { $sort: { rentals: -1, _id: 1 } },
+  { $limit: 3 }
+])
+```
+
+### Problem 3: first and last rental per customer
+
+The text dates sort correctly, so `$min` and `$max` work directly:
+
+```js run
+db.customers.aggregate([
+  { $project: { first: { $min: "$rentals.rentalDate" }, last: { $max: "$rentals.rentalDate" }, rentals: { $size: "$rentals" } } },
+  { $sort: { _id: 1 } },
+  { $limit: 3 }
+])
+```
+
+### Problem 4: cohorts: customers by first rental month
+
+```js run
+db.customers.aggregate([
+  { $project: { cohort: { $substrCP: [{ $min: "$rentals.rentalDate" }, 0, 7] } } },
+  { $group: { _id: "$cohort", customers: { $sum: 1 } } },
+  { $sort: { _id: 1 } }
+])
+```
+
+### Problem 5: retention by cohort
+
+For each first-rental month (cohort), how many customers rented in all five different months of the data? Take the distinct months of each customer with `$setUnion`, sort them, and use the first as the cohort:
+
+```js run
+db.customers.aggregate([
+  { $project: { months: { $setUnion: [{ $map: { input: "$rentals", as: "r", in: { $substrCP: ["$$r.rentalDate", 0, 7] } } }, []] } } },
+  { $project: { months: { $sortArray: { input: "$months", sortBy: 1 } } } },
+  { $project: { cohort: { $arrayElemAt: ["$months", 0] }, returned: { $gte: [{ $size: "$months" }, 5] } } },
+  { $group: { _id: "$cohort", customers: { $sum: 1 }, returned: { $sum: { $cond: ["$returned", 1, 0] } } } },
+  { $sort: { _id: 1 } }
+])
+```
+
+### Problem 6: days between consecutive rentals
+
+Window function `$shift` on the unwound, sorted rentals of one customer:
+
+```js run
+db.customers.aggregate([
+  { $match: { _id: 1 } },
+  { $unwind: "$rentals" },
+  { $project: { at: { $dateFromString: { dateString: "$rentals.rentalDate" } } } },
+  { $setWindowFields: { sortBy: { at: 1 }, output: { prev: { $shift: { output: "$at", by: -1 } } } } },
+  { $match: { prev: { $ne: null } } },
+  { $project: { _id: 0, gapDays: { $round: [{ $divide: [{ $subtract: ["$at", "$prev"] }, 86400000] }, 1] } } },
+  { $group: { _id: null, avgGap: { $avg: "$gapDays" }, longest: { $max: "$gapDays" } } },
+  { $project: { _id: 0, avgGap: { $round: ["$avgGap", 1] }, longest: 1 } }
+])
+```
+
+### Problem 7: rentals outstanding at a date
+
+Rentals not yet returned on 2005-06-01 (rented before, returned after or never):
+
+```js run
+db.customers.aggregate([
+  { $unwind: "$rentals" },
+  { $match: { "rentals.rentalDate": { $lt: "2005-06-01" }, $or: [{ "rentals.returnDate": null }, { "rentals.returnDate": { $gte: "2005-06-01" } }] } },
+  { $count: "outstanding" }
+])
+```
+
+## Try it yourself
+
+Find the customers whose first rental was in July 2005 and who never rented again after August. Then find the longest gap between two rentals of any customer.
+
+## Watch out
+
+### Text dates work for order, not for arithmetic
+
+`$min`, `$max`, `<` and `>` are fine on `YYYY-MM-DD hh:mm:ss`. For differences convert with `$dateFromString`.
+
+### Time zones
+
+`$dateFromString` assumes UTC unless told otherwise. Add `timezone` if the data is local time.
+
+### Week starts differ
+
+`$isoWeek` numbers weeks the ISO way (Monday first); `$week` starts on Sunday. Be explicit with `startOfWeek`.
+
+### Retention definitions vary
+
+"Returned" can mean any later month, the next month, or within 30 days. State the definition, then encode it.
+
+## Interview corner
+
+**"How do you group by month in MongoDB?"**
+Convert to a date and use `$dateTrunc` or `$dateToString` with `%Y-%m`, or (for text dates in ISO layout) take the first 7 characters.
+
+**"What is a cohort analysis?"**
+Grouping users by when they first did something (their cohort) and measuring what they do later.
+
+**"How do you get the time between consecutive events?"**
+Sort by time in `$setWindowFields`, `$shift` the previous timestamp, and subtract.
+
+## Practice
+
+### Warm-up: first month
+
+What is the month (`YYYY-MM`) of the very first rental of all customers? Return the string.
+
+```js practice
+// hint: `$min` over all rental dates, then the first 7 characters.
+db.customers.aggregate([{ $unwind: "$rentals" }, { $group: { _id: null, first: { $min: "$rentals.rentalDate" } } }, { $project: { _id: 0, month: { $substrCP: ["$first", 0, 7] } } }])
+```
+
+### Core: rentals per month for store 2
+
+Rentals per month of store 2, ordered by month.
+
+```js practice
+// hint: `$match` on `rentals.storeId` after `$unwind`.
+db.customers.aggregate([
+  { $unwind: "$rentals" },
+  { $match: { "rentals.storeId": 2 } },
+  { $group: { _id: { $substrCP: ["$rentals.rentalDate", 0, 7] }, rentals: { $sum: 1 } } },
+  { $sort: { _id: 1 } }
+])
+```
+
+### Stretch: customers active in exactly three months
+
+How many customers rented in exactly three different calendar months? Return `{ customers: n }`.
+
+```js practice
+// hint: `$setUnion` of the month strings, then `$size`.
+db.customers.aggregate([
+  { $project: { m: { $size: { $setUnion: [{ $map: { input: "$rentals", as: "r", in: { $substrCP: ["$$r.rentalDate", 0, 7] } } }, []] } } } },
+  { $match: { m: 3 } },
+  { $count: "customers" }
+])
+```

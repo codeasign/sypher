@@ -1,0 +1,174 @@
+---
+title: "Pipeline Performance and explain"
+order: 0
+---
+
+A pipeline that is correct on 1000 films can be painfully slow on 100 million. This page shows how to **look** at what a pipeline does (`explain`), the rules that make pipelines fast, and the limits you will hit.
+
+## What you'll learn
+
+- Reading `explain()` for an aggregation
+- Which stages can use indexes
+- Rules of thumb: filter early, project early, avoid needless unwinds
+- Memory limits and `allowDiskUse`
+
+## Syntax
+
+```js show
+db.collection.explain("executionStats").aggregate([ ...pipeline ])
+db.collection.aggregate([ ...pipeline ], { allowDiskUse: true })
+```
+
+## Examples
+
+### Look at the plan
+
+The `queryPlanner` part says how documents are found. Does the plan use an index scan (`IXSCAN`)? A filter on the indexed `title` field does; a filter on `rentalRate` does not:
+
+```js run
+const usesIndex = (m) => JSON.stringify(db.films.explain().aggregate([{ $match: m }]).queryPlanner.winningPlan).includes("IXSCAN");
+[usesIndex({ title: "ACADEMY DINOSAUR" }), usesIndex({ rentalRate: 4.99 })]
+```
+
+### A filter with no index
+
+`rentalRate` has no index, so the server reads every document (a collection scan, `COLLSCAN`):
+
+```js run
+db.films.explain().aggregate([{ $match: { rentalRate: 4.99 } }]).queryPlanner.winningPlan.stage
+```
+
+### Measure with executionStats
+
+How many documents did the server look at versus return?
+
+```js run
+const s1 = db.films.explain("executionStats").aggregate([{ $match: { title: "ACADEMY DINOSAUR" } }]).executionStats;
+({ returned: s1.nReturned, docsExamined: s1.totalDocsExamined, keysExamined: s1.totalKeysExamined })
+```
+
+```js run
+const s2 = db.films.explain("executionStats").aggregate([{ $match: { rentalRate: 4.99 } }]).executionStats;
+({ returned: s2.nReturned, docsExamined: s2.totalDocsExamined, keysExamined: s2.totalKeysExamined })
+```
+
+The first examined 1 document to return 1. The second examined all 1000 to return 336. On a big collection that ratio is the difference between milliseconds and minutes.
+
+### Filter early, project early
+
+Every stage before `$match` processes documents that will be thrown away. And carrying big fields (like the whole `rentals` array) through many stages costs memory. Compare two pipelines with the same result:
+
+```js run
+[
+  db.customers.aggregate([{ $unwind: "$rentals" }, { $match: { "rentals.storeId": 2 } }, { $count: "n" }]).toArray()[0].n,
+  db.customers.aggregate([{ $match: { "rentals.storeId": 2 } }, { $unwind: "$rentals" }, { $match: { "rentals.storeId": 2 } }, { $count: "n" }]).toArray()[0].n
+]
+```
+
+The second has an extra `$match` before `$unwind` that discards customers with no store 2 rentals early.
+
+### Avoid unwinding when an array expression will do
+
+Both give the same total, but only the second creates 16044 intermediate documents:
+
+```js run
+[
+  db.customers.aggregate([{ $project: { n: { $size: "$rentals" } } }, { $group: { _id: null, total: { $sum: "$n" } } }]).toArray()[0].total,
+  db.customers.aggregate([{ $unwind: "$rentals" }, { $count: "n" }]).toArray()[0].n
+]
+```
+
+### Which stages can use an index
+
+| Stage | Uses an index when |
+|---|---|
+| `$match` | It is first (or is moved first), and the field is indexed |
+| `$sort` | It is first (or right after `$match`), and an index matches the order |
+| `$group` | Rarely; `$sort` + `$first` on an indexed field can |
+| `$lookup` | The **foreign** field is indexed |
+| `$limit` + `$sort` | Together the server keeps only N documents (top-N) |
+
+### Sort + limit is cheap, sort alone is not
+
+`$sort` followed by `$limit` needs only a running top-N in memory:
+
+```js run
+db.films.aggregate([{ $sort: { replacementCost: -1, title: 1 } }, { $limit: 2 }, { $project: { _id: 0, title: 1 } }])
+```
+
+### Memory limits: 100 MB per blocking stage
+
+`$group`, `$sort` (without an index) and others hold data in RAM. If a stage passes 100 MB it fails, unless the pipeline allows spilling to disk:
+
+```js run
+db.films.aggregate([{ $group: { _id: "$title", n: { $sum: 1 } } }, { $sort: { n: -1, _id: 1 } }, { $limit: 2 }], { allowDiskUse: true })
+```
+
+## Try it yourself
+
+Take a slow-looking pipeline of your own (a `$group` after `$unwind` of `actors`), run it with `explain("executionStats")`, then add an early `$match` and compare `totalDocsExamined`.
+
+## Watch out
+
+### Do not benchmark on tiny data
+
+A collection scan of 1000 documents is instant. Test on realistic volumes, or trust the plan (index scan versus collection scan) rather than timings.
+
+### `explain` on the wrong shape
+
+`explain()` works on the pipeline you give it. If your application adds stages, explain the real pipeline.
+
+### Too many indexes hurt writes
+
+Every index must be updated on each insert and update. Index for the queries you actually run.
+
+### `allowDiskUse` is a safety net, not a fix
+
+Spilling to disk is much slower. Reduce data first: filter, project, group on fewer keys.
+
+### Results can differ if you reorder stages
+
+Moving `$limit` before `$sort` changes the result. Only reorder when the meaning stays the same.
+
+## Interview corner
+
+**"How do you check whether an aggregation uses an index?"**
+`explain()` (or `explain("executionStats")`) and look for `IXSCAN` in the plan versus `COLLSCAN`, and compare docs examined with docs returned.
+
+**"How do you make an aggregation faster?"**
+Filter and sort early on indexed fields, project only needed fields, avoid `$unwind` when array expressions work, index the `$lookup` foreign field, and limit results.
+
+**"What happens if a `$group` uses too much memory?"**
+It fails at 100 MB per stage unless `allowDiskUse: true`, which spills to disk at a performance cost.
+
+## Practice
+
+### Warm-up: which plan?
+
+Return `true` or `false`: is the plan for a `$match` on `_id: 5` a collection scan? (Check whether `JSON.stringify(plan)` contains `COLLSCAN`.)
+
+```js practice
+// hint: `db.films.explain().aggregate([...]).queryPlanner.winningPlan`.
+JSON.stringify(db.films.explain().aggregate([{ $match: { _id: 5 } }]).queryPlanner.winningPlan).includes("COLLSCAN")
+```
+
+### Core: examined versus returned
+
+For a `$match` on `rating: "R"`, return `[nReturned, totalDocsExamined]`.
+
+```js practice
+// hint: `explain("executionStats")`, read `executionStats`.
+(() => { const e = db.films.explain("executionStats").aggregate([{ $match: { rating: "R" } }]).executionStats; return [e.nReturned, e.totalDocsExamined]; })()
+```
+
+### Stretch: same answer, less work
+
+Return the number of rentals of store 1 in two ways (with `$unwind`+`$match` and with a `$filter`+`$size` sum) as `[a, b]`.
+
+```js practice
+// hint: The second uses `$sum` of `$size` of a `$filter`.
+[
+  db.customers.aggregate([{ $unwind: "$rentals" }, { $match: { "rentals.storeId": 1 } }, { $count: "n" }]).toArray()[0].n,
+  db.customers.aggregate([{ $project: { n: { $size: { $filter: { input: "$rentals", as: "r", cond: { $eq: ["$$r.storeId", 1] } } } } } }, { $group: { _id: null, total: { $sum: "$n" } } }]).toArray()[0].total
+]
+```

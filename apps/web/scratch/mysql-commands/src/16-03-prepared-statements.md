@@ -1,0 +1,184 @@
+---
+title: "Prepared Statements"
+order: 0
+---
+
+A **prepared statement** is a query that MySQL parses once, with `?` placeholders for the values, and then runs as many times as you like with different values. It is faster for repeated queries, and it is the standard defence against SQL injection.
+
+## What you'll learn
+
+- `PREPARE`, `EXECUTE` and `DEALLOCATE PREPARE`
+- Passing values with `USING`
+- Reusing a statement with different values
+- Building a statement dynamically, safely
+
+## Syntax
+
+```sql show
+PREPARE statement_name FROM 'SELECT ... WHERE column = ? AND other = ?';
+SET @value1 = ...;
+SET @value2 = ...;
+EXECUTE statement_name USING @value1, @value2;
+DEALLOCATE PREPARE statement_name;
+```
+
+The statement is kept for your **current connection** only. Values are passed as user variables (`@name`).
+
+## Examples
+
+### A statement with one placeholder
+
+```sql run
+PREPARE films_by_rating FROM 'SELECT title, length FROM film WHERE rating = ? ORDER BY title';
+
+SET @wanted = 'G';
+EXECUTE films_by_rating USING @wanted;
+
+DEALLOCATE PREPARE films_by_rating;
+```
+
+### Reuse it with different values
+
+Prepare once, execute many times. Each `EXECUTE` skips the parsing:
+
+```sql run
+PREPARE count_by_rating FROM 'SELECT ? AS rating, COUNT(*) AS films FROM film WHERE rating = ?';
+
+SET @r = 'PG';
+EXECUTE count_by_rating USING @r, @r;
+
+SET @r = 'R';
+EXECUTE count_by_rating USING @r, @r;
+
+DEALLOCATE PREPARE count_by_rating;
+```
+
+### More than one placeholder
+
+The values are used in order, left to right:
+
+```sql run
+PREPARE films_between FROM 'SELECT title, length FROM film WHERE rating = ? AND length BETWEEN ? AND ? ORDER BY length, title';
+
+SET @rating = 'PG-13', @low = 46, @high = 50;
+EXECUTE films_between USING @rating, @low, @high;
+
+DEALLOCATE PREPARE films_between;
+```
+
+### Placeholders in LIMIT
+
+Paging is a common use. `LIMIT` accepts placeholders in a prepared statement:
+
+```sql run
+PREPARE page_of_films FROM 'SELECT film_id, title FROM film ORDER BY film_id LIMIT ? OFFSET ?';
+
+SET @page_size = 5, @skip = 10;
+EXECUTE page_of_films USING @page_size, @skip;
+
+DEALLOCATE PREPARE page_of_films;
+```
+
+### Building a statement dynamically
+
+Sometimes the *shape* of the query is not known in advance: for example the columns of a pivot table depend on the data. Placeholders cannot hold column names, but you can build the text and then `PREPARE` it. Here one column is generated for each rating found in the table:
+
+```sql run
+SELECT GROUP_CONCAT(
+         DISTINCT CONCAT('SUM(rating = ', QUOTE(rating), ') AS `', REPLACE(rating, '-', ''), '`')
+         ORDER BY rating
+       ) INTO @columns
+FROM film;
+
+SET @sql = CONCAT('SELECT ', @columns, ' FROM film');
+
+SELECT @sql AS the_generated_query;
+
+PREPARE pivot FROM @sql;
+EXECUTE pivot;
+DEALLOCATE PREPARE pivot;
+```
+
+This is how the pivot from *Interview Problem: Pivot Rows into Columns* can adapt itself when a new rating appears. Only build SQL text from **trusted** names (here, values read from the table itself), never directly from user input.
+
+## Try it yourself
+
+Prepare a statement that finds payments between two amounts, and run it for three different ranges without repreparing.
+
+## Watch out
+
+### Placeholders are for values only
+
+A table or column name cannot be a placeholder:
+
+```sql run error
+PREPARE bad FROM 'SELECT * FROM ?';
+```
+
+### The statement lives only as long as your connection
+
+`DEALLOCATE PREPARE` frees it earlier. Another connection cannot use it. Preparing many statements and never freeing them wastes server memory (there is a limit, `max_prepared_stmt_count`).
+
+### Values come from user variables
+
+`EXECUTE ... USING` takes `@variables`, not literals. Set them first with `SET @name = ...`.
+
+### A placeholder is not always a speed-up
+
+Parsing is a small part of most queries. The main reason to use prepared statements is **safety**. Speed helps mostly for a tiny statement that runs thousands of times.
+
+### Most of the time, your driver does this for you
+
+In application code, use the library's parameterised queries (`cursor.execute(sql, params)`). You will rarely write `PREPARE` by hand, except in procedures or scripts.
+
+## Interview corner
+
+**"What is a prepared statement?"**
+A query parsed once with `?` placeholders and executed repeatedly with different values, sent separately from the SQL text.
+
+**"Why do prepared statements prevent SQL injection?"**
+The values are passed apart from the statement, so the database never treats them as SQL, however they are written.
+
+**"Can you use a placeholder for a table name?"**
+No. Placeholders are for values. Build the text dynamically from an allow-list of trusted names.
+
+**"When would you build a statement dynamically with `PREPARE`?"**
+When the structure of the query (which columns or tables) depends on data or a setting, as in a dynamic pivot, and the names come from trusted sources.
+
+## Practice
+
+### Warm-up: prepare and run
+
+Prepare `SELECT COUNT(*) AS payments FROM payment WHERE amount > ?`, run it with `10`, and return the count.
+
+```sql practice
+-- hint: PREPARE ... FROM '...?', SET @min = 10, EXECUTE ... USING @min.
+PREPARE big_payments FROM 'SELECT COUNT(*) AS payments FROM payment WHERE amount > ?';
+SET @min = 10;
+EXECUTE big_payments USING @min;
+DEALLOCATE PREPARE big_payments;
+```
+
+### Core: two placeholders
+
+Prepare a statement that returns `title` and `length` of films of a given rating and **at most** a given length, ordered by length then title. Run it for rating `NC-17` and length `48`.
+
+```sql practice
+-- hint: Two placeholders, values passed in the same order.
+PREPARE short_films FROM 'SELECT title, length FROM film WHERE rating = ? AND length <= ? ORDER BY length, title';
+SET @rating = 'NC-17', @max = 48;
+EXECUTE short_films USING @rating, @max;
+DEALLOCATE PREPARE short_films;
+```
+
+### Stretch: a page of results
+
+Prepare `SELECT customer_id, first_name FROM customer ORDER BY customer_id LIMIT ? OFFSET ?` and run it for page 3 with 4 customers per page (that is, `OFFSET 8`).
+
+```sql practice
+-- hint: LIMIT 4 OFFSET 8.
+PREPARE customer_page FROM 'SELECT customer_id, first_name FROM customer ORDER BY customer_id LIMIT ? OFFSET ?';
+SET @size = 4, @skip = 8;
+EXECUTE customer_page USING @size, @skip;
+DEALLOCATE PREPARE customer_page;
+```

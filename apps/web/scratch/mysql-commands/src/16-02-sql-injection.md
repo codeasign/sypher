@@ -1,0 +1,206 @@
+---
+title: "SQL Injection"
+order: 0
+---
+
+**SQL injection** is one of the most common and most damaging security flaws in web applications. It happens when a program builds a SQL statement by gluing user input into the text, so that a clever input changes the *meaning* of the query. Here you will see an injection happen against the DVD Rental data, so you will recognise the pattern, and then see the fix.
+
+This is a defensive lesson: you attack only your own practice database, to learn how to write code that cannot be attacked.
+
+## What you'll learn
+
+- How string-built SQL gets hijacked
+- Three classic attacks: "return everything", "read another table" and "comment out the rest"
+- How prepared statements stop all of them
+- The other layers of defence
+
+## The setup
+
+Imagine a search box: "find customers by last name". The application takes what the user typed and builds the query by **concatenating** it into a string. We can imitate exactly that inside MySQL, with `CONCAT` and a prepared statement to run the text:
+
+```sql run
+SET @typed = 'SMITH';
+SET @query = CONCAT("SELECT customer_id, last_name FROM customer WHERE last_name = '", @typed, "'");
+
+SELECT @query AS the_query_that_will_run;
+
+PREPARE search FROM @query;
+EXECUTE search;
+DEALLOCATE PREPARE search;
+```
+
+With a normal input, it works as intended.
+
+## Attack 1: return everything
+
+The attacker types a name plus a quote plus an always-true condition: `x' OR '1'='1`. Look at the query that gets built, and how many customers it returns:
+
+```sql run
+SET @typed = "x' OR '1'='1";
+SET @query = CONCAT("SELECT COUNT(*) AS customers_returned FROM customer WHERE last_name = '", @typed, "'");
+
+SELECT @query AS the_query_that_will_run;
+
+PREPARE search FROM @query;
+EXECUTE search;
+DEALLOCATE PREPARE search;
+```
+
+The extra text closed the string early and added `OR '1'='1'`, which is true for every row. The search that should find one surname returned **every customer**. In a login form, the same trick logs the attacker in without a password.
+
+## Attack 2: read another table
+
+With `UNION`, the attacker adds a second query whose results appear in the same list. Here they pull the staff usernames into the customer search:
+
+```sql run
+SET @typed = "x' UNION SELECT staff_id, username FROM staff -- -";
+SET @query = CONCAT("SELECT customer_id, last_name FROM customer WHERE last_name = '", @typed, "'");
+
+SELECT @query AS the_query_that_will_run;
+
+PREPARE search FROM @query;
+EXECUTE search;
+DEALLOCATE PREPARE search;
+```
+
+Data from a table the search box was never meant to touch came back. The `-- -` is a comment marker that swallows the closing quote the application added, so the query stays valid.
+
+## Attack 3: comment out the rest
+
+A classic login check is `WHERE username = '...' AND password = '...'`. Typing `admin' -- -` as the username comments out the rest of the test entirely. The demo below uses a status test (`AND active = 0`) in place of the password test:
+
+```sql run
+SET @typed = "Mike' -- -";
+SET @query = CONCAT("SELECT username FROM staff WHERE username = '", @typed, "' AND active = 0");
+
+SELECT @query AS the_query_that_will_run;
+
+PREPARE login FROM @query;
+EXECUTE login;
+DEALLOCATE PREPARE login;
+```
+
+The query was meant to find a **deactivated** account (`active = 0`), but the `-- -` in the typed name turned the rest of the line into a comment, so the `AND active = 0` test never ran. The row for `Mike` came back even though Mike's account is active. In a real login, the same trick skips the password test.
+
+## The fix: parameters, not concatenation
+
+A **prepared statement** sends the query text and the values **separately**. The `?` is a placeholder. Whatever you put in it is treated as a *value*, never as SQL, however many quotes it contains:
+
+```sql run
+PREPARE safe_search FROM 'SELECT COUNT(*) AS customers_returned FROM customer WHERE last_name = ?';
+
+SET @typed = "x' OR '1'='1";
+EXECUTE safe_search USING @typed;
+
+SET @typed = 'SMITH';
+EXECUTE safe_search USING @typed;
+
+DEALLOCATE PREPARE safe_search;
+```
+
+The same malicious text now finds **0** customers, because MySQL looks for someone whose last name is literally `x' OR '1'='1`. And the honest search still works. This is what your programming language's database library does when you use parameters:
+
+```python
+# Python (mysql-connector)
+cursor.execute("SELECT * FROM customer WHERE last_name = %s", (typed,))
+```
+
+```javascript
+// Node.js (mysql2)
+const [rows] = await connection.execute('SELECT * FROM customer WHERE last_name = ?', [typed]);
+```
+
+```php
+// PHP (PDO)
+$stmt = $pdo->prepare('SELECT * FROM customer WHERE last_name = :name');
+$stmt->execute(['name' => $typed]);
+```
+
+## Try it yourself
+
+Rewrite the "comment out the rest" query with `?` placeholders for both the username and the status, and try the same malicious input.
+
+## Watch out
+
+### Never build SQL by concatenating input
+
+That is the whole lesson. If you see `"... WHERE name = '" + input + "'"` in code, it is a bug waiting for an attacker.
+
+### Escaping is not enough
+
+Hand-written "escape the quotes" functions get forgotten, get bypassed, and break on unusual character sets. Parameters remove the whole class of problem.
+
+### Placeholders cannot stand for table or column names
+
+You cannot write `ORDER BY ?` or `FROM ?`. If a user picks a sort column, compare their choice against a **fixed list of allowed names** in your code, and use only the value from the list:
+
+```sql show
+-- application logic (pseudo-code)
+allowed = {'title', 'length', 'rental_rate'}
+column = user_choice if user_choice in allowed else 'title'
+query = "SELECT title FROM film ORDER BY " + column
+```
+
+### Stacked queries
+
+Some drivers allow several statements in one call (`...; DROP TABLE ...`). Keep that option off. (MySQL's standard connections refuse it, which is why our demos could not use it.)
+
+### Defence in depth
+
+- Connect with an account that has **only the privileges the app needs** (*Users, GRANT and REVOKE*). A search box should never connect as `root`.
+- Validate input (length, format), as an extra layer.
+- Hide detailed database errors from users.
+- Keep software patched, and use a web application firewall for extra protection.
+
+## Interview corner
+
+**"What is SQL injection, and how do you prevent it?"**
+Attacker-controlled input changes the structure of a query because it was concatenated into the SQL text. Prevent it with parameterised queries (prepared statements), least-privilege database accounts, and input validation. Escaping alone is not sufficient.
+
+**"Can you use a parameter for a column name?"**
+No. Placeholders are for values only. For identifiers, check the input against an allow-list.
+
+**"What can an attacker do with SQL injection?"**
+Read data they should not see (including other tables), bypass logins, change or delete data, and sometimes run commands on the server, depending on privileges.
+
+**"Why does connecting as a low-privilege user help?"**
+Even if an injection succeeds, the attacker can only do what that account may do, not drop tables or read the `mysql` user table.
+
+## Practice
+
+### Warm-up: see the attack
+
+Build the query `SELECT COUNT(*) AS customers_returned FROM customer WHERE last_name = '<input>'` by concatenation with the input `Q' OR 'a'='a`, run it, and return the count.
+
+```sql practice
+-- hint: CONCAT the input inside single quotes, PREPARE the text, EXECUTE it.
+SET @typed = "Q' OR 'a'='a";
+SET @query = CONCAT("SELECT COUNT(*) AS customers_returned FROM customer WHERE last_name = '", @typed, "'");
+PREPARE attack FROM @query;
+EXECUTE attack;
+DEALLOCATE PREPARE attack;
+```
+
+### Core: the same input, made safe
+
+Prepare `SELECT COUNT(*) AS customers_returned FROM customer WHERE last_name = ?`, run it with the **same** input, and return the count.
+
+```sql practice
+-- hint: `PREPARE ... FROM '...?'`, then `EXECUTE ... USING @typed`.
+PREPARE safe_search FROM 'SELECT COUNT(*) AS customers_returned FROM customer WHERE last_name = ?';
+SET @typed = "Q' OR 'a'='a";
+EXECUTE safe_search USING @typed;
+DEALLOCATE PREPARE safe_search;
+```
+
+### Stretch: a safe lookup that still finds people
+
+Using a placeholder, look up the customer whose `last_name` is `SMITH` and return `customer_id` and `first_name`, ordered by `customer_id`.
+
+```sql practice
+-- hint: A placeholder for the last name, and `ORDER BY customer_id` in the statement text.
+PREPARE by_name FROM 'SELECT customer_id, first_name FROM customer WHERE last_name = ? ORDER BY customer_id';
+SET @typed = 'SMITH';
+EXECUTE by_name USING @typed;
+DEALLOCATE PREPARE by_name;
+```

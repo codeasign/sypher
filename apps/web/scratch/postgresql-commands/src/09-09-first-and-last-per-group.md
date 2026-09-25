@@ -1,0 +1,174 @@
+---
+title: "Interview Problem: First and Last per Group"
+order: 0
+---
+
+"Show each customer's most recent order" (or first, or biggest) is the **greatest-per-group** problem. It appears in almost every SQL interview, in several disguises, and it has a classic wrong answer. PostgreSQL has a one-line answer of its own.
+
+## What you'll learn
+
+- Why `GROUP BY` with `MAX` cannot return the whole row
+- Four correct ways: `DISTINCT ON`, window functions, a join, and `LATERAL`
+- How each handles ties
+
+## The problem
+
+For each customer, show their **latest rental**: the start time and the rental id.
+
+## The classic wrong answer
+
+You cannot select `rental_id` next to `MAX(lower(rental_period))`, because the group has many rental ids:
+
+```sql run error
+SELECT customer_id, rental_id, MAX(lower(rental_period))
+FROM rental
+GROUP BY customer_id;
+```
+
+PostgreSQL refuses. (In old, loose settings some databases would silently return a `rental_id` that does **not** belong to the latest time.)
+
+## Way 1: DISTINCT ON (PostgreSQL's shortcut)
+
+`DISTINCT ON (customer_id)` keeps the first row of each customer, in the `ORDER BY` order:
+
+```sql run
+SELECT DISTINCT ON (customer_id) customer_id, rental_id, lower(rental_period) AS rented_at
+FROM rental
+ORDER BY customer_id, lower(rental_period) DESC, rental_id DESC
+LIMIT 5;
+```
+
+The `rental_id DESC` is a tiebreaker in case two rentals share the exact same time. It is the shortest solution, but it is PostgreSQL-only.
+
+## Way 2: ROW_NUMBER
+
+Number each customer's rentals from newest to oldest, and keep number 1. It works in every database:
+
+```sql run
+SELECT customer_id, rental_id, rented_at
+FROM (
+  SELECT customer_id, rental_id, lower(rental_period) AS rented_at,
+         ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY lower(rental_period) DESC, rental_id DESC) AS rn
+  FROM rental
+) x
+WHERE rn = 1
+ORDER BY customer_id
+LIMIT 5;
+```
+
+## Way 3: join to the maximum
+
+Find each customer's latest time, then join back to fetch the full row:
+
+```sql run
+SELECT r.customer_id, r.rental_id, lower(r.rental_period) AS rented_at
+FROM rental r
+JOIN (
+  SELECT customer_id, MAX(lower(rental_period)) AS latest FROM rental GROUP BY customer_id
+) m ON m.customer_id = r.customer_id AND lower(r.rental_period) = m.latest
+ORDER BY r.customer_id, r.rental_id
+LIMIT 5;
+```
+
+If a customer has two rentals at exactly the same latest time, **both** are returned.
+
+## Way 4: LATERAL
+
+```sql run
+SELECT c.customer_id, x.rental_id, x.rented_at
+FROM customer c
+CROSS JOIN LATERAL (
+  SELECT rental_id, lower(rental_period) AS rented_at
+  FROM rental
+  WHERE customer_id = c.customer_id
+  ORDER BY lower(rental_period) DESC, rental_id DESC
+  LIMIT 1
+) x
+ORDER BY c.customer_id
+LIMIT 5;
+```
+
+## First **and** last together
+
+`FIRST_VALUE` and `LAST_VALUE` put both on the same row. A plain `GROUP BY` also works when you only need the times and not the full rows:
+
+```sql run
+SELECT customer_id, MIN(lower(rental_period)) AS first_rental, MAX(lower(rental_period)) AS last_rental
+FROM rental
+GROUP BY customer_id
+ORDER BY customer_id
+LIMIT 5;
+```
+
+## Try it yourself
+
+Show each customer's biggest payment (the whole row), and the first film each customer ever rented.
+
+## Watch out
+
+### Ties: one row or all of them?
+
+Ways 1, 2 and 4 return exactly **one** row per customer (the tiebreaker decides which). Way 3 returns **all** rows tied for the latest time. Ask the interviewer which is wanted.
+
+### Without a tiebreaker, DISTINCT ON and ROW_NUMBER are arbitrary
+
+If two rows tie on the time, which one you get can change between runs. Always end the `ORDER BY` with a unique column.
+
+### DISTINCT ON needs a matching ORDER BY
+
+The `ORDER BY` must begin with the `DISTINCT ON` expressions. The remaining columns say which row of each group comes first.
+
+## Interview corner
+
+**"Return each customer's latest order."**
+In PostgreSQL: `DISTINCT ON (customer_id) ... ORDER BY customer_id, order_date DESC`. Portable: the `ROW_NUMBER` solution. Mention the join-to-MAX alternative and explain the tie behaviour of each.
+
+**"Why doesn't `SELECT id, MAX(date) ... GROUP BY user` work?"**
+`id` is not aggregated, so which `id` belongs to the maximum date is undefined. PostgreSQL rejects it.
+
+**"Which is fastest?"**
+With an index on `(customer_id, rental_start DESC)`, the `LATERAL` form and `DISTINCT ON` can read just one row per customer. Without one, the window function or the join to the pre-aggregated maximum are usually best. Check with `EXPLAIN`.
+
+## Practice
+
+### Warm-up: each customer's largest payment
+
+Show `customer_id`, `payment_id` and `amount` for each customer's **largest single payment** (exactly one row per customer, ties broken by the lowest `payment_id`), for customers 1 to 5. Order by customer.
+
+```sql practice
+-- hint: `DISTINCT ON (customer_id)` with `ORDER BY customer_id, amount DESC, payment_id`.
+SELECT DISTINCT ON (customer_id) customer_id, payment_id, amount
+FROM payment
+WHERE customer_id <= 5
+ORDER BY customer_id, amount DESC, payment_id;
+```
+
+### Core: the first film each customer rented
+
+For customers 1 to 5, show `customer_id` and the `title` of the film in their **first rental** (earliest start, ties by `rental_id`). Order by customer.
+
+```sql practice
+-- hint: `DISTINCT ON (customer_id)` over rental joined to inventory and film.
+SELECT DISTINCT ON (r.customer_id) r.customer_id, f.title
+FROM rental r
+JOIN inventory i ON i.inventory_id = r.inventory_id
+JOIN film f ON f.film_id = i.film_id
+WHERE r.customer_id <= 5
+ORDER BY r.customer_id, lower(r.rental_period), r.rental_id;
+```
+
+### Stretch: days between first and last
+
+For customers 1 to 5, show `customer_id`, `first_rental`, `last_rental` and `days_active` (the whole days between them). Order by customer.
+
+```sql practice
+-- hint: MIN and MAX of `lower(rental_period)`; subtract the dates with `::date`.
+SELECT customer_id,
+       MIN(lower(rental_period)) AS first_rental,
+       MAX(lower(rental_period)) AS last_rental,
+       MAX(lower(rental_period))::date - MIN(lower(rental_period))::date AS days_active
+FROM rental
+WHERE customer_id <= 5
+GROUP BY customer_id
+ORDER BY customer_id;
+```

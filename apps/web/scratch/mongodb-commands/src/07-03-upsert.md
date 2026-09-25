@@ -1,0 +1,178 @@
+---
+title: "Upsert: Update or Insert"
+order: 0
+---
+
+An **upsert** says "update the document if it exists, otherwise insert it". It replaces the clumsy "read, check, then write" sequence, which is unsafe when two clients run it at the same time.
+
+## What you'll learn
+
+- `upsert: true` on updates and replaces
+- How the inserted document is built from the filter and update
+- `$setOnInsert` for values that only apply to new documents
+- Why a unique index makes upserts safe
+
+## Syntax
+
+```js show
+db.collection.updateOne(filter, update, { upsert: true })
+db.collection.updateOne(filter, { $set: {...}, $setOnInsert: {...} }, { upsert: true })
+```
+
+## Examples
+
+```js run destructive
+const lab = db.getSiblingDB("lab_upsert")
+lab.getCollectionNames()
+```
+
+### The first call inserts
+
+There is no document for `home` yet, so the upsert creates one. `upsertedCount` is 1, and `insertedId` (the field where mongosh reports the new id) names the created document:
+
+```js run destructive
+lab.pageviews.updateOne({ _id: "home" }, { $inc: { views: 1 } }, { upsert: true })
+```
+
+### The second call updates
+
+Now the document exists, so the same command increments it:
+
+```js run destructive
+lab.pageviews.updateOne({ _id: "home" }, { $inc: { views: 1 } }, { upsert: true })
+lab.pageviews.findOne({ _id: "home" })
+```
+
+### The new document is built from the filter and the update
+
+Equality conditions of the filter become fields of the new document:
+
+```js run destructive
+lab.users.updateOne({ email: "ann@example.com" }, { $set: { name: "Ann" } }, { upsert: true })
+lab.users.findOne({ email: "ann@example.com" }, { _id: 0 })
+```
+
+### $setOnInsert: only for new documents
+
+Use it for values that must be set once, such as a creation date, and never touched again:
+
+```js run destructive
+const stamp = "2026-01-01"
+lab.visitors.updateOne({ _id: "v1" }, { $set: { lastSeen: "2026-05-01" }, $setOnInsert: { firstSeen: stamp } }, { upsert: true })
+lab.visitors.updateOne({ _id: "v1" }, { $set: { lastSeen: "2026-06-01" }, $setOnInsert: { firstSeen: "2099-01-01" } }, { upsert: true })
+lab.visitors.findOne({ _id: "v1" })
+```
+
+### replaceOne with upsert
+
+```js run destructive
+lab.settings.replaceOne({ _id: "theme" }, { mode: "dark" }, { upsert: true })
+lab.settings.findOne({ _id: "theme" })
+```
+
+### Race conditions and a unique index
+
+Two clients upserting the same new key at the same moment can both try to insert. Without a unique index you may end up with two documents. With one, the loser gets a duplicate-key error and can simply retry:
+
+```js run destructive
+lab.accounts.createIndex({ email: 1 }, { unique: true });
+lab.accounts.updateOne({ email: "a@x.com" }, { $set: { plan: "free" } }, { upsert: true });
+lab.accounts.updateOne({ email: "a@x.com" }, { $set: { plan: "pro" } }, { upsert: true });
+lab.accounts.find({}, { _id: 0 }).toArray()
+```
+
+### bulkWrite with upserts
+
+Load a list of records, creating or updating each by key:
+
+```js run destructive
+lab.prices.bulkWrite([
+  { updateOne: { filter: { sku: "A" }, update: { $set: { price: 5 } }, upsert: true } },
+  { updateOne: { filter: { sku: "B" }, update: { $set: { price: 7 } }, upsert: true } },
+  { updateOne: { filter: { sku: "A" }, update: { $set: { price: 6 } }, upsert: true } }
+]).upsertedCount
+```
+
+```js run destructive
+lab.prices.find({}, { _id: 0 }).sort({ sku: 1 }).toArray()
+```
+
+### Clean up
+
+```js run destructive
+lab.dropDatabase()
+```
+
+## Try it yourself
+
+Write a "visits per day" counter: an upsert keyed on the date string that increments a `count`. Call it three times for one date and once for another.
+
+## Watch out
+
+### Upsert with a non-equality filter
+
+`{ price: { $gt: 5 } }` gives MongoDB nothing to copy into a new document for `price`. Put the key in an equality condition, and set the rest in the update.
+
+### Without a unique index, concurrent upserts can duplicate
+
+The upsert itself is not a lock. Create a unique index on the key you upsert by, and be ready to retry on error 11000.
+
+### `$setOnInsert` is ignored on updates
+
+That is its purpose. Do not use it for data that should change later.
+
+### An upsert may insert something you did not intend
+
+A typo in the filter creates a brand-new document instead of failing. Check `upsertedCount` when it matters.
+
+## Interview corner
+
+**"What is an upsert?"**
+An update that inserts a new document when the filter matches nothing. It is enabled with the `upsert: true` option.
+
+**"How do you set a field only when a document is created?"**
+With `$setOnInsert`.
+
+**"Are upserts safe under concurrency?"**
+Only with a unique index on the filter key. Then a race produces a duplicate-key error for one caller, which can retry.
+
+## Practice
+
+### Warm-up: insert through upsert
+
+In a scratch collection, upsert `{ _id: "a" }` with `$set: { n: 1 }` and return `upsertedCount`.
+
+```js practice destructive
+// hint: `updateOne(..., { upsert: true }).upsertedCount`.
+const lab = db.getSiblingDB("lab_upsert")
+const c = lab.t.updateOne({ _id: "a" }, { $set: { n: 1 } }, { upsert: true }).upsertedCount
+lab.dropDatabase();
+c
+```
+
+### Core: counter
+
+Upsert `{ _id: "k" }` with `$inc: { n: 1 }` four times, then return `n`.
+
+```js practice destructive
+// hint: A loop, or four calls.
+const lab = db.getSiblingDB("lab_upsert")
+for (let i = 0; i < 4; i++) lab.t.updateOne({ _id: "k" }, { $inc: { n: 1 } }, { upsert: true });
+const n = lab.t.findOne({ _id: "k" }).n
+lab.dropDatabase();
+n
+```
+
+### Stretch: first seen
+
+Upsert `{ _id: "u" }` twice: the first call sets `seen: 1` and `$setOnInsert: { first: 1 }`, the second sets `seen: 2` and `$setOnInsert: { first: 99 }`. Return the stored document.
+
+```js practice destructive
+// hint: `$setOnInsert` is ignored on the second call.
+const lab = db.getSiblingDB("lab_upsert")
+lab.t.updateOne({ _id: "u" }, { $set: { seen: 1 }, $setOnInsert: { first: 1 } }, { upsert: true });
+lab.t.updateOne({ _id: "u" }, { $set: { seen: 2 }, $setOnInsert: { first: 99 } }, { upsert: true });
+const d = lab.t.findOne({ _id: "u" })
+lab.dropDatabase();
+d
+```

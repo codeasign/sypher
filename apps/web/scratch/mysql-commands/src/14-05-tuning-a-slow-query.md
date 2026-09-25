@@ -1,0 +1,195 @@
+---
+title: "Tuning a Slow Query"
+order: 0
+---
+
+"A query is slow. What do you do?" is the most common performance question in interviews, and the most common job in real life. This page turns everything from Module 14 into a **repeatable method**, applied to a real example.
+
+## What you'll learn
+
+- How slow queries are found
+- A step-by-step method for tuning one
+- `EXPLAIN ANALYZE` and the slow query log
+- What else to try when an index is not enough
+
+## Finding slow queries
+
+MySQL can record every statement that takes longer than a limit into the **slow query log**. Its settings:
+
+```sql run
+SELECT @@slow_query_log AS slow_log_on,
+       @@long_query_time AS threshold_seconds,
+       @@log_queries_not_using_indexes AS log_unindexed;
+```
+
+The log is off by default, and the threshold is 10 seconds. On a real server you turn it on and lower the threshold:
+
+```sql show
+SET GLOBAL slow_query_log = ON;
+SET GLOBAL long_query_time = 1;   -- log anything slower than 1 second
+```
+
+Then a tool such as `mysqldumpslow` or `pt-query-digest` summarises the log to show which queries cost the most in total.
+
+## The method
+
+1. **Reproduce and measure.** Run the query and note how long it takes, or how many rows it reads.
+2. **Read the plan.** `EXPLAIN`: is it `ALL`? Is `key` `NULL`? Is `rows` huge? Is there `Using filesort`?
+3. **Fix the cause.** Add or change an index, rewrite the condition, select fewer columns.
+4. **Measure again.** Confirm it really got better.
+5. **Check the cost.** Does the new index slow writes too much? Does it help other queries?
+
+## A worked example
+
+A report needs all rentals by customer 7 in July 2005. On a copy with no indexes:
+
+```sql run as=root destructive
+CREATE TABLE rental_plain AS SELECT * FROM rental;
+
+FLUSH STATUS;
+
+SELECT COUNT(*) AS rentals_found
+FROM rental_plain
+WHERE customer_id = 7 AND rental_date >= '2005-07-01' AND rental_date < '2005-08-01';
+
+SHOW SESSION STATUS WHERE Variable_name IN ('Handler_read_key', 'Handler_read_next', 'Handler_read_rnd_next');
+```
+
+### Step 2: the plan
+
+```sql run as=root destructive
+EXPLAIN SELECT COUNT(*)
+FROM rental_plain
+WHERE customer_id = 7 AND rental_date >= '2005-07-01' AND rental_date < '2005-08-01';
+```
+
+`type: ALL`, `key: NULL`: it read every row to find a handful.
+
+### Step 3: the fix
+
+The query has an **equality** on `customer_id` and a **range** on `rental_date`, exactly the shape a composite index `(customer_id, rental_date)` is built for:
+
+```sql run as=root destructive
+CREATE INDEX idx_customer_date ON rental_plain (customer_id, rental_date);
+
+EXPLAIN SELECT COUNT(*)
+FROM rental_plain
+WHERE customer_id = 7 AND rental_date >= '2005-07-01' AND rental_date < '2005-08-01';
+```
+
+### Step 4: measure again
+
+```sql run as=root destructive
+FLUSH STATUS;
+
+SELECT COUNT(*) AS rentals_found
+FROM rental_plain
+WHERE customer_id = 7 AND rental_date >= '2005-07-01' AND rental_date < '2005-08-01';
+
+SHOW SESSION STATUS WHERE Variable_name IN ('Handler_read_key', 'Handler_read_next', 'Handler_read_rnd_next');
+```
+
+The full scan is gone. It made one lookup and read only the matching entries. Because the query needs only `COUNT(*)`, the index answered it alone (a covering index).
+
+## EXPLAIN ANALYZE: what really happened
+
+`EXPLAIN` guesses. `EXPLAIN ANALYZE` **runs the query** and reports the real time and row counts for each step. Its timings differ on every run, so we do not print the output here, but you should run it yourself:
+
+```sql run as=root destructive noout
+EXPLAIN ANALYZE
+SELECT COUNT(*)
+FROM rental_plain
+WHERE customer_id = 7 AND rental_date >= '2005-07-01' AND rental_date < '2005-08-01';
+```
+
+Look for the line with `actual time=...` and `rows=...`, and compare the real `rows` with the estimate. A big gap means stale statistics: run `ANALYZE TABLE rental_plain`.
+
+## When an index is not enough
+
+| Symptom | Try |
+|---|---|
+| `Using filesort` on a big result | an index that matches the `ORDER BY` |
+| `SELECT *` reading wide rows | select only the columns you need |
+| Deep pagination (`OFFSET 100000`) | keyset pagination (`WHERE id > last_id`) |
+| Many tiny queries in a loop (N+1) | one query with a join or `IN (...)` |
+| A subquery that runs per row | rewrite as a join, or use a window function |
+| Counting a huge table often | a maintained counter, or a summary table |
+| Old statistics | `ANALYZE TABLE t` |
+| A table full of deleted rows | `OPTIMIZE TABLE t` (rebuilds it) |
+| Still slow after all this | cache the result, add a read replica, or partition |
+
+## Try it yourself
+
+Take the slowest query you can find from the earlier modules (a join of several tables, or one with a `LIKE '%...%'`), and walk through the five steps.
+
+## Watch out
+
+### Measure, do not guess
+
+"It feels faster" is not measurement. Compare row counts, `EXPLAIN ANALYZE` times, or repeated runs, and remember that the first run may be slow because the data was not yet in memory.
+
+### Test with realistic data
+
+A query that is fine on 1000 rows can be terrible on 50 million. Tune against data of a realistic size, and realistic values.
+
+### Each fix has a cost
+
+A new index speeds up reads and slows down writes. Check that you have not made the important write path worse.
+
+### One slow query is not always the problem
+
+A query that takes 5 ms but runs 10000 times a minute can hurt more than one that takes 5 seconds once a day. The slow query log's *total time per query type* shows this.
+
+## Interview corner
+
+**"How do you optimise a slow query?"**
+Use this method: measure it, look at `EXPLAIN` (scan type, key, rows, filesort), find the cause (a missing or unusable index, too many columns or rows, a bad join), fix it (index, rewrite, fewer columns), and measure again. Mention that you would also check the slow query log to find the worst offenders.
+
+**"What is the difference between `EXPLAIN` and `EXPLAIN ANALYZE`?"**
+`EXPLAIN` shows the estimated plan without running the query. `EXPLAIN ANALYZE` runs it and shows real timings and row counts.
+
+**"The server's CPU is at 100%. Where do you start?"**
+Find the top queries (slow query log, `SHOW PROCESSLIST`, the `performance_schema`), `EXPLAIN` the worst ones, and check for missing indexes and runaway full scans.
+
+**"How would you page through a million rows efficiently?"**
+Keyset pagination: `WHERE id > last_seen_id ORDER BY id LIMIT n`, not `OFFSET`.
+
+## Practice
+
+### Warm-up: is logging on?
+
+Return `@@slow_query_log` as `slow_log_on` and `@@long_query_time` as `threshold`.
+
+```sql practice
+-- hint: Read the two system variables.
+SELECT @@slow_query_log AS slow_log_on, @@long_query_time AS threshold;
+```
+
+### Core: measure a scan
+
+On a copy `payment_plain` of `payment` (no indexes), reset the counters, count the payments over 10 dollars, and return the `Handler_read_rnd_next` counter.
+
+```sql practice as=root destructive
+-- hint: `FLUSH STATUS;`, the query, then `SHOW SESSION STATUS LIKE 'Handler_read_rnd_next'`.
+DROP TABLE IF EXISTS payment_plain;
+CREATE TABLE payment_plain AS SELECT * FROM payment;
+
+FLUSH STATUS;
+SELECT COUNT(*) AS big_payments FROM payment_plain WHERE amount > 10;
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+```
+
+### Stretch: fix and re-measure
+
+On the same copy, add an index on `amount`, reset the counters, run the same count, and return `Handler_read_key` and `Handler_read_next` together.
+
+```sql practice as=root destructive
+-- hint: `CREATE INDEX idx_amount ON payment_plain (amount)` before measuring.
+DROP TABLE IF EXISTS payment_plain;
+CREATE TABLE payment_plain AS SELECT * FROM payment;
+CREATE INDEX idx_amount ON payment_plain (amount);
+
+FLUSH STATUS;
+SELECT COUNT(*) AS big_payments FROM payment_plain WHERE amount > 10;
+SHOW SESSION STATUS WHERE Variable_name IN ('Handler_read_key', 'Handler_read_next');
+```

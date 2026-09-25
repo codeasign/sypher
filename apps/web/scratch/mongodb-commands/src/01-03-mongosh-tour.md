@@ -1,0 +1,116 @@
+---
+title: "A Tour of mongosh"
+order: 0
+---
+
+`mongosh` is the MongoDB shell. It is a JavaScript environment with a database connection already open: `db` is your current database, and every collection is a property of `db`. Learn these few habits and you can explore any MongoDB database.
+
+## What you'll learn
+
+- `db`, collections and commands as JavaScript
+- The shell helpers: `show`, `use`, `help()`
+- Variables, loops and printing
+- How this course shows output
+
+## Syntax
+
+```js show
+db.collection.command(arguments)      // run a command on a collection
+db.command()                          // run a command on the database
+use otherdb                           // switch database (shell only)
+show collections                      // list collections (shell only)
+```
+
+## Examples
+
+### db is a JavaScript object
+
+`db` is your current database, and `db.films` is the `films` collection. Every command is a method call:
+
+```js run
+db.films.countDocuments()
+```
+
+### Look around
+
+`show collections` and `getCollectionNames()` list the collections:
+
+```js run
+show collections
+```
+
+### Variables and JavaScript
+
+It is a real JavaScript shell, so variables, functions, loops and `Math` all work:
+
+```js run
+const total = db.films.countDocuments()
+const longFilms = db.films.countDocuments({ lengthMinutes: { $gt: 150 } })
+Math.round((longFilms / total) * 100) + "% of films are longer than 150 minutes"
+```
+
+### Loops and printing
+
+```js run
+for (const name of db.films.distinct("rating").sort()) {
+  print(name + ": " + db.films.countDocuments({ rating: name }))
+}
+```
+
+### Documents are ordinary objects
+
+A query returns objects you can use like any JavaScript value:
+
+```js run
+const film = db.films.findOne({ _id: 2 })
+film.title.toLowerCase() + " has " + film.actors.length + " actors"
+```
+
+### Switching databases
+
+`use` changes which database `db` points to (in this course we stay in the DVD Rental database, so this is just to show the shape):
+
+```js show
+use sypher-mongodb-DvdRental
+```
+
+### Help is built in
+
+```js show
+help()            // shell help
+db.help()         // database methods
+db.films.help()   // collection methods
+```
+
+## Try it yourself
+
+Print the title of every film with a `rentalRate` of `4.99` and a `lengthMinutes` under 50, using `find(...)` and `forEach`.
+
+## Watch out
+
+### Commands are JavaScript, so quotes and commas matter
+
+Field names in a query document can be bare (`{ rating: "PG" }`) or quoted. Text values need quotes. A missing comma or brace is an ordinary JavaScript error.
+
+### A cursor shows only the first 20 documents in the shell
+
+`find()` returns a **cursor**. Interactive `mongosh` prints the first 20 and asks you to type `it` for more. In this course examples always use `.limit(n)` or a filter so the whole result is shown.
+
+### `use` and `show` are shell commands, not JavaScript
+
+They work at the `mongosh` prompt but not inside a script or an application. In code, use `db.getSiblingDB("name")` and `db.getCollectionNames()`.
+
+### Collection names with odd characters
+
+A collection called `my-data` cannot be written `db.my-data`. Use `db.getCollection("my-data")`.
+
+## Interview corner
+
+**"What is `mongosh`?"**
+The MongoDB shell: an interactive JavaScript (Node.js) environment for running commands, scripts and administration tasks against a MongoDB server.
+
+**"How do you list the collections of a database?"**
+`show collections` in the shell, or `db.getCollectionNames()` in code.
+
+**"What is a cursor?"**
+The object `find()` returns. It fetches documents from the server in batches as you iterate, instead of loading the whole result at once.

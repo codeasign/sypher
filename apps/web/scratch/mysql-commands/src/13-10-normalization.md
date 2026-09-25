@@ -1,0 +1,269 @@
+---
+title: "Normalisation: 1NF, 2NF and 3NF"
+order: 0
+---
+
+**Normalisation** is the process of organising tables so that each fact is stored **once**. It is the reason the DVD Rental database has a `customer` table and a `rental` table instead of one giant sheet. It prevents a whole family of bugs that show up when the same fact is copied in many places.
+
+## What you'll learn
+
+- The problems of a single "flat" table
+- The first three normal forms, with examples
+- How to split a flat table into related tables
+- When denormalising is fine
+
+## The problem: everything in one table
+
+An online shop that keeps every order in one table:
+
+```sql run destructive
+CREATE TABLE orders_flat (
+  order_id INT NOT NULL,
+  product_id INT NOT NULL,
+  customer_name VARCHAR(30) NOT NULL,
+  customer_city VARCHAR(30) NOT NULL,
+  product_name VARCHAR(30) NOT NULL,
+  unit_price DECIMAL(6, 2) NOT NULL,
+  qty INT NOT NULL,
+  PRIMARY KEY (order_id, product_id)
+);
+
+INSERT INTO orders_flat VALUES
+  (1, 10, 'Asha', 'Pune', 'Notebook', 4.50, 2),
+  (1, 20, 'Asha', 'Pune', 'Pen', 1.25, 10),
+  (2, 10, 'Ben', 'Delhi', 'Notebook', 4.50, 1),
+  (3, 30, 'Asha', 'Pune', 'Stapler', 7.00, 1),
+  (3, 20, 'Asha', 'Pune', 'Pen', 1.25, 4);
+
+SELECT * FROM orders_flat ORDER BY order_id, product_id;
+```
+
+Asha's city is stored in **four** rows, and the notebook's name and price in **two**. That repetition causes three kinds of trouble, called *anomalies*.
+
+### Update anomaly
+
+Asha moves to Mumbai. If you update only one of her rows, the data now disagrees with itself:
+
+```sql run destructive
+UPDATE orders_flat SET customer_city = 'Mumbai' WHERE order_id = 1 AND product_id = 10;
+
+SELECT customer_name, GROUP_CONCAT(DISTINCT customer_city ORDER BY customer_city) AS cities_on_file
+FROM orders_flat
+GROUP BY customer_name
+ORDER BY customer_name;
+```
+
+Asha now lives in two cities.
+
+### Delete anomaly
+
+Delete the only order that contains the stapler, and the stapler (its name and price) vanishes from the database too:
+
+```sql run destructive
+DELETE FROM orders_flat WHERE order_id = 3 AND product_id = 30;
+
+SELECT COUNT(*) AS staplers_known FROM orders_flat WHERE product_name = 'Stapler';
+```
+
+### Insert anomaly
+
+You cannot record a new customer, or a new product, until they appear in an order, because every row must have an order and a product.
+
+## The normal forms
+
+| Form | Rule | In plain English |
+|---|---|---|
+| **1NF** | every column holds one value; no repeating groups | no lists such as `'red,green,blue'` in a column |
+| **2NF** | 1NF, and every non-key column depends on the **whole** key | nothing depends on only *part* of a composite key |
+| **3NF** | 2NF, and no non-key column depends on another non-key column | nothing is determined by something other than the key |
+
+### First normal form: one value per cell
+
+A column holding a comma-separated list is not atomic, and it is painful to query:
+
+```sql run destructive
+CREATE TABLE product_bad (product_id INT PRIMARY KEY, name VARCHAR(30), tags VARCHAR(60));
+INSERT INTO product_bad VALUES (10, 'Notebook', 'paper,office'), (20, 'Pen', 'office,writing');
+
+SELECT name FROM product_bad WHERE FIND_IN_SET('office', tags) > 0 ORDER BY name;
+```
+
+That works, but it cannot use an index, cannot enforce that a tag is valid, and gets clumsy fast. The fix is a separate row per tag:
+
+```sql run destructive
+CREATE TABLE product_tag (product_id INT NOT NULL, tag VARCHAR(20) NOT NULL, PRIMARY KEY (product_id, tag));
+INSERT INTO product_tag VALUES (10, 'paper'), (10, 'office'), (20, 'office'), (20, 'writing');
+
+SELECT product_id FROM product_tag WHERE tag = 'office' ORDER BY product_id;
+```
+
+### Second normal form: depend on the whole key
+
+In `orders_flat` the key is `(order_id, product_id)`. But `product_name` and `unit_price` depend on `product_id` **alone**, and `customer_name` on `order_id` alone. Those are partial dependencies. The cure is to give each their own table.
+
+### Third normal form: depend only on the key
+
+If an order row stored `customer_id`, `customer_city` and the customer's postcode, the city would depend on `customer_id`, not on the order. That is a transitive dependency. Again the cure is a separate `customer` table.
+
+## Splitting the flat table
+
+Each fact goes into the table it belongs to, and the tables link with keys:
+
+```sql run destructive
+CREATE TABLE shop_customer (
+  customer_id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(30) NOT NULL UNIQUE,
+  city VARCHAR(30) NOT NULL
+);
+
+CREATE TABLE shop_product (
+  product_id INT PRIMARY KEY,
+  name VARCHAR(30) NOT NULL,
+  unit_price DECIMAL(6, 2) NOT NULL
+);
+
+CREATE TABLE shop_order (
+  order_id INT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  FOREIGN KEY (customer_id) REFERENCES shop_customer (customer_id)
+);
+
+CREATE TABLE shop_order_line (
+  order_id INT NOT NULL,
+  product_id INT NOT NULL,
+  qty INT NOT NULL,
+  PRIMARY KEY (order_id, product_id),
+  FOREIGN KEY (order_id) REFERENCES shop_order (order_id),
+  FOREIGN KEY (product_id) REFERENCES shop_product (product_id)
+);
+
+INSERT INTO shop_customer (name, city) VALUES ('Asha', 'Pune'), ('Ben', 'Delhi');
+INSERT INTO shop_product VALUES (10, 'Notebook', 4.50), (20, 'Pen', 1.25), (30, 'Stapler', 7.00);
+INSERT INTO shop_order VALUES (1, 1), (2, 2), (3, 1);
+INSERT INTO shop_order_line VALUES (1, 10, 2), (1, 20, 10), (2, 10, 1), (3, 30, 1), (3, 20, 4);
+
+SELECT (SELECT COUNT(*) FROM shop_customer) AS customers,
+       (SELECT COUNT(*) FROM shop_product) AS products,
+       (SELECT COUNT(*) FROM shop_order_line) AS order_lines;
+```
+
+Asha's city, the notebook's price and the stapler's name are now each stored **once**.
+
+### The same report, by joining
+
+Nothing was lost. Joining the tables gives back exactly what the flat table showed:
+
+```sql run destructive
+SELECT o.order_id, c.name AS customer, p.name AS product, l.qty, p.unit_price
+FROM shop_order_line AS l
+JOIN shop_order AS o ON o.order_id = l.order_id
+JOIN shop_customer AS c ON c.customer_id = o.customer_id
+JOIN shop_product AS p ON p.product_id = l.product_id
+ORDER BY o.order_id, p.product_id;
+```
+
+### The anomalies are gone
+
+Moving Asha is one update, in one place. And a new product can exist without any order:
+
+```sql run destructive
+UPDATE shop_customer SET city = 'Mumbai' WHERE name = 'Asha';
+INSERT INTO shop_product VALUES (40, 'Eraser', 0.75);
+
+SELECT name, city FROM shop_customer ORDER BY customer_id;
+```
+
+## Try it yourself
+
+Design tables for a library (books, authors, members, loans) on paper. For each, ask: what does this column depend on? Is it the whole key, and only the key?
+
+## Watch out
+
+### Normalising too far
+
+Splitting into dozens of tiny tables makes every query a long chain of joins. For most application data, **3NF is the goal**.
+
+### Denormalise on purpose, and only when you must
+
+Reporting tables and read-heavy caches are often deliberately denormalised: the customer's city is copied into each order row so reports run fast without joins. That is a trade-off you make knowingly, and you accept the update problem, usually by rebuilding the copy from the clean tables.
+
+### "Normal" does not mean "correct"
+
+Normalisation removes redundancy. It does not decide whether your design matches the business, so a design still needs to be checked against real questions.
+
+### Prices in an order line
+
+A real shop keeps the **price at the time of sale** in the order line, because a product's price changes later. That is a deliberate copy, not an anomaly.
+
+## Interview corner
+
+**"What is normalisation, and why do it?"**
+Organising data so each fact is stored once, to avoid update, insert and delete anomalies and to save space.
+
+**"Explain 1NF, 2NF and 3NF."**
+1NF: atomic values, no repeating groups. 2NF: every non-key column depends on the whole primary key. 3NF: non-key columns depend only on the key, not on each other. A short way to remember: "the key, the whole key, and nothing but the key."
+
+**"When would you denormalise?"**
+For read performance in reporting and analytics, or to keep a historical value (such as a price at the time of an order), accepting the extra work to keep copies consistent.
+
+**"Design a schema for an online shop on a whiteboard."**
+Customers, products, orders, order lines (link table with quantity and price), maybe addresses and categories. Say which columns are keys, which relationships are one-to-many and many-to-many.
+
+## Practice
+
+### Warm-up: spot the anomaly
+
+Using the flat table below, return the number of **different cities** on file for the customer `Asha` after the (partial) update, as `cities_for_asha`.
+
+```sql practice destructive
+-- hint: `COUNT(DISTINCT customer_city)` over Asha's rows.
+DROP TABLE IF EXISTS orders_flat;
+CREATE TABLE orders_flat (
+  order_id INT NOT NULL,
+  product_id INT NOT NULL,
+  customer_name VARCHAR(30) NOT NULL,
+  customer_city VARCHAR(30) NOT NULL,
+  PRIMARY KEY (order_id, product_id)
+);
+INSERT INTO orders_flat VALUES (1, 10, 'Asha', 'Pune'), (1, 20, 'Asha', 'Pune'), (3, 20, 'Asha', 'Pune');
+UPDATE orders_flat SET customer_city = 'Mumbai' WHERE order_id = 1 AND product_id = 10;
+
+SELECT COUNT(DISTINCT customer_city) AS cities_for_asha FROM orders_flat WHERE customer_name = 'Asha';
+```
+
+### Core: split out the customers
+
+From `orders_flat` (as above, with the three Asha rows), create a `customer_split` table with the **distinct** `customer_name` and `customer_city` pairs, and return the number of rows in it as `customer_rows`. (After the split, each fact should appear once for each different value pair.)
+
+```sql practice destructive
+-- hint: `CREATE TABLE customer_split AS SELECT DISTINCT customer_name, customer_city FROM orders_flat`.
+DROP TABLE IF EXISTS orders_flat;
+DROP TABLE IF EXISTS customer_split;
+CREATE TABLE orders_flat (
+  order_id INT NOT NULL,
+  product_id INT NOT NULL,
+  customer_name VARCHAR(30) NOT NULL,
+  customer_city VARCHAR(30) NOT NULL,
+  PRIMARY KEY (order_id, product_id)
+);
+INSERT INTO orders_flat VALUES (1, 10, 'Asha', 'Pune'), (1, 20, 'Asha', 'Pune'), (3, 20, 'Asha', 'Pune'), (2, 10, 'Ben', 'Delhi');
+CREATE TABLE customer_split AS SELECT DISTINCT customer_name, customer_city FROM orders_flat;
+
+SELECT COUNT(*) AS customer_rows FROM customer_split;
+```
+
+### Stretch: one row per tag
+
+A table stores `(1, 'paper,office')` and `(2, 'office,writing')` in a `tags` column. Split it into one row per tag using a UNION (or by inserting each tag), and return each product with its tag, ordered by product and tag.
+
+```sql practice destructive
+-- hint: Use `SUBSTRING_INDEX` twice: the part before the comma, and the part after it. UNION ALL the two halves.
+DROP TABLE IF EXISTS product_bad;
+CREATE TABLE product_bad (product_id INT PRIMARY KEY, tags VARCHAR(60));
+INSERT INTO product_bad VALUES (1, 'paper,office'), (2, 'office,writing');
+
+SELECT product_id, SUBSTRING_INDEX(tags, ',', 1) AS tag FROM product_bad
+UNION ALL
+SELECT product_id, SUBSTRING_INDEX(tags, ',', -1) FROM product_bad
+ORDER BY product_id, tag;
+```
