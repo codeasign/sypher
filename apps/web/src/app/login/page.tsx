@@ -4,6 +4,7 @@ import { Eye, EyeOff } from 'lucide-react';
 import { Suspense, useState, type FormEvent } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { apiFetch } from '@/lib/api';
+import { trackEvent } from '@/lib/analytics';
 import RecaptchaV2, { recaptchaConfigured } from '@/components/RecaptchaV2';
 import styles from './styles.module.css';
 
@@ -67,6 +68,7 @@ function AuthForm(): React.JSX.Element {
       return;
     }
     const authUser = await res.json().catch(() => ({}));
+    trackEvent(isSignUp ? 'sign_up' : 'login', { method: 'email' });
     // Provisioned account with a temporary/admin-set password — force a
     // password change before anything else.
     router.push(authUser?.mustResetPassword ? '/set-password' : '/dashboard');

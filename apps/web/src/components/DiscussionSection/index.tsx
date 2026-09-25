@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { ArrowBigUp, Clock, Lightbulb } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
+import { trackEvent } from '@/lib/analytics';
 import EmptyState from '@/components/EmptyState';
 import {
   COMMENT_SORT_MODES,
@@ -268,6 +269,7 @@ export default function DiscussionSection({
     }
     const created = result.comment;
     setTops((prev) => sortForClient([{ ...created, replyCount: 0 }, ...prev], sort));
+    trackEvent('comment_posted', { target_type: targetType, target_id: targetId, is_reply: false });
     return { error: null };
   }
 
@@ -279,6 +281,7 @@ export default function DiscussionSection({
       ...prev,
       [parentId]: sortForClient([...(prev[parentId] ?? []), reply], sort),
     }));
+    trackEvent('comment_posted', { target_type: targetType, target_id: targetId, is_reply: true });
     // The replier obviously wants to see their reply — expand the thread.
     setExpandedTops((prev) => ({ ...prev, [parentId]: true }));
     setTops((prev) => prev.map((t) => (t.id === parentId ? { ...t, replyCount: (t.replyCount ?? 0) + 1 } : t)));

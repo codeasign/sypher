@@ -1,22 +1,14 @@
 'use client';
 
 import { Moon, Sun } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import Image from 'next/image';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { apiFetch } from '@/lib/api';
+import { useAuthUser } from '@/contexts/AuthUserContext';
 import { useColorMode } from '@/hooks/useColorMode';
 import { DashboardIcon, ManageCoursesIcon } from '@/components/icons/SidebarIcons';
 import styles from './styles.module.css';
-
-interface AuthUser {
-  id: string;
-  email: string;
-  fullName: string | null;
-  role: string;
-  companyId: string | null;
-}
 
 // Theme toggle glyphs (Lucide Sun / Moon).
 function LightModeIcon({ className }: { className?: string }): React.JSX.Element {
@@ -63,37 +55,14 @@ function ColorModeToggle(): React.JSX.Element {
 // the course-authoring source of truth in Phase 1, but browsing the catalog
 // no longer requires leaving Sypher Next.
 //
-// Auth state is a local, component-owned client fetch (apiFetch('/auth/me')
-// on mount) rather than a shared AuthContext/provider — this is the only
-// consumer of "am I logged in" so far; worth promoting to a real context if
-// a second client component ever needs the same state.
+// Auth state comes from the shared AuthUserProvider (mounted in the root
+// layout) rather than its own fetch — AnalyticsSession became a second
+// consumer of the same "am I logged in" state, so it was promoted out of
+// this component.
 export default function Navbar(): React.JSX.Element | null {
   const pathname = usePathname();
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [user, setUser] = useState<AuthUser | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    apiFetch('/auth/me')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (!cancelled) setUser(data);
-      })
-      .catch(() => {
-        if (!cancelled) setUser(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-    // Re-checks on every route change, not just once on mount. Navbar
-    // lives in the root layout, which does NOT remount on a client-side
-    // router.push() (e.g. the login form's redirect to /dashboard) — an
-    // empty dependency array here meant Navbar froze on whatever auth
-    // state was true when the layout first mounted and never noticed a
-    // same-session login/logout that happened via client-side navigation
-    // instead of a full page load. `pathname` is a reliable proxy for
-    // "something navigation-worthy just happened."
-  }, [pathname]);
+  const { user } = useAuthUser();
 
   // The corporate portal (corporate.sypher.local -> /corporate/*) is a
   // standalone gated entrance — no main-site nav. Middleware redirects

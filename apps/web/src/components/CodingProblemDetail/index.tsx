@@ -6,6 +6,7 @@ import CodingIDE from '@/components/CodingIDE';
 import CodingProblemBookmarkButton from '@/components/CodingProblemBookmarkButton';
 import CodingProblemMarkdown from '@/components/CodingProblemMarkdown';
 import type { CodingProblemDetail as CodingProblemDetailData } from '@/data/codingProblems';
+import { trackEvent } from '@/lib/analytics';
 import EmptyState from '@/components/EmptyState';
 import styles from './styles.module.css';
 
@@ -46,6 +47,9 @@ export default function CodingProblemDetail({
   initialBookmarked: boolean;
 }): React.JSX.Element {
   const [tab, setTab] = useState<Tab>('ide');
+  useEffect(() => {
+    trackEvent('coding_problem_open', { problem_id: problem.id, difficulty: problem.difficulty, category: problem.categoryLabel });
+  }, [problem.id, problem.difficulty, problem.categoryLabel]);
   // LeetCode-style fullscreen: expands the Problem/IDE split to a fixed
   // full-viewport overlay instead of navigating anywhere else — Escape or
   // the exit button drops back to the normal in-page layout.

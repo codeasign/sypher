@@ -4,6 +4,7 @@ import { Bookmark } from 'lucide-react';
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { addCodingProblemBookmark, removeCodingProblemBookmark } from '@/data/codingProblems';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 function BookmarkIcon({ filled }: { filled: boolean }): React.JSX.Element {
@@ -42,6 +43,7 @@ export default function CodingProblemBookmarkButton({ problemId, initialBookmark
     const next = !bookmarked;
     setBookmarked(next);
     onChange?.(next);
+    trackEvent('bookmark_toggle', { kind: 'coding_problem', action: next ? 'add' : 'remove', problem_id: problemId });
     try {
       await (next ? addCodingProblemBookmark(problemId) : removeCodingProblemBookmark(problemId));
       router.refresh();

@@ -6,6 +6,7 @@ import { usePathname } from 'next/navigation';
 import { apiFetch } from '@/lib/api';
 import { uploadToBunny } from '@/data/bunnyUpload';
 import { PRESET_AVATARS, checkHandleAvailable, submitOnboarding } from '@/data/onboarding';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 // Pre-auth / password screens where a blocking onboarding modal would be
@@ -130,6 +131,7 @@ function OnboardingModal({ initialHandle }: { initialHandle: string }): React.JS
       if (result.error?.toLowerCase().includes('taken')) setHandleState('taken');
       return;
     }
+    trackEvent('onboarding_completed');
     // Reload so the whole app (Navbar, etc.) re-reads the now-onboarded user.
     window.location.reload();
   }

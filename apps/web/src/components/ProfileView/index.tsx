@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { uploadToBunny } from '@/data/bunnyUpload';
 import { PRESET_AVATARS } from '@/data/onboarding';
+import { trackEvent } from '@/lib/analytics';
 import { AddIcon, EditIcon, InfoIcon, MailIcon } from '@/components/icons/ActionIcons';
 import EmptyState from '@/components/EmptyState';
 import GoProCard from '@/components/GoProCard';
@@ -161,6 +162,7 @@ export default function ProfileView({
     setMe(updated);
     setAvatarOpen(false);
     setToast('Avatar updated');
+    trackEvent('profile_field_update', { field: 'avatar' });
     // DashboardSidebar's avatarUrl is a server-fetched prop from
     // (app)/layout.tsx — without this it stays stale until the next
     // full navigation.
@@ -200,6 +202,7 @@ export default function ProfileView({
     setMe(updated);
     setEditingBio(false);
     setToast('About updated');
+    trackEvent('profile_field_update', { field: 'bio' });
   }
 
   async function saveHandle(): Promise<void> {
@@ -223,6 +226,7 @@ export default function ProfileView({
     setMe(updated);
     setEditingHandle(false);
     setToast('Handle updated');
+    trackEvent('profile_field_update', { field: 'handle' });
   }
 
   const activePage = pages[tab];

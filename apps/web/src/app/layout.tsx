@@ -4,7 +4,11 @@ import Navbar from '@/components/Navbar';
 import FirstLoginOnboarding from '@/components/FirstLoginOnboarding';
 import ThemeScript from '@/components/ThemeScript';
 import UploadOverlay from '@/components/UploadOverlay';
+import AnalyticsBootstrap from '@/components/AnalyticsBootstrap';
+import AnalyticsSession from '@/components/AnalyticsSession';
+import CookieConsentBanner from '@/components/CookieConsentBanner';
 import { ToastProvider } from '@/components/Toast/ToastProvider';
+import { AuthUserProvider } from '@/contexts/AuthUserContext';
 import './globals.css';
 
 // Wordmark font for the navbar brand (exposed as --font-brand).
@@ -19,12 +23,17 @@ export default function RootLayout({ children }: { children: ReactNode }): React
     <html lang="en" className={brandFont.variable} suppressHydrationWarning>
       <body>
         <ThemeScript />
-        <ToastProvider>
-          <Navbar />
-          {children}
-          <FirstLoginOnboarding />
-          <UploadOverlay />
-        </ToastProvider>
+        <AnalyticsBootstrap />
+        <AuthUserProvider>
+          <AnalyticsSession />
+          <ToastProvider>
+            <Navbar />
+            {children}
+            <FirstLoginOnboarding />
+            <UploadOverlay />
+          </ToastProvider>
+          <CookieConsentBanner />
+        </AuthUserProvider>
       </body>
     </html>
   );

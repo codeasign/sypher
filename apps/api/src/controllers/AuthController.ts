@@ -527,6 +527,7 @@ export class AuthController extends Controller {
     }
 
     let user = await userRepository.findByEmail(profile.email);
+    let isNewUser = false;
     if (!user) {
       user = await userRepository.create({
         email: profile.email,
@@ -534,6 +535,7 @@ export class AuthController extends Controller {
         fullName: profile.fullName,
         provider: 'GOOGLE',
       });
+      isNewUser = true;
       logger.info(`Registered user ${user.id} via Google`);
     }
 
@@ -547,6 +549,13 @@ export class AuthController extends Controller {
     // came in via the open main login.
 
     const cookie = await createSessionAndCookie(user, request);
-    return redirect(302, undefined, { Location: `${env.frontendUrl}/dashboard`, 'Set-Cookie': cookie });
+    // Tags a brand-new account's redirect so AnalyticsSession
+    // (apps/web/src/components/AnalyticsSession) can fire a sign_up
+    // analytics event with method='google' -- there's no other reliable
+    // "just created via OAuth" signal available client-side, since this
+    // callback is the only place that knows. AnalyticsSession scrubs the
+    // param after reading it so a refresh doesn't double-count it.
+    const destination = isNewUser ? `${env.frontendUrl}/dashboard?_signup=google` : `${env.frontendUrl}/dashboard`;
+    return redirect(302, undefined, { Location: destination, 'Set-Cookie': cookie });
   }
 }

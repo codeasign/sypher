@@ -1,6 +1,6 @@
 'use client';
 
-import React from 'react';
+import React, { useEffect } from 'react';
 import Link from 'next/link';
 import ReactMarkdown from 'react-markdown';
 import remarkBreaks from 'remark-breaks';
@@ -10,6 +10,7 @@ import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import CodeBlock from './CodeBlock';
 import PdfEmbed from '@/components/PdfEmbed';
 import YouTube from '@/components/YouTube';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 const schema = {
@@ -28,6 +29,15 @@ interface BlogPostArticleProps {
   authorName?: string | null;
   authorBio?: string | null;
   showBackLink?: boolean;
+  /**
+   * Fires a blog_post_view analytics event on mount. Default false — this
+   * component is also reused for the admin editor's live preview
+   * (BlogPostEditorInner), which must never fire a view event for an
+   * author's own edits. Only the public /blog/[slug] page passes true.
+   */
+  trackView?: boolean;
+  /** Blog post id, for the trackView event's post_id param. */
+  postId?: string;
 }
 
 function formatDate(iso: string): string {
@@ -45,7 +55,14 @@ export default function BlogPostArticle({
   authorName,
   authorBio,
   showBackLink = true,
+  trackView = false,
+  postId,
 }: BlogPostArticleProps): React.JSX.Element {
+  useEffect(() => {
+    if (trackView) trackEvent('blog_post_view', { post_id: postId, post_slug: slug });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slug]);
+
   return (
     <article>
       {showBackLink && (

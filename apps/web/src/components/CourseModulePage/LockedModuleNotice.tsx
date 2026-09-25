@@ -17,7 +17,7 @@ interface LockedModuleNoticeProps {
 // component were somehow bypassed.
 export default function LockedModuleNotice({ userEmail }: LockedModuleNoticeProps): React.JSX.Element {
   const router = useRouter();
-  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid(userEmail, () => router.refresh());
+  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid(userEmail, () => router.refresh(), 'locked_module');
 
   return (
     <div className={styles.lockedNotice}>

@@ -61,6 +61,8 @@ export default async function BlogPostPage({ params }: { params: Promise<{ slug:
         <div className={styles.mainColumn}>
           <BlogPostArticle
             slug={slug}
+            postId={post.id}
+            trackView
             title={post.title}
             content={post.content}
             coverImageUrl={post.coverImageUrl}

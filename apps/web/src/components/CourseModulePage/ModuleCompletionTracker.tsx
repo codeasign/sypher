@@ -3,6 +3,7 @@
 import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiFetch } from '@/lib/api';
+import { trackEvent } from '@/lib/analytics';
 
 interface ModuleCompletionTrackerProps {
   courseSlug: string;
@@ -23,6 +24,7 @@ export default function ModuleCompletionTracker({ courseSlug, moduleSlug, alread
   const router = useRouter();
 
   useEffect(() => {
+    trackEvent('course_module_view', { course_slug: courseSlug, module_slug: moduleSlug });
     const path = `/courses/${encodeURIComponent(courseSlug)}/modules/${encodeURIComponent(moduleSlug)}/complete`;
     apiFetch(path, { method: 'POST' })
       .then((res) => {

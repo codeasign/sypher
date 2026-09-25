@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import Editor from '@monaco-editor/react';
 import { apiFetch } from '@/lib/api';
+import { trackEvent } from '@/lib/analytics';
 import { useColorMode } from '@/hooks/useColorMode';
 import { composeSourceCode } from './sourceCompose';
 import { CloseFullscreenIcon, OpenInFullIcon } from '@/components/icons/ActionIcons';
@@ -231,7 +232,7 @@ export default function CodingIDE({
         body: JSON.stringify({ problemId, languageId: LANGUAGE_IDS[language], sourceCode }),
       });
       if (!res.ok) throw new Error(await proxyErrorBody(res));
-      const { results: proxyResults } = (await res.json()) as { results: ProxyResult[]; cached: boolean };
+      const { results: proxyResults, cached } = (await res.json()) as { results: ProxyResult[]; cached: boolean };
       const settled: TestResult[] = proxyResults.map((r) => {
         if (r.compileOutput) return { index: r.index, status: 'error' as const, statusDescription: 'Compilation Error', stdout: null, stderr: null, compileOutput: r.compileOutput, time: null, memory: null };
         return { index: r.index, status: STATUS_MAP[r.statusId ?? -1] ?? 'error', statusDescription: r.statusDescription, stdout: r.stdout, stderr: r.stderr, compileOutput: null, time: r.time, memory: r.memory };
@@ -239,9 +240,30 @@ export default function CodingIDE({
       const firstCompile = settled.find((r) => r.compileOutput);
       if (firstCompile) setCompileError(firstCompile.compileOutput ?? null);
       setResults(settled);
+      // cached: true means Judge0Controller served this from its own result
+      // cache (computeCacheKey/getCachedResult) without calling out to
+      // RapidAPI at all -- billing (and this codebase's own 100-calls/month
+      // quota, recordMonthlySubmission) only happens on cached: false. Cost
+      // math downstream should sum cached:false events, not raw event count.
+      trackEvent('coding_judge0_call', {
+        call_type: kind,
+        problem_id: problemId,
+        language,
+        cached,
+        test_count: settled.length,
+        passed: settled.every((r) => r.status === 'accepted'),
+      });
     } catch (err) {
       setCompileError(err instanceof Error ? err.message : 'Unknown error');
       setResults([]);
+      // A thrown error here can mean either "never reached Judge0" (429
+      // rate limit, 502 monthly-quota block -- no cost incurred) or "Judge0
+      // itself errored" (Judge0UpstreamError -- RapidAPI still bills the
+      // attempt). The client can't tell these apart from the error message
+      // alone, so this is tagged separately rather than folded into
+      // cached:false -- treat error:true rows as "cost unknown", not
+      // "definitely billed".
+      trackEvent('coding_judge0_call', { call_type: kind, problem_id: problemId, language, cached: false, error: true });
     } finally {
       setRunningKind(null);
       fetchMonthlyUsage();
@@ -265,6 +287,10 @@ export default function CodingIDE({
       });
       if (!res.ok) throw new Error(await proxyErrorBody(res));
       const r = (await res.json()) as { statusId: number | undefined; statusDescription: string; stdout: string | null; stderr: string | null; compileOutput: string | null; time: string | null; memory: number | null };
+      // custom never caches (Judge0Controller.custom always calls
+      // runSingleToCompletion directly) -- every non-error response here is
+      // a real, billable Judge0 call, unlike run/submit's cached branch.
+      trackEvent('coding_judge0_call', { call_type: 'custom', problem_id: problemId, language, cached: false });
       if (r.compileOutput) {
         setCustomResult({ index: -1, status: 'error', statusDescription: 'Compilation Error', stdout: null, stderr: null, compileOutput: r.compileOutput, time: null, memory: null });
         return;
@@ -281,6 +307,7 @@ export default function CodingIDE({
       });
     } catch (err) {
       setCustomResult({ index: -1, status: 'error', statusDescription: err instanceof Error ? err.message : 'Error', stdout: null, stderr: null, compileOutput: null, time: null, memory: null });
+      trackEvent('coding_judge0_call', { call_type: 'custom', problem_id: problemId, language, cached: false, error: true });
     } finally {
       setCustomRunning(false);
       fetchMonthlyUsage();

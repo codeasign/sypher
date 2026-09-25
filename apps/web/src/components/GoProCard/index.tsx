@@ -16,7 +16,7 @@ interface GoProCardProps {
 // panel; reused wherever else a free user needs the same nudge.
 export default function GoProCard({ userEmail, message }: GoProCardProps): React.JSX.Element {
   const router = useRouter();
-  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid(userEmail, () => router.refresh());
+  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid(userEmail, () => router.refresh(), 'go_pro_card');
 
   return (
     <div className={styles.proCard}>

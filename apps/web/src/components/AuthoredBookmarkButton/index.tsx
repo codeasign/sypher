@@ -9,6 +9,7 @@ import {
   addAuthoredModuleBookmark,
   removeAuthoredModuleBookmark,
 } from '@/data/bookmarks';
+import { trackEvent } from '@/lib/analytics';
 import styles from './styles.module.css';
 
 function BookmarkIcon({ filled }: { filled: boolean }): React.JSX.Element {
@@ -35,6 +36,7 @@ export function CourseBookmarkButton({ courseId, initialBookmarked, onChange }: 
     setPending(true);
     const next = !bookmarked;
     setBookmarked(next);
+    trackEvent('bookmark_toggle', { kind: 'course', action: next ? 'add' : 'remove', course_id: courseId });
     try {
       await (next ? addAuthoredCourseBookmark(courseId) : removeAuthoredCourseBookmark(courseId));
       onChange?.(next);
@@ -87,6 +89,7 @@ export function ModuleBookmarkButton({ moduleId, courseId, initialBookmarked, on
     setPending(true);
     const next = !bookmarked;
     setBookmarked(next);
+    trackEvent('bookmark_toggle', { kind: 'module', action: next ? 'add' : 'remove', module_id: moduleId, course_id: courseId });
     try {
       await (next ? addAuthoredModuleBookmark(moduleId, courseId) : removeAuthoredModuleBookmark(moduleId));
       onChange?.(next);

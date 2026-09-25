@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import Image from 'next/image';
 import { startMockAttempt, submitMockAttempt, type MockExamSummary, type MockTestQuestionView, type MockTestResultResponse } from '@/data/mockTests';
+import { trackEvent } from '@/lib/analytics';
 import { LogoutMenuIcon, TimerIcon } from '@/components/icons/ActionIcons';
 import MiniBars from '@/components/charts/MiniBars';
 import RankedBars from '@/components/charts/RankedBars';
@@ -168,6 +169,12 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
         }
         setResult(submitResult);
         setPhase('results');
+        trackEvent('mock_test_submit', {
+          exam_code: exam.examCode,
+          score: submitResult.score,
+          correct_count: submitResult.correctCount,
+          total_questions: submitResult.totalQuestions,
+        });
         try {
           window.sessionStorage.setItem(resultStorageKey(exam.slug), JSON.stringify(submitResult));
         } catch {
@@ -203,6 +210,7 @@ export default function MockTestRunner({ exam }: { exam: MockExamSummary }): Rea
       setCurrentIndex(0);
       setConfirmingExit(false);
       setReviewFilter('correct');
+      trackEvent('mock_test_start', { exam_code: exam.examCode, question_count: start.questions.length });
       setActive({
         attemptId: start.attemptId,
         startedAtMs: new Date(start.startedAt).getTime(),

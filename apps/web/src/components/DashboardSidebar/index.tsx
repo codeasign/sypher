@@ -72,7 +72,7 @@ export default function DashboardSidebar({ role, email, fullName, avatarUrl, vis
   const accessItems = items.filter((item) => ACCESS_MANAGE_KEYS.has(item.key));
   const contentItems = items.filter((item) => !ACCESS_MANAGE_KEYS.has(item.key));
   const displayName = fullName || email.split('@')[0] || 'User';
-  const { handleUpgrade, isProcessing } = useUpgradeToPaid(email, () => router.refresh());
+  const { handleUpgrade, isProcessing } = useUpgradeToPaid(email, () => router.refresh(), 'dashboard_sidebar');
 
   function isActive(href: string): boolean {
     return pathname === href || pathname.startsWith(`${href}/`);

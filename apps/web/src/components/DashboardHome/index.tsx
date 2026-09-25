@@ -89,6 +89,7 @@ export default function DashboardHome({
     const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid(
         userEmail,
         () => router.refresh(),
+        'dashboard_home',
     );
     const firstName =
         (fullName?.trim().split(/\s+/)[0] || userEmail.split("@")[0]) ??

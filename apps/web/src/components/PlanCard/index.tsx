@@ -17,7 +17,7 @@ interface PlanCardProps {
 // dashboard/page.tsx so the badge flips without a full reload.
 export default function PlanCard({ isPaidAndActive, userEmail }: PlanCardProps): React.JSX.Element {
   const router = useRouter();
-  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid(userEmail, () => router.refresh());
+  const { handleUpgrade, isProcessing, errorMessage } = useUpgradeToPaid(userEmail, () => router.refresh(), 'plan_card');
 
   return (
     <div className={styles.card}>

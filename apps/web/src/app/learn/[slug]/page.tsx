@@ -11,6 +11,7 @@ import DiscussionSection from '@/components/DiscussionSection';
 import CourseDescriptionMarkdown from '@/components/CourseDescriptionMarkdown';
 import EmptyState from '@/components/EmptyState';
 import GoProCard from '@/components/GoProCard';
+import CourseViewTracker from '@/components/CourseViewTracker';
 import styles from './styles.module.css';
 
 interface AuthUser {
@@ -105,6 +106,7 @@ export default async function CourseHomePage({ params }: { params: Promise<{ slu
   return (
     <div className={styles.page}>
       <div className={styles.container}>
+        <CourseViewTracker courseId={course.id} courseSlug={slug} hasFullAccess={course.hasFullAccess} started={course.started} />
         <Link href="/learn" className={styles.backLink}>
           ← My Courses
         </Link>
