@@ -1,12 +1,24 @@
 const base = process.env.IMPORT_API_URL || 'http://localhost:4000';
-const login = await fetch(`${base}/auth/login`, {
-  method: 'POST', headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ email: process.env.IMPORT_ADMIN_EMAIL || 'admin@sypher.local', password: process.env.IMPORT_ADMIN_PASSWORD || 'devpassword123' }),
-});
-if (!login.ok) throw new Error(`Login: ${login.status}`);
-const cookie = login.headers.getSetCookie().map(c => c.split(';')[0]).join('; ');
+// When set, skips /auth/login (and its recaptcha gate, required in
+// production by default) entirely — goes straight through apps/api's
+// 'importTool' security scheme (tsoaAuth.ts) via a header on every request.
+const importToolSecret = process.env.IMPORT_TOOL_SECRET || '';
+let cookie = '';
+if (importToolSecret) {
+  console.log('using IMPORT_TOOL_SECRET, skipping /auth/login entirely');
+} else {
+  const login = await fetch(`${base}/auth/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: process.env.IMPORT_ADMIN_EMAIL || 'admin@sypher.local', password: process.env.IMPORT_ADMIN_PASSWORD || 'devpassword123' }),
+  });
+  if (!login.ok) throw new Error(`Login: ${login.status}`);
+  cookie = login.headers.getSetCookie().map(c => c.split(';')[0]).join('; ');
+}
+function authHeaders() {
+  return importToolSecret ? { 'X-Import-Tool-Secret': importToolSecret } : { Cookie: cookie };
+}
 async function get(p) {
-  const r = await fetch(base + p, { headers: { Cookie: cookie } });
+  const r = await fetch(base + p, { headers: authHeaders() });
   if (!r.ok) throw new Error(`${p}: ${r.status}`);
   return r.json();
 }

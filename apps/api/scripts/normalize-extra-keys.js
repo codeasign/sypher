@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const BANK = 'D:/jenny/sypher/apps/web/question-bank';
+const BANK = path.resolve(__dirname, '../../web/question-bank');
 const TIERS = ['easy', 'medium', 'hard'];
 
 /** Rebuild an object so its keys follow the given order, keeping any extras at the end. */

@@ -81,10 +81,22 @@ async function findCourse(slug: string): Promise<any> {
   }
 }
 
+// When IMPORT_TOOL_SECRET is set, every request carries it as a header and
+// auth goes straight through apps/api's 'importTool' security scheme
+// (tsoaAuth.ts) — this never touches /auth/login or its recaptcha gate at
+// all, which is required against any target with RECAPTCHA_REQUIRED=true
+// (production's default). Falls back to the original cookie-login flow
+// when the secret isn't configured, so local runs without it still work
+// exactly as before.
+const IMPORT_TOOL_SECRET = process.env.IMPORT_TOOL_SECRET || '';
+
 async function api<T = any>(method: string, route: string, body?: unknown): Promise<T> {
   const response = await fetch(`${API_URL}${route}`, {
     method,
-    headers: { 'Content-Type': 'application/json', Cookie: sessionCookie },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(IMPORT_TOOL_SECRET ? { 'X-Import-Tool-Secret': IMPORT_TOOL_SECRET } : { Cookie: sessionCookie }),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) throw new Error(`${method} ${route}: HTTP ${response.status}`);
@@ -92,6 +104,7 @@ async function api<T = any>(method: string, route: string, body?: unknown): Prom
 }
 
 async function login(): Promise<void> {
+  if (IMPORT_TOOL_SECRET) return; // api() sends the header directly, no session needed
   const response = await fetch(`${API_URL}/auth/login`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

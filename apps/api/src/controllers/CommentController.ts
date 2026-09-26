@@ -49,6 +49,11 @@ export interface CommentHelpfulStateResponse {
   viewerHelpful: boolean;
 }
 
+export interface CommentReportStateResponse {
+  reportCount: number;
+  viewerReported: boolean;
+}
+
 @Route('comments')
 @Tags('Comments')
 export class CommentController extends Controller {
@@ -178,6 +183,29 @@ export class CommentController extends Controller {
     await assertCommentTargetVisible(user, ctx);
 
     const state = await commentRepository.toggleHelpful(commentId, user.id);
+    return state ?? notFound(404);
+  }
+
+  // Report toggle — one-click flag, no reason required. Purely a signal to
+  // admins (Reported Comments page); never hides or alters the comment.
+  @Post('{commentId}/report')
+  @Security('session')
+  public async report(
+    @Path() commentId: string,
+    @Request() request: ExpressRequest,
+    @Res() notFound: TsoaResponse<404, void>,
+    @Res() tooManyRequests: TsoaResponse<429, CommentMessageResponse, { 'Retry-After': string }>,
+  ): Promise<CommentReportStateResponse | void> {
+    const user = request.user as User;
+    const retryAfterSeconds = await consumeCommentToggleAllowance(user.id);
+    if (retryAfterSeconds > 0) {
+      return tooManyRequests(429, { message: "You're doing that too quickly. Please wait a moment." }, { 'Retry-After': String(retryAfterSeconds) });
+    }
+    const ctx = await commentRepository.getActionContext(commentId);
+    if (!ctx) return notFound(404);
+    await assertCommentTargetVisible(user, ctx);
+
+    const state = await commentRepository.toggleReport(commentId, user.id);
     return state ?? notFound(404);
   }
 

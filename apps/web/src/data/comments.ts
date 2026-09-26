@@ -42,6 +42,9 @@ export interface CommentView {
   mentions: CommentMentionRef[];
   viewerVote: 'UP' | 'DOWN' | null;
   viewerHelpful: boolean;
+  viewerReported: boolean;
+  /** An admin removed this from the Reported Comments page — body above is already the fixed placeholder text. */
+  isRemovedByModerator: boolean;
   replyCount?: number;
 }
 
@@ -66,6 +69,11 @@ export interface CommentVoteStateData {
 export interface CommentHelpfulStateData {
   helpfulCount: number;
   viewerHelpful: boolean;
+}
+
+export interface CommentReportStateData {
+  reportCount: number;
+  viewerReported: boolean;
 }
 
 async function asError(res: Response): Promise<string> {
@@ -207,6 +215,14 @@ export async function toggleCommentHelpful(
   commentId: string,
 ): Promise<{ error: string | null; state: CommentHelpfulStateData | null }> {
   const res = await apiFetch(`/comments/${encodeURIComponent(commentId)}/helpful`, { method: 'POST' });
+  if (!res.ok) return { error: await asError(res), state: null };
+  return { error: null, state: await res.json() };
+}
+
+export async function reportComment(
+  commentId: string,
+): Promise<{ error: string | null; state: CommentReportStateData | null }> {
+  const res = await apiFetch(`/comments/${encodeURIComponent(commentId)}/report`, { method: 'POST' });
   if (!res.ok) return { error: await asError(res), state: null };
   return { error: null, state: await res.json() };
 }

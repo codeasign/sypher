@@ -32,6 +32,14 @@ export const env = {
     mobileDevBypass:
       process.env.RECAPTCHA_MOBILE_DEV_BYPASS === 'true' && (process.env.NODE_ENV ?? 'development') !== 'production',
   },
+  // Server-to-server auth for content-publishing scripts (scripts/publish-
+  // content.ts and the importers it drives), entirely separate from the
+  // public /auth/login|register recaptcha gate — see tsoaAuth.ts's
+  // 'importTool' security scheme. Never used by any user-facing flow.
+  importTool: {
+    secret: process.env.IMPORT_TOOL_SECRET ?? '',
+    adminEmail: process.env.IMPORT_ADMIN_EMAIL ?? '',
+  },
   google: {
     clientId: process.env.GOOGLE_CLIENT_ID ?? '',
     clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? '',

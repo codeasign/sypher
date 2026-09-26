@@ -65,8 +65,30 @@ export interface CommentViewData {
   mentions: { userId: string; username: string }[];
   viewerVote: CommentVoteType | null;
   viewerHelpful: boolean;
+  viewerReported: boolean;
+  /**
+   * True when an admin removed this from the Reported Comments page — body
+   * above is already substituted with a fixed placeholder (never the real
+   * text; see assembleViews), distinct from isDeleted's full invisibility.
+   */
+  isRemovedByModerator: boolean;
   /** Top-level rows only: visible reply count for the "N replies" affordance. */
   replyCount?: number;
+}
+
+const MODERATOR_REMOVED_BODY_PLACEHOLDER = 'This comment was deleted by an admin.';
+
+/** One row on the admin Reported Comments page (CommentRepository.listReported). */
+export interface CommentReportedRow {
+  id: string;
+  body: string;
+  author: { id: string; fullName: string | null; username: string };
+  reportCount: number;
+  isReportResolved: boolean;
+  isRemovedByModerator: boolean;
+  createdAt: Date;
+  target: { kind: 'module' | 'blog' | 'course' | 'video' | 'unknown'; label: string; href: string };
+  lastRemoval: { removedAt: Date; removedBy: string } | null;
 }
 
 export interface CommentListPage {
@@ -470,6 +492,145 @@ export class CommentRepository {
     });
   }
 
+  /** Report toggle — same one-per-(comment,user) shape as toggleHelpful. Purely a signal; never hides or alters the comment itself. */
+  async toggleReport(commentId: string, userId: string): Promise<{ reportCount: number; viewerReported: boolean } | null> {
+    return prisma.$transaction(async (tx) => {
+      const comment = await tx.comment.findFirst({
+        where: { id: commentId, isDeleted: false },
+        select: { reportCount: true },
+      });
+      if (!comment) return null;
+
+      const existing = await tx.commentReport.findUnique({
+        where: { commentId_userId: { commentId, userId } },
+      });
+      let reportCount = comment.reportCount;
+      if (existing) {
+        await tx.commentReport.delete({ where: { id: existing.id } });
+        reportCount -= 1;
+      } else {
+        await tx.commentReport.create({ data: { commentId, userId } });
+        reportCount += 1;
+        // A fresh report on a previously-resolved comment reopens it —
+        // otherwise a new report would silently sit hidden behind the old
+        // resolution on the admin page's default "open" filter.
+        await tx.comment.update({ where: { id: commentId }, data: { reportCount, isReportResolved: false } });
+        return { reportCount, viewerReported: true };
+      }
+      await tx.comment.update({ where: { id: commentId }, data: { reportCount } });
+      return { reportCount, viewerReported: false };
+    });
+  }
+
+  /**
+   * Admin Reported Comments page — paginated, newest-report-first within
+   * the open/resolved/all filter. Each row carries enough target context
+   * (course/module/blog/video title + a deep link) for an admin to jump
+   * straight to the thread without a second lookup.
+   */
+  async listReported(opts: {
+    resolved: 'open' | 'resolved' | 'all';
+    page: number;
+    pageSize: number;
+  }): Promise<{ items: CommentReportedRow[]; total: number }> {
+    const where: Prisma.CommentWhereInput = {
+      isDeleted: false,
+      reportCount: { gt: 0 },
+      ...(opts.resolved === 'open' ? { isReportResolved: false } : opts.resolved === 'resolved' ? { isReportResolved: true } : {}),
+    };
+    const [rows, total] = await Promise.all([
+      prisma.comment.findMany({
+        where,
+        orderBy: { updatedAt: 'desc' },
+        skip: (opts.page - 1) * opts.pageSize,
+        take: opts.pageSize,
+        include: {
+          user: { select: { id: true, fullName: true, username: true } },
+          courseModule: { select: { id: true, slug: true, title: true, course: { select: { slug: true } } } },
+          blogPost: { select: { id: true, title: true, slug: true } },
+          course: { select: { id: true, name: true, slug: true } },
+          video: { select: { id: true, title: true, slug: true } },
+          moderationLogs: {
+            orderBy: { removedAt: 'desc' },
+            take: 1,
+            include: { removedBy: { select: { fullName: true, username: true } } },
+          },
+        },
+      }),
+      prisma.comment.count({ where }),
+    ]);
+
+    return {
+      total,
+      items: rows.map((row) => {
+        const target = row.courseModule
+          ? { kind: 'module' as const, label: row.courseModule.title, href: `/learn/${row.courseModule.course.slug}/${row.courseModule.slug}#comment-${row.id}` }
+          : row.blogPost
+            ? { kind: 'blog' as const, label: row.blogPost.title, href: `/blog/${row.blogPost.slug}#comment-${row.id}` }
+            : row.course
+              ? { kind: 'course' as const, label: row.course.name, href: `/learn/${row.course.slug}#comment-${row.id}` }
+              : row.video
+                ? { kind: 'video' as const, label: row.video.title, href: `/videos/${row.video.slug}#comment-${row.id}` }
+                : { kind: 'unknown' as const, label: 'Unknown', href: '#' };
+        const lastRemoval = row.moderationLogs[0];
+        return {
+          id: row.id,
+          body: row.isRemovedByModerator ? MODERATOR_REMOVED_BODY_PLACEHOLDER : row.body,
+          author: { id: row.user.id, fullName: row.user.fullName, username: row.user.username },
+          reportCount: row.reportCount,
+          isReportResolved: row.isReportResolved,
+          isRemovedByModerator: row.isRemovedByModerator,
+          createdAt: row.createdAt,
+          target,
+          lastRemoval: lastRemoval
+            ? { removedAt: lastRemoval.removedAt, removedBy: lastRemoval.removedBy ? lastRemoval.removedBy.fullName || lastRemoval.removedBy.username : 'Unknown' }
+            : null,
+        };
+      }),
+    };
+  }
+
+  /** Dismiss or reopen report(s) on a comment without removing it. */
+  async setReportResolved(commentId: string, resolved: boolean): Promise<boolean> {
+    const result = await prisma.comment.updateMany({
+      where: { id: commentId, isDeleted: false },
+      data: { isReportResolved: resolved },
+    });
+    return result.count > 0;
+  }
+
+  /**
+   * Admin removal FROM the Reported Comments page. Deliberately the
+   * opposite of softDelete's invisibility: the row stays visible (never
+   * touches isDeleted), rendered everywhere as a fixed placeholder (see
+   * assembleViews), while the real body/author are preserved permanently
+   * in a CommentModerationLog row for audit — independent of this Comment
+   * row's own fate later (edit, further moderation, etc).
+   */
+  async removeByModerator(commentId: string, removedById: string): Promise<boolean> {
+    return prisma.$transaction(async (tx) => {
+      const comment = await tx.comment.findFirst({
+        where: { id: commentId, isDeleted: false, isRemovedByModerator: false },
+        select: { id: true, userId: true, body: true },
+      });
+      if (!comment) return false;
+
+      await tx.comment.update({
+        where: { id: commentId },
+        data: { isRemovedByModerator: true, isReportResolved: true },
+      });
+      await tx.commentModerationLog.create({
+        data: {
+          commentId,
+          commentAuthorId: comment.userId,
+          commentBody: comment.body,
+          removedById,
+        },
+      });
+      return true;
+    });
+  }
+
   /**
    * Best Answer swap (§7): exactly one per thread group (the top-level
    * comment + all its replies — any member can carry the marker, which is
@@ -574,7 +735,7 @@ export class CommentRepository {
     // An anonymous viewer has no votes/helpfuls of their own to look up —
     // skip both queries rather than filtering on userId: null (which would
     // never match a real row and is a wasted round-trip either way).
-    const [viewerVotes, viewerHelpfuls, mentionRows, replyCounts] = await Promise.all([
+    const [viewerVotes, viewerHelpfuls, viewerReports, mentionRows, replyCounts] = await Promise.all([
       viewerId === null
         ? Promise.resolve([] as { commentId: string; type: CommentVoteType }[])
         : prisma.commentVote.findMany({
@@ -584,6 +745,12 @@ export class CommentRepository {
       viewerId === null
         ? Promise.resolve([] as { commentId: string }[])
         : prisma.commentHelpful.findMany({
+            where: { commentId: { in: ids }, userId: viewerId },
+            select: { commentId: true },
+          }),
+      viewerId === null
+        ? Promise.resolve([] as { commentId: string }[])
+        : prisma.commentReport.findMany({
             where: { commentId: { in: ids }, userId: viewerId },
             select: { commentId: true },
           }),
@@ -602,6 +769,7 @@ export class CommentRepository {
 
     const voteById = new Map(viewerVotes.map((v) => [v.commentId, v.type]));
     const helpfulIds = new Set(viewerHelpfuls.map((h) => h.commentId));
+    const reportedIds = new Set(viewerReports.map((r) => r.commentId));
     const mentionsByComment = new Map<string, { userId: string; username: string }[]>();
     for (const m of mentionRows) {
       const list = mentionsByComment.get(m.commentId) ?? [];
@@ -615,7 +783,12 @@ export class CommentRepository {
     return rows.map((row) => ({
       id: row.id,
       parentId: row.parentId,
-      body: row.body,
+      // Admin-moderated removal: never serve the real text again once
+      // removed (never trust the frontend alone to hide it) — the original
+      // is preserved for audit purposes only in CommentModerationLog, not
+      // here. Distinct from isDeleted, which these queries already filter
+      // out entirely (assembleViews never even sees those rows).
+      body: row.isRemovedByModerator ? MODERATOR_REMOVED_BODY_PLACEHOLDER : row.body,
       upvoteCount: row.upvoteCount,
       downvoteCount: row.downvoteCount,
       score: row.score,
@@ -632,9 +805,11 @@ export class CommentRepository {
         avatarUrl: row.user.avatarUrl,
       },
       isContentAuthor: contentAuthorIdOf(row) === row.user.id,
-      mentions: mentionsByComment.get(row.id) ?? [],
+      mentions: row.isRemovedByModerator ? [] : mentionsByComment.get(row.id) ?? [],
       viewerVote: voteById.get(row.id) ?? null,
       viewerHelpful: helpfulIds.has(row.id),
+      viewerReported: reportedIds.has(row.id),
+      isRemovedByModerator: row.isRemovedByModerator,
       ...(opts?.withReplyCounts ? { replyCount: replyCountByParent.get(row.id) ?? 0 } : {}),
     }));
   }

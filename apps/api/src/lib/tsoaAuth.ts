@@ -1,10 +1,28 @@
+import crypto from 'node:crypto';
 import type { Request } from 'express';
 import type { User } from '@prisma/client';
 import { env } from './env';
 import { UnauthorizedError } from './errors';
 import { SessionRepository } from '../repositories/SessionRepository';
+import { prisma } from './prisma';
 
 const sessionRepository = new SessionRepository();
+
+/**
+ * Constant-time comparison of the X-Import-Tool-Secret header against
+ * env.importTool.secret — same shape as the Razorpay webhook signature
+ * check (paymentsWebhook.ts): compare lengths first (timingSafeEqual
+ * throws on a length mismatch, and comparing length isn't itself a useful
+ * timing oracle here), then a real constant-time byte comparison. Not an
+ * HMAC — this is a plain shared secret, not a signed payload.
+ */
+function importToolSecretMatches(request: Request): boolean {
+  if (!env.importTool.secret) return false;
+  const provided = request.headers['x-import-tool-secret'];
+  if (typeof provided !== 'string' || !provided) return false;
+  const expected = env.importTool.secret;
+  return provided.length === expected.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(provided));
+}
 
 // touch() updates lastSeenAt on every authenticated request by default,
 // which is two DB round trips (the lookup plus this write) on the single
@@ -69,6 +87,25 @@ export function usedBearerAuth(request: Request): boolean {
  * validation lives, per the scaffolding plan.
  */
 export async function expressAuthentication(request: Request, securityName: string): Promise<User> {
+  if (securityName === 'importTool') {
+    // Deliberately does NOT touch /auth/login|register or their recaptcha
+    // gate at all — this resolves a request straight to a real ADMIN User
+    // row via a shared-secret header, for scripts/publish-content.ts and
+    // the importers it drives. Only endpoints explicitly decorated with
+    // @Security('importTool') (stacked alongside @Security('session') —
+    // tsoa OR-semantics, either one satisfies) accept this path.
+    if (!importToolSecretMatches(request)) {
+      throw new UnauthorizedError();
+    }
+    if (!env.importTool.adminEmail) {
+      throw new UnauthorizedError('IMPORT_ADMIN_EMAIL is not configured server-side for the importTool scheme');
+    }
+    const user = await prisma.user.findUnique({ where: { email: env.importTool.adminEmail } });
+    if (!user || user.role !== 'ADMIN') {
+      throw new UnauthorizedError('Configured IMPORT_ADMIN_EMAIL has no matching ADMIN user');
+    }
+    return user;
+  }
   if (securityName !== 'session') {
     throw new UnauthorizedError(`Unknown security scheme: ${securityName}`);
   }

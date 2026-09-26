@@ -34,6 +34,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Dev-seed credentials only (already public in apps/api/prisma/seed.ts).
 const ADMIN_EMAIL = process.env.IMPORT_ADMIN_EMAIL || 'admin@sypher.local';
 const ADMIN_PASSWORD = process.env.IMPORT_ADMIN_PASSWORD || 'devpassword123';
+// When set, every request carries this instead of a session cookie, going
+// straight through apps/api's 'importTool' security scheme (tsoaAuth.ts) —
+// never touches /auth/login or its recaptcha gate, required against any
+// target with RECAPTCHA_REQUIRED=true (production's default).
+const IMPORT_TOOL_SECRET = process.env.IMPORT_TOOL_SECRET || '';
 
 function parseArgs(argv) {
   const args = {};
@@ -79,6 +84,10 @@ class ApiClient {
   }
 
   async login() {
+    if (IMPORT_TOOL_SECRET) {
+      console.log('[import] using IMPORT_TOOL_SECRET, skipping /auth/login entirely');
+      return;
+    }
     const res = await this.raw('POST', '/auth/login', {
       body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
       headers: { 'Content-Type': 'application/json' },
@@ -96,7 +105,8 @@ class ApiClient {
 
   raw(method, urlPath, options = {}) {
     const headers = { ...(options.headers || {}) };
-    if (this.cookie) headers.Cookie = this.cookie;
+    if (IMPORT_TOOL_SECRET) headers['X-Import-Tool-Secret'] = IMPORT_TOOL_SECRET;
+    else if (this.cookie) headers.Cookie = this.cookie;
     return fetch(`${this.baseUrl}${urlPath}`, { method, ...options, headers });
   }
 

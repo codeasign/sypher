@@ -3,11 +3,12 @@
 import { useState } from 'react';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import Tooltip from '@/components/Tooltip';
-import { DeleteIcon, EditIcon, ReplyIcon, ThumbUpIcon } from '@/components/icons/ActionIcons';
+import { DeleteIcon, EditIcon, ReplyIcon, ReportIcon, ThumbUpIcon } from '@/components/icons/ActionIcons';
 import {
   deleteComment,
   editComment,
   markBestAnswer,
+  reportComment,
   toggleCommentHelpful,
   voteComment,
   type CommentView,
@@ -85,6 +86,12 @@ export default function CommentItem({
   const [votePending, setVotePending] = useState(false);
   const [helpfulPending, setHelpfulPending] = useState(false);
   const [bestPending, setBestPending] = useState(false);
+  const [reportPending, setReportPending] = useState(false);
+  // Not lifted to the parent's comment array like vote/helpful — report
+  // count is deliberately never shown publicly (admin-only signal on the
+  // Reported Comments page), so only the viewer's own toggle state matters
+  // here, and it's fine to own it locally.
+  const [viewerReported, setViewerReported] = useState(comment.viewerReported);
   const [editing, setEditing] = useState(false);
   const [replyOpen, setReplyOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -110,6 +117,14 @@ export default function CommentItem({
     const result = await toggleCommentHelpful(comment.id);
     setHelpfulPending(false);
     if (result.state) onHelpful(comment.id, result.state);
+  }
+
+  async function handleReport(): Promise<void> {
+    if (!me || reportPending) return;
+    setReportPending(true);
+    const result = await reportComment(comment.id);
+    setReportPending(false);
+    if (result.state) setViewerReported(result.state.viewerReported);
   }
 
   async function handleMarkBest(): Promise<void> {
@@ -218,11 +233,13 @@ export default function CommentItem({
               }}
               onCancel={() => setEditing(false)}
             />
+          ) : comment.isRemovedByModerator ? (
+            <p className={styles.commentBodyRemoved}>{comment.body}</p>
           ) : (
             <CommentMarkdown body={comment.body} mentions={comment.mentions} />
           )}
 
-          {!editing && (
+          {!editing && !comment.isRemovedByModerator && (
             <div className={`${styles.actionRow} ${isOwner ? styles.actionRowOwner : ''}`}>
               {/* All comments use the same icon-only affordances (bare
                   Material glyph, hover Tooltip, verb tint, no background) —
@@ -260,6 +277,21 @@ export default function CommentItem({
                   </Tooltip>
                   {comment.helpfulCount > 0 && <span className={styles.actionCount}>{comment.helpfulCount}</span>}
                 </span>
+              )}
+
+              {!isOwner && me && (
+                <Tooltip label={viewerReported ? 'Remove report' : 'Report comment'}>
+                  <button
+                    type="button"
+                    className={`${styles.actionBtn} ${viewerReported ? styles.actionBtnDanger : ''}`}
+                    disabled={reportPending}
+                    onClick={() => void handleReport()}
+                    aria-pressed={viewerReported}
+                    aria-label={viewerReported ? 'Remove report' : 'Report comment'}
+                  >
+                    <ReportIcon />
+                  </button>
+                </Tooltip>
               )}
 
               {me && (

@@ -4,7 +4,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const BANK = 'D:/jenny/sypher/apps/web/question-bank';
+const BANK = path.resolve(__dirname, '../../web/question-bank');
 const TIERS = ['easy', 'medium', 'hard'];
 const QKEYS = ['id', 'difficulty', 'type', 'domain', 'question', 'options', 'correct_answer', 'explanation'];
 

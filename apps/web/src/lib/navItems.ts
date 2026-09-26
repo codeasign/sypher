@@ -23,4 +23,5 @@ export const NAV_ITEMS: NavItemDef[] = [
   { key: 'course-audit', label: 'Course Audit', href: '/course-audit' },
   { key: 'manage-videos', label: 'Manage Videos', href: '/manage-videos' },
   { key: 'browse-videos', label: 'Browse Videos', href: '/browse-videos' },
+  { key: 'reported-comments', label: 'Reported Comments', href: '/reported-comments' },
 ];

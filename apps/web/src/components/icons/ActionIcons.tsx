@@ -14,6 +14,7 @@ import {
   ChevronRight,
   ExternalLink,
   FilePlus,
+  Flag,
   FileText,
   Image as ImageGlyph,
   Info,
@@ -86,6 +87,7 @@ export const ChevronDownIcon = wrap(ChevronDown);
 export const ChevronRightIcon = wrap(ChevronRight);
 export const ReplyIcon = wrap(Reply);
 export const ThumbUpIcon = wrap(ThumbsUp);
+export const ReportIcon = wrap(Flag);
 
 // Speech bubble for reply-count toggles.
 export const CommentIcon = wrap(MessageSquare);

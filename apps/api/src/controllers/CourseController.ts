@@ -429,6 +429,7 @@ export class CourseController extends Controller {
   // CoursePage.
   @Get('manage/list')
   @Security('session')
+  @Security('importTool')
   public async listManage(
     @Request() request: ExpressRequest,
     @Query() limit?: string,
@@ -594,6 +595,7 @@ export class CourseController extends Controller {
 
   @Post()
   @Security('session')
+  @Security('importTool')
   public async create(@Body() body: CourseCreateRequest, @Request() request: ExpressRequest): Promise<CourseResponse> {
     const user = request.user as User;
     await requireCanManageCourses(user);
@@ -604,6 +606,7 @@ export class CourseController extends Controller {
 
   @Put('{id}')
   @Security('session')
+  @Security('importTool')
   public async update(@Path() id: string, @Body() body: CourseUpdateRequest, @Request() request: ExpressRequest): Promise<void> {
     await requireCanManageCourses(request.user as User);
     assertNoReplacementChar(body.name, 'Name');
@@ -614,6 +617,7 @@ export class CourseController extends Controller {
 
   @Put('{id}/status')
   @Security('session')
+  @Security('importTool')
   public async updateStatus(@Path() id: string, @Body() body: CourseSetStatusRequest, @Request() request: ExpressRequest): Promise<void> {
     const user = request.user as User;
     await requireCanManageCourses(user);
@@ -640,6 +644,7 @@ export class CourseController extends Controller {
   // admin-authored content, not user-generated volume.
   @Get('{courseId}/manage/modules')
   @Security('session')
+  @Security('importTool')
   public async listManageModules(@Path() courseId: string, @Request() request: ExpressRequest): Promise<CourseModuleResponse[]> {
     setPrivateNoStoreCache(this);
     await requireCanManageCourses(request.user as User);
@@ -648,6 +653,7 @@ export class CourseController extends Controller {
 
   @Post('{courseId}/modules')
   @Security('session')
+  @Security('importTool')
   public async createModule(
     @Path() courseId: string,
     @Body() body: CourseModuleCreateRequest,
@@ -671,6 +677,7 @@ export class CourseController extends Controller {
   // Use the same management authorization as ordinary module creation.
   @Post('{courseId}/modules/import')
   @Security('session')
+  @Security('importTool')
   public async importModule(
     @Path() courseId: string,
     @Body() body: ImportCourseModuleInput,
@@ -690,6 +697,7 @@ export class CourseController extends Controller {
 
   @Put('{courseId}/modules/{moduleId}')
   @Security('session')
+  @Security('importTool')
   public async updateModule(
     @Path() courseId: string,
     @Path() moduleId: string,
@@ -745,6 +753,7 @@ export class CourseController extends Controller {
 
   @Put('{courseId}/access/roles')
   @Security('session')
+  @Security('importTool')
   public async setAccessRoles(@Path() courseId: string, @Body() body: CourseSetRolesRequest, @Request() request: ExpressRequest): Promise<void> {
     await requireCanManageCourses(request.user as User);
     await authoredCourseAccessRepository.setAllowedRoles(courseId, body.allowedRoles);
