@@ -44,6 +44,32 @@ ENV NEXT_PUBLIC_RECAPTCHA_SITE_KEY=$NEXT_PUBLIC_RECAPTCHA_SITE_KEY
 ENV NEXT_PUBLIC_WEB3FORMS_ACCESS_KEY=$NEXT_PUBLIC_WEB3FORMS_ACCESS_KEY
 ENV NEXT_TELEMETRY_DISABLED=1
 
+# Guard against exactly what happened once already: NEXT_PUBLIC_API_BASE_URL
+# went missing from GitHub Secrets and the build silently succeeded with an
+# empty value baked into the client bundle (every browser-side API call went
+# to the wrong host). NEXT_PUBLIC_API_BASE_URL / NEXT_PUBLIC_WEB_URL are
+# load-bearing — the app is fundamentally broken without them — so a missing
+# value fails the build outright. NEXT_PUBLIC_RECAPTCHA_SITE_KEY /
+# NEXT_PUBLIC_WEB3FORMS_ACCESS_KEY degrade gracefully (bot protection / the
+# contact form just won't work), so those only warn.
+RUN set -eu; \
+    missing_critical=""; \
+    if [ -z "$NEXT_PUBLIC_API_BASE_URL" ]; then missing_critical="$missing_critical NEXT_PUBLIC_API_BASE_URL"; fi; \
+    if [ -z "$NEXT_PUBLIC_WEB_URL" ]; then missing_critical="$missing_critical NEXT_PUBLIC_WEB_URL"; fi; \
+    if [ -n "$missing_critical" ]; then \
+      echo "============================================================"; \
+      echo "BUILD FAILED: required build-arg(s) empty/unset:$missing_critical"; \
+      echo "These are baked into the client bundle at build time — an empty"; \
+      echo "value means every browser-side call goes to the wrong host,"; \
+      echo "silently, in production. Set them as GitHub Actions repo secrets"; \
+      echo "(see .github/workflows/deploy.yml's build-args) or pass"; \
+      echo "--build-arg explicitly for a local build."; \
+      echo "============================================================"; \
+      exit 1; \
+    fi; \
+    if [ -z "$NEXT_PUBLIC_RECAPTCHA_SITE_KEY" ]; then echo "WARNING: NEXT_PUBLIC_RECAPTCHA_SITE_KEY is empty — bot protection will be disabled client-side in this image."; fi; \
+    if [ -z "$NEXT_PUBLIC_WEB3FORMS_ACCESS_KEY" ]; then echo "WARNING: NEXT_PUBLIC_WEB3FORMS_ACCESS_KEY is empty — the contact form will not work in this image."; fi
+
 RUN npm run build --workspace=web
 
 # ---------------------------------------------------------------------------
